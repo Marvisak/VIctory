@@ -5,13 +5,15 @@
 //! structurisation; branches and guards are built from them. A value the
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
+//! The refusal then names the instruction that made the value
+//! ([`Origin`]), which is often far from the one that needs it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
+use super::{Origin, UserData};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -59,25 +61,32 @@ pub(crate) struct Parts<'a> {
 }
 
 enum Stop {
-    /// A phi whose incoming value has no DXIL form was read: redo with it missing.
-    Retry(Value, Why),
-    Fail(ShaderError),
+    /// A phi whose incoming value has no DXIL form was read: redo with it
+    /// missing, made where that value was.
+    Retry(Value, Why, Option<Origin>),
+    /// With the origin of the missing value the refusal comes from, if any.
+    Fail(ShaderError, Option<Origin>),
 }
 
+#[cfg(test)]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_traced(parts).map_err(|(e, _)| e)
+}
+
+/// Lowers `parts`. A refusal that comes from reading a missing value comes
+/// with the instruction that made it.
+pub(crate) fn lower_traced(parts: &Parts) -> Result<Lowered, (ShaderError, Option<Origin>)> {
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad).run() {
             Ok(l) => return Ok(l),
-            Err(Stop::Retry(v, why)) => {
-                if bad.insert(v, why).is_some() {
-                    return Err(ShaderError::Unsupported {
-                        offset: 0,
-                        what: "a phi that does not settle",
-                    });
+            Err(Stop::Retry(v, why, from)) => {
+                if bad.insert(v, (why, from)).is_some() {
+                    let what = "a phi that does not settle";
+                    return Err((ShaderError::Unsupported { offset: 0, what }, None));
                 }
             }
-            Err(Stop::Fail(e)) => return Err(e),
+            Err(Stop::Fail(e, from)) => return Err((e, from)),
         }
     }
 }
@@ -150,9 +159,14 @@ fn half_shift(width: u32) -> u32 {
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
-    bad: &'a HashMap<Value, Why>,
+    bad: &'a HashMap<Value, (Why, Option<Origin>)>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
+    /// The instruction that made each missing value (none: an input, or a
+    /// join that has no form of its own).
+    origins: HashMap<Value, Option<Origin>>,
+    /// The reason and origin of the last missing value read.
+    read_missing: Option<(Why, Option<Origin>)>,
     floats: HashMap<Value, V>,
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
@@ -339,11 +353,11 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
 }
 
 fn unsupported(offset: usize, what: Why) -> Stop {
-    Stop::Fail(ShaderError::Unsupported { offset, what })
+    Stop::Fail(ShaderError::Unsupported { offset, what }, None)
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, (Why, Option<Origin>)>) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -455,6 +469,8 @@ impl<'a> Lower<'a> {
             bad,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
+            origins: HashMap::new(),
+            read_missing: None,
             floats: HashMap::new(),
             block: vec![None; p.blocks.len()],
             cur: 0,
@@ -720,6 +736,10 @@ impl<'a> Lower<'a> {
             } else {
                 Val::Missing(UNKNOWN)
             };
+            if matches!(val, Val::Missing(_)) {
+                let (offset, name) = (inst.machine.offset, inst.name());
+                self.origins.insert(w, Some(Origin { offset, name }));
+            }
             self.vals.insert(w, val);
         }
     }
@@ -866,7 +886,11 @@ impl<'a> Lower<'a> {
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
                 let val = match phi.reg {
                     Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
-                    _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
+                    _ if self.bad.contains_key(&phi.value) => {
+                        let (why, from) = self.bad[&phi.value];
+                        self.origins.insert(phi.value, from);
+                        Val::Missing(why)
+                    }
                     Reg::Scc => {
                         let v = self.s.m.phi(self.cur, self.s.t.i1);
                         self.data_phis.push((v, b, i));
@@ -1120,7 +1144,10 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
-            Some(&Val::Missing(w)) => return Err(w),
+            Some(&Val::Missing(w)) => {
+                self.read_missing = Some((w, self.origins.get(&v).copied().flatten()));
+                return Err(w);
+            }
             Some(&val) => return Ok(val),
             None => {}
         }
@@ -1586,12 +1613,18 @@ impl<'a> Lower<'a> {
 
     fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
         match atom {
-            Atom::Lane(v) => self.lane_bits.get(&v).copied().ok_or_else(|| {
-                self.lane_fail
-                    .get(&v)
-                    .copied()
-                    .unwrap_or("a lane mask from a carry")
-            }),
+            Atom::Lane(v) => match self.lane_bits.get(&v) {
+                Some(&x) => Ok(x),
+                None => {
+                    let why = self
+                        .lane_fail
+                        .get(&v)
+                        .copied()
+                        .unwrap_or("a lane mask from a carry");
+                    self.read_missing = Some((why, self.origins.get(&v).copied().flatten()));
+                    Err(why)
+                }
+            },
             Atom::Uniform(v) => match self.get(v)? {
                 Val::Bit(x) => Ok(x),
                 Val::I32(x) => {
@@ -2254,6 +2287,7 @@ impl<'a> Lower<'a> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
+        self.read_missing = None;
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
             MaskData::Host => {
@@ -2302,16 +2336,44 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        // A missing value written here was made where the missing value it
+        // comes from was, else here.
+        let made = |l: &Self, why: Why| match l.read_missing {
+            Some((w, from)) if w == why => from,
+            _ => Some(Origin { offset, name }),
+        };
         match r {
-            Ok(()) => Ok(()),
-            Err(why) if effect => Err(unsupported(offset, why)),
+            Ok(()) => {
+                for &(_, v) in &inst.writes {
+                    if let Some(&Val::Missing(why)) = self.vals.get(&v)
+                        && !self.origins.contains_key(&v)
+                    {
+                        let from = made(self, why);
+                        self.origins.insert(v, from);
+                    }
+                }
+                Ok(())
+            }
+            Err(why) if effect => Err(self.refuse(offset, why)),
             Err(why) => {
+                let from = made(self, why);
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
+                    self.origins.insert(v, from);
                 }
                 Ok(())
             }
         }
+    }
+
+    /// A refusal at `offset`; one that comes from reading a missing value
+    /// names the instruction that made it.
+    fn refuse(&self, offset: usize, what: Why) -> Stop {
+        let from = match self.read_missing {
+            Some((w, from)) if w == what => from,
+            _ => None,
+        };
+        Stop::Fail(ShaderError::Unsupported { offset, what }, from)
     }
 
     fn is_mask(&self, v: Option<Value>) -> bool {
@@ -6744,6 +6806,7 @@ impl<'a> Lower<'a> {
             .insts
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
+        self.read_missing = None;
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
@@ -6764,13 +6827,13 @@ impl<'a> Lower<'a> {
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
                         let a = self
                             .atom(atom, self.cur)
-                            .map_err(|w| unsupported(offset, w))?;
+                            .map_err(|w| self.refuse(offset, w))?;
                         (a, not_taken, taken)
                     }
                     _ => {
                         let c = self
                             .boolean(when, self.cur)
-                            .map_err(|w| unsupported(offset, w))?;
+                            .map_err(|w| self.refuse(offset, w))?;
                         (c, taken, not_taken)
                     }
                 };
@@ -6907,13 +6970,16 @@ impl<'a> Lower<'a> {
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                        let why = "an SCC joined with SGPR values";
+                        return Err(Stop::Retry(phi.value, why, None));
                     }
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, why));
+                        let from = self.origins.get(&arg).copied().flatten();
+                        return Err(Stop::Retry(phi.value, why, from));
                     }
                     _ if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "a join of mismatched values"));
+                        let why = "a join of mismatched values";
+                        return Err(Stop::Retry(phi.value, why, None));
                     }
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),
@@ -6936,7 +7002,8 @@ impl<'a> Lower<'a> {
                     *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
                         unsupported(offset, "a lane-mask join of an untracked mask")
                     })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                self.read_missing = None;
+                let x = self.boolean(m, qb).map_err(|w| self.refuse(offset, w))?;
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
@@ -6947,7 +7014,7 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Origin, Parts, buffer_format, half_shift, lower, lower_traced};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -6957,6 +7024,14 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lowers_traced(words, rsrc2).map_err(|(e, _)| e)
+    }
+
+    /// [`lowers`], with the refusal's origin.
+    fn lowers_traced(
+        words: &[u32],
+        rsrc2: u32,
+    ) -> Result<(), (crate::ShaderError, Option<Origin>)> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -6974,7 +7049,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
-        lower(&Parts {
+        lower_traced(&Parts {
             native: &native,
             p: &p,
             st: &st,
@@ -7324,6 +7399,60 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    #[test]
+    fn a_refusal_names_the_instruction_that_made_its_missing_value() {
+        // The program above: a timestamp the last branch tests, read
+        // directly and through two joins.
+        let words = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBF06_8101, // s_cmp_eq_u32 s1, 1
+            0xBF85_0001, // s_cbranch_scc1
+            0xBE86_0381, // s_mov_b32 s6, 1
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // s_cbranch_scc1: the refusal
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        let direct = [&words[..2], &words[8..]].concat();
+        let made = Origin {
+            offset: 0,
+            name: "s_memtime",
+        };
+        for (code, branch) in [(&direct[..], 0xC), (&words[..], 0x24)] {
+            match lowers_traced(code, 3 << 7) {
+                // Timestamps lower: nothing is missing here any more.
+                Ok(()) => {}
+                Err((crate::ShaderError::Unsupported { offset, .. }, from)) => {
+                    assert_eq!(offset, branch);
+                    assert_eq!(from, Some(made));
+                }
+                Err((error, _)) => panic!("{error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_refusal_for_an_input_names_no_instruction() {
+        let words = [
+            0xBF85_0001, // s_cbranch_scc1 on SCC as the program starts
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let (error, from) = lowers_traced(&words, 0).unwrap_err();
+        assert_eq!(
+            error,
+            crate::ShaderError::Unsupported {
+                offset: 0,
+                what: "SCC on entry"
+            }
+        );
+        assert_eq!(from, None);
     }
 
     #[test]

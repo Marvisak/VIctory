@@ -214,6 +214,33 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// The instruction that made a value the emitter has no DXIL form for.
+/// A refusal that comes from reading such a value carries it: the value
+/// is often made far from where it is needed (a lane write read back by a
+/// branch, a descriptor dword carried through joins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Origin {
+    /// Byte offset of the instruction in the program.
+    pub offset: usize,
+    pub name: &'static str,
+}
+
+/// Why [`emit_traced`] refused a program.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Refusal {
+    pub error: ShaderError,
+    /// Where the missing value the refusal comes from was made; none when
+    /// the refusing instruction is the cause, or the value is an input or a
+    /// join with no form of its own.
+    pub from: Option<Origin>,
+}
+
+impl From<ShaderError> for Refusal {
+    fn from(error: ShaderError) -> Self {
+        Self { error, from: None }
+    }
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -223,6 +250,18 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_traced(c, native, p, st, io, res).map_err(|r| r.error)
+}
+
+/// [`emit`], naming where a refusal's missing value was made.
+pub fn emit_traced(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, Refusal> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -278,7 +317,7 @@ pub fn emit(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let l = lower::lower_traced(&lower::Parts {
         native,
         p,
         st,
@@ -288,7 +327,8 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    })
+    .map_err(|(error, from)| Refusal { error, from })?;
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,

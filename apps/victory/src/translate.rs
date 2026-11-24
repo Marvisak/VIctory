@@ -71,6 +71,9 @@ struct Tally {
     ms_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
+    /// Reason → the instructions that made the missing values it was
+    /// refused for, with the programs each made refuse.
+    made_by: BTreeMap<String, BTreeMap<&'static str, usize>>,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
@@ -136,6 +139,12 @@ impl Tally {
         self.lines.extend(other.lines);
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
+        }
+        for (reason, by) in other.made_by {
+            let into = self.made_by.entry(reason).or_default();
+            for (name, n) in by {
+                *into.entry(name).or_default() += n;
+            }
         }
     }
 }
@@ -297,6 +306,12 @@ pub fn run(
     failed.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
+        if let Some(by) = t.made_by.get(&reason) {
+            let mut by: Vec<_> = by.iter().collect();
+            by.sort_by_key(|&(name, n)| (std::cmp::Reverse(*n), *name));
+            let by: Vec<String> = by.iter().map(|(name, n)| format!("{n} {name}")).collect();
+            println!("           made by {}", by.join(", "));
+        }
     }
     Ok(())
 }
@@ -390,16 +405,28 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
+                    match emit::emit_traced(&container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("emit: {what}"), || {
-                                format!("{} at {offset:#x}", label())
-                            }),
-                        Err(e) => t.fail(format!("emit: {e}"), label),
+                        Err(emit::Refusal {
+                            error: ShaderError::Unsupported { offset, what },
+                            from,
+                        }) => {
+                            let reason = format!("emit: {what}");
+                            // Where the missing value it needed was made.
+                            let from = from.map_or(String::new(), |o| {
+                                *t.made_by
+                                    .entry(reason.clone())
+                                    .or_default()
+                                    .entry(o.name)
+                                    .or_default() += 1;
+                                format!(" from {} at {:#x}", o.name, o.offset)
+                            });
+                            t.fail(reason, || format!("{} at {offset:#x}{from}", label()));
+                        }
+                        Err(r) => t.fail(format!("emit: {}", r.error), label),
                     }
                 }
             }
