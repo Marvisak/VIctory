@@ -96,7 +96,7 @@ unfulfilled expectation is itself a warning, and CI runs `-D warnings`.
    ~1,200; split by responsibility before you cross either.
 10. **Docs match code in the same commit.** Do not call implemented things
     "planned", or planned things done. Cite only documents that exist in
-    the repository; there is no `docs/decisions/` directory.
+    the repository; there is no decision-record directory under `docs/`.
 11. **Lints.** Libraries log through `tracing`, never `println!`/`eprintln!`;
     no `dbg!`, `todo!`, `unimplemented!`, `std::process::exit`,
     `mem::forget`, or `result.ok();` (all enforced). Lints are configured
@@ -108,14 +108,14 @@ unfulfilled expectation is itself a warning, and CI runs `-D warnings`.
 |---------|--------------|------------|
 | Portable code calls a `cfg(windows)` item; Windows CI passes, every other host fails to build | `victory-gpu` `resource::view_format` called `host_resource` (fixed by gating it); `victory-hle` `d3d12x.rs` uses `super::xmem`, `xgame.rs` uses `super::lifecycle`, `xgameui.rs` uses `windows_sys` unconditionally | Gate the caller too, or give the item a non-Windows body. Run the Linux commands above. |
 | Tests assume the test binary is a PE image | `victory-pe` `image.rs` and `victory-loader` `prepare.rs` tests reading `current_exe()` (now `cfg(windows)`) | Gate with `#[cfg(windows)]` and a comment saying why, or build a synthetic image (`synthetic_image` in `image.rs`). |
-| Safe signature, raw-pointer dereference inside | 38 module-level `not_unsafe_ptr_arg_deref` allows (13 in `victory-gpu`, 25 in `victory-hle/src/modules`) | `unsafe extern "system" fn` with a `# Safety` section; see the ratchet. |
+| Safe signature, raw-pointer dereference inside | 38 module-level `not_unsafe_ptr_arg_deref` allows (13 in `victory-gpu`, 25 in `crates/victory-hle/src/modules`) | `unsafe extern "system" fn` with a `# Safety` section; see the ratchet. |
 | Swallowed I/O errors | `apps/victory/src/translate.rs`: `let _ = std::fs::write(...)` for dumps; `.filter_map(Result::ok)` over `walkdir` in `apps/victory/src/census.rs:37` and the non-git fallback of `xtask/src/policy.rs:134` (`translate` itself now walks through `apps/victory/src/walk.rs`, which reports every skipped entry) | `if let Err(e) = ... { tracing::warn!(...) }`; count and report skipped entries, as `walk.rs` does. |
 | Hand-written field-by-field merge | `Tally::merge` added ~40 fields one by one, so a new field could be left out of the sum (fixed: `apps/victory/src/translate/tally.rs:122` destructures every field) | `let Tally { a, b, c } = other;` naming every field, never `..`, so a new field fails to compile until merged. |
 | `_ =>` standing for "vertex/pixel" | `counter()` and `check()` in `apps/victory/src/translate.rs` treat every `HwStage` (8 variants) other than `Cs`/`Ms`/`Vs` as one group | Name the variants: `HwStage::Ls \| HwStage::Hs \| ... =>`. |
-| Panic reachable from title code | `victory-shader/src/emit/bitcode.rs` `panic!`s on internal invariants, reached from `victory-gpu` pipeline creation; `host!` in `victory-hle/src/modules/files.rs` panics if a host export is missing; `Stage::translated` in `victory-gpu/src/pipeline/host.rs` uses `expect` | Return `Result` and map it to the API's failure (`E_FAIL`, a dropped draw) with a log line. |
-| Giant functions and files | `victory-shader/src/emit/lower.rs` is 7,424 lines; clippy counts 32 functions over 100 lines in the portable crates alone | New logic goes in a new, focused module; extract before extending. |
+| Panic reachable from title code | `crates/victory-shader/src/emit/bitcode.rs` `panic!`s on internal invariants, reached from `victory-gpu` pipeline creation; `host!` in `crates/victory-hle/src/modules/files.rs` panics if a host export is missing; `Stage::translated` in `crates/victory-gpu/src/pipeline/host.rs` uses `expect` | Return `Result` and map it to the API's failure (`E_FAIL`, a dropped draw) with a log line. |
+| Giant functions and files | `crates/victory-shader/src/emit/lower.rs` is 7,424 lines; clippy counts 32 functions over 100 lines in the portable crates alone | New logic goes in a new, focused module; extract before extending. |
 | Docs promise what the code does not do (or deny what it does) | see Known doc drift below | Update the doc in the same commit as the code. |
-| A Windows-only test helper prints, Linux CI is green and Windows clippy fails | `emit/valu_tests.rs` was gated `#[cfg(all(test, windows))]`; clippy only exempts code under a plain `#[cfg(test)]`, so its `eprintln!` in `run_cases` broke PR #1 | Gate test modules with `#[cfg(test)]` and `#[cfg(windows)]` as two attributes, never `cfg(all(test, ...))` (the `portable` CI job rejects it). |
+| A Windows-only test helper prints, Linux CI is green and Windows clippy fails | `crates/victory-shader/src/emit/valu_tests.rs` was gated `#[cfg(all(test, windows))]`; clippy only exempts code under a plain `#[cfg(test)]`, so its `eprintln!` in `run_cases` broke PR #1 | Gate test modules with `#[cfg(test)]` and `#[cfg(windows)]` as two attributes, never `cfg(all(test, ...))` (the `portable` CI job rejects it). |
 | Unverifiable lint suppression | `#[allow(dead_code)] // unused in test builds` | `#[allow(dead_code, reason = "...")]`; never `#[expect]` on code CI compiles differently per cfg. |
 
 ## Known doc drift (to fix, not to copy)
@@ -127,14 +127,14 @@ unfulfilled expectation is itself a warning, and CI runs `-D warnings`.
   `victory-formats` (implemented).
 - `docs/architecture.md` diagram: game assets go through
   `victory-pipeline + victory-game`. Neither converts assets today; the only
-  real `Converter` is shader translation in `victory-gpu/src/shader_cache.rs`.
+  real `Converter` is shader translation in `crates/victory-gpu/src/shader_cache.rs`.
 - `crates/victory-game/src/lib.rs` and `docs/architecture.md` promise
   "hooks" placed in the title's code; the crate has `sgd5` and
   `KnownBuild` only.
 - "decision 0003" is cited 10 times (in `victory-shader` and
   `victory-gpu`) and "decision 0007" 16 times (`victory-gpu`,
   `victory-hle`); no decision records exist in the repository.
-- `victory-hle/src/modules/mod.rs` lists `xstore` stubs as planned;
+- `crates/victory-hle/src/modules/mod.rs` lists `xstore` stubs as planned;
   `xstore.rs` exists.
 
 ## Lint ratchet
