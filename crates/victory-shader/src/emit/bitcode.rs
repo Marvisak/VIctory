@@ -5,7 +5,10 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
+
+use crate::ShaderError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
@@ -184,6 +187,8 @@ pub(crate) enum Attr {
 struct Func {
     name: String,
     ty: Ty,
+    /// Its pointer type (the type of the function as a value).
+    ptr: Ty,
     attr: Option<Attr>,
     body: bool,
 }
@@ -211,6 +216,10 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
+    /// The first broken builder invariant (an emitter bug). Building goes
+    /// on with a placeholder so the many call sites stay infallible;
+    /// [`Module::write`] reports it.
+    broken: Option<String>,
 }
 
 impl Module {
@@ -247,6 +256,16 @@ impl Module {
     }
     pub fn func_ty(&mut self, ret: Ty, params: Vec<Ty>) -> Ty {
         self.ty(TypeDef::Func(ret, params))
+    }
+
+    /// Records a broken invariant (the first one is kept) and gives an
+    /// `i32` undef to stand in for the value that could not be built.
+    fn broke(&mut self, what: String) -> V {
+        if self.broken.is_none() {
+            self.broken = Some(what);
+        }
+        let t = self.int(32);
+        self.undef(t)
     }
 
     fn is_void(&self, t: Ty) -> bool {
@@ -287,13 +306,16 @@ impl Module {
     }
     /// A constant struct or array of constants.
     pub fn aggregate(&mut self, ty: Ty, fields: &[V]) -> V {
-        let ids = fields
-            .iter()
-            .map(|f| match f {
-                V::Const(i) => *i,
-                _ => panic!("aggregate of a non-constant"),
-            })
-            .collect();
+        let mut ids = Vec::with_capacity(fields.len());
+        for &f in fields {
+            match f {
+                V::Const(i) => ids.push(i),
+                V::Global(_) | V::Func(_) | V::Inst(_) => {
+                    self.broke(format!("aggregate of a non-constant {f:?}"));
+                    return self.undef(ty);
+                }
+            }
+        }
         self.constant(ty, Const::Aggregate(ids))
     }
 
@@ -321,9 +343,11 @@ impl Module {
             return V::Func(i);
         }
         let i = self.funcs.len() as u32;
+        let ptr = self.ptr(ty);
         self.funcs.push(Func {
             name: name.into(),
             ty,
+            ptr,
             attr,
             body,
         });
@@ -348,7 +372,11 @@ impl Module {
     /// An internal constant global initialised with the constant `init`.
     pub fn constant_global(&mut self, name: &str, init: V) -> V {
         let V::Const(i) = init else {
-            panic!("a global initialised with a non-constant")
+            self.broke(format!(
+                "global {name} initialised with a non-constant {init:?}"
+            ));
+            let t = self.int(32);
+            return self.global(name, t, 0);
         };
         let ty = self.consts[i as usize].0;
         let g = self.global(name, ty, 0);
@@ -368,19 +396,23 @@ impl Module {
             V::Global(i) => self.globals[i as usize].ptr,
             V::Const(i) => self.consts[i as usize].0,
             V::Inst(i) => self.insts[i as usize].ty,
-            V::Func(i) => {
-                let t = self.funcs[i as usize].ty;
-                *self
-                    .type_ids
-                    .get(&TypeDef::Ptr(t, 0))
-                    .map(|t| Ty(*t))
-                    .as_ref()
-                    .expect("function pointer type")
-            }
+            V::Func(i) => self.funcs[i as usize].ptr,
         }
     }
 
+    /// Whether `block` exists; records a broken invariant if not.
+    fn has_block(&mut self, block: usize) -> bool {
+        let ok = block < self.blocks.len();
+        if !ok {
+            self.broke(format!("block {block} does not exist"));
+        }
+        ok
+    }
+
     fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
+        if !self.has_block(block) {
+            return self.broke(format!("an instruction in block {block}"));
+        }
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
@@ -405,23 +437,38 @@ impl Module {
     }
     pub fn extract(&mut self, block: usize, agg: V, index: u32) -> V {
         let ty = match &self.types[self.type_of(agg).0 as usize] {
-            TypeDef::Struct(_, f) => f[index as usize],
-            TypeDef::Array(_, t) => *t,
-            t => panic!("extractvalue from {t:?}"),
+            TypeDef::Struct(_, f) => f.get(index as usize).copied(),
+            TypeDef::Array(n, t) => (index < *n).then_some(*t),
+            TypeDef::Void
+            | TypeDef::Int(_)
+            | TypeDef::Float
+            | TypeDef::Ptr(..)
+            | TypeDef::Func(..) => None,
         };
-        self.push(block, ty, Op::Extract(agg, index))
+        match ty {
+            Some(ty) => self.push(block, ty, Op::Extract(agg, index)),
+            None => {
+                let t = self.types[self.type_of(agg).0 as usize].clone();
+                self.broke(format!("extractvalue {index} from {t:?}"))
+            }
+        }
     }
     pub fn call(&mut self, block: usize, f: V, args: Vec<V>) -> V {
         let V::Func(i) = f else {
-            panic!("call of a non-function")
+            return self.broke(format!("call of a non-function {f:?}"));
         };
-        let TypeDef::Func(ret, _) = self.types[self.funcs[i as usize].ty.0 as usize] else {
-            unreachable!()
+        let fty = self.funcs[i as usize].ty;
+        let TypeDef::Func(ret, _) = self.types[fty.0 as usize] else {
+            let t = self.types[fty.0 as usize].clone();
+            return self.broke(format!("call of a function of type {t:?}"));
         };
         self.push(block, ret, Op::Call(i, args))
     }
     /// A phi at the top of `block`; incoming values come with [`Module::set_phi`].
     pub fn phi(&mut self, block: usize, ty: Ty) -> V {
+        if !self.has_block(block) {
+            return self.broke(format!("a phi in block {block}"));
+        }
         let i = self.insts.len() as u32;
         self.insts.push(Inst {
             ty,
@@ -433,10 +480,10 @@ impl Module {
     /// The address of element `index` of the array `ptr` points to.
     pub fn element(&mut self, block: usize, ptr: V, index: V) -> V {
         let TypeDef::Ptr(arr, space) = self.types[self.type_of(ptr).0 as usize] else {
-            panic!("element of a non-pointer")
+            return self.broke(format!("element of a non-pointer {ptr:?}"));
         };
         let TypeDef::Array(_, elem) = self.types[arr.0 as usize] else {
-            panic!("element of a non-array")
+            return self.broke(format!("element of a pointer to a non-array {ptr:?}"));
         };
         let ty = self.ptr_in(elem, space);
         let zero = self.i32(0);
@@ -444,7 +491,7 @@ impl Module {
     }
     pub fn load(&mut self, block: usize, ptr: V) -> V {
         let TypeDef::Ptr(ty, _) = self.types[self.type_of(ptr).0 as usize] else {
-            panic!("load from a non-pointer")
+            return self.broke(format!("load from a non-pointer {ptr:?}"));
         };
         self.push(block, ty, Op::Load(ptr))
     }
@@ -465,11 +512,23 @@ impl Module {
     }
 
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
-        let V::Inst(i) = phi else { panic!() };
-        self.insts[i as usize].op = Op::Phi(incoming);
+        if !incoming.iter().all(|&(_, b)| self.has_block(b)) {
+            return;
+        }
+        match phi {
+            V::Inst(i) if matches!(self.insts[i as usize].op, Op::Phi(_)) => {
+                self.insts[i as usize].op = Op::Phi(incoming);
+            }
+            V::Inst(_) | V::Global(_) | V::Func(_) | V::Const(_) => {
+                self.broke(format!("incoming values set on a non-phi {phi:?}"));
+            }
+        }
     }
     pub fn terminate(&mut self, block: usize, t: Term) {
-        self.blocks[block].term = Some(t);
+        let targets_exist = successors(Some(t)).iter().all(|&b| self.has_block(b));
+        if targets_exist && self.has_block(block) {
+            self.blocks[block].term = Some(t);
+        }
     }
 
     pub fn md_str(&mut self, s: &str) -> Md {
@@ -489,7 +548,6 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
-    /// The module as bitcode.
     /// Which instructions are written: every body instruction, the branch
     /// conditions, and whatever they read, transitively (a phi nothing reads
     /// is dropped). A worklist visits each instruction once, so a long chain
@@ -521,7 +579,20 @@ impl Module {
         live
     }
 
-    pub fn write(&self) -> Vec<u8> {
+    /// The module as bitcode, or the first invariant the building broke.
+    pub fn write(&self) -> Result<Vec<u8>, ShaderError> {
+        if let Some(what) = &self.broken {
+            return Err(ShaderError::Internal(what.clone()));
+        }
+        if self.blocks.is_empty() {
+            return Err(ShaderError::Internal("the module has no blocks".into()));
+        }
+        self.write_bitcode()
+    }
+
+    /// The bitcode of a module with at least one block, every block id in
+    /// it naming one of its blocks (the builder checks both).
+    fn write_bitcode(&self) -> Result<Vec<u8>, ShaderError> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
@@ -541,12 +612,12 @@ impl Module {
             }
             w.record(3, &r);
         }
-        w.exit();
+        w.exit()?;
         w.enter(PARAMATTR_BLOCK, 3);
         for id in 1..=4 {
             w.record(2, &[id]);
         }
-        w.exit();
+        w.exit()?;
 
         w.enter(TYPE_BLOCK, 4);
         w.record(1, &[self.types.len() as u64]);
@@ -575,7 +646,7 @@ impl Module {
                 }
             }
         }
-        w.exit();
+        w.exit()?;
 
         w.record(2, &chars("dxil-ms-dx"));
         w.record(
@@ -651,7 +722,7 @@ impl Module {
                 }
             }
         }
-        w.exit();
+        w.exit()?;
 
         // Phis nothing reads are left out (one register per phi makes many).
         let live = self.live();
@@ -727,6 +798,8 @@ impl Module {
                 }
             }
         }
+        // The first misplaced use found below; the module is not written.
+        let bad = OnceCell::new();
         let abs = |v: V| -> u32 {
             match v {
                 V::Global(i) => i,
@@ -734,10 +807,22 @@ impl Module {
                 V::Const(i) => funcs + i,
                 V::Inst(i) => {
                     let id = ids[i as usize];
-                    assert_ne!(id, u32::MAX, "use of a void value");
+                    if id == u32::MAX {
+                        bad.get_or_init(|| format!("use of a void or unplaced value {v:?}"));
+                        return 0;
+                    }
                     id
                 }
             }
+        };
+        // `inst_id - abs(v)`: the relative id of a value defined earlier.
+        let back = |v: V, inst_id: u32| -> u64 {
+            let a = abs(v);
+            if a >= inst_id {
+                bad.get_or_init(|| format!("forward reference outside a phi to {v:?}"));
+                return 0;
+            }
+            u64::from(inst_id - a)
         };
 
         w.enter(METADATA_BLOCK, 3);
@@ -759,7 +844,7 @@ impl Module {
             let r: Vec<u64> = nodes.iter().map(|m| u64::from(m.0)).collect();
             w.record(10, &r);
         }
-        w.exit();
+        w.exit()?;
         // The metadata kinds an LLVM 3.7 module declares, as DXC writes them.
         w.enter(METADATA_BLOCK, 3);
         for (id, kind) in [
@@ -785,7 +870,7 @@ impl Module {
             r.extend(chars(kind));
             w.record(6, &r);
         }
-        w.exit();
+        w.exit()?;
 
         w.enter(VALUE_SYMTAB_BLOCK, 4);
         let names = self.globals.iter().map(|g| &g.name);
@@ -794,21 +879,18 @@ impl Module {
             r.extend(chars(name));
             w.record(1, &r);
         }
-        w.exit();
+        w.exit()?;
 
         w.enter(FUNCTION_BLOCK, 4);
         w.record(1, &[layout.len() as u64]);
         let mut inst_id = base;
         // The operands of variable-length records, reused across them.
         let mut r: Vec<u64> = Vec::new();
-        for b in layout.iter().map(|&b| &self.blocks[b]) {
+        for &n in &layout {
+            let b = &self.blocks[n];
             for &i in b.phis.iter().filter(|&&i| live[i as usize]).chain(&b.body) {
                 let inst = &self.insts[i as usize];
-                let rel = |v: V| {
-                    let a = abs(v);
-                    assert!(a < inst_id, "forward reference outside a phi");
-                    u64::from(inst_id - a)
-                };
+                let rel = |v: V| back(v, inst_id);
                 match &inst.op {
                     Op::Bin(op, a, b) => w.record(2, &[rel(*a), rel(*b), *op as u64]),
                     Op::Cast(op, v) => w.record(3, &[rel(*v), u64::from(inst.ty.0), *op as u64]),
@@ -852,19 +934,26 @@ impl Module {
                     inst_id += 1;
                 }
             }
-            match b.term.expect("unterminated block") {
+            let Some(term) = b.term else {
+                return Err(ShaderError::Internal(format!(
+                    "block {n} is not terminated"
+                )));
+            };
+            match term {
                 Term::Ret => w.record(10, &[]),
                 Term::Br(t) => w.record(11, &[target(t)]),
                 Term::CondBr(c, t, f) => {
-                    let a = abs(c);
-                    assert!(a < inst_id);
-                    w.record(11, &[target(t), target(f), u64::from(inst_id - a)]);
+                    let rel = back(c, inst_id);
+                    w.record(11, &[target(t), target(f), rel]);
                 }
             }
         }
-        w.exit();
-        w.exit();
-        w.finish()
+        if let Some(what) = bad.into_inner() {
+            return Err(ShaderError::Internal(what));
+        }
+        w.exit()?;
+        w.exit()?;
+        Ok(w.finish())
     }
 }
 
@@ -916,7 +1005,7 @@ fn successors(term: Option<Term>) -> Succs {
     match term {
         Some(Term::Br(t)) => Succs { to: [t, 0], len: 1 },
         Some(Term::CondBr(_, t, f)) => Succs { to: [t, f], len: 2 },
-        _ => Succs { to: [0, 0], len: 0 },
+        None | Some(Term::Ret) => Succs { to: [0, 0], len: 0 },
     }
 }
 
@@ -991,11 +1080,16 @@ impl Writer {
         self.stack.push((width, self.words.len()));
     }
 
-    fn exit(&mut self) {
-        self.emit(0, self.width()); // END_BLOCK
+    /// Closes the innermost open block; there must be one.
+    fn exit(&mut self) -> Result<(), ShaderError> {
+        let Some((width, start)) = self.stack.pop() else {
+            return Err(ShaderError::Internal("a block closed twice".into()));
+        };
+        self.emit(0, width); // END_BLOCK, in the closed block's width
         self.align();
-        let (_, start) = self.stack.pop().expect("open block");
+        // `enter` pushed `start` after the length word, so `start >= 1`.
         self.words[start - 1] = (self.words.len() - start) as u32;
+        Ok(())
     }
 
     /// An unabbreviated record.
@@ -1015,6 +1109,9 @@ impl Writer {
 }
 
 #[cfg(test)]
+mod invariant_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1027,7 +1124,7 @@ mod tests {
         let mut w = Writer::default();
         w.enter(8, 3);
         w.record(1, &[1]);
-        w.exit();
+        w.exit().unwrap();
         let bytes = w.finish();
         // header word, length word, one record word, end word.
         assert_eq!(bytes.len() % 4, 0);
@@ -1180,10 +1277,10 @@ mod tests {
     #[test]
     fn written_bytes_unchanged() {
         for ((regs, stages, read), len, hash) in [
-            ((64, 64, 64), 38_916, 0x9586_730c_f953_4a45),
-            ((128, 256, 32), 295_952, 0x89e5_de2d_64f0_8785),
+            ((64, 64, 64), 38_924, 0x387a_5041_1fbc_cc4e),
+            ((128, 256, 32), 295_960, 0x4c54_0779_a84c_2797),
         ] {
-            let bytes = synthetic(regs, stages, read).write();
+            let bytes = synthetic(regs, stages, read).write().unwrap();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
         }
     }
@@ -1193,11 +1290,11 @@ mod tests {
     fn bench_write() {
         for (regs, stages, read) in [(64, 64, 64), (128, 256, 32), (256, 512, 256)] {
             let m = synthetic(regs, stages, read);
-            let bytes = m.write();
+            let bytes = m.write().unwrap();
             let runs = 5;
             let t = std::time::Instant::now();
             for _ in 0..runs {
-                std::hint::black_box(m.write());
+                std::hint::black_box(m.write().unwrap());
             }
             let per = t.elapsed() / runs;
             println!(

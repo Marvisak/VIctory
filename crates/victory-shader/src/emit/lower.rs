@@ -910,7 +910,7 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            dxil: self.s.finish(),
+            dxil: self.s.finish().map_err(Stop::Fail)?,
             user_data,
             samplers: self.samplers,
         })

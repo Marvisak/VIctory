@@ -33,4 +33,9 @@ pub enum ShaderError {
     /// Valid code the translator cannot handle yet: an opcode name or a construct.
     #[error("GFX10 code at {offset:#x}: {what} is not supported")]
     Unsupported { offset: usize, what: &'static str },
+    /// A translator bug: the emitter broke one of its own invariants
+    /// (building DXIL from values of the wrong kind). The shader is
+    /// rejected instead of the process aborting.
+    #[error("internal translator error: {0}")]
+    Internal(String),
 }
