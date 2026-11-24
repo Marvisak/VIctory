@@ -5789,6 +5789,7 @@ impl<'a> Lower<'a> {
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            "image_gather4_c_lz" | "image_gather4_c_lz_o" => (74, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -5841,7 +5842,7 @@ impl<'a> Lower<'a> {
                 .ok_or("an untracked sampler")?;
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
-            let cmp = matches!(op, 64 | 65);
+            let cmp = matches!(op, 64 | 65 | 74);
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
@@ -6019,8 +6020,18 @@ impl<'a> Lower<'a> {
                     if name == "image_gather4" {
                         return Err("a gather with implicit level");
                     }
+                    if !matches!(kind, 2 | 5 | 7) {
+                        return Err("a gather on a 1D or 3D image");
+                    }
+                    if offset_word && kind == 5 {
+                        return Err("a cube gather with texel offsets");
+                    }
                     if dmask.count_ones() != 1 {
                         return Err("a gather of several channels");
+                    }
+                    if op == 74 && *dmask != 1 {
+                        // D3D12 comparison gather only compares channel 0 (red).
+                        return Err("a comparison gather of a non-red channel");
                     }
                     if offset_word {
                         let w = addr_val(self, 0)?;
@@ -6034,14 +6045,27 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
-                    self.s.op(
-                        c,
-                        "textureGather.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        73,
-                        &args,
-                    )
+                    if op == 74 {
+                        let reference = addr_val(self, first - 1)?;
+                        args.push(self.as_float(reference));
+                        self.s.op(
+                            c,
+                            "textureGatherCmp.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            74,
+                            &args,
+                        )
+                    } else {
+                        self.s.op(
+                            c,
+                            "textureGather.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            73,
+                            &args,
+                        )
+                    }
                 }
             }
         } else {
@@ -6073,7 +6097,7 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
-        let channels: Vec<u32> = if op == 73 {
+        let channels: Vec<u32> = if matches!(op, 73 | 74) {
             vec![0, 1, 2, 3]
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
