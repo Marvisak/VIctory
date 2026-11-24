@@ -95,7 +95,10 @@ pub(crate) enum Cast {
     Bitcast = 11,
 }
 
-/// Compare predicates: floats 0-15, integers 32-41.
+/// Compare predicates: floats 0-15, integers 32-41. Not all are emitted:
+/// `v_cmp_*` finds NaNs from the bits rather than by an unordered or
+/// constant predicate, since drivers disagree on those (see `Lower::is_nan`).
+#[allow(dead_code)]
 pub(crate) mod pred {
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;

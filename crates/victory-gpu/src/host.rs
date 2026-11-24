@@ -180,6 +180,9 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some((adapter, name)) = high_performance_adapter() {
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            tracing::info!(adapter = %name, "host device");
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
@@ -226,6 +229,36 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// The first hardware adapter, in high-performance order, that makes a D3D12
+/// device, with its name. A laptop's default adapter (the one a null adapter
+/// means) is its integrated GPU unless the user set a per-app preference in
+/// Windows; this picks the discrete one. None when DXGI cannot order them.
+fn high_performance_adapter() -> Option<(IDXGIAdapter1, String)> {
+    // SAFETY: plain DXGI adapter queries; the probe device is dropped.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        (0..)
+            .map_while(|i| {
+                factory
+                    .EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                        i,
+                        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                    )
+                    .ok()
+            })
+            .find_map(|adapter| {
+                let desc = adapter.GetDesc1().ok()?;
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    return None;
+                }
+                let mut probe: Option<ID3D12Device> = None;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut probe).ok()?;
+                let name = String::from_utf16_lossy(&desc.Description);
+                Some((adapter, name.trim_end_matches('\0').to_owned()))
+            })
+    }
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -251,6 +284,18 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn high_performance_adapter_is_hardware() {
+        // Without a D3D12 GPU (a CI runner) there is none to pick.
+        let Some((adapter, name)) = high_performance_adapter() else {
+            return;
+        };
+        eprintln!("high-performance adapter: {name}");
+        // SAFETY: plain DXGI adapter query.
+        let desc = unsafe { adapter.GetDesc1().unwrap() };
+        assert_eq!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {

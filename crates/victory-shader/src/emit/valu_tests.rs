@@ -937,3 +937,196 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn scalar_min_max_set_scc_to_the_comparison() {
+    // op s6, s0, s1; s_cselect_b32 s7, 1, 0 (reads SCC); v_mov_b32 v0, s7
+    let scc_of = |op: u8| {
+        build_valu_cs(&[
+            sop2(op, 6, 0, 1),
+            sop2(0x0a, 7, 129, 128),
+            vop1(0x001, 0, sgpr(7)),
+        ])
+    };
+    // (opcode, name, [s0, s1] -> SCC). The old lowering set SCC to result != 0,
+    // which is wrong whenever the picked value is non-zero but the test failed.
+    type Cases = &'static [([u32; 2], u32)];
+    let ops: &[(u8, &str, Cases)] = &[
+        (
+            0x06,
+            "s_min_i32",
+            &[
+                ([1, 2], 1),
+                ([2, 1], 0),
+                ([5, 5], 0),
+                ([0xffff_ffff, 1], 1),
+                ([0, 3], 1),
+            ],
+        ),
+        (
+            0x07,
+            "s_min_u32",
+            &[([1, 2], 1), ([2, 1], 0), ([0xffff_ffff, 1], 0)],
+        ),
+        (
+            0x08,
+            "s_max_i32",
+            &[([3, 2], 1), ([2, 3], 0), ([7, 7], 0), ([0xffff_ffff, 1], 0)],
+        ),
+        (
+            0x09,
+            "s_max_u32",
+            &[([3, 2], 1), ([2, 3], 0), ([0xffff_ffff, 1], 1)],
+        ),
+    ];
+    for &(op, name, cases) in ops {
+        let shader = scc_of(op);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0[0], c.0[1], 0, 0]).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#x}, {:#x}) SCC = {got}, want {want}",
+                inp[0], inp[1]
+            );
+        });
+    }
+}
+
+/// Every f32 compare against NaNs, with two registers and with one register
+/// compared to itself (`x != x`, the pattern a driver that assumes no NaNs
+/// folds away). Ordered compares are false for a NaN, unordered ones true.
+#[test]
+fn v_cmp_f32_all_predicates_with_nan() {
+    let nan = f32::NAN.to_bits();
+    let f = f32::to_bits;
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    // (VOPC opcode, name, expected for how a compares to b; None for a NaN)
+    type Want = fn(Option<std::cmp::Ordering>) -> bool;
+    let ops: &[(u16, &str, Want)] = &[
+        (0x01, "lt", |o| o == Some(Less)),
+        (0x02, "eq", |o| o == Some(Equal)),
+        (0x03, "le", |o| matches!(o, Some(Less | Equal))),
+        (0x04, "gt", |o| o == Some(Greater)),
+        (0x06, "ge", |o| matches!(o, Some(Greater | Equal))),
+        (0x07, "o", |o| o.is_some()),
+        (0x08, "u", |o| o.is_none()),
+        (0x09, "nge", |o| !matches!(o, Some(Greater | Equal))),
+        (0x0a, "nlg", |o| !matches!(o, Some(Less | Greater))),
+        (0x0b, "ngt", |o| o != Some(Greater)),
+        (0x0c, "nle", |o| !matches!(o, Some(Less | Equal))),
+        (0x0d, "neq", |o| o != Some(Equal)),
+        (0x0e, "nlt", |o| o != Some(Less)),
+    ];
+    let pairs = [
+        [f(1.0), f(2.0)],
+        [f(2.0), f(2.0)],
+        [nan, f(1.0)],
+        [f(1.0), nan],
+        [nan, nan],
+        [0xFFC0_0000, f(0.0)], // a negative quiet NaN
+    ];
+    for &(op, name, want) in ops {
+        // v_cmp_<op>_f32_e64 s20, v1, v2 / v1, v1; v_cndmask_b32_e64 v0, 0, 1, s20
+        for (src1, what) in [(vgpr(2), "v1, v2"), (vgpr(1), "v1, v1")] {
+            let mut body = vop3(op, 20, vgpr(1), src1, 0x80).to_vec();
+            body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+            let shader = build_valu_cs(&body);
+            let inputs: Vec<[u32; 4]> = pairs.iter().map(|p| [p[0], p[1], 0, 0]).collect();
+            run_cases(&shader, &inputs, |backend, _, inp, got| {
+                let a = f32::from_bits(inp[0]);
+                let b = if src1 == vgpr(1) {
+                    a
+                } else {
+                    f32::from_bits(inp[1])
+                };
+                let w = u32::from(want(a.partial_cmp(&b)));
+                assert_eq!(
+                    got, w,
+                    "{backend}: v_cmp_{name}_f32({what}) on ({a}, {b}) = {got}, want {w}"
+                );
+            });
+        }
+    }
+}
+
+/// The 16-bit conversions of a NaN give 0, as on the hardware.
+#[test]
+fn v_cvt_16_f16_of_nan_is_zero() {
+    for (op, name) in [(0x052u16, "v_cvt_u16_f16"), (0x053, "v_cvt_i16_f16")] {
+        // op v0, v1
+        let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
+        let cases = [
+            [0x7E00, 0, 0, 0],
+            [0xFE00, 0, 0, 0],
+            [0x7C01, 0, 0, 0],
+            [0x3C00, 0, 0, 0],
+        ];
+        run_cases(&shader, &cases, |backend, i, inp, got| {
+            let want = u32::from(i == 3);
+            assert_eq!(
+                got & 0xFFFF,
+                want,
+                "{backend}: {name}({:#06x}) = {got:#x}, want {want}",
+                inp[0]
+            );
+        });
+    }
+}
+
+/// `v_med3_f32` orders -0 below +0, like the hardware's minimum and maximum,
+/// also when a NaN makes it the minimum of three.
+#[test]
+fn v_med3_f32_orders_negative_zero_below_positive_zero() {
+    // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
+    let shader = build_valu_cs(&vop3(0x157, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let (pz, nz, nan) = (0_u32, 0x8000_0000_u32, f32::NAN.to_bits());
+    let (one, m1) = (1.0f32.to_bits(), (-1.0f32).to_bits());
+    let cases: &[([u32; 4], u32)] = &[
+        ([pz, nz, one, 0], pz),
+        ([nz, pz, one, 0], pz),
+        ([nz, nz, pz, 0], nz),
+        ([pz, pz, nz, 0], pz),
+        ([m1, nz, pz, 0], nz),
+        ([nz, m1, pz, 0], nz),
+        // A NaN: the minimum of the other two.
+        ([nan, nz, pz, 0], nz),
+        ([pz, nan, nz, 0], nz),
+        ([pz, nz, nan, 0], nz),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_med3_f32({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}
+
+/// A loop stopped by the iteration limit leaves the program (see
+/// `LOOP_LIMIT`), also when it loops back through a conditional branch: it
+/// must not go on past the loop and store what it had so far.
+#[test]
+fn loop_stopped_by_the_limit_stores_nothing() {
+    // s_mov_b32 s6, 0
+    // loop: s_add_u32 s6, s6, 1; s_cmp_lg_u32 s0, 0; s_cbranch_scc1 loop
+    // v_mov_b32 v0, s6 (then stored)
+    let shader = build_valu_cs(&[
+        s_mov_b32(6, 0x80),
+        sop2(0x00, 6, 6, 0x81),
+        0xBF07_8000,          // s_cmp_lg_u32 s0, 0
+        0xBF85_0000 | 0xFFFD, // s_cbranch_scc1 -3 dwords: the s_add
+        vop1(0x001, 0, sgpr(6)),
+    ]);
+    // s0 = 0: one pass, stores 1. s0 = 1: never ends on the console; here
+    // it stops at the limit and stores nothing (the buffer stays zero).
+    run_cases(&shader, &[[0; 4], [1, 0, 0, 0]], |backend, i, _, got| {
+        let want = [1, 0][i];
+        assert_eq!(
+            got, want,
+            "{backend}: s0 = {i}: stored {got:#x}, want {want:#x}"
+        );
+    });
+}

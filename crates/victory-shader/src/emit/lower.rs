@@ -1468,18 +1468,44 @@ impl<'a> Lower<'a> {
 
     /// The median of three. With a NaN among them the hardware gives the
     /// minimum of the three instead (the host's minimum skips NaNs, so that
-    /// is the smallest number among them).
+    /// is the smallest number among them). Built from `max_min`, which
+    /// orders -0 below +0 as the hardware does: the host's own minimum and
+    /// maximum may give either zero.
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
-        let lo = self.binary(36, a, b);
-        let hi = self.binary(35, a, b);
-        let t = self.binary(36, hi, third);
-        let median = self.binary(35, lo, t);
-        let least = self.binary(36, lo, third);
-        let ab = self.s.m.cmp(c, pred::UNO, a, b);
-        let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
-        let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
+        let lo = self.max_min(false, a, b);
+        let hi = self.max_min(true, a, b);
+        let t = self.max_min(false, hi, third);
+        let median = self.max_min(true, lo, t);
+        let least = self.max_min(false, lo, third);
+        let (na, nb, nc) = (self.is_nan(a), self.is_nan(b), self.is_nan(third));
+        let nan = self.s.m.bin(c, Bin::Or, na, nb);
+        let nan = self.s.m.bin(c, Bin::Or, nan, nc);
         self.s.m.select(c, nan, least, median)
+    }
+
+    /// Whether `f` is a NaN, from its bits: its magnitude above infinity's.
+    /// A float compare (`f != f`) is not reliable: a driver that assumes no
+    /// NaNs folds it (observed on Intel UHD Graphics).
+    fn is_nan(&mut self, f: V) -> V {
+        self.magnitude_vs_infinity(f, pred::IUGT)
+    }
+
+    /// Whether `f` is not a NaN (a number or an infinity), from its bits;
+    /// see [`Self::is_nan`]. Its own compare rather than a negated `is_nan`:
+    /// an `xor` of a compare in a loop exit hung the AMD driver.
+    fn is_number(&mut self, f: V) -> V {
+        self.magnitude_vs_infinity(f, pred::IULE)
+    }
+
+    /// `|f|`'s bits compared, by `p`, with infinity's.
+    fn magnitude_vs_infinity(&mut self, f: V, p: u8) -> V {
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let magnitude = self.s.m.i32(0x7FFF_FFFF);
+        let bits = self.s.m.bin(c, Bin::And, bits, magnitude);
+        let inf = self.s.m.i32(0x7F80_0000);
+        self.s.m.cmp(c, p, bits, inf)
     }
 
     /// `a - floor(a)`, which on the hardware never reaches 1.0: where it
@@ -2696,8 +2722,9 @@ impl<'a> Lower<'a> {
                     "s_min_i32" => pred::SLT,
                     _ => pred::SGT,
                 };
+                // SCC is the comparison that picked the result, not result != 0.
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                (self.s.m.select(c, t, a, b), Some(t))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -2749,7 +2776,11 @@ impl<'a> Lower<'a> {
                 {
                     return Ok(());
                 }
-                None if name.starts_with("s_add") || name.starts_with("s_sub") => {
+                // s_lshlN_add sets SCC to a carry out, never to result != 0.
+                None if name.starts_with("s_add")
+                    || name.starts_with("s_sub")
+                    || name.starts_with("s_lshl") && name.ends_with("_add_u32") =>
+                {
                     Val::Missing("the carry of a scalar operation")
                 }
                 None => {
@@ -4621,7 +4652,7 @@ impl<'a> Lower<'a> {
                 let t = self.binary(35, a, lo);
                 let t = self.binary(36, t, hi);
                 let r = self.s.m.cast(c, Cast::FpToSi, t, i32t);
-                let nan = self.s.m.cmp(c, pred::UNO, a, a);
+                let nan = self.is_nan(a);
                 let z = self.s.m.i32(0);
                 self.s.m.select(c, nan, z, r)
             }
@@ -5335,34 +5366,54 @@ impl<'a> Lower<'a> {
                 } else {
                     (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?)
                 };
-                if op == "lg" {
-                    // Ordered and not equal, false for a NaN, as `olt | ogt`.
-                    // `fcmp one` means the same, but the AMD D3D12 driver
-                    // runs it as unordered (true for a NaN) where NVIDIA
-                    // and WARP do not; olt and ogt agree on all three.
-                    let lt = self.s.m.cmp(c, pred::OLT, a, b);
-                    let gt = self.s.m.cmp(c, pred::OGT, a, b);
-                    self.s.m.bin(c, Bin::Or, lt, gt)
+                // Drivers disagree on NaNs in float compares: AMD's runs
+                // `fcmp one` as unordered, and Intel's folds `x == x` to
+                // true (assuming no NaNs). So NaN operands are found from
+                // the bits, and the float compare only orders two numbers:
+                // an ordered compare is false with a NaN, an unordered one
+                // true. `Num` is how the two numbers must compare.
+                enum Num {
+                    Const(bool),
+                    Cmp(u8),
+                    NotEqual,
+                }
+                let (num, ordered) = match op {
+                    "f" => (Num::Const(false), true),
+                    "tru" => (Num::Const(true), false),
+                    "lt" => (Num::Cmp(pred::OLT), true),
+                    "eq" => (Num::Cmp(pred::OEQ), true),
+                    "le" => (Num::Cmp(pred::OLE), true),
+                    "gt" => (Num::Cmp(pred::OGT), true),
+                    "ge" => (Num::Cmp(pred::OGE), true),
+                    "lg" => (Num::NotEqual, true),
+                    "o" => (Num::Const(true), true),
+                    "u" => (Num::Const(false), false),
+                    "nge" => (Num::Cmp(pred::OLT), false),
+                    "nlg" => (Num::Cmp(pred::OEQ), false),
+                    "ngt" => (Num::Cmp(pred::OLE), false),
+                    "nle" => (Num::Cmp(pred::OGT), false),
+                    "neq" => (Num::NotEqual, false),
+                    "nlt" => (Num::Cmp(pred::OGE), false),
+                    _ => return Err(inst.name()),
+                };
+                let numbers = match num {
+                    Num::Const(k) => self.s.m.bool(k),
+                    Num::Cmp(p) => self.s.m.cmp(c, p, a, b),
+                    // `olt | ogt`: `fcmp one` is unreliable (see above).
+                    Num::NotEqual => {
+                        let lt = self.s.m.cmp(c, pred::OLT, a, b);
+                        let gt = self.s.m.cmp(c, pred::OGT, a, b);
+                        self.s.m.bin(c, Bin::Or, lt, gt)
+                    }
+                };
+                if ordered {
+                    let (na, nb) = (self.is_number(a), self.is_number(b));
+                    let both = self.s.m.bin(c, Bin::And, na, nb);
+                    self.s.m.bin(c, Bin::And, numbers, both)
                 } else {
-                    let p = match op {
-                        "f" => pred::FALSE,
-                        "lt" => pred::OLT,
-                        "eq" => pred::OEQ,
-                        "le" => pred::OLE,
-                        "gt" => pred::OGT,
-                        "ge" => pred::OGE,
-                        "o" => pred::ORD,
-                        "u" => pred::UNO,
-                        "nge" => pred::ULT,
-                        "nlg" => pred::UEQ,
-                        "ngt" => pred::ULE,
-                        "nle" => pred::UGT,
-                        "neq" => pred::UNE,
-                        "nlt" => pred::UGE,
-                        "tru" => pred::TRUE,
-                        _ => return Err(inst.name()),
-                    };
-                    self.s.m.cmp(c, p, a, b)
+                    let (na, nb) = (self.is_nan(a), self.is_nan(b));
+                    let either = self.s.m.bin(c, Bin::Or, na, nb);
+                    self.s.m.bin(c, Bin::Or, numbers, either)
                 }
             }
             "u64" | "i64" => {
@@ -6746,7 +6797,7 @@ impl<'a> Lower<'a> {
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
+                let ok = self.count_iteration(t, self.cur);
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
@@ -6774,23 +6825,21 @@ impl<'a> Lower<'a> {
                         (c, taken, not_taken)
                     }
                 };
-                // A back edge is taken only below the iteration limit.
+                // A back edge goes through a latch of its own that goes on
+                // below the iteration limit and leaves through the abort
+                // block at it. (Folding the limit into the branch condition
+                // instead sent a stopped lane down the loop's exit, on
+                // through the program with the loop's values unfinished.)
                 let back =
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
-                // (No `xor` of a compare: a loop exit testing one hung the
-                // AMD driver.)
-                let cond = if back(self, taken) {
-                    let ok = self.count_iteration(taken, pred::IULT);
-                    self.s.m.bin(self.cur, Bin::And, cond, ok)
-                } else if back(self, not_taken) {
-                    let stop = self.count_iteration(not_taken, pred::IUGE);
-                    self.s.m.bin(self.cur, Bin::Or, cond, stop)
-                } else {
-                    cond
-                };
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
-                let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+                let (mut t, mut f) = (self.edge(b, taken), self.edge(b, not_taken));
+                for (to, via) in [(taken, &mut t), (not_taken, &mut f)] {
+                    if back(self, to) {
+                        *via = self.limited_latch(b, to);
+                    }
+                }
                 for (to, via) in [(taken, t), (not_taken, f)] {
                     if !back(self, to) {
                         // From an edge block, or from here.
@@ -6829,10 +6878,9 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A back edge to header `to` (a back edge keeps its block, no
-    /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
-    fn count_iteration(&mut self, to: usize, p: u8) -> V {
+    /// A back edge to header `to`, entering it from DXIL block `from`: the
+    /// count goes up (computed here); true while it is below [`LOOP_LIMIT`].
+    fn count_iteration(&mut self, to: usize, from: usize) -> V {
         let c = self.cur;
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
@@ -6842,8 +6890,21 @@ impl<'a> Lower<'a> {
             .get_mut(&to)
             .expect("header")
             .1
-            .push((next, c));
-        self.s.m.cmp(c, p, next, limit)
+            .push((next, from));
+        self.s.m.cmp(c, pred::IULT, next, limit)
+    }
+
+    /// The latch for a conditional back edge from IR block `from` to header
+    /// `to`: back to the header below [`LOOP_LIMIT`], to the abort block at
+    /// it. The header's phis take their values for this edge from it.
+    fn limited_latch(&mut self, from: usize, to: usize) -> usize {
+        let latch = self.s.m.new_block();
+        let ok = self.count_iteration(to, latch);
+        let abort = self.abort_block();
+        let header = self.block[to].expect("reachable");
+        self.s.m.terminate(latch, Term::CondBr(ok, header, abort));
+        self.edges.insert((from, to), latch);
+        latch
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.

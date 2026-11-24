@@ -75,7 +75,40 @@ impl Host {
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                // The high-performance adapter: on a laptop the default one
+                // is the integrated GPU. `VICTORY_TEST_ADAPTER=n` takes the
+                // n-th hardware adapter in that order instead (to run the
+                // tests on another GPU of the machine).
+                let factory: IDXGIFactory6 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                let adapter = (0..)
+                    .map_while(|i| {
+                        factory
+                            .EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                                i,
+                                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                            )
+                            .ok()
+                    })
+                    .filter(|a| {
+                        a.GetDesc1()
+                            .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0)
+                    })
+                    .nth(
+                        std::env::var("VICTORY_TEST_ADAPTER")
+                            .ok()
+                            .and_then(|n| n.parse().ok())
+                            .unwrap_or(0),
+                    )
+                    .ok_or("no hardware adapter")?;
+                // (Named in test output, to show which GPU the tests ran on.)
+                if cfg!(test)
+                    && let Ok(d) = adapter.GetDesc1()
+                {
+                    let name = String::from_utf16_lossy(&d.Description);
+                    eprintln!("hardware adapter: {}", name.trim_end_matches('\0'));
+                }
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             }
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {

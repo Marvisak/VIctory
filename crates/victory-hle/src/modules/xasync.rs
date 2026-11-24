@@ -602,11 +602,27 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
     // SAFETY: a block in flight is valid.
     let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
     let (status, size) = words(block);
-    if result < 0 || required_size == 0 {
-        release(block);
+    let ends = result < 0 || required_size == 0;
+    if ends {
+        // Before the status is published, while the call is still ours.
+        call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
     }
-    size.store(required_size, Ordering::Release);
-    status.store(result as u32 as usize, Ordering::Release);
+    {
+        // Published and unregistered together under the lock `call()` and
+        // `XAsyncBegin` take: a status check never finds the call gone with
+        // the status still pending (and so stops waiting too early), and a
+        // title reusing the block once it sees the status finds it free.
+        let mut calls = lock(&CALLS);
+        size.store(required_size, Ordering::Release);
+        status.store(result as u32 as usize, Ordering::Release);
+        if ends
+            && calls
+                .get(&(block as usize))
+                .is_some_and(|c| Arc::ptr_eq(c, &call))
+        {
+            calls.remove(&(block as usize));
+        }
+    }
     *done = true;
     call.finished.notify_all();
     drop(done);
@@ -1333,5 +1349,48 @@ mod tests {
             E_ABORT
         );
         XTaskQueueCloseHandle(q);
+    }
+
+    /// A provider whose calls only end when the test completes them, and
+    /// whose cleanup is slow enough to widen any gap around it.
+    extern "system" fn by_hand(op: u32, _data: *const ProviderData) -> HRESULT {
+        if op == OP_CLEANUP {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        S_OK
+    }
+
+    #[test]
+    fn waiting_never_sees_a_failed_call_still_pending() {
+        // Completing a call that fails (or has no result) ends it. A status
+        // check that starts while that is under way must wait for the final
+        // status, never return E_PENDING for a call that already ended.
+        for _ in 0..40 {
+            let mut block = AsyncBlock {
+                queue: std::ptr::null(),
+                context: std::ptr::null_mut(),
+                callback: None,
+                internal: [0; 4],
+            };
+            let b = &raw mut block;
+            assert_eq!(
+                XAsyncBegin(
+                    b,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    Some(by_hand)
+                ),
+                S_OK
+            );
+            let addr = b as usize;
+            let t = std::thread::spawn(move || XAsyncComplete(addr as *mut AsyncBlock, E_ABORT, 0));
+            // Check while the completion is still in the provider's cleanup.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let hr = XAsyncGetStatus(b, true);
+            t.join().unwrap();
+            assert_eq!(hr, E_ABORT, "waited status");
+            assert!(call(b).is_none(), "an ended call stays registered");
+        }
     }
 }

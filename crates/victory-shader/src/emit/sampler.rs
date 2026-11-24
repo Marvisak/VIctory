@@ -71,6 +71,14 @@ impl StaticSampler {
             max_lod,
         }
     }
+
+    /// Makes this a comparison sampler. D3D12 keeps the reduction in filter
+    /// bits 7-8 (0 standard, 1 comparison, 2 minimum, 3 maximum), so the
+    /// comparison replaces whatever reduction the words carried: OR-ing it in
+    /// would turn a minimum sampler (0x100) into a maximum one (0x180).
+    pub fn make_comparison(&mut self) {
+        self.filter = self.filter & !0x180 | 0x80;
+    }
 }
 
 #[cfg(test)]
@@ -121,5 +129,23 @@ mod tests {
             ),
             (0x1D5, 16, 15.0)
         );
+    }
+
+    #[test]
+    fn comparison_replaces_the_reduction() {
+        // (decoded filter, after make_comparison): standard, minimum and
+        // maximum reductions, with point, linear and anisotropic filters.
+        for (filter, want) in [
+            (0x00, 0x80),
+            (0x14, 0x94),
+            (0x115, 0x95),
+            (0x1D5, 0xD5),
+            (0x95, 0x95),
+        ] {
+            let mut s = StaticSampler::from_words([0, 0, 0, 0]);
+            s.filter = filter;
+            s.make_comparison();
+            assert_eq!(s.filter, want, "filter {filter:#x}");
+        }
     }
 }
