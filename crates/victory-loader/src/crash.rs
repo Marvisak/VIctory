@@ -63,6 +63,10 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 
 /// Appends a failure that is not an exception (the host GPU's) to the crash
 /// log, with the title's last debug output, and prints it.
+#[allow(
+    clippy::print_stderr,
+    reason = "the report must reach the console even if logging is down"
+)]
 pub fn log_crash(text: &str) {
     let text = format!("{text}
 {}", title_output());
@@ -440,6 +444,10 @@ unsafe fn thrown(p: &[usize]) -> String {
 
 /// # Safety
 /// See [`report_unhandled`].
+#[allow(
+    clippy::print_stderr,
+    reason = "the report must reach the console even if logging is down"
+)]
 unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     // SAFETY: the system passes valid exception pointers.
     let (record, context) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };

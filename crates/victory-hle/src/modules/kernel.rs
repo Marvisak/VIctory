@@ -573,6 +573,10 @@ mod host {
         0
     }
 
+    #[allow(
+        clippy::exit,
+        reason = "the stand-in for the CRT's `exit`, which the title asked for"
+    )]
     pub(super) fn exit(code: i32) -> ! {
         std::process::exit(code)
     }
@@ -581,6 +585,10 @@ mod host {
         std::process::abort()
     }
 
+    #[allow(
+        clippy::exit,
+        reason = "the stand-in for `TerminateProcess`, which the title asked for"
+    )]
     pub(super) fn terminate_process(_: *mut c_void, code: u32) -> i32 {
         std::process::exit(code as i32)
     }

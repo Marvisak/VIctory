@@ -403,6 +403,10 @@ mod tests {
     /// kept thread, and checks that a busy thread stopped and the kept one
     /// did not.
     #[test]
+    #[allow(
+        clippy::exit,
+        reason = "the child process must leave before the harness joins the threads it ended"
+    )]
     fn exit_child() {
         if std::env::var_os("VICTORY_EXIT_CHILD").is_none() {
             return;
