@@ -937,3 +937,99 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_cvt_pkrtz_f16_f32_supports_clamp_and_rtz() {
+    let vop3_pkrtz = |clamp: bool, abs: u8, neg: u8| -> [u32; 2] {
+        [
+            0x35 << 26 | 0x12F << 16 | u32::from(clamp) << 15 | u32::from(abs & 7) << 8,
+            u32::from(neg & 7) << 29 | (vgpr(2) as u32) << 9 | vgpr(1) as u32,
+        ]
+    };
+    let pack = |lo: u16, hi: u16| u32::from(lo) | (u32::from(hi) << 16);
+
+    // Unclamped v_cvt_pkrtz_f16_f32: RTZ rounding, finite overflow -> 0x7BFF/0xFBFF,
+    // +/-inf -> 0x7C00/0xFC00, sub-ULP below 1.0 -> 0x3BFF.
+    let unclamped = build_valu_cs(&vop3_pkrtz(false, 0, 0));
+    let unclamped_cases: &[([u32; 4], u32)] = &[
+        (
+            [1.0f32.to_bits(), (-2.5f32).to_bits(), 0, 0],
+            pack(0x3C00, 0xC100),
+        ),
+        (
+            // 1.0 - 2^-12 rounds toward zero to 0x3BFF; -1.0 + 2^-12 -> 0xBBFF.
+            [0x3F7F_F000, 0xBF7F_F000, 0, 0],
+            pack(0x3BFF, 0xBBFF),
+        ),
+        (
+            // Finite overflow saturates to max finite half; +/-inf stays +/-inf.
+            [65520.0f32.to_bits(), (-65520.0f32).to_bits(), 0, 0],
+            pack(0x7BFF, 0xFBFF),
+        ),
+        (
+            [f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits(), 0, 0],
+            pack(0x7C00, 0xFC00),
+        ),
+        (
+            // Smallest sub-half-ULP below 2^-24 rounds toward zero to +/-0.0.
+            [0x3340_0000, 0xB340_0000, 0, 0],
+            pack(0x0000, 0x8000),
+        ),
+    ];
+    let unclamped_in: Vec<[u32; 4]> = unclamped_cases.iter().map(|c| c.0).collect();
+    run_cases(&unclamped, &unclamped_in, |backend, i, inp, got| {
+        let want = unclamped_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_pkrtz_f16_f32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+
+    // Clamped v_cvt_pkrtz_f16_f32: saturates both f16 results to [0.0, 1.0] (NaN -> 0.0),
+    // with RTZ preserved on values inside (0, 1).
+    let clamped = build_valu_cs(&vop3_pkrtz(true, 0, 0));
+    let clamped_cases: &[([u32; 4], u32)] = &[
+        (
+            [(-0.5f32).to_bits(), 2.5f32.to_bits(), 0, 0],
+            pack(0x0000, 0x3C00),
+        ),
+        (
+            [f32::NEG_INFINITY.to_bits(), f32::INFINITY.to_bits(), 0, 0],
+            pack(0x0000, 0x3C00),
+        ),
+        (
+            [f32::NAN.to_bits(), (-0.0f32).to_bits(), 0, 0],
+            pack(0x0000, 0x0000),
+        ),
+        (
+            // 0.5 exact, and 1.0 - 2^-12 stays 0x3BFF under RTZ (not rounded up to 1.0).
+            [0.5f32.to_bits(), 0x3F7F_F000, 0, 0],
+            pack(0x3800, 0x3BFF),
+        ),
+    ];
+    let clamped_in: Vec<[u32; 4]> = clamped_cases.iter().map(|c| c.0).collect();
+    run_cases(&clamped, &clamped_in, |backend, i, inp, got| {
+        let want = clamped_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_pkrtz_f16_f32({:#010x}, {:#010x}) clamp = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+
+    // Clamped with abs/neg input modifiers: |-0.5| -> 0.5, -(-2.0) -> clamp(2.0) = 1.0.
+    let clamped_mods = build_valu_cs(&vop3_pkrtz(true, 0b01, 0b10));
+    run_cases(
+        &clamped_mods,
+        &[[(-0.5f32).to_bits(), (-2.0f32).to_bits(), 0, 0]],
+        |backend, _, inp, got| {
+            let want = pack(0x3800, 0x3C00);
+            assert_eq!(
+                got, want,
+                "{backend}: v_cvt_pkrtz_f16_f32(|{:#010x}|, -{:#010x}) clamp = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1],
+            );
+        },
+    );
+}
