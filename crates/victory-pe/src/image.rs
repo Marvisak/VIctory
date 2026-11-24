@@ -476,6 +476,7 @@ mod tests {
         assert!(off < data.len());
     }
 
+    #[cfg(windows)]
     #[test]
     fn rva_to_file_offset_rejects_offsets_past_4_gib() {
         let mut info = ImageInfo::parse(&own_image()).unwrap();
