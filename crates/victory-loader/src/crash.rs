@@ -10,21 +10,31 @@
 //! and appended to the crash log, with the title's last debug output, which
 //! often states the reason. Panics of ours go to the crash log too.
 
+use std::ffi::c_void;
 use std::ptr::null_mut;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
 };
 
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, M128A, RtlLookupFunctionEntry,
-    RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, FlushInstructionCache, M128A,
+    RtlLookupFunctionEntry, RtlVirtualUnwind, SetUnhandledExceptionFilter, UNW_FLAG_NHANDLER,
 };
+use windows_sys::Win32::System::Kernel::PROCESSOR_NUMBER;
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
 };
-use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
+use windows_sys::Win32::System::Memory::{
+    MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_EXECUTE_WRITECOPY, VirtualProtect, VirtualQuery,
+};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentProcessorNumberEx, GetCurrentThreadStackLimits,
+};
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.
@@ -134,10 +144,11 @@ const FATAL: [i32; 6] = [
     EXCEPTION_BREAKPOINT,
 ];
 
-/// Console CPUs are Zen 2: titles use AMD-only instructions Intel CPUs
-/// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
-/// line at `rax`; `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so
-/// a spin loop around them works with mwaitx as a yield.
+/// Console CPUs are Zen 2: titles use AMD-only (or pre-Ice-Lake Intel missing)
+/// instructions. Does their job instead: `clzero` (`0f 01 fc`) zeroes the
+/// 64-byte line at `rax`; `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints
+/// (`monitorx` is lazily NOP-patched, `mwaitx` yields); standalone `clwb` is
+/// lazily NOP-patched; `rdpid` returns the current logical processor ID.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
     // instruction's bytes are readable, as the CPU just fetched them.
@@ -150,11 +161,26 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         let code = context.Rip as *const u8;
         match code.cast::<[u8; 3]>().read_unaligned() {
             [0x0f, 0x01, 0xfc] => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
-            [0x0f, 0x01, 0xfa] => {}
+            [0x0f, 0x01, 0xfa] => {
+                // Wait-hint setup: lazily patch out with a 3-byte NOP so repeat
+                // spins avoid future `#UD` traps.
+                patch_with_nops(code as *mut u8, &[0x0f, 0x01, 0xfa]);
+            }
             [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
             _ => {
-                // Only bytes inside the faulting instruction's page are read: the next page may
-                // not be mapped.
+                // Decode `rdpid` directly from `code` so it still works even when
+                // the 4- or 5-byte instruction straddles a 4 KiB page boundary (the
+                // CPU already fetched the full instruction before raising `#UD`).
+                if let Some((dst, len)) = rdpid_at(code) {
+                    let mut proc_num = PROCESSOR_NUMBER::default();
+                    GetCurrentProcessorNumberEx(&mut proc_num);
+                    *gpr(context, dst) =
+                        (u64::from(proc_num.Group) << 6) | u64::from(proc_num.Number);
+                    context.Rip += len as u64;
+                    return true;
+                }
+                // Only bytes inside the faulting instruction's page are read for
+                // multi-instruction lookahead (`clwb_loop`): the next page may not be mapped.
                 let room = 0x1000 - (context.Rip as usize & 0xfff);
                 let mut bytes = [0u8; 32];
                 let n = room.min(bytes.len());
@@ -173,10 +199,12 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     context.Rip += pass.len as u64;
                     return true;
                 }
-                if n >= 15
-                    && let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15]))
+                if let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15]))
+                    && len <= n
                 {
-                    // A write-back hint: the PC's memory is coherent, so it has nothing to do.
+                    // A write-back hint: PC memory is coherent, so lazily NOP-patch
+                    // this standalone `clwb` to avoid repeated `#UD` traps.
+                    patch_with_nops(code as *mut u8, &bytes[..len]);
                     context.Rip += len as u64;
                     return true;
                 }
@@ -190,6 +218,240 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         context.Rip += 3;
     }
     true
+}
+
+/// Serializes lazy code patching from the vectored exception handler.
+static PATCH_LOCK: Mutex<()> = Mutex::new(());
+
+/// Canonical x86-64 multi-byte NOP encodings (Intel SDM Vol. 2B Table 4-12)
+/// for lengths `1..=9`.
+const CANONICAL_NOPS: [&[u8]; 9] = [
+    &[0x90],
+    &[0x66, 0x90],
+    &[0x0f, 0x1f, 0x00],
+    &[0x0f, 0x1f, 0x40, 0x00],
+    &[0x0f, 0x1f, 0x44, 0x00, 0x00],
+    &[0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00],
+    &[0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00],
+    &[0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    &[0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+];
+
+/// Fills `out[..len]` with canonical x86-64 multi-byte NOP instructions
+/// (`1 <= len <= 15`).
+fn fill_nops(out: &mut [u8]) {
+    let mut at = 0;
+    while at < out.len() {
+        let chunk = (out.len() - at).min(CANONICAL_NOPS.len());
+        out[at..at + chunk].copy_from_slice(CANONICAL_NOPS[chunk - 1]);
+        at += chunk;
+    }
+}
+
+/// Atomically compares and exchanges 16 bytes at a 16-byte aligned writable
+/// address using `lock cmpxchg16b`.
+#[cfg(target_arch = "x86_64")]
+unsafe fn cmpxchg16b(aligned: *mut u8, old: [u64; 2], new: [u64; 2]) -> bool {
+    let success: u8;
+    // SAFETY: caller guarantees `aligned` is 16-byte aligned and writable and
+    // `cmpxchg16b` is supported. `rbx` is preserved via `xchg` without moving
+    // `rsp` (`xchg` leaves flags untouched so `sete` reads `cmpxchg16b`'s ZF).
+    unsafe {
+        std::arch::asm!(
+            "xchg rbx, {new_lo}",
+            "lock cmpxchg16b [{ptr}]",
+            "xchg rbx, {new_lo}",
+            "sete {ok}",
+            ptr = in(reg) aligned,
+            new_lo = inout(reg) new[0] => _,
+            in("rcx") new[1],
+            inout("rax") old[0] => _,
+            inout("rdx") old[1] => _,
+            ok = out(reg_byte) success,
+            options(nostack),
+        );
+    }
+    success != 0
+}
+
+/// Lazily overwrites an executable instruction at `addr` (matching `expected`)
+/// with canonical multi-byte NOPs using a single hardware-atomic store
+/// (`AtomicU64` or `lock cmpxchg16b`), then flushes the instruction cache and
+/// restores the original page protection. Returns `true` if the site is now
+/// patched (or was already patched by another thread), or `false` to fall back
+/// to `Rip += len` without patching (e.g. non-executable memory, page/16-byte
+/// boundary crossing, lock contention, or `VirtualProtect` refusal).
+unsafe fn patch_with_nops(addr: *mut u8, expected: &[u8]) -> bool {
+    let len = expected.len();
+    if len == 0 || len > 15 {
+        return false;
+    }
+    let ip = addr as usize;
+    if (ip & 0xfff) + len > 0x1000 {
+        return false;
+    }
+    let use_u64 = (ip & 7) + len <= 8;
+    let use_u128 = !use_u64
+        && (ip & 15) + len <= 16
+        && cfg!(target_arch = "x86_64")
+        && std::arch::is_x86_feature_detected!("cmpxchg16b");
+    if !use_u64 && !use_u128 {
+        return false;
+    }
+    // Non-blocking lock so a VEH handler can never deadlock with another thread.
+    let Ok(_guard) = PATCH_LOCK.try_lock() else {
+        return false;
+    };
+    let mut mbi = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: queries the protection of the faulting instruction's page.
+    let queried = unsafe {
+        VirtualQuery(
+            addr as *const c_void,
+            &mut mbi,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    const EXEC_PROTECTS: [u32; 4] = [
+        PAGE_EXECUTE,
+        PAGE_EXECUTE_READ,
+        PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY,
+    ];
+    if queried == 0 || !EXEC_PROTECTS.contains(&(mbi.Protect & 0xff)) {
+        return false;
+    }
+    let mut nops = [0u8; 15];
+    fill_nops(&mut nops[..len]);
+    // SAFETY: `addr..addr+len` is inside a committed executable page.
+    let live = unsafe { std::slice::from_raw_parts(addr, len) };
+    if live == &nops[..len] {
+        return true;
+    }
+    if live != expected {
+        return false;
+    }
+    let (aligned, width) = if use_u64 {
+        ((ip & !7) as *mut u8, 8usize)
+    } else {
+        ((ip & !15) as *mut u8, 16usize)
+    };
+    let offset = ip - aligned as usize;
+    let mut old = 0u32;
+    // SAFETY: `aligned..aligned+width` lies within the single verified page.
+    if unsafe {
+        VirtualProtect(
+            aligned as *const c_void,
+            width,
+            PAGE_EXECUTE_READWRITE,
+            &mut old,
+        )
+    } == 0
+    {
+        return false;
+    }
+    let patched = if use_u64 {
+        // SAFETY: `aligned` is 8-byte aligned and writable for 8 bytes.
+        let atom = unsafe { &*(aligned as *const AtomicU64) };
+        let cur = atom.load(Ordering::Acquire);
+        let mut bytes = cur.to_ne_bytes();
+        if &bytes[offset..offset + len] == expected {
+            bytes[offset..offset + len].copy_from_slice(&nops[..len]);
+            let next = u64::from_ne_bytes(bytes);
+            atom.compare_exchange(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        } else {
+            bytes[offset..offset + len] == nops[..len]
+        }
+    } else {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut cur_bytes = [0u8; 16];
+            // SAFETY: `aligned` is 16-byte aligned and writable for 16 bytes.
+            unsafe { std::ptr::copy_nonoverlapping(aligned, cur_bytes.as_mut_ptr(), 16) };
+            if &cur_bytes[offset..offset + len] == expected {
+                let mut next_bytes = cur_bytes;
+                next_bytes[offset..offset + len].copy_from_slice(&nops[..len]);
+                let old_pair = [
+                    u64::from_ne_bytes(cur_bytes[0..8].try_into().unwrap()),
+                    u64::from_ne_bytes(cur_bytes[8..16].try_into().unwrap()),
+                ];
+                let new_pair = [
+                    u64::from_ne_bytes(next_bytes[0..8].try_into().unwrap()),
+                    u64::from_ne_bytes(next_bytes[8..16].try_into().unwrap()),
+                ];
+                // SAFETY: `aligned` is 16-byte aligned, writable, and CPU supports cmpxchg16b.
+                unsafe { cmpxchg16b(aligned, old_pair, new_pair) }
+            } else {
+                cur_bytes[offset..offset + len] == nops[..len]
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    };
+    // SAFETY: flush icache for the patched bytes and restore the original page protection.
+    unsafe {
+        if patched {
+            FlushInstructionCache(GetCurrentProcess(), addr as *const c_void, len);
+        }
+        let mut ignored = 0u32;
+        VirtualProtect(aligned as *const c_void, width, old, &mut ignored);
+    }
+    patched
+}
+
+/// `rdpid r64` (`f3 [rex] 0f c7 /7`, register form), which Intel CPUs before
+/// Ice Lake lack: `(dst_gpr, instruction_len)`, or `None`.
+fn rdpid_decode(code: &[u8]) -> Option<(u8, usize)> {
+    if *code.first()? != 0xf3 {
+        return None;
+    }
+    let (rex, at) = if code.get(1).is_some_and(|&b| b & 0xf0 == 0x40) {
+        (code[1], 2)
+    } else {
+        (0, 1)
+    };
+    if code.get(at..at + 2)? != [0x0f, 0xc7] {
+        return None;
+    }
+    let modrm = *code.get(at + 2)?;
+    if modrm >> 6 != 3 || (modrm >> 3) & 7 != 7 {
+        return None;
+    }
+    let dst = (modrm & 7) | ((rex & 1) << 3);
+    Some((dst, at + 3))
+}
+
+/// Decodes `rdpid r64` directly from a faulting instruction pointer, reading
+/// only bytes belonging to the instruction itself.
+///
+/// # Safety
+/// `code` points to the faulting instruction the CPU just fetched.
+unsafe fn rdpid_at(code: *const u8) -> Option<(u8, usize)> {
+    // SAFETY: byte 0 is the start of the faulting instruction.
+    if unsafe { code.read() } != 0xf3 {
+        return None;
+    }
+    // SAFETY: after a prefix byte, at least the next opcode/REX byte is part of the instruction.
+    let b1 = unsafe { code.add(1).read() };
+    let (rex, at) = if b1 & 0xf0 == 0x40 { (b1, 2) } else { (0, 1) };
+    // SAFETY: `F3 [REX]` is a prefix sequence; the CPU fetched the opcode byte at `at`.
+    if unsafe { code.add(at).read() } != 0x0f {
+        return None;
+    }
+    // SAFETY: `0F` introduces a 2-byte opcode; the CPU fetched the second opcode byte.
+    if unsafe { code.add(at + 1).read() } != 0xc7 {
+        return None;
+    }
+    // SAFETY: `0F C7` always takes a ModRM byte; the CPU fetched it before `#UD`.
+    let modrm = unsafe { code.add(at + 2).read() };
+    let buf = [0xf3, rex, 0x0f, 0xc7, modrm];
+    if at == 2 {
+        rdpid_decode(&buf)
+    } else {
+        rdpid_decode(&[0xf3, 0x0f, 0xc7, modrm])
+    }
 }
 
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
@@ -986,6 +1248,119 @@ mod tests {
             end.copy_from_nonoverlapping(code.as_ptr(), 3);
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn rdpid_decodes_and_emulates_logical_processor_id() {
+        assert_eq!(rdpid_decode(&[0xf3, 0x0f, 0xc7, 0xf8]), Some((0, 4))); // rdpid rax
+        assert_eq!(rdpid_decode(&[0xf3, 0x48, 0x0f, 0xc7, 0xf9]), Some((1, 5))); // rdpid rcx (REX.W)
+        assert_eq!(rdpid_decode(&[0xf3, 0x41, 0x0f, 0xc7, 0xff]), Some((15, 5))); // rdpid r15
+        assert_eq!(rdpid_decode(&[0xf3, 0x0f, 0xc7, 0xf0]), None); // /6, not /7
+        assert_eq!(rdpid_decode(&[0xf3, 0x0f, 0xc7, 0x38]), None); // memory operand
+        assert_eq!(rdpid_decode(&[0x0f, 0xc7, 0xf8]), None); // rdseed (no F3)
+        assert_eq!(rdpid_decode(&[0xf3, 0x0f, 0xc7]), None); // truncated
+
+        // Emulate `rdpid r11` (F3 41 0F C7 FB) and confirm it writes a valid
+        // processor ID without altering EFLAGS.
+        let code: [u8; 6] = [0xf3, 0x41, 0x0f, 0xc7, 0xfb, 0xcc];
+        // SAFETY: synthetic exception record and context pointing at `code`.
+        let (skipped, r11, flags_after) = unsafe {
+            let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+            record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rip = code.as_ptr() as u64;
+            context.R11 = u64::MAX;
+            context.EFlags = 0x246;
+            let mut pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: &mut context,
+            };
+            assert!(emulate_amd_only(&mut pointers));
+            (
+                context.Rip - code.as_ptr() as u64,
+                context.R11,
+                context.EFlags,
+            )
+        };
+        assert_eq!(skipped, 5);
+        assert_ne!(r11, u64::MAX);
+        assert_eq!(flags_after, 0x246);
+    }
+
+    #[test]
+    fn lazy_nop_patch_overwrites_executable_clwb_and_restores_protection() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, VirtualAlloc, VirtualFree,
+        };
+        // Verify canonical NOP table produces valid encodings for every length 1..=15.
+        for len in 1..=15 {
+            let mut buf = vec![0xffu8; len];
+            fill_nops(&mut buf);
+            assert!(buf.iter().all(|&b| b != 0xff));
+            if len <= 9 {
+                assert_eq!(&buf[..], CANONICAL_NOPS[len - 1]);
+            } else {
+                assert_eq!(&buf[..9], CANONICAL_NOPS[8]);
+                assert_eq!(&buf[9..], CANONICAL_NOPS[len - 10]);
+            }
+        }
+        // Allocate one executable page, write a standalone `clwb [rax]` (4B) inside
+        // an 8-byte slot and a `clwb [r9+disp32]` (9B) straddling an 8-byte boundary
+        // (offset 6..15 -> cmpxchg16b path), protect PAGE_EXECUTE_READ, and patch both.
+        // SAFETY: allocates a private 4 KiB page for the test and frees it before returning.
+        unsafe {
+            let page = VirtualAlloc(
+                null_mut(),
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_EXECUTE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+            let clwb4 = [0x66u8, 0x0f, 0xae, 0x30]; // clwb [rax]
+            let clwb9 = [0x66u8, 0x41, 0x0f, 0xae, 0xb1, 0x10, 0x00, 0x00, 0x00]; // clwb [r9+0x10]
+            std::ptr::copy_nonoverlapping(clwb4.as_ptr(), page, clwb4.len());
+            page.add(4).write(0xc3); // ret
+            std::ptr::copy_nonoverlapping(clwb9.as_ptr(), page.add(0x16), clwb9.len());
+            page.add(0x16 + clwb9.len()).write(0xc3); // ret
+
+            let mut old = 0u32;
+            assert_ne!(
+                VirtualProtect(page as *const c_void, 0x1000, PAGE_EXECUTE_READ, &mut old),
+                0
+            );
+            assert!(patch_with_nops(page, &clwb4));
+            assert!(patch_with_nops(page.add(0x16), &clwb9));
+            // Idempotent if called again once already patched.
+            assert!(patch_with_nops(page, &clwb4));
+            // Non-executable stack memory is refused.
+            let mut stack_bytes = clwb4;
+            assert!(!patch_with_nops(stack_bytes.as_mut_ptr(), &clwb4));
+
+            // Protection must be restored to PAGE_EXECUTE_READ and bytes must be NOPs.
+            let mut mbi = MEMORY_BASIC_INFORMATION::default();
+            assert_ne!(
+                VirtualQuery(
+                    page as *const c_void,
+                    &mut mbi,
+                    size_of::<MEMORY_BASIC_INFORMATION>()
+                ),
+                0
+            );
+            assert_eq!(mbi.Protect & 0xff, PAGE_EXECUTE_READ);
+            assert_eq!(std::slice::from_raw_parts(page, 4), CANONICAL_NOPS[3]);
+            assert_eq!(
+                std::slice::from_raw_parts(page.add(0x16), 9),
+                CANONICAL_NOPS[8]
+            );
+            // Actually execute both patched NOP+ret sequences to prove they are valid x86-64.
+            let f1: extern "C" fn() = std::mem::transmute(page);
+            let f2: extern "C" fn() = std::mem::transmute(page.add(0x16));
+            f1();
+            f2();
+
+            assert_ne!(VirtualFree(page as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
 }
