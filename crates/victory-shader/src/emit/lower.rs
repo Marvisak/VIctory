@@ -43,6 +43,8 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    #[cfg(test)]
+    pub raw_buffer_load_masks: Vec<u8>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -577,6 +579,40 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.load(c, at))
     }
 
+    /// Loads `count` consecutive dwords from raw buffer `h` starting at byte
+    /// offset `byte`, issuing vectorized `rawBufferLoad.f32` calls of up to 4
+    /// dwords (`align = 4`).
+    fn raw_buffer_load(&mut self, h: V, byte: V, count: u32) -> Vec<V> {
+        let c = self.cur;
+        let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let mut out = Vec::with_capacity(count as usize);
+        let mut k = 0;
+        while k < count {
+            let chunk = (count - k).min(4);
+            let at = if k == 0 {
+                byte
+            } else {
+                let off = self.s.m.i32(4 * k);
+                self.s.m.bin(c, Bin::Add, byte, off)
+            };
+            let mask = self.s.m.i8((1u8 << chunk) - 1);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, at, u, mask, al],
+            );
+            for ch in 0..chunk {
+                let x = self.s.m.extract(c, r, ch);
+                out.push(self.as_int(x));
+            }
+            k += chunk;
+        }
+        out
+    }
+
     /// A global memory load (`global_load_*`): from the program's constant
     /// table, or from a root SRV at the address the title sets.
     fn flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -622,23 +658,18 @@ impl<'a> Lower<'a> {
             };
             Some(self.handle((b, i), &src, false, (11, 0))?)
         };
+        if sub.is_none()
+            && let Some(h) = h
+        {
+            for (k, x) in self.raw_buffer_load(h, off, n).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
             match h {
                 None => l.code_dword(byte),
-                Some(h) => {
-                    let c = l.cur;
-                    let (u, mask, al) = (l.s.m.undef(l.s.t.i32), l.s.m.i8(1), l.s.m.i32(4));
-                    let r = l.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        l.s.t.res_ret,
-                        139,
-                        &[h, byte, u, mask, al],
-                    );
-                    let x = l.s.m.extract(c, r, 0);
-                    Ok(l.as_int(x))
-                }
+                Some(h) => Ok(l.raw_buffer_load(h, byte, 1)[0]),
             }
         };
         for k in 0..n {
@@ -902,6 +933,8 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        #[cfg(test)]
+        let raw_buffer_load_masks = self.s.m.raw_buffer_load_masks();
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -913,6 +946,8 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            #[cfg(test)]
+            raw_buffer_load_masks,
         })
     }
 
@@ -2852,21 +2887,7 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
+            for (k, x) in self.raw_buffer_load(h, addr, count).into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -3135,34 +3156,16 @@ impl<'a> Lower<'a> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let total: u32 = bits.iter().sum();
-        let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-        let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
-            let mask = l.s.m.i8((1u8 << n) - 1);
-            let r = l.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                l.s.t.res_ret,
-                139,
-                &[h, at, u, mask, align],
-            );
-            (0..n)
-                .map(|k| {
-                    let x = l.s.m.extract(c, r, k);
-                    l.as_int(x)
-                })
-                .collect()
-        };
         let words = if total < 32 {
             // A byte or half inside the dword that holds it.
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
-            let w = load(self, at, 1)[0];
+            let w = self.raw_buffer_load(h, at, 1)[0];
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
         } else {
-            load(self, off, total / 32)
+            self.raw_buffer_load(h, off, total / 32)
         };
         let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();
@@ -7417,5 +7420,189 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn vectorizes_wide_raw_buffer_loads() {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+
+        const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
+            0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
+        }
+        const fn s_load_dwordx4(dst: u8, base: u8, off: u32) -> [u32; 2] {
+            [
+                0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+                125 << 25 | (off & 0x1F_FFFF),
+            ]
+        }
+        const fn s_buffer_load(op: u32, dst: u8, base: u8, off: u32) -> [u32; 2] {
+            [
+                0x3D << 26 | op << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+                125 << 25 | (off & 0x1F_FFFF),
+            ]
+        }
+        const fn global_load(op: u32, vdst: u8, saddr: u8, vaddr: u8, off: u16) -> [u32; 2] {
+            [
+                0x37 << 26 | op << 18 | 2 << 14 | (off as u32 & 0xFFF),
+                (vdst as u32) << 24 | (saddr as u32 & 0x7F) << 16 | vaddr as u32,
+            ]
+        }
+        const fn v_mov_b32(vdst: u8, src0: u16) -> u32 {
+            0x7E00_0000 | (vdst as u32) << 17 | 0x001 << 9 | (src0 as u32 & 0x1FF)
+        }
+        const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+            [
+                0x38 << 26 | 0x1C << 18 | (byte_off as u32 & 0xFFF),
+                0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+            ]
+        }
+
+        let lower_masks = |native: NativeProgram| -> Vec<u8> {
+            let p = ir::build(&native.code, false, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap()
+            .raw_buffer_load_masks
+        };
+
+        // s_buffer_load_dword{,x2,x4,x8,x16} from a heap raw SRV.
+        for (op, count, want) in [
+            (0x08, 1u8, &[0x1u8][..]),
+            (0x09, 2, &[0x3][..]),
+            (0x0A, 4, &[0xF][..]),
+            (0x0B, 8, &[0xF, 0xF][..]),
+            (0x0C, 16, &[0xF, 0xF, 0xF, 0xF][..]),
+        ] {
+            let mut words = vec![s_mov_b32(1, 0x80)];
+            words.extend_from_slice(&s_load_dwordx4(4, 0, 0));
+            words.extend_from_slice(&s_load_dwordx4(8, 0, 32));
+            words.extend_from_slice(&s_buffer_load(op, 16, 4, 0));
+            for k in 0..count {
+                words.push(v_mov_b32(0, u16::from(16 + k)));
+                words.extend_from_slice(&buffer_store_dword(0, 8, u16::from(k) * 4));
+            }
+            words.push(S_ENDPGM);
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![
+                    UsedResource {
+                        kind: ResourceType::Srv,
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 4,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                    UsedResource {
+                        kind: ResourceType::Uav,
+                        root: RootType::Table,
+                        table_offset_dwords: 8,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 4,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                ],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 1,
+                    threads: [1, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            assert_eq!(lower_masks(native), want, "s_buffer_load count={count}");
+        }
+
+        // global_load_{ubyte,dword,dwordx2,dwordx3,dwordx4} from a root SRV.
+        for (op, count, want) in [
+            (0x08, 1u8, &[0x1u8][..]),
+            (0x0C, 1, &[0x1][..]),
+            (0x0D, 2, &[0x3][..]),
+            (0x0F, 3, &[0x7][..]),
+            (0x0E, 4, &[0xF][..]),
+        ] {
+            let mut words = vec![s_mov_b32(3, 0x80), v_mov_b32(0, 0x80)];
+            words.extend_from_slice(&s_load_dwordx4(8, 2, 0));
+            words.extend_from_slice(&global_load(op, 1, 0, 0, 0));
+            for k in 0..count {
+                words.extend_from_slice(&buffer_store_dword(1 + k, 8, u16::from(k) * 4));
+            }
+            words.push(S_ENDPGM);
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![
+                    RootParam {
+                        root: RootType::Descriptor,
+                        table_offset_dwords: 0,
+                        sgprs: 2,
+                        base_register: 0,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                    RootParam {
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 2,
+                        slot: 1,
+                    },
+                ],
+                used: vec![
+                    UsedResource {
+                        kind: ResourceType::Srv,
+                        root: RootType::Descriptor,
+                        table_offset_dwords: 0,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 2,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                    UsedResource {
+                        kind: ResourceType::Uav,
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 4,
+                        user_data: 2,
+                        slot: 1,
+                    },
+                ],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 3 << 1,
+                    threads: [1, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            assert_eq!(lower_masks(native), want, "global_load op={op:#x}");
+        }
     }
 }

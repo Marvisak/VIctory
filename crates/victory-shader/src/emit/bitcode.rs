@@ -473,6 +473,23 @@ impl Module {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)
     }
+
+    #[cfg(test)]
+    pub(crate) fn raw_buffer_load_masks(&self) -> Vec<u8> {
+        let mut masks = Vec::new();
+        for b in &self.blocks {
+            for &id in &b.body {
+                if let Op::Call(f, args) = &self.insts[id as usize].op
+                    && self.funcs[*f as usize].name == "dx.op.rawBufferLoad.f32"
+                    && let Some(&V::Const(ci)) = args.get(4)
+                    && let Const::Int(m) = self.consts[ci as usize].1
+                {
+                    masks.push(m as u8);
+                }
+            }
+        }
+        masks
+    }
     pub fn md_value(&mut self, v: V) -> Md {
         let ty = self.type_of(v);
         self.mds.push(MdDef::Value(ty, v));

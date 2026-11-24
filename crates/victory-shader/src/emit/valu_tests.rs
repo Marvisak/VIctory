@@ -5,7 +5,7 @@
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -936,4 +936,334 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+/// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], byte_off` (`soffset = null`).
+const fn s_load_dwordx4_at(dst: u8, base: u8, byte_off: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25 | (byte_off & 0x1F_FFFF),
+    ]
+}
+
+/// SMEM `s_buffer_load_dword* s[dst..], s[base:base+3], soffset offset:byte_off`.
+const fn s_buffer_load_op(op: u32, dst: u8, base: u8, soffset: u8, byte_off: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | op << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        (soffset as u32) << 25 | (byte_off & 0x1F_FFFF),
+    ]
+}
+
+/// GLOBAL `global_load_dword* v[vdst..], v[vaddr], s[saddr:saddr+1] offset:byte_off`.
+const fn global_load_op(op: u32, vdst: u8, saddr: u8, vaddr: u8, byte_off: u16) -> [u32; 2] {
+    [
+        0x37 << 26 | op << 18 | 2 << 14 | (byte_off as u32 & 0xFFF),
+        (vdst as u32) << 24 | (saddr as u32 & 0x7F) << 16 | vaddr as u32,
+    ]
+}
+
+fn lower_and_validate(native: &NativeProgram, expected_masks: &[u8]) -> HostShader {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    assert_eq!(lowered.raw_buffer_load_masks, expected_masks);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+    shader
+}
+
+#[test]
+fn s_buffer_load_wide_srv_reads_exact_dwords_and_oob_zeros() {
+    let data: Vec<u32> = (0..24u32).map(|i| 0x1000_0000 | (i * 0x101 + 7)).collect();
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        for (op, count, want_masks) in [
+            (0x09, 2usize, &[0x3u8][..]),
+            (0x0A, 4, &[0xF][..]),
+            (0x0B, 8, &[0xF, 0xF][..]),
+            (0x0C, 16, &[0xF, 0xF, 0xF, 0xF][..]),
+        ] {
+            // s0 = dynamic byte offset (root constant); s[2:3] = table base (slot 0 SRV, slot 1 UAV).
+            // Immediate offset +4 exercises constant + dynamic byte address addition.
+            let mut words = vec![s_mov_b32(3, 0x80)];
+            words.extend_from_slice(&s_load_dwordx4_at(4, 2, 0));
+            words.extend_from_slice(&s_load_dwordx4_at(8, 2, 32));
+            words.extend_from_slice(&s_buffer_load_op(op, 16, 4, 0, 4));
+            for k in 0..count {
+                words.push(vop1(0x001, 0, sgpr(16 + k as u8)));
+                words.extend_from_slice(&buffer_store_dword(0, 8, (k * 4) as u16));
+            }
+            words.push(S_ENDPGM);
+
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![
+                    RootParam {
+                        root: RootType::Constants,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                    RootParam {
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 2,
+                        slot: 1,
+                    },
+                ],
+                used: vec![
+                    UsedResource {
+                        kind: ResourceType::Srv,
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 4,
+                        user_data: 2,
+                        slot: 1,
+                    },
+                    UsedResource {
+                        kind: ResourceType::Uav,
+                        root: RootType::Table,
+                        table_offset_dwords: 8,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 4,
+                        user_data: 2,
+                        slot: 1,
+                    },
+                ],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 3 << 1,
+                    threads: [1, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let shader = lower_and_validate(&native, want_masks);
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+
+            // Test in-bounds offsets and a partial-OOB slice crossing the end of the buffer.
+            let cases: &[(&[u32], u32)] = &[
+                (&data, 0),
+                (&data, 12),
+                (&data[..count.saturating_sub(1).max(1)], 0),
+            ];
+            for &(slice, dyn_off) in cases {
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = match (u.root, u.slot) {
+                        (RootType::Constants, 0) => dyn_off,
+                        (RootType::Table, 1) => 0,
+                        other => panic!("unexpected user data {other:?}"),
+                    };
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[
+                                View::Buffer {
+                                    data: slice,
+                                    stride: Stride::Raw,
+                                },
+                                View::RawUav(count as u32),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                let base_dword = (dyn_off as usize + 4) / 4;
+                let want: Vec<u32> = (0..count)
+                    .map(|k| slice.get(base_dword + k).copied().unwrap_or(0))
+                    .collect();
+                assert_eq!(
+                    out[0],
+                    want,
+                    "{label}: s_buffer_load count={count} len={} dyn_off={dyn_off}",
+                    slice.len()
+                );
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn global_load_wide_srv_reads_exact_dwords() {
+    let data: Vec<u32> = (0..16u32).map(|i| 0x2000_0000 | (i * 0x211 + 13)).collect();
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        for (op, count, want_masks) in [
+            (0x0D, 2usize, &[0x3u8][..]),
+            (0x0F, 3, &[0x7][..]),
+            (0x0E, 4, &[0xF][..]),
+        ] {
+            // s[0:1] = root SRV (slot 0); s2 = dynamic byte offset (root constant);
+            // s[4:5] = UAV table base (slot 2). `s_and_b32 s6, s2, s2` turns the
+            // root constant into a dynamic byte offset rather than a base address.
+            let mut words = vec![
+                s_mov_b32(5, 0x80),
+                sop2(0x0E, 6, 2, 2),
+                vop1(0x001, 0, sgpr(6)),
+            ];
+            words.extend_from_slice(&s_load_dwordx4_at(8, 4, 0));
+            words.extend_from_slice(&global_load_op(op, 1, 0, 0, 4));
+            for k in 0..count {
+                words.extend_from_slice(&buffer_store_dword(1 + k as u8, 8, (k * 4) as u16));
+            }
+            words.push(S_ENDPGM);
+
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![
+                    RootParam {
+                        root: RootType::Descriptor,
+                        table_offset_dwords: 0,
+                        sgprs: 2,
+                        base_register: 0,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                    RootParam {
+                        root: RootType::Constants,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 2,
+                        slot: 1,
+                    },
+                    RootParam {
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 4,
+                        slot: 2,
+                    },
+                ],
+                used: vec![
+                    UsedResource {
+                        kind: ResourceType::Srv,
+                        root: RootType::Descriptor,
+                        table_offset_dwords: 0,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 2,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                    UsedResource {
+                        kind: ResourceType::Uav,
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 4,
+                        user_data: 4,
+                        slot: 2,
+                    },
+                ],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 5 << 1,
+                    threads: [1, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let shader = lower_and_validate(&native, want_masks);
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+
+            for dyn_off in [0u32, 8, 24] {
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = match (u.root, u.slot) {
+                        (RootType::Constants, 1) => dyn_off,
+                        (RootType::Table, 2) => 0,
+                        other => panic!("unexpected user data {other:?}"),
+                    };
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![
+                                (0, Root::Constants(ud)),
+                                (
+                                    1,
+                                    Root::View {
+                                        srv: true,
+                                        data: data.clone(),
+                                    },
+                                ),
+                            ],
+                            views: &[View::RawUav(count as u32)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                let base_dword = (dyn_off as usize + 4) / 4;
+                let want = &data[base_dword..base_dword + count];
+                assert_eq!(
+                    out[0], want,
+                    "{label}: global_load count={count} dyn_off={dyn_off}"
+                );
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
