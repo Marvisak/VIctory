@@ -1110,6 +1110,28 @@ mod tests {
     }
 
     #[test]
+    fn exec_from_user_data_leaves_an_opaque_guard() {
+        let p = build(
+            &[
+                0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert_eq!(s.guards[0][0], None, "the EXEC write runs in every lane");
+        let g = s.guards[0][1].expect("guard");
+        // s[0:1] comes from user data, so no compare explains the mask: it
+        // must stay opaque, never pass as uniform or as a lane compare.
+        assert!(
+            matches!(s.bools.support(g)[..], [Atom::Opaque(_)]),
+            "{:?}",
+            s.bools.support(g)
+        );
+    }
+
+    #[test]
     fn divergent_loop_exits_per_lane() {
         let p = build(
             &[

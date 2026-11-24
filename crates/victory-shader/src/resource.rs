@@ -978,6 +978,42 @@ mod tests {
     }
 
     #[test]
+    fn immediate_samplers_are_constants_in_code() {
+        // Words the console compiler wrote for a static point sampler
+        // (`emit::sampler`), so the sampler path downstream decodes them.
+        let words = [0x3088, 0x0054_0100, 0x1400_0080, 0x8000_0000];
+        let r = track_words(
+            &[
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                0xBE88_03FF,
+                words[0], // s_mov_b32 s8, words[0]
+                0xBE89_03FF,
+                words[1], // s_mov_b32 s9, words[1]
+                0xBE8A_03FF,
+                words[2], // s_mov_b32 s10, words[2]
+                0xBE8B_03FF,
+                words[3], // s_mov_b32 s11, words[3]
+                0xF080_0F08,
+                0x0040_0002, // image_sample v[0:3], v[2:3], s[0:7], s[8:11]
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        let sampler = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Sampler)
+            .expect("sampler descriptor");
+        assert_eq!(sampler.source, Source::Constant(words.to_vec()));
+        // A literal is no memory access: only the resource's load is one.
+        assert_eq!(r.scalar, [((0, 2), at(0, 0))]);
+    }
+
+    #[test]
     fn root_descriptors_are_built_in_code() {
         let r = track_words(
             &[
