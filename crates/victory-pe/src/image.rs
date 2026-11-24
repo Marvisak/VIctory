@@ -162,10 +162,10 @@ impl ImageInfo {
         };
 
         let imports = match file.import_table()? {
-            Some(table) => parse_imports(&table, opt.size_of_image())?,
+            Some(table) => parse_imports(&table, opt.size_of_headers(), opt.size_of_image())?,
             None => Vec::new(),
         };
-        let delay_imports = parse_delay_imports(&file, opt.size_of_image())?;
+        let delay_imports = parse_delay_imports(&file, opt.size_of_headers(), opt.size_of_image())?;
         let exports = parse_exports(&file)?;
         let tls = parse_tls(&file, data, opt.image_base())?;
         let codeview = file.pdb_info()?.map(|cv| CodeViewInfo {
@@ -256,6 +256,7 @@ fn convert_import(import: Import<'_>) -> ImportSymbol {
 
 fn parse_imports(
     table: &ImportTable<'_>,
+    size_of_headers: u32,
     size_of_image: u32,
 ) -> Result<Vec<ImportModule>, PeError> {
     let mut modules = Vec::new();
@@ -269,9 +270,13 @@ fn parse_imports(
         };
         modules.push(ImportModule {
             dll: utf8(table.name(desc.name.get(LE))?),
-            entries: entries(table.thunks(int_rva)?, iat_rva, size_of_image, |t| {
-                table.import::<ImageNtHeaders64>(t)
-            })?,
+            entries: entries(
+                table.thunks(int_rva)?,
+                iat_rva,
+                size_of_headers,
+                size_of_image,
+                |t| table.import::<ImageNtHeaders64>(t),
+            )?,
         });
     }
     Ok(modules)
@@ -279,6 +284,7 @@ fn parse_imports(
 
 fn parse_delay_imports(
     file: &PeFile64<'_>,
+    size_of_headers: u32,
     size_of_image: u32,
 ) -> Result<Vec<ImportModule>, PeError> {
     let Some(table) = file.delay_load_import_table()? else {
@@ -292,6 +298,7 @@ fn parse_delay_imports(
             entries: entries(
                 table.thunks(desc.import_name_table_rva.get(LE))?,
                 desc.import_address_table_rva.get(LE),
+                size_of_headers,
                 size_of_image,
                 |t| table.import::<ImageNtHeaders64>(t),
             )?,
@@ -301,10 +308,12 @@ fn parse_delay_imports(
 }
 
 /// Pairs each name-table entry with its IAT slot. The IAT RVA is not checked
-/// by `object`, so every slot is checked to lie inside the image here.
+/// by `object`, so every slot is checked to lie inside the image here, past
+/// the headers: the loader writes each slot.
 fn entries<'data>(
     mut thunks: ImportThunkList<'data>,
     iat_rva: u32,
+    size_of_headers: u32,
     size_of_image: u32,
     import: impl Fn(pe::ImageThunkData64) -> object::read::Result<Import<'data>>,
 ) -> Result<Vec<ImportEntry>, PeError> {
@@ -313,9 +322,13 @@ fn entries<'data>(
         let iat_slot_rva = u32::try_from(entries.len() * 8)
             .ok()
             .and_then(|offset| iat_rva.checked_add(offset))
-            .filter(|&rva| rva.checked_add(8).is_some_and(|end| end <= size_of_image))
+            .filter(|&rva| {
+                rva >= size_of_headers && rva.checked_add(8).is_some_and(|end| end <= size_of_image)
+            })
             .ok_or_else(|| {
-                PeError::Malformed(format!("IAT at {iat_rva:#x} runs outside the image"))
+                PeError::Malformed(format!(
+                    "IAT at {iat_rva:#x} overlaps the headers or runs outside the image"
+                ))
             })?;
         entries.push(ImportEntry {
             symbol: convert_import(import(thunk)?),
@@ -543,5 +556,69 @@ mod tests {
                 (Some("gamma"), 3, Some(0x1204))
             ]
         );
+    }
+
+    /// `synthetic_image` (SizeOfHeaders 0x200) importing `f` from `t.dll`
+    /// through an IAT at `iat_rva`, as a normal or a delay-load import.
+    fn image_importing_through(iat_rva: u32, delay: bool) -> Vec<u8> {
+        let mut body = vec![0u8; 0x100];
+        let put32 =
+            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        // One descriptor at RVA 0x1000, then a null one.
+        let (index, size) = if delay {
+            put32(&mut body, 0, 1); // attributes: RVA based
+            put32(&mut body, 4, 0x1060); // DLL name
+            put32(&mut body, 12, iat_rva);
+            put32(&mut body, 16, 0x1040); // name table
+            (pe::IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, 0x40u32)
+        } else {
+            put32(&mut body, 0, 0x1040); // name table
+            put32(&mut body, 12, 0x1060); // DLL name
+            put32(&mut body, 16, iat_rva);
+            (dir::IMPORT, 0x28u32)
+        };
+        put32(&mut body, 0x40, 0x1070); // one thunk: hint/name, then null
+        body[0x60..0x66].copy_from_slice(b"t.dll\0");
+        body[0x72..0x74].copy_from_slice(b"f\0");
+
+        let mut d = synthetic_image(&body);
+        let export = layout::data_directory_offset(&d, 0).unwrap();
+        d[export..export + 8].fill(0);
+        let at = layout::data_directory_offset(&d, index).unwrap();
+        d[at..at + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        d[at + 4..at + 8].copy_from_slice(&size.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn refuses_iat_in_headers() {
+        for delay in [false, true] {
+            let slots = |info: ImageInfo| {
+                let modules = if delay {
+                    info.delay_imports
+                } else {
+                    info.imports
+                };
+                modules[0]
+                    .entries
+                    .iter()
+                    .map(|e| e.iat_slot_rva)
+                    .collect::<Vec<_>>()
+            };
+            // The loader writes every slot: these would overwrite the headers.
+            for iat in [0x80, 0x1F8] {
+                assert!(
+                    matches!(
+                        ImageInfo::parse(&image_importing_through(iat, delay)),
+                        Err(PeError::Malformed(_))
+                    ),
+                    "IAT at {iat:#x} (delay: {delay}) was accepted"
+                );
+            }
+            for iat in [0x200, 0x1080] {
+                let info = ImageInfo::parse(&image_importing_through(iat, delay)).unwrap();
+                assert_eq!(slots(info), [iat], "delay: {delay}");
+            }
+        }
     }
 }
