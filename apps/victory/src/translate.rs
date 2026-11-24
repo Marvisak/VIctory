@@ -366,7 +366,9 @@ fn check(
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
-            _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
+            HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs | HwStage::Ps => {
+                host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop))
+            }
         };
         match made {
             Ok(()) => {
@@ -432,7 +434,7 @@ fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
             &mut t.ms_validated,
             &mut t.ms_pipelines,
         ],
-        _ => [
+        HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs | HwStage::Vs | HwStage::Ps => [
             &mut t.emit_programs,
             &mut t.emitted,
             &mut t.validated,
