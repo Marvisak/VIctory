@@ -5,6 +5,7 @@
     reason = "a command-line tool: its reports are its output"
 )]
 
+mod citations;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -29,6 +30,13 @@ enum Cmd {
         #[arg(long)]
         staged: bool,
     },
+    /// Check that every path a contract document cites (`path`, `path:line`
+    /// in inline code) exists from the repository root.
+    Citations {
+        /// Documents to check, relative to the repository root.
+        #[arg(default_value = "AGENTS.md")]
+        docs: Vec<String>,
+    },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
 }
@@ -37,6 +45,7 @@ fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::Citations { docs } => citations::run(&root, &docs),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

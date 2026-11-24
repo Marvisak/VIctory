@@ -23,7 +23,7 @@ rules below are the filter, so they are strict on purpose.
 | `victory-gpu` | D3D12.X objects, command lists, GPU memory → host D3D12 | shader translation logic | compiles, with dead-code warnings |
 | `victory-hle` | console API implementations called by title code | format decoders (call `victory-formats`) | **no** (see the ratchet) |
 | `apps/victory` | CLI: inspect, census, translate, run | library logic that other crates need | no (depends on `victory-hle`) |
-| `xtask` | asset-policy check, git hooks | product code | yes |
+| `xtask` | asset-policy check, citation check, git hooks | product code | yes |
 
 Dependency direction (enforced by review, keep it acyclic and downward):
 
@@ -50,6 +50,7 @@ do not compile there yet):
 cargo check  --workspace --all-targets --locked --exclude victory-hle --exclude victory
 cargo clippy --workspace --all-targets --locked --exclude victory-hle --exclude victory --exclude victory-gpu -- -D warnings
 cargo test   --workspace --locked --exclude victory-hle --exclude victory
+cargo xtask citations                    # also part of cargo test
 ```
 
 Windows (what the `check` CI job runs; the only place all code compiles):
@@ -97,10 +98,31 @@ unfulfilled expectation is itself a warning, and CI runs `-D warnings`.
 10. **Docs match code in the same commit.** Do not call implemented things
     "planned", or planned things done. Cite only documents that exist in
     the repository; there is no decision-record directory under `docs/`.
+    Paths cited here are checked; see Citations.
 11. **Lints.** Libraries log through `tracing`, never `println!`/`eprintln!`;
     no `dbg!`, `todo!`, `unimplemented!`, `std::process::exit`,
     `mem::forget`, or `result.ok();` (all enforced). Lints are configured
     once, in the root `Cargo.toml`; every crate has `[lints] workspace = true`.
+
+## Citations
+
+`cargo xtask citations` (a CI step, and the `agents_md_citations_resolve`
+test) fails when a path this file cites stops existing, so a rename or
+deletion has to update the contract in the same commit. What it checks:
+
+- An inline code span (outside fenced blocks) made only of letters,
+  digits, `_`, `-`, `.` and at least one `/` is a citation, optionally
+  ending in `/` (must be a directory) or `:line` (must be within the file).
+- Citations resolve from the repository root. A path written relative to
+  a crate is reported as missing, so write
+  `crates/victory-gpu/src/pipeline/host.rs`, not the part after `crates/`.
+- Bare file names without a `/` (such as `lib.rs` or `Cargo.toml`) are not
+  checked: they name a file in the sentence's context, and many are
+  ambiguous across crates. Write the full path when the file matters.
+- Globs, and spans with spaces or other characters (`*.rs`,
+  `// SAFETY:`), are not citations and are not checked.
+- To mention a path that must not exist, say it in words, not in a code
+  span.
 
 ## Pitfalls seen in this repository
 
@@ -171,5 +193,6 @@ only with a commit that makes it pass, verified on Windows CI.
 - [ ] Docs (crate docs, `docs/`, README status) updated in the same commit;
       nothing cited that does not exist.
 - [ ] `cargo xtask policy` passes; nothing derived from a title is added.
+- [ ] `cargo xtask citations` passes; paths cited here are root-relative.
 - [ ] Commits are small, Conventional Commits (`fix(gpu): ...`), each one
       building on its own.
