@@ -409,6 +409,40 @@ mod tests {
     }
 
     #[test]
+    fn qsad_decodes_operand_widths_and_clamp() {
+        let code = bytes(&[
+            0xd572_0008,
+            0x0412_0701, // v_qsad_pk_u16_u8 v[8:9], v[1:2], v3, v[4:5]
+            0xd573_8008,
+            0x0412_0701, // v_mqsad_pk_u16_u8 v[8:9], v[1:2], v3, v[4:5] clamp
+            0xd575_8008,
+            0x0412_0701, // v_mqsad_u32_u8 v[8:11], v[1:2], v3, v[4:7] clamp
+            S_ENDPGM,
+        ]);
+        let instructions = decode(&code).unwrap();
+        let vector = |reg, dwords| Operand::Vector { reg, dwords };
+        for (inst, (name, width, clamp)) in instructions.iter().zip([
+            ("v_qsad_pk_u16_u8", 2, false),
+            ("v_mqsad_pk_u16_u8", 2, true),
+            ("v_mqsad_u32_u8", 4, true),
+        ]) {
+            assert_eq!(inst.encoding, Encoding::Vop3);
+            assert_eq!(inst.name(), Some(name));
+            assert_eq!(inst.words.len(), 2);
+            for wave64 in [false, true] {
+                let Fields::Valu(v) = inst.fields(wave64) else {
+                    panic!("{name} did not decode as VALU");
+                };
+                assert_eq!(v.dst, Some(vector(8, width)));
+                assert_eq!(v.src, [vector(1, 2), vector(3, 1), vector(4, width)]);
+                assert_eq!(v.clamp, clamp);
+                assert_eq!(v.carry, None);
+            }
+        }
+        assert_eq!(instructions.len(), 4);
+    }
+
+    #[test]
     fn follows_branches_and_skips_data() {
         let code = [
             sopp(0x04, 1), // s_cbranch_scc0 -> 8

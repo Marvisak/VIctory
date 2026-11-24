@@ -13,7 +13,7 @@ use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
-use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::gfx10::{Dpp, Fields, NULL, Operand, Valu};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
@@ -3744,6 +3744,9 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" | "v_mqsad_u32_u8" => {
+                self.quad_sad(inst, v, guard)
+            }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
@@ -4258,6 +4261,110 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
         }
+    }
+
+    /// Four overlapping four-byte SAD windows (RDNA 2 ISA §12.12).
+    fn quad_sad(&mut self, inst: &Inst, v: &Valu, guard: Option<V>) -> Result<(), Why> {
+        if v.abs != 0 || v.neg != 0 || v.opsel != 0 || v.omod != 0 {
+            return Err("quad SAD operand or output modifiers");
+        }
+        let ([stream, reference, accum], Some(Operand::Vector { reg, .. })) =
+            (v.src.as_slice(), v.dst)
+        else {
+            return Err("quad SAD operands");
+        };
+        let packed = inst.name() != "v_mqsad_u32_u8";
+        let masked = inst.name() != "v_qsad_pk_u16_u8";
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let max = self.s.m.i32(if packed { 0xffff } else { u32::MAX });
+
+        let stream = self.quad_sad_pair(inst, stream)?;
+        let bytes = [0u8, 1, 2, 3, 4, 5, 6]
+            .map(|i| self.select_bits(stream[usize::from(i / 4)], i % 4, false));
+        let reference = self.operand(inst, reference)?;
+        let reference = [0, 1, 2, 3].map(|i| {
+            let byte = self.select_bits(reference, i, false);
+            let include = masked.then(|| self.s.m.cmp(c, pred::NE, byte, zero));
+            (byte, include)
+        });
+        let mut results = if packed {
+            let [lo, hi] = self.quad_sad_pair(inst, accum)?;
+            vec![
+                self.select_bits(lo, 4, false),
+                self.select_bits(lo, 5, false),
+                self.select_bits(hi, 4, false),
+                self.select_bits(hi, 5, false),
+            ]
+        } else {
+            self.vgprs(inst, accum, 4)?
+        };
+
+        for (acc, window) in results.iter_mut().zip(bytes.windows(4)) {
+            let mut sum = zero;
+            for (&x, (y, include)) in window.iter().zip(reference) {
+                let less = self.s.m.cmp(c, pred::IULT, x, y);
+                let xy = self.s.m.bin(c, Bin::Sub, x, y);
+                let yx = self.s.m.bin(c, Bin::Sub, y, x);
+                let diff = self.s.m.select(c, less, yx, xy);
+                let diff = include.map_or(diff, |on| self.s.m.select(c, on, diff, zero));
+                sum = self.s.m.bin(c, Bin::Add, sum, diff);
+            }
+            let result = self.s.m.bin(c, Bin::Add, *acc, sum);
+            *acc = if v.clamp {
+                let overflow = if packed {
+                    self.s.m.cmp(c, pred::IUGT, result, max)
+                } else {
+                    self.s.m.cmp(c, pred::IULT, result, *acc)
+                };
+                self.s.m.select(c, overflow, max, result)
+            } else if packed {
+                self.s.m.bin(c, Bin::And, result, max)
+            } else {
+                result
+            };
+        }
+
+        if packed {
+            let k16 = self.s.m.i32(16);
+            for (i, &[lo, hi]) in results.as_chunks::<2>().0.iter().enumerate() {
+                let high = self.s.m.bin(c, Bin::Shl, hi, k16);
+                let word = self.s.m.bin(c, Bin::Or, lo, high);
+                self.write(inst, Reg::V(reg + i as u8), word, guard);
+            }
+        } else {
+            for (i, word) in results.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + i as u8), word, guard);
+            }
+        }
+        Ok(())
+    }
+
+    /// Read a 64-bit packed operand as raw dwords without requiring DXIL INT64.
+    fn quad_sad_pair(&mut self, inst: &Inst, op: &Operand) -> Result<[V; 2], Why> {
+        if let Operand::Const(code @ 240..=248) = *op {
+            let bits = if code == 248 {
+                (0.5 / std::f64::consts::PI).to_bits()
+            } else {
+                let bits = crate::resource::inline(code).ok_or("an inline float")?;
+                f64::from(f32::from_bits(bits)).to_bits()
+            };
+            return Ok([self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32)]);
+        }
+        let lo = self.operand(inst, op)?;
+        let hi = match *op {
+            Operand::Vector { reg, .. } => Some(Reg::V(reg + 1)),
+            Operand::Scalar { code, .. } if code != NULL => Some(Reg::S(code + 1)),
+            _ => None,
+        };
+        let hi = match hi {
+            Some(reg) => self.i32_of(inst.read(reg).ok_or("an unread operand")?)?,
+            // Signed inline integers extend to 64 bits. A 32-bit literal in
+            // this unsigned operand expands with a zero high dword.
+            None if matches!(op, Operand::Const(193..=208)) => self.s.m.i32(u32::MAX),
+            None => self.s.m.i32(0),
+        };
+        Ok([lo, hi])
     }
 
     /// A 64-bit source (a register pair; inline constants sign-extend).

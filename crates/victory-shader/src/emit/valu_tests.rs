@@ -69,29 +69,43 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_with_outputs(body, 4, &[0], false, 1)
+}
+
+fn build_valu_cs_with_outputs(
+    body: &[u32],
+    input_dwords: u8,
+    outputs: &[u8],
+    wave64: bool,
+    threads: u32,
+) -> HostShader {
+    let table = input_dwords.next_multiple_of(2);
+    let descriptor = (table + 2).next_multiple_of(4);
     let mut words = Vec::new();
-    // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
-    words.push(s_mov_b32(5, 0x80)); // inline constant 0
-    words.extend_from_slice(&s_load_dwordx4(8, 4));
-    // Copy root constants s0..s3 into v1..v4 so VALU instructions operate on
+    // The table address is at heap index 0, so its high dword is zero.
+    words.push(s_mov_b32(table + 1, 0x80));
+    words.extend_from_slice(&s_load_dwordx4(descriptor, table));
+    // Copy root constants from SGPRs to VGPRs so VALU instructions operate on
     // VGPRs just as they do in real shaders.
-    for i in 0..4u8 {
+    for i in 0..input_dwords {
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    for (i, &reg) in outputs.iter().enumerate() {
+        words.extend_from_slice(&buffer_store_dword(reg, descriptor, 4 * i as u16));
+    }
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 8,
+        wave64,
+        vgprs: 16,
         layout: vec![
             RootParam {
                 root: RootType::Constants,
                 table_offset_dwords: 0,
-                sgprs: 4,
+                sgprs: u32::from(input_dwords),
                 base_register: 0,
                 user_data: 0,
                 slot: 0,
@@ -101,7 +115,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
                 table_offset_dwords: 0,
                 sgprs: 1,
                 base_register: 0,
-                user_data: 4,
+                user_data: table,
                 slot: 1,
             },
         ],
@@ -112,12 +126,12 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
             lower_bound: 0,
             stride: 0,
             dwords: 4,
-            user_data: 4,
+            user_data: table,
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            rsrc2: u32::from(table + 1) << 1,
+            threads: [threads, 1, 1],
         }),
         code,
     };
@@ -174,6 +188,17 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    run_cases_with_outputs(shader, 1, cases, |backend, i, inputs, output| {
+        check(backend, i, inputs, output[0]);
+    });
+}
+
+fn run_cases_with_outputs<const N: usize>(
+    shader: &HostShader,
+    output_dwords: u32,
+    cases: &[[u32; N]],
+    mut check: impl FnMut(&str, usize, [u32; N], &[u32]),
+) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -199,17 +224,228 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(output_dwords)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            check(label, i, inputs, out[0][0]);
+            check(label, i, inputs, &out[0]);
         }
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn v_qsad_pk_u16_u8_matches_rdna2() {
+    check_quad_sad(0x172, true, false);
+}
+
+#[test]
+fn v_mqsad_pk_u16_u8_matches_rdna2() {
+    check_quad_sad(0x173, true, true);
+}
+
+#[test]
+fn v_mqsad_u32_u8_matches_rdna2() {
+    check_quad_sad(0x175, false, true);
+}
+
+fn check_quad_sad(opcode: u16, packed: bool, masked: bool) {
+    // Stream dwords, reference, accumulator dwords, thread to read back.
+    let cases = [
+        [
+            0x0403_0201,
+            0xfe07_0605,
+            0x0403_0201,
+            1,
+            0x0010_0200,
+            17,
+            111,
+            1,
+        ],
+        [
+            0x0403_0201,
+            0x0007_0605,
+            0x0080_00ff,
+            0xffff_fffd,
+            0xfffd_ffff,
+            0xffff_ff00,
+            u32::MAX,
+            17,
+        ],
+        [u32::MAX, u32::MAX, 0, 0, 0xffff_0001, 2, 3, 33],
+        [
+            0,
+            0xfe00_0000,
+            u32::MAX,
+            u32::MAX,
+            0x8000_7000,
+            u32::MAX - 1020,
+            u32::MAX - 1019,
+            63,
+        ],
+        [
+            0xff80_0100,
+            0x00ff_807f,
+            0x7f00_0180,
+            91,
+            0x7fff_ffff,
+            827,
+            1,
+            0,
+        ],
+    ];
+    let outputs = if packed {
+        &[9, 10][..]
+    } else {
+        &[9, 10, 11, 12]
+    };
+    let old = 42;
+    for wave64 in [false, true] {
+        let (save_exec, restore_exec) = if wave64 {
+            (0xBE90_047E, 0xBEFE_0410) // s_mov_b64 s[16:17], exec; s_mov_b64 exec, s[16:17]
+        } else {
+            (s_mov_b32(16, 126), s_mov_b32(126, 16))
+        };
+        for clamp in [false, true] {
+            let mut body: Vec<u32> = outputs
+                .iter()
+                .map(|&reg| vop1(0x001, reg, 128 + old as u16))
+                .collect();
+            body.push(save_exec);
+            body.push(0x7DAA_0080); // v_cmpx_ne_u32 0, v0 (thread X)
+            let mut sad = vop3(opcode, 9, vgpr(1), vgpr(3), vgpr(4));
+            sad[0] |= u32::from(clamp) << 15;
+            body.extend(sad);
+            body.push(restore_exec);
+            // Only the requested thread stores, including thread 0, which
+            // was inactive for the SAD and should retain all old dwords.
+            body.push(0x7DA4_0007); // v_cmpx_eq_u32 s7, v0
+
+            let shader = build_valu_cs_with_outputs(&body, 8, outputs, wave64, 64);
+            run_cases_with_outputs(
+                &shader,
+                outputs.len() as u32,
+                &cases,
+                |host, i, input, got| {
+                    let expected = quad_sad_reference(input, packed, masked, clamp);
+                    let expected = if input[7] == 0 { [old; 4] } else { expected };
+                    assert_eq!(
+                        got,
+                        &expected[..outputs.len()],
+                        "{host}, case {i}, wave64={wave64}, clamp={clamp}"
+                    );
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn qsad_reads_register_pairs_and_expanded_constants() {
+    let input = [
+        0xa413_8362,
+        0xfe87_4639,
+        0xa400_0090,
+        0x0003_0009,
+        0x0005_000b,
+        21,
+        u32::MAX,
+        1,
+    ];
+    let cases = [
+        // v_qsad_pk_u16_u8 v[9:10], s[0:1], v3, v[4:5]
+        (vec![0xd572_0009, 0x0412_0600], input, true, false),
+        // v_mqsad_pk_u16_u8 v[9:10], -1, v3, 0xfedcab89
+        (
+            vec![0xd573_0009, 0x03fe_06c1, 0xfedc_ab89],
+            [u32::MAX, u32::MAX, input[2], 0xfedc_ab89, 0, 0, 0, 1],
+            true,
+            true,
+        ),
+        // v_qsad_pk_u16_u8 v[9:10], 0.5, v3, null
+        (
+            vec![0xd572_0009, 0x01f6_06f0],
+            [0, 0x3fe0_0000, input[2], 0, 0, 0, 0, 1],
+            true,
+            false,
+        ),
+        // v_mqsad_u32_u8 v[9:12], 0xf2345678, v3, v[4:7]
+        (
+            vec![0xd575_0009, 0x0412_06ff, 0xf234_5678],
+            [
+                0xf234_5678,
+                0,
+                input[2],
+                input[3],
+                input[4],
+                input[5],
+                input[6],
+                1,
+            ],
+            false,
+            true,
+        ),
+    ];
+    for (body, reference, packed, masked) in cases {
+        let outputs = if packed {
+            &[9, 10][..]
+        } else {
+            &[9, 10, 11, 12]
+        };
+        let shader = build_valu_cs_with_outputs(&body, 8, outputs, false, 1);
+        let expected = quad_sad_reference(reference, packed, masked, false);
+        run_cases_with_outputs(
+            &shader,
+            outputs.len() as u32,
+            &[input],
+            |host, _, _, got| {
+                assert_eq!(got, &expected[..outputs.len()], "{host}: {body:x?}");
+            },
+        );
+    }
+}
+
+fn quad_sad_reference(input: [u32; 8], packed: bool, masked: bool, clamp: bool) -> [u32; 4] {
+    let [lo, hi, reference, a, b, c, d, _] = input;
+    let stream = (u64::from(lo) | u64::from(hi) << 32).to_le_bytes();
+    let reference = reference.to_le_bytes();
+    let accumulators = if packed {
+        [a & 0xffff, a >> 16, b & 0xffff, b >> 16]
+    } else {
+        [a, b, c, d]
+    };
+    let mut result = [0u32; 4];
+    for (i, window) in stream.windows(4).take(4).enumerate() {
+        let differences = window
+            .iter()
+            .zip(reference)
+            .filter(|&(_, r)| !masked || r != 0)
+            .map(|(&x, r)| u32::from(x.abs_diff(r)))
+            .sum::<u32>();
+        let sum = if clamp {
+            accumulators[i].saturating_add(differences)
+        } else {
+            accumulators[i].wrapping_add(differences)
+        };
+        result[i] = if packed && clamp {
+            sum.min(0xffff)
+        } else {
+            sum
+        };
+    }
+    if packed {
+        [
+            result[0] & 0xffff | result[1] << 16,
+            result[2] & 0xffff | result[3] << 16,
+            0,
+            0,
+        ]
+    } else {
+        result
+    }
 }
 
 fn is_f16_nan(bits: u16) -> bool {
