@@ -275,6 +275,11 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// Multi-argument host command signatures bound to `root`, cached per
+    /// mapped layout and record stride.
+    pub(crate) signatures: std::sync::Mutex<
+        Vec<(Vec<crate::indirect::HostIndirectArg>, u32, ID3D12CommandSignature)>,
+    >,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -451,6 +456,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                signatures: std::sync::Mutex::new(Vec::new()),
             });
         }
         let Some(g) = g else {
@@ -483,6 +489,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                signatures: std::sync::Mutex::new(Vec::new()),
             });
         }
 
@@ -553,6 +560,7 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
+            signatures: std::sync::Mutex::new(Vec::new()),
         })
     }
 }
