@@ -548,4 +548,61 @@ mod tests {
             ]
         );
     }
+
+    // The own-binary tests above only run on Windows; these cover the same
+    // edges on the synthetic image, on any host.
+
+    #[test]
+    fn synthetic_image_maps_rvas_within_its_raw_data() {
+        let info = ImageInfo::parse(&synthetic_image(&[0; 0x80])).unwrap();
+        assert!(info.is_dll());
+        assert_eq!(info.sections.len(), 1);
+        assert_eq!(info.rva_to_file_offset(0x1000), Some(0x200));
+        assert_eq!(info.rva_to_file_offset(0x11FF), Some(0x3FF));
+        // Before the section, and past both its virtual and raw sizes.
+        assert_eq!(info.rva_to_file_offset(0xFFF), None);
+        assert_eq!(info.rva_to_file_offset(0x1200), None);
+        assert_eq!(info.rva_to_file_offset(u32::MAX), None);
+    }
+
+    #[test]
+    fn rva_mapping_stops_at_the_smaller_of_virtual_and_raw_size() {
+        let mut info = ImageInfo::parse(&synthetic_image(&[0; 0x80])).unwrap();
+        // Zero-fill past the raw data is in memory but not in the file.
+        info.sections[0].virtual_size = 0x400;
+        assert_eq!(info.rva_to_file_offset(0x11FF), Some(0x3FF));
+        assert_eq!(info.rva_to_file_offset(0x1200), None);
+        // Alignment padding past the virtual size is in the file only.
+        info.sections[0].virtual_size = 0x100;
+        assert_eq!(info.rva_to_file_offset(0x10FF), Some(0x2FF));
+        assert_eq!(info.rva_to_file_offset(0x1100), None);
+        // A virtual size of 0 means "the raw size".
+        info.sections[0].virtual_size = 0;
+        assert_eq!(info.rva_to_file_offset(0x11FF), Some(0x3FF));
+    }
+
+    #[test]
+    fn synthetic_rva_mapping_rejects_offsets_past_4_gib() {
+        let mut info = ImageInfo::parse(&synthetic_image(&[0; 0x80])).unwrap();
+        info.sections[0].file_offset = u32::MAX - 0x10;
+        assert_eq!(info.rva_to_file_offset(0x1010), Some(u32::MAX));
+        // One byte further used to overflow.
+        assert_eq!(info.rva_to_file_offset(0x1011), None);
+    }
+
+    #[test]
+    fn synthetic_image_rejects_other_machines_and_pe32() {
+        let mut arm = synthetic_image(&[0; 0x80]);
+        arm[0x44..0x46].copy_from_slice(&0xAA64u16.to_le_bytes());
+        assert!(matches!(
+            ImageInfo::parse(&arm),
+            Err(PeError::Unsupported(_))
+        ));
+        let mut pe32 = synthetic_image(&[0; 0x80]);
+        pe32[0x58..0x5A].copy_from_slice(&0x10Bu16.to_le_bytes());
+        assert!(ImageInfo::parse(&pe32).is_err());
+        let mut truncated = synthetic_image(&[0; 0x80]);
+        truncated.truncate(0x100);
+        assert!(ImageInfo::parse(&truncated).is_err());
+    }
 }
