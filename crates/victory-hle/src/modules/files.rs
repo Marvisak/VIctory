@@ -49,17 +49,8 @@ macro_rules! try_host {
 }
 pub(crate) use try_host;
 
-/// The host's own function; panics if the host lacks it.
-macro_rules! host {
-    ($dll:literal, $name:literal: $ty:ty) => {{
-        $crate::modules::files::try_host!($dll, $name: $ty)
-            .unwrap_or_else(|| panic!("the host lacks {}!{}", $dll, $name))
-    }};
-}
-pub(crate) use host;
-
-/// The host's `dll!name`, or `None`, logged the first time for each
-/// export, if the host lacks it.
+/// The host's `dll!name`; `None` if the host lacks it, logged the first
+/// time for each export.
 pub(crate) fn host_function(dll: &'static str, name: &'static str) -> Option<usize> {
     let address = crate::host::function(dll, name);
     if address.is_none() {
