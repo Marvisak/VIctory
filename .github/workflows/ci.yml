@@ -31,3 +31,18 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+
+  # Titles only run on Windows, but the workspace builds and tests on Linux
+  # (Wine/UMU contributors work there). This keeps the `cfg(windows)` gates
+  # honest: a host-only path that leaks into shared code fails here first.
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Check, diagnostics build
+        run: cargo check --workspace --all-targets --all-features --locked
+      - name: Tests
+        run: cargo test --workspace --locked
