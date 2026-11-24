@@ -734,6 +734,42 @@ impl<'a> Lower<'a> {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
+            Shape::Active64Hi(lo, hi, mask) => {
+                if self.mask_data == MaskData::None {
+                    return Err("a wave reduction in a mesh shader");
+                }
+                let c = self.cur;
+                let &m = self
+                    .x
+                    .st
+                    .masks
+                    .get(&mask)
+                    .ok_or("a wave reduction's untracked mask")?;
+                let on = self.boolean(m, c)?;
+                let lo = self.i32_of(lo)?;
+                let hi = self.i32_of(hi)?;
+                let z = self.s.m.i32(0);
+                let lo = self.s.m.select(c, on, lo, z);
+                let hi = self.s.m.select(c, on, hi, z);
+                self.s.flags |= flags::WAVE_OPS | flags::INT64;
+                let i64t = self.s.m.int(64);
+                let k32 = self.s.m.int_const(i64t, 32);
+                let lo64 = self.s.m.cast(c, Cast::ZExt, lo, i64t);
+                let hi64 = self.s.m.cast(c, Cast::ZExt, hi, i64t);
+                let hi64 = self.s.m.bin(c, Bin::Shl, hi64, k32);
+                let arg = self.s.m.bin(c, Bin::Or, lo64, hi64);
+                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                let sum = self.s.op(
+                    c,
+                    "waveActiveOp.i64",
+                    Attr::NoUnwind,
+                    i64t,
+                    119,
+                    &[arg, k0, k1],
+                );
+                let shifted = self.s.m.bin(c, Bin::LShr, sum, k32);
+                return Ok(self.s.m.cast(c, Cast::Trunc, shifted, self.s.t.i32));
+            }
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
                 let &m = self
@@ -766,13 +802,23 @@ impl<'a> Lower<'a> {
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
         self.s.flags |= flags::WAVE_OPS;
-        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        let half = matches!(op, Op::AddF16 | Op::MinF16 | Op::MaxF16);
+        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF) || half;
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
-        let arg = if float { self.as_float(x) } else { x };
+        let arg = if half {
+            let mask16 = self.s.m.i32(0xFFFF);
+            let lo = self.s.m.bin(c, Bin::And, x, mask16);
+            self.s
+                .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[lo])
+        } else if float {
+            self.as_float(x)
+        } else {
+            x
+        };
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
-            (Op::AddU | Op::AddF, Some(inclusive)) => {
+            (Op::AddU | Op::AddF | Op::AddF16, Some(inclusive)) => {
                 let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
                 let r = self.s.op(
                     c,
@@ -801,10 +847,10 @@ impl<'a> Lower<'a> {
             (_, None) => {
                 let (code, unsigned) = match op {
                     Op::AddU => (0, 1),
-                    Op::AddF => (0, 0),
+                    Op::AddF | Op::AddF16 => (0, 0),
                     Op::MinU => (2, 1),
                     Op::MaxU => (3, 1),
-                    Op::MinI | Op::MinF => (2, 0),
+                    Op::MinI | Op::MinF | Op::MinF16 => (2, 0),
                     _ => (3, 0),
                 };
                 let (k, u) = (self.s.m.i8(code), self.s.m.i8(unsigned));
@@ -818,7 +864,14 @@ impl<'a> Lower<'a> {
                 )
             }
         };
-        Ok(if float { self.as_int(r) } else { r })
+        Ok(if half {
+            self.s
+                .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[r])
+        } else if float {
+            self.as_int(r)
+        } else {
+            r
+        })
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {

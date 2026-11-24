@@ -21,12 +21,15 @@ use crate::ir::{EXEC, Inst, Program, Reg, Value};
 pub(crate) enum Op {
     AddU,
     AddF,
+    AddF16,
     MinU,
     MaxU,
     MinI,
     MaxI,
     MinF,
     MaxF,
+    MinF16,
+    MaxF16,
     Or,
     And,
     Xor,
@@ -37,12 +40,15 @@ impl Op {
         Some(match name {
             "v_add_nc_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
+            "v_add_f16" => Op::AddF16,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
             "v_min_i32" => Op::MinI,
             "v_max_i32" => Op::MaxI,
             "v_min_f32" => Op::MinF,
             "v_max_f32" => Op::MaxF,
+            "v_min_f16" => Op::MinF16,
+            "v_max_f16" => Op::MaxF16,
             "v_or_b32" => Op::Or,
             "v_and_b32" => Op::And,
             "v_xor_b32" => Op::Xor,
@@ -55,17 +61,20 @@ impl Op {
         match self {
             Op::AddU | Op::Or | Op::Xor | Op::MaxU => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
+            Op::AddF16 => (k & 0xFFFF) == 0 || (k & 0xFFFF) == 0x8000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
             Op::MaxI => k == 0x8000_0000,
             Op::MinF => k == 0x7F80_0000,
             Op::MaxF => k == 0xFF80_0000,
+            Op::MinF16 => (k & 0xFFFF) == 0x7C00,
+            Op::MaxF16 => (k & 0xFFFF) == 0xFC00,
         }
     }
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::Xor)
+        matches!(self, Op::AddU | Op::AddF | Op::AddF16 | Op::Xor)
     }
 }
 
@@ -86,6 +95,27 @@ pub(crate) enum Sym {
         ident: u32,
         lanes: u64,
     },
+    /// High 32 bits of the unsigned 64-bit sum over `lanes` of
+    /// `mask ? (hi << 32 | lo) : 0`.
+    Red64Hi {
+        lo: Value,
+        hi: Value,
+        mask: Value,
+        lanes: u64,
+    },
+}
+
+/// Per-lane carry out of `v_add_co_u32` during a 64-bit sum reduction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carry {
+    Unknown,
+    Zero,
+    Add {
+        lo: Value,
+        mask: Value,
+        la: u64,
+        lb: u64,
+    },
 }
 
 /// What a value a section leaves holds in every lane.
@@ -97,6 +127,8 @@ pub(crate) enum Shape {
     Masked(Value, Value, u32),
     /// `op` over every lane.
     Active(Op, Value, Value, u32),
+    /// High 32 bits of the unsigned 64-bit sum over every lane.
+    Active64Hi(Value, Value, Value),
     /// `op` over the lanes below (`inclusive`: and including) each lane.
     Prefix(Op, Value, Value, u32, bool),
 }
@@ -239,6 +271,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let mut exec = all;
     let mut vec: HashMap<Value, Vec<Sym>> = HashMap::new();
     let mut uni: HashMap<Value, Sym> = HashMap::new();
+    let mut carries: HashMap<(Value, Option<Value>), Vec<Carry>> = HashMap::new();
     // Masks the section derives from the saved EXEC (`s_and` with it).
     let mut masked = vec![saved];
     for inst in insts {
@@ -311,7 +344,8 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 _ => one(Sym::Unknown),
             }
         };
-        let modifiers = v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some();
+        let modifiers =
+            v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some() || v.opsel != 0;
         if name == "v_readlane_b32" {
             let (Some(Operand::Scalar { code, .. }), Some(src), Some(lane)) =
                 (v.dst, v.src.first(), v.src.get(1))
@@ -468,6 +502,148 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
+            ("v_add_co_u32", Some(a)) => {
+                let b = src(1).unwrap_or_default();
+                let mut lane_carry = vec![Carry::Unknown; wave as usize];
+                let out: Vec<Sym> = (0..wave as usize)
+                    .map(|l| {
+                        let al = a[l];
+                        let bl = b.get(l).copied().unwrap_or(Sym::Unknown);
+                        match (al, bl) {
+                            (Sym::K(0), x) | (x, Sym::K(0)) => {
+                                lane_carry[l] = Carry::Zero;
+                                x
+                            }
+                            (
+                                Sym::Red {
+                                    op: None | Some(Op::AddU),
+                                    src: sa,
+                                    mask: ma,
+                                    ident: 0,
+                                    lanes: la,
+                                },
+                                Sym::Red {
+                                    op: None | Some(Op::AddU),
+                                    src: sb,
+                                    mask: mb,
+                                    ident: 0,
+                                    lanes: lb,
+                                },
+                            ) if sa == sb && ma == mb && la & lb == 0 => {
+                                lane_carry[l] = Carry::Add {
+                                    lo: sa,
+                                    mask: ma,
+                                    la,
+                                    lb,
+                                };
+                                Sym::Red {
+                                    op: Some(Op::AddU),
+                                    src: sa,
+                                    mask: ma,
+                                    ident: 0,
+                                    lanes: la | lb,
+                                }
+                            }
+                            _ => Sym::Unknown,
+                        }
+                    })
+                    .collect();
+                if let Some(Operand::Scalar { code, dwords }) = v.carry
+                    && let Some(c0) = inst.write(Reg::S(code))
+                {
+                    uni.insert(c0, Sym::Unknown);
+                    let c1 = if dwords == 2 {
+                        inst.write(Reg::S(code + 1)).inspect(|&w| {
+                            uni.insert(w, Sym::Unknown);
+                        })
+                    } else {
+                        None
+                    };
+                    if exec == all {
+                        carries.insert((c0, c1), lane_carry);
+                    }
+                }
+                out
+            }
+            ("v_add_co_ci_u32", Some(a)) => {
+                let b = src(1).unwrap_or_default();
+                let cin_key = match v.src.get(2) {
+                    Some(&Operand::Scalar { code, dwords }) => inst.read(Reg::S(code)).map(|c0| {
+                        let c1 = if dwords == 2 {
+                            inst.read(Reg::S(code + 1))
+                        } else {
+                            None
+                        };
+                        (c0, c1)
+                    }),
+                    _ => None,
+                };
+                if let Some(Operand::Scalar { code, dwords }) = v.carry
+                    && let Some(c0) = inst.write(Reg::S(code))
+                {
+                    uni.insert(c0, Sym::Unknown);
+                    if dwords == 2
+                        && let Some(c1) = inst.write(Reg::S(code + 1))
+                    {
+                        uni.insert(c1, Sym::Unknown);
+                    }
+                }
+                let cin = cin_key.and_then(|k| carries.get(&k));
+                let hi_part = |s: Sym, lo_want: Value, mask_want: Value| -> Option<(Value, u64)> {
+                    match s {
+                        Sym::Red {
+                            op: None,
+                            src,
+                            mask,
+                            ident: 0,
+                            lanes,
+                        } if mask == mask_want => Some((src, lanes)),
+                        Sym::Red64Hi {
+                            lo,
+                            hi,
+                            mask,
+                            lanes,
+                        } if lo == lo_want && mask == mask_want => Some((hi, lanes)),
+                        _ => None,
+                    }
+                };
+                (0..wave as usize)
+                    .map(|l| {
+                        let al = a[l];
+                        let bl = b.get(l).copied().unwrap_or(Sym::Unknown);
+                        let Some(c) = cin.and_then(|cv| cv.get(l).copied()) else {
+                            return Sym::Unknown;
+                        };
+                        match c {
+                            Carry::Zero => match (al, bl) {
+                                (Sym::K(0), x) | (x, Sym::K(0)) => x,
+                                _ => Sym::Unknown,
+                            },
+                            Carry::Add { lo, mask, la, lb } => {
+                                let Some((ha, lha)) = hi_part(al, lo, mask) else {
+                                    return Sym::Unknown;
+                                };
+                                let Some((hb, lhb)) = hi_part(bl, lo, mask) else {
+                                    return Sym::Unknown;
+                                };
+                                if ha == hb
+                                    && ((lha == la && lhb == lb) || (lha == lb && lhb == la))
+                                {
+                                    Sym::Red64Hi {
+                                        lo,
+                                        hi: ha,
+                                        mask,
+                                        lanes: la | lb,
+                                    }
+                                } else {
+                                    Sym::Unknown
+                                }
+                            }
+                            Carry::Unknown => Sym::Unknown,
+                        }
+                    })
+                    .collect()
+            }
             (n, Some(a)) => match (Op::of(n), src(1)) {
                 (Some(op), Some(b)) => (0..wave as usize)
                     .map(|l| combine(op, a[l], b[l]))
@@ -530,6 +706,12 @@ fn shapes(
             ident,
             lanes,
         } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+        Sym::Red64Hi {
+            lo,
+            hi,
+            mask,
+            lanes,
+        } if lanes == all => Some(Shape::Active64Hi(lo, hi, mask)),
         _ => None,
     };
     for (v, s) in uni {
@@ -573,6 +755,12 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 ident,
                 lanes,
             } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+            Sym::Red64Hi {
+                lo,
+                hi,
+                mask,
+                lanes,
+            } if lanes == all => Some(Shape::Active64Hi(lo, hi, mask)),
             _ => None,
         };
     }
@@ -675,5 +863,29 @@ mod tests {
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
             Some(Shape::Active(Op::AddU, x, m, 0))
         );
+        let red64 = Sym::Red64Hi {
+            lo: x,
+            hi: Value(3),
+            mask: m,
+            lanes: u64::MAX,
+        };
+        assert_eq!(
+            per_lane(&vec![red64; 64], u64::MAX),
+            Some(Shape::Active64Hi(x, Value(3), m))
+        );
+    }
+
+    #[test]
+    fn f16_op_identities_match_ieee_binary16() {
+        assert_eq!(Op::of("v_add_f16"), Some(Op::AddF16));
+        assert_eq!(Op::of("v_min_f16"), Some(Op::MinF16));
+        assert_eq!(Op::of("v_max_f16"), Some(Op::MaxF16));
+        assert!(Op::AddF16.identity(0x0000));
+        assert!(Op::AddF16.identity(0x8000));
+        assert!(!Op::AddF16.identity(0x3C00));
+        assert!(Op::MinF16.identity(0x7C00));
+        assert!(Op::MaxF16.identity(0xFC00));
+        assert!(Op::AddF16.counts());
+        assert!(!Op::MinF16.counts());
     }
 }

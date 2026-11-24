@@ -937,3 +937,263 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// Builds a 4-thread Wave32 compute shader (fits in one wave on every D3D12
+/// host including WARP) that receives 4 root constants in `s0..s3`, runs
+/// `body` (leaving its two output dwords in `v0` and `v1`), and writes them
+/// to dwords 0 and 1 of the raw UAV at heap index 0.
+fn build_wave4_cs(body: &[u32]) -> HostShader {
+    let mut words = Vec::new();
+    words.push(s_mov_b32(5, 0x80));
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(body);
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.extend_from_slice(&buffer_store_dword(1, 8, 4));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 12,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [4, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    shader
+}
+
+const fn s_or_saveexec_b32(sdst: u8, src0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | 0x3D << 8 | src0 as u32
+}
+
+const fn vop3b(op: u16, vdst: u8, sdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0x35 << 26 | (op as u32 & 0x3FF) << 16 | (sdst as u32 & 0x7F) << 8 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18,
+    ]
+}
+
+const fn v_mov_dpp8(vdst: u8, vsrc: u8, sel: u32) -> [u32; 2] {
+    [vop1(0x001, vdst, 0xE9), vsrc as u32 | (sel << 8)]
+}
+
+const fn v_mov_row_mirror(vdst: u8, vsrc: u8) -> [u32; 2] {
+    [
+        vop1(0x001, vdst, 0xFA),
+        vsrc as u32 | (0x140 << 8) | (1 << 19) | (0xF << 24) | (0xF << 28),
+    ]
+}
+
+const fn v_add_f16_dpp8(vdst: u8, vsrc0: u8, vsrc1: u8, sel: u32) -> [u32; 2] {
+    [
+        (0x32u32 << 25) | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | 0xE9,
+        vsrc0 as u32 | (sel << 8),
+    ]
+}
+
+const fn v_add_f16_row_mirror(vdst: u8, vsrc0: u8, vsrc1: u8) -> [u32; 2] {
+    [
+        (0x32u32 << 25) | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | 0xFA,
+        vsrc0 as u32 | (0x140 << 8) | (1 << 19) | (0xF << 24) | (0xF << 28),
+    ]
+}
+
+fn run_cases2(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    mut check: impl FnMut(&str, usize, [u32; 4], [u32; 2]),
+) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(p) => p,
+            // WARP does not support fixed WaveSize(32) on SM 6.6.
+            Err(e) if warp => {
+                eprintln!("{label}: compute_pipeline skipped ({e})");
+                continue;
+            }
+            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
+        };
+        for (i, &inputs) in cases.iter().enumerate() {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(2)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            check(label, i, inputs, [out[0][0], out[0][1]]);
+        }
+        ran += 1;
+    }
+    if ran == 0 {
+        eprintln!("no SM 6.6 device supporting WaveSize(32) available; execution skipped");
+    }
+}
+
+#[test]
+fn whole_wave_u64_sum_carries_across_lanes() {
+    let mut body = Vec::new();
+    // Per-lane input: v6 = s0 (lo), v7 = s1 (hi).
+    body.push(vop1(0x001, 6, sgpr(0)));
+    body.push(vop1(0x001, 7, sgpr(1)));
+    // Whole-wave 64-bit unsigned sum over Wave32.
+    body.push(s_or_saveexec_b32(12, 0xC1)); // s_or_saveexec_b32 s12, -1
+    body.extend_from_slice(&vop3(0x101, 2, 0x80, vgpr(6), sgpr(12))); // v2 = mask ? v6 : 0
+    body.extend_from_slice(&vop3(0x101, 3, 0x80, vgpr(7), sgpr(12))); // v3 = mask ? v7 : 0
+    for sel in [14570689u32, 9658386, 2340] {
+        body.extend_from_slice(&v_mov_dpp8(4, 2, sel));
+        body.extend_from_slice(&v_mov_dpp8(5, 3, sel));
+        body.extend_from_slice(&vop3b(0x30F, 2, 106, vgpr(4), vgpr(2), 0));
+        body.extend_from_slice(&vop3b(0x128, 3, 106, vgpr(5), vgpr(3), sgpr(106)));
+    }
+    body.extend_from_slice(&v_mov_row_mirror(4, 2));
+    body.extend_from_slice(&v_mov_row_mirror(5, 3));
+    body.extend_from_slice(&vop3b(0x30F, 2, 106, vgpr(4), vgpr(2), 0));
+    body.extend_from_slice(&vop3b(0x128, 3, 106, vgpr(5), vgpr(3), sgpr(106)));
+    body.extend_from_slice(&vop3(0x378, 4, vgpr(2), 0x80, 0x80)); // v_permlanex16_b32
+    body.extend_from_slice(&vop3(0x378, 5, vgpr(3), 0x80, 0x80));
+    body.extend_from_slice(&vop3b(0x30F, 2, 106, vgpr(4), vgpr(2), 0));
+    body.extend_from_slice(&vop3b(0x128, 3, 106, vgpr(5), vgpr(3), sgpr(106)));
+    body.extend_from_slice(&vop3(0x360, 14, vgpr(2), 0x80, 0)); // v_readlane_b32 s14, v2, 0
+    body.extend_from_slice(&vop3(0x360, 15, vgpr(3), 0x80, 0)); // v_readlane_b32 s15, v3, 0
+    body.push(s_mov_b32(126, 12)); // restore exec_lo
+    body.push(vop1(0x001, 0, sgpr(14)));
+    body.push(vop1(0x001, 1, sgpr(15)));
+
+    let shader = build_wave4_cs(&body);
+    let cases: &[([u32; 4], u64)] = &[
+        // 4 * ((3 << 32) | 0x8000_0001) = (14 << 32) | 4 (2 carries into hi)
+        ([0x8000_0001, 3, 0, 0], (14u64 << 32) | 4),
+        // 4 * ((0 << 32) | 0xFFFF_FFFF) = (3 << 32) | 0xFFFF_FFFC
+        ([0xFFFF_FFFF, 0, 0, 0], (3u64 << 32) | 0xFFFF_FFFC),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases2(&shader, &inputs, |backend, i, inp, [lo, hi]| {
+        let want = cases[i].1;
+        let got = (u64::from(hi) << 32) | u64::from(lo);
+        assert_eq!(
+            got, want,
+            "{backend}: wave u64 sum({:#x}, {:#x}) = {got:#x}, want {want:#x}",
+            inp[0], inp[1]
+        );
+    });
+}
+
+#[test]
+fn whole_wave_f16_sum_matches_rdna2() {
+    let mut body = Vec::new();
+    // Per-lane f16 input in low 16 bits of v6.
+    body.push(vop1(0x001, 6, sgpr(0)));
+    body.push(s_or_saveexec_b32(12, 0xC1));
+    body.extend_from_slice(&vop3(0x101, 2, 0x80, vgpr(6), sgpr(12))); // v2 = mask ? v6 : 0
+    for sel in [14570689u32, 9658386, 2340] {
+        body.extend_from_slice(&v_add_f16_dpp8(2, 2, 2, sel));
+    }
+    body.extend_from_slice(&v_add_f16_row_mirror(2, 2, 2));
+    body.extend_from_slice(&vop3(0x378, 3, vgpr(2), 0x80, 0x80)); // v_permlanex16_b32
+    body.extend_from_slice(&vop3(0x132, 2, vgpr(3), vgpr(2), 0)); // v_add_f16_e64
+    body.extend_from_slice(&vop3(0x360, 14, vgpr(2), 0x80, 0)); // v_readlane_b32 s14, v2, 0
+    body.push(s_mov_b32(126, 12));
+    body.push(vop1(0x001, 0, sgpr(14)));
+    body.push(vop1(0x001, 1, 0x80));
+
+    let shader = build_wave4_cs(&body);
+    let cases: &[([u32; 4], u32)] = &[
+        // 4 * 1.5 (0x3E00) = 6.0 (0x4600)
+        ([0x3E00, 0, 0, 0], 0x4600),
+        // 4 * -1.0 (0xBC00) = -4.0 (0xC400)
+        ([0xBC00, 0, 0, 0], 0xC400),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases2(&shader, &inputs, |backend, i, inp, [lo, _]| {
+        let want = cases[i].1;
+        let got = lo & 0xFFFF;
+        assert_eq!(
+            got, want,
+            "{backend}: wave f16 sum({:#06x}) = {got:#06x}, want {want:#06x}",
+            inp[0]
+        );
+    });
+}
