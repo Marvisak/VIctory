@@ -70,6 +70,7 @@ pub(crate) struct State {
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
+    /// Host COM heap identities. The list keeps the bound objects alive.
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
@@ -410,6 +411,27 @@ impl State {
 
     /// A descriptor a shader reads through a table: its host slot made if
     /// it changed, constant data copied, textures made readable.
+    fn bind_host_heaps(&mut self, list: &HostList, heaps: [Option<&ID3D12DescriptorHeap>; 2]) {
+        // A new title heap can reuse an old title address. The old host
+        // heap is still kept by the recording, so its COM identity is distinct.
+        let identities = heaps.map(|heap| heap.map_or(0, |heap| heap.as_raw() as usize));
+        if self.host_heaps == identities {
+            return;
+        }
+        let heaps: Vec<_> = heaps
+            .into_iter()
+            .flatten()
+            .map(|heap| {
+                list.keep(heap);
+                Some(heap.clone())
+            })
+            .collect();
+        // SAFETY: an open list and shader-visible heaps.
+        unsafe { list.list.SetDescriptorHeaps(&heaps) };
+        self.host_heaps = identities;
+        self.host_roots = [0; 2];
+    }
+
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
@@ -419,20 +441,14 @@ impl State {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
-        }
+        let heaps = self.heaps.map(|heap| {
+            let heap = heap as This;
+            (!heap.is_null())
+                .then(|| crate::descriptor::heap(heap).host())
+                .flatten()
+                .map(|host| &host.heap)
+        });
+        self.bind_host_heaps(list, heaps);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
@@ -1214,4 +1230,45 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacing_a_bound_host_heap_invalidates_root_bindings() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let new_heap = || -> ID3D12DescriptorHeap {
+            // SAFETY: a live device and a valid shader-visible view heap description.
+            unsafe {
+                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 4,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+            }
+            .unwrap()
+        };
+        let original = new_heap();
+        let mut state = State::default();
+        state.bind_host_heaps(&list, [Some(&original), None]);
+
+        state.host_roots = [1, 2];
+        state.bind_host_heaps(&list, [Some(&original), None]);
+        assert_eq!(state.host_roots, [1, 2]);
+
+        // The title can replace the heap at the same guest address. The
+        // command list holds the original host object after this drop.
+        drop(original);
+        let replacement = new_heap();
+        state.bind_host_heaps(&list, [Some(&replacement), None]);
+        assert_eq!(state.host_roots, [0; 2]);
+        assert_eq!(state.host_heaps, [replacement.as_raw() as usize, 0]);
+        list.close();
+    }
 }
