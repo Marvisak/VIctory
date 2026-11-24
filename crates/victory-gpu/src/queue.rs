@@ -2,8 +2,12 @@
 //! so fence signals complete at once.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
+use crate::list::{CpuOp, ListStep, MemoryWait};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
@@ -28,12 +32,251 @@ pub(crate) struct QueueDesc {
     nodes: u32,
 }
 
+#[cfg(windows)]
+type HostSegment = (Arc<crate::host::HostList>, Arc<Vec<Vec<u8>>>);
+
+/// One queued item on a guest command queue waiting behind an unsatisfied
+/// 64-bit command-list memory wait.
+enum PendingAction {
+    #[cfg(windows)]
+    Host(HostSegment),
+    Cpu(Vec<CpuOp>),
+    Wait(MemoryWait),
+    /// Retained guest fence pointer (`AddRef`'d on enqueue, `Release`'d after signal).
+    Signal(usize, u64),
+}
+
+impl From<ListStep> for PendingAction {
+    fn from(step: ListStep) -> Self {
+        match step {
+            #[cfg(windows)]
+            ListStep::Host { list, uploads } => PendingAction::Host((list, uploads)),
+            ListStep::Cpu(ops) => PendingAction::Cpu(ops),
+            ListStep::Wait(w) => PendingAction::Wait(w),
+        }
+    }
+}
+
+#[derive(Default)]
+struct QueuePending {
+    items: VecDeque<PendingAction>,
+    running: bool,
+}
+
+impl QueuePending {
+    fn is_busy(&self) -> bool {
+        self.running || !self.items.is_empty()
+    }
+}
+
+/// Per-queue pending submission state, kept alive by `Arc` until drained.
+#[derive(Default)]
+struct QueueState {
+    busy: AtomicBool,
+    inner: Mutex<QueuePending>,
+}
+
+/// Number of queues currently registered with the wait scheduler.
+static PENDING_QUEUES: AtomicUsize = AtomicUsize::new(0);
+
+/// Background scheduler that polls/wakes pending command-list memory waits
+/// without blocking the submitting CPU thread.
+struct WaitScheduler {
+    queues: Mutex<Vec<Arc<QueueState>>>,
+    wake: (Mutex<u64>, Condvar),
+}
+
+static SCHEDULER: OnceLock<WaitScheduler> = OnceLock::new();
+
+fn scheduler() -> &'static WaitScheduler {
+    SCHEDULER.get_or_init(|| {
+        let s = WaitScheduler {
+            queues: Mutex::new(Vec::new()),
+            wake: (Mutex::new(0), Condvar::new()),
+        };
+        let _ = std::thread::Builder::new()
+            .name("victory-gpu-wait".into())
+            .spawn(wait_worker);
+        s
+    })
+}
+
+fn register_pending(state: Arc<QueueState>) {
+    let s = scheduler();
+    let mut queues = s.queues.lock().unwrap_or_else(|e| e.into_inner());
+    if !queues.iter().any(|q| Arc::ptr_eq(q, &state)) {
+        queues.push(state);
+        PENDING_QUEUES.store(queues.len(), Ordering::Release);
+    }
+    drop(queues);
+    wake_scheduler(s);
+}
+
+fn wake_scheduler(s: &WaitScheduler) {
+    let mut epoch = s.wake.0.lock().unwrap_or_else(|e| e.into_inner());
+    *epoch = epoch.wrapping_add(1);
+    s.wake.1.notify_all();
+}
+
+/// Wakes any command-list memory waits that may have been satisfied by a
+/// GPU submission, copy-back, or bottom-of-pipe write.
+pub(crate) fn notify_memory_waiters() {
+    if PENDING_QUEUES.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    if let Some(s) = SCHEDULER.get() {
+        wake_scheduler(s);
+    }
+}
+
+fn release_fence(fence: This) {
+    crate::fence::release(fence);
+}
+
+#[cfg(windows)]
+fn run_host_batch(batch: &[HostSegment]) {
+    if batch.is_empty() {
+        return;
+    }
+    if let Some(host) = crate::host::host() {
+        let refs: Vec<&crate::host::HostList> = batch.iter().map(|(l, _)| l.as_ref()).collect();
+        host.execute(&refs);
+    }
+}
+
+fn run_cpu_ops(ops: &[CpuOp]) {
+    for &op in ops {
+        op.run();
+    }
+    notify_memory_waiters();
+}
+
+/// Advances `q` as far as ready actions allow without holding `q.inner` while
+/// executing host GPU submissions or fence signals. Returns `true` if any
+/// item made progress.
+fn drain_ready(q: &QueueState) -> bool {
+    let mut progressed = false;
+    loop {
+        #[cfg(windows)]
+        let mut host_batch: Vec<HostSegment> = Vec::new();
+        let mut next_other = None;
+        {
+            let mut inner = q.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.running {
+                return progressed;
+            }
+            loop {
+                match inner.items.front() {
+                    Some(PendingAction::Wait(w)) => {
+                        #[cfg(windows)]
+                        if !host_batch.is_empty() {
+                            break;
+                        }
+                        if w.satisfied() {
+                            inner.items.pop_front();
+                            progressed = true;
+                            continue;
+                        }
+                        q.busy.store(inner.is_busy(), Ordering::Release);
+                        return progressed;
+                    }
+                    #[cfg(windows)]
+                    Some(PendingAction::Host(_)) => {
+                        if let Some(PendingAction::Host(seg)) = inner.items.pop_front() {
+                            host_batch.push(seg);
+                        }
+                    }
+                    Some(PendingAction::Cpu(_)) | Some(PendingAction::Signal(..)) => {
+                        #[cfg(windows)]
+                        if !host_batch.is_empty() {
+                            break;
+                        }
+                        next_other = inner.items.pop_front();
+                        break;
+                    }
+                    None => {
+                        #[cfg(windows)]
+                        if !host_batch.is_empty() {
+                            break;
+                        }
+                        q.busy.store(false, Ordering::Release);
+                        return progressed;
+                    }
+                }
+            }
+            inner.running = true;
+            q.busy.store(true, Ordering::Release);
+        }
+
+        progressed = true;
+        #[cfg(windows)]
+        if !host_batch.is_empty() {
+            run_host_batch(&host_batch);
+        }
+        match next_other {
+            Some(PendingAction::Cpu(ops)) => run_cpu_ops(&ops),
+            Some(PendingAction::Signal(fence, value)) => {
+                crate::fence::signal(fence as This, value);
+                release_fence(fence as This);
+            }
+            _ => {}
+        }
+
+        let mut inner = q.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.running = false;
+        q.busy.store(inner.is_busy(), Ordering::Release);
+    }
+}
+
+fn wait_worker() {
+    let s = scheduler();
+    loop {
+        let epoch = *s.wake.0.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let snapshot: Vec<Arc<QueueState>> = {
+                let queues = s.queues.lock().unwrap_or_else(|e| e.into_inner());
+                queues.clone()
+            };
+            let mut progressed = false;
+            for q in &snapshot {
+                progressed |= drain_ready(q);
+            }
+            if !progressed {
+                break;
+            }
+        }
+        let still_waiting = {
+            let mut queues = s.queues.lock().unwrap_or_else(|e| e.into_inner());
+            queues.retain(|q| q.busy.load(Ordering::Acquire));
+            let len = queues.len();
+            PENDING_QUEUES.store(len, Ordering::Release);
+            len > 0
+        };
+        let lock = s.wake.0.lock().unwrap_or_else(|e| e.into_inner());
+        if *lock != epoch {
+            continue;
+        }
+        if still_waiting {
+            // Bounded poll fallback so direct CPU memory writes also wake promptly.
+            drop(
+                s.wake
+                    .1
+                    .wait_timeout(lock, Duration::from_millis(1))
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+        } else {
+            drop(s.wake.1.wait(lock).unwrap_or_else(|e| e.into_inner()));
+        }
+    }
+}
+
 /// The title reads the list type right after the header.
 #[repr(C)]
 struct Queue {
     object: Object,
     kind: u32,
     desc: QueueDesc,
+    state: Arc<QueueState>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -61,6 +304,7 @@ pub(crate) extern "system" fn create(
         },
         kind: desc.kind,
         desc,
+        state: Arc::new(QueueState::default()),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -110,25 +354,119 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
-    if lists.is_null() {
+/// Runs the lists' host lists and waits for them (decision 0007). Lists
+/// containing an unsatisfied 64-bit memory wait execute their pre-wait work
+/// immediately and defer only the post-wait tail onto this queue's pending
+/// stream so the submitting CPU thread never deadlocks.
+extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    if lists.is_null() || count == 0 {
         return;
     }
-    #[cfg(windows)]
-    if let Some(host) = crate::host::host() {
-        // SAFETY: the title passes `count` lists.
-        let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let host_lists: Vec<_> = lists
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        host.execute(&host_lists);
+    // SAFETY: the title passes `count` lists.
+    let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+    let mut steps = Vec::new();
+    for &l in lists {
+        steps.extend(crate::list::snapshot(l));
+    }
+    if steps.is_empty() {
+        #[cfg(windows)]
+        if crate::host::host().is_none() {
+            static ONCE: AtomicBool = AtomicBool::new(false);
+            if !ONCE.swap(true, Ordering::Relaxed) {
+                tracing::warn!(count, "command lists submitted; no host GPU runs them");
+            }
+        }
         return;
     }
-    static ONCE: AtomicBool = AtomicBool::new(false);
-    if !ONCE.swap(true, Ordering::Relaxed) {
-        tracing::warn!(count, "command lists submitted; no host GPU runs them");
+
+    let state = &queue(this).state;
+    let has_wait = steps.iter().any(|s| matches!(s, ListStep::Wait(_)));
+
+    // Fast path: queue is idle and no list contains a memory wait.
+    if !has_wait && !state.busy.load(Ordering::Acquire) {
+        #[cfg(windows)]
+        {
+            let mut batch: Vec<HostSegment> = Vec::new();
+            for step in steps {
+                match step {
+                    ListStep::Host { list, uploads } => batch.push((list, uploads)),
+                    ListStep::Cpu(ops) => {
+                        run_host_batch(&batch);
+                        batch.clear();
+                        run_cpu_ops(&ops);
+                    }
+                    ListStep::Wait(_) => unreachable!(),
+                }
+            }
+            run_host_batch(&batch);
+        }
+        #[cfg(not(windows))]
+        for step in steps {
+            if let ListStep::Cpu(ops) = step {
+                run_cpu_ops(&ops);
+            }
+        }
+        return;
+    }
+
+    // Slow path: queue is already waiting behind an earlier wait, or this
+    // submission contains a 64-bit memory wait.
+    {
+        let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.is_busy() {
+            for step in steps {
+                inner.items.push_back(step.into());
+            }
+            state.busy.store(true, Ordering::Release);
+            drop(inner);
+            register_pending(state.clone());
+            return;
+        }
+        inner.running = true;
+        state.busy.store(true, Ordering::Release);
+    }
+
+    // Execute ready prefix synchronously so pre-wait work runs right away;
+    // stop and enqueue without blocking at the first unsatisfied wait.
+    let mut iter = steps.into_iter().peekable();
+    let mut deferred_tail: Vec<PendingAction> = Vec::new();
+    while let Some(step) = iter.next() {
+        match step {
+            #[cfg(windows)]
+            ListStep::Host { list, uploads } => {
+                let mut batch = vec![(list, uploads)];
+                while matches!(iter.peek(), Some(ListStep::Host { .. })) {
+                    if let Some(ListStep::Host { list, uploads }) = iter.next() {
+                        batch.push((list, uploads));
+                    }
+                }
+                run_host_batch(&batch);
+            }
+            ListStep::Cpu(ops) => run_cpu_ops(&ops),
+            ListStep::Wait(w) => {
+                if !w.satisfied() {
+                    deferred_tail.push(PendingAction::Wait(w));
+                    deferred_tail.extend(iter.map(PendingAction::from));
+                    break;
+                }
+            }
+        }
+    }
+
+    let need_register = {
+        let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // Prepend our deferred tail ahead of any items that arrived concurrently
+        // on this queue while our pre-wait prefix was running.
+        for action in deferred_tail.into_iter().rev() {
+            inner.items.push_front(action);
+        }
+        inner.running = false;
+        let busy = inner.is_busy();
+        state.busy.store(busy, Ordering::Release);
+        busy
+    };
+    if need_register {
+        register_pending(state.clone());
     }
 }
 
@@ -157,9 +495,22 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
+    }
+    let state = &queue(this).state;
+    if state.busy.load(Ordering::Acquire) {
+        let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.is_busy() {
+            crate::object::add_ref(fence);
+            inner
+                .items
+                .push_back(PendingAction::Signal(fence as usize, value));
+            drop(inner);
+            register_pending(state.clone());
+            return S_OK;
+        }
     }
     crate::fence::signal(fence, value)
 }
@@ -204,11 +555,20 @@ impl Written {
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
             if bytes == 4 {
-                at.cast::<u32>().write_unaligned(value as u32);
+                if (at as usize).is_multiple_of(4) {
+                    AtomicU32::from_ptr(at.cast::<u32>()).store(value as u32, Ordering::Release);
+                } else {
+                    std::sync::atomic::fence(Ordering::Release);
+                    at.cast::<u32>().write_unaligned(value as u32);
+                }
+            } else if (at as usize).is_multiple_of(8) {
+                AtomicU64::from_ptr(at.cast::<u64>()).store(value, Ordering::Release);
             } else {
+                std::sync::atomic::fence(Ordering::Release);
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        notify_memory_waiters();
     }
 }
 
@@ -403,7 +763,9 @@ extern "system" fn copy_page_mappings(
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
     S_OK
 }
@@ -543,5 +905,301 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[test]
+    fn memory_wait_comparison_ops_cover_full_64_bit_words() {
+        let hi = 0x0000_0001_0000_0000u64;
+        let lo = 0x0000_0000_ffff_ffffu64;
+        assert!(!MemoryWait::compare(hi, 1, lo)); // NEVER
+        assert!(MemoryWait::compare(lo, 2, hi)); // LESS
+        assert!(!MemoryWait::compare(hi, 2, lo));
+        assert!(MemoryWait::compare(hi, 3, hi)); // EQUAL
+        assert!(!MemoryWait::compare(hi, 3, 0));
+        assert!(MemoryWait::compare(lo, 4, hi)); // LESS_EQUAL
+        assert!(MemoryWait::compare(hi, 4, hi));
+        assert!(MemoryWait::compare(hi, 5, lo)); // GREATER
+        assert!(!MemoryWait::compare(hi, 5, hi));
+        assert!(MemoryWait::compare(hi, 6, lo)); // NOT_EQUAL
+        assert!(!MemoryWait::compare(hi, 6, hi));
+        assert!(MemoryWait::compare(hi, 7, lo)); // GREATER_EQUAL
+        assert!(MemoryWait::compare(hi, 7, hi));
+        assert!(!MemoryWait::compare(lo, 7, hi));
+        assert!(MemoryWait::compare(0, 8, u64::MAX)); // ALWAYS
+    }
+
+    fn make_queue_and_list() -> (This, This, This) {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut alloc = null;
+        let alloc_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &alloc_iid, &mut alloc),
+            S_OK
+        );
+        let mut list = null;
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list),
+            S_OK
+        );
+        (q, alloc, list)
+    }
+
+    fn list_slot_offset(list: This, old_offset: usize) -> usize {
+        if crate::list::is_newer_table(list) && old_offset >= 59 * 8 {
+            old_offset + 16
+        } else {
+            old_offset
+        }
+    }
+
+    fn wait_fence_value(fence: This, want: u64) {
+        let completed = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while completed(fence) < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for fence value {want} (got {})",
+                completed(fence)
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn command_list_memory_wait_orders_producer_and_consumer_both_ways() {
+        for consumer_first in [false, true] {
+            let (prod_q, prod_alloc, prod_list) = make_queue_and_list();
+            let (cons_q, cons_alloc, cons_list) = make_queue_and_list();
+            let mut fence = std::ptr::null();
+            assert_eq!(
+                crate::fence::create(
+                    std::ptr::null(),
+                    0,
+                    0,
+                    &crate::fence::FENCE_IIDS[0],
+                    &mut fence
+                ),
+                S_OK
+            );
+
+            let payload = Box::new(AtomicU64::new(0));
+            let counter = Box::new(AtomicU64::new(0));
+            let result = Box::new(AtomicU64::new(0));
+
+            let write64 = slot::<extern "system" fn(This, u64, u64, u32, u32)>(
+                prod_list,
+                list_slot_offset(prod_list, 0x230),
+            );
+            let close_p = slot::<extern "system" fn(This) -> HRESULT>(prod_list, 0x48);
+            write64(prod_list, (&raw const *payload) as u64, 0x5a55a11c, 0, 0);
+            write64(prod_list, (&raw const *counter) as u64, 2, 0, 0);
+            assert_eq!(close_p(prod_list), S_OK);
+
+            let wait64 = slot::<extern "system" fn(This, u64, u32, u64, u32)>(
+                cons_list,
+                list_slot_offset(cons_list, 0x240),
+            );
+            let copy_mem = slot::<extern "system" fn(This, u64, u64, u64, u32)>(
+                cons_list,
+                list_slot_offset(cons_list, 0x1e0),
+            );
+            let close_c = slot::<extern "system" fn(This) -> HRESULT>(cons_list, 0x48);
+            wait64(cons_list, (&raw const *counter) as u64, 7, 1, 0);
+            copy_mem(
+                cons_list,
+                (&raw const *result) as u64,
+                (&raw const *payload) as u64,
+                8,
+                0,
+            );
+            assert_eq!(close_c(cons_list), S_OK);
+
+            let exec_p = slot::<extern "system" fn(This, u32, *const This)>(prod_q, 0x50);
+            let exec_c = slot::<extern "system" fn(This, u32, *const This)>(cons_q, 0x50);
+            let sig_c =
+                slot::<extern "system" fn(This, This, u64) -> HRESULT>(cons_q, signal_slot(cons_q));
+            let completed = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
+
+            if consumer_first {
+                exec_c(cons_q, 1, &cons_list);
+                assert_eq!(sig_c(cons_q, fence, 1), S_OK);
+                assert_eq!(completed(fence), 0);
+                assert_eq!(result.load(Ordering::Acquire), 0);
+                exec_p(prod_q, 1, &prod_list);
+                wait_fence_value(fence, 1);
+            } else {
+                exec_p(prod_q, 1, &prod_list);
+                exec_c(cons_q, 1, &cons_list);
+                assert_eq!(sig_c(cons_q, fence, 1), S_OK);
+                assert_eq!(completed(fence), 1);
+            }
+
+            assert_eq!(counter.load(Ordering::Acquire), 2);
+            assert_eq!(payload.load(Ordering::Acquire), 0x5a55a11c);
+            assert_eq!(
+                result.load(Ordering::Acquire),
+                0x5a55a11c,
+                "consumer_first={consumer_first}"
+            );
+
+            for o in [
+                prod_list, prod_alloc, prod_q, cons_list, cons_alloc, cons_q, fence,
+            ] {
+                slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+            }
+        }
+    }
+
+    #[test]
+    fn mid_list_memory_wait_preserves_pre_wait_work_and_releases_post_wait_tail() {
+        let (prod_q, prod_alloc, prod_list) = make_queue_and_list();
+        let (cons_q, cons_alloc, cons_list) = make_queue_and_list();
+        let mut fence = std::ptr::null();
+        assert_eq!(
+            crate::fence::create(
+                std::ptr::null(),
+                0,
+                0,
+                &crate::fence::FENCE_IIDS[0],
+                &mut fence
+            ),
+            S_OK
+        );
+
+        let pre_src = Box::new(AtomicU64::new(0xfeed_face_cafe_babe));
+        let pre_dst = Box::new(AtomicU64::new(0));
+        let pre_marker = Box::new(AtomicU64::new(0));
+        let gate = Box::new(AtomicU64::new(0));
+        let post_src = Box::new(AtomicU64::new(0));
+        let post_dst = Box::new(AtomicU64::new(0));
+        let post_marker = Box::new(AtomicU64::new(0));
+
+        let write64_c = slot::<extern "system" fn(This, u64, u64, u32, u32)>(
+            cons_list,
+            list_slot_offset(cons_list, 0x230),
+        );
+        let wait64_c = slot::<extern "system" fn(This, u64, u32, u64, u32)>(
+            cons_list,
+            list_slot_offset(cons_list, 0x240),
+        );
+        let copy_c = slot::<extern "system" fn(This, u64, u64, u64, u32)>(
+            cons_list,
+            list_slot_offset(cons_list, 0x1e0),
+        );
+        let close_c = slot::<extern "system" fn(This) -> HRESULT>(cons_list, 0x48);
+
+        // Pre-wait work.
+        copy_c(
+            cons_list,
+            (&raw const *pre_dst) as u64,
+            (&raw const *pre_src) as u64,
+            8,
+            0,
+        );
+        write64_c(
+            cons_list,
+            (&raw const *pre_marker) as u64,
+            0x1111_2222_3333_4444,
+            0,
+            0,
+        );
+        // Full 64-bit threshold: low 32 bits alone must not satisfy it.
+        wait64_c(
+            cons_list,
+            (&raw const *gate) as u64,
+            7,
+            0x0000_0001_0000_0001,
+            1,
+        );
+        // Post-wait work.
+        copy_c(
+            cons_list,
+            (&raw const *post_dst) as u64,
+            (&raw const *post_src) as u64,
+            8,
+            0,
+        );
+        write64_c(
+            cons_list,
+            (&raw const *post_marker) as u64,
+            0xaaaa_bbbb_cccc_dddd,
+            0,
+            0,
+        );
+        assert_eq!(close_c(cons_list), S_OK);
+
+        let write64_p = slot::<extern "system" fn(This, u64, u64, u32, u32)>(
+            prod_list,
+            list_slot_offset(prod_list, 0x230),
+        );
+        let close_p = slot::<extern "system" fn(This) -> HRESULT>(prod_list, 0x48);
+        write64_p(
+            prod_list,
+            (&raw const *post_src) as u64,
+            0x5a55_a11c_dead_beef,
+            0,
+            0,
+        );
+        write64_p(
+            prod_list,
+            (&raw const *gate) as u64,
+            0x0000_0001_0000_0001,
+            0,
+            0,
+        );
+        assert_eq!(close_p(prod_list), S_OK);
+
+        let exec_c = slot::<extern "system" fn(This, u32, *const This)>(cons_q, 0x50);
+        let exec_p = slot::<extern "system" fn(This, u32, *const This)>(prod_q, 0x50);
+        let sig_c =
+            slot::<extern "system" fn(This, This, u64) -> HRESULT>(cons_q, signal_slot(cons_q));
+        let completed = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
+
+        // Submit consumer first: pre-wait work completes immediately; post-wait stays pending.
+        exec_c(cons_q, 1, &cons_list);
+        assert_eq!(sig_c(cons_q, fence, 1), S_OK);
+        assert_eq!(pre_dst.load(Ordering::Acquire), 0xfeed_face_cafe_babe);
+        assert_eq!(pre_marker.load(Ordering::Acquire), 0x1111_2222_3333_4444);
+        assert_eq!(post_dst.load(Ordering::Acquire), 0);
+        assert_eq!(post_marker.load(Ordering::Acquire), 0);
+        assert_eq!(completed(fence), 0);
+
+        // Low-32-bit write only must not release a 64-bit wait.
+        gate.store(1, Ordering::Release);
+        notify_memory_waiters();
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(post_dst.load(Ordering::Acquire), 0);
+        assert_eq!(completed(fence), 0);
+
+        // Producer writes full 64-bit payload and gate, releasing post-wait work and fence.
+        exec_p(prod_q, 1, &prod_list);
+        wait_fence_value(fence, 1);
+        assert_eq!(post_dst.load(Ordering::Acquire), 0x5a55_a11c_dead_beef);
+        assert_eq!(post_marker.load(Ordering::Acquire), 0xaaaa_bbbb_cccc_dddd);
+
+        for o in [
+            prod_list, prod_alloc, prod_q, cons_list, cons_alloc, cons_q, fence,
+        ] {
+            slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        }
     }
 }

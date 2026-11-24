@@ -64,29 +64,26 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// Last render-target and depth descriptor handles set on the list,
+    /// replayed when a mid-list wait opens a new host command list segment.
+    target_handles: Vec<u64>,
+    depth_handle: u64,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
+    viewports: Vec<D3D12_VIEWPORT>,
+    scissors: Vec<RECT>,
+    blend_factor: Option<[f32; 4]>,
+    stencil_ref: Option<u32>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
+    /// Tables made afresh in this segment: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
-    }
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -170,6 +167,58 @@ impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
+    }
+
+    /// Re-applies persistent graphics state when a mid-list wait seals the
+    /// current host command list and opens a fresh segment.
+    pub(crate) fn rebind_segment(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        // Fresh tables point at CBV scratch owned by the sealed segment.
+        self.fresh_tables.clear();
+        if self.topology != 0 {
+            self.set_topology(list, self.topology);
+        }
+        if !self.viewports.is_empty() {
+            viewports(list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            scissors(list, &self.scissors);
+        }
+        if let Some(factor) = self.blend_factor {
+            blend_factor(list, Some(&factor));
+        }
+        if let Some(reference) = self.stencil_ref {
+            stencil_ref(list, reference);
+        }
+        if !self.target_handles.is_empty() || self.depth_handle != 0 {
+            let handles = self.target_handles.clone();
+            let depth = self.depth_handle;
+            self.set_targets(list, &handles, depth);
+        }
+    }
+
+    pub(crate) fn set_viewports(&mut self, list: &HostList, vp: &[D3D12_VIEWPORT]) {
+        self.viewports.clear();
+        self.viewports.extend_from_slice(vp);
+        viewports(list, vp);
+    }
+
+    pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        self.scissors.clear();
+        self.scissors.extend_from_slice(rects);
+        scissors(list, rects);
+    }
+
+    pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
+        self.blend_factor = factor.copied();
+        blend_factor(list, factor);
+    }
+
+    pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
+        self.stencil_ref = Some(reference);
+        stencil_ref(list, reference);
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -256,6 +305,9 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        self.target_handles.clear();
+        self.target_handles.extend_from_slice(handles);
+        self.depth_handle = depth;
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -349,7 +401,10 @@ impl State {
             return false;
         };
         if p.compute || p.mesh != mesh {
-            once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            once!(
+                mesh,
+                "a draw or mesh dispatch with another kind of pipeline"
+            );
             return false;
         }
         if !self.bind(list, p, false) {
@@ -733,8 +788,7 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            list.keep_dynamic(std::ptr::from_ref(heap) as usize, first, n);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1032,13 +1086,19 @@ impl State {
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                Some(p) => why(&format!(
+                    "prepare failed (compute {}, mesh {})",
+                    p.compute, p.mesh
+                )),
             }
             return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
+            )
         });
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
@@ -1155,7 +1215,10 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{}x{} f{} flags {:#x}",
+                d.Width, d.Height, d.Format.0, d.Flags.0
+            )
         })
     };
     match view {

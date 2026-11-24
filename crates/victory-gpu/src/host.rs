@@ -311,6 +311,13 @@ pub(crate) struct HostList {
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
 }
 
+// SAFETY: D3D12 command lists, allocators, resources, and retained IUnknown
+// handles are free-threaded COM objects; interior state is behind Mutex or
+// OnceLock, and execution/prelude recording is serialized under Host::submitted.
+unsafe impl Send for HostList {}
+// SAFETY: as above.
+unsafe impl Sync for HostList {}
+
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
@@ -409,8 +416,19 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Dynamic descriptor slots owned by this host list segment: title heap,
+    /// first slot, count; released when the segment resets or drops.
+    dynamic: Vec<(usize, u32, u32)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+}
+
+impl Drop for Deferred {
+    fn drop(&mut self) {
+        for &(heap, first, n) in &self.dynamic {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+    }
 }
 
 impl Host {
@@ -604,6 +622,8 @@ impl Host {
             }
         }
         self.log_messages();
+        drop(submitted);
+        crate::queue::notify_memory_waiters();
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1135,6 +1155,12 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    /// Keeps dynamic descriptor slots `[first, first + count)` of `heap`
+    /// alive until this host list segment is reset or dropped.
+    pub(crate) fn keep_dynamic(&self, heap: usize, first: u32, count: u32) {
+        self.deferred().dynamic.push((heap, first, count));
     }
 
     /// Whether this is the first time since the reset that the list asks
