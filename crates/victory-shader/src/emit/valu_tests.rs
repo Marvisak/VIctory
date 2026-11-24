@@ -11,6 +11,9 @@ use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
 use crate::{io, ir, resource, structure};
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
@@ -69,6 +72,10 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_with_threads(body, 1)
+}
+
+fn build_valu_cs_with_threads(body: &[u32], threads: u32) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -117,7 +124,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code,
     };
@@ -172,6 +179,15 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_cases_with_wave_size(shader, cases, None, check);
+}
+
+fn run_cases_with_wave_size(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    wave_size: Option<u32>,
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -181,6 +197,24 @@ fn run_cases(
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        if let Some(size) = wave_size {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the feature selector requires a writable OPTIONS1 of this size.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .expect("D3D12_OPTIONS1");
+            if !options.WaveOps.as_bool()
+                || !(options.WaveLaneCountMin..=options.WaveLaneCountMax).contains(&size)
+            {
+                eprintln!("no wave{size} on {label}; skipped");
+                continue;
+            }
+        }
         let (root, pso) = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
@@ -209,7 +243,31 @@ fn run_cases(
         }
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    assert!(
+        ran > 0 || wave_size.is_some(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
+}
+
+#[test]
+fn scalar_lane_mask_comparison_is_wave_wide() {
+    for (op, expected) in [(0xBF06_7E6A, 2), (0xBF07_7E6A, 1)] {
+        let shader = build_valu_cs_with_threads(
+            &[
+                vop1(0x001, 5, 129),    // v_mov_b32 v5, 1
+                0x7D84_0080,           // v_cmp_eq_u32 vcc_lo, 0, v0 (local thread ID)
+                op,                    // s_cmp_eq/lg_u32 vcc_lo, exec_lo
+                0xBF85_0001,           // s_cbranch_scc1 skip
+                vop1(0x001, 5, 130),    // v_mov_b32 v5, 2
+                0x7DA4_0080,           // skip: v_cmpx_eq_u32 0, v0 (only lane 0 stores)
+                vop1(0x001, 0, vgpr(5)), // v_mov_b32 v0, v5
+            ],
+            2,
+        );
+        run_cases_with_wave_size(&shader, &[[0; 4]], Some(32), |backend, _, _, got| {
+            assert_eq!(got, expected, "{backend}: scalar compare {op:#x}");
+        });
+    }
 }
 
 fn is_f16_nan(bits: u16) -> bool {
