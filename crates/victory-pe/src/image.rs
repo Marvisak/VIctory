@@ -605,4 +605,182 @@ mod tests {
         truncated.truncate(0x100);
         assert!(ImageInfo::parse(&truncated).is_err());
     }
+
+    // The own-binary import, IAT and TLS tests only run on Windows. This
+    // image carries all three by hand, so their edges run on any host.
+
+    const SYNTHETIC_BASE: u64 = 0x1_8000_0000;
+
+    /// The synthetic image with its export directory cleared and instead an
+    /// import of `user32.dll` (`Beep` by name, then ordinal 7) and a TLS
+    /// directory whose callback array holds two callbacks, a terminator and
+    /// a stray entry after it. Returns the image and the file offset of RVA
+    /// 0x1000, where the body starts.
+    fn synthetic_image_with_imports_and_tls() -> (Vec<u8>, usize) {
+        let mut b = vec![0u8; 0x200];
+        let p16 =
+            |b: &mut Vec<u8>, at: usize, v: u16| b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        let p32 =
+            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let p64 =
+            |b: &mut Vec<u8>, at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        // One import descriptor, then the null one.
+        p32(&mut b, 0x00, 0x1100); // name table
+        p32(&mut b, 0x0C, 0x1180); // DLL name
+        p32(&mut b, 0x10, 0x1140); // IAT
+        for table in [0x100, 0x140] {
+            p64(&mut b, table, 0x1190);
+            p64(&mut b, table + 8, (1 << 63) | 7);
+        }
+        b[0x180..0x18B].copy_from_slice(b"user32.dll\0");
+        p16(&mut b, 0x190, 0x2A);
+        b[0x192..0x197].copy_from_slice(b"Beep\0");
+        // TLS directory; its callback array is at RVA 0x1060.
+        p64(
+            &mut b,
+            0x1C0 + layout::TLS64_ADDRESS_OF_CALLBACKS,
+            SYNTHETIC_BASE + 0x1060,
+        );
+        p64(&mut b, 0x60, SYNTHETIC_BASE + 0x1010);
+        p64(&mut b, 0x68, SYNTHETIC_BASE + 0x1020);
+        p64(&mut b, 0x78, SYNTHETIC_BASE + 0x1030); // after the terminator
+
+        let mut d = synthetic_image(&b);
+        let directory = |d: &mut Vec<u8>, index: usize, rva: u32, size: u32| {
+            let at = 0x58 + 112 + index * 8;
+            d[at..at + 4].copy_from_slice(&rva.to_le_bytes());
+            d[at + 4..at + 8].copy_from_slice(&size.to_le_bytes());
+        };
+        directory(&mut d, 0, 0, 0);
+        directory(&mut d, dir::IMPORT, 0x1000, 40);
+        directory(&mut d, pe::IMAGE_DIRECTORY_ENTRY_TLS, 0x11C0, 40);
+        (d, 0x200)
+    }
+
+    fn symbols(module: &ImportModule) -> Vec<(ImportSymbol, u32)> {
+        module
+            .entries
+            .iter()
+            .map(|e| (e.symbol.clone(), e.iat_slot_rva))
+            .collect()
+    }
+
+    fn beep_then_ordinal_7(first_slot: u32) -> Vec<(ImportSymbol, u32)> {
+        vec![
+            (
+                ImportSymbol::Name {
+                    hint: 0x2A,
+                    name: "Beep".into(),
+                },
+                first_slot,
+            ),
+            (ImportSymbol::Ordinal(7), first_slot + 8),
+        ]
+    }
+
+    #[test]
+    fn synthetic_imports_pair_names_and_ordinals_with_iat_slots() {
+        let (data, _) = synthetic_image_with_imports_and_tls();
+        let info = ImageInfo::parse(&data).unwrap();
+        assert!(info.exports.is_empty());
+        assert!(info.delay_imports.is_empty());
+        assert_eq!(info.imports.len(), 1);
+        assert_eq!(info.imports[0].dll, "user32.dll");
+        assert_eq!(symbols(&info.imports[0]), beep_then_ordinal_7(0x1140));
+        assert_eq!(info.import_count(), 2);
+        assert_eq!(info.imports[0].entries[1].symbol.to_string(), "#7");
+    }
+
+    #[test]
+    fn without_a_name_table_imports_are_read_from_the_iat() {
+        let (mut data, body) = synthetic_image_with_imports_and_tls();
+        // Old linkers leave OriginalFirstThunk 0. Clear the name table too,
+        // so only a read of the IAT can find the imports.
+        data[body..body + 4].fill(0);
+        data[body + 0x100..body + 0x110].fill(0);
+        let info = ImageInfo::parse(&data).unwrap();
+        assert_eq!(symbols(&info.imports[0]), beep_then_ordinal_7(0x1140));
+    }
+
+    #[test]
+    fn synthetic_iat_must_fit_inside_the_image() {
+        let (data, body) = synthetic_image_with_imports_and_tls();
+        let with_iat = |rva: u32, entries: usize| {
+            let mut d = data.clone();
+            d[body + 0x10..body + 0x14].copy_from_slice(&rva.to_le_bytes());
+            d[body + 0x100 + entries * 8..body + 0x110].fill(0);
+            ImageInfo::parse(&d)
+        };
+        // The IAT RVA is not checked by `object`: only the slots it implies.
+        // The last slot may end exactly at SizeOfImage (0x2000)...
+        let info = with_iat(0x1FF8, 1).unwrap();
+        assert_eq!(info.imports[0].entries[0].iat_slot_rva, 0x1FF8);
+        // ...but a second slot from there runs past it,
+        assert!(matches!(with_iat(0x1FF8, 2), Err(PeError::Malformed(_))));
+        // and one at the 4 GiB limit used to overflow.
+        assert!(matches!(
+            with_iat(0xFFFF_FFF8, 1),
+            Err(PeError::Malformed(_))
+        ));
+        assert!(matches!(
+            with_iat(0xFFFF_FFFC, 1),
+            Err(PeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn synthetic_tls_callbacks_stop_at_the_first_null() {
+        let (data, _) = synthetic_image_with_imports_and_tls();
+        let tls = ImageInfo::parse(&data).unwrap().tls.unwrap();
+        assert_eq!(tls.directory_rva, 0x11C0);
+        assert_eq!(tls.callbacks_va, SYNTHETIC_BASE + 0x1060);
+        assert_eq!(tls.callback_rvas, [0x1010, 0x1020]);
+    }
+
+    #[test]
+    fn synthetic_tls_without_callbacks_is_still_a_tls_directory() {
+        let (mut data, body) = synthetic_image_with_imports_and_tls();
+        let callbacks = body + 0x1C0 + layout::TLS64_ADDRESS_OF_CALLBACKS;
+        data[callbacks..callbacks + 8].fill(0);
+        let tls = ImageInfo::parse(&data).unwrap().tls.unwrap();
+        assert_eq!(tls.callbacks_va, 0);
+        assert!(tls.callback_rvas.is_empty());
+        // And no TLS directory at all is `None`, not an error.
+        let at = 0x58 + 112 + pe::IMAGE_DIRECTORY_ENTRY_TLS * 8;
+        data[at..at + 8].fill(0);
+        assert!(ImageInfo::parse(&data).unwrap().tls.is_none());
+    }
+
+    #[test]
+    fn synthetic_tls_pointers_outside_the_image_are_refused() {
+        let (data, body) = synthetic_image_with_imports_and_tls();
+        let patched = |at: usize, va: u64| {
+            let mut d = data.clone();
+            d[body + at..body + at + 8].copy_from_slice(&va.to_le_bytes());
+            ImageInfo::parse(&d)
+        };
+        let array = 0x1C0 + layout::TLS64_ADDRESS_OF_CALLBACKS;
+        // The array below the image base, more than 4 GiB above it, and
+        // inside the image but past the one section's data.
+        for va in [
+            SYNTHETIC_BASE - 8,
+            SYNTHETIC_BASE + (1 << 32),
+            SYNTHETIC_BASE + 0x1F00,
+        ] {
+            assert!(
+                matches!(patched(array, va), Err(PeError::Malformed(_))),
+                "callback array at {va:#x}"
+            );
+        }
+        // A callback below the image base.
+        assert!(matches!(
+            patched(0x68, SYNTHETIC_BASE - 0x10),
+            Err(PeError::Malformed(_))
+        ));
+        // A TLS directory RVA past the section.
+        let mut d = data.clone();
+        let at = 0x58 + 112 + pe::IMAGE_DIRECTORY_ENTRY_TLS * 8;
+        d[at..at + 4].copy_from_slice(&0x1F00u32.to_le_bytes());
+        assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+    }
 }
