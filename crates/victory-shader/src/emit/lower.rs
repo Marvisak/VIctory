@@ -3869,6 +3869,37 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
                 int(self, r)
             }
+            "v_ldexp_f32" => {
+                // src0 * 2^src1 as three factors 2^e, each exponent in the
+                // normal range, so the products are exact until the result
+                // leaves it. Past |src1| = 375 every finite nonzero src0 has
+                // over- or underflowed, so src1 is clamped there; then
+                // e1 = floor(src1 * 21846 / 65536) (about a third) and the
+                // rest in two halves.
+                // shortcut: a result that turns denormal before the last
+                // factor is rounded twice where denormals are kept.
+                let (a, e) = (f(self, 0)?, s(self, 1)?);
+                let (lo, hi) = (self.s.m.i32((-375i32).cast_unsigned()), self.s.m.i32(375));
+                let below = self.s.m.cmp(c, pred::SLT, e, lo);
+                let e = self.s.m.select(c, below, lo, e);
+                let above = self.s.m.cmp(c, pred::SGT, e, hi);
+                let e = self.s.m.select(c, above, hi, e);
+                let (third, k16, one) = (self.s.m.i32(21846), self.s.m.i32(16), self.s.m.i32(1));
+                let t = self.s.m.bin(c, Bin::Mul, e, third);
+                let e1 = self.s.m.bin(c, Bin::AShr, t, k16);
+                let rest = self.s.m.bin(c, Bin::Sub, e, e1);
+                let e2 = self.s.m.bin(c, Bin::AShr, rest, one);
+                let e3 = self.s.m.bin(c, Bin::Sub, rest, e2);
+                let mut r = a;
+                for x in [e1, e2, e3] {
+                    let (bias, k23) = (self.s.m.i32(127), self.s.m.i32(23));
+                    let x = self.s.m.bin(c, Bin::Add, x, bias);
+                    let x = self.s.m.bin(c, Bin::Shl, x, k23);
+                    let p = self.as_float(x);
+                    r = self.s.m.bin(c, Bin::Mul, r, p);
+                }
+                float(self, r)
+            }
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded to nearest even (the MODE default) into the low half.
                 let a = f(self, 0)?;
@@ -4675,6 +4706,75 @@ impl<'a> Lower<'a> {
             "v_mul_hi_u32" | "v_mul_hi_i32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 self.mul_hi(a, b, name == "v_mul_hi_i32")
+            }
+            "v_mul_hi_u32_u24" | "v_mul_hi_i32_i24" => {
+                // The high 32 bits of the 48-bit product of the low 24 bits
+                // (zero- or sign-extended, as `v_mul_u32_u24` takes them).
+                let signed = name == "v_mul_hi_i32_i24";
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let (sh, op) = (k(self, 8), if signed { Bin::AShr } else { Bin::LShr });
+                let a = self.s.m.bin(c, Bin::Shl, a, sh);
+                let a = self.s.m.bin(c, op, a, sh);
+                let b = self.s.m.bin(c, Bin::Shl, b, sh);
+                let b = self.s.m.bin(c, op, b, sh);
+                self.mul_hi(a, b, signed)
+            }
+            "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32" => {
+                // Each source saturated to 16 bits: src0 into the low half,
+                // src1 into the high one.
+                let unsigned = name == "v_cvt_pk_u16_u32";
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let mut halves = [a, b];
+                for x in &mut halves {
+                    *x = if unsigned {
+                        let max = k(self, 0xFFFF);
+                        let over = self.s.m.cmp(c, pred::IUGT, *x, max);
+                        self.s.m.select(c, over, max, *x)
+                    } else {
+                        let (lo, hi, m) = (k(self, 0xFFFF_8000), k(self, 0x7FFF), k(self, 0xFFFF));
+                        let below = self.s.m.cmp(c, pred::SLT, *x, lo);
+                        let t = self.s.m.select(c, below, lo, *x);
+                        let above = self.s.m.cmp(c, pred::SGT, t, hi);
+                        let t = self.s.m.select(c, above, hi, t);
+                        self.s.m.bin(c, Bin::And, t, m)
+                    };
+                }
+                let k16 = k(self, 16);
+                let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
+                self.s.m.bin(c, Bin::Or, halves[0], hi)
+            }
+            "v_dot2_i32_i16" | "v_dot2_u32_u16" | "v_dot4_i32_i8" | "v_dot4_u32_u8"
+            | "v_dot8_u32_u4" => {
+                // The products of the packed fields of src0 and src1, summed
+                // into src2, wrapping (clamp is refused with the other
+                // integer output modifiers).
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                if v.opsel != 0 || v.neg_hi != 0 {
+                    return Err("dot product operand selects");
+                }
+                let (bits, signed) = match name {
+                    "v_dot2_i32_i16" => (16, true),
+                    "v_dot2_u32_u16" => (16, false),
+                    "v_dot4_i32_i8" => (8, true),
+                    "v_dot4_u32_u8" => (8, false),
+                    _ => (4, false),
+                };
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let mut sum = s(self, 2)?;
+                let op = if signed { Bin::AShr } else { Bin::LShr };
+                for i in 0..32 / bits {
+                    // Field i to the top, then down again (extending it).
+                    let (up, down) = (k(self, 32 - bits * (i + 1)), k(self, 32 - bits));
+                    let x = self.s.m.bin(c, Bin::Shl, a, up);
+                    let x = self.s.m.bin(c, op, x, down);
+                    let y = self.s.m.bin(c, Bin::Shl, b, up);
+                    let y = self.s.m.bin(c, op, y, down);
+                    let p = self.s.m.bin(c, Bin::Mul, x, y);
+                    sum = self.s.m.bin(c, Bin::Add, sum, p);
+                }
+                sum
             }
             "v_alignbit_b32" | "v_alignbyte_b32" => {
                 // The low dword of {a, b} >> shift.

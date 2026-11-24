@@ -673,3 +673,167 @@ fn bfe_signed_and_unsigned_match_rdna2() {
         );
     });
 }
+
+/// VOP3P `op vdst, src0, src1, src2` with the default `op_sel_hi` (all
+/// halves high) and no other modifiers.
+const fn vop3p(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0x33 << 26 | (op as u32 & 0x7F) << 16 | 1 << 14 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18 | 3 << 27,
+    ]
+}
+
+/// Inputs that reach the edges of 8-, 16- and 24-bit fields.
+const EDGES: [u32; 10] = [
+    0,
+    1,
+    0x7F,
+    0x80,
+    0xFF,
+    0x7FFF,
+    0x8000,
+    0x00FF_FFFF,
+    0x8000_0000,
+    0xFFFF_FFFF,
+];
+
+/// Pairs and triples of [`EDGES`] and a few mixed words.
+fn edge_cases() -> Vec<[u32; 4]> {
+    let mut out = Vec::new();
+    for &a in &EDGES {
+        for &b in &EDGES {
+            out.push([a, b, 0x1234_5678, 0]);
+        }
+    }
+    out.extend([
+        [0x0123_4567, 0x89AB_CDEF, 0xDEAD_BEEF, 0],
+        [0x8081_7F7E, 0xFF01_80FE, 0x7FFF_FFFF, 0],
+        [0xFEDC_BA98, 0x7654_3210, 0x8000_0000, 0],
+    ]);
+    out
+}
+
+#[test]
+fn v_mul_hi_24_bit_products() {
+    // VOP2 v_mul_hi_u32_u24 (0x0c) and v_mul_hi_i32_i24 (0x0a) as VOP3.
+    for (op, signed) in [(0x10c, false), (0x10a, true)] {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), 0));
+        let cases = edge_cases();
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let ext = |x: u32| {
+                if signed {
+                    i64::from((x << 8).cast_signed() >> 8)
+                } else {
+                    i64::from(x & 0x00FF_FFFF)
+                }
+            };
+            let want = ((ext(inp[0]) * ext(inp[1])) >> 32) as u32;
+            assert_eq!(
+                got, want,
+                "{backend}: op {op:#x}({:#x}, {:#x})",
+                inp[0], inp[1]
+            );
+        });
+    }
+}
+
+#[test]
+fn v_cvt_pk_16_saturates_each_half() {
+    // VOP3 v_cvt_pk_u16_u32 (0x36a) and v_cvt_pk_i16_i32 (0x36b).
+    for (op, signed) in [(0x36a, false), (0x36b, true)] {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), 0));
+        let cases = edge_cases();
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let sat = |x: u32| {
+                if signed {
+                    (x.cast_signed().clamp(-32768, 32767) as u32) & 0xFFFF
+                } else {
+                    x.min(0xFFFF)
+                }
+            };
+            let want = sat(inp[0]) | sat(inp[1]) << 16;
+            assert_eq!(
+                got, want,
+                "{backend}: op {op:#x}({:#x}, {:#x})",
+                inp[0], inp[1]
+            );
+        });
+    }
+}
+
+#[test]
+fn v_dot_products_of_packed_fields() {
+    // VOP3P dot products: (opcode, field bits, signed).
+    for (op, bits, signed) in [
+        (0x14, 16, true),
+        (0x15, 16, false),
+        (0x16, 8, true),
+        (0x17, 8, false),
+        (0x19, 4, false),
+    ] {
+        let shader = build_valu_cs(&vop3p(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        let cases = edge_cases();
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let field = |x: u32, i: u32| {
+                let f = (x >> (bits * i)) & ((1 << bits) - 1);
+                if signed && f >> (bits - 1) != 0 {
+                    i64::from(f) - (1 << bits)
+                } else {
+                    i64::from(f)
+                }
+            };
+            let mut sum = if signed {
+                i64::from(inp[2].cast_signed())
+            } else {
+                i64::from(inp[2])
+            };
+            for i in 0..32 / bits {
+                sum += field(inp[0], i) * field(inp[1], i);
+            }
+            let want = sum as u32;
+            assert_eq!(
+                got, want,
+                "{backend}: dot op {op:#x}({:#x}, {:#x}, {:#x})",
+                inp[0], inp[1], inp[2]
+            );
+        });
+    }
+}
+
+#[test]
+fn v_ldexp_f32_scales_by_powers_of_two() {
+    // VOP3 v_ldexp_f32 (0x362): v1 * 2^v2.
+    let shader = build_valu_cs(&vop3(0x362, 0, vgpr(1), vgpr(2), 0));
+    let f = f32::to_bits;
+    let e = |x: i32| x.cast_unsigned();
+    let cases: &[([u32; 4], f32)] = &[
+        ([f(1.0), e(0), 0, 0], 1.0),
+        ([f(1.5), e(3), 0, 0], 12.0),
+        ([f(-3.0), e(-2), 0, 0], -0.75),
+        ([f(1.0), e(127), 0, 0], 2f32.powi(127)),
+        ([f(1.0), e(-126), 0, 0], f32::MIN_POSITIVE),
+        ([f(1.0), e(128), 0, 0], f32::INFINITY),
+        ([f(-1.0), e(1000), 0, 0], f32::NEG_INFINITY),
+        ([f(1.0), e(i32::MIN), 0, 0], 0.0),
+        // Exponents past one factor's range still scale exactly.
+        ([f(2f32.powi(-100)), e(200), 0, 0], 2f32.powi(100)),
+        ([f(2f32.powi(100)), e(-200), 0, 0], 2f32.powi(-100)),
+        (
+            [f(f32::MAX), e(-253), 0, 0],
+            f32::MAX / 2f32.powi(127) / 2f32.powi(126),
+        ),
+        ([f(0.0), e(50), 0, 0], 0.0),
+        ([f(f32::INFINITY), e(-50), 0, 0], f32::INFINITY),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            f32::from_bits(got),
+            want,
+            "{backend}: ldexp({}, {})",
+            f32::from_bits(inp[0]),
+            inp[1].cast_signed()
+        );
+    });
+}

@@ -594,4 +594,76 @@ mod tests {
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
+
+    /// The VALU instructions added for packing, dot products and ldexp
+    /// translate in a pixel shader whose colour depends on their result
+    /// (their values are checked on a GPU by `valu_tests`).
+    #[test]
+    fn packing_dot_and_ldexp_instructions_translate() {
+        let vop1 = |vdst: u32, src0: u32| 0x7E00_0000 | vdst << 17 | 1 << 9 | src0;
+        // v1..v3 = 1.0, 2.0, 0.5; then the instruction into v4.
+        let prologue = [vop1(1, 242), vop1(2, 244), vop1(3, 240)];
+        let operands = 257 | 258 << 9 | 259 << 18;
+        let vop3 = |op: u32| [0x35 << 26 | op << 16 | 4, operands];
+        let vop3p = |op: u32| [0x33 << 26 | op << 16 | 1 << 14 | 4, operands | 3 << 27];
+        let cases: [(&str, [u32; 2]); 10] = [
+            ("v_mul_hi_i32_i24", vop3(0x10a)),
+            ("v_mul_hi_u32_u24", vop3(0x10c)),
+            ("v_ldexp_f32", vop3(0x362)),
+            ("v_cvt_pk_u16_u32", vop3(0x36a)),
+            ("v_cvt_pk_i16_i32", vop3(0x36b)),
+            ("v_dot2_i32_i16", vop3p(0x14)),
+            ("v_dot2_u32_u16", vop3p(0x15)),
+            ("v_dot4_i32_i8", vop3p(0x16)),
+            ("v_dot4_u32_u8", vop3p(0x17)),
+            ("v_dot8_u32_u4", vop3p(0x19)),
+        ];
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let osg1 = super::container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        for (name, inst) in cases {
+            // exp mrt0 v4, v4, v4, v4 done vm; s_endpgm
+            let words = [
+                &prologue[..],
+                &inst,
+                &[0xF800_180F, 0x0404_0404, 0xBF81_0000],
+            ]
+            .concat();
+            let native = super::NativeProgram {
+                stage: super::HwStage::Ps,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![],
+                used: vec![],
+                io: crate::native::StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 2,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
+            let decoded = crate::gfx10::decode(&native.code).unwrap();
+            assert_eq!(decoded[3].name(), Some(name));
+            let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            if let Err(e) = super::emit(&c, &native, &p, &st, &io, &res) {
+                panic!("{name}: {e}");
+            }
+        }
+    }
 }
