@@ -68,9 +68,10 @@ fn build() -> &'static [u8; 32] {
 }
 
 /// The translation of a console shader container, from the cache when
-/// there is one.
+/// there is one. A refusal names where the missing value it needed was
+/// made.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| victory_shader::emit::translate_traced(c).map_err(|r| r.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),

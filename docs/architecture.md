@@ -96,4 +96,9 @@ to the per-lane load or choice that gives each lane its own (a mask's
 the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
-lists what they cannot handle yet.
+lists what they cannot handle yet. A value with no DXIL form only stops a
+program where something with an effect needs it, often far from where it
+was made, so an emit refusal also names the instruction that made the
+value (`from <instruction> at <offset>` with `--list`, and `made by` under
+each reason; `made by <instruction> at <offset>` in the runtime's "shader
+does not translate" warning).
