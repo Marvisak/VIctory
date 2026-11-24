@@ -174,6 +174,7 @@ static CAPTURE_VTABLE: Methods<6> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::{S_OK, method};
+    use windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED;
 
     #[test]
     fn sdr_and_display_deferrals() {
@@ -185,11 +186,16 @@ mod tests {
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();
-        assert_eq!(
-            method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle),
-            S_OK
-        );
-        assert!(!handle.is_null());
-        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+        let hr = method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle);
+        const UNSUPPORTED: HRESULT = (0x8007_0000 | ERROR_NOT_SUPPORTED) as HRESULT;
+        match hr {
+            S_OK => {
+                assert!(!handle.is_null());
+                method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+            }
+            // Some Windows sessions cannot create a display power request.
+            UNSUPPORTED => assert!(handle.is_null()),
+            _ => panic!("unexpected display power request HRESULT {hr:#010x}"),
+        }
     }
 }

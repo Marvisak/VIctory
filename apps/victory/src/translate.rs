@@ -273,10 +273,11 @@ pub fn run(
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
         for (v, p) in &pairs {
-            let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
+            let graphics = find_shader(&kept, v, &[HwStage::Vs, HwStage::Ms]);
+            let pixel = find_shader(&kept, p, &[HwStage::Ps]);
+            let made = match (graphics, pixel) {
+                (Some(vs), Some(ps)) => if vs.stage == HwStage::Ms {
                     host.mesh_pipeline(vs, ps)
                 } else {
                     host.pipeline(vs, ps)
@@ -301,6 +302,17 @@ pub fn run(
     Ok(())
 }
 
+fn find_shader<'a>(
+    shaders: &'a [(String, emit::HostShader)],
+    name: &str,
+    stages: &[HwStage],
+) -> Option<&'a emit::HostShader> {
+    shaders
+        .iter()
+        .find(|(label, shader)| stages.contains(&shader.stage) && label.contains(name))
+        .map(|(_, shader)| shader)
+}
+
 fn translate(
     source: &Source,
     path: &Path,
@@ -319,7 +331,8 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    let key = translation_key(&container);
+    if !lock(seen).insert(key) {
         t.duplicates += 1;
         return;
     }
@@ -412,6 +425,18 @@ fn translate(
             }
         }
     }
+}
+
+fn translation_key(container: &Container<'_>) -> blake3::Hash {
+    // Emission reads signatures and pipeline metadata alongside the DXIL.
+    // Parsed parts exclude bytes after a container embedded in another file.
+    let mut hash = blake3::Hasher::new();
+    for part in &container.parts {
+        hash.update(&part.fourcc.0);
+        hash.update(&(part.data.len() as u64).to_le_bytes());
+        hash.update(part.data);
+    }
+    hash.finalize()
 }
 
 /// Validates an emitted shader if asked to.
@@ -668,4 +693,68 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_pair_selects_each_shader_by_stage() {
+        let ps = host::stub_ps();
+        let vs = host::stub_vs(&ps).unwrap();
+        let shaders = [("shared Ps".to_owned(), ps), ("shared Vs".to_owned(), vs)];
+
+        let graphics = find_shader(&shaders, "shared", &[HwStage::Vs, HwStage::Ms]);
+        let pixel = find_shader(&shaders, "shared", &[HwStage::Ps]);
+        assert_eq!(graphics.map(|shader| shader.stage), Some(HwStage::Vs));
+        assert_eq!(pixel.map(|shader| shader.stage), Some(HwStage::Ps));
+        assert!(find_shader(&shaders, "Vs", &[HwStage::Ps]).is_none());
+    }
+
+    fn shader_with_signature(signature: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; 40]; // Header and two part offsets.
+        bytes[..4].copy_from_slice(b"DXBC");
+        bytes[20..22].copy_from_slice(&1u16.to_le_bytes());
+        bytes[28..32].copy_from_slice(&2u32.to_le_bytes());
+        let parts = [(b"DXIL", b"synthetic program".as_slice()), (b"ISG1", signature)];
+        for (index, (tag, part)) in parts.into_iter().enumerate() {
+            let offset = bytes.len() as u32;
+            let table = 32 + index * 4;
+            bytes[table..table + 4].copy_from_slice(&offset.to_le_bytes());
+            bytes.extend_from_slice(tag);
+            bytes.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(part);
+        }
+        let size = bytes.len() as u32;
+        bytes[24..28].copy_from_slice(&size.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn translates_distinct_signatures_and_skips_duplicate_parts() {
+        let first = shader_with_signature(b"first signature");
+        let second = shader_with_signature(b"second signature");
+        let mut embedded = first.clone();
+        embedded.extend_from_slice(b"unrelated bytes after the container");
+        let seen = Mutex::new(HashSet::new());
+        let mut tally = Tally::default();
+        let mut checks = Checks {
+            keep: None,
+            validator: None,
+            host: None,
+        };
+        for data in [&first, &second, &embedded] {
+            translate(
+                &Source::Raw { offset: 0, data },
+                Path::new("synthetic"),
+                &seen,
+                &mut tally,
+                &mut checks,
+            );
+        }
+
+        assert_eq!(tally.containers, 3);
+        assert_eq!(tally.duplicates, 1);
+    }
 }

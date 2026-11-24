@@ -186,8 +186,12 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
             std::fs::remove_dir_all(entry.path())?;
-        } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
-            committed.push(n);
+        } else if let Some(digits) = file.strip_prefix('v')
+            && let Ok(number) = digits.parse::<u64>()
+            && digits == number.to_string()
+        {
+            // Only consider names that `commit` writes and cleanup can reconstruct.
+            committed.push(number);
         }
     }
     committed.sort_unstable();
@@ -292,6 +296,8 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
         }
     }
     out.sort();
+    // Recovery can see both names for a migration that already committed.
+    out.dedup();
     out
 }
 
@@ -1141,6 +1147,38 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+    }
+
+    #[test]
+    fn recovering_a_committed_migration_counts_the_container_once() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let old = root.join("Slot");
+        let new = container_dir(root, "Slot");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("blob"), b"data").unwrap();
+        commit(&new, 1, "Slot", "", &[("blob", Source::Data(b"data"))]).unwrap();
+
+        assert_eq!(used_bytes(root), 4);
+        assert!(!old.exists());
+        assert_eq!(containers(root), [("Slot".into(), new)]);
+    }
+
+    #[test]
+    fn a_noncanonical_directory_does_not_remove_a_committed_save() {
+        let root = tempfile::tempdir().unwrap();
+        let c = Provider {
+            root: root.path().to_owned(),
+        }
+        .container("Slot");
+        commit(&c.dir, 1, "Slot", "", &[("blob", Source::Data(b"data"))]).unwrap();
+        let backup = c.dir.join("v01");
+        std::fs::create_dir(&backup).unwrap();
+
+        let blobs = read(&c, None);
+        assert!(c.dir.join("v1").is_dir(), "the committed save was removed");
+        assert!(backup.is_dir());
+        assert_eq!(blobs.unwrap(), [("blob".into(), b"data".to_vec())]);
     }
 
     /// An empty configuration id names none. As a folder name it would be

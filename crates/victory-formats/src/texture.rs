@@ -272,10 +272,18 @@ impl Layout {
             && d.element_bytes.is_power_of_two()
             && d.element_bytes <= 16
             && matches!(d.block, 1 | 4)
+            // GFX10 Z swizzles require uncompressed elements of up to 64 bits.
+            && (!d.swizzle.z_order() || (d.block == 1 && d.element_bytes <= 8))
             && d.samples.is_power_of_two()
             && d.samples <= 8
-            && (d.samples == 1 || (d.dimension == Dimension::Tex2d && d.mips == 1))
-            && (d.dimension != Dimension::Tex1d || d.height == 1)
+            && (d.samples == 1
+                || (d.dimension == Dimension::Tex2d
+                    && d.mips == 1
+                    && !d.swizzle.standard()
+                    && !d.swizzle.display()))
+            // GFX10 permits linear, Z and render swizzles for 1D resources.
+            && (d.dimension != Dimension::Tex1d
+                || (d.height == 1 && !d.swizzle.standard() && !d.swizzle.display()))
             && (d.dimension != Dimension::Tex3d
                 || matches!(d.swizzle.0, 0 | 5 | 9 | 17 | 21 | 24..=27));
         if !valid {
@@ -347,9 +355,16 @@ impl Layout {
         };
         let slices = d.depth.next_multiple_of(block[2]);
         let three_d = d.dimension == Dimension::Tex3d;
-        // Mip depths placed by a thick layout (thin ones store depth as
-        // slices).
-        let mip_depth = |i: u32| if thick { padded_dim(d.depth, i, 1) } else { 1 };
+        // A thin volume allocates the full mip chain in each depth slice.
+        let padded_depth = |i: u32| {
+            if thick {
+                padded_dim(d.depth, i, 1)
+            } else if three_d {
+                d.depth
+            } else {
+                1
+            }
+        };
         let depth_of = |i: u32| if three_d { dim(d.depth, i, 1) } else { 1 };
         let (width, height) = (|i| dim(d.width, i, d.block), |i| dim(d.height, i, d.block));
         let padded = |i| (padded_dim(d.width, i, d.block), padded_dim(d.height, i, d.block));
@@ -412,7 +427,6 @@ impl Layout {
                 }
                 let pitch = w.next_multiple_of(block[0]);
                 let rows = h.next_multiple_of(block[1]);
-                let depth = mip_depth(i).next_multiple_of(block[2]);
                 let one = u64::from(pitch) * u64::from(rows) * bpe;
                 slice_size += one;
                 sizes.push(one * u64::from(block[2]));
@@ -422,7 +436,7 @@ impl Layout {
                     depth: depth_of(i),
                     pitch,
                     rows,
-                    depth_pitch: if three_d { depth } else { 1 },
+                    depth_pitch: padded_depth(i).next_multiple_of(block[2]),
                     offset: 0,
                     tail: None,
                 });
@@ -464,9 +478,9 @@ impl Layout {
                     pitch,
                     rows,
                     depth_pitch: if thick {
-                        mip_depth(i).next_multiple_of(BLOCK_256_3D[element_log2 as usize][2])
+                        padded_depth(i).next_multiple_of(BLOCK_256_3D[element_log2 as usize][2])
                     } else {
-                        1
+                        padded_depth(i)
                     },
                     offset: 0,
                     tail: Some(Tail {
@@ -855,6 +869,40 @@ mod tests {
     }
 
     #[test]
+    fn one_dimensional_textures_require_a_supported_swizzle() {
+        let mut d = Desc {
+            dimension: Dimension::Tex1d,
+            ..desc(32, 1, 1, 4, Swizzle::LINEAR)
+        };
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_Z_X, Swizzle::SW_64KB_R_X] {
+            d.swizzle = swizzle;
+            assert!(Layout::new(&d).is_ok(), "{swizzle:?}");
+        }
+        for swizzle in [Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
+            d.swizzle = swizzle;
+            assert_eq!(Layout::new(&d), Err(Error::Invalid), "{swizzle:?}");
+        }
+    }
+
+    #[test]
+    fn multisampling_requires_a_compatible_tiled_swizzle() {
+        for samples in [2, 4, 8] {
+            let d = Desc {
+                samples,
+                ..desc(128, 128, 1, 4, Swizzle::SW_64KB_R_X)
+            };
+            let layout = Layout::new(&d).unwrap();
+            let single_sampled = Layout::new(&Desc { samples: 1, ..d }).unwrap();
+            assert_eq!(layout.size, single_sampled.size * u64::from(samples));
+            for swizzle in [Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
+                let d = Desc { swizzle, ..d };
+                assert!(Layout::new(&Desc { samples: 1, ..d }).is_ok());
+                assert_eq!(Layout::new(&d), Err(Error::Invalid), "{samples}x {swizzle:?}");
+            }
+        }
+    }
+
+    #[test]
     fn blocks_hold_their_size_in_elements() {
         for log2 in [8u32, 12, 16] {
             let swizzle = match log2 {
@@ -987,6 +1035,44 @@ mod tests {
         assert_eq!(l.mips[2].offset, 4096);
         assert_eq!(l.mips[1].offset, 8192);
         assert_eq!(l.mips[0].offset, 8192 + 16384);
+    }
+
+    #[test]
+    fn thin_volume_mips_report_the_depth_allocated_per_chain() {
+        let d = Desc {
+            dimension: Dimension::Tex3d,
+            depth: 8,
+            ..desc(128, 128, 4, 4, Swizzle::SW_64KB_R_X)
+        };
+        let layout = Layout::new(&d).unwrap();
+        assert!(!layout.thick);
+        assert_eq!(layout.slices, 8);
+        assert_eq!(layout.size, layout.slice_size * 8);
+        assert!(layout.first_tail_mip > 0 && layout.first_tail_mip < d.mips);
+        for (i, mip) in layout.mips.iter().enumerate() {
+            assert_eq!(mip.depth, d.depth >> i);
+            assert_eq!(mip.depth_pitch, d.depth);
+        }
+    }
+
+    #[test]
+    fn z_order_rejects_compressed_and_wide_elements() {
+        let mut d = TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 32,
+            height: 32,
+            depth_or_array: 1,
+            mips: 1,
+            format: 40, // D32_FLOAT
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_Z_X,
+        };
+        assert!(Texture::new(&d).is_ok());
+        // BC1_UNORM, R32G32B32A32_FLOAT
+        for format in [71, 2] {
+            d.format = format;
+            assert_eq!(Texture::new(&d), Err(Error::Invalid), "format {format}");
+        }
     }
 
     #[test]
