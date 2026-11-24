@@ -147,7 +147,7 @@ mod device_type {
 
     use victory_gpu::console::{self, Console};
 
-    use crate::modules::files::host;
+    use crate::modules::files::try_host;
     use crate::{HleModule, hle_export};
 
     type Key = *mut c_void;
@@ -158,6 +158,9 @@ mod device_type {
     const FILE_NOT_FOUND: u32 = 2;
     const INVALID_PARAMETER: u32 = 87;
     const MORE_DATA: u32 = 234;
+    /// What a registry call returns when the host lacks the function
+    /// behind it; registry calls return their error instead of setting it.
+    const PROC_NOT_FOUND: u32 = 127;
     const DWORD: u32 = 4;
 
     /// Stands for the key; never a host handle value.
@@ -204,9 +207,10 @@ mod device_type {
     // below), so no other call can reach the host with our key.
     pub extern "system" fn RegOpenKeyW(root: Key, sub: *const u16, out: *mut Key) -> u32 {
         open(root, sub, out).unwrap_or_else(|| {
-            host!("advapi32.dll", "RegOpenKeyW": extern "system" fn(Key, *const u16, *mut Key) -> u32)(
-                root, sub, out,
-            )
+            match try_host!("advapi32.dll", "RegOpenKeyW": extern "system" fn(Key, *const u16, *mut Key) -> u32) {
+                Some(f) => f(root, sub, out),
+                None => PROC_NOT_FOUND,
+            }
         })
     }
 
@@ -218,9 +222,13 @@ mod device_type {
         out: *mut Key,
     ) -> u32 {
         open(root, sub, out).unwrap_or_else(|| {
-            host!("advapi32.dll", "RegOpenKeyExW": extern "system" fn(
+            match try_host!("advapi32.dll", "RegOpenKeyExW": extern "system" fn(
                 Key, *const u16, u32, u32, *mut Key,
-            ) -> u32)(root, sub, options, access, out)
+            ) -> u32)
+            {
+                Some(f) => f(root, sub, options, access, out),
+                None => PROC_NOT_FOUND,
+            }
         })
     }
 
@@ -233,9 +241,13 @@ mod device_type {
         size: *mut u32,
     ) -> u32 {
         if key != oem() {
-            return host!("advapi32.dll", "RegQueryValueExW": extern "system" fn(
+            return match try_host!("advapi32.dll", "RegQueryValueExW": extern "system" fn(
                 Key, *const u16, *mut u32, *mut u32, *mut u8, *mut u32,
-            ) -> u32)(key, name, reserved, kind, data, size);
+            ) -> u32)
+            {
+                Some(f) => f(key, name, reserved, kind, data, size),
+                None => PROC_NOT_FOUND,
+            };
         }
         if !is(name, VALUE) {
             return FILE_NOT_FOUND;
@@ -270,7 +282,10 @@ mod device_type {
         if key == oem() {
             return SUCCESS;
         }
-        host!("advapi32.dll", "RegCloseKey": extern "system" fn(Key) -> u32)(key)
+        match try_host!("advapi32.dll", "RegCloseKey": extern "system" fn(Key) -> u32) {
+            Some(f) => f(key),
+            None => PROC_NOT_FOUND,
+        }
     }
 
     pub(crate) fn module() -> HleModule {
