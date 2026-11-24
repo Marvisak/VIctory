@@ -569,11 +569,24 @@ mod host_free_tests {
         q
     }
 
+    /// A method's offset in the older layout, moved to where `q`'s own table
+    /// has it: another test may switch layouts while this one runs (see
+    /// `tests::signal_slot`).
+    fn at(q: This, offset: usize) -> usize {
+        // SAFETY: one of our queues; its first field is the table.
+        let table = unsafe { *q.cast::<*const *const ()>() };
+        if table == NEWER_FUNCTIONS.0.as_ptr() {
+            newer_slot(offset / 8) * 8
+        } else {
+            offset
+        }
+    }
+
     #[test]
     fn timestamp_frequency_refuses_null_and_reports_the_rate() {
         let q = queue_direct();
         type Freq = extern "system" fn(This, *mut u64) -> HRESULT;
-        let freq = slot::<Freq>(q, 0x80);
+        let freq = slot::<Freq>(q, at(q, 0x80));
         assert_eq!(freq(q, std::ptr::null_mut()), E_INVALIDARG);
         let mut out = 0;
         assert_eq!(freq(q, &mut out), S_OK);
@@ -590,11 +603,11 @@ mod host_free_tests {
             S_OK
         );
         type Wait = extern "system" fn(This, This, u64) -> HRESULT;
-        let wait = slot::<Wait>(q, 0x78);
+        let wait = slot::<Wait>(q, at(q, 0x78));
         assert_eq!(wait(q, std::ptr::null(), 1), E_INVALIDARG);
         assert_eq!(wait(q, fence, 9), S_OK);
         type Signal2 = extern "system" fn(This, This, u64, *const u8, *const u8) -> HRESULT;
-        let signal2 = slot::<Signal2>(q, 0x100);
+        let signal2 = slot::<Signal2>(q, at(q, 0x100));
         assert_eq!(signal2(q, fence, 4, std::ptr::null(), std::ptr::null()), S_OK);
         assert_eq!(
             slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),
@@ -607,7 +620,7 @@ mod host_free_tests {
     fn present_succeeds_without_copying_to_a_window() {
         let q = queue_direct();
         type Present = extern "system" fn(This, u32, *const Plane, *const u8) -> HRESULT;
-        let present = slot::<Present>(q, 0xf0);
+        let present = slot::<Present>(q, at(q, 0xf0));
         assert_eq!(present(q, 0, std::ptr::null(), std::ptr::null()), S_OK);
         // planes set but no resources is still fine off Windows.
         let plane = Plane {
@@ -637,7 +650,7 @@ mod host_free_tests {
         }
         let q = queue_direct();
         type Map = extern "system" fn(This, u32, *const PageBatch, u64, u32, u32) -> HRESULT;
-        let map = slot::<Map>(q, 0xe8);
+        let map = slot::<Map>(q, at(q, 0xe8));
         assert_eq!(map(q, 1, std::ptr::null(), 0, 0, 0), E_INVALIDARG);
         if crate::resource::page_mapper().is_none() {
             let batch = PageBatch {
