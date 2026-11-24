@@ -783,4 +783,176 @@ mod tests {
         d[at..at + 4].copy_from_slice(&0x1F00u32.to_le_bytes());
         assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
     }
+
+    #[test]
+    fn forwarded_exports_name_their_target_by_name_or_ordinal() {
+        // Ordinal base 1; slot 1 a real export, slots 2 and 3 forwarders.
+        // An address inside the export directory (0x1000..0x1080) is a
+        // "dll.name" or "dll.#ordinal" string, not code.
+        let mut body = vec![0u8; 0x100];
+        let put32 =
+            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put32(&mut body, 12, 0x1040); // name of the DLL
+        put32(&mut body, 16, 1); // ordinal base
+        put32(&mut body, 20, 3); // number of functions
+        put32(&mut body, 24, 1); // number of names
+        put32(&mut body, 28, 0x1028); // address table
+        put32(&mut body, 32, 0x1034); // name pointer table
+        put32(&mut body, 36, 0x1038); // name ordinal table
+        put32(&mut body, 0x28, 0x1200);
+        put32(&mut body, 0x2C, 0x1060);
+        put32(&mut body, 0x30, 0x1070);
+        put32(&mut body, 0x34, 0x1044);
+        body[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+        body[0x40..0x44].copy_from_slice(b"t.dl");
+        body[0x44..0x4A].copy_from_slice(b"Sleep\0");
+        body[0x60..0x6F].copy_from_slice(b"kernel32.Sleep\0");
+        body[0x70..0x7C].copy_from_slice(b"kernel32.#5\0");
+
+        let info = ImageInfo::parse(&synthetic_image(&body)).unwrap();
+        let exports: Vec<_> = info
+            .exports
+            .iter()
+            .map(|e| (e.name.as_deref(), e.ordinal, e.rva, e.forward.as_deref()))
+            .collect();
+        assert_eq!(
+            exports,
+            [
+                (None, 1, Some(0x1200), None),
+                (Some("Sleep"), 2, None, Some("kernel32.Sleep")),
+                (None, 3, None, Some("kernel32.#5")),
+            ]
+        );
+
+        // A forwarder with nothing after the dot is refused, not exported
+        // at its string's address.
+        body[0x70..0x7C].fill(0);
+        body[0x70..0x7A].copy_from_slice(b"kernel32.\0");
+        assert!(ImageInfo::parse(&synthetic_image(&body)).is_err());
+    }
+
+    /// Writes a delay-import descriptor for `xinput.dll` at RVA 0x1080
+    /// (directory 13) that shares the name table at 0x1100 and has its own
+    /// IAT at `iat`.
+    fn with_delay_imports(data: &[u8], body: usize, iat: u32) -> Vec<u8> {
+        let mut d = data.to_vec();
+        let p32 =
+            |d: &mut Vec<u8>, at: usize, v: u32| d[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let desc = body + 0x80;
+        p32(&mut d, desc, 1); // attributes: RVA based
+        p32(&mut d, desc + 4, 0x11A0); // DLL name
+        p32(&mut d, desc + 8, 0x11B0); // module handle
+        p32(&mut d, desc + 12, iat);
+        p32(&mut d, desc + 16, 0x1100); // name table
+        d[body + 0x1A0..body + 0x1AB].copy_from_slice(b"xinput.dll\0");
+        let at = 0x58 + 112 + pe::IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT * 8;
+        p32(&mut d, at, 0x1080);
+        p32(&mut d, at + 4, 64);
+        d
+    }
+
+    #[test]
+    fn synthetic_delay_imports_use_their_own_iat() {
+        let (data, body) = synthetic_image_with_imports_and_tls();
+        let info = ImageInfo::parse(&with_delay_imports(&data, body, 0x1160)).unwrap();
+        assert_eq!(info.delay_imports.len(), 1);
+        assert_eq!(info.delay_imports[0].dll, "xinput.dll");
+        assert_eq!(symbols(&info.delay_imports[0]), beep_then_ordinal_7(0x1160));
+        // The ordinary imports are unchanged, and `import_count` leaves the
+        // delay-loaded ones out.
+        assert_eq!(symbols(&info.imports[0]), beep_then_ordinal_7(0x1140));
+        assert_eq!(info.import_count(), 2);
+    }
+
+    #[test]
+    fn synthetic_delay_import_iat_must_fit_inside_the_image() {
+        let (data, body) = synthetic_image_with_imports_and_tls();
+        // Two slots from 0x1FF8 run past SizeOfImage (0x2000), and one at
+        // the 4 GiB limit would overflow.
+        for iat in [0x1FF8, 0xFFFF_FFF8] {
+            assert!(
+                matches!(
+                    ImageInfo::parse(&with_delay_imports(&data, body, iat)),
+                    Err(PeError::Malformed(_))
+                ),
+                "delay IAT at {iat:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_flags_and_subsystem_on_the_synthetic_image() {
+        let base = synthetic_image(&[0; 0x80]);
+        let parse = |patch: &dyn Fn(&mut Vec<u8>)| {
+            let mut d = base.clone();
+            patch(&mut d);
+            ImageInfo::parse(&d).unwrap()
+        };
+        let info = parse(&|_| {});
+        assert_eq!(info.subsystem_name(), "other");
+        assert!(!info.has_relocations);
+        assert!(!info.has_exception_table);
+        assert!(!info.has_load_config);
+        assert!(info.codeview.is_none());
+
+        let directory = |d: &mut Vec<u8>, index: usize| {
+            let at = 0x58 + 112 + index * 8;
+            d[at..at + 4].copy_from_slice(&0x1100u32.to_le_bytes());
+            d[at + 4..at + 8].copy_from_slice(&8u32.to_le_bytes());
+        };
+        let info = parse(&|d| {
+            directory(d, dir::BASERELOC);
+            directory(d, dir::EXCEPTION);
+            directory(d, dir::LOAD_CONFIG);
+        });
+        assert!(info.has_relocations && info.has_exception_table && info.has_load_config);
+        // A relocation directory doesn't count once the file says its
+        // relocations were stripped,
+        let stripped = parse(&|d| {
+            directory(d, dir::BASERELOC);
+            d[0x56] |= layout::file_flags::RELOCS_STRIPPED as u8;
+        });
+        assert!(!stripped.has_relocations);
+        // nor does one with an RVA but no size.
+        let empty = parse(&|d| {
+            directory(d, dir::BASERELOC);
+            let at = 0x58 + 112 + dir::BASERELOC * 8 + 4;
+            d[at..at + 4].fill(0);
+        });
+        assert!(!empty.has_relocations);
+
+        // An executable, not a DLL.
+        let exe = parse(&|d| d[0x57] &= !((layout::file_flags::DLL >> 8) as u8));
+        assert!(!exe.is_dll());
+
+        use layout::subsystem::*;
+        for (value, name) in [
+            (WINDOWS_GUI, "windows-gui"),
+            (WINDOWS_CUI, "windows-cui"),
+            (XBOX, "xbox"),
+            (XBOX_CODE_CATALOG, "xbox-code-catalog"),
+            (1, "other"),
+        ] {
+            let info = parse(&|d| d[0x58 + 68..0x58 + 70].copy_from_slice(&value.to_le_bytes()));
+            assert_eq!(info.subsystem, value);
+            assert_eq!(info.subsystem_name(), name);
+        }
+    }
+
+    #[test]
+    fn codeview_symbol_key_uses_windows_guid_byte_order() {
+        let cv = CodeViewInfo {
+            pdb_path: "t.pdb".into(),
+            guid: [
+                0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+                0xEE, 0xFF,
+            ],
+            age: 0x1A,
+        };
+        // Data1-3 little-endian, Data4 as bytes, then the age in hex with
+        // no padding.
+        assert_eq!(cv.symbol_key(), "00112233445566778899AABBCCDDEEFF1A");
+        let cv = CodeViewInfo { age: 1, ..cv };
+        assert!(cv.symbol_key().ends_with("FF1"));
+    }
 }
