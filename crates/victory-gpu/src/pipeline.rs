@@ -63,8 +63,9 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Shared, so a host pipeline's stages can hold it (see `host::Stage`).
     #[cfg(windows)]
-    translated: OnceLock<Option<Translated>>,
+    translated: OnceLock<Option<Arc<Translated>>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -106,7 +107,7 @@ pub(crate) struct Translated {
 impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
-    pub(crate) fn translated(&self) -> Option<&Translated> {
+    pub(crate) fn translated(&self) -> Option<&Arc<Translated>> {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
@@ -125,7 +126,7 @@ impl Shader {
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
-                done.ok()
+                done.ok().map(Arc::new)
             })
             .as_ref()
     }
