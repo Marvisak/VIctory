@@ -56,11 +56,7 @@ pub fn packet(data: &[u8], index: usize) -> Option<Packet> {
     let start = index.checked_mul(PACKET_BYTES)?;
     let b = data.get(start..)?.get(..4)?;
     let h = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-    Some(Packet {
-        frames: h >> 26,
-        first_frame_bit: (h >> 11) & 0x7fff,
-        skip: h & 0xff,
-    })
+    Some(Packet { frames: h >> 26, first_frame_bit: (h >> 11) & 0x7fff, skip: h & 0xff })
 }
 
 /// One frame's bits gathered out of its packets.
@@ -119,12 +115,7 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
     }
     let end = cursor.pos;
     let next = next_frame(data, start, end);
-    Some(Frame {
-        data: out,
-        bits,
-        start,
-        next,
-    })
+    Some(Frame { data: out, bits, start, next })
 }
 
 /// Where the frame after the one at `start`..`end` begins: right after it,
@@ -151,7 +142,8 @@ fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
     let mut end = end;
     if end.is_multiple_of(PACKET_BITS) || (last && end / PACKET_BITS == index) {
         // The next frame begins in the next packet of this stream.
-        let next = (end - 1) / PACKET_BITS + 1 + packet(data, (end - 1) / PACKET_BITS)?.skip as usize;
+        let next =
+            (end - 1) / PACKET_BITS + 1 + packet(data, (end - 1) / PACKET_BITS)?.skip as usize;
         let header = packet(data, next)?;
         end = next * PACKET_BITS + HEADER_BITS + header.first_frame_bit as usize;
     }
@@ -490,11 +482,7 @@ impl Decoder {
     /// Decodes one frame (`frame.data`, `frame.bits`) and appends
     /// `FRAME_SAMPLES` interleaved samples per channel to `out`.
     pub fn decode(&mut self, data: &[u8], bits: usize, out: &mut Vec<i16>) -> Result<(), Error> {
-        let mut b = Bits {
-            data,
-            pos: 0,
-            end: bits,
-        };
+        let mut b = Bits { data, pos: 0, end: bits };
         let len = b.read(LENGTH_BITS) as usize;
         let result = self.frame(&mut b, len);
         if result.is_err() {
@@ -654,11 +642,8 @@ impl Decoder {
     fn coefficients(&mut self, b: &mut Bits, c: usize) -> Result<(), Error> {
         let codes = codes();
         let table = b.bit() as usize;
-        let (run, level): (&[u16], &[f32]) = if table == 1 {
-            (&COEF1_RUN, &COEF1_LEVEL)
-        } else {
-            (&COEF0_RUN, &COEF0_LEVEL)
-        };
+        let (run, level): (&[u16], &[f32]) =
+            if table == 1 { (&COEF1_RUN, &COEF1_LEVEL) } else { (&COEF0_RUN, &COEF0_LEVEL) };
         let subframe_len = self.subframe_len;
         let ch = &mut self.ch[c];
         let mut rl_mode = false;
@@ -757,7 +742,9 @@ impl Decoder {
             ch.scale_factors = target;
             if ch.reuse_sf {
                 let from = ch.saved_scale_factors[ch.scale_factor_idx];
-                for (sf, &offset) in ch.saved_scale_factors[target].iter_mut().zip(&sf_offsets).take(self.num_bands) {
+                for (sf, &offset) in
+                    ch.saved_scale_factors[target].iter_mut().zip(&sf_offsets).take(self.num_bands)
+                {
                     *sf = from[offset];
                 }
             }
@@ -900,11 +887,8 @@ impl Decoder {
                     let c = self.channel_indexes[i];
                     self.ch[c].quant_step = quant_step;
                     if b.bit() {
-                        self.ch[c].quant_step += if modifier_len > 0 {
-                            b.read(modifier_len) as i32 + 1
-                        } else {
-                            1
-                        };
+                        self.ch[c].quant_step +=
+                            if modifier_len > 0 { b.read(modifier_len) as i32 + 1 } else { 1 };
                     }
                 }
             }
@@ -933,7 +917,8 @@ impl Decoder {
                 let sf = ch.saved_scale_factors[ch.scale_factors];
                 for band in 0..self.num_bands {
                     let end = sfb[band + 1].min(subframe_len);
-                    let exp = ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
+                    let exp =
+                        ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
                     let quant = 10f32.powf(exp as f32 / 20.0);
                     for (t, &c) in tmp[sfb[band]..end].iter_mut().zip(&ch.coeffs[sfb[band]..end]) {
                         *t = c * quant;
@@ -956,7 +941,10 @@ impl Decoder {
                 start += (winlen - subframe_len) / 2;
                 winlen = subframe_len;
             }
-            window_overlap(&mut ch.out[start..start + winlen], &windows()[log2(winlen) as usize - 7]);
+            window_overlap(
+                &mut ch.out[start..start + winlen],
+                &windows()[log2(winlen) as usize - 7],
+            );
             ch.prev_block_len = subframe_len;
         }
 
@@ -1057,7 +1045,9 @@ mod tests {
                 -(input
                     .iter()
                     .enumerate()
-                    .map(|(k, &x)| x as f64 * (std::f64::consts::PI / n as f64 * t * (k as f64 + 0.5)).cos())
+                    .map(|(k, &x)| {
+                        x as f64 * (std::f64::consts::PI / n as f64 * t * (k as f64 + 0.5)).cos()
+                    })
                     .sum::<f64>() as f32)
             })
             .collect()
@@ -1170,9 +1160,8 @@ mod tests {
             }
             streams += 1;
             let data = std::fs::read(&path).unwrap();
-            let counted: u32 = (0..data.len() / PACKET_BYTES)
-                .map(|i| packet(&data, i).unwrap().frames)
-                .sum();
+            let counted: u32 =
+                (0..data.len() / PACKET_BYTES).map(|i| packet(&data, i).unwrap().frames).sum();
             // Context word 1: sample rate in bits 27-28, stereo in bit 29.
             let ctx = std::fs::read(path.with_extension("ctx")).unwrap();
             let word = u32::from_le_bytes(ctx[4..8].try_into().unwrap());

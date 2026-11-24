@@ -83,8 +83,7 @@ pub fn data_directory_offset(data: &[u8], index: usize) -> Option<usize> {
     if index >= count {
         return None;
     }
-    opt.checked_add(OPT_DATA_DIRECTORY)?
-        .checked_add(index.checked_mul(DATA_DIRECTORY_SIZE)?)
+    opt.checked_add(OPT_DATA_DIRECTORY)?.checked_add(index.checked_mul(DATA_DIRECTORY_SIZE)?)
 }
 
 pub fn read_u32(data: &[u8], at: usize) -> Option<u32> {

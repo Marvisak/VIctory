@@ -74,10 +74,7 @@ pub(super) struct Tally {
 
 impl Tally {
     pub(super) fn new(list: bool) -> Self {
-        Self {
-            list,
-            ..Self::default()
-        }
+        Self { list, ..Self::default() }
     }
 
     pub(super) fn fail(&mut self, reason: String, example: impl FnOnce() -> String) {
@@ -259,10 +256,7 @@ mod tests {
     use super::*;
 
     fn reasons(entries: &[(&str, usize, &str)]) -> Reasons {
-        entries
-            .iter()
-            .map(|&(r, n, e)| (r.to_owned(), (n, e.to_owned())))
-            .collect()
+        entries.iter().map(|&(r, n, e)| (r.to_owned(), (n, e.to_owned()))).collect()
     }
 
     #[test]
@@ -301,18 +295,10 @@ mod tests {
 
     #[test]
     fn merge_sums_counts_and_keeps_the_first_example() {
-        let mut a = Tally {
-            files: 1,
-            ms_pipelines: 2,
-            ..Tally::default()
-        };
+        let mut a = Tally { files: 1, ms_pipelines: 2, ..Tally::default() };
         a.fail("r".into(), || "a".into());
         a.infra("i".into(), || "a".into());
-        let mut b = Tally {
-            files: 3,
-            ms_pipelines: 4,
-            ..Tally::default()
-        };
+        let mut b = Tally { files: 3, ms_pipelines: 4, ..Tally::default() };
         b.fail("r".into(), || "b".into());
         b.infra("i".into(), || "b".into());
         *b.exports.entry("color").or_default() += 5;
@@ -326,11 +312,7 @@ mod tests {
     #[test]
     fn merging_an_empty_tally_changes_nothing() {
         let full = || {
-            let mut t = Tally {
-                files: 2,
-                translated: 3,
-                ..Tally::new(true)
-            };
+            let mut t = Tally { files: 2, translated: 3, ..Tally::new(true) };
             t.fail("r".into(), || "e".into());
             t.infra("i".into(), || "e".into());
             *t.untraced_used.entry("k".into()).or_default() += 1;

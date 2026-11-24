@@ -26,12 +26,7 @@ use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, T
 use crate::resource::PAGEABLE_IIDS;
 
 const PIPELINE_IIDS: [Iid; 4] = [
-    guid(
-        0x765a30f3,
-        0xf624,
-        0x4c6f,
-        [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45],
-    ),
+    guid(0x765a30f3, 0xf624, 0x4c6f, [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45]),
     PAGEABLE_IIDS[0],
     PAGEABLE_IIDS[1],
     PAGEABLE_IIDS[2],
@@ -141,12 +136,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
-            .find(|p| {
-                matches!(
-                    p.stage,
-                    HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-                )
-            })
+            .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs))
             .map(|p| p.used)
             .unwrap_or_default(),
         None => Vec::new(),
@@ -226,10 +216,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
             if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 Some(hash.to_ascii_lowercase())
             } else {
-                tracing::warn!(
-                    hash,
-                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
-                );
+                tracing::warn!(hash, "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes");
                 None
             }
         })
@@ -246,10 +233,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     if hashes.is_empty() {
         return None;
     }
-    p.shaders
-        .iter()
-        .find(|shader| hashes.contains(&shader.hash))
-        .map(|shader| shader.hash.as_str())
+    p.shaders.iter().find(|shader| hashes.contains(&shader.hash)).map(|shader| shader.hash.as_str())
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -298,9 +282,7 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
         return None;
     }
     // SAFETY: the title passes `size` bytes of shader code.
-    Some(shader(stage, unsafe {
-        std::slice::from_raw_parts(code.code, code.size)
-    }))
+    Some(shader(stage, unsafe { std::slice::from_raw_parts(code.code, code.size) }))
 }
 
 fn hand_out(
@@ -441,11 +423,7 @@ pub(crate) extern "system" fn create_stream(
         // SAFETY: inside the stream the title passes.
         let kind = unsafe { desc.stream.add(at).cast::<u32>().read_unaligned() };
         let Some((size, stage)) = subobject(kind) else {
-            tracing::warn!(
-                kind,
-                at,
-                "pipeline subobject of unknown size; the rest is ignored"
-            );
+            tracing::warn!(kind, at, "pipeline subobject of unknown size; the rest is ignored");
             break;
         };
         if let Some(stage) = stage {
@@ -522,52 +500,30 @@ mod tests {
     use crate::object::{S_OK, slot};
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
-        pipeline(p)
-            .shaders
-            .iter()
-            .map(|s| (s.stage, s.container.clone()))
-            .collect()
+        pipeline(p).shaders.iter().map(|s| (s.stage, s.container.clone())).collect()
     }
 
     #[test]
     fn pipelines_keep_their_shaders() {
         let (vs, ps) = ([1u8, 2, 3], [4u8; 5]);
-        let none = || Bytecode {
-            code: std::ptr::null(),
-            size: 0,
-        };
+        let none = || Bytecode { code: std::ptr::null(), size: 0 };
         let desc = GraphicsHead {
             root: std::ptr::null(),
             stages: [
-                Bytecode {
-                    code: vs.as_ptr(),
-                    size: vs.len(),
-                },
-                Bytecode {
-                    code: ps.as_ptr(),
-                    size: ps.len(),
-                },
+                Bytecode { code: vs.as_ptr(), size: vs.len() },
+                Bytecode { code: ps.as_ptr(), size: ps.len() },
                 none(),
                 none(),
                 none(),
             ],
         };
         let mut p = std::ptr::null();
-        assert_eq!(
-            create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
-            S_OK
-        );
-        assert_eq!(
-            shaders(p),
-            [("vertex", vs.to_vec()), ("pixel", ps.to_vec())]
-        );
+        assert_eq!(create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert_eq!(shaders(p), [("vertex", vs.to_vec()), ("pixel", ps.to_vec())]);
         // A second pipeline with the same pixel shader shares its container.
         let mut q = std::ptr::null();
         create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q);
-        assert!(Arc::ptr_eq(
-            &pipeline(p).shaders[1],
-            &pipeline(q).shaders[1]
-        ));
+        assert!(Arc::ptr_eq(&pipeline(p).shaders[1], &pipeline(q).shaders[1]));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 
@@ -606,10 +562,7 @@ mod tests {
         put(0x278, 14 | 3 << 32);
         put(0x280, 15 | 28 << 32);
         put(0x2a0, 1 << 32);
-        let desc = StreamDesc {
-            size: stream.len(),
-            stream: stream.as_ptr(),
-        };
+        let desc = StreamDesc { size: stream.len(), stream: stream.as_ptr() };
         let mut p = std::ptr::null();
         let hr = create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
         assert_eq!(hr, S_OK);
@@ -618,10 +571,7 @@ mod tests {
         {
             let g = pipeline(p).host.graphics.as_deref().unwrap();
             assert_eq!(g.topology.0, 3);
-            assert_eq!(
-                (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
-                (1, 28)
-            );
+            assert_eq!((g.targets.NumRenderTargets, g.targets.RTFormats[0].0), (1, 28));
         }
     }
 }

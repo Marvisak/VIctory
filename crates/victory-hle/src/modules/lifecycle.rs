@@ -11,10 +11,7 @@
     clippy::not_unsafe_ptr_arg_deref,
     reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
 )]
-#![allow(
-    clippy::too_many_arguments,
-    reason = "the signature is fixed by the API title code calls"
-)]
+#![allow(clippy::too_many_arguments, reason = "the signature is fixed by the API title code calls")]
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -147,14 +144,8 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     if width <= 0 || height <= 0 || aw <= 0 || ah <= 0 || (width <= aw && height <= ah) {
         return (width, height);
     }
-    let scale = f64::min(
-        f64::from(aw) / f64::from(width),
-        f64::from(ah) / f64::from(height),
-    );
-    (
-        (f64::from(width) * scale) as i32,
-        (f64::from(height) * scale) as i32,
-    )
+    let scale = f64::min(f64::from(aw) / f64::from(width), f64::from(ah) / f64::from(height));
+    ((f64::from(width) * scale) as i32, (f64::from(height) * scale) as i32)
 }
 
 /// Puts our procedure in front of the title's.
@@ -278,9 +269,7 @@ pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
 pub fn wait_for_previous() {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
-    let Some(handle) = std::env::var(RELAUNCHED_FROM)
-        .ok()
-        .and_then(|h| h.parse::<usize>().ok())
+    let Some(handle) = std::env::var(RELAUNCHED_FROM).ok().and_then(|h| h.parse::<usize>().ok())
     else {
         return;
     };
@@ -305,10 +294,7 @@ fn end() {
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "lifecycle",
-        dlls: &[
-            "api-ms-win-core-psm-appnotify-*",
-            "ext-ms-win-rtcore-ntuser-window-*",
-        ],
+        dlls: &["api-ms-win-core-psm-appnotify-*", "ext-ms-win-rtcore-ntuser-window-*"],
         exports: vec![
             hle_export!(RegisterAppStateChangeNotification),
             hle_export!(UnregisterAppStateChangeNotification),
@@ -327,14 +313,8 @@ mod tests {
     #[test]
     fn registrations_come_and_go() {
         let (mut a, mut b) = (0, 0);
-        assert_eq!(
-            RegisterAppStateChangeNotification(Some(noop), std::ptr::null_mut(), &mut a),
-            0
-        );
-        assert_eq!(
-            RegisterAppStateChangeNotification(Some(noop), std::ptr::null_mut(), &mut b),
-            0
-        );
+        assert_eq!(RegisterAppStateChangeNotification(Some(noop), std::ptr::null_mut(), &mut a), 0);
+        assert_eq!(RegisterAppStateChangeNotification(Some(noop), std::ptr::null_mut(), &mut b), 0);
         UnregisterAppStateChangeNotification(a);
         let left: Vec<_> = routines().iter().map(|r| r.0).collect();
         assert_eq!(left, [b]);
@@ -342,18 +322,10 @@ mod tests {
 
     #[test]
     fn oversized_windows_shrink_to_the_screen() {
-        let area = RECT {
-            left: 0,
-            top: 0,
-            right: 1920,
-            bottom: 1040,
-        };
+        let area = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
         assert_eq!(fit_into(&area, 3840, 2160), (1848, 1040));
         assert_eq!(fit_into(&area, 1280, 720), (1280, 720));
-        assert_eq!(
-            fit_into(&area, wm::CW_USEDEFAULT, 0),
-            (wm::CW_USEDEFAULT, 0)
-        );
+        assert_eq!(fit_into(&area, wm::CW_USEDEFAULT, 0), (wm::CW_USEDEFAULT, 0));
     }
 
     #[test]

@@ -63,13 +63,13 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 
 /// Appends a failure that is not an exception (the host GPU's) to the crash
 /// log, with the title's last debug output, and prints it.
-#[allow(
-    clippy::print_stderr,
-    reason = "the report must reach the console even if logging is down"
-)]
+#[allow(clippy::print_stderr, reason = "the report must reach the console even if logging is down")]
 pub fn log_crash(text: &str) {
-    let text = format!("{text}
-{}", title_output());
+    let text = format!(
+        "{text}
+{}",
+        title_output()
+    );
     eprint!("{text}");
     append_to_log(&text);
 }
@@ -321,11 +321,7 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
     // SAFETY: the caller's code bytes are readable up to the instruction's end.
     let b = |i: usize| unsafe { code.add(i).read() };
     let prefix = b(0);
-    let (rex, at) = if b(1) & 0xf0 == 0x40 {
-        (b(1), 2)
-    } else {
-        (0, 1)
-    };
+    let (rex, at) = if b(1) & 0xf0 == 0x40 { (b(1), 2) } else { (0, 1) };
     if !matches!(prefix, 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
         return None;
     }
@@ -418,8 +414,7 @@ unsafe fn thrown(p: &[usize]) -> String {
         let types = p[3] + rva(p[2] + 12);
         let name = |i: usize| {
             let descriptor = p[3] + rva(p[3] + rva(types + 4 + 4 * i) + 4);
-            std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char)
-                .to_string_lossy()
+            std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char).to_string_lossy()
         };
         let first = name(0);
         let value = match &*first {
@@ -444,10 +439,7 @@ unsafe fn thrown(p: &[usize]) -> String {
 
 /// # Safety
 /// See [`report_unhandled`].
-#[allow(
-    clippy::print_stderr,
-    reason = "the report must reach the console even if logging is down"
-)]
+#[allow(clippy::print_stderr, reason = "the report must reach the console even if logging is down")]
 unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     // SAFETY: the system passes valid exception pointers.
     let (record, context) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
@@ -478,11 +470,7 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         text.push_str(&l);
         text.push('\n');
     };
-    line(format!(
-        "VIctory: {what} {:#010x} at {}{detail}",
-        code as u32,
-        locate(at)
-    ));
+    line(format!("VIctory: {what} {:#010x} at {}{detail}", code as u32, locate(at)));
     line(format!(
         "  rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rsp {:#x} rbp {:#x}",
         context.Rax,
@@ -519,10 +507,7 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         // SAFETY: the caller of `save_on_crash` named readable memory.
         let bytes = unsafe { std::slice::from_raw_parts(*address as *const u8, *len) };
         let saved = std::fs::write(file, bytes);
-        eprintln!(
-            "  saved {address:#x}+{len:#x} to {} ({saved:?})",
-            file.display()
-        );
+        eprintln!("  saved {address:#x}+{len:#x} to {} ({saved:?})", file.display());
     }
 }
 
@@ -678,10 +663,7 @@ mod tests {
         };
         // Frame 0 differs (two call sites in this function); callers agree.
         assert!(walked.len() >= 4, "{walked:?}");
-        let ours: Vec<_> = frames[1..walked.len()]
-            .iter()
-            .map(|&f| f as usize)
-            .collect();
+        let ours: Vec<_> = frames[1..walked.len()].iter().map(|&f| f as usize).collect();
         let system: Vec<_> = walked[1..].iter().map(|&f| f as usize).collect();
         assert_eq!(ours, system);
     }
@@ -767,15 +749,9 @@ mod tests {
         assert_eq!(clwb_len(pad(&[0x66, 0x41, 0x0f, 0xae, 0x31])), Some(5)); // clwb [r9]
         assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x30])), Some(4)); // clwb [rax]
         assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x70, 0x40])), Some(5)); // clwb [rax+0x40]
-        assert_eq!(
-            clwb_len(pad(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0])),
-            Some(8)
-        ); // [rax+disp32]
+        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0])), Some(8)); // [rax+disp32]
         assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x34, 0x24])), Some(5)); // clwb [rsp]
-        assert_eq!(
-            clwb_len(pad(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0])),
-            Some(8)
-        ); // [rip+disp32]
+        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0])), Some(8)); // [rip+disp32]
         assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x38])), None); // clflushopt, /7
         assert_eq!(clwb_len(pad(&[0x0f, 0xae, 0x30])), None); // xsaveopt, no 66
         assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0xf0])), None); // register form
@@ -814,10 +790,7 @@ mod tests {
     }
 
     fn reg(low: u64, high: u64) -> M128A {
-        M128A {
-            Low: low,
-            High: high as i64,
-        }
+        M128A { Low: low, High: high as i64 }
     }
 
     /// Gives `code` to the emulation as if it faulted with `exception` at
@@ -841,10 +814,8 @@ mod tests {
             context.Rip = start;
             context.Rax = rax;
             context.Anonymous.FltSave.XmmRegisters = *xmm;
-            let mut pointers = EXCEPTION_POINTERS {
-                ExceptionRecord: &mut record,
-                ContextRecord: &mut context,
-            };
+            let mut pointers =
+                EXCEPTION_POINTERS { ExceptionRecord: &mut record, ContextRecord: &mut context };
             let emulated = emulate_amd_only(&mut pointers);
             *xmm = context.Anonymous.FltSave.XmmRegisters;
             emulated.then(|| context.Rip - start)
@@ -932,17 +903,11 @@ mod tests {
         xmm[0] = reg(0x1122_3344_5566_7788, 0);
         // extrq xmm0, length 0 (64), index 0. A non-zero index with
         // length 64 goes past bit 63, and AMD leaves that result undefined.
-        assert_eq!(
-            emulate(&[0x66, 0x0f, 0x78, 0xc0, 0x00, 0x00], 0, &mut xmm),
-            Some(6)
-        );
+        assert_eq!(emulate(&[0x66, 0x0f, 0x78, 0xc0, 0x00, 0x00], 0, &mut xmm), Some(6));
         assert_eq!(low(&xmm, 0), 0x1122_3344_5566_7788);
         // insertq xmm0, xmm1, length 0 (64), index 0
         xmm[1] = reg(0xdead_beef_cafe_f00d, 0);
-        assert_eq!(
-            emulate(&[0xf2, 0x0f, 0x78, 0xc1, 0x00, 0x00], 0, &mut xmm),
-            Some(6)
-        );
+        assert_eq!(emulate(&[0xf2, 0x0f, 0x78, 0xc1, 0x00, 0x00], 0, &mut xmm), Some(6));
         assert_eq!(low(&xmm, 0), 0xdead_beef_cafe_f00d);
     }
 
@@ -957,10 +922,7 @@ mod tests {
         assert_eq!(emulate(&bad_extrq, 0, &mut xmm), None);
         // a clzero that did not cause an illegal instruction
         let clzero = [0x0f, 0x01, 0xfc];
-        assert_eq!(
-            emulate_as(EXCEPTION_ACCESS_VIOLATION, &clzero, 0, &mut xmm),
-            None
-        );
+        assert_eq!(emulate_as(EXCEPTION_ACCESS_VIOLATION, &clzero, 0, &mut xmm), None);
     }
 
     #[test]
@@ -975,13 +937,9 @@ mod tests {
         // SAFETY: two fresh pages of ours, the second made unreadable, so a
         // read past the end of the first faults.
         unsafe {
-            let page = VirtualAlloc(
-                std::ptr::null(),
-                0x2000,
-                MEM_RESERVE | MEM_COMMIT,
-                PAGE_READWRITE,
-            )
-            .cast::<u8>();
+            let page =
+                VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                    .cast::<u8>();
             assert!(!page.is_null());
             let mut old = 0;
             let guard = page.add(0x1000).cast();

@@ -32,16 +32,9 @@ pub fn run(
     let image = victory_loader::load(&prepared, &images)?;
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
-    println!(
-        "mapped at      {:#x} (preferred {:#x})",
-        image.base(),
-        image.info().image_base
-    );
-    let resolver = HleResolver::new(if strict {
-        HostPolicy::none()
-    } else {
-        HostPolicy::default()
-    });
+    println!("mapped at      {:#x} (preferred {:#x})", image.base(), image.info().image_base);
+    let resolver =
+        HleResolver::new(if strict { HostPolicy::none() } else { HostPolicy::default() });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     // A missing manifest leaves id 0 and no storage quota.
@@ -75,10 +68,7 @@ pub fn run(
         Unimplemented::Trap => UnimplementedPolicy::Trap,
         Unimplemented::Zero => UnimplementedPolicy::ReturnZero,
     };
-    let with_dlls = WithTitleDlls {
-        inner: &resolver,
-        dlls: &dlls,
-    };
+    let with_dlls = WithTitleDlls { inner: &resolver, dlls: &dlls };
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
@@ -118,9 +108,7 @@ pub fn run(
     }));
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
-    let code = main
-        .join()
-        .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    let code = main.join().map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
 }
@@ -226,19 +214,10 @@ impl LateDlls {
                     &wanted,
                 )?;
                 let hle = victory_hle::HleResolver::new(self.host.clone());
-                let old = victory_loader::WithTitleDlls {
-                    inner: &hle,
-                    dlls: &mapped,
-                };
-                let resolver = victory_loader::WithTitleDlls {
-                    inner: &old,
-                    dlls: &new,
-                };
+                let old = victory_loader::WithTitleDlls { inner: &hle, dlls: &mapped };
+                let resolver = victory_loader::WithTitleDlls { inner: &old, dlls: &new };
                 for (name, dll) in &new {
-                    println!(
-                        "title dll      {name} at {:#x} (loaded by the title)",
-                        dll.base()
-                    );
+                    println!("title dll      {name} at {:#x} (loaded by the title)", dll.base());
                     show(name, dll.bind_imports(&resolver, self.policy)?);
                     set_image_path(dll.base(), &self.title_dir.join(name));
                 }
@@ -249,9 +228,7 @@ impl LateDlls {
             let failed = new.iter().enumerate().find_map(|(i, (name, dll))| {
                 // SAFETY: bound above, dependencies attached first.
                 let attached = unsafe { dll.attach() };
-                attached
-                    .err()
-                    .map(|e| (i, e.context(format!("attaching {name}"))))
+                attached.err().map(|e| (i, e.context(format!("attaching {name}"))))
             });
             let Some((i, error)) = failed else {
                 return Ok(new.last().map(|(_, dll)| dll.base()));

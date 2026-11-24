@@ -43,10 +43,7 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     }
     let raw = memchr::memmem::find_iter(data, b"DXBC")
         .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
-            offset,
-            data: &data[offset..],
-        });
+        .map(|offset| Source::Raw { offset, data: &data[offset..] });
     out.extend(raw);
     out
 }
@@ -168,10 +165,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
         }
         t.files_with_shaders += usize::from(found_here > 0);
     }
-    println!(
-        "containers found       {} (in {} files)",
-        t.containers, t.files_with_shaders
-    );
+    println!("containers found       {} (in {} files)", t.containers, t.files_with_shaders);
     println!("  with DXIL part       {}", t.with_dxil_part);
     println!("  with LLVM bitcode    {}", t.with_bitcode);
     println!("  PC-standard layout   {}", t.standard_layout);
@@ -188,10 +182,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
         println!("  native unreadable    {n}: {e}");
     }
     if t.with_native > 0 {
-        println!(
-            "  decoded programs     {} ({} instructions)",
-            t.decoded, t.instructions
-        );
+        println!("  decoded programs     {} ({} instructions)", t.decoded, t.instructions);
         for (e, n) in &t.decode_errors {
             println!("  decode failed        {n}: {e}");
         }

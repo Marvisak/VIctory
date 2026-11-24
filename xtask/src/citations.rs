@@ -109,9 +109,7 @@ fn parse(span: &str) -> Option<(&str, Option<usize>)> {
     let segments = path.trim_end_matches('/');
     let shaped = path.chars().all(path_char)
         && segments.contains('/')
-        && segments
-            .split('/')
-            .all(|s| !s.is_empty() && s != "." && s != "..");
+        && segments.split('/').all(|s| !s.is_empty() && s != "." && s != "..");
     shaped.then_some((path, line))
 }
 
@@ -145,11 +143,7 @@ mod tests {
     use super::{Citation, check, extract};
 
     fn cite(doc_line: usize, path: &str, line: Option<usize>) -> Citation {
-        Citation {
-            doc_line,
-            path: path.to_owned(),
-            line,
-        }
+        Citation { doc_line, path: path.to_owned(), line }
     }
 
     /// Enforces the citations wherever tests run, so Windows CI checks them too.
@@ -197,10 +191,7 @@ mod tests {
         assert!(!ok("xtask/src/gone.rs", None), "missing file");
         assert!(!ok("src/citations.rs", None), "not from the root");
         assert!(!ok("xtask/src/citations.rs", Some(0)), "line 0");
-        assert!(
-            !ok("xtask/src/citations.rs", Some(1_000_000)),
-            "past the end"
-        );
+        assert!(!ok("xtask/src/citations.rs", Some(1_000_000)), "past the end");
         assert!(!ok("xtask/src", Some(1)), "line of a directory");
         assert!(!ok("xtask/Cargo.toml/", None), "file written as directory");
     }

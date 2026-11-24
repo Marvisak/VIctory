@@ -49,6 +49,8 @@ unused_must_use = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+# Keep complexity and argument-count checks at the project-configured thresholds.
+cognitive_complexity = "warn"
 undocumented_unsafe_blocks = "warn"
 # An unexplained `allow` hides a problem from every later reader and reviewer.
 allow_attributes_without_reason = "warn"

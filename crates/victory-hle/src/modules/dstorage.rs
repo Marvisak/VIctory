@@ -38,12 +38,8 @@ use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing
 use crate::{HleModule, hle_export};
 
 /// The factory interface Grand Theft Auto VI asks for.
-const FACTORY: Guid = Guid::new(
-    0x6295_9d11,
-    0xd45f,
-    0x4884,
-    [0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae],
-);
+const FACTORY: Guid =
+    Guid::new(0x6295_9d11, 0xd45f, 0x4884, [0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae]);
 const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_HANDLE_EOF)`: the source ends early.
@@ -79,12 +75,7 @@ struct Instance<T> {
 
 impl<T> Instance<T> {
     fn create(base: Object, state: T) -> *mut c_void {
-        Box::into_raw(Box::new(Instance {
-            base,
-            refs: AtomicU32::new(1),
-            state,
-        }))
-        .cast()
+        Box::into_raw(Box::new(Instance { base, refs: AtomicU32::new(1), state })).cast()
     }
 }
 
@@ -110,9 +101,7 @@ fn iid_text(iid: *const Guid) -> String {
 
 /// `HRESULT_FROM_WIN32` of a host error.
 fn from_win32(error: &std::io::Error) -> HRESULT {
-    error
-        .raw_os_error()
-        .map_or(E_INVALIDARG, |e| (0x8007_0000 | (e as u32 & 0xffff)) as i32)
+    error.raw_os_error().map_or(E_INVALIDARG, |e| (0x8007_0000 | (e as u32 & 0xffff)) as i32)
 }
 
 // The factory.
@@ -162,12 +151,7 @@ extern "system" fn create_status_array(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
-    tracing::info!(
-        capacity,
-        name = text(name),
-        iid = iid_text(iid),
-        "dstorage: status array"
-    );
+    tracing::info!(capacity, name = text(name), iid = iid_text(iid), "dstorage: status array");
     let entries = (0..capacity).map(|_| AtomicI32::new(S_OK)).collect();
     let array = Instance::create(
         Object::new("dstorage status array", &STATUS_VTABLE),
@@ -216,10 +200,7 @@ extern "system" fn create_queue(
     let lane = Lane::new(desc.priority, desc.capacity);
     lanes.lanes.insert(id, lane);
     drop(lanes);
-    put(
-        out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
-    )
+    put(out, Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }))
 }
 
 /// Grand Theft Auto VI asks for 32 MiB and stops if this fails.
@@ -236,9 +217,7 @@ fn text(name: *const c_char) -> String {
         return String::new();
     }
     // SAFETY: a NUL-terminated name from the title.
-    unsafe { CStr::from_ptr(name) }
-        .to_string_lossy()
-        .into_owned()
+    unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned()
 }
 
 static FACTORY_VTABLE: Methods<16> = Methods([
@@ -290,9 +269,7 @@ type Array = *mut Instance<StatusArray>;
 extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
     // SAFETY: an array we created and the title still holds.
     let entries = &unsafe { &*this }.state.entries;
-    entries
-        .get(index as usize)
-        .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
+    entries.get(index as usize).map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
 }
 
 /// Grand Theft Auto VI polls this (entry 0, a `Sleep(1)` loop) and never
@@ -490,7 +467,8 @@ impl Lanes {
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                bcpack_workers =
+                    format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 waiting,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
@@ -527,12 +505,7 @@ impl Lanes {
         self.clock[class] += size * COST[class];
         self.lane_now[class] = lane.clock;
         lane.clock += size;
-        Some(Job {
-            lane: id,
-            seq,
-            request,
-            staging,
-        })
+        Some(Job { lane: id, seq, request, staging })
     }
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
@@ -553,11 +526,7 @@ impl Lanes {
         };
         // A class that had nothing waiting starts from now, not from the
         // credit it left behind.
-        if !self
-            .lanes
-            .values()
-            .any(|l| l.class == class && !l.reads.is_empty())
-        {
+        if !self.lanes.values().any(|l| l.class == class && !l.reads.is_empty()) {
             self.clock[class] = self.clock[class].max(self.now);
         }
         let Some(lane) = self.lanes.get_mut(&id) else {
@@ -609,12 +578,8 @@ impl Lane {
                 return;
             };
             let later = self.failures.split_off(&seq);
-            let first = std::mem::replace(&mut self.failures, later)
-                .into_values()
-                .next();
-            status
-                .entry()
-                .store(first.unwrap_or(S_OK), Ordering::Release);
+            let first = std::mem::replace(&mut self.failures, later).into_values().next();
+            status.entry().store(first.unwrap_or(S_OK), Ordering::Release);
         }
     }
 }
@@ -646,10 +611,7 @@ fn close_lane(id: u64) {
     lane.reads.clear();
     lane.statuses.clear(); // releases their arrays
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
-        lanes = scheduler
-            .finished
-            .wait(lanes)
-            .unwrap_or_else(|e| e.into_inner());
+        lanes = scheduler.finished.wait(lanes).unwrap_or_else(|e| e.into_inner());
     }
     lanes.lanes.remove(&id);
     scheduler.finished.notify_all();
@@ -694,7 +656,6 @@ enum Command {
     Read(Request),
     Status(Status),
 }
-
 
 /// A status entry to write, holding a reference on its array.
 struct Status {
@@ -754,10 +715,7 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
-        lanes = scheduler
-            .finished
-            .wait(lanes)
-            .unwrap_or_else(|e| e.into_inner());
+        lanes = scheduler.finished.wait(lanes).unwrap_or_else(|e| e.into_inner());
     }
     let Some(lane) = lanes.lanes.get_mut(&id) else {
         return;
@@ -921,13 +879,13 @@ static READING: AtomicU64 = AtomicU64::new(0);
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
-        out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
+        out.copy_from_slice(unsafe {
+            std::slice::from_raw_parts(request.source.cast(), out.len())
+        });
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state.file;
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
@@ -979,11 +937,7 @@ fn into_destination(
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
-        Err(E_INVALIDARG)
-    }
+    if super::xmem::write_physical(pages, offset, &data[..n]) { Ok(()) } else { Err(E_INVALIDARG) }
 }
 
 /// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
@@ -1035,10 +989,7 @@ mod tests {
         let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
             call(factory(), 0x20);
         let mut file = std::ptr::null_mut();
-        assert_eq!(
-            open(factory(), wide.as_ptr(), std::ptr::null(), &mut file),
-            S_OK
-        );
+        assert_eq!(open(factory(), wide.as_ptr(), std::ptr::null(), &mut file), S_OK);
         file
     }
 
@@ -1052,10 +1003,7 @@ mod tests {
         ) -> HRESULT = call(factory(), 0x28);
         let mut array = std::ptr::null_mut();
         let name = c"test".as_ptr();
-        assert_eq!(
-            create(factory(), capacity, name, std::ptr::null(), &mut array),
-            S_OK
-        );
+        assert_eq!(create(factory(), capacity, name, std::ptr::null(), &mut array), S_OK);
         array
     }
 
@@ -1163,14 +1111,7 @@ mod tests {
         let at = |b: &mut Vec<u8>| b.as_mut_ptr().cast();
         enqueue(queue, &request(0, at(&mut raw), 1000, file, 5000, 1000));
         let offset = plain.len() as u64;
-        let zlib = request(
-            ZLIB,
-            at(&mut inflated),
-            plain.len(),
-            file,
-            offset,
-            packed.len(),
-        );
+        let zlib = request(ZLIB, at(&mut inflated), plain.len(), file, offset, packed.len());
         enqueue(queue, &zlib);
         enqueue_status(queue, array, 0);
         assert_eq!(result(array, 0), E_PENDING, "pending until done");
@@ -1211,7 +1152,8 @@ mod tests {
         // Requests in flight together run in any order, so none of them
         // shares a destination (failed ones leave theirs undefined).
         let mut buffers = [[0u8; 16]; 5];
-        let [failed, failed_too, out, other, bcpack] = buffers.each_mut().map(|b| b.as_mut_ptr().cast());
+        let [failed, failed_too, out, other, bcpack] =
+            buffers.each_mut().map(|b| b.as_mut_ptr().cast());
 
         // Segment 0: a read past the end, then a bad stream; the first wins.
         enqueue(queue, &request(0, failed, 16, file, 4090, 16));
@@ -1453,10 +1395,7 @@ mod tests {
         use crate::modules::xmem;
         let mut pages = [0usize; 2];
         let mut n = 2;
-        assert_eq!(
-            xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
-            1
-        );
+        assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
         // Where the title would see them: a reservation of 64 KiB pages.
         let mapped = xmem::XMemVirtualAlloc(
             std::ptr::null_mut(),
@@ -1466,10 +1405,7 @@ mod tests {
             0x04,
         );
         assert!(!mapped.is_null());
-        assert_eq!(
-            xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()),
-            mapped
-        );
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 2, pages.as_ptr()), mapped);
 
         let plain = pattern(100);
         let (queue, array) = (new_queue(1), status_array(1));
@@ -1495,10 +1431,7 @@ mod tests {
         use crate::modules::xmem;
         let allocate = |n: usize| {
             let (mut pages, mut given) = (vec![0usize; n], n);
-            assert_eq!(
-                xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),
-                1
-            );
+            assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()), 1);
             pages
         };
         let (a, b) = (allocate(3), allocate(1));
@@ -1532,18 +1465,12 @@ mod tests {
                 0x04,
             );
             assert!(!mapped.is_null());
-            assert_eq!(
-                xmem::XMemMapPhysicalPages(mapped, 3, pages.as_ptr()),
-                mapped
-            );
+            assert_eq!(xmem::XMemMapPhysicalPages(mapped, 3, pages.as_ptr()), mapped);
             // SAFETY: all three pages are mapped read-write.
             let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 3 * PAGE) };
             assert!(seen[..50].iter().all(|&b| b == 0));
             assert_eq!(seen[50..50 + plain.len()], plain);
-            assert_eq!(
-                xmem::XMemMapPhysicalPages(mapped, 3, std::ptr::null()),
-                mapped
-            );
+            assert_eq!(xmem::XMemMapPhysicalPages(mapped, 3, std::ptr::null()), mapped);
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);

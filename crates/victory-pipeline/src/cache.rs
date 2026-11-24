@@ -59,10 +59,7 @@ impl Cache {
         std::fs::create_dir_all(dir)?;
         // Write-then-rename so readers never see partial output.
         let tmp = tempfile_in(dir);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
@@ -108,10 +105,7 @@ mod tests {
     fn converts_once_then_hits() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("cache")).unwrap();
-        let conv = Upper {
-            version: 1,
-            runs: AtomicUsize::new(0),
-        };
+        let conv = Upper { version: 1, runs: AtomicUsize::new(0) };
         let a = cache.get_or_convert(&conv, b"abc").unwrap();
         let b = cache.get_or_convert(&conv, b"abc").unwrap();
         assert_eq!(a, b);
@@ -123,31 +117,19 @@ mod tests {
     fn failed_publication_removes_the_staging_file() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("cache")).unwrap();
-        let conv = Upper {
-            version: 1,
-            runs: AtomicUsize::new(0),
-        };
+        let conv = Upper { version: 1, runs: AtomicUsize::new(0) };
         let path = cache.path_for(&CacheKey::new(&conv, b"abc"));
         std::fs::create_dir_all(&path).unwrap();
 
         assert!(cache.get_or_convert(&conv, b"abc").is_err());
         assert!(path.is_dir());
-        assert_eq!(
-            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
-            1
-        );
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
     }
 
     #[test]
     fn version_bump_invalidates() {
-        let v1 = Upper {
-            version: 1,
-            runs: AtomicUsize::new(0),
-        };
-        let v2 = Upper {
-            version: 2,
-            runs: AtomicUsize::new(0),
-        };
+        let v1 = Upper { version: 1, runs: AtomicUsize::new(0) };
+        let v2 = Upper { version: 2, runs: AtomicUsize::new(0) };
         assert_ne!(CacheKey::new(&v1, b"x"), CacheKey::new(&v2, b"x"));
     }
 

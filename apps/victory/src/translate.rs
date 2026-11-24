@@ -46,20 +46,13 @@ impl Checks {
         pipelines: bool,
         keep: Option<Kept>,
     ) -> Result<Self> {
-        let validator = validate
-            .then(|| Validator::load(dll))
-            .transpose()
-            .map_err(anyhow::Error::msg)?;
+        let validator =
+            validate.then(|| Validator::load(dll)).transpose().map_err(anyhow::Error::msg)?;
         let host = pipelines
             .then(|| Host::new(false).and_then(|h| host::stub_ps().map(|ps| (h, ps))))
             .transpose()
             .map_err(anyhow::Error::msg)?;
-        Ok(Self {
-            keep,
-            validator,
-            host,
-            dumped: HashMap::new(),
-        })
+        Ok(Self { keep, validator, host, dumped: HashMap::new() })
     }
 }
 
@@ -80,9 +73,8 @@ pub fn run(
         .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     // At least one: with none, every file would be read and nothing counted.
-    let threads = jobs
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
-        .max(1);
+    let threads =
+        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())).max(1);
     let mut checks = (0..threads)
         .map(|_| {
             let keep = (!pairs.is_empty()).then(|| kept.clone());
@@ -92,8 +84,7 @@ pub fn run(
     if validate {
         println!(
             "validator    {}",
-            dll.as_ref()
-                .map_or("dxil.dll".into(), |p| p.display().to_string())
+            dll.as_ref().map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
     let seen = Mutex::new(HashSet::new());
@@ -125,10 +116,7 @@ pub fn run(
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
     let verdict = t.verdict();
     println!("files        {} read", t.files);
-    println!(
-        "containers   {} ({} duplicates skipped)",
-        t.containers, t.duplicates
-    );
+    println!("containers   {} ({} duplicates skipped)", t.containers, t.duplicates);
     println!(
         "programs     {} translated of {} ({} IR instructions)",
         t.translated, t.programs, t.instructions
@@ -321,10 +309,9 @@ fn program(
                         *counter(t, p.stage, 1) += 1;
                         check(shader, t, checks, label);
                     }
-                    Err(ShaderError::Unsupported { offset, what }) => t
-                        .fail(format!("emit: {what}"), || {
-                            format!("{} at {offset:#x}", label())
-                        }),
+                    Err(ShaderError::Unsupported { offset, what }) => {
+                        t.fail(format!("emit: {what}"), || format!("{} at {offset:#x}", label()))
+                    }
                     Err(e) => t.fail(format!("emit: {e}"), label),
                 }
             }
@@ -353,14 +340,9 @@ fn check(
     if t.list
         && let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP")
     {
-        let name: String = label()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        write_dump(
-            format!("{dir}/{}.dxil", &name[name.len().saturating_sub(100)..]),
-            &shader.dxil,
-        );
+        let name: String =
+            label().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        write_dump(format!("{dir}/{}.dxil", &name[name.len().saturating_sub(100)..]), &shader.dxil);
     }
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
@@ -461,24 +443,15 @@ fn write_dump(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> bool {
 /// 3 pipelines.
 fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
     let [a, b, c, d] = match stage {
-        HwStage::Cs => [
-            &mut t.cs_programs,
-            &mut t.cs_emitted,
-            &mut t.cs_validated,
-            &mut t.cs_pipelines,
-        ],
-        HwStage::Ms => [
-            &mut t.ms_programs,
-            &mut t.ms_emitted,
-            &mut t.ms_validated,
-            &mut t.ms_pipelines,
-        ],
-        HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs | HwStage::Vs | HwStage::Ps => [
-            &mut t.emit_programs,
-            &mut t.emitted,
-            &mut t.validated,
-            &mut t.pipelines,
-        ],
+        HwStage::Cs => {
+            [&mut t.cs_programs, &mut t.cs_emitted, &mut t.cs_validated, &mut t.cs_pipelines]
+        }
+        HwStage::Ms => {
+            [&mut t.ms_programs, &mut t.ms_emitted, &mut t.ms_validated, &mut t.ms_pipelines]
+        }
+        HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs | HwStage::Vs | HwStage::Ps => {
+            [&mut t.emit_programs, &mut t.emitted, &mut t.validated, &mut t.pipelines]
+        }
     };
     [a, b, c, d].into_iter().nth(k).expect("0 to 3")
 }
@@ -539,10 +512,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
         // tables are no root parameter.
         if let Some(a) = a
             && a.param != resource::CODE
-            && !matches!(
-                p.layout[a.param].root,
-                RootType::ResourceHeap | RootType::SamplerHeap
-            )
+            && !matches!(p.layout[a.param].root, RootType::ResourceHeap | RootType::SamplerHeap)
         {
             traced.insert(p.layout[a.param].user_data);
         }
@@ -561,11 +531,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
     // values (decoded) are matched against the listed entries, which do not
     // say which value is whose.
     let mut values: Vec<emit::StaticSampler> = Vec::new();
-    for d in r
-        .descriptors
-        .iter()
-        .filter(|d| d.role == resource::Role::Sampler)
-    {
+    for d in r.descriptors.iter().filter(|d| d.role == resource::Role::Sampler) {
         for leaf in d.source.leaves() {
             if let resource::Source::Constant(words) = leaf
                 && let Ok(w) = <[u32; 4]>::try_from(&words[..words.len().min(4)])
@@ -580,11 +546,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
     // Engines often declare equal samplers at several registers, so equal
     // values may stand for several entries, but never more values than
     // entries.
-    let immediate = p
-        .used
-        .iter()
-        .filter(|u| u.root == RootType::ImmediateSampler)
-        .count();
+    let immediate = p.used.iter().filter(|u| u.root == RootType::ImmediateSampler).count();
     let samplers_match = !values.is_empty() && values.len() <= immediate;
     let matched = |u: &&victory_shader::UsedResource| {
         if u.root == RootType::ImmediateSampler {
@@ -594,9 +556,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
         }
     };
     for u in p.used.iter().filter(|u| !matched(u)) {
-        *t.untraced_used
-            .entry(format!("{:?} via {:?}", u.kind, u.root))
-            .or_default() += 1;
+        *t.untraced_used.entry(format!("{:?} via {:?}", u.kind, u.root)).or_default() += 1;
     }
     t.unlisted += traced.difference(&listed).count();
 }
@@ -604,11 +564,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
 fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Tally) {
     t.structured += 1;
     for (block, guards) in program.blocks.iter().zip(&s.guards) {
-        t.vector += block
-            .insts
-            .iter()
-            .filter(|i| i.read(ir::Reg::S(ir::EXEC)).is_some())
-            .count();
+        t.vector += block.insts.iter().filter(|i| i.read(ir::Reg::S(ir::EXEC)).is_some()).count();
         for &g in guards.iter().flatten() {
             t.guarded += 1;
             let support = s.bools.support(g);
@@ -617,11 +573,7 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
     }
     for exit in &s.exits {
         if let LaneExit::Branch { when, .. } = *exit {
-            if s.bools
-                .support(when)
-                .iter()
-                .all(|a| matches!(a, Atom::Uniform(_)))
-            {
+            if s.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
                 t.uniform_branches += 1;
             } else {
                 t.lane_branches += 1;
@@ -660,14 +612,7 @@ mod tests {
         Container {
             digest: [digest; 16],
             version: (1, 0),
-            parts: parts
-                .iter()
-                .map(|&(fourcc, data)| Part {
-                    fourcc,
-                    offset: 0,
-                    data,
-                })
-                .collect(),
+            parts: parts.iter().map(|&(fourcc, data)| Part { fourcc, offset: 0, data }).collect(),
         }
     }
 

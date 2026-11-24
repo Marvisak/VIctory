@@ -58,10 +58,7 @@ fn main() -> Result<()> {
                 .current_dir(&root)
                 .status()
                 .context("running git")?;
-            anyhow::ensure!(
-                status.success(),
-                "git config failed (is this a git repository?)"
-            );
+            anyhow::ensure!(status.success(), "git config failed (is this a git repository?)");
             println!("hooks installed: commits now run `cargo xtask policy --staged`");
             Ok(())
         }
@@ -69,8 +66,5 @@ fn main() -> Result<()> {
 }
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("xtask lives in the workspace")
-        .into()
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask lives in the workspace").into()
 }

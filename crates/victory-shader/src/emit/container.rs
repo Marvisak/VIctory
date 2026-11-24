@@ -76,9 +76,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
     for (i, e) in elements.iter().enumerate() {
-        let shared = (e.kind != 0)
-            .then(|| (0..i).find(|&j| elements[j].kind == e.kind))
-            .flatten();
+        let shared = (e.kind != 0).then(|| (0..i).find(|&j| elements[j].kind == e.kind)).flatten();
         match shared {
             Some(j) => offsets.push(offsets[j]),
             None => {
@@ -94,14 +92,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
         let rw = if input { used } else { !used & 0xf };
-        for v in [
-            0,
-            offset,
-            e.index,
-            e.system_value(),
-            e.sig_comp(),
-            e.row.unwrap_or(u32::MAX),
-        ] {
+        for v in [0, offset, e.index, e.system_value(), e.sig_comp(), e.row.unwrap_or(u32::MAX)] {
             out.extend(v.to_le_bytes());
         }
         out.extend([e.mask(), rw, 0, 0]);
@@ -144,13 +135,8 @@ pub(crate) struct Psv<'a> {
 
 /// `PSV0` with runtime info version 2 (validator 1.6).
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
-    let vectors = |els: &[SigElement]| {
-        els.iter()
-            .filter_map(|e| e.row)
-            .map(|r| r + 1)
-            .max()
-            .unwrap_or(0)
-    };
+    let vectors =
+        |els: &[SigElement]| els.iter().filter_map(|e| e.row).map(|r| r + 1).max().unwrap_or(0);
     let (in_vectors, out_vectors) = (vectors(p.inputs), vectors(p.outputs));
     let mut out = Vec::new();
     let u32s = |out: &mut Vec<u8>, vs: &[u32]| {
@@ -164,11 +150,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     if p.stage == 0 {
         // PSInfo.SampleFrequency: an input interpolated per sample, or the
         // sample index.
-        info[1] = u8::from(
-            p.inputs
-                .iter()
-                .any(|e| matches!(e.interp, 6 | 7) || e.kind == 12),
-        );
+        info[1] = u8::from(p.inputs.iter().any(|e| matches!(e.interp, 6 | 7) || e.kind == 12));
     }
     let (min, max) = p.wave_size.map_or((0, u32::MAX), |n| (n, n));
     info[16..20].copy_from_slice(&min.to_le_bytes());
@@ -194,10 +176,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
         for b in p.bindings {
-            u32s(
-                &mut out,
-                &[b.kind, b.space, b.register, b.register, b.dxil_kind, 0],
-            );
+            u32s(&mut out, &[b.kind, b.space, b.register, b.register, b.dxil_kind, 0]);
         }
     }
     // Names of arbitrary semantics (system values use ""), then indices.
@@ -255,16 +234,8 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         let per = (out_vectors * 4).div_ceil(32);
         for i in 0..in_vectors * 4 {
             for k in 0..per {
-                let bits = if i < ni {
-                    no.saturating_sub(32 * k).min(32)
-                } else {
-                    0
-                };
-                let mask = if bits == 32 {
-                    u32::MAX
-                } else {
-                    (1u32 << bits) - 1
-                };
+                let bits = if i < ni { no.saturating_sub(32 * k).min(32) } else { 0 };
+                let mask = if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 };
                 u32s(&mut out, &[mask]);
             }
         }
@@ -322,12 +293,7 @@ pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
     }
     tail.extend(((len as u32) << 1 | 1).to_le_bytes());
     let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
-    for block in data[..len - left]
-        .as_chunks::<64>()
-        .0
-        .iter()
-        .chain(tail.as_chunks::<64>().0)
-    {
+    for block in data[..len - left].as_chunks::<64>().0.iter().chain(tail.as_chunks::<64>().0) {
         md5_block(&mut state, block);
     }
     let mut out = [0; 16];
@@ -339,12 +305,7 @@ pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
 
 fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
     const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
-    let x: Vec<u32> = block
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| u32::from_le_bytes(*c))
-        .collect();
+    let x: Vec<u32> = block.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
     let [mut a, mut b, mut c, mut d] = *state;
     for i in 0..64 {
         let (f, g) = match i / 16 {
@@ -379,11 +340,8 @@ mod tests {
         block.extend(24u64.to_le_bytes());
         let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
         md5_block(&mut state, block.as_slice().try_into().unwrap());
-        let hex: String = state
-            .iter()
-            .flat_map(|s| s.to_le_bytes())
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let hex: String =
+            state.iter().flat_map(|s| s.to_le_bytes()).map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
     }
 }

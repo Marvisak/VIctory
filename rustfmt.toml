@@ -1,2 +1,6 @@
 max_width = 100
-use_field_init_shorthand = true
+tab_spaces = 4
+newline_style = "Unix"
+use_small_heuristics = "Max"
+trailing_comma = "Always"
+reorder_imports = true

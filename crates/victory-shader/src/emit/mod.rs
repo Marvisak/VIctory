@@ -128,12 +128,10 @@ pub fn loop_limit() -> u32 {
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
-    let parsed = value
-        .map(str::trim)
-        .and_then(|v| match v.strip_prefix("0x") {
-            Some(hex) => u32::from_str_radix(hex, 16).ok(),
-            None => v.parse().ok(),
-        });
+    let parsed = value.map(str::trim).and_then(|v| match v.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => v.parse().ok(),
+    });
     match parsed {
         Some(n) if n > 0 => n,
         _ => lower::LOOP_LIMIT,
@@ -165,12 +163,7 @@ impl HostShader {
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {
-        let n = self
-            .user_data
-            .iter()
-            .map(|u| u.index + 1)
-            .max()
-            .unwrap_or(0);
+        let n = self.user_data.iter().map(|u| u.index + 1).max().unwrap_or(0);
         n.next_multiple_of(4)
     }
 }
@@ -192,17 +185,10 @@ pub struct UserData {
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let dxil = c.part(FourCC::DXIL).ok_or(ShaderError::Malformed("no DXIL part"))?;
     let native = crate::native_programs(dxil.data)?
         .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
-            )
-        })
+        .find(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms))
         .ok_or(ShaderError::Unsupported {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
@@ -222,13 +208,8 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 /// that agree on these translate the same way, whatever else they carry
 /// (digest, debug name, statistics), so the offline batch deduplicates on
 /// them. A part read here must be added to the list.
-pub const INPUT_PARTS: [FourCC; 5] = [
-    FourCC::DXIL,
-    FourCC::ISG1,
-    FourCC::OSG1,
-    FourCC::PSG1,
-    FourCC::PSV0,
-];
+pub const INPUT_PARTS: [FourCC; 5] =
+    [FourCC::DXIL, FourCC::ISG1, FourCC::OSG1, FourCC::PSG1, FourCC::PSV0];
 
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
@@ -288,9 +269,7 @@ pub fn emit(
             let threads = psv
                 .filter(|d| crate::dxbc::u32_at(d, 0).is_ok_and(|n| n >= 48))
                 .and_then(|d| crate::dxbc::u32_at(d, 4 + 36).ok());
-            threads.map_or(ms.threads, |t| {
-                t.max(ms.max_vertices).max(ms.max_primitives)
-            })
+            threads.map_or(ms.threads, |t| t.max(ms.max_vertices).max(ms.max_primitives))
         }
         _ => 0,
     };
@@ -340,9 +319,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             .get(name_at..)
             .and_then(|s| s.split(|&b| b == 0).next())
             .ok_or(ShaderError::Malformed("signature name out of bounds"))?;
-        let mask = *part
-            .get(at + 24)
-            .ok_or(ShaderError::Malformed("truncated"))?;
+        let mask = *part.get(at + 24).ok_or(ShaderError::Malformed("truncated"))?;
         if u32_at(part, at + 28)? != 0 {
             return Err(ShaderError::Unsupported {
                 offset: 0,
@@ -522,10 +499,7 @@ mod tests {
             vgprs: 2,
             layout: vec![],
             used: vec![],
-            io: StageIo::Cs(ComputeIo {
-                rsrc2: 0,
-                threads: [64, 1, 1],
-            }),
+            io: StageIo::Cs(ComputeIo { rsrc2: 0, threads: [64, 1, 1] }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
@@ -557,12 +531,7 @@ mod tests {
         });
         let b = s.entry;
         for (c, v) in [1.0f32, 0.5, 0.25, 1.0].into_iter().enumerate() {
-            let args = [
-                s.m.i32(0),
-                s.m.i32(0),
-                s.m.i8(c as u8),
-                s.m.f32(v.to_bits()),
-            ];
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(c as u8), s.m.f32(v.to_bits())];
             s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
         }
         s.m.terminate(b, super::bitcode::Term::Ret);
@@ -613,10 +582,7 @@ mod tests {
         for digest in [&[0u8; 16][..], &wrong] {
             let mut other = ps.clone();
             other.dxil[4..20].copy_from_slice(digest);
-            assert!(
-                host.pipeline(&vs, &other).is_err(),
-                "digest {digest:02x?} accepted"
-            );
+            assert!(host.pipeline(&vs, &other).is_err(), "digest {digest:02x?} accepted");
         }
     }
 
@@ -690,8 +656,7 @@ mod tests {
             let c = super::Container::parse(&bytes).unwrap();
             let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
             let st = crate::structure::structure(&p).unwrap();
-            let res =
-                crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
             let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.

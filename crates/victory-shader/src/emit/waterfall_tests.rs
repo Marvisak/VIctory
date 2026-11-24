@@ -49,10 +49,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
             range(ResourceType::Uav, 16, 4, 0, 0),
             range(ResourceType::Sampler, 0, 4, 0, 1),
         ],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 2 << 1,
-            threads: [32, 1, 1],
-        }),
+        io: StageIo::Cs(ComputeIo { rsrc2: 2 << 1, threads: [32, 1, 1] }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
@@ -84,8 +81,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         root_srvs: lowered.root_srvs,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
     } else {
         eprintln!("no dxil.dll; validation skipped");
     }
@@ -109,9 +105,7 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     // One GPU test at a time, with the VALU tests: in parallel on the
     // hardware adapter and WARP the test process sometimes died of an
     // access violation (7 of 24 runs of these four tests).
-    let _one = super::valu_tests::ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
@@ -149,11 +143,7 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
 fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
     let first = [[1.0f32, 0.0, 0.0, 1.0]];
     let second = [[2.0f32, 0.0, 0.0, 1.0]];
-    let views = [
-        View::Texture(1, 1, &first),
-        View::Texture(1, 1, &second),
-        View::RawUav(32),
-    ];
+    let views = [View::Texture(1, 1, &first), View::Texture(1, 1, &second), View::RawUav(32)];
     run(shader, &views)
         .into_iter()
         .map(|(label, words)| (label, words.into_iter().map(f32::from_bits).collect()))
@@ -196,14 +186,8 @@ fn lanes_load_from_the_buffer_their_nested_arms_chose() {
     let first: Vec<u32> = (0..32).map(|i| 100 + i).collect();
     let second: Vec<u32> = (0..32).map(|i| 200 + i).collect();
     let views = [
-        View::Buffer {
-            data: &first,
-            stride: Stride::Structured(4),
-        },
-        View::Buffer {
-            data: &second,
-            stride: Stride::Structured(4),
-        },
+        View::Buffer { data: &first, stride: Stride::Structured(4) },
+        View::Buffer { data: &second, stride: Stride::Structured(4) },
         View::RawUav(32),
     ];
     for (label, got) in run(&shader, &views) {

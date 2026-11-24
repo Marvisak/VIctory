@@ -71,8 +71,7 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+    set.get_or_insert_with(Default::default).insert(resource as usize);
 }
 
 /// The title released a resource.
@@ -149,17 +148,13 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             // SAFETY: a borrowed pointer the location never releases.
             pResource: unsafe { std::mem::transmute_copy(texture) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: i as u32,
-            },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
             pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: *footprint,
-            },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
         };
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
@@ -245,8 +240,7 @@ impl Staging {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
             if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                self.layout.detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
@@ -284,10 +278,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
-        once!(
-            ?desc,
-            "texture contents without a console layout not uploaded"
-        );
+        once!(?desc, "texture contents without a console layout not uploaded");
         return None;
     };
     if layout.desc.swizzle.xor() {

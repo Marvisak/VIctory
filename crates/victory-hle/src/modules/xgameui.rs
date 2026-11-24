@@ -15,20 +15,12 @@ use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text,
 };
 
-pub const PROVIDER: Guid = Guid::new(
-    0xdfcd_4649,
-    0x4ff8,
-    0x4043,
-    [0xba, 0x07, 0x35, 0xd6, 0x07, 0xdf, 0x98, 0xb0],
-);
+pub const PROVIDER: Guid =
+    Guid::new(0xdfcd_4649, 0x4ff8, 0x4043, [0xba, 0x07, 0x35, 0xd6, 0x07, 0xdf, 0x98, 0xb0]);
 /// As Grand Theft Auto VI (2026) asks for it; the slots it calls (0x38,
 /// 0x40, 0x88-0x98) take the public API's arguments in the 2020 order.
-pub const IID_2026: Guid = Guid::new(
-    0xeaf6_69df,
-    0x5542,
-    0x4590,
-    [0x99, 0xa3, 0x8d, 0xc0, 0x61, 0xf8, 0x37, 0xcc],
-);
+pub const IID_2026: Guid =
+    Guid::new(0xeaf6_69df, 0x5542, 0x4590, [0x99, 0xa3, 0x8d, 0xc0, 0x61, 0xf8, 0x37, 0xcc]);
 
 pub static OBJECT: Object = Object::new("game ui", &VTABLE);
 pub const INTERFACES: &[Interface] = &[(PROVIDER, IID_2026, &OBJECT)];
@@ -63,7 +55,8 @@ extern "system" fn text_entry_async(
     _scope: u32,
     max_length: u32,
 ) -> HRESULT {
-    let [title, description, default] = [title, description, default].map(|t| text(t).unwrap_or_default());
+    let [title, description, default] =
+        [title, description, default].map(|t| text(t).unwrap_or_default());
     tracing::info!(title, description, max_length, "text entry");
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {
         match ask(&title, &description, &default, max_length) {
@@ -202,7 +195,12 @@ mod dialog {
         entry.typed
     }
 
-    extern "system" fn procedure(dialog: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
+    extern "system" fn procedure(
+        dialog: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> isize {
         // SAFETY: our dialog; its user data is the `Entry` from `ask`,
         // stored at WM_INITDIALOG.
         unsafe {
@@ -217,12 +215,16 @@ mod dialog {
                     0 // focus set here
                 }
                 wm::WM_COMMAND => {
-                    let entry = &mut *(wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA) as *mut Entry);
+                    let entry =
+                        &mut *(wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA) as *mut Entry);
                     match (wparam & 0xffff) as i32 {
                         wm::IDOK => {
-                            let mut buffer = vec![0u16; wm::GetWindowTextLengthW(edit) as usize + 1];
-                            let n = wm::GetWindowTextW(edit, buffer.as_mut_ptr(), buffer.len() as i32);
-                            entry.typed = Some(String::from_utf16_lossy(&buffer[..n.max(0) as usize]));
+                            let mut buffer =
+                                vec![0u16; wm::GetWindowTextLengthW(edit) as usize + 1];
+                            let n =
+                                wm::GetWindowTextW(edit, buffer.as_mut_ptr(), buffer.len() as i32);
+                            entry.typed =
+                                Some(String::from_utf16_lossy(&buffer[..n.max(0) as usize]));
                             wm::EndDialog(dialog, 1);
                         }
                         wm::IDCANCEL => {
@@ -281,10 +283,7 @@ mod tests {
         let mut b = block();
         type Card = extern "system" fn(This, *mut AsyncBlock, *const c_void, u64) -> HRESULT;
         type Done = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
-        assert_eq!(
-            method::<Card>(&OBJECT, 0x38)(this, &mut b, std::ptr::null(), 1),
-            S_OK
-        );
+        assert_eq!(method::<Card>(&OBJECT, 0x38)(this, &mut b, std::ptr::null(), 1), S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
         assert_eq!(method::<Done>(&OBJECT, 0x40)(this, &mut b), S_OK);
 
@@ -298,7 +297,8 @@ mod tests {
             u32,
         ) -> HRESULT;
         type Size = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
-        type Result_ = extern "system" fn(This, *mut AsyncBlock, u32, *mut c_char, *mut u32) -> HRESULT;
+        type Result_ =
+            extern "system" fn(This, *mut AsyncBlock, u32, *mut c_char, *mut u32) -> HRESULT;
         let null = std::ptr::null();
         let entry = method::<Entry>(&OBJECT, 0x88);
         // Dismissed: cancelled.

@@ -17,10 +17,7 @@
     clippy::not_unsafe_ptr_arg_deref,
     reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
 )]
-#![allow(
-    clippy::too_many_arguments,
-    reason = "the signature is fixed by the API title code calls"
-)]
+#![allow(clippy::too_many_arguments, reason = "the signature is fixed by the API title code calls")]
 
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::ffi::OsStrExt;
@@ -95,10 +92,7 @@ pub fn mount(root: &Path) -> Option<char> {
 /// drive of that letter is hidden from the title.
 pub fn mount_at(letter: char, root: &Path) {
     let letter = letter.to_ascii_uppercase();
-    let Some(index) = u32::from(letter)
-        .checked_sub(u32::from('A'))
-        .filter(|i| *i < 26)
-    else {
+    let Some(index) = u32::from(letter).checked_sub(u32::from('A')).filter(|i| *i < 26) else {
         return;
     };
     // SAFETY: no arguments.
@@ -192,13 +186,11 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
         out.push(b'\\'.into());
     }
     let verbatim = !prefix.is_empty();
-    out.extend(tail.iter().map(|&c| {
-        if verbatim && c == u16::from(b'/') {
-            b'\\'.into()
-        } else {
-            c
-        }
-    }));
+    out.extend(tail.iter().map(
+        |&c| {
+            if verbatim && c == u16::from(b'/') { b'\\'.into() } else { c }
+        },
+    ));
     out.push(0);
     Some(out)
 }
@@ -840,14 +832,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(remove),
             hle_export!(_wchmod),
             hle_export!(_wutime64),
-            HleExport {
-                name: FIOPEN,
-                address: fiopen as *const () as usize,
-            },
-            HleExport {
-                name: FIOPEN_WIDE,
-                address: fiopen_wide as *const () as usize,
-            },
+            HleExport { name: FIOPEN, address: fiopen as *const () as usize },
+            HleExport { name: FIOPEN_WIDE, address: fiopen_wide as *const () as usize },
         ],
     }
 }
@@ -907,23 +893,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_string_lossy().into_owned();
         let letter = mount(dir.path()).unwrap();
-        assert_eq!(
-            mount(dir.path()),
-            Some(letter),
-            "mounting twice reuses the letter"
-        );
+        assert_eq!(mount(dir.path()), Some(letter), "mounting twice reuses the letter");
         let tr = |s: String| translate(&w(&s)[..s.encode_utf16().count()]).map(|v| text(&v));
-        assert_eq!(
-            tr(format!("{letter}:/a/b.txt")),
-            Some(format!("{root}/a/b.txt"))
-        );
+        assert_eq!(tr(format!("{letter}:/a/b.txt")), Some(format!("{root}/a/b.txt")));
         let lower = letter.to_ascii_lowercase();
         assert_eq!(tr(format!("{lower}:\\a")), Some(format!("{root}\\a")));
         assert_eq!(tr(format!("{letter}:")), Some(format!("{root}\\")));
-        assert_eq!(
-            tr(format!(r"\\?\{letter}:/a/b")),
-            Some(format!(r"\\?\{root}\a\b"))
-        );
+        assert_eq!(tr(format!(r"\\?\{letter}:/a/b")), Some(format!(r"\\?\{root}\a\b")));
         assert_eq!(tr(r"C:\Windows".into()), None);
         assert_eq!(tr("relative/path".into()), None);
         assert_eq!(tr(String::new()), None);
@@ -982,15 +958,7 @@ mod tests {
 
         let path = w(&format!(r"{letter}:\created.bin"));
         let null = std::ptr::null_mut();
-        let h = CreateFileW(
-            path.as_ptr(),
-            GENERIC_WRITE,
-            0,
-            null,
-            CREATE_ALWAYS,
-            0,
-            null,
-        );
+        let h = CreateFileW(path.as_ptr(), GENERIC_WRITE, 0, null, CREATE_ALWAYS, 0, null);
         assert_ne!(h as isize, -1);
         close(h);
         assert!(dir.path().join("created.bin").is_file());
@@ -1083,10 +1051,8 @@ mod tests {
         assert!(fiopen(path("d.txt").as_ptr().cast(), OUT, 0x40).is_null());
 
         // Nothing was made behind a path rewritten twice.
-        let names: Vec<_> = std::fs::read_dir(&folder)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
+        let names: Vec<_> =
+            std::fs::read_dir(&folder).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names, ["present.txt"]);
     }
 }

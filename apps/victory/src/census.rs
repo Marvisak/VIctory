@@ -20,11 +20,8 @@ struct DllStats {
 
 pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
-    let resolver = HleResolver::new(if strict {
-        HostPolicy::none()
-    } else {
-        HostPolicy::default()
-    });
+    let resolver =
+        HleResolver::new(if strict { HostPolicy::none() } else { HostPolicy::default() });
 
     let mut images = 0usize;
     let mut failed = Vec::new();
@@ -32,10 +29,7 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
     let mut missing: BTreeMap<(String, String), BTreeSet<PathBuf>> = BTreeMap::new();
 
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
             let path = entry.path();
             if !entry.file_type().is_file() || !looks_like_pe(path) {
                 continue;
@@ -117,8 +111,5 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
 /// packages do not always use .exe/.dll).
 fn looks_like_pe(path: &Path) -> bool {
     let mut magic = [0u8; 2];
-    std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .is_ok()
-        && &magic == b"MZ"
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && &magic == b"MZ"
 }

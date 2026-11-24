@@ -22,12 +22,7 @@ use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
 const ALLOCATOR_IIDS: [Iid; 4] = [
-    guid(
-        0x6102dee4,
-        0xaf59,
-        0x4b09,
-        [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
-    ),
+    guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]),
     PAGEABLE_IIDS[0],
     PAGEABLE_IIDS[1],
     PAGEABLE_IIDS[2],
@@ -38,54 +33,14 @@ const ALLOCATOR_IIDS: [Iid; 4] = [
 /// own List5 and List6 (Grand Theft Auto VI asks for List6), then the
 /// device child's.
 const LIST_IIDS: [Iid; 10] = [
-    guid(
-        0x7116d91c,
-        0xe7e4,
-        0x47ce,
-        [0xb8, 0xc6, 0xec, 0x81, 0x68, 0xf4, 0x37, 0xe5],
-    ),
-    guid(
-        0x5b160d0f,
-        0xac1b,
-        0x4185,
-        [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
-    ),
-    guid(
-        0x553103fb,
-        0x1fe7,
-        0x4557,
-        [0xbb, 0x38, 0x94, 0x6d, 0x7d, 0x0e, 0x7c, 0xa7],
-    ),
-    guid(
-        0x38c3e585,
-        0xff17,
-        0x412c,
-        [0x91, 0x50, 0x4f, 0xc6, 0xf9, 0xd7, 0x2a, 0x28],
-    ),
-    guid(
-        0x6fda83a7,
-        0xb84c,
-        0x4e38,
-        [0x9a, 0xc8, 0xc7, 0xbd, 0x22, 0x01, 0x6b, 0x3d],
-    ),
-    guid(
-        0x8754318e,
-        0xd3a9,
-        0x4541,
-        [0x98, 0xcf, 0x64, 0x5b, 0x50, 0xdc, 0x48, 0x74],
-    ),
-    guid(
-        0x55050859,
-        0x4024,
-        0x474c,
-        [0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74],
-    ),
-    guid(
-        0xc3827890,
-        0x4024,
-        0x474c,
-        [0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74],
-    ),
+    guid(0x7116d91c, 0xe7e4, 0x47ce, [0xb8, 0xc6, 0xec, 0x81, 0x68, 0xf4, 0x37, 0xe5]),
+    guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]),
+    guid(0x553103fb, 0x1fe7, 0x4557, [0xbb, 0x38, 0x94, 0x6d, 0x7d, 0x0e, 0x7c, 0xa7]),
+    guid(0x38c3e585, 0xff17, 0x412c, [0x91, 0x50, 0x4f, 0xc6, 0xf9, 0xd7, 0x2a, 0x28]),
+    guid(0x6fda83a7, 0xb84c, 0x4e38, [0x9a, 0xc8, 0xc7, 0xbd, 0x22, 0x01, 0x6b, 0x3d]),
+    guid(0x8754318e, 0xd3a9, 0x4541, [0x98, 0xcf, 0x64, 0x5b, 0x50, 0xdc, 0x48, 0x74]),
+    guid(0x55050859, 0x4024, 0x474c, [0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74]),
+    guid(0xc3827890, 0x4024, 0x474c, [0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74]),
     PAGEABLE_IIDS[1],
     PAGEABLE_IIDS[2],
 ];
@@ -152,10 +107,7 @@ pub(crate) extern "system" fn create_allocator(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    let allocator = Box::new(Allocator {
-        object: Object::new(&ALLOCATOR_FUNCTIONS),
-        kind,
-    });
+    let allocator = Box::new(Allocator { object: Object::new(&ALLOCATOR_FUNCTIONS), kind });
     object::hand_out(ALLOCATOR, allocator, iid, &ALLOCATOR_IIDS, out)
 }
 
@@ -318,39 +270,21 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             })
         }
         1 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
-            } else {
-                host(b.first)?
-            },
-            second: if b.second == 0 {
-                0
-            } else {
-                host(b.second as This)? as u64
-            },
+            first: if b.first.is_null() { b.first } else { host(b.first)? },
+            second: if b.second == 0 { 0 } else { host(b.second as This)? as u64 },
             ..*b
         }),
-        2 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
-            } else {
-                host(b.first)?
-            },
-            ..*b
-        }),
+        2 => {
+            Some(Barrier { first: if b.first.is_null() { b.first } else { host(b.first)? }, ..*b })
+        }
         _ => None,
     }
 }
 
 /// An unordered access barrier on every resource: earlier shader writes
 /// finish before later work reads or writes.
-const UAV_BARRIER: Barrier = Barrier {
-    kind: 2,
-    flags: 0,
-    first: std::ptr::null(),
-    second: 0,
-    last: 0,
-};
+const UAV_BARRIER: Barrier =
+    Barrier { kind: 2, flags: 0, first: std::ptr::null(), second: 0, last: 0 };
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
@@ -360,10 +294,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
+        let mut host: Vec<Barrier> =
+            barriers.iter().filter_map(|b| host_barrier(list, b)).collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
@@ -445,10 +377,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
-        if let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
-            crate::resource::host_resource(src),
-        ) {
+        if let (Some(to), Some(from)) =
+            (crate::resource::host_resource(dst), crate::resource::host_resource(src))
+        {
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
@@ -459,10 +390,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
-        } else if let (Some((to, a)), Some((from, b))) = (
-            crate::resource::buffer_bytes(dst),
-            crate::resource::buffer_bytes(src),
-        ) {
+        } else if let (Some((to, a)), Some((from, b))) =
+            (crate::resource::buffer_bytes(dst), crate::resource::buffer_bytes(src))
+        {
             list.defer_copy(to, from, a.min(b) as usize);
         }
     }
@@ -503,9 +433,7 @@ extern "system" fn copy_texture_region(
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
         let (Some(list), Some(&dst), Some(&src)) =
-            (host_list(this), unsafe { dst.as_ref() }, unsafe {
-                src.as_ref()
-            })
+            (host_list(this), unsafe { dst.as_ref() }, unsafe { src.as_ref() })
         else {
             return;
         };
@@ -622,10 +550,8 @@ extern "system" fn resolve(
 ) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
-        && let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
-            crate::resource::host_resource(src),
-        )
+        && let (Some(to), Some(from)) =
+            (crate::resource::host_resource(dst), crate::resource::host_resource(src))
     {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
@@ -645,8 +571,7 @@ extern "system" fn resolve(
             let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = DXGI_FORMAT(format as i32);
             if (a.Width, a.Height) == (b.Width, b.Height) {
-                list.list
-                    .ResolveSubresource(to, dst_sub, from, src_sub, format);
+                list.list.ResolveSubresource(to, dst_sub, from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
                 // The console clips a larger source to the destination.
                 let rect = RECT {
@@ -694,10 +619,9 @@ extern "system" fn clear_rtv(
         else {
             return;
         };
-        let (Some(texture), Some(host)) = (
-            crate::resource::host_resource(record.resource),
-            crate::host::host(),
-        ) else {
+        let (Some(texture), Some(host)) =
+            (crate::resource::host_resource(record.resource), crate::host::host())
+        else {
             return;
         };
         // SAFETY: the title passes four floats (null is tolerated).
@@ -745,10 +669,9 @@ extern "system" fn clear_dsv(
         else {
             return;
         };
-        let (Some(texture), Some(host)) = (
-            crate::resource::host_resource(record.resource),
-            crate::host::host(),
-        ) else {
+        let (Some(texture), Some(host)) =
+            (crate::resource::host_resource(record.resource), crate::host::host())
+        else {
             return;
         };
         let rects = (count > 0 && !rects.is_null()).then(|| {
@@ -760,8 +683,13 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+            list.list.ClearDepthStencilView(
+                dsv,
+                D3D12_CLEAR_FLAGS(flags as i32 & 3),
+                depth,
+                stencil,
+                rects,
+            )
         };
     }
     #[cfg(not(windows))]
@@ -988,9 +916,7 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
-        with_state(this, |_, s| {
-            s.set_constants(true, slot, items(values, count), offset)
-        });
+        with_state(this, |_, s| s.set_constants(true, slot, items(values, count), offset));
     }
     pub(super) extern "system" fn graphics_constants(
         this: This,
@@ -999,9 +925,7 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
-        with_state(this, |_, s| {
-            s.set_constants(false, slot, items(values, count), offset)
-        });
+        with_state(this, |_, s| s.set_constants(false, slot, items(values, count), offset));
     }
     /// Root constant buffer, shader resource and unordered access views.
     pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
@@ -1056,9 +980,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
-            s.draw(list, vertices, instances, first, first_instance)
-        });
+        with_state(this, |list, s| s.draw(list, vertices, instances, first, first_instance));
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
@@ -1247,7 +1169,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        let barrier =
+            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1385,11 +1308,8 @@ const fn list_table(newer: bool) -> [*const (); 160] {
     let mut f = object::d3d12_object(object::missing_table::<LIST, 160>());
     let mut i = 0;
     while i < METHODS.len() + MORE_METHODS.len() {
-        let (slot, method) = if i < METHODS.len() {
-            METHODS[i]
-        } else {
-            MORE_METHODS[i - METHODS.len()]
-        };
+        let (slot, method) =
+            if i < METHODS.len() { METHODS[i] } else { MORE_METHODS[i - METHODS.len()] };
         f[if newer { newer_slot(slot) } else { slot }] = method;
         i += 1;
     }
@@ -1415,10 +1335,7 @@ mod tests {
     fn every_inline_command_falls_back_to_the_table() {
         let null = std::ptr::null();
         let mut allocator = null;
-        assert_eq!(
-            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
-            S_OK
-        );
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
         let mut list = null;
         let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
         assert_eq!(hr, S_OK);
@@ -1435,10 +1352,7 @@ mod tests {
         assert_eq!(same, list);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(list, 0x10)(list), 1);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(list, 0x40)(list), 0);
-        assert_eq!(
-            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
-            S_OK
-        );
+        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
         // List-owned upload memory: aligned, writable, gone at reset.
         let p = allocate_upload(list, 40, 0x100);
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
