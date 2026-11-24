@@ -43,6 +43,12 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Names of declared functions (`dx.op.*`, `main`) in the emitted module.
+    #[cfg(test)]
+    pub op_names: Vec<String>,
+    /// Emitted module instructions formatted via `Module::inst_lines`.
+    #[cfg(test)]
+    pub insts: Vec<String>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -910,6 +916,10 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            op_names: self.s.m.func_names().map(str::to_owned).collect(),
+            #[cfg(test)]
+            insts: self.s.m.inst_lines(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -1339,14 +1349,12 @@ impl<'a> Lower<'a> {
         Ok(f)
     }
 
-    fn src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+    /// Source `k` as raw bits, preserving any DPP cross-lane value and SDWA selection.
+    fn raw_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
-            return Err("integer operand modifiers");
-        }
         match self.src0 {
             Some(x) if k == 0 => Ok(x),
             _ => {
@@ -1357,6 +1365,35 @@ impl<'a> Lower<'a> {
                 })
             }
         }
+    }
+
+    /// Source `k` as raw bits with `abs` (`& 0x7FFF_FFFF`) and `neg`
+    /// (`^ 0x8000_0000`) applied bitwise so denormals and NaN payloads are preserved.
+    fn src_bits(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let mut x = self.raw_src(inst, k)?;
+        let c = self.cur;
+        if v.abs >> k & 1 != 0 {
+            let mask = self.s.m.i32(0x7FFF_FFFF);
+            x = self.s.m.bin(c, Bin::And, x, mask);
+        }
+        if v.neg >> k & 1 != 0 {
+            let sign = self.s.m.i32(0x8000_0000);
+            x = self.s.m.bin(c, Bin::Xor, x, sign);
+        }
+        Ok(x)
+    }
+
+    fn src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
+            return Err("integer operand modifiers");
+        }
+        self.raw_src(inst, k)
     }
 
     fn unary(&mut self, op: u32, f: V) -> V {
@@ -3895,11 +3932,11 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_mov_b32" => {
-                if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
+                if v.clamp || v.omod != 0 {
                     let a = f(self, 0)?;
                     return float(self, a);
                 }
-                let a = s(self, 0)?;
+                let a = self.src_bits(inst, 0)?;
                 int(self, a)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
@@ -4160,12 +4197,7 @@ impl<'a> Lower<'a> {
                     .and_then(|m| self.x.st.masks.get(&m).copied())
                     .ok_or("a select on an untracked mask")?;
                 let cond = self.boolean(m, c)?;
-                if v.abs != 0 || v.neg != 0 {
-                    let (a, bb) = (f(self, 0)?, f(self, 1)?);
-                    let r = self.s.m.select(c, cond, bb, a);
-                    return float(self, r);
-                }
-                let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                let (a, bb) = (self.src_bits(inst, 0)?, self.src_bits(inst, 1)?);
                 let r = self.s.m.select(c, cond, bb, a);
                 int(self, r)
             }
