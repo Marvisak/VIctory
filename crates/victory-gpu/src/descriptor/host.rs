@@ -516,6 +516,16 @@ fn buffer_srv(
         return None;
     }
     buffer.FirstElement += offset / element;
+    // A zero count means "to the end of the buffer" on the console; the host
+    // rejects the view and removes the device for it (the debug layer says
+    // so). The count is filled from the host copy's size.
+    if buffer.NumElements == 0 {
+        // SAFETY: a live buffer.
+        let bytes = unsafe { shadow.buffer.GetDesc() }.Width;
+        buffer.NumElements = (bytes / element)
+            .saturating_sub(u64::from(buffer.FirstElement))
+            .max(1) as u32;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
