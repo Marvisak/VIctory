@@ -43,6 +43,15 @@ pub(crate) struct VertexView {
     stride: u32,
 }
 
+/// The root data sent to the host for one stage of the current draw
+/// (diagnostics, for the device-removed report).
+#[cfg(feature = "diagnostics")]
+struct BoundUserData {
+    values: Vec<u32>,
+    /// Tables made afresh for it: (root slot, offset of the fresh table).
+    rebuilt_tables: Vec<(u8, u32)>,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IndexView {
@@ -89,6 +98,9 @@ pub(crate) struct State {
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
+    /// The values sent to each stage for the next device-removed marker.
+    #[cfg(feature = "diagnostics")]
+    bound_user_data: Vec<BoundUserData>,
 }
 
 impl Drop for State {
@@ -508,6 +520,12 @@ impl State {
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        let record_bindings = crate::host::dred_on();
+        #[cfg(feature = "diagnostics")]
+        if record_bindings {
+            self.bound_user_data.clear();
+        }
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
         if list.take_rebind() {
@@ -590,8 +608,9 @@ impl State {
             // Root views a shader reads as title memory: the copies holding
             // their addresses go into the page table.
             let mut roots = Vec::new();
+            let mut values = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                values.resize(dwords as usize, 0);
                 for u in &t.host.user_data {
                     if u.root == RootType::Descriptor
                         && u.dword == 0
@@ -641,6 +660,10 @@ impl State {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     }
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            if record_bindings {
+                self.bound_user_data.push(BoundUserData { values, rebuilt_tables: made.clone() });
             }
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
@@ -924,9 +947,10 @@ impl State {
     }
 
     /// What a draw or dispatch runs, for the device-removed report
-    /// (diagnostics): the pipeline, then per stage the user data it gets
-    /// (with the view at that heap index, if one is), the host addresses
-    /// of its root views and the views its tables name.
+    /// (diagnostics): the pipeline, then per stage the user data it was
+    /// bound with (tables by where they are: rebuilt, in which heap and at
+    /// which slot, or unbound), the host addresses of its root views and the
+    /// title tables it reads.
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
@@ -934,34 +958,11 @@ impl State {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
-        let views = (self.heaps[0] != 0)
-            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-            .flatten();
-        for stage in &p.stages {
+        for (stage, bound) in p.stages.iter().zip(&self.bound_user_data) {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in t.host.user_data.iter().filter(|u| !is_root_view(u)) {
-                let v = self.user_value(compute, u.slot, u.root, u.dword);
-                let _ = write!(text, " u{}={v:#x}", u.index);
-                let index = if u.root == RootType::Table { v / 32 } else { v };
-                if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
-                    let _ = write!(text, " [heap {index}: {slot}]");
-                    // A slot the host never made: what the title's memory
-                    // holds there (our record, zeros, or words it wrote itself).
-                    if slot == "null" && self.heaps[0] != 0 {
-                        let at = crate::descriptor::heap(self.heaps[0] as This).start + u64::from(index) * 32;
-                        let mut words = [0u8; 32];
-                        if crate::host::read_into(at as *const u8, &mut words) {
-                            let w: Vec<u32> =
-                                words.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                            let _ = write!(text, " (title words {w:x?}");
-                            if let Some(view) = crate::descriptor::view(at) {
-                                let _ = write!(text, ": {}", describe(Some(&view)));
-                            }
-                            let _ = write!(text, ")");
-                        }
-                    }
-                }
+                self.note_user_data(&mut text, compute, u, bound);
             }
             let viewed = t.host.user_data.iter().filter(|u| is_root_view(u)).map(|u| u.slot);
             let slots: std::collections::BTreeSet<u8> =
@@ -978,7 +979,7 @@ impl State {
                 }
             }
         }
-        let _ = write!(text, " tables {:?}", self.reads(compute));
+        let _ = write!(text, " title tables {:?}", self.reads(compute));
         if !compute {
             let mem = |r: usize| crate::resource::texture_memory(r as This).map_or(0, |(p, _)| p as u64);
             let targets: Vec<String> = self.targets.iter().map(|&t| format!("{t:#x} mem {:#x}", mem(t))).collect();
@@ -1010,6 +1011,65 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "mesh");
         }
+    }
+
+    /// One user-data value as bound, for [`State::op_text`]: a table's by
+    /// where it is (rebuilt for this draw, or the heap and slot it starts
+    /// at, with that slot's host view; for a view the host never made, what
+    /// the title's heap memory holds there).
+    #[cfg(feature = "diagnostics")]
+    fn note_user_data(
+        &self,
+        text: &mut String,
+        compute: bool,
+        data: &victory_shader::emit::UserData,
+        bound: &BoundUserData,
+    ) {
+        use std::fmt::Write;
+        let Some(&value) = bound.values.get(data.index as usize) else {
+            return;
+        };
+        let _ = write!(text, " u{}={value:#x}", data.index);
+        if data.root != RootType::Table {
+            return;
+        }
+        if bound.rebuilt_tables.iter().any(|&(slot, _)| slot == data.slot) {
+            // Rebuilt tables use dynamic view slots, which have no mirror
+            // record. The offset is in 32-byte console view descriptors.
+            let _ = write!(text, " [rebuilt view table base {}]", value / 32);
+            return;
+        }
+        let table = match self.roots_ref(compute).get(usize::from(data.slot)) {
+            Some(Root::Table(handle)) => self
+                .heap_of(*handle)
+                .and_then(|heap| heap.index(*handle).map(|index| (heap, index))),
+            _ => None,
+        };
+        let Some((heap, index)) = table else {
+            text.push_str(" [unbound table]");
+            return;
+        };
+        let kind = if heap.samplers() { "sampler" } else { "view" };
+        let _ = write!(text, " [{kind} table base {index}");
+        if let Some(record) = heap.host().and_then(|h| h.describe_slot(index)) {
+            let _ = write!(text, ": {record}");
+            // A view the host never made: what the title's memory holds
+            // there (our record, zeros, or words it wrote itself).
+            if record == "null" && !heap.samplers() {
+                let at = heap.start + u64::from(index) * 32;
+                let mut words = [0u8; 32];
+                if crate::host::read_into(at as *const u8, &mut words) {
+                    let w: Vec<u32> =
+                        words.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    let _ = write!(text, " (title words {w:x?}");
+                    if let Some(view) = crate::descriptor::view(at) {
+                        let _ = write!(text, ": {}", describe(Some(&view)));
+                    }
+                    text.push(')');
+                }
+            }
+        }
+        text.push(']');
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -2442,5 +2502,28 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod breadcrumb_tests {
+    use super::*;
+    use victory_shader::emit::UserData;
+
+    /// The device-removed report names each user-data value as bound: a
+    /// constant by its value, a table rebuilt for the draw by its fresh
+    /// base, and a table slot the title never set as unbound (not as an
+    /// index into whatever heap is first).
+    #[test]
+    fn breadcrumbs_distinguish_constants_rebuilt_tables_and_missing_tables() {
+        let mut state = State::default();
+        state.set_table(false, 1, 0x1000);
+        let bound = BoundUserData { values: vec![0x1234, 0x8000, 0], rebuilt_tables: vec![(1, 0x8000)] };
+        let mut text = String::new();
+        for (index, root) in [(0, RootType::Constants), (1, RootType::Table), (2, RootType::Table)] {
+            let data = UserData { index, slot: index as u8, root, dword: 0 };
+            state.note_user_data(&mut text, false, &data, &bound);
+        }
+        assert_eq!(text, " u0=0x1234 u1=0x8000 [rebuilt view table base 1024] u2=0x0 [unbound table]");
     }
 }
