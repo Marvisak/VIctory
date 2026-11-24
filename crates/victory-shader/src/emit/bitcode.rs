@@ -1063,6 +1063,9 @@ impl Writer {
 }
 
 #[cfg(test)]
+mod invariant_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
