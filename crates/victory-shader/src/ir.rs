@@ -1224,4 +1224,217 @@ mod tests {
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
     }
+
+    /// The CFG and SSA invariants every consumer relies on: all blocks are
+    /// reachable, exits and predecessors agree, each phi has one argument per
+    /// predecessor in that order, and no unrenamed `NONE` value survives.
+    fn assert_well_formed(p: &Program) {
+        let reachable = reverse_postorder(&p.blocks);
+        assert_eq!(reachable.len(), p.blocks.len(), "unreachable blocks");
+        let mut linked = p.blocks.clone();
+        link(&mut linked);
+        for (b, block) in p.blocks.iter().enumerate() {
+            assert_eq!(block.preds, linked[b].preds, "block {b} predecessors");
+            for target in block.exit.successors() {
+                assert!(target < p.blocks.len(), "block {b} exits to {target}");
+            }
+            for phi in &block.phis {
+                assert_eq!(phi.args.len(), block.preds.len(), "{phi:?}");
+                assert!(!phi.args.contains(&NONE), "{phi:?}");
+                assert_ne!(phi.value, NONE, "{phi:?}");
+            }
+            for inst in &block.insts {
+                let name = inst.name();
+                assert!(inst.reads.iter().all(|&(_, v)| v != NONE), "{name}");
+                assert!(inst.writes.iter().all(|&(_, v)| v != NONE), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_branch_skips_its_dead_code_before_the_ir_is_built() {
+        // VIC-BT-002's reproducer (#1242): an unconditional branch over a
+        // dead definition, and a reachable merge that reads the register.
+        let words = [
+            0xBF82_0002, // 0: s_branch -> 12
+            0xBE80_0380, // 4: s_mov_b32 s0, 0
+            0xBF82_0001, // 8: s_branch -> 12
+            0x8001_8100, // 12: s_add_u32 s1, s0, 1
+            S_ENDPGM,    // 16
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        // decode() follows control flow, so the code at 4 and 8 is never
+        // decoded and cannot become a block with an unrenamed read.
+        let offsets: Vec<usize> = crate::gfx10::decode(&code)
+            .unwrap()
+            .iter()
+            .map(|i| i.offset)
+            .collect();
+        assert_eq!(offsets, [0, 12, 16]);
+        let p = build(&code, false, 256).unwrap();
+        assert_eq!(p.blocks.len(), 2);
+        assert_eq!(p.blocks[0].exit, Exit::Jump(1));
+        assert_eq!(p.blocks[1].offset, 12);
+        assert_eq!(p.blocks[1].preds, [0]);
+        assert!(p.blocks[1].phis.is_empty());
+        assert_eq!(
+            p.blocks[1].insts[0].read(Reg::S(0)),
+            Some(input(&p, Reg::S(0)))
+        );
+        assert_well_formed(&p);
+    }
+
+    #[test]
+    fn a_branch_skips_dead_reads_without_needing_a_join() {
+        // The second mechanism VIC-BT-002 claims: a skipped instruction that
+        // reads a register, with no merge at all.
+        let p = build_words(
+            &[
+                0xBF82_0002, // 0: s_branch -> 12
+                0x8002_8101, // 4: s_add_u32 s2, s1, 1
+                0xBF82_0001, // 8: s_branch -> 12
+                S_ENDPGM,    // 12
+            ],
+            false,
+        );
+        assert_eq!(p.blocks.len(), 2);
+        assert_eq!(p.blocks[1].preds, [0]);
+        assert!(p.blocks[1].phis.is_empty());
+        assert_well_formed(&p);
+    }
+
+    #[test]
+    fn skipped_predecessors_do_not_reach_a_join() {
+        // Several consecutive blocks skipped by one branch: none becomes a
+        // predecessor of the reachable merge.
+        let p = build_words(
+            &[
+                0xBF82_0004, // 0: s_branch -> 20
+                0xBE80_0381, // 4: s_mov_b32 s0, 1
+                0xBF82_0002, // 8: s_branch -> 20
+                0xBE80_0382, // 12: s_mov_b32 s0, 2
+                0xBF82_0000, // 16: s_branch -> 20
+                0x8001_8100, // 20: s_add_u32 s1, s0, 1
+                S_ENDPGM,    // 24
+            ],
+            false,
+        );
+        assert_eq!(p.blocks.len(), 2);
+        assert_eq!(p.blocks[1].offset, 20);
+        assert_eq!(p.blocks[1].preds, [0]);
+        assert!(p.blocks[1].phis.is_empty());
+        assert_well_formed(&p);
+    }
+
+    #[test]
+    fn splitting_an_irreducible_loop_leaves_every_block_reachable() {
+        // The split copies the entry at 8 before the header at 12; the copy
+        // and all originals stay reachable, so every phi argument is a value
+        // some reachable predecessor defined.
+        let p = build_words(
+            &[
+                0xBF06_0100, // 0: s_cmp_eq_u32 s0, s1
+                0xBF85_0001, // 4: s_cbranch_scc1 -> 12, the loop's second entry
+                0x8002_8102, // 8: s_add_u32 s2, s2, 1
+                0xBF84_FFFE, // 12: s_cbranch_scc0 -> 8
+                0x8003_8102, // 16: s_add_u32 s3, s2, 1
+                S_ENDPGM,    // 20
+            ],
+            false,
+        );
+        assert_eq!(p.blocks.len(), 5);
+        assert_eq!(
+            p.blocks[0].exit,
+            Exit::Branch {
+                taken: 2,
+                not_taken: 4
+            }
+        );
+        assert_eq!((p.blocks[4].offset, p.blocks[4].exit), (8, Exit::Jump(2)));
+        assert_eq!(p.blocks[2].preds, [0, 1, 4]);
+        let phi = p.blocks[2]
+            .phis
+            .iter()
+            .find(|phi| phi.reg == Reg::S(2))
+            .expect("s2 phi");
+        assert_eq!(phi.args.len(), p.blocks[2].preds.len());
+        assert_eq!(phi.args[0], input(&p, Reg::S(2)));
+        assert_eq!(phi.args[1], p.blocks[1].insts[0].write(Reg::S(2)).unwrap());
+        assert_eq!(phi.args[2], p.blocks[4].insts[0].write(Reg::S(2)).unwrap());
+        assert_well_formed(&p);
+    }
+
+    #[test]
+    fn join_phi_arguments_follow_predecessor_order() {
+        let p = build_words(
+            &[
+                0xBF06_0100, // 0: s_cmp_eq_u32 s0, s1
+                0xBF85_0002, // 4: s_cbranch_scc1 -> 16
+                0xBE80_0380, // 8: s_mov_b32 s0, 0
+                0xBF82_0001, // 12: s_branch -> 20
+                0xBE80_0381, // 16: s_mov_b32 s0, 1
+                0x8001_8100, // 20: s_add_u32 s1, s0, 1
+                S_ENDPGM,    // 24
+            ],
+            false,
+        );
+        assert_eq!(p.blocks.len(), 4);
+        assert_eq!(p.blocks[3].preds, [1, 2]);
+        let phi = p.blocks[3]
+            .phis
+            .iter()
+            .find(|phi| phi.reg == Reg::S(0))
+            .expect("s0 phi");
+        // Two separate definitions of the same constant stay distinct SSA
+        // values, so the phi is kept rather than folded to a constant.
+        assert_eq!(
+            phi.args,
+            [
+                p.blocks[1].insts[0].write(Reg::S(0)).unwrap(),
+                p.blocks[2].insts[0].write(Reg::S(0)).unwrap()
+            ]
+        );
+        assert_eq!(p.blocks[3].insts[0].read(Reg::S(0)), Some(phi.value));
+        assert_well_formed(&p);
+    }
+
+    #[test]
+    fn a_phi_of_one_value_collapses_to_it() {
+        let p = build_words(
+            &[
+                0xBF06_0100, // 0: s_cmp_eq_u32 s0, s1
+                0xBF85_0001, // 4: s_cbranch_scc1 -> 12
+                0xBF80_0000, // 8: s_nop 0, dropped from the IR
+                0x8001_8100, // 12: s_add_u32 s1, s0, 1
+                S_ENDPGM,    // 16
+            ],
+            false,
+        );
+        assert_eq!(p.blocks[2].preds, [0, 1]);
+        assert!(p.blocks[2].phis.is_empty(), "{:?}", p.blocks[2].phis);
+        assert_eq!(
+            p.blocks[2].insts[0].read(Reg::S(0)),
+            Some(input(&p, Reg::S(0)))
+        );
+        assert_well_formed(&p);
+    }
+
+    #[test]
+    fn a_reachable_edge_to_the_entry_is_rejected() {
+        let code: Vec<u8> = [
+            0xBE80_0380, // 0: s_mov_b32 s0, 0
+            0xBF82_FFFE, // 4: s_branch -> 0
+            S_ENDPGM,    // 8
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        assert_eq!(
+            build(&code, false, 256),
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a branch to the program entry"
+            })
+        );
+    }
 }
