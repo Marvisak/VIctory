@@ -15,7 +15,7 @@ use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Exit, Inst, M0, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -257,6 +257,33 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
+fn lds_addtid(name: &str) -> bool {
+    matches!(name, "ds_read_addtid_b32" | "ds_write_addtid_b32")
+}
+
+/// With at most one LDS instruction between unconditional group barriers,
+/// memory ordering is independent of which host wave runs each guest lane.
+fn lds_accesses_separated(p: &Program) -> bool {
+    let [block] = p.blocks.as_slice() else {
+        return false;
+    };
+    let mut accessed = false;
+    for inst in &block.insts {
+        if inst.name() == "s_barrier" {
+            accessed = false;
+        } else if matches!(
+            inst.fields,
+            Fields::Ds { .. } | Fields::Buffer { lds: true, .. } | Fields::Flat { lds: true, .. }
+        ) {
+            if accessed {
+                return false;
+            }
+            accessed = true;
+        }
+    }
+    true
+}
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -363,6 +390,7 @@ impl<'a> Lower<'a> {
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            let addtid_lds = s.lds_dwords != 0 && insts().any(|i| lds_addtid(i.name()));
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
@@ -398,9 +426,10 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
+            console_lanes |= addtid_lds && !lds_accesses_separated(p);
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            if console_lanes || one_wave && s.lds_dwords > 0 && !addtid_lds {
                 s.wave_size = Some(wave);
             }
         }
@@ -580,15 +609,19 @@ impl<'a> Lower<'a> {
     /// A global memory load (`global_load_*`): from the program's constant
     /// table, or from a root SRV at the address the title sets.
     fn flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
-        let Fields::Flat { dst, .. } = &inst.fields else {
+        let Fields::Flat { dst, lds, .. } = &inst.fields else {
             unreachable!()
         };
         let name = inst.name();
         let rest = name
             .strip_prefix("global_load_")
             .ok_or("a global memory write")?;
+        let addtid = rest == "dword_addtid";
+        if addtid && *lds {
+            return Err("a global ADDTID load to LDS");
+        }
         let (n, sub) = match rest {
-            "dword" => (1, None),
+            "dword" | "dword_addtid" => (1, None),
             "dwordx2" => (2, None),
             "dwordx3" => (3, None),
             "dwordx4" => (4, None),
@@ -611,6 +644,10 @@ impl<'a> Lower<'a> {
         if let Some(d) = a.dynamic {
             let d = self.i32_of(d)?;
             off = self.s.m.bin(c, Bin::Add, off, d);
+        }
+        if addtid {
+            let lane = self.addtid_offset()?;
+            off = self.s.m.bin(c, Bin::Add, off, lane);
         }
         let h = if a.param == CODE {
             None
@@ -642,6 +679,10 @@ impl<'a> Lower<'a> {
             }
         };
         for k in 0..n {
+            // The ADDTID form must not access a root SRV for inactive lanes.
+            // A load from the internal code table already clamps its index.
+            let at = self.begin_guarded(if addtid && h.is_some() { guard } else { None });
+            let c = self.cur;
             let x = match sub {
                 None => {
                     let four = self.s.m.i32(4 * k);
@@ -662,6 +703,12 @@ impl<'a> Lower<'a> {
                         .m
                         .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left)
                 }
+            };
+            let x = if at.is_some() {
+                let zero = self.s.m.i32(0);
+                self.end_guarded(at, &[(x, zero)])[0]
+            } else {
+                x
             };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
@@ -1889,14 +1936,7 @@ impl<'a> Lower<'a> {
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        let flat = self.s.op(
-            e,
-            "flattenedThreadIdInGroup.i32",
-            Attr::ReadNone,
-            i32t,
-            96,
-            &[],
-        );
+        let flat = self.flat_thread_id(e);
         let first = self.s.op(
             e,
             "waveReadLaneFirst.i32",
@@ -1920,6 +1960,17 @@ impl<'a> Lower<'a> {
             }
             _ => self.s.m.bin(e, Bin::UDiv, f, xy),
         })
+    }
+
+    fn flat_thread_id(&mut self, at: usize) -> V {
+        self.s.op(
+            at,
+            "flattenedThreadIdInGroup.i32",
+            Attr::ReadNone,
+            self.s.t.i32,
+            96,
+            &[],
+        )
     }
 
     /// Mesh: the counts and the primitives no lane exports. The console's
@@ -2002,6 +2053,20 @@ impl<'a> Lower<'a> {
             111,
             &[],
         )
+    }
+
+    /// Implicit byte offset for ADDTID memory operations.
+    fn addtid_offset(&mut self) -> Result<V, Why> {
+        let lane = if self.x.native.stage == HwStage::Cs && !self.console_lanes {
+            let id = self.flat_thread_id(self.cur);
+            let mask = self.s.m.i32(self.wave() - 1);
+            self.s.m.bin(self.cur, Bin::And, id, mask)
+        } else {
+            self.cross_lane(false)?;
+            self.lane_index()
+        };
+        let two = self.s.m.i32(2);
+        Ok(self.s.m.bin(self.cur, Bin::Shl, lane, two))
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
@@ -2127,6 +2192,9 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        if lds_addtid(name) {
+            return self.ds_addtid(inst, dst_reg, data.first(), offset, guard);
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -2244,6 +2312,62 @@ impl<'a> Lower<'a> {
         let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
+        }
+        Ok(())
+    }
+
+    fn ds_addtid(
+        &mut self,
+        inst: &Inst,
+        dst: Option<u8>,
+        data: Option<&Operand>,
+        offset: u32,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let zero = self.s.m.i32(0);
+        if self.s.lds_dwords == 0 {
+            if let Some(reg) = dst {
+                self.write(inst, Reg::V(reg), zero, guard);
+            }
+            return Ok(());
+        }
+        let value = if dst.is_none() {
+            Some(self.vgprs(inst, data.ok_or("an LDS ADDTID store value")?, 1)?[0])
+        } else {
+            None
+        };
+        let c = self.cur;
+        let m0 = self.i32_of(inst.read(Reg::S(M0)).ok_or("an LDS ADDTID base")?)?;
+        let low16 = self.s.m.i32(0xffff);
+        let m0 = self.s.m.bin(c, Bin::And, m0, low16);
+        let immediate = self.s.m.i32(offset);
+        let base = self.s.m.bin(c, Bin::Add, m0, immediate);
+        let lane = self.addtid_offset()?;
+        let byte = self.s.m.bin(c, Bin::Add, base, lane);
+
+        // RDNA 2 §10.4.3 and §12.13 use M0[15:0] as a byte base.
+        // Bounds apply to the workgroup allocation. An inactive lane or
+        // invalid address must never touch the host's groupshared array.
+        let two = self.s.m.i32(2);
+        let index = self.s.m.bin(c, Bin::LShr, byte, two);
+        let size = self.s.m.i32(self.s.lds_dwords);
+        let in_bounds = self.s.m.cmp(c, pred::IULT, index, size);
+        let three = self.s.m.i32(3);
+        let low_bits = self.s.m.bin(c, Bin::Or, m0, byte);
+        let low_bits = self.s.m.bin(c, Bin::And, low_bits, three);
+        let aligned = self.s.m.cmp(c, pred::EQ, low_bits, zero);
+        let valid = self.s.m.bin(c, Bin::And, in_bounds, aligned);
+        let active = guard.map_or(valid, |g| self.s.m.bin(c, Bin::And, g, valid));
+        let at = self.begin_guarded(Some(active));
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(self.cur, lds, index);
+        if let Some(value) = value {
+            self.s.m.store(self.cur, ptr, value);
+            self.end_guarded(at, &[]);
+        } else if let Some(reg) = dst {
+            let value = self.s.m.load(self.cur, ptr);
+            let value = self.end_guarded(at, &[(value, zero)])[0];
+            self.write(inst, Reg::V(reg), value, guard);
         }
         Ok(())
     }

@@ -579,8 +579,8 @@ impl<'a> Tracer<'a> {
         self.origin(v)
     }
 
-    /// A global memory address: an SGPR pair plus a VGPR offset, or a VGPR
-    /// pair.
+    /// A global memory address: an SGPR pair plus an optional VGPR offset,
+    /// or a VGPR pair. ADDTID's implicit lane offset is added at emission.
     fn flat_address(
         &self,
         inst: &Inst,
@@ -588,9 +588,6 @@ impl<'a> Tracer<'a> {
         saddr: Option<&Operand>,
         offset: i16,
     ) -> Result<Address, &'static str> {
-        let Some(&Operand::Vector { reg, .. }) = addr else {
-            return Err("a global address not in VGPRs");
-        };
         let off = offset as i32 as u32;
         match saddr {
             Some(&Operand::Scalar { code, .. }) if code != NULL => {
@@ -598,8 +595,16 @@ impl<'a> Tracer<'a> {
                 let (Some(lo), Some(hi)) = (word(0), word(1)) else {
                     return Err("an address not in SGPRs");
                 };
-                let v = inst.read(Reg::V(reg)).ok_or("a global address")?;
-                let mut extra = self.sum(self.vorigin(v));
+                let mut extra = if let Some(&Operand::Vector { reg, .. }) = addr {
+                    let v = inst.read(Reg::V(reg)).ok_or("a global address")?;
+                    self.sum(self.vorigin(v))
+                } else {
+                    Sum {
+                        base: None,
+                        offset: 0,
+                        dynamic: None,
+                    }
+                };
                 if extra.base.is_some() {
                     return Err("an offset from a root parameter");
                 }
@@ -607,6 +612,9 @@ impl<'a> Tracer<'a> {
                 self.address(lo, hi, extra)
             }
             _ => {
+                let Some(&Operand::Vector { reg, .. }) = addr else {
+                    return Err("a global ADDTID load without a traceable base");
+                };
                 let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
                 let (Some(lo), Some(hi)) = (word(0), word(1)) else {
                     return Err("a global address");
@@ -1181,7 +1189,11 @@ impl<'a> Tracer<'a> {
             let Term::Value(v) = *w else { return None };
             let site = self.defs[v.0 as usize]?;
             let inst = self.inst(site);
-            if !inst.name().starts_with("global_load_dword") {
+            // ADDTID advances by one dword per lane. These loads do not
+            // establish a descriptor-aligned address for each lane.
+            if !inst.name().starts_with("global_load_dword")
+                || inst.name() == "global_load_dword_addtid"
+            {
                 return None;
             }
             let k = inst

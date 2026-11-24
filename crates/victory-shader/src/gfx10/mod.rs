@@ -409,6 +409,65 @@ mod tests {
     }
 
     #[test]
+    fn addtid_decodes_without_a_vector_address() {
+        let words = [
+            0xdac0_0104,
+            0x0000_0700, // ds_write_addtid_b32 v7 offset:260
+            0xdac4_0104,
+            0x0800_0000, // ds_read_addtid_b32 v8 offset:260
+            0xdc58_8ffc,
+            0x0904_0000, // global_load_dword_addtid v9, s[4:5] offset:-4
+            S_ENDPGM,
+        ];
+        let decoded = decode(&bytes(&words)).unwrap();
+        assert_eq!(decoded.len(), 4);
+        assert_eq!(decoded[0].name(), Some("ds_write_addtid_b32"));
+        assert_eq!(decoded[1].name(), Some("ds_read_addtid_b32"));
+        assert_eq!(decoded[2].name(), Some("global_load_dword_addtid"));
+        let vector = |reg| Operand::Vector { reg, dwords: 1 };
+        for wave64 in [false, true] {
+            assert_eq!(
+                decoded[0].fields(wave64),
+                Fields::Ds {
+                    dst: None,
+                    addr: None,
+                    data: vec![vector(7)],
+                    offset0: 4,
+                    offset1: 1,
+                    gds: false,
+                },
+            );
+            assert_eq!(
+                decoded[1].fields(wave64),
+                Fields::Ds {
+                    dst: Some(vector(8)),
+                    addr: None,
+                    data: vec![],
+                    offset0: 4,
+                    offset1: 1,
+                    gds: false,
+                },
+            );
+            let Fields::Flat {
+                dst,
+                addr,
+                saddr,
+                offset,
+                lds,
+                ..
+            } = decoded[2].fields(wave64)
+            else {
+                panic!("expected global memory fields");
+            };
+            assert_eq!(dst, Some(vector(9)));
+            assert_eq!(addr, None);
+            assert_eq!(saddr, Some(Operand::Scalar { code: 4, dwords: 2 }));
+            assert_eq!(offset, -4);
+            assert!(!lds);
+        }
+    }
+
+    #[test]
     fn follows_branches_and_skips_data() {
         let code = [
             sopp(0x04, 1), // s_cbranch_scc0 -> 8

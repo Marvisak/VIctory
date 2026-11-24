@@ -387,6 +387,8 @@ impl Instruction {
                 let (load, atomic) = (name.contains("_load_"), name.contains("_atomic_"));
                 let addr = match self.encoding {
                     Encoding::Flat => Some(vector(w1 & 0xFF, 2)),
+                    // ADDTID substitutes the lane's byte offset for VADDR.
+                    Encoding::Global if name.ends_with("_addtid") => None,
                     Encoding::Global => Some(vector(w1 & 0xFF, 1 + u8::from(saddr == NULL))),
                     // With an SGPR base, scratch takes no VGPR.
                     _ => (saddr == NULL).then(|| vector(w1 & 0xFF, 1)),
