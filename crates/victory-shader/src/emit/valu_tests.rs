@@ -937,3 +937,106 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_movrel_masks_m0_and_accepts_scalar_src0() {
+    // s3 holds M0 (including non-zero upper bits [31:8]); v1..v3 hold inputs[0..3].
+    // 1. v_movrels_b32: reads v[1 + (M0 & 0xFF)].
+    let movrels = build_valu_cs(&[
+        s_mov_b32(124, 3),       // s_mov_b32 m0, s3
+        vop1(0x043, 0, vgpr(1)), // v_movrels_b32 v0, v1
+    ]);
+    let movrels_cases: &[([u32; 4], u32)] = &[
+        (
+            [0x1111_0000, 0x2222_0001, 0x3333_0002, 0x0000_0002],
+            0x3333_0002,
+        ),
+        (
+            [0x1111_0000, 0x2222_0001, 0x3333_0002, 0x0001_0002],
+            0x3333_0002,
+        ),
+        (
+            [0x1111_0000, 0x2222_0001, 0x3333_0002, 0xFFFF_FF00],
+            0x1111_0000,
+        ),
+        (
+            [0x1111_0000, 0x2222_0001, 0x3333_0002, 0xABCD_EF01],
+            0x2222_0001,
+        ),
+    ];
+    let movrels_in: Vec<[u32; 4]> = movrels_cases.iter().map(|c| c.0).collect();
+    run_cases(&movrels, &movrels_in, |backend, i, inp, got| {
+        let want = movrels_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_movrels_b32(m0={:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[3],
+        );
+    });
+
+    // 2. v_movrelsd_b32: copies v[1 + (M0 & 0xFF)] -> v[5 + (M0 & 0xFF)] while
+    //    preserving untouched v5..v7.
+    let movrelsd = build_valu_cs(&[
+        vop1(0x001, 5, 0x80),    // v5 = 0
+        vop1(0x001, 6, 0x80),    // v6 = 0
+        vop1(0x001, 7, 0x80),    // v7 = 0
+        s_mov_b32(124, 3),       // m0 = s3
+        vop1(0x044, 5, vgpr(1)), // v_movrelsd_b32 v5, v1
+        vop1(0x001, 0, vgpr(6)), // v0 = v6 (written when M0[7:0] == 1)
+    ]);
+    run_cases(
+        &movrelsd,
+        &[
+            [0xAAAA_0000, 0xBBBB_1111, 0xCCCC_2222, 0x1234_0001],
+            [0xAAAA_0000, 0xBBBB_1111, 0xCCCC_2222, 0x1234_0002],
+        ],
+        |backend, i, inp, got| {
+            let want = if i == 0 { 0xBBBB_1111 } else { 0 };
+            assert_eq!(
+                got, want,
+                "{backend}: v_movrelsd_b32(m0={:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[3],
+            );
+        },
+    );
+
+    // 3. v_movreld_b32 with an SGPR source (s0) and an inline constant source (42)
+    //    plus upper bits set in M0.
+    let movreld_sgpr = build_valu_cs(&[
+        s_mov_b32(124, 3),       // m0 = s3
+        vop1(0x042, 1, sgpr(0)), // v_movreld_b32 v1, s0 (writes s0 -> v[1 + M0[7:0]])
+        vop1(0x001, 0, vgpr(2)), // v0 = v2
+    ]);
+    run_cases(
+        &movreld_sgpr,
+        &[
+            [0xCAFE_BABE, 0x1111_2222, 0, 0x55AA_0001],
+            [0xCAFE_BABE, 0x1111_2222, 0, 0x55AA_0000],
+        ],
+        |backend, i, inp, got| {
+            let want = if i == 0 { 0xCAFE_BABE } else { 0x1111_2222 };
+            assert_eq!(
+                got, want,
+                "{backend}: v_movreld_b32(s0, m0={:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[3],
+            );
+        },
+    );
+
+    let movreld_const = build_valu_cs(&[
+        s_mov_b32(124, 3),         // m0 = s3
+        vop1(0x042, 1, 0x80 + 42), // v_movreld_b32 v1, 42
+        vop1(0x001, 0, vgpr(3)),   // v0 = v3
+    ]);
+    run_cases(
+        &movreld_const,
+        &[[0, 0, 0xDEAD_BEEF, 0x9999_0002]],
+        |backend, _, inp, got| {
+            assert_eq!(
+                got, 42,
+                "{backend}: v_movreld_b32(42, m0={:#010x}) = {got}, want 42",
+                inp[3],
+            );
+        },
+    );
+}
