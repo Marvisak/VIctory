@@ -1818,7 +1818,7 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        if v.omod != 0 {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -3736,7 +3736,12 @@ impl<'a> Lower<'a> {
         let f = |l: &mut Self, k| l.fsrc(inst, k);
         let s = |l: &mut Self, k| l.src(inst, k);
         let float = |l: &mut Self, r: V| l.write_f(inst, r, guard);
-        let int = |l: &mut Self, r: V| l.write_i(inst, r, guard);
+        let int = |l: &mut Self, r: V| {
+            if v.clamp {
+                return Err("integer output modifiers");
+            }
+            l.write_i(inst, r, guard)
+        };
         if let Some(r) = self.valu16(inst, name, guard) {
             return r;
         }
@@ -4188,8 +4193,13 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
-                int(self, r)?;
+                let add = name.starts_with("v_add");
+                let (mut r, carry) = self.add_sub_carry(c, add, a, bb, cin);
+                if v.clamp {
+                    let limit = self.s.m.i32(if add { u32::MAX } else { 0 });
+                    r = self.s.m.select(c, carry, limit, r);
+                }
+                self.write_i(inst, r, guard)?;
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
                 {
@@ -4201,6 +4211,23 @@ impl<'a> Lower<'a> {
                         .or_insert(Val::Missing("a lane mask read as data"));
                 }
                 Ok(())
+            }
+            "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32" | "v_add3_u32" if v.clamp => {
+                let add = name.starts_with("v_add");
+                let (mut a, mut b) = (s(self, 0)?, s(self, 1)?);
+                if name == "v_subrev_nc_u32" {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                let (mut r, mut overflow) = self.add_sub_carry(c, add, a, b, None);
+                if name == "v_add3_u32" {
+                    let d = s(self, 2)?;
+                    let (sum, carry) = self.add_sub_carry(c, true, r, d, None);
+                    r = sum;
+                    overflow = self.s.m.bin(c, Bin::Or, overflow, carry);
+                }
+                let limit = self.s.m.i32(if add { u32::MAX } else { 0 });
+                let r = self.s.m.select(c, overflow, limit, r);
+                self.write_i(inst, r, guard)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
