@@ -436,6 +436,37 @@ mod tests {
     }
 
     #[test]
+    fn import_sizes_that_miss_or_overshoot_the_terminator_are_normalised() {
+        // Some linkers count only the real descriptors; others pad. The
+        // parser walks to the null descriptor either way, so the patched
+        // directory is the same: that terminator, one descriptor long.
+        let original = synthetic_exe();
+        let import = layout::data_directory_offset(&original, dir::IMPORT).unwrap();
+        let expected = prepare(&original).unwrap().bytes;
+        for size in [0, IMPORT_DESCRIPTOR_SIZE, 3 * IMPORT_DESCRIPTOR_SIZE, 0x100] {
+            let mut sized = original.clone();
+            write_u32(&mut sized, import + 4, size).unwrap();
+            let prepared = prepare(&sized).unwrap();
+            assert_eq!(prepared.info.import_count(), 1, "size {size:#x}");
+            assert_eq!(
+                prepared.info.imports[0].entries[0].iat_slot_rva, 0x1140,
+                "size {size:#x}"
+            );
+            assert_eq!(prepared.bytes, expected, "size {size:#x}");
+            // Different originals, different prepared files.
+            assert_ne!(
+                prepared.file_name(),
+                prepare(&original).unwrap().file_name()
+            );
+        }
+        // The bound IAT slot survives whatever the recorded size.
+        assert_eq!(
+            expected[at(0x1140)..at(0x1148)],
+            original[at(0x1140)..at(0x1148)]
+        );
+    }
+
+    #[test]
     fn a_tls_directory_outside_the_file_is_refused() {
         let mut original = synthetic_exe();
         // Past the raw data but inside the section's 0x400: not file-backed
