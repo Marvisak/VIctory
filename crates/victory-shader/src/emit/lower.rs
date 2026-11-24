@@ -31,6 +31,10 @@ enum Val {
     Missing(Why),
 }
 
+/// A handle's block, load, first dword, sampler flag and resource
+/// properties.
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
+
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is used for comparisons.
@@ -195,7 +199,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<HandleKey, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -4664,7 +4668,7 @@ impl<'a> Lower<'a> {
         }
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -7475,7 +7479,9 @@ impl<'a> Lower<'a> {
                 // host device must support both (D3D12 options 9 and 11).
                 self.s.flags |= flags::INT64 | flags::ATOMIC64_TYPED | flags::ATOMIC64_HEAP;
             }
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            // The view's elements: U32 or U64, one component.
+            let element = if wide { 0x107 } else { 0x105 };
+            let h = self.handle(site, src, false, (kind | 0x1000, element))?;
             let at = self.begin_guarded(guard);
             let (ty, suffix) = if wide {
                 (i64t, "i64")
