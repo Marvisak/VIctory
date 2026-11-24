@@ -31,3 +31,25 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+
+  # The pure crates must keep building and passing on any host, so a
+  # Windows-only assumption in them shows up here rather than in a port.
+  # victory-hle and the victory app do not compile off Windows yet, and
+  # victory-gpu warns there about code only its Windows paths use; see the
+  # lint ratchet in AGENTS.md for widening this.
+  portable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --workspace --all-targets --locked --exclude victory-hle --exclude victory
+      - name: Clippy
+        run: >-
+          cargo clippy --workspace --all-targets --locked
+          --exclude victory-hle --exclude victory --exclude victory-gpu
+          -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked --exclude victory-hle --exclude victory
