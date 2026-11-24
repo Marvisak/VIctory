@@ -4989,26 +4989,72 @@ impl<'a> Lower<'a> {
                 } else {
                     (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?)
                 };
-                let p = match op {
-                    "f" => pred::FALSE,
-                    "lt" => pred::OLT,
-                    "eq" => pred::OEQ,
-                    "le" => pred::OLE,
-                    "gt" => pred::OGT,
-                    "lg" => pred::ONE,
-                    "ge" => pred::OGE,
-                    "o" => pred::ORD,
-                    "u" => pred::UNO,
-                    "nge" => pred::ULT,
-                    "nlg" => pred::UEQ,
-                    "ngt" => pred::ULE,
-                    "nle" => pred::UGT,
-                    "neq" => pred::UNE,
-                    "nlt" => pred::UGE,
-                    "tru" => pred::TRUE,
-                    _ => return Err(inst.name()),
+                // `fsrc` may emit two separate bitcasts for the same register,
+                // which host CSE later merges into `fcmp ... %f, %f`.
+                let same_src = a == b
+                    || (self.src0.is_none()
+                        && matches!(
+                            &inst.fields,
+                            Fields::Valu(v)
+                                if v.src.len() >= 2
+                                    && v.src[0] == v.src[1]
+                                    && (v.abs & 1) == ((v.abs >> 1) & 1)
+                                    && (v.neg & 1) == ((v.neg >> 1) & 1)
+                                    && (v.opsel & 1) == ((v.opsel >> 1) & 1)
+                                    && v.sdwa.is_none()
+                        ));
+                // Some D3D12 drivers (observed on Intel Iris Xe) assume no NaNs
+                // for plain `fcmp`, folding `fcmp ord` to true, `fcmp uno` to
+                // false (even across distinct registers), and self-comparisons
+                // like `fcmp oeq/une x, x` to constants. Use DXIL `IsNaN`
+                // (`dx.op.isSpecialFloat.f32`, opcode 8) for ordered/unordered
+                // and same-value NaN-sensitive predicates.
+                let is_nan = |l: &mut Self, x: V| {
+                    l.s.op(c, "isSpecialFloat.f32", Attr::ReadNone, l.s.t.i1, 8, &[x])
                 };
-                self.s.m.cmp(c, p, a, b)
+                let any_nan = |l: &mut Self, x: V, y: V| {
+                    let nx = is_nan(l, x);
+                    if same_src {
+                        nx
+                    } else {
+                        let ny = is_nan(l, y);
+                        l.s.m.bin(c, Bin::Or, nx, ny)
+                    }
+                };
+                match op {
+                    "u" => any_nan(self, a, b),
+                    "o" => {
+                        let u = any_nan(self, a, b);
+                        let yes = self.s.m.bool(true);
+                        self.s.m.bin(c, Bin::Xor, u, yes)
+                    }
+                    "eq" | "le" | "ge" if same_src => {
+                        let n = is_nan(self, a);
+                        let yes = self.s.m.bool(true);
+                        self.s.m.bin(c, Bin::Xor, n, yes)
+                    }
+                    "neq" | "nge" | "nle" if same_src => is_nan(self, a),
+                    _ => {
+                        let p = match op {
+                            "f" => pred::FALSE,
+                            "lt" => pred::OLT,
+                            "eq" => pred::OEQ,
+                            "le" => pred::OLE,
+                            "gt" => pred::OGT,
+                            "lg" => pred::ONE,
+                            "ge" => pred::OGE,
+                            "nge" => pred::ULT,
+                            "nlg" => pred::UEQ,
+                            "ngt" => pred::ULE,
+                            "nle" => pred::UGT,
+                            "neq" => pred::UNE,
+                            "nlt" => pred::UGE,
+                            "tru" => pred::TRUE,
+                            _ => return Err(inst.name()),
+                        };
+                        self.s.m.cmp(c, p, a, b)
+                    }
+                }
             }
             "u64" | "i64" => {
                 let (a, b) = (self.src64(inst, 0)?, self.src64(inst, 1)?);

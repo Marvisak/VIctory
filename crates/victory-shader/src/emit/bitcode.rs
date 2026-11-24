@@ -96,6 +96,7 @@ pub(crate) enum Cast {
 }
 
 /// Compare predicates: floats 0-15, integers 32-41.
+#[allow(dead_code)]
 pub(crate) mod pred {
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;

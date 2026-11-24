@@ -673,3 +673,58 @@ fn bfe_signed_and_unsigned_match_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_cmp_f32_nan_matches_rdna2() {
+    let nan = f32::NAN.to_bits();
+    let one = 1.0f32.to_bits();
+    let two = 2.0f32.to_bits();
+    let sel = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+
+    // Self-comparisons (x, x): ordered predicates must be false on NaN and true
+    // on finite values; unordered predicates must be true on NaN and false on
+    // finite values (Intel Xe folds plain `fcmp` self-compares to constants).
+    for (name, opc, want_nan, want_one) in [
+        ("v_cmp_eq_f32", 0x002u16, 0u32, 1u32),
+        ("v_cmp_le_f32", 0x003u16, 0u32, 1u32),
+        ("v_cmp_ge_f32", 0x006u16, 0u32, 1u32),
+        ("v_cmp_o_f32", 0x007u16, 0u32, 1u32),
+        ("v_cmp_u_f32", 0x008u16, 1u32, 0u32),
+        ("v_cmp_nge_f32", 0x009u16, 1u32, 0u32),
+        ("v_cmp_nle_f32", 0x00cu16, 1u32, 0u32),
+        ("v_cmp_neq_f32", 0x00du16, 1u32, 0u32),
+    ] {
+        let cmp = vop3(opc, 6, vgpr(1), vgpr(1), 0);
+        let sh = build_valu_cs(&[cmp[0], cmp[1], sel[0], sel[1]]);
+        run_cases(&sh, &[[nan, 0, 0, 0], [one, 0, 0, 0]], |backend, i, _, got| {
+            let want = if i == 0 { want_nan } else { want_one };
+            assert_eq!(
+                got, want,
+                "{backend}: {name}(same reg, case {i}) = {got}, want {want}",
+            );
+        });
+    }
+
+    // Distinct-register ordered/unordered comparisons: Intel Xe also folds
+    // `fcmp ord`/`fcmp uno` on distinct registers when either operand is NaN.
+    for (name, opc, want_nan, want_finite) in [
+        ("v_cmp_o_f32", 0x007u16, 0u32, 1u32),
+        ("v_cmp_u_f32", 0x008u16, 1u32, 0u32),
+    ] {
+        let cmp = vop3(opc, 6, vgpr(1), vgpr(2), 0);
+        let sh = build_valu_cs(&[cmp[0], cmp[1], sel[0], sel[1]]);
+        let inputs = [
+            [nan, one, 0, 0],
+            [one, nan, 0, 0],
+            [nan, nan, 0, 0],
+            [one, two, 0, 0],
+        ];
+        run_cases(&sh, &inputs, |backend, i, _, got| {
+            let want = if i == 3 { want_finite } else { want_nan };
+            assert_eq!(
+                got, want,
+                "{backend}: {name}(diff reg, case {i}) = {got}, want {want}",
+            );
+        });
+    }
+}
