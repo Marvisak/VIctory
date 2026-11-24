@@ -49,11 +49,14 @@ pub mod resource;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
+mod scissor;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(windows)]
+mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
