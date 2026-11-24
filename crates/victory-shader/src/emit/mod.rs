@@ -243,6 +243,23 @@ pub use shader::{
     VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
+static HELPER_LANE_WAVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells translation that the host runs shader model 6.7: pixel shaders
+/// with wave operations then include helper lanes in them, as the
+/// console's do. Without it a loop that serves one lane's value per pass
+/// (sampling with a per-lane descriptor) never serves a helper lane and
+/// runs to the loop limit, which hangs NVIDIA GPUs. Part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+pub fn set_helper_lane_waves(on: bool) {
+    HELPER_LANE_WAVES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`set_helper_lane_waves`].
+pub fn helper_lane_waves() -> bool {
+    HELPER_LANE_WAVES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 

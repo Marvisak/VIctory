@@ -103,6 +103,19 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
                 sm.HighestShaderModel.0
             ));
         }
+        let mut sm67 = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_7,
+        };
+        super::set_helper_lane_waves(
+            device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&raw mut sm67).cast(),
+                    size_of_val(&sm67) as u32,
+                )
+                .is_ok()
+                && sm67.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_7.0,
+        );
         Ok(device)
     }
 }

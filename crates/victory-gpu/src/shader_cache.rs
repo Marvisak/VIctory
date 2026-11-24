@@ -68,6 +68,21 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// [`build`], and whether pixel wave operations include helper lanes
+/// (shader model 6.7): the host's device decides that, and it exists only
+/// after the cache is opened, so it keys each entry rather than the folder.
+/// Unchanged where they do not.
+fn entry_build() -> [u8; 32] {
+    if victory_shader::emit::helper_lane_waves() {
+        let mut h = blake3::Hasher::new();
+        h.update(build());
+        h.update(b"helper lanes");
+        *h.finalize().as_bytes()
+    } else {
+        *build()
+    }
+}
+
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
@@ -87,7 +102,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     let options = victory_shader::emit::Options { view_marks: true };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &entry_build(), container, translate),
         None => (translate(container), false),
     }
 }
