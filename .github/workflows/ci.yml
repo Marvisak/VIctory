@@ -50,3 +50,15 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
+
+      - name: Asset policy
+        run: cargo xtask policy
+
+      - name: Build release executable
+        run: cargo build --workspace --release --locked
+
+      - name: Verify native ELF executable
+        run: file target/release/victory | grep -E 'ELF.*x86-64'
+
+      - name: Synthetic offline CLI
+        run: bash tests/offline-cli.sh target/release/victory

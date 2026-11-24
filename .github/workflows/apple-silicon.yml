@@ -15,10 +15,12 @@ concurrency:
 jobs:
   native-arm64:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
 
       - name: Keep temporary files outside checkout
         run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
@@ -33,7 +35,13 @@ jobs:
         run: cargo xtask policy
 
       - name: Check workspace
-        run: cargo check --workspace --locked
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Clippy, diagnostics build
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Test workspace
         run: cargo test --workspace --locked
