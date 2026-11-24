@@ -4,14 +4,23 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::{
+    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, ClientToScreen,
+    CreateCompatibleDC,
+    CreateDIBSection, CreateFontW, DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    DeleteDC, DeleteObject, DrawTextW, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION,
+    FONT_QUALITY, GetTextExtentPoint32W, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -208,6 +217,9 @@ fn create() -> windows::core::Result<Host> {
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         tracing::info!("host D3D12 device ready");
+        let wave64_mode = recommended_wave64_mode(&device);
+        crate::shader_cache::set_wave64_mode(wave64_mode);
+        tracing::info!(?wave64_mode, "Wave64 compute lowering mode selected");
         Ok(Host {
             device,
             queue,
@@ -223,6 +235,31 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+/// Queries D3D12 wave lane capabilities and chooses the Wave64 lowering mode.
+fn recommended_wave64_mode(device: &ID3D12Device) -> victory_shader::emit::Wave64Mode {
+    use victory_shader::emit::Wave64Mode;
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: plain D3D12 feature query with valid struct size.
+    let ok = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut opts).cast(),
+            size_of_val(&opts) as u32,
+        )
+    }
+    .is_ok();
+    if !ok || !opts.WaveOps.as_bool() {
+        return Wave64Mode::Emulate;
+    }
+    if opts.WaveLaneCountMin <= 64 && opts.WaveLaneCountMax >= 64 {
+        Wave64Mode::Native
+    } else if opts.WaveLaneCountMin <= 32 && opts.WaveLaneCountMax >= 32 {
+        Wave64Mode::Wave32
+    } else {
+        Wave64Mode::Emulate
     }
 }
 
@@ -299,6 +336,14 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Commands recorded so far, for `VICTORY_LIST_BUDGET` (diagnostics).
+    recorded: AtomicU32,
+    /// Mesh dispatches recorded so far, for `VICTORY_MESH_BUDGET`
+    /// (diagnostics).
+    recorded_mesh: AtomicU32,
+    /// Recorded work by estimated GPU cost, for `VICTORY_LIST_SPLIT`
+    /// (diagnostics).
+    weight: AtomicU32,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -479,6 +524,9 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                recorded: AtomicU32::new(0),
+                recorded_mesh: AtomicU32::new(0),
+                weight: AtomicU32::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -508,7 +556,34 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        for list in runs {
+            if let Some(Some((_, data))) = list.budget.get() {
+                // SAFETY: the list's mapped budget word. The submission lock
+                // keeps the CPU reset from racing a previous GPU submission.
+                unsafe { (*data as *mut u32).write_volatile(0) };
+            }
+        }
         let prepared = std::time::Instant::now();
+        // The host's watchdog resets a device whose submission runs for about
+        // two seconds; a world frame's 30-odd lists add up to more than that,
+        // so runs go in small groups and the GPU drains between them.
+        const RUNS_PER_SUBMISSION: usize = 4;
+        let chunked = |max: usize| {
+            let mut groups: Vec<&[Option<ID3D12CommandList>]> = Vec::new();
+            let mut start = 0;
+            while start < runs.len() {
+                let end = (start + max).min(runs.len());
+                let from = firsts[start];
+                let to = if end < firsts.len() {
+                    firsts[end]
+                } else {
+                    lists.len()
+                };
+                groups.push(&lists[from..to]);
+                start = end;
+            }
+            groups
+        };
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
@@ -518,10 +593,10 @@ impl Host {
                 .map(|(&a, &b)| &lists[a..b])
                 .collect()
         } else {
-            vec![&lists[..]]
+            chunked(RUNS_PER_SUBMISSION)
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups = chunked(RUNS_PER_SUBMISSION);
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -540,7 +615,7 @@ impl Host {
                 }
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -550,6 +625,12 @@ impl Host {
                 }
             }
             let _ = (i, started);
+            // A removed device cannot run the groups after this one; the
+            // report below names what was in flight.
+            // SAFETY: a plain query.
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                break;
+            }
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
@@ -781,6 +862,59 @@ impl Host {
 }
 
 impl HostList {
+    /// Whether another command may be recorded, for `VICTORY_LIST_BUDGET`
+    /// (diagnostics): a list longer than the budget is cut short so one
+    /// submission stays under the GPU watchdog. Unset or zero means no limit.
+    pub(crate) fn allow_record(&self) -> bool {
+        static BUDGET: OnceLock<u32> = OnceLock::new();
+        let budget = *BUDGET.get_or_init(|| {
+            std::env::var("VICTORY_LIST_BUDGET")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        });
+        budget == 0 || self.recorded.fetch_add(1, Ordering::Relaxed) < budget
+    }
+
+    /// Whether another mesh dispatch may be recorded, for
+    /// `VICTORY_MESH_BUDGET` (diagnostics): an emulated mesh dispatch costs
+    /// 0.1–0.3 s, so a list with many of them trips the GPU watchdog.
+    /// Unset or zero means no limit.
+    pub(crate) fn allow_mesh(&self) -> bool {
+        static BUDGET: OnceLock<u32> = OnceLock::new();
+        let budget = *BUDGET.get_or_init(|| {
+            std::env::var("VICTORY_MESH_BUDGET")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        });
+        budget == 0 || self.recorded_mesh.fetch_add(1, Ordering::Relaxed) < budget
+    }
+
+    /// Records work by estimated GPU cost, for `VICTORY_LIST_SPLIT`.
+    pub(crate) fn add_weight(&self, n: u32) {
+        self.weight.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The work recorded so far, by estimated GPU cost.
+    pub(crate) fn weight(&self) -> u32 {
+        self.weight.load(Ordering::Relaxed)
+    }
+
+    /// Whether the list should be split before the next command, for
+    /// `VICTORY_LIST_SPLIT` (diagnostics): the recorded weight at which a
+    /// list is cut. Unset or zero means no split.
+    pub(crate) fn wants_split(&self) -> bool {
+        static BUDGET: OnceLock<u32> = OnceLock::new();
+        let budget = *BUDGET.get_or_init(|| {
+            std::env::var("VICTORY_LIST_SPLIT")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        });
+        budget != 0 && self.weight() >= budget
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -1472,6 +1606,233 @@ struct Meter {
     caption: Option<Vec<u16>>,
 }
 
+/// The FPS overlay's own window: a small always-on-top, click-through HUD
+/// over the title, so the rate is visible in fullscreen too.
+static OVERLAY_GAME: AtomicIsize = AtomicIsize::new(0);
+static OVERLAY_TEXT: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+/// Shows the rate and the frame's details in the overlay over `game`;
+/// `VICTORY_FPS_OVERLAY=0` turns it off.
+fn fps_overlay(game: HWND, fps: &str, detail: &str) {
+    if std::env::var_os("VICTORY_FPS_OVERLAY").is_some_and(|v| v == "0") {
+        return;
+    }
+    OVERLAY_GAME.store(game.0 as isize, Ordering::Relaxed);
+    *OVERLAY_TEXT.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((fps.to_string(), detail.to_string()));
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("victory-fps".into())
+            .spawn(overlay_thread);
+    });
+}
+
+fn overlay_thread() {
+    unsafe {
+        let instance = GetModuleHandleW(None).unwrap_or_default();
+        let class = w!("VictoryFpsOverlay");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(overlay_proc),
+            hInstance: HINSTANCE(instance.0),
+            lpszClassName: class,
+            ..Default::default()
+        };
+        // RegisterClassW fails when the class already exists, which is fine.
+        let _ = RegisterClassW(&wc);
+        let hwnd = match CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            class,
+            w!(""),
+            WS_POPUP,
+            0,
+            0,
+            10,
+            10,
+            None,
+            None,
+            Some(HINSTANCE(instance.0)),
+            None,
+        ) {
+            Ok(hwnd) => hwnd,
+            Err(_) => return,
+        };
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        tracing::info!("FPS overlay shown");
+        loop {
+            let (fps, detail) = OVERLAY_TEXT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or_default();
+            let game = OVERLAY_GAME.load(Ordering::Relaxed);
+            if game != 0 && !fps.is_empty() {
+                let mut at = POINT::default();
+                if ClientToScreen(HWND(game as *mut _), &mut at).as_bool() {
+                    render_overlay(hwnd, &fps, &detail, at.x + 16, at.y + 12);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+}
+
+/// Paints the HUD with per-pixel alpha: a bright rate, dimmer details and a
+/// one-pixel dark outline, so there is no box behind it.
+fn render_overlay(hwnd: HWND, fps: &str, detail: &str, x: i32, y: i32) {
+    unsafe {
+    const PAD: i32 = 2;
+    let fps_wide: Vec<u16> = fps.encode_utf16().collect();
+    let detail_wide: Vec<u16> = detail.encode_utf16().collect();
+    let dc = CreateCompatibleDC(None);
+    if dc.is_invalid() {
+        return;
+    }
+    let font = |height: i32, weight: i32| {
+        unsafe {
+        CreateFontW(
+            height,
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            FONT_CHARSET(1),
+            FONT_OUTPUT_PRECISION(0),
+            FONT_CLIP_PRECISION(0),
+            FONT_QUALITY(4),
+            0,
+            w!("Segoe UI"),
+        )
+        }
+    };
+    let fps_font = font(-20, 600);
+    let detail_font = font(-15, 500);
+    let old = SelectObject(dc, fps_font.into());
+    let mut fps_size = SIZE::default();
+    let _ = GetTextExtentPoint32W(dc, &fps_wide, &mut fps_size);
+    SelectObject(dc, detail_font.into());
+    let mut detail_size = SIZE::default();
+    let _ = GetTextExtentPoint32W(dc, &detail_wide, &mut detail_size);
+    SelectObject(dc, old);
+
+    let gap = 9;
+    let width = fps_size.cx + gap + detail_size.cx + PAD * 2;
+    let height = fps_size.cy.max(detail_size.cy) + PAD * 2;
+    let mut info = BITMAPINFO::default();
+    info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    info.bmiHeader.biWidth = width;
+    // Top-down, so row zero is the top row.
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    let bitmap = match CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+        Ok(bitmap) => bitmap,
+        Err(_) => {
+            let _ = DeleteDC(dc);
+            let _ = DeleteObject(fps_font.into());
+            let _ = DeleteObject(detail_font.into());
+            return;
+        }
+    };
+    SelectObject(dc, bitmap.into());
+    SetBkMode(dc, TRANSPARENT);
+    let count = (width * height) as usize;
+
+    let paint = |dx: i32, dy: i32| {
+        unsafe {
+        SelectObject(dc, fps_font.into());
+        SetTextColor(dc, COLORREF(0x00ff_ffff));
+        let mut rect = RECT {
+            left: PAD + dx,
+            top: dy,
+            right: width,
+            bottom: height,
+        };
+        DrawTextW(
+            dc,
+            &mut fps_wide.clone(),
+            &mut rect,
+            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_LEFT,
+        );
+        SelectObject(dc, detail_font.into());
+        SetTextColor(dc, COLORREF(0x00d0_d0d0));
+        let mut rect = RECT {
+            left: PAD + fps_size.cx + gap + dx,
+            top: dy,
+            right: width,
+            bottom: height,
+        };
+        DrawTextW(
+            dc,
+            &mut detail_wide.clone(),
+            &mut rect,
+            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_LEFT,
+        );
+        }
+    };
+
+    paint(0, 0);
+    let text: Vec<u32> = std::slice::from_raw_parts(bits.cast::<u32>(), count).to_vec();
+    std::ptr::write_bytes(bits.cast::<u32>(), 0, count);
+    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+        paint(dx, dy);
+    }
+    let outline: Vec<u32> = std::slice::from_raw_parts(bits.cast::<u32>(), count).to_vec();
+    let boundary = PAD + fps_size.cx + gap - 2;
+    let pixels = std::slice::from_raw_parts_mut(bits.cast::<u32>(), count);
+    for row in 0..height {
+        for column in 0..width {
+            let i = (row * width + column) as usize;
+            let t = text[i] & 0xff;
+            let o = outline[i] & 0xff;
+            let alpha = t.max(o);
+            pixels[i] = if alpha == 0 {
+                0
+            } else if t >= o {
+                // Premultiplied: the detail text is a dim grey, the rate white.
+                let level = if column < boundary { alpha } else { alpha * 200 / 255 };
+                (alpha << 24) | (level << 16) | (level << 8) | level
+            } else {
+                // The outline is black at three-quarters strength.
+                (alpha * 3 / 4) << 24
+            };
+        }
+    }
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    let _ = UpdateLayeredWindow(
+        hwnd,
+        None,
+        Some(&POINT { x, y }),
+        Some(&SIZE {
+            cx: width,
+            cy: height,
+        }),
+        Some(dc),
+        Some(&POINT::default()),
+        COLORREF(0),
+        Some(&blend),
+        ULW_ALPHA,
+    );
+    let _ = DeleteObject(bitmap.into());
+    let _ = DeleteObject(fps_font.into());
+    let _ = DeleteObject(detail_font.into());
+    let _ = DeleteDC(dc);
+    }
+}
+
+extern "system" fn overlay_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe { DefWindowProcW(hwnd, msg, w, l) }
+}
+
 impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
@@ -1498,6 +1859,11 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
+        fps_overlay(
+            hwnd,
+            &format!("{fps:.0} FPS"),
+            &format!("{ms:.1} ms  ·  {draws:.0} draws"),
+        );
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {

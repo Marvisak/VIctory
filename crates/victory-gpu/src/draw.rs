@@ -66,6 +66,17 @@ pub(crate) struct State {
     depth: usize,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
+    /// Whether the title has set a topology (for a split list's replay).
+    topology_set: bool,
+    /// The render target and depth handles the title set, for a split list.
+    target_handles: Vec<u64>,
+    depth_handle: u64,
+    /// The viewports, scissors, blend factor and stencil reference the title
+    /// set, for a split list.
+    viewports: Vec<D3D12_VIEWPORT>,
+    scissors: Vec<RECT>,
+    blend: Option<[f32; 4]>,
+    stencil: u32,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -174,6 +185,7 @@ impl State {
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
         self.topology = topology;
+        self.topology_set = true;
         let host = match topology {
             RECTANGLES => 4,
             TRIANGLE_FAN | LINE_LOOP | QUADS | QUAD_STRIP => {
@@ -251,6 +263,8 @@ impl State {
         let Some(host) = crate::host::host() else {
             return;
         };
+        self.target_handles = handles.to_vec();
+        self.depth_handle = depth;
         self.targets.clear();
         let mut rtvs = Vec::new();
         for &h in handles {
@@ -286,6 +300,61 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+    }
+
+    /// The viewports the title set, for a split list's replay.
+    pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+        self.viewports = viewports.to_vec();
+        crate::draw::viewports(list, viewports);
+    }
+
+    /// The scissors the title set, for a split list's replay.
+    pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        self.scissors = rects.to_vec();
+        crate::draw::scissors(list, rects);
+    }
+
+    /// The blend factor the title set, for a split list's replay.
+    pub(crate) fn set_blend(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
+        self.blend = factor.copied();
+        crate::draw::blend_factor(list, factor);
+    }
+
+    /// The stencil reference the title set, for a split list's replay.
+    pub(crate) fn set_stencil(&mut self, list: &HostList, reference: u32) {
+        self.stencil = reference;
+        crate::draw::stencil_ref(list, reference);
+    }
+
+    /// Re-applies the title's state to a new host list after a split. The
+    /// old list ran to completion, so its dynamic descriptor slots can go
+    /// back. Pipelines, roots and heaps are bound lazily by the next draw.
+    pub(crate) fn replay(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        self.fresh_tables.clear();
+        let dynamic = std::mem::take(&mut self.dynamic);
+        for (heap, first, n) in dynamic {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+        if self.topology_set {
+            self.set_topology(list, self.topology);
+        }
+        if !self.target_handles.is_empty() || self.depth_handle != 0 {
+            let handles = self.target_handles.clone();
+            self.set_targets(list, &handles, self.depth_handle);
+        }
+        if !self.viewports.is_empty() {
+            crate::draw::viewports(list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            crate::draw::scissors(list, &self.scissors);
+        }
+        if let Some(blend) = self.blend {
+            crate::draw::blend_factor(list, Some(&blend));
+        }
+        crate::draw::stencil_ref(list, self.stencil);
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -513,12 +582,22 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        if !list.allow_record() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::pipeline::note_drop(self.pipeline as This);
+                crate::pipeline::note_why("list budget reached".into());
+            }
+            return;
+        }
         self.bind(list, p, true);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        list.add_weight(2);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -563,6 +642,15 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        if !list.allow_mesh() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::pipeline::note_drop(self.pipeline as This);
+                crate::pipeline::note_why("mesh budget reached".into());
+            }
+            return;
+        }
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -571,6 +659,7 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    list.add_weight(16);
                     true
                 }
                 Err(_) => false,
@@ -827,6 +916,7 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.add_weight(1);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -914,6 +1004,7 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.add_weight(1);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -941,6 +1032,11 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        }
+        if !list.allow_record() {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why("list budget reached".into());
             return false;
         }
         const DRAW: u32 = 0;

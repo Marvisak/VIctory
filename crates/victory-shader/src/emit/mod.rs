@@ -73,7 +73,17 @@
 //!   console numbers groups in x only: the draw path passes the title's
 //!   count as `DispatchMesh(x, 1, 1)`. Per-primitive outputs (`PSG1`) are
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
-//!   console never exports them).
+//!   console never exports them). A console wave64 mesh program that reads
+//!   lane numbers, other lanes or lane masks as numbers cannot declare a
+//!   wave size on the host; its console lanes (64 consecutive flattened
+//!   thread ids per wave) are emulated in group-shared memory, as a wave64
+//!   compute program's are without `WaveSize`. A program whose only need is
+//!   its own lane number (`v_mbcnt`, quad-local swizzles and DPPs, constant
+//!   lane masks) uses `SV_GroupIndex & 63` directly, with no group-shared
+//!   memory or barriers. Exchanges synchronize only their own virtual wave
+//!   through an LDS counter, so another console wave on a different scalar
+//!   branch or loop iteration never blocks it. A cross-lane read only some
+//!   lanes of a wave reach is still refused, never run with host lanes.
 
 mod bitcode;
 mod container;
@@ -84,11 +94,14 @@ pub mod host;
 mod lower;
 mod sampler;
 mod shader;
+mod spin;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
 mod valu_tests;
 mod wave;
+#[cfg(test)]
+mod wave64_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -103,8 +116,9 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///
-/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
-/// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
+/// `VICTORY_SHADER_LOOP_LIMIT` (decimal or `0x` hex, at least 1) sets it
+/// instead, in every build: a release build can then show which loops
+/// make a frame slow without a diagnostics build. A loop that hits the limit in
 /// every lane of a full-screen pass still runs for seconds (2^20 times a
 /// 4K screen is about 10^13 iterations); a much lower limit shows whether
 /// such loops are what makes a frame slow. The value is part of the
@@ -112,17 +126,39 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
-        if cfg!(feature = "diagnostics") {
-            parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
-        } else {
-            lower::LOOP_LIMIT
-        }
+        parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
+    })
+}
+
+/// The spin-wait limit without an override: 4096.
+pub const DEFAULT_SPIN_LIMIT: u32 = 1 << 12;
+
+/// The iteration count after which a loop that only waits for memory to
+/// change (a spin wait, see `spin.rs`) is left: [`DEFAULT_SPIN_LIMIT`], or
+/// `VICTORY_SHADER_SPIN_LIMIT` (decimal or `0x` hex, at least 1), never
+/// more than [`loop_limit`]. On the console the write such a loop waits
+/// for comes within microseconds; on the host, when it never comes (the
+/// writer's view is another host resource, null, or the load was hoisted),
+/// 2^20 uncached reads per lane cost about a second per wave, which is
+/// what world frames spent per host submission. 4096 reads are a few
+/// milliseconds. Part of the translation: the shader cache keys on it.
+pub fn spin_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let v = std::env::var("VICTORY_SHADER_SPIN_LIMIT").ok();
+        parse_limit(v.as_deref(), DEFAULT_SPIN_LIMIT).min(loop_limit())
     })
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
+    parse_limit(value, lower::LOOP_LIMIT)
+}
+
+/// A limit's value from its variable; `default` when it is unset,
+/// unreadable or 0.
+fn parse_limit(value: Option<&str>, default: u32) -> u32 {
     let parsed = value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
@@ -131,7 +167,7 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
         });
     match parsed {
         Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
+        _ => default,
     }
 }
 
@@ -183,9 +219,36 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// How a Wave64 compute shader is mapped onto the host device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Wave64Mode {
+    /// Emit native `WaveSize(64)` when compute lane semantics require it.
+    #[default]
+    Native,
+    /// Map virtual 64-lane waves onto 32-lane host waves (`WaveSize(32)`).
+    Wave32,
+    /// Emulate 64-lane waves in group-shared memory without `WaveSize`.
+    Emulate,
+}
+
+/// Options controlling DXIL emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TranslateOptions {
+    pub wave64: Wave64Mode,
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// shader container with default options ([`Wave64Mode::Native`]).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_with(container, TranslateOptions::default())
+}
+
+/// Translates the vertex, pixel, compute or mesh program of a console
+/// shader container using `options`.
+pub fn translate_with(
+    container: &[u8],
+    options: TranslateOptions,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -206,10 +269,10 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage)?;
     let io = io::raise(&p, &native)?;
     let st = structure::structure(&p)?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_with(&c, &native, &p, &st, &io, &res, options)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran with default options.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -217,6 +280,19 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_with(c, native, p, st, io, res, TranslateOptions::default())
+}
+
+/// Emits a program whose earlier stages already ran using `options`.
+pub fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: TranslateOptions,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -276,6 +352,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        options,
     })?;
     Ok(HostShader {
         stage: native.stage,
@@ -405,6 +482,14 @@ mod tests {
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_spin_limit_parses_with_its_own_default() {
+        use super::{DEFAULT_SPIN_LIMIT, parse_limit};
+        assert_eq!(parse_limit(None, DEFAULT_SPIN_LIMIT), 4096);
+        assert_eq!(parse_limit(Some("0x40"), DEFAULT_SPIN_LIMIT), 64);
+        assert_eq!(parse_limit(Some("0"), DEFAULT_SPIN_LIMIT), 4096);
     }
     use super::container::SigElement;
     use super::shader::Shader;
@@ -593,5 +678,132 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    /// A mesh program of `threads` lanes declaring `max` vertices and
+    /// primitives; each lane exports its vertex (the position, then
+    /// `vertex_rows` four-component rows) and its primitive (`prim_rows`
+    /// rows), translated.
+    fn mesh(
+        threads: u32,
+        max: u32,
+        vertex_rows: u8,
+        prim_rows: u8,
+    ) -> Result<HostShader, ShaderError> {
+        use crate::native::{MeshIo, Usage, VsOutput};
+        let element = |name: &str, row: u8, kind: u8| SigElement {
+            name: name.into(),
+            index: row.into(),
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row.into()),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let mut vertex = vec![element("SV_Position", 0, 3)];
+        vertex.extend((1..=vertex_rows).map(|r| element("TEXCOORD", r, 0)));
+        let prims: Vec<SigElement> = (0..prim_rows).map(|r| element("PRIMDATA", r, 0)).collect();
+        let mut words: Vec<u32> = vec![
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_02F2, // v_mov_b32 v1, 1.0
+            0xF800_00CF, // exp pos0 v0, v0, v0, v1
+            0x0100_0000,
+        ];
+        let mut outputs = Vec::new();
+        for n in 0..vertex_rows + prim_rows {
+            // exp param<n> v1, v1, v1, v1; the last ones per-primitive.
+            words.extend([0xF800_000F | (32 + u32::from(n)) << 4, 0x0101_0101]);
+            let primitive = n >= vertex_rows;
+            outputs.push(VsOutput {
+                usage: Usage::Generic,
+                row: if primitive { n - vertex_rows } else { n + 1 },
+                param: if primitive { 0x80 | n } else { n },
+                fp16: false,
+                pack2: false,
+            });
+        }
+        words.extend([
+            0xF800_0941, // exp prim v0, off, off, off done
+            0x0000_0000,
+            0xBF81_0000, // s_endpgm
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs,
+                clip_cntl: 0,
+                threads,
+                max_vertices: max,
+                max_primitives: max,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = super::container::signature(&vertex, false);
+        let psg1 = super::container::signature(&prims, false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1), (FourCC::PSG1, &psg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// The vertex and primitive maxima a translated mesh shader's `PSV0`
+    /// declares (bytes 12 and 14 of the runtime info, after its size).
+    fn psv_maxima(dxil: &[u8]) -> (u16, u16) {
+        let c = Container::parse(dxil).unwrap();
+        let d = c.part(FourCC::PSV0).unwrap().data;
+        let half = |at: usize| u16::from_le_bytes([d[4 + at], d[5 + at]]);
+        (half(12), half(14))
+    }
+
+    /// What `dxil.dll` says of a container; `None` without it.
+    #[cfg(windows)]
+    fn validated(dxil: &[u8]) -> Option<Result<(), String>> {
+        let path = super::validator::Validator::default_path();
+        let mut v = super::validator::Validator::load(path.as_deref()).ok()?;
+        Some(v.validate(&mut dxil.to_vec()))
+    }
+
+    #[cfg(not(windows))]
+    fn validated(_: &[u8]) -> Option<Result<(), String>> {
+        None
+    }
+
+    /// 64 lanes declaring 256 vertices and primitives, with 28 vertex and 8
+    /// primitive output components: 36 KiB at those maxima, past the 32 KiB
+    /// D3D12 allows (the validator refused it: "vertex plus primitive output
+    /// size is greater than 32768"). The lanes write vertices and primitives
+    /// 0-63 alone, so the maxima come down to 64. Outputs that fit keep the
+    /// console's maxima.
+    #[test]
+    fn mesh_maxima_past_the_lanes_come_down_to_fit() {
+        for (rows, maxima) in [((6, 2), (64, 64)), ((1, 1), (256, 256))] {
+            let s = mesh(64, 256, rows.0, rows.1).unwrap();
+            match validated(&s.dxil) {
+                Some(r) => r.unwrap_or_else(|e| panic!("{rows:?}: {e}")),
+                None => eprintln!("no dxil.dll; validation skipped"),
+            }
+            assert_eq!(psv_maxima(&s.dxil), maxima, "{rows:?}");
+        }
+    }
+
+    /// 128 lanes, 256 vertices and primitives, 64 vertex and 8 primitive
+    /// output components: past 32 KiB even at the lane count. Still
+    /// translated as before, with the maxima down to the lanes.
+    #[test]
+    fn mesh_outputs_past_32_kib_at_the_lane_count_keep_the_lane_maxima() {
+        let s = mesh(128, 256, 15, 2).unwrap();
+        assert_eq!(psv_maxima(&s.dxil), (128, 128));
     }
 }

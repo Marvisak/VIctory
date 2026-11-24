@@ -73,8 +73,9 @@ The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Input: XInput pads. A DualSense (USB or Bluetooth) is read over HID as well
+and plays as the first pad when no XInput pad answers. With no pad
+connected the keyboard is a pad while the title's window has focus:
 
 | Keys | Pad |
 |------|-----|
@@ -84,6 +85,10 @@ title's window has focus:
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
+
+The rate is shown in the window caption and in a small always-on-top
+counter over the title (`VICTORY_FPS_OVERLAY=0` turns the counter off);
+the counter also shows shader-cache hits and misses.
 
 ## Commands
 
@@ -117,6 +122,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_FPS_OVERLAY=0` | turns off the always-on-top frame-rate counter |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
@@ -124,7 +130,10 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_LIST_SPLIT=<n>` | cut a title list into more host lists before its estimated GPU weight (a draw 1, a dispatch 2, a mesh dispatch 16) reaches `n`, replaying render targets, viewports, scissors and roots; keeps each submission under the GPU watchdog |
+| `VICTORY_MESH_BUDGET=<n>` | record at most `n` mesh dispatches per host list and drop the rest (faster and safer, but missing geometry; prefer `VICTORY_LIST_SPLIT`) |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries; works in release builds too); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_SHADER_SPIN_LIMIT=<n>` | loops that only reread memory until another workgroup or queue changes it (spin waits) stop after `n` iterations per lane instead of 4096 (own shader cache entries); `1048576` restores the general limit for them |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 

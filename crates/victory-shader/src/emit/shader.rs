@@ -578,7 +578,18 @@ impl Shader {
             inputs: &self.inputs,
             outputs: &self.outputs,
             prims: &self.prims,
-            mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            // The validator reads mesh shared memory from the module's
+            // group-shared allocation, so a declared size no LDS operation
+            // allocated (wave64 emulation scratch a program never touches)
+            // must stay out.
+            mesh: self.mesh.map(|m| {
+                let shared = if self.lds.is_some() {
+                    self.lds_dwords * 4
+                } else {
+                    0
+                };
+                (m, shared)
+            }),
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
