@@ -5515,7 +5515,7 @@ impl<'a> Lower<'a> {
             Some((pack2, b)) => {
                 // 16-bit values: one in the low half of each dword, or two
                 // per dword (`packed_half`); the host's are 32-bit floats.
-                let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
+                let half = |l: &mut Self, h: u8, omod: u8, clamp: bool| -> Result<Option<V>, Why> {
                     let src = if pack2 {
                         packed_half(&l.s.inputs, attribute.row, b, h)
                     } else {
@@ -5525,7 +5525,15 @@ impl<'a> Lower<'a> {
                         return Ok(None);
                     };
                     let x = channel(l, row, ch)?;
-                    let f = l.as_float(x);
+                    let mut f = l.as_float(x);
+                    if omod != 0 {
+                        let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(omod)];
+                        let k = l.s.m.f32(factor.to_bits());
+                        f = l.s.m.bin(l.cur, Bin::Mul, f, k);
+                    }
+                    if clamp {
+                        f = l.unary(7, f);
+                    }
                     let i32t = l.s.t.i32;
                     Ok(Some(l.s.op(
                         l.cur,
@@ -5539,14 +5547,19 @@ impl<'a> Lower<'a> {
                 let h = 2 * attribute.channel;
                 let c = self.cur;
                 if f16 {
-                    let lo = half(self, h + u8::from(attribute.high))?
+                    let (omod, clamp) = match &inst.fields {
+                        Fields::Valu(v) => (v.omod, v.clamp),
+                        _ => (0, false),
+                    };
+                    let r = half(self, h + u8::from(attribute.high), omod, clamp)?
                         .ok_or("a packed input half no element holds")?;
-                    self.low_half(inst, reg, lo)
+                    // A pixel interpolates in every lane; guards only hide inactive ones.
+                    return self.write_half(inst, r, None);
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
                     let z = self.s.m.i32(0);
-                    let lo = half(self, h)?.unwrap_or(z);
-                    let hi = half(self, h + 1)?.unwrap_or(z);
+                    let lo = half(self, h, 0, false)?.unwrap_or(z);
+                    let hi = half(self, h + 1, 0, false)?.unwrap_or(z);
                     let k16 = self.s.m.i32(16);
                     let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
                     self.s.m.bin(c, Bin::Or, lo, hi)

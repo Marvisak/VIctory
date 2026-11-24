@@ -937,3 +937,279 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_interp_p2_f16_respects_opsel_and_clamp() {
+    use super::container::{self, SigElement};
+    use super::host::Draw;
+    use crate::dxbc::{self, Container, FourCC};
+    use crate::native::{PsInput, Usage, VsInput, VsOutput};
+
+    let exp = |target: u8, en: u8, done: bool, vm: bool, regs: [u8; 4]| -> [u32; 2] {
+        [
+            0xF800_0000
+                | u32::from(vm) << 12
+                | u32::from(done) << 11
+                | u32::from(target) << 4
+                | u32::from(en),
+            u32::from(regs[0])
+                | u32::from(regs[1]) << 8
+                | u32::from(regs[2]) << 16
+                | u32::from(regs[3]) << 24,
+        ]
+    };
+    let vop3_mods = |op: u16,
+                     vdst: u8,
+                     s0: u16,
+                     s1: u16,
+                     s2: u16,
+                     opsel: u8,
+                     clamp: bool,
+                     omod: u8|
+     -> [u32; 2] {
+        [
+            0x35 << 26
+                | (op as u32 & 0x3FF) << 16
+                | u32::from(clamp) << 15
+                | u32::from(opsel & 0xF) << 11
+                | u32::from(vdst),
+            u32::from(omod & 3) << 27
+                | (s2 as u32 & 0x1FF) << 18
+                | (s1 as u32 & 0x1FF) << 9
+                | (s0 as u32 & 0x1FF),
+        ]
+    };
+    let sig_el = |name: &str, kind: u8, row: u32| SigElement {
+        name: name.into(),
+        index: 0,
+        kind,
+        comp: 9,
+        interp: 0,
+        row: Some(row),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    };
+
+    // Synthetic vertex shader forwarding POSITION (row 0, v4..v7) -> SV_Position
+    // and TEXCOORD (row 1, v8..v11) -> param0.
+    let mut vs_words = Vec::new();
+    vs_words.extend_from_slice(&exp(12, 0xF, false, false, [4, 5, 6, 7]));
+    vs_words.extend_from_slice(&exp(32, 0xF, true, false, [8, 9, 10, 11]));
+    vs_words.push(S_ENDPGM);
+    let vs_native = NativeProgram {
+        stage: HwStage::Vs,
+        wave64: false,
+        vgprs: 12,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Vs {
+            inputs: vec![
+                VsInput {
+                    usage: Usage::Other(0),
+                    row: 0,
+                    mask: 0xF,
+                    vgpr: 4,
+                },
+                VsInput {
+                    usage: Usage::Generic,
+                    row: 1,
+                    mask: 0xF,
+                    vgpr: 8,
+                },
+            ],
+            outputs: vec![VsOutput {
+                usage: Usage::Generic,
+                row: 1,
+                param: 0,
+                fp16: false,
+                pack2: false,
+            }],
+        },
+        code: vs_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let vs_isg1 = container::signature(&[sig_el("POSITION", 0, 0), sig_el("TEXCOORD", 0, 1)], true);
+    let vs_osg1 = container::signature(
+        &[sig_el("SV_Position", 3, 0), sig_el("TEXCOORD", 0, 1)],
+        false,
+    );
+    let vs_dxbc = dxbc::build(&[(FourCC::ISG1, &vs_isg1), (FourCC::OSG1, &vs_osg1)]);
+    let vs_c = Container::parse(&vs_dxbc).unwrap();
+    let vs_p = ir::build(&vs_native.code, false, vs_native.vgprs).unwrap();
+    let vs_st = structure::structure(&vs_p).unwrap();
+    let vs_res = resource::track(&vs_p, &vs_native.layout, HwStage::Vs, Some(&vs_st)).unwrap();
+    let vs_io = io::raise(&vs_p, &vs_native).unwrap();
+    let vs = super::emit(&vs_c, &vs_native, &vs_p, &vs_st, &vs_io, &vs_res).unwrap();
+
+    // Synthetic pixel shader reading packed fp16 TEXCOORD0 (x=-0.5, y=2.5, z=0.25, w=-2.0):
+    // - attr0.x (low -> x = -0.5) into v2.lo (op_sel[3]=0)
+    // - attr0.x high (high -> y = 2.5) into v2.hi (op_sel[3]=1), preserving v2.lo
+    // - attr0.y (low -> z = 0.25) * 2.0 (omod=1) into v3.lo -> 0.5
+    // - attr0.x high (high -> y = 2.5) clamped (clamp=1) into v3.hi (op_sel[3]=1) -> 1.0
+    // - attr0.y high (high -> w = -2.0) clamped (clamp=1) into v4.lo -> 0.0
+    // Unpacks v2.lo, v2.hi, v3.lo, v3.hi + v4.lo (packed into 4 channels via second PS or sum).
+    let attr = |index: u16, chan: u16, high: bool| -> u16 {
+        (index & 0x3F) | (chan & 3) << 6 | u16::from(high) << 8
+    };
+    let mut ps_words = Vec::new();
+    // v2.lo = attr0.x (-0.5)
+    ps_words.extend_from_slice(&vop3(0x342, 4, attr(0, 0, false), vgpr(0), 0));
+    ps_words.extend_from_slice(&vop3_mods(
+        0x35A,
+        2,
+        attr(0, 0, false),
+        vgpr(1),
+        vgpr(4),
+        0b0000,
+        false,
+        0,
+    ));
+    // v2.hi = attr0.x high (2.5), preserving v2.lo (-0.5)
+    ps_words.extend_from_slice(&vop3(0x342, 5, attr(0, 0, true), vgpr(0), 0));
+    ps_words.extend_from_slice(&vop3_mods(
+        0x35A,
+        2,
+        attr(0, 0, true),
+        vgpr(1),
+        vgpr(5),
+        0b1000,
+        false,
+        0,
+    ));
+    // v3.lo = attr0.y (0.25) * 2.0 (omod=1) -> 0.5
+    ps_words.extend_from_slice(&vop3(0x342, 6, attr(0, 1, false), vgpr(0), 0));
+    ps_words.extend_from_slice(&vop3_mods(
+        0x35A,
+        3,
+        attr(0, 1, false),
+        vgpr(1),
+        vgpr(6),
+        0b0000,
+        false,
+        1,
+    ));
+    // v3.hi = clamp(attr0.x high (2.5)) -> 1.0, preserving v3.lo (0.5)
+    ps_words.extend_from_slice(&vop3(0x342, 7, attr(0, 0, true), vgpr(0), 0));
+    ps_words.extend_from_slice(&vop3_mods(
+        0x35A,
+        3,
+        attr(0, 0, true),
+        vgpr(1),
+        vgpr(7),
+        0b1000,
+        true,
+        0,
+    ));
+    // v4.lo = clamp(attr0.y high (-2.0)) -> 0.0 (folded into channel 3 via v_add_f32 below)
+    ps_words.extend_from_slice(&vop3(0x342, 8, attr(0, 1, true), vgpr(0), 0));
+    ps_words.extend_from_slice(&vop3_mods(
+        0x35A,
+        4,
+        attr(0, 1, true),
+        vgpr(1),
+        vgpr(8),
+        0b0000,
+        true,
+        0,
+    ));
+    // Unpack f16 halves to f32: v8=v2.lo (-0.5), v9=v2.hi (2.5), v10=v3.lo (0.5), v11=v3.hi + v4.lo (1.0 + 0.0 = 1.0)
+    ps_words.extend_from_slice(&vop3_mods(0x18B, 8, vgpr(2), 0, 0, 0b0000, false, 0));
+    ps_words.extend_from_slice(&vop3_mods(0x18B, 9, vgpr(2), 0, 0, 0b0001, false, 0));
+    ps_words.extend_from_slice(&vop3_mods(0x18B, 10, vgpr(3), 0, 0, 0b0000, false, 0));
+    ps_words.extend_from_slice(&vop3_mods(0x18B, 11, vgpr(3), 0, 0, 0b0001, false, 0));
+    ps_words.extend_from_slice(&vop3_mods(0x18B, 12, vgpr(4), 0, 0, 0b0000, false, 0));
+    // v11 = v11 + v12 (v_add_f32 VOP3 0x103)
+    ps_words.extend_from_slice(&vop3(0x103, 11, vgpr(11), vgpr(12), 0));
+    ps_words.extend_from_slice(&exp(0, 0xF, true, true, [8, 9, 10, 11]));
+    ps_words.push(S_ENDPGM);
+
+    let ps_native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 16,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![PsInput {
+                usage: Usage::Generic,
+                row: 1,
+                mask: 0xF,
+                attr: 0,
+                flat: false,
+                fp16: true,
+                pack2: true,
+                row2: 1,
+            }],
+            input_addr: 1 << 1, // PerspectiveCenter in v0/v1
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let ps_isg1 = container::signature(
+        &[sig_el("SV_Position", 3, 0), sig_el("TEXCOORD", 0, 1)],
+        true,
+    );
+    let ps_osg1 = container::signature(&[sig_el("SV_Target", 16, 0)], false);
+    let ps_dxbc = dxbc::build(&[(FourCC::ISG1, &ps_isg1), (FourCC::OSG1, &ps_osg1)]);
+    let ps_c = Container::parse(&ps_dxbc).unwrap();
+    let ps_p = ir::build(&ps_native.code, false, ps_native.vgprs).unwrap();
+    let ps_st = structure::structure(&ps_p).unwrap();
+    let ps_res = resource::track(&ps_p, &ps_native.layout, HwStage::Ps, Some(&ps_st)).unwrap();
+    let ps_io = io::raise(&ps_p, &ps_native).unwrap();
+    let ps = super::emit(&ps_c, &ps_native, &ps_p, &ps_st, &ps_io, &ps_res).unwrap();
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for (name, dxil) in [("vs", &vs.dxil), ("ps", &ps.dxil)] {
+            let mut copy = dxil.clone();
+            v.validate(&mut copy)
+                .unwrap_or_else(|e| panic!("{name} DXIL validation failed: {e}"));
+        }
+    }
+
+    #[rustfmt::skip]
+    let vertices: [f32; 24] = [
+        -1.0, -1.0, 0.5, 1.0,   -0.5, 2.5, 0.25, -2.0,
+         3.0, -1.0, 0.5, 1.0,   -0.5, 2.5, 0.25, -2.0,
+        -1.0,  3.0, 0.5, 1.0,   -0.5, 2.5, 0.25, -2.0,
+    ];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut backends: Vec<(&str, Host)> = Vec::new();
+    let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    if !warp_only && let Ok(h) = Host::new(false) {
+        backends.push(("hardware", h));
+    }
+    if let Ok(h) = Host::new(true) {
+        backends.push(("warp", h));
+    }
+    assert!(!backends.is_empty(), "no SM 6.6 D3D12 device available");
+    for (label, host) in &backends {
+        let (root, pso) = host
+            .pipeline(&vs, &ps)
+            .unwrap_or_else(|e| panic!("{label}: graphics pipeline failed: {e}"));
+        let px = host
+            .draw(
+                &root,
+                &pso,
+                &Draw {
+                    roots: vec![],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &vertices,
+                    stride: 8 * 4,
+                    size: (4, 4),
+                    mesh_groups: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: draw failed: {e}"));
+        assert_eq!(px.len(), 16);
+        for (i, &[a, b, c, d]) in px.iter().enumerate() {
+            assert_eq!(
+                [a, b, c, d],
+                [-0.5, 2.5, 0.5, 1.0],
+                "{label}: pixel {i} got [{a}, {b}, {c}, {d}], want [-0.5, 2.5, 0.5, 1.0]"
+            );
+        }
+    }
+}
