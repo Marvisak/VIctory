@@ -928,6 +928,13 @@ impl<'a> Lower<'a> {
     /// Values of the program's input registers.
     fn inputs(&mut self) -> Result<(), Stop> {
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
+        let x = self.x;
+        let written = |r: Reg| {
+            x.p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.writes.iter().any(|&(w, _)| w == r))
+        };
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
@@ -937,9 +944,18 @@ impl<'a> Lower<'a> {
                     // holds what the last wave left, so no program depends
                     // on it: a read the paths only seem to allow (a branch
                     // past the write, taken only with one past the read)
-                    // reads zero, as VGPRs do.
+                    // reads zero, as VGPRs do. A register no instruction
+                    // writes is no such path but more likely an input the
+                    // decoding does not know about (a system SGPR in another
+                    // position, say), so it stays refused.
                     None if n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k) => {
-                        Val::I32(self.s.m.i32(0))
+                        if written(reg) {
+                            Val::I32(self.s.m.i32(0))
+                        } else {
+                            Val::Missing(
+                                "an SGPR no instruction writes, above the initialized ones",
+                            )
+                        }
                     }
                     None => Val::Missing("a hardware SGPR input"),
                 },

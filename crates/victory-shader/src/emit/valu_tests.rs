@@ -10,7 +10,7 @@ use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
-use crate::{io, ir, resource, structure};
+use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
@@ -69,6 +69,21 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    let shader = try_build_valu_cs(body).expect("lower");
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+/// [`build_valu_cs`] without the validation, returning a refusal instead of
+/// panicking on it.
+fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -137,10 +152,9 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
-    .expect("lower");
+    })?;
 
-    let shader = HostShader {
+    Ok(HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -148,16 +162,34 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+    })
+}
+
+/// `s20` is above the 5 SGPRs the hardware initializes here and is written
+/// only on the path the branch skips, so its read after the join is a path
+/// artefact and reads zero.
+#[test]
+fn an_sgpr_written_on_another_path_reads_zero() {
+    let body = [
+        s_mov_b32(16, 0x80),      // s16 = 0
+        0xBF06_8010,              // s_cmp_eq_u32 s16, 0
+        0xBF85_0001,              // s_cbranch_scc1 past the next instruction
+        s_mov_b32(20, 0x87),      // s20 = 7
+        vop1(0x001, 0, sgpr(20)), // v_mov_b32 v0, s20
+    ];
+    build_valu_cs(&body);
+}
+
+/// An SGPR above the initialized ones that no instruction writes is more
+/// likely an input the decoding misses than a path artefact, so it stays
+/// refused.
+#[test]
+fn an_sgpr_no_instruction_writes_is_refused() {
+    let body = [vop1(0x001, 0, sgpr(20))]; // v_mov_b32 v0, s20
+    let Err(e) = try_build_valu_cs(&body) else {
+        panic!("translated");
     };
-
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        let mut copy = shader.dxil.clone();
-        let ours = copy[4..20].to_vec();
-        v.validate(&mut copy).expect("DXIL validation failed");
-        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
-    }
-
-    shader
+    assert!(e.to_string().contains("no instruction writes"), "{e}");
 }
 
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
