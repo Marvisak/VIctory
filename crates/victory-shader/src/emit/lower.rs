@@ -803,6 +803,21 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
+        let user_data = self.lower_ir()?;
+        let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
+        let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let cmp_samplers = self.s.cmp_samplers;
+        Ok(Lowered {
+            cmp_samplers,
+            root_cbvs,
+            root_srvs,
+            dxil: self.s.finish(),
+            user_data,
+            samplers: self.samplers,
+        })
+    }
+
+    fn lower_ir(&mut self) -> Result<Vec<UserData>, Stop> {
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -880,17 +895,7 @@ impl<'a> Lower<'a> {
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
-        let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
-        let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
-        let cmp_samplers = self.s.cmp_samplers;
-        Ok(Lowered {
-            cmp_samplers,
-            root_cbvs,
-            root_srvs,
-            dxil: self.s.finish(),
-            user_data,
-            samplers: self.samplers,
-        })
+        Ok(user_data)
     }
 
     fn exported_out(&self, b: usize) -> bool {
@@ -1149,6 +1154,39 @@ impl<'a> Lower<'a> {
         Val::I32(self.s.m.extract(entry, r, index % 4))
     }
 
+    /// Both dwords `(lo, hi)` of a lane mask's ballot, taken in the block
+    /// that writes the mask (see [`MaskData`]).
+    fn mask_ballot(&mut self, lo: Value) -> Result<(V, V), Why> {
+        let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        if !self.x.st.active.contains(&lo) {
+            return Err("a lane mask holding lanes elsewhere read as data");
+        }
+        if let Some(&xy) = self.ballots.get(&lo) {
+            return Ok(xy);
+        }
+        let at = match self.def_block.get(&lo) {
+            // Program inputs (EXEC on entry).
+            None => self.s.entry,
+            Some(&b) if b == self.cur_ir => self.cur,
+            Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+        };
+        if !self.balloting.insert(lo) {
+            return Err("a lane mask whose lanes depend on its own value");
+        }
+        let bit = self.boolean(m, at);
+        self.balloting.remove(&lo);
+        let bit = bit?;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+        self.ballots.insert(lo, xy);
+        Ok(xy)
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
@@ -1156,37 +1194,86 @@ impl<'a> Lower<'a> {
             Some(&lo) => (lo, true),
             None => (v, false),
         };
-        let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if !self.x.st.active.contains(&lo) {
-            return Err("a lane mask holding lanes elsewhere read as data");
-        }
-        let (x, y) = match self.ballots.get(&lo) {
-            Some(&xy) => xy,
-            None => {
-                let at = match self.def_block.get(&lo) {
-                    // Program inputs (EXEC on entry).
-                    None => self.s.entry,
-                    Some(&b) if b == self.cur_ir => self.cur,
-                    Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
-                };
-                if !self.balloting.insert(lo) {
-                    return Err("a lane mask whose lanes depend on its own value");
-                }
-                let bit = self.boolean(m, at);
-                self.balloting.remove(&lo);
-                let bit = bit?;
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
-                self.ballots.insert(lo, xy);
-                xy
-            }
-        };
+        let (x, y) = self.mask_ballot(lo)?;
         Ok(if high { y } else { x })
+    }
+
+    /// For a wave32 program under [`MaskData::Host`], a 32-bit scalar operand
+    /// holding a tracked mask still represents a host-wave ballot, so its
+    /// `(lo, hi)` pair must be read to preserve lanes 32-63 on wave64 hosts.
+    fn host_mask_pair(&mut self, inst: &Inst, op: &Operand) -> Result<Option<(V, V)>, Why> {
+        if self.mask_data != MaskData::Host || self.x.native.wave64 {
+            return Ok(None);
+        }
+        let Operand::Scalar { code, .. } = *op else {
+            return Ok(None);
+        };
+        if code == NULL {
+            return Ok(None);
+        }
+        let Some(v) = inst.read(Reg::S(code)) else {
+            return Ok(None);
+        };
+        if matches!(self.vals.get(&v), Some(Val::I32(_) | Val::Bit(_)))
+            || !self.x.st.masks.contains_key(&v)
+        {
+            return Ok(None);
+        }
+        self.mask_ballot(v).map(Some)
+    }
+
+    fn is_zero_operand(op: &Operand) -> bool {
+        matches!(op, Operand::Scalar { code: NULL, .. } | Operand::Literal(0))
+            || matches!(op, Operand::Const(c) if crate::resource::inline(*c) == Some(0))
+    }
+
+    fn bcnt1_64(&mut self, c: usize, a: V, b: V) -> V {
+        let i32t = self.s.t.i32;
+        let na = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[a]);
+        let nb = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[b]);
+        self.s.m.bin(c, Bin::Add, na, nb)
+    }
+
+    fn ff1_64(&mut self, c: usize, a: V, b: V) -> V {
+        // The lowest set bit; -1 for none (as DXIL's first bit low).
+        let i32t = self.s.t.i32;
+        let fa = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[a]);
+        let fb = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[b]);
+        let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+        let fb32 = self.s.m.bin(c, Bin::Add, fb, k32);
+        let none = self.s.m.cmp(c, pred::EQ, b, z);
+        let fb = self.s.m.select(c, none, fb, fb32);
+        let low = self.s.m.cmp(c, pred::NE, a, z);
+        self.s.m.select(c, low, fa, fb)
+    }
+
+    fn eq_64(&mut self, c: usize, (a0, a1): (V, V), (b0, b1): (V, V)) -> V {
+        let e0 = self.s.m.cmp(c, pred::EQ, a0, b0);
+        let e1 = self.s.m.cmp(c, pred::EQ, a1, b1);
+        self.s.m.bin(c, Bin::And, e0, e1)
+    }
+
+    /// `(1 << below) - 1`, all ones from 32 on.
+    fn below_mask(&mut self, c: usize, below: V) -> V {
+        let (one, k31, k32, ones) = (
+            self.s.m.i32(1),
+            self.s.m.i32(31),
+            self.s.m.i32(32),
+            self.s.m.i32(u32::MAX),
+        );
+        let sh = self.s.m.bin(c, Bin::And, below, k31);
+        let m = self.s.m.bin(c, Bin::Shl, one, sh);
+        let m = self.s.m.bin(c, Bin::Sub, m, one);
+        let full = self.s.m.cmp(c, pred::IUGE, below, k32);
+        self.s.m.select(c, full, ones, m)
     }
 
     // ---- operands ----
@@ -2324,6 +2411,32 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(op) = name.strip_prefix("s_cmp_").or(name.strip_prefix("s_cmpk_")) {
+            if matches!(name, "s_cmp_eq_u32" | "s_cmp_lg_u32") {
+                let s0 = src.first().ok_or("a missing operand")?;
+                let s1 = src.get(1).ok_or("a missing operand")?;
+                let p0 = self.host_mask_pair(inst, s0)?;
+                let p1 = self.host_mask_pair(inst, s1)?;
+                let eq = match (p0, p1) {
+                    (Some(a), Some(b)) => Some(self.eq_64(c, a, b)),
+                    (Some(a), None) if Self::is_zero_operand(s1) => {
+                        let z = self.s.m.i32(0);
+                        Some(self.eq_64(c, a, (z, z)))
+                    }
+                    (None, Some(b)) if Self::is_zero_operand(s0) => {
+                        let z = self.s.m.i32(0);
+                        Some(self.eq_64(c, (z, z), b))
+                    }
+                    _ => None,
+                };
+                if let Some(mut r) = eq {
+                    if op.starts_with("lg") {
+                        let t = self.s.m.bool(true);
+                        r = self.s.m.bin(c, Bin::Xor, r, t);
+                    }
+                    self.set(scc, Val::Bit(r));
+                    return Ok(());
+                }
+            }
             let (a, b) = if name.starts_with("s_cmpk_") {
                 let b = if op.ends_with("_i32") {
                     sext16(self)
@@ -2366,14 +2479,7 @@ impl<'a> Lower<'a> {
             return match name {
                 "s_bcnt1_i32_b64" => {
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
-                    let i32t = self.s.t.i32;
-                    let na = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[a]);
-                    let nb = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[b]);
-                    let r = self.s.m.bin(c, Bin::Add, na, nb);
+                    let r = self.bcnt1_64(c, a, b);
                     self.set(lo, Val::I32(r));
                     let z = self.s.m.i32(0);
                     let s = self.s.m.cmp(c, pred::NE, r, z);
@@ -2381,21 +2487,8 @@ impl<'a> Lower<'a> {
                     Ok(())
                 }
                 "s_ff1_i32_b64" => {
-                    // The lowest set bit; -1 for none (as DXIL's first bit low).
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
-                    let i32t = self.s.t.i32;
-                    let fa = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[a]);
-                    let fb = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[b]);
-                    let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
-                    let fb32 = self.s.m.bin(c, Bin::Add, fb, k32);
-                    let none = self.s.m.cmp(c, pred::EQ, b, z);
-                    let fb = self.s.m.select(c, none, fb, fb32);
-                    let low = self.s.m.cmp(c, pred::NE, a, z);
-                    let r = self.s.m.select(c, low, fa, fb);
+                    let r = self.ff1_64(c, a, b);
                     self.set(lo, Val::I32(r));
                     Ok(())
                 }
@@ -2552,11 +2645,19 @@ impl<'a> Lower<'a> {
             }
             "s_ff1_i32_b32" | "s_bcnt1_i32_b32" => {
                 // First set bit (-1 for zero, as DXIL's), or the bit count.
-                let a = src32(self, 0)?;
-                let op = if name == "s_ff1_i32_b32" { 32 } else { 31 };
-                let r = self
-                    .s
-                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
+                let op0 = src.first().ok_or("a missing operand")?;
+                let r = if let Some((a, b)) = self.host_mask_pair(inst, op0)? {
+                    if name == "s_ff1_i32_b32" {
+                        self.ff1_64(c, a, b)
+                    } else {
+                        self.bcnt1_64(c, a, b)
+                    }
+                } else {
+                    let a = src32(self, 0)?;
+                    let op = if name == "s_ff1_i32_b32" { 32 } else { 31 };
+                    self.s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a])
+                };
                 (r, None)
             }
             "s_bfe_u32" | "s_bfe_i32" => {
@@ -4883,7 +4984,7 @@ impl<'a> Lower<'a> {
             "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => {
                 // Bits of the mask's low (high) half below this lane, plus src1:
                 // with an all-ones mask, the lane index.
-                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let b = s(self, 1)?;
                 // Mesh lanes are the console's by construction; pixel and
                 // vertex lanes are the host's, as their masks are.
                 if self.mask_data == MaskData::Host {
@@ -4891,6 +4992,33 @@ impl<'a> Lower<'a> {
                     let Fields::Valu(v) = &inst.fields else {
                         unreachable!()
                     };
+                    if name == "v_mbcnt_lo_u32_b32" && !self.x.native.wave64 {
+                        if matches!(v.src.first(), Some(&Operand::Const(193))) {
+                            self.s.flags |= flags::WAVE_OPS;
+                            let lane = self.lane_index();
+                            return Ok(self.s.m.bin(c, Bin::Add, lane, b));
+                        }
+                        if let Some((lo, hi)) = v
+                            .src
+                            .first()
+                            .map(|op| self.host_mask_pair(inst, op))
+                            .transpose()?
+                            .flatten()
+                        {
+                            self.s.flags |= flags::WAVE_OPS;
+                            let lane = self.lane_index();
+                            let m_lo = self.below_mask(c, lane);
+                            let (k32, z) = (k(self, 32), k(self, 0));
+                            let t = self.s.m.bin(c, Bin::Sub, lane, k32);
+                            let low = self.s.m.cmp(c, pred::IULT, lane, k32);
+                            let below_hi = self.s.m.select(c, low, z, t);
+                            let m_hi = self.below_mask(c, below_hi);
+                            let x_lo = self.s.m.bin(c, Bin::And, lo, m_lo);
+                            let x_hi = self.s.m.bin(c, Bin::And, hi, m_hi);
+                            let n = self.bcnt1_64(c, x_lo, x_hi);
+                            return Ok(self.s.m.bin(c, Bin::Add, n, b));
+                        }
+                    }
                     let host = match v.src.first() {
                         Some(&Operand::Const(193)) => true,
                         Some(&Operand::Scalar { code, .. }) => {
@@ -4907,6 +5035,7 @@ impl<'a> Lower<'a> {
                 } else if self.s.mesh.is_none() {
                     self.cross_lane(false)?;
                 }
+                let a = s(self, 0)?;
                 let lane = self.lane_index();
                 let below = if name == "v_mbcnt_lo_u32_b32" {
                     lane
@@ -4916,13 +5045,7 @@ impl<'a> Lower<'a> {
                     let low = self.s.m.cmp(c, pred::IULT, lane, k32);
                     self.s.m.select(c, low, z, t)
                 };
-                // (1 << below) - 1, all ones from 32 on.
-                let (one, k32, ones) = (k(self, 1), k(self, 32), k(self, u32::MAX));
-                let sh = m31(self, below);
-                let m = self.s.m.bin(c, Bin::Shl, one, sh);
-                let m = self.s.m.bin(c, Bin::Sub, m, one);
-                let full = self.s.m.cmp(c, pred::IUGE, below, k32);
-                let m = self.s.m.select(c, full, ones, m);
+                let m = self.below_mask(c, below);
                 let x = self.s.m.bin(c, Bin::And, a, m);
                 let n = self
                     .s
@@ -6649,5 +6772,66 @@ mod tests {
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    #[test]
+    fn host_wave32_mask_ops_use_both_ballot_halves() {
+        use std::collections::HashMap;
+        let words = [
+            0xBE80_0F7E, // s_bcnt1_i32_b32 s0, exec_lo
+            0xBE81_137E, // s_ff1_i32_b32 s1, exec_lo
+            0xD765_0002,
+            0x0001_007E, // v_mbcnt_lo_u32_b32 v2, exec_lo, 0
+            0xD765_0003,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v3, -1, 0
+            0xBF06_807E, // s_cmp_eq_u32 exec_lo, 0
+            0x8504_0100, // s_cselect_b32 s4, s0, s1
+            0x7E00_0204, // v_mov_b32 v0, s4
+            0x7E02_0201, // v_mov_b32 v1, s1
+            0xF800_180F,
+            0x0302_0100, // exp mrt0, v0, v1, v2, v3 done vm
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let p = ir::build(&native.code, false, 8).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        let bad = HashMap::new();
+        let mut l = super::Lower::new(&parts, &bad);
+        assert!(l.lower_ir().is_ok());
+        assert_eq!(l.mask_data, super::MaskData::Host);
+        assert_eq!(l.s.wave_size, None);
+        let &(_lo, hi) = l.ballots.values().next().unwrap();
+        assert!(
+            l.s.m.uses_of(hi) >= 4,
+            "expected high ballot half to be used by s_bcnt1_i32_b32, s_ff1_i32_b32, v_mbcnt_lo_u32_b32, and s_cmp_eq_u32 (>= 4 uses), got {}",
+            l.s.m.uses_of(hi)
+        );
     }
 }
