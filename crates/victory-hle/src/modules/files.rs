@@ -32,19 +32,45 @@ use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
 use crate::{HleExport, HleModule, hle_export};
 
-/// The host's own function: what the import would have been bound to.
+/// The host's own function: what the import would have been bound to, or
+/// `None` if the host lacks it. Looked up once per call site; the caller
+/// returns its API's failure for `None` (see [`host_function`]).
+macro_rules! try_host {
+    ($dll:literal, $name:literal: $ty:ty) => {{
+        static ADDRESS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let address = *ADDRESS.get_or_init(|| $crate::modules::files::host_function($dll, $name));
+        address.map(|address| {
+            // SAFETY: `address` is the host's export of `$dll!$name`, whose
+            // documented signature is `$ty`.
+            unsafe { std::mem::transmute::<usize, $ty>(address) }
+        })
+    }};
+}
+pub(crate) use try_host;
+
+/// The host's own function; panics if the host lacks it.
 macro_rules! host {
     ($dll:literal, $name:literal: $ty:ty) => {{
-        static ADDRESS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let address = *ADDRESS.get_or_init(|| {
-            crate::host::function($dll, $name)
-                .unwrap_or_else(|| panic!("the host lacks {}!{}", $dll, $name))
-        });
-        // SAFETY: the host exports this function with this signature.
-        unsafe { std::mem::transmute::<usize, $ty>(address) }
+        $crate::modules::files::try_host!($dll, $name: $ty)
+            .unwrap_or_else(|| panic!("the host lacks {}!{}", $dll, $name))
     }};
 }
 pub(crate) use host;
+
+/// The host's `dll!name`, or `None`, logged the first time for each
+/// export, if the host lacks it.
+pub(crate) fn host_function(dll: &'static str, name: &'static str) -> Option<usize> {
+    let address = crate::host::function(dll, name);
+    if address.is_none() {
+        static MISSING: Mutex<Vec<(&str, &str)>> = Mutex::new(Vec::new());
+        let mut missing = MISSING.lock().unwrap_or_else(|e| e.into_inner());
+        if !missing.contains(&(dll, name)) {
+            tracing::error!("the host lacks {dll}!{name}; calls to it fail");
+            missing.push((dll, name));
+        }
+    }
+    address
+}
 
 /// Mounted drives: upper-case letter and host root (UTF-16, no trailing
 /// separator, no NUL).
