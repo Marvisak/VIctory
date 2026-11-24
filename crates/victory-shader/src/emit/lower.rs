@@ -4171,6 +4171,8 @@ impl<'a> Lower<'a> {
         const INT: &[&str] = &[
             "v_add_nc_u16",
             "v_sub_nc_u16",
+            "v_add_nc_i16",
+            "v_sub_nc_i16",
             "v_subrev_nc_u16",
             "v_mul_lo_u16",
             "v_lshlrev_b16",
@@ -4349,8 +4351,8 @@ impl<'a> Lower<'a> {
                 }
                 let k15 = self.s.m.i32(15);
                 match name {
-                    "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
-                    "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
+                    "v_add_nc_u16" | "v_add_nc_i16" => self.s.m.bin(c, Bin::Add, a, b),
+                    "v_sub_nc_u16" | "v_sub_nc_i16" => self.s.m.bin(c, Bin::Sub, a, b),
                     "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
                     "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
                     "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
@@ -4534,15 +4536,16 @@ impl<'a> Lower<'a> {
             l.s.m.bin(c, Bin::And, x, k31)
         };
         Ok(match name {
-            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
-            | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
+            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_add_nc_i32"
+            | "v_sub_nc_u32" | "v_sub_nc_i32" | "v_subrev_nc_u32" | "v_mul_lo_u32"
+            | "v_mul_lo_i32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let (op, a, b) = match name {
                     "v_and_b32" => (Bin::And, a, b),
                     "v_or_b32" => (Bin::Or, a, b),
                     "v_xor_b32" => (Bin::Xor, a, b),
-                    "v_add_nc_u32" => (Bin::Add, a, b),
-                    "v_sub_nc_u32" => (Bin::Sub, a, b),
+                    "v_add_nc_u32" | "v_add_nc_i32" => (Bin::Add, a, b),
+                    "v_sub_nc_u32" | "v_sub_nc_i32" => (Bin::Sub, a, b),
                     "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
                 };
@@ -6522,7 +6525,112 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, buffer_format};
+    use super::super::container::SigElement;
+    use super::{Numeric, Parts, buffer_format, lower};
+    use crate::native::{HwStage, NativeProgram, StageIo};
+    use crate::{ShaderError, io, ir, resource, structure};
+
+    /// VOP3 `op dst, a, b` (GFX10 encoding); `flags` are the clamp, op_sel
+    /// and abs bits of the first dword.
+    fn vop3(op: u32, flags: u32, dst: u32, a: u32, b: u32) -> [u32; 2] {
+        [0xD400_0000 | op << 16 | flags | dst, a | b << 9]
+    }
+
+    /// The DXIL of a pixel shader that exports `body`'s v2, computed from
+    /// a per-lane value in v3.
+    fn lower_ps(body: [u32; 2]) -> Result<Vec<u8>, ShaderError> {
+        let words = [
+            // v_mbcnt_lo_u32_b32 v3, -1, 0
+            vop3(0x365, 0, 3, 193, 128)[0],
+            vop3(0x365, 0, 3, 193, 128)[1],
+            body[0],
+            body[1],
+            0xF800_180F, // exp mrt0, v2, v2, v2, v2 done vm
+            0x0202_0202,
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256)?;
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let io = io::raise(&p, &native)?;
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let st = structure::structure(&p)?;
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![target],
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        lower(&parts).map(|l| l.dxil)
+    }
+
+    #[test]
+    fn signed_names_of_wrapping_integer_operations_match_the_unsigned_ones() {
+        // The low 32 bits of a sum, difference or product do not depend on
+        // the sign, so the _i32 forms lower exactly as their _u32 twins.
+        for (signed, unsigned) in [
+            (0x37F, 0x125), // v_add_nc_i32, v_add_nc_u32
+            (0x376, 0x126), // v_sub_nc_i32, v_sub_nc_u32
+            (0x16B, 0x169), // v_mul_lo_i32, v_mul_lo_u32
+        ] {
+            let a = lower_ps(vop3(signed, 0, 2, 259, 129)).unwrap();
+            let b = lower_ps(vop3(unsigned, 0, 2, 259, 129)).unwrap();
+            assert_eq!(a, b, "opcode {signed:#x}");
+        }
+    }
+
+    #[test]
+    fn sixteen_bit_signed_add_and_sub_lower_with_half_selects() {
+        // v_add_nc_i16 and v_sub_nc_i16, also reading the high halves.
+        for op in [0x30D, 0x30E] {
+            for opsel in [0, 1 << 11, 1 << 12 | 1 << 14] {
+                lower_ps(vop3(op, opsel, 2, 259, 259)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn clamped_signed_operations_are_refused_not_miscompiled() {
+        // Clamping saturates; wrapping them would give other values.
+        let clamp = 1 << 15;
+        for op in [0x37F, 0x376, 0x16B, 0x30D, 0x30E] {
+            let err = lower_ps(vop3(op, clamp, 2, 259, 129)).unwrap_err();
+            assert!(
+                matches!(err, ShaderError::Unsupported { what, .. } if what.contains("modifier")),
+                "{op:#x}: {err:?}"
+            );
+        }
+    }
 
     #[test]
     fn buffer_formats_by_number() {
