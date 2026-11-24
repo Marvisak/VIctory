@@ -116,6 +116,7 @@ victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm] [--effects]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 victory translate [paths...] --cache [--pipelines] [--jobs N]
+victory meshdump [paths...] [--hash <16 hex>] [--isa] [--compute]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
@@ -123,6 +124,15 @@ victory config
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
+
+`meshdump` surveys the title's mesh (and with `--compute`, compute)
+programs without running it: per program, the group shape (threads, LDS,
+vertex/primitive caps), the `s_barrier` count, and whether a barrier sits
+in a block only some lanes reach - such a barrier deadlocks a group on a
+host whose wave is narrower than the console's. `--hash` limits the survey
+to listed 16-hex content hashes; `--isa` also prints the decoded GFX10
+instructions. Use it to check the divergent-barrier hypothesis for a hang
+before touching the translator.
 
 ## Debugging
 
