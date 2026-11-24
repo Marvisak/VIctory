@@ -186,7 +186,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
             std::fs::remove_dir_all(entry.path())?;
-        } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
+        } else if let Some(n) = version_number(&file) {
             committed.push(n);
         }
     }
@@ -209,6 +209,15 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         display,
         blobs,
     }))
+}
+
+/// The number of a committed version folder, named exactly as `commit`
+/// names it (`v1`, never `v01` or `v+1`). A look-alike name would parse to
+/// the same number, and removing the older versions by their rebuilt names
+/// would then delete the real one; folders we did not write are left alone.
+fn version_number(file: &str) -> Option<u64> {
+    let n = file.strip_prefix('v')?.parse::<u64>().ok()?;
+    (file[1..] == n.to_string()).then_some(n)
 }
 
 /// The version of container `name` in `dir`; none for a missing container
@@ -1004,6 +1013,44 @@ mod tests {
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {
         Some(("one".into(), vec![("a".into(), "old a".into()), ("b".into(), "old b".into())]))
+    }
+
+    /// A folder that only looks like a version (a copy named `v01` beside
+    /// `v1`, left by a sync tool or a restore) neither deletes the real
+    /// version nor hides later ones (#870).
+    #[test]
+    fn a_look_alike_version_folder_loses_no_save() {
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves.path();
+        assert_eq!(update(root, "one", &[("a", Some("old a"))]), S_OK);
+        let dir = container_dir(root, "Slot");
+        let real = current_named(&dir, "Slot").unwrap().unwrap().dir;
+        let number = real.file_name().unwrap().to_str().unwrap()[1..].to_string();
+        for stray in [format!("v0{number}"), format!("v+{number}")] {
+            std::fs::create_dir(dir.join(&stray)).unwrap();
+            std::fs::copy(real.join(MANIFEST), dir.join(stray).join(MANIFEST)).unwrap();
+        }
+        let one = Some(("one".into(), vec![("a".into(), "old a".into())]));
+        assert_eq!(state(root), one);
+
+        // Later writes stay visible too.
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+        assert_eq!(update(root, "three", &[("b", Some("new b"))]), S_OK);
+        let three = Some((
+            "three".into(),
+            vec![("a".into(), "new a".into()), ("b".into(), "new b".into())],
+        ));
+        assert_eq!(state(root), three);
+    }
+
+    #[test]
+    fn version_folder_names_are_exact() {
+        assert_eq!(version_number("v1"), Some(1));
+        assert_eq!(version_number("v0"), Some(0));
+        assert_eq!(version_number("v18446744073709551615"), Some(u64::MAX));
+        for bad in ["v01", "v+1", "v", "v1.new", "v1 ", "x1", "v-1"] {
+            assert_eq!(version_number(bad), None, "{bad}");
+        }
     }
 
     /// Run by the crash test in a child process; does nothing otherwise.
