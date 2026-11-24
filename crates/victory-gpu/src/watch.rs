@@ -332,10 +332,8 @@ mod tests {
         writing(view + 100, 13);
         assert!(read(&mut file));
         // SAFETY: the bytes just read.
-        assert_eq!(
-            unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) },
-            b"from the disk"
-        );
+        let read_back = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
+        assert_eq!(read_back, b"from the disk");
         assert_eq!(guard(view, view + 2 * BLOCK), Some((view / PAGE..view / PAGE + 1).collect()));
         // SAFETY: our view.
         unsafe {
