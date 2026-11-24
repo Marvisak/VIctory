@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 
+use crate::ShaderError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
 
@@ -211,6 +213,10 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
+    /// The first broken builder invariant (an emitter bug). Building goes
+    /// on with a placeholder so the many call sites stay infallible;
+    /// [`Module::write`] reports it.
+    broken: Option<String>,
 }
 
 impl Module {
@@ -247,6 +253,16 @@ impl Module {
     }
     pub fn func_ty(&mut self, ret: Ty, params: Vec<Ty>) -> Ty {
         self.ty(TypeDef::Func(ret, params))
+    }
+
+    /// Records a broken invariant (the first one is kept) and gives an
+    /// `i32` undef to stand in for the value that could not be built.
+    fn broke(&mut self, what: String) -> V {
+        if self.broken.is_none() {
+            self.broken = Some(what);
+        }
+        let t = self.int(32);
+        self.undef(t)
     }
 
     fn is_void(&self, t: Ty) -> bool {
@@ -287,13 +303,16 @@ impl Module {
     }
     /// A constant struct or array of constants.
     pub fn aggregate(&mut self, ty: Ty, fields: &[V]) -> V {
-        let ids = fields
-            .iter()
-            .map(|f| match f {
-                V::Const(i) => *i,
-                _ => panic!("aggregate of a non-constant"),
-            })
-            .collect();
+        let mut ids = Vec::with_capacity(fields.len());
+        for &f in fields {
+            match f {
+                V::Const(i) => ids.push(i),
+                V::Global(_) | V::Func(_) | V::Inst(_) => {
+                    self.broke(format!("aggregate of a non-constant {f:?}"));
+                    return self.undef(ty);
+                }
+            }
+        }
         self.constant(ty, Const::Aggregate(ids))
     }
 
@@ -348,7 +367,11 @@ impl Module {
     /// An internal constant global initialised with the constant `init`.
     pub fn constant_global(&mut self, name: &str, init: V) -> V {
         let V::Const(i) = init else {
-            panic!("a global initialised with a non-constant")
+            self.broke(format!(
+                "global {name} initialised with a non-constant {init:?}"
+            ));
+            let t = self.int(32);
+            return self.global(name, t, 0);
         };
         let ty = self.consts[i as usize].0;
         let g = self.global(name, ty, 0);
@@ -405,18 +428,30 @@ impl Module {
     }
     pub fn extract(&mut self, block: usize, agg: V, index: u32) -> V {
         let ty = match &self.types[self.type_of(agg).0 as usize] {
-            TypeDef::Struct(_, f) => f[index as usize],
-            TypeDef::Array(_, t) => *t,
-            t => panic!("extractvalue from {t:?}"),
+            TypeDef::Struct(_, f) => f.get(index as usize).copied(),
+            TypeDef::Array(n, t) => (index < *n).then_some(*t),
+            TypeDef::Void
+            | TypeDef::Int(_)
+            | TypeDef::Float
+            | TypeDef::Ptr(..)
+            | TypeDef::Func(..) => None,
         };
-        self.push(block, ty, Op::Extract(agg, index))
+        match ty {
+            Some(ty) => self.push(block, ty, Op::Extract(agg, index)),
+            None => {
+                let t = self.types[self.type_of(agg).0 as usize].clone();
+                self.broke(format!("extractvalue {index} from {t:?}"))
+            }
+        }
     }
     pub fn call(&mut self, block: usize, f: V, args: Vec<V>) -> V {
         let V::Func(i) = f else {
-            panic!("call of a non-function")
+            return self.broke(format!("call of a non-function {f:?}"));
         };
-        let TypeDef::Func(ret, _) = self.types[self.funcs[i as usize].ty.0 as usize] else {
-            unreachable!()
+        let fty = self.funcs[i as usize].ty;
+        let TypeDef::Func(ret, _) = self.types[fty.0 as usize] else {
+            let t = self.types[fty.0 as usize].clone();
+            return self.broke(format!("call of a function of type {t:?}"));
         };
         self.push(block, ret, Op::Call(i, args))
     }
@@ -433,10 +468,10 @@ impl Module {
     /// The address of element `index` of the array `ptr` points to.
     pub fn element(&mut self, block: usize, ptr: V, index: V) -> V {
         let TypeDef::Ptr(arr, space) = self.types[self.type_of(ptr).0 as usize] else {
-            panic!("element of a non-pointer")
+            return self.broke(format!("element of a non-pointer {ptr:?}"));
         };
         let TypeDef::Array(_, elem) = self.types[arr.0 as usize] else {
-            panic!("element of a non-array")
+            return self.broke(format!("element of a pointer to a non-array {ptr:?}"));
         };
         let ty = self.ptr_in(elem, space);
         let zero = self.i32(0);
@@ -444,7 +479,7 @@ impl Module {
     }
     pub fn load(&mut self, block: usize, ptr: V) -> V {
         let TypeDef::Ptr(ty, _) = self.types[self.type_of(ptr).0 as usize] else {
-            panic!("load from a non-pointer")
+            return self.broke(format!("load from a non-pointer {ptr:?}"));
         };
         self.push(block, ty, Op::Load(ptr))
     }
@@ -465,8 +500,14 @@ impl Module {
     }
 
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
-        let V::Inst(i) = phi else { panic!() };
-        self.insts[i as usize].op = Op::Phi(incoming);
+        match phi {
+            V::Inst(i) if matches!(self.insts[i as usize].op, Op::Phi(_)) => {
+                self.insts[i as usize].op = Op::Phi(incoming);
+            }
+            V::Inst(_) | V::Global(_) | V::Func(_) | V::Const(_) => {
+                self.broke(format!("incoming values set on a non-phi {phi:?}"));
+            }
+        }
     }
     pub fn terminate(&mut self, block: usize, t: Term) {
         self.blocks[block].term = Some(t);
@@ -489,7 +530,6 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
-    /// The module as bitcode.
     /// Which instructions are written: every body instruction, the branch
     /// conditions, and whatever they read, transitively (a phi nothing reads
     /// is dropped). A worklist visits each instruction once, so a long chain
@@ -521,7 +561,15 @@ impl Module {
         live
     }
 
-    pub fn write(&self) -> Vec<u8> {
+    /// The module as bitcode, or the first invariant the building broke.
+    pub fn write(&self) -> Result<Vec<u8>, ShaderError> {
+        if let Some(what) = &self.broken {
+            return Err(ShaderError::Internal(what.clone()));
+        }
+        Ok(self.write_bitcode())
+    }
+
+    fn write_bitcode(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
@@ -1183,7 +1231,7 @@ mod tests {
             ((64, 64, 64), 38_916, 0x9586_730c_f953_4a45),
             ((128, 256, 32), 295_952, 0x89e5_de2d_64f0_8785),
         ] {
-            let bytes = synthetic(regs, stages, read).write();
+            let bytes = synthetic(regs, stages, read).write().unwrap();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
         }
     }
@@ -1193,11 +1241,11 @@ mod tests {
     fn bench_write() {
         for (regs, stages, read) in [(64, 64, 64), (128, 256, 32), (256, 512, 256)] {
             let m = synthetic(regs, stages, read);
-            let bytes = m.write();
+            let bytes = m.write().unwrap();
             let runs = 5;
             let t = std::time::Instant::now();
             for _ in 0..runs {
-                std::hint::black_box(m.write());
+                std::hint::black_box(m.write().unwrap());
             }
             let per = t.elapsed() / runs;
             println!(

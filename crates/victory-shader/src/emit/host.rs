@@ -466,11 +466,11 @@ pub fn stub_vs(ps: &HostShader) -> Result<HostShader, String> {
             half: false,
         });
     }
-    Ok(stub(false, outputs))
+    stub(false, outputs)
 }
 
 /// A pixel shader that reads nothing and writes target 0.
-pub fn stub_ps() -> HostShader {
+pub fn stub_ps() -> Result<HostShader, String> {
     let target = SigElement {
         name: "SV_Target".into(),
         index: 0,
@@ -486,7 +486,7 @@ pub fn stub_ps() -> HostShader {
     stub(true, vec![target])
 }
 
-fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
+fn stub(pixel: bool, outputs: Vec<SigElement>) -> Result<HostShader, String> {
     use super::bitcode::{Attr, Term};
     let mut s = super::shader::Shader::new(pixel);
     let b = s.entry;
@@ -516,19 +516,20 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         })
         .collect();
     s.m.terminate(b, Term::Ret);
-    HostShader {
+    let dxil = s.finish().map_err(|e| e.to_string())?;
+    Ok(HostShader {
         stage: if pixel {
             crate::native::HwStage::Ps
         } else {
             crate::native::HwStage::Vs
         },
-        dxil: s.finish(),
+        dxil,
         user_data: Vec::new(),
         samplers: Vec::new(),
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
-    }
+    })
 }
 
 /// A root argument for [`Host::draw`].

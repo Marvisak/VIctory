@@ -51,7 +51,7 @@ impl Checks {
             .transpose()
             .map_err(anyhow::Error::msg)?;
         let host = pipelines
-            .then(|| Host::new(false).map(|h| (h, host::stub_ps())))
+            .then(|| Host::new(false).and_then(|h| host::stub_ps().map(|ps| (h, ps))))
             .transpose()
             .map_err(anyhow::Error::msg)?;
         Ok(Self {
