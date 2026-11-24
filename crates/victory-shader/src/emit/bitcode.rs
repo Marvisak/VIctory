@@ -472,6 +472,27 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_dx_op(&self, name: &str, opcode: i64) -> bool {
+        self.insts.iter().any(|inst| match &inst.op {
+            Op::Call(fid, args) => {
+                self.funcs[*fid as usize].name == name
+                    && matches!(
+                        args.first(),
+                        Some(V::Const(cid)) if matches!(self.consts[*cid as usize].1, Const::Int(n) if n == opcode)
+                    )
+            }
+            _ => false,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_cmp(&self, predicate: u8) -> bool {
+        self.insts
+            .iter()
+            .any(|inst| matches!(inst.op, Op::Cmp(p, _, _) if p == predicate))
+    }
+
     /// The module as bitcode.
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();

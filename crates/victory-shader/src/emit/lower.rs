@@ -37,6 +37,10 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    #[cfg(test)]
+    pub has_isnan_op: bool,
+    #[cfg(test)]
+    pub has_fcmp_uno: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -883,6 +887,10 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        #[cfg(test)]
+        let has_isnan_op = self.s.m.has_dx_op("dx.op.isSpecialFloat.f32", 8);
+        #[cfg(test)]
+        let has_fcmp_uno = self.s.m.has_cmp(pred::UNO);
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -890,6 +898,10 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            #[cfg(test)]
+            has_isnan_op,
+            #[cfg(test)]
+            has_fcmp_uno,
         })
     }
 
@@ -1406,6 +1418,11 @@ impl<'a> Lower<'a> {
     /// The median of three. With a NaN among them the hardware gives the
     /// minimum of the three instead (the host's minimum skips NaNs, so that
     /// is the smallest number among them).
+    ///
+    /// Uses `dx.op.isSpecialFloat.f32` (`IsNaN`) instead of `fcmp uno`: some
+    /// D3D12 drivers (observed on Intel Iris Xe) fold `fcmp uno x, x` to false
+    /// under default shader fast-math, returning the wrong operand when the
+    /// third input is NaN.
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         let lo = self.binary(36, a, b);
@@ -1413,9 +1430,14 @@ impl<'a> Lower<'a> {
         let t = self.binary(36, hi, third);
         let median = self.binary(35, lo, t);
         let least = self.binary(36, lo, third);
-        let ab = self.s.m.cmp(c, pred::UNO, a, b);
-        let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
-        let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
+        let is_nan = |l: &mut Self, x: V| {
+            l.s.op(c, "isSpecialFloat.f32", Attr::ReadNone, l.s.t.i1, 8, &[x])
+        };
+        let nan_a = is_nan(self, a);
+        let nan_b = is_nan(self, b);
+        let nan_c = is_nan(self, third);
+        let ab = self.s.m.bin(c, Bin::Or, nan_a, nan_b);
+        let nan = self.s.m.bin(c, Bin::Or, ab, nan_c);
         self.s.m.select(c, nan, least, median)
     }
 
@@ -6565,8 +6587,8 @@ mod tests {
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
-    /// Lowers a compute program of constants: whether it translates.
-    fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+    /// Lowers a compute program of constants and returns the lowered result.
+    fn lower_words(words: &[u32]) -> Result<super::Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -6595,7 +6617,33 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+    }
+
+    /// Lowers a compute program of constants: whether it translates.
+    fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+        lower_words(words).map(|_| ())
+    }
+
+    #[test]
+    fn med3_f32_emits_dxil_isnan_instead_of_fcmp_uno() {
+        // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
+        let src0 = 256 + 1u32;
+        let src1 = 256 + 2u32;
+        let src2 = 256 + 3u32;
+        let words = [
+            0x35 << 26 | (0x157u32 << 16),
+            src0 | (src1 << 9) | (src2 << 18),
+            S_ENDPGM,
+        ];
+        let lowered = lower_words(&words).unwrap();
+        assert!(
+            lowered.has_isnan_op,
+            "v_med3_f32 must emit dx.op.isSpecialFloat.f32 (IsNaN)"
+        );
+        assert!(
+            !lowered.has_fcmp_uno,
+            "v_med3_f32 must not emit fcmp uno (folded away by some drivers)"
+        );
     }
 
     #[test]
