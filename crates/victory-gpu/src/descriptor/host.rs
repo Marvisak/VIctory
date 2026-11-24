@@ -19,8 +19,8 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`],
+    /// capped only if the host heap limit is smaller.
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -65,13 +65,17 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
-/// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
-/// each a device removal shortly after; #59).
+/// 2^16 ran out seconds into the world on both uncapped (#59) and capped
+/// NVIDIA heaps (#747).
 const DYNAMIC: u32 = 1 << 18;
 
-/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
-const MIN_DYNAMIC: u32 = 1 << 16;
+/// Splits a capped view heap of `limit` host descriptors into
+/// `(mirrored_title_slots, dynamic_slots)`, reserving [`DYNAMIC`] slots for
+/// fresh tables while keeping at least one mirrored slot when `limit > 1`.
+fn capped_split(limit: u32) -> (u32, u32) {
+    let dynamic = DYNAMIC.min(limit.saturating_sub(1));
+    (limit - dynamic, dynamic)
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -93,8 +97,9 @@ impl HostHeap {
                     })
             }
         };
-        // The larger dynamic range only where the host takes it on top of
-        // every title slot; else the smaller one, and the cap after that.
+        // Full dynamic budget on top of every title slot where the host
+        // takes it; when the host caps the heap (NVIDIA 1M limit), keep the
+        // full dynamic reserve out of the cap so world tables do not starve.
         let (heap, count, extra) = if sampler {
             match make(count) {
                 Ok(heap) => (heap, count, 0),
@@ -103,16 +108,22 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make(count + DYNAMIC) {
-            (heap, count, DYNAMIC)
         } else {
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
+            let wanted = count.saturating_add(DYNAMIC);
+            match make(wanted) {
+                Ok(heap) => (heap, count, DYNAMIC),
+                Err(e) if wanted > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    let (mirrored, dynamic) = capped_split(PORTABLE_VIEWS);
+                    tracing::warn!(
+                        error = %e,
+                        count,
+                        mirrored,
+                        dynamic,
+                        "host view heap capped at {PORTABLE_VIEWS}"
+                    );
+                    (make(PORTABLE_VIEWS).ok()?, mirrored, dynamic)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -972,5 +983,33 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A capped view heap reserves the full `2^18` dynamic budget while
+    /// keeping the mirrored prefix intact, and small limits never underflow.
+    #[test]
+    fn capped_view_heap_reserves_dynamic_slots() {
+        assert_eq!(
+            capped_split(PORTABLE_VIEWS),
+            (PORTABLE_VIEWS - DYNAMIC, DYNAMIC)
+        );
+        assert_eq!(DYNAMIC, 1 << 18);
+        assert_eq!(capped_split(1024), (1, 1023));
+        assert_eq!(capped_split(1), (1, 0));
+        assert_eq!(capped_split(0), (0, 0));
+    }
+
+    /// A title view heap larger than the portable 1M limit keeps the full
+    /// `2^18` dynamic budget whether the host caps it or takes the full size.
+    #[test]
+    fn large_view_heap_keeps_full_dynamic_budget() {
+        let Some(heap) = HostHeap::new(false, PORTABLE_VIEWS + 250_000) else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.dynamic, DYNAMIC);
+        assert!(heap.count() + heap.dynamic >= PORTABLE_VIEWS);
+        let first = heap.dynamic(DYNAMIC).expect("full dynamic range available");
+        assert_eq!(first, heap.count());
+        heap.release(first, DYNAMIC);
     }
 }
