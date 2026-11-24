@@ -958,6 +958,12 @@ mod state {
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
     }
+    pub(super) extern "system" fn compute_root_signature(this: This, signature: This) {
+        with_state(this, |_, s| s.set_root_signature(true, signature));
+    }
+    pub(super) extern "system" fn graphics_root_signature(this: This, signature: This) {
+        with_state(this, |_, s| s.set_root_signature(false, signature));
+    }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
         with_state(this, |_, s| s.set_table(true, slot, handle));
     }
@@ -1112,10 +1118,12 @@ mod state {
     pub(super) use super::ignored_state as blend_factor;
     pub(super) use super::ignored_state as compute_constant;
     pub(super) use super::ignored_state as compute_constants;
+    pub(super) use super::ignored_state as compute_root_signature;
     pub(super) use super::ignored_state as compute_table;
     pub(super) use super::ignored_state as compute_view;
     pub(super) use super::ignored_state as graphics_constant;
     pub(super) use super::ignored_state as graphics_constants;
+    pub(super) use super::ignored_state as graphics_root_signature;
     pub(super) use super::ignored_state as graphics_table;
     pub(super) use super::ignored_state as graphics_view;
     pub(super) use super::ignored_state as heaps;
@@ -1306,8 +1314,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (25, set_pipeline as *const ()),              // 0xc8
     (26, barrier as *const ()),                   // 0xd0
     (32, state::heaps as *const ()),              // 0x100
-    (33, ignored_state as *const ()),             // 0x108 compute root signature
-    (34, ignored_state as *const ()),             // 0x110 graphics root signature
+    (33, state::compute_root_signature as *const ()), // 0x108 compute root signature
+    (34, state::graphics_root_signature as *const ()), // 0x110 graphics root signature
     (35, state::compute_table as *const ()),      // 0x118
     (36, state::graphics_table as *const ()),     // 0x120
     (37, state::compute_constant as *const ()),   // 0x128
