@@ -1,7 +1,10 @@
 //! XPackage: the title's own installation, complete and launchable, with
 //! every chunk ready; no other package (content, add-ons) is installed.
 //! The package is the folder of the title's executable (`G:` to the title).
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::ffi::{c_char, c_void};
 use std::path::Path;

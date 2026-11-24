@@ -3,10 +3,14 @@
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
-#![allow(non_snake_case)]
-// Title code calls these through the objects, passing pointers the real API
-// would trust.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    non_snake_case,
+    reason = "exports carry the exact API names (`GameInputCreate`) that `hle_export!` binds imports by"
+)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -161,7 +165,10 @@ pub struct Device {
 /// follows the public layout and is zero where we have nothing to say.
 #[repr(C)]
 #[derive(Default)]
-#[allow(dead_code)] // read by title code
+#[allow(
+    dead_code,
+    reason = "fields are written for title code to read; Rust never reads them"
+)]
 struct DeviceInfo {
     size: u32,
     vendor: u16,

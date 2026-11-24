@@ -1,6 +1,9 @@
 //! Query heaps. Nothing runs on a GPU yet, so no query ever produces a
 //! result; the heap only remembers its description.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;

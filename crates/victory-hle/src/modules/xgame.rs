@@ -1,7 +1,10 @@
 //! The title's own id (from its manifest), which runtime areas exist, and
 //! game invites and events. Offline no invite arrives and events go
 //! nowhere.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::ffi::{CStr, c_char, c_void};
 

@@ -7,8 +7,14 @@
 //! submitting thread. A null queue handle means the process queue. An
 //! async block's system area holds its status and result size, so both
 //! stay readable after our state for the call is gone.
-#![allow(non_snake_case)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    non_snake_case,
+    reason = "exports carry the exact API names (`XTaskQueueCreate`) that `hle_export!` binds imports by"
+)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;

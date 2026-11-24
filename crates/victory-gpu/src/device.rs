@@ -4,7 +4,10 @@
 //! device methods in PC order); console additions follow. Methods we have
 //! not written log their table offset and fail, so a run shows what to
 //! write next.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::ffi::c_void;
 

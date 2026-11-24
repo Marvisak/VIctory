@@ -1,6 +1,9 @@
 //! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
 //! GPU yet, so only signals (the title's, later our queues') move one.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::ffi::c_void;
 use std::sync::Mutex;

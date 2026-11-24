@@ -2,10 +2,14 @@
 //!
 //! Only the differences live here; everything else passes through to the
 //! host (see `HostPolicy`).
-#![allow(non_snake_case)]
-// Title code calls these through its import table, passing pointers the real
-// API would trust.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    non_snake_case,
+    reason = "exports carry the exact API names (`GetModuleHandleW`) that `hle_export!` binds imports by"
+)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::ffi::{CStr, c_void};
 

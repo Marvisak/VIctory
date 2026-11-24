@@ -3,8 +3,14 @@
 //! URLs over the network, past `modules::net`. Titles get a proxy that
 //! opens local files only, with paths on our virtual drives rewritten to
 //! their host folders, and forwards everything else to the host's resolver.
-#![allow(non_snake_case)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    non_snake_case,
+    reason = "exports carry the exact API names (`MFCreateSourceResolver`) that `hle_export!` binds imports by"
+)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -380,7 +386,10 @@ extern "system" fn end_from_url(
     f(host, result, kind, object)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the signature is fixed by the API title code calls"
+)]
 extern "system" fn begin_from_stream(
     this: *mut Resolver,
     stream: Unknown,

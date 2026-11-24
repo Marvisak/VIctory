@@ -17,7 +17,10 @@
 //! shortened) plus a hash of the exact name, so names differing only in
 //! case get different folders. Offline there is no cloud copy, so nothing
 //! ever needs a sync.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::ffi::{CString, c_char, c_void};
 use std::io::Write as _;

@@ -8,7 +8,10 @@
 //!
 //! shortcut: event offsets are ignored (every event is at the tick); tie
 //! the clock to presentation if a title paces by them.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};

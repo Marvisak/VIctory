@@ -8,7 +8,10 @@
 //! Each list records onto a host command list as its methods are called
 //! (decision 0007); draw state lives in `crate::draw`. Methods not
 //! written yet log once with their caller, so a run lists what to do next.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::mem::offset_of;
 
@@ -592,7 +595,10 @@ extern "system" fn copy_texture_region(
     let _ = (this, dst, x, y, z, src, source_box);
 }
 
-#[allow(clippy::too_many_arguments)] // the method's own arguments
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the method's own arguments, fixed by the D3D12.X table it sits in"
+)]
 extern "system" fn copy_texture_region_x(
     this: This,
     dst: *const CopyLocation,

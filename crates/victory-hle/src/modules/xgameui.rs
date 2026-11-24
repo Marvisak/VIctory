@@ -3,7 +3,10 @@
 //! description, default text, the length limit) on a thread of its own and
 //! completes the call with what the user typed, or as cancelled (`E_ABORT`)
 //! when the dialog is dismissed or cannot open.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::ffi::{c_char, c_void};
 
@@ -143,7 +146,7 @@ mod dialog {
     /// The description, an edit box with the default text, OK and Cancel,
     /// from an in-memory template (dialog units, the system font); Enter
     /// accepts, Esc cancels.
-    #[allow(dead_code)] // unused in test builds
+    #[allow(dead_code, reason = "test builds answer with a stand-in `ask` instead")]
     pub(super) fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
         let mut t: Vec<u16> = Vec::new();
         fn dword(t: &mut Vec<u16>, v: u32) {

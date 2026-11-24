@@ -1,7 +1,10 @@
 //! XSystem: the console's identity and sandbox, and how analytics describe
 //! the device. Fixed values: one offline retail console, the model the user
 //! chose ([`victory_gpu::console`]).
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put_string,
@@ -135,7 +138,10 @@ static ANALYTICS_VTABLE: Methods<4> = Methods([
 /// takes a missing value for a PC.
 #[cfg(windows)]
 mod device_type {
-    #![allow(non_snake_case)]
+    #![allow(
+        non_snake_case,
+        reason = "exports carry the exact API names (`RegOpenKeyW`) that `hle_export!` binds imports by"
+    )]
 
     use std::ffi::c_void;
 
