@@ -62,6 +62,19 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Asks a device a `feature`; `None` when it does not answer (a driver, or
+/// options older than the feature).
+fn feature<T: Default>(device: &ID3D12Device, feature: D3D12_FEATURE) -> Option<T> {
+    let mut out = T::default();
+    // SAFETY: a live device; the feature's own structure and size.
+    unsafe {
+        device
+            .CheckFeatureSupport(feature, (&raw mut out).cast(), size_of_val(&out) as u32)
+            .ok()?;
+    }
+    Some(out)
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -95,6 +108,18 @@ impl Host {
                 ));
             }
             Ok(Host { device })
+        }
+    }
+
+    /// The lane counts of a wave the device runs (options 1): a program
+    /// asking a wave size outside them cannot build.
+    pub fn wave_lanes(&self) -> (u32, u32) {
+        match feature::<D3D12_FEATURE_DATA_D3D12_OPTIONS1>(
+            &self.device,
+            D3D12_FEATURE_D3D12_OPTIONS1,
+        ) {
+            Some(o) => (o.WaveLaneCountMin, o.WaveLaneCountMax),
+            None => (0, 0),
         }
     }
 
