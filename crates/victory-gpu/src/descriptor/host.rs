@@ -971,15 +971,11 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        return !typeless && stores(own, unordered);
     }
     let cast = castable.contains(&view);
     if family(view) != family(own) && !cast {
         once!(view, own, "view format of another family");
-        return false;
-    }
-    if cast && family(view) != family(own) && unordered && !typed_store(view) {
-        once!(view, own, "an unordered view in a format the host cannot store");
         return false;
     }
     if let Some(format) = format
@@ -987,8 +983,21 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         && !cast
     {
         *format = d.Format;
+        return stores(own, unordered);
     }
-    true
+    stores(view, unordered)
+}
+
+/// Whether an unordered view in `format` can be made (any other view can):
+/// a host without typed stores to that format removes the device for one
+/// (NVIDIA and B5G5R5A1_UNORM: DXGI_ERROR_INVALID_CALL). Such a view is null
+/// instead: its writes are dropped.
+fn stores(format: u32, unordered: bool) -> bool {
+    if !unordered || typed_store(format) {
+        return true;
+    }
+    once!(format, "an unordered view in a format the host cannot store");
+    false
 }
 
 /// Whether a view without a description of `resource` (a title texture)
@@ -1359,6 +1368,16 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unordered view is made only in a format the host stores to (NVIDIA
+    /// refuses B5G5R5A1_UNORM and removes the device); other views always.
+    #[test]
+    fn unordered_views_need_typed_stores() {
+        for format in [86, 28, 2] {
+            assert!(stores(format, false), "{format}");
+            assert_eq!(stores(format, true), typed_store(format), "{format}");
+        }
+    }
 
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]
