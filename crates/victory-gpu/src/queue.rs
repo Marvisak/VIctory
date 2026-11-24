@@ -42,6 +42,20 @@ fn queue<'a>(this: This) -> &'a Queue {
     unsafe { &*this.cast::<Queue>() }
 }
 
+#[cfg(all(test, windows, feature = "diagnostics"))]
+pub(crate) fn create_sync_trace_test_queue() -> This {
+    let null = std::ptr::null();
+    let desc = QueueDesc {
+        kind: 0,
+        priority: 0,
+        flags: 0,
+        nodes: 0,
+    };
+    let mut queue = null;
+    assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut queue), S_OK);
+    queue
+}
+
 pub(crate) extern "system" fn create(
     _: This,
     desc: *const QueueDesc,
@@ -111,7 +125,7 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+extern "system" fn execute(_this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -121,7 +135,23 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let host_lists: Vec<_> = lists
             .iter()
-            .filter_map(|&l| crate::list::host_list(l))
+            .filter_map(|&l| {
+                let host_list = crate::list::host_list(l)?;
+
+                #[cfg(feature = "diagnostics")]
+                {
+                    if crate::list::sync_trace_enabled() {
+                        tracing::info!(
+                            queue = ?_this,
+                            list = ?l,
+                            host_list = ?(host_list as *const crate::host::HostList),
+                            "sync trace: command list submission requested"
+                        );
+                    }
+                }
+
+                Some(host_list)
+            })
             .collect();
         host.execute(&host_lists);
         return;

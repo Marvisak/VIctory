@@ -244,8 +244,30 @@ extern "system" fn allocator_reset(_: This) -> HRESULT {
 extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
+#[cfg(feature = "diagnostics")]
+pub(crate) fn sync_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("VICTORY_SYNC_TRACE").as_deref(),
+            Ok("1")
+        )
+    })
+}
+
 extern "system" fn list_release(this: This) -> u32 {
-    object::release_boxed::<List>(this)
+    let remaining = object::release_boxed::<List>(this);
+
+    #[cfg(feature = "diagnostics")]
+    if remaining == 0 && sync_trace_enabled() {
+        tracing::info!(
+            list = ?this,
+            "sync trace: list released"
+        );
+    }
+
+    remaining
 }
 extern "system" fn list_type(this: This) -> u32 {
     // SAFETY: `this` is one of our lists.
@@ -262,6 +284,14 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(feature = "diagnostics")]
+    if sync_trace_enabled() {
+        tracing::info!(
+            list = ?this,
+            "sync trace: list reset requested"
+        );
+    }
+
     // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
@@ -1227,7 +1257,20 @@ pub(crate) fn take_counts() -> (u64, u64) {
 /// A GPU wait for a memory value `(address, comparison, reference, ...)`.
 /// Lists run one after another and to completion, so a value another queue
 /// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+extern "system" fn wait_value(_this: This, _address: u64, _comparison: u32, _reference: u64) {
+    #[cfg(feature = "diagnostics")]
+    {
+        if crate::list::sync_trace_enabled() {
+            tracing::info!(
+                list = ?_this,
+                address = %format_args!("{:#x}", _address),
+                comparison = _comparison,
+                reference = %format_args!("{:#x}", _reference),
+                "sync trace: ignored memory wait"
+            );
+        }
+    }
+}
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
@@ -1267,6 +1310,18 @@ extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, fl
 }
 
 fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
+    #[cfg(feature = "diagnostics")]
+    {
+        if address != 0 && crate::list::sync_trace_enabled() {
+            tracing::info!(
+                list = ?this,
+                address = %format_args!("{:#x}", address),
+                value = ?what,
+                bytes,
+                "sync trace: memory write recorded"
+            );
+        }
+    }
     if address == 0 {
         return;
     }
@@ -1404,6 +1459,176 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(feature = "diagnostics")]
+    fn capture_sync_events(run: impl FnOnce()) -> Vec<std::collections::BTreeMap<String, String>> {
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        use tracing::{Event, Metadata, Subscriber, span};
+
+        #[derive(Default)]
+        struct Fields(BTreeMap<String, String>);
+
+        impl tracing::field::Visit for Fields {
+            fn record_debug(
+                &mut self,
+                field: &tracing::field::Field,
+                value: &dyn std::fmt::Debug,
+            ) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+        }
+
+        struct Capture(Arc<Mutex<Vec<Fields>>>);
+
+        impl Subscriber for Capture {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                metadata.is_event()
+            }
+
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+
+            fn enter(&self, _: &span::Id) {}
+
+            fn exit(&self, _: &span::Id) {}
+
+            fn event(&self, event: &Event<'_>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Capture(events.clone()), run);
+
+        let mut captured = events.lock().unwrap();
+        std::mem::take(&mut *captured)
+            .into_iter()
+            .map(|fields| fields.0)
+            .filter(|fields| {
+                fields.get("message").is_some_and(|m| m.contains("sync trace:"))
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn memory_wait_trace_is_opt_in_and_preserves_value() {
+        let mut value = 42u64;
+        let address = (&mut value as *mut u64) as u64;
+
+        let events = capture_sync_events(|| {
+            wait_value(std::ptr::null(), address, 7, 99);
+        });
+
+        assert_eq!(value, 42);
+        assert_eq!(events.len(), usize::from(sync_trace_enabled()));
+
+        if sync_trace_enabled() {
+            let fields = &events[0];
+            assert_eq!(fields["address"], format!("{address:#x}"));
+            assert_eq!(fields["comparison"], "7");
+            assert_eq!(fields["reference"], "0x63");
+            assert!(fields["message"].contains("ignored memory wait"));
+        }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn sync_trace_deferred_write_executes_after_submission() {
+        let Some(_host) = crate::host::host() else {
+            eprintln!("SKIPPED: no host D3D12 device");
+            return;
+        };
+
+        let null = std::ptr::null();
+        let queue = crate::queue::create_sync_trace_test_queue();
+        let mut allocator = null;
+        let mut list = null;
+
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        let host_id = format!("{:p}", host_list(list).expect("host list"));
+        let list_id = format!("{list:?}");
+        let queue_id = format!("{queue:?}");
+
+        let mut value = 42u64;
+        let address = (&mut value as *mut u64) as u64;
+        let mut before = 0;
+
+        let release = |o: This| {
+            slot::<extern "system" fn(This) -> u32>(o, 0x10)(o)
+        };
+
+        let events = capture_sync_events(|| {
+            write64(list, address, 99, 0, 0);
+            before = value;
+
+            assert_eq!(close(list), S_OK);
+
+            let execute = slot::<
+                extern "system" fn(This, u32, *const This)
+            >(queue, 0x50);
+
+            execute(queue, 1, &list);
+
+            assert_eq!(reset(list, allocator, null), S_OK);
+            assert_eq!(release(list), 0);
+        });
+
+        assert_eq!(release(allocator), 0);
+        assert_eq!(release(queue), 0);
+
+        assert_eq!(before, 42, "write must remain deferred");
+        assert_eq!(value, 99, "write must execute after submission");
+
+        let enabled = matches!(
+            std::env::var("VICTORY_SYNC_TRACE").as_deref(),
+            Ok("1")
+        );
+
+        assert_eq!(sync_trace_enabled(), enabled);
+
+        if enabled {
+            assert_eq!(events.len(), 5);
+
+            assert!(events[0]["message"].contains("memory write recorded"));
+            assert!(events[1]["message"].contains("submission requested"));
+            assert!(events[2]["message"].contains("deferred memory write executed"));
+            assert!(events[3]["message"].contains("list reset requested"));
+            assert!(events[4]["message"].contains("list released"));
+
+            for fields in [&events[0], &events[2]] {
+                assert_eq!(fields["address"], format!("{address:#x}"));
+                assert_eq!(fields["bytes"], "8");
+                assert_eq!(fields["value"], "Value(99)");
+            }
+
+            assert_eq!(events[0]["list"], list_id);
+            assert_eq!(events[1]["list"], list_id);
+            assert_eq!(events[1]["queue"], queue_id);
+            assert_eq!(events[1]["host_list"], host_id);
+            assert_eq!(events[2]["host_list"], host_id);
+            assert_eq!(events[3]["list"], list_id);
+            assert_eq!(events[4]["list"], list_id);
+        } else {
+            assert!(events.is_empty());
+        }
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

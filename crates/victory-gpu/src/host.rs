@@ -601,6 +601,20 @@ impl Host {
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
+
+                #[cfg(feature = "diagnostics")]
+                {
+                    if crate::list::sync_trace_enabled() {
+                        tracing::info!(
+                            host_list = ?(*list as *const HostList),
+                            batch_end = *submitted,
+                            address = %format_args!("{:#x}", at),
+                            value = ?what,
+                            bytes,
+                            "sync trace: deferred memory write executed"
+                        );
+                    }
+                }
             }
         }
         self.log_messages();
