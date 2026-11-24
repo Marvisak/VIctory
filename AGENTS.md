@@ -23,7 +23,7 @@ rules below are the filter, so they are strict on purpose.
 | `victory-gpu` | D3D12.X objects, command lists, GPU memory → host D3D12 | shader translation logic | compiles, with dead-code warnings |
 | `victory-hle` | console API implementations called by title code | format decoders (call `victory-formats`) | **no** (see the ratchet) |
 | `apps/victory` | CLI: inspect, census, translate, run | library logic that other crates need | no (depends on `victory-hle`) |
-| `xtask` | asset-policy check, git hooks | product code | yes |
+| `xtask` | asset-policy check, citation check, git hooks | product code | yes |
 
 Dependency direction (enforced by review, keep it acyclic and downward):
 
@@ -50,6 +50,7 @@ do not compile there yet):
 cargo check  --workspace --all-targets --locked --exclude victory-hle --exclude victory
 cargo clippy --workspace --all-targets --locked --exclude victory-hle --exclude victory --exclude victory-gpu -- -D warnings
 cargo test   --workspace --locked --exclude victory-hle --exclude victory
+cargo xtask citations                    # also part of cargo test
 ```
 
 Windows (what the `check` CI job runs; the only place all code compiles):
@@ -96,11 +97,32 @@ unfulfilled expectation is itself a warning, and CI runs `-D warnings`.
    ~1,200; split by responsibility before you cross either.
 10. **Docs match code in the same commit.** Do not call implemented things
     "planned", or planned things done. Cite only documents that exist in
-    the repository; there is no `docs/decisions/` directory.
+    the repository; there is no decision-record directory under `docs/`.
+    Paths cited here are checked; see Citations.
 11. **Lints.** Libraries log through `tracing`, never `println!`/`eprintln!`;
     no `dbg!`, `todo!`, `unimplemented!`, `std::process::exit`,
     `mem::forget`, or `result.ok();` (all enforced). Lints are configured
     once, in the root `Cargo.toml`; every crate has `[lints] workspace = true`.
+
+## Citations
+
+`cargo xtask citations` (a CI step, and the `agents_md_citations_resolve`
+test) fails when a path this file cites stops existing, so a rename or
+deletion has to update the contract in the same commit. What it checks:
+
+- An inline code span (outside fenced blocks) made only of letters,
+  digits, `_`, `-`, `.` and at least one `/` is a citation, optionally
+  ending in `/` (must be a directory) or `:line` (must be within the file).
+- Citations resolve from the repository root. A path written relative to
+  a crate is reported as missing, so write
+  `crates/victory-gpu/src/pipeline/host.rs`, not the part after `crates/`.
+- Bare file names without a `/` (such as `lib.rs` or `Cargo.toml`) are not
+  checked: they name a file in the sentence's context, and many are
+  ambiguous across crates. Write the full path when the file matters.
+- Globs, and spans with spaces or other characters (`*.rs`,
+  `// SAFETY:`), are not citations and are not checked.
+- To mention a path that must not exist, say it in words, not in a code
+  span.
 
 ## Pitfalls seen in this repository
 
@@ -108,14 +130,14 @@ unfulfilled expectation is itself a warning, and CI runs `-D warnings`.
 |---------|--------------|------------|
 | Portable code calls a `cfg(windows)` item; Windows CI passes, every other host fails to build | `victory-gpu` `resource::view_format` called `host_resource` (fixed by gating it); `victory-hle` `d3d12x.rs` uses `super::xmem`, `xgame.rs` uses `super::lifecycle`, `xgameui.rs` uses `windows_sys` unconditionally | Gate the caller too, or give the item a non-Windows body. Run the Linux commands above. |
 | Tests assume the test binary is a PE image | `victory-pe` `image.rs` and `victory-loader` `prepare.rs` tests reading `current_exe()` (now `cfg(windows)`) | Gate with `#[cfg(windows)]` and a comment saying why, or build a synthetic image (`synthetic_image` in `image.rs`). |
-| Safe signature, raw-pointer dereference inside | 38 module-level `not_unsafe_ptr_arg_deref` allows (13 in `victory-gpu`, 25 in `victory-hle/src/modules`) | `unsafe extern "system" fn` with a `# Safety` section; see the ratchet. |
-| Swallowed I/O errors | `apps/victory/src/translate.rs` dropped dump writes with `let _ = std::fs::write(...)` (fixed: `write_dump` logs the path); `apps/victory/src/census.rs`: `.filter_map(Result::ok)` over `walkdir` | `if let Err(e) = ... { tracing::warn!(...) }`; count and report skipped entries. |
-| Hand-written field-by-field merge | `Tally::merge` in `apps/victory/src/translate.rs` adds ~40 fields one by one | `let Tally { a, b, .. } = other;` without `..`, so a new field fails to compile until merged. |
+| Safe signature, raw-pointer dereference inside | 38 module-level `not_unsafe_ptr_arg_deref` allows (13 in `victory-gpu`, 25 in `crates/victory-hle/src/modules`) | `unsafe extern "system" fn` with a `# Safety` section; see the ratchet. |
+| Swallowed I/O errors | `apps/victory/src/translate.rs` dropped dump writes with `let _ = std::fs::write(...)` (fixed: `write_dump` logs the path); `.filter_map(Result::ok)` over `walkdir` in `apps/victory/src/census.rs:37` and the non-git fallback of `xtask/src/policy.rs:134` (`translate` itself now walks through `apps/victory/src/walk.rs`, which reports every skipped entry) | `if let Err(e) = ... { tracing::warn!(...) }`; count and report skipped entries, as `walk.rs` does. |
+| Hand-written field-by-field merge | `Tally::merge` added ~40 fields one by one, so a new field could be left out of the sum (fixed: `apps/victory/src/translate/tally.rs:122` destructures every field) | `let Tally { a, b, c } = other;` naming every field, never `..`, so a new field fails to compile until merged. |
 | `_ =>` standing for "vertex/pixel" | `counter()` and `check()` in `apps/victory/src/translate.rs` treated every `HwStage` (8 variants) other than `Cs`/`Ms`/`Vs` as one group (fixed: both list the variants) | Name the variants: `HwStage::Ls \| HwStage::Hs \| ... =>`. |
-| Panic reachable from title code | `victory-shader/src/emit/bitcode.rs` `panic!`s on internal invariants, reached from `victory-gpu` pipeline creation; `host!` in `victory-hle/src/modules/files.rs` panics if a host export is missing; `Stage::translated` in `victory-gpu/src/pipeline/host.rs` uses `expect` | Return `Result` and map it to the API's failure (`E_FAIL`, a dropped draw) with a log line. |
-| Giant functions and files | `victory-shader/src/emit/lower.rs` is 7,424 lines; clippy counts 32 functions over 100 lines in the portable crates alone | New logic goes in a new, focused module; extract before extending. |
+| Panic reachable from title code | `crates/victory-shader/src/emit/bitcode.rs` `panic!`s on internal invariants, reached from `victory-gpu` pipeline creation; `host!` in `crates/victory-hle/src/modules/files.rs` panics if a host export is missing; `Stage::translated` in `crates/victory-gpu/src/pipeline/host.rs` uses `expect` | Return `Result` and map it to the API's failure (`E_FAIL`, a dropped draw) with a log line. |
+| Giant functions and files | `crates/victory-shader/src/emit/lower.rs` is 7,424 lines; clippy counts 32 functions over 100 lines in the portable crates alone | New logic goes in a new, focused module; extract before extending. |
 | Docs promise what the code does not do (or deny what it does) | see Known doc drift below | Update the doc in the same commit as the code. |
-| A Windows-only test helper prints, Linux CI is green and Windows clippy fails | `emit/valu_tests.rs` was gated `#[cfg(all(test, windows))]`; clippy only exempts code under a plain `#[cfg(test)]`, so its `eprintln!` in `run_cases` broke PR #1 | Gate test modules with `#[cfg(test)]` and `#[cfg(windows)]` as two attributes, never `cfg(all(test, ...))` (the `portable` CI job rejects it). |
+| A Windows-only test helper prints, Linux CI is green and Windows clippy fails | `crates/victory-shader/src/emit/valu_tests.rs` was gated `#[cfg(all(test, windows))]`; clippy only exempts code under a plain `#[cfg(test)]`, so its `eprintln!` in `run_cases` broke PR #1 | Gate test modules with `#[cfg(test)]` and `#[cfg(windows)]` as two attributes, never `cfg(all(test, ...))` (the `portable` CI job rejects it). |
 | Unverifiable lint suppression | `#[allow(dead_code)] // unused in test builds` | `#[allow(dead_code, reason = "...")]`; never `#[expect]` on code CI compiles differently per cfg. |
 
 ## Known doc drift (to fix, not to copy)
@@ -127,14 +149,14 @@ unfulfilled expectation is itself a warning, and CI runs `-D warnings`.
   `victory-formats` (implemented).
 - `docs/architecture.md` diagram: game assets go through
   `victory-pipeline + victory-game`. Neither converts assets today; the only
-  real `Converter` is shader translation in `victory-gpu/src/shader_cache.rs`.
+  real `Converter` is shader translation in `crates/victory-gpu/src/shader_cache.rs`.
 - `crates/victory-game/src/lib.rs` and `docs/architecture.md` promise
   "hooks" placed in the title's code; the crate has `sgd5` and
   `KnownBuild` only.
 - "decision 0003" is cited 10 times (in `victory-shader` and
   `victory-gpu`) and "decision 0007" 16 times (`victory-gpu`,
   `victory-hle`); no decision records exist in the repository.
-- `victory-hle/src/modules/mod.rs` lists `xstore` stubs as planned;
+- `crates/victory-hle/src/modules/mod.rs` lists `xstore` stubs as planned;
   `xstore.rs` exists.
 
 ## Lint ratchet
@@ -171,5 +193,6 @@ only with a commit that makes it pass, verified on Windows CI.
 - [ ] Docs (crate docs, `docs/`, README status) updated in the same commit;
       nothing cited that does not exist.
 - [ ] `cargo xtask policy` passes; nothing derived from a title is added.
+- [ ] `cargo xtask citations` passes; paths cited here are root-relative.
 - [ ] Commits are small, Conventional Commits (`fix(gpu): ...`), each one
       building on its own.

@@ -60,6 +60,12 @@ jobs:
             echo "::error::split into #[cfg(test)] and #[cfg(<platform>)]; see AGENTS.md, Pitfalls"
             exit 1
           fi
+      # Paths AGENTS.md cites must exist, so renaming or deleting a cited
+      # file fails here instead of leaving the contract stale. The Tests
+      # steps run it too (agents_md_citations_resolve); this names it.
+      - name: AGENTS.md citations
+        if: ${{ !cancelled() }}
+        run: cargo xtask citations
       - name: Check
         if: ${{ !cancelled() }}
         run: cargo check --workspace --all-targets --locked --keep-going --exclude victory-hle --exclude victory
