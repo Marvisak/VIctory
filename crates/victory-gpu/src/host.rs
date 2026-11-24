@@ -276,6 +276,293 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    #[test]
+    fn shadow_cache_invalidates_on_register_unregister_and_nested_buffers() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().expect("host command list");
+        let backing = vec![0u8; 0x10000];
+        let base = backing.as_ptr() as u64;
+        let res_outer = std::ptr::from_ref(&backing) as usize;
+        let res_inner = res_outer.wrapping_add(1);
+
+        crate::shadow::register(res_outer, base, 0x10000);
+        let s_outer = list.find_shadow(base + 0x100, 64).expect("outer shadow");
+        let s_outer_hit = list
+            .find_shadow(base + 0x2000, 64)
+            .expect("cached subrange hit");
+        assert!(std::sync::Arc::ptr_eq(&s_outer, &s_outer_hit));
+
+        // Registering an inner buffer bumps the global generation and must
+        // invalidate the per-list cache immediately.
+        crate::shadow::register(res_inner, base + 0x1000, 0x2000);
+        let s_inner = list
+            .find_shadow(base + 0x1500, 64)
+            .expect("inner shadow after generation bump");
+        assert!(!std::sync::Arc::ptr_eq(&s_outer, &s_inner));
+
+        // Non-overlapping outer segments still resolve to outer, while a
+        // straddling query resolves to outer without poisoning inner lookups.
+        assert!(std::sync::Arc::ptr_eq(
+            &list.find_shadow(base + 0x100, 64).unwrap(),
+            &s_outer,
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &list.find_shadow(base + 0x5000, 64).unwrap(),
+            &s_outer,
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &list.find_shadow(base + 0x2800, 0x1000).unwrap(),
+            &s_outer,
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &list.find_shadow(base + 0x2800, 64).unwrap(),
+            &s_inner,
+        ));
+
+        // Unregistering the inner buffer invalidates again and reverts to outer.
+        crate::shadow::unregister(res_inner, base + 0x1000);
+        let s_reverted = list
+            .find_shadow(base + 0x1500, 64)
+            .expect("reverted to outer");
+        assert!(std::sync::Arc::ptr_eq(&s_outer, &s_reverted));
+
+        // Clean up global buffer table.
+        crate::shadow::unregister(res_outer, base);
+        list.close();
+        list.reset();
+        assert!(
+            list.shadow_cache
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    #[test]
+    fn view_cache_invalidates_on_forget_and_reset() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().expect("host command list");
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let resource_tag = 0u64;
+        let resource = std::ptr::from_ref(&resource_tag) as usize;
+
+        crate::descriptor::create_srv(
+            std::ptr::null(),
+            resource as crate::object::This,
+            std::ptr::null(),
+            handle,
+        );
+        let expected = Some(crate::descriptor::View::Shader(resource, None));
+        assert_eq!(list.lookup_view(handle), expected);
+        // Second lookup hits the per-list inline cache.
+        assert_eq!(list.lookup_view(handle), expected);
+
+        // Forgetting the resource must invalidate the cached entry immediately.
+        crate::descriptor::forget(resource);
+        assert_eq!(list.lookup_view(handle), None);
+
+        // Re-record, populate cache, then verify `reset()` clears it.
+        crate::descriptor::create_srv(
+            std::ptr::null(),
+            resource as crate::object::This,
+            std::ptr::null(),
+            handle,
+        );
+        assert_eq!(list.lookup_view(handle), expected);
+        list.close();
+        list.reset();
+        assert!(
+            list.view_cache
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .all(Option::is_none)
+        );
+        crate::descriptor::forget(resource);
+    }
+
+    #[test]
+    fn concurrent_read_locks_and_caches_stress() {
+        let Some(host) = host() else { return };
+        let stable_bufs: Vec<Vec<u8>> = (0..4).map(|_| vec![0xA5u8; 4096]).collect();
+        let stable_ranges: Vec<(usize, u64)> = stable_bufs
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let res = b.as_ptr() as usize ^ (i + 1);
+                let addr = b.as_ptr() as u64;
+                crate::shadow::register(res, addr, b.len() as u64);
+                (res, addr)
+            })
+            .collect();
+        let expected_shadows: Vec<std::sync::Arc<crate::shadow::Shadow>> = stable_ranges
+            .iter()
+            .map(|&(_, addr)| crate::shadow::find(addr, 64).expect("stable shadow"))
+            .collect();
+
+        let mut stable_slots = [[0u32; 8]; 4];
+        let stable_resources: [u64; 4] = [1, 2, 3, 4];
+        let mut stable_handles = [0u64; 4];
+        for i in 0..4 {
+            let handle = stable_slots[i].as_mut_ptr() as u64;
+            let res = std::ptr::from_ref(&stable_resources[i]) as usize;
+            crate::descriptor::create_srv(
+                std::ptr::null(),
+                res as crate::object::This,
+                std::ptr::null(),
+                handle,
+            );
+            stable_handles[i] = handle;
+        }
+
+        let churn_buf = vec![0u8; 4096];
+        let churn_addr = churn_buf.as_ptr() as u64;
+        let churn_res = churn_addr as usize;
+        let mut churn_slot = [0u32; 8];
+        let churn_handle = churn_slot.as_mut_ptr() as u64;
+        let churn_view_tag = 0u64;
+        let churn_view_res = std::ptr::from_ref(&churn_view_tag) as usize;
+
+        std::thread::scope(|s| {
+            // Concurrent readers exercising per-list caches and shared RwLocks.
+            for t in 0..4 {
+                let ranges = &stable_ranges;
+                let expected = &expected_shadows;
+                let handles = &stable_handles;
+                let resources = &stable_resources;
+                s.spawn(move || {
+                    let list = host.new_list().expect("worker list");
+                    for iter in 0..300usize {
+                        let idx = (iter + t) % ranges.len();
+                        let (_, addr) = ranges[idx];
+                        let offset = ((iter * 16) % 2048) as u64;
+                        let got = list.find_shadow(addr + offset, 64).expect("shadow hit");
+                        assert!(std::sync::Arc::ptr_eq(&got, &expected[idx]));
+                        let direct = crate::shadow::find(addr + offset, 64).expect("direct shadow");
+                        assert!(std::sync::Arc::ptr_eq(&got, &direct));
+
+                        let res = std::ptr::from_ref(&resources[idx]) as usize;
+                        assert_eq!(
+                            list.lookup_view(handles[idx]),
+                            Some(crate::descriptor::View::Shader(res, None)),
+                        );
+                        assert_eq!(list.lookup_view(handles[idx]), crate::descriptor::view(handles[idx]));
+                    }
+                    list.close();
+                });
+            }
+            // Concurrent buffer table mutator.
+            s.spawn(move || {
+                for _ in 0..200 {
+                    crate::shadow::register(churn_res, churn_addr, 4096);
+                    let _ = crate::shadow::find(churn_addr, 64);
+                    crate::shadow::unregister(churn_res, churn_addr);
+                }
+            });
+            // Concurrent descriptor view table mutator.
+            s.spawn(move || {
+                for _ in 0..200 {
+                    crate::descriptor::create_srv(
+                        std::ptr::null(),
+                        churn_view_res as crate::object::This,
+                        std::ptr::null(),
+                        churn_handle,
+                    );
+                    let _ = crate::descriptor::view(churn_handle);
+                    crate::descriptor::forget(churn_view_res);
+                }
+            });
+        });
+
+        for &(res, addr) in &stable_ranges {
+            crate::shadow::unregister(res, addr);
+        }
+        for r in &stable_resources {
+            crate::descriptor::forget(std::ptr::from_ref(r) as usize);
+        }
+    }
+
+    #[test]
+    fn list_reset_cycle_gpu_copy_parity() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().expect("host command list");
+        let mut backing = vec![0x3Cu8; 4096];
+        let base = backing.as_ptr() as u64;
+        let res_a = std::ptr::from_ref(&backing) as usize;
+        let res_b = res_a.wrapping_add(1);
+
+        let readback_props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let buf_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain readback buffer creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &readback_props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &buf_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .expect("readback buffer");
+        }
+        let readback = readback.unwrap();
+
+        let run_copy = |expected_byte: u8| {
+            let shadow = list.find_shadow(base + 64, 256).expect("shadow");
+            shadow.refresh(&list, base + 64, 256);
+            // SAFETY: open list and live buffers with in-bounds offsets.
+            unsafe {
+                list.list
+                    .CopyBufferRegion(&readback, 0, &shadow.buffer, shadow.offset(base + 64), 256);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut ptr = std::ptr::null_mut();
+            let range = D3D12_RANGE { Begin: 0, End: 256 };
+            // SAFETY: readback buffer finished execution.
+            let bytes = unsafe {
+                readback.Map(0, Some(&range), Some(&mut ptr)).expect("map");
+                let out = std::slice::from_raw_parts(ptr.cast::<u8>(), 256).to_vec();
+                readback.Unmap(0, None);
+                out
+            };
+            assert!(bytes.iter().all(|&b| b == expected_byte));
+            shadow
+        };
+
+        // Cycle 1: populate cache and verify GPU copy of pattern 0x3C.
+        crate::shadow::register(res_a, base, backing.len() as u64);
+        let s1 = run_copy(0x3C);
+
+        // Reset list, replace buffer registration at the same VA with new data.
+        list.reset();
+        crate::shadow::unregister(res_a, base);
+        backing.fill(0x7Au8);
+        crate::shadow::register(res_b, base, backing.len() as u64);
+        let s2 = run_copy(0x7A);
+        assert!(!std::sync::Arc::ptr_eq(&s1, &s2));
+
+        crate::shadow::unregister(res_b, base);
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -301,6 +588,12 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Per-list inline cache of title-VA to host buffer copy lookups,
+    /// invalidated by `shadow::generation()` and cleared on `reset()`.
+    shadow_cache: Mutex<ShadowCache>,
+    /// Per-list inline cache of descriptor view lookups, invalidated by
+    /// `descriptor::views_generation()` and cleared on `reset()`.
+    view_cache: Mutex<ViewCache>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -323,6 +616,106 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+
+const LIST_CACHE_SLOTS: usize = 16;
+
+/// Bounded, allocation-free per-list cache for `shadow::find` lookups.
+struct ShadowCache {
+    generation: u64,
+    next: usize,
+    entries: [Option<(crate::shadow::CachedRange, std::sync::Arc<crate::shadow::Shadow>)>;
+        LIST_CACHE_SLOTS],
+}
+
+impl Default for ShadowCache {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            next: 0,
+            entries: std::array::from_fn(|_| None),
+        }
+    }
+}
+
+impl ShadowCache {
+    fn clear(&mut self) {
+        self.generation = 0;
+        self.next = 0;
+        self.entries.fill(None);
+    }
+
+    fn lookup(&mut self, address: u64, len: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        let end = address.checked_add(len.max(1))?;
+        let generation = crate::shadow::generation();
+        if self.generation == generation {
+            for (range, shadow) in self.entries.iter().flatten() {
+                if range.matches(address, end) {
+                    return Some(shadow.clone());
+                }
+            }
+        } else {
+            self.clear();
+            self.generation = generation;
+        }
+        // `generation` was observed before `find_with_range`: any concurrent
+        // registration/removal bumps the generation and invalidates this entry.
+        let (shadow, range) = crate::shadow::find_with_range(address, len)?;
+        if crate::shadow::generation() == generation {
+            self.entries[self.next] = Some((range, shadow.clone()));
+            self.next = (self.next + 1) % LIST_CACHE_SLOTS;
+        } else {
+            self.clear();
+        }
+        Some(shadow)
+    }
+}
+
+/// Bounded, allocation-free per-list cache for `descriptor::view_at` lookups.
+struct ViewCache {
+    generation: u64,
+    next: usize,
+    entries: [Option<(u32, u32, crate::descriptor::View)>; LIST_CACHE_SLOTS],
+}
+
+impl Default for ViewCache {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            next: 0,
+            entries: std::array::from_fn(|_| None),
+        }
+    }
+}
+
+impl ViewCache {
+    fn clear(&mut self) {
+        self.generation = 0;
+        self.next = 0;
+        self.entries.fill(None);
+    }
+
+    fn lookup(&mut self, i: u32, view_gen: u32) -> Option<crate::descriptor::View> {
+        let generation = crate::descriptor::views_generation();
+        if self.generation == generation {
+            for (slot_i, slot_gen, view) in self.entries.iter().flatten() {
+                if *slot_i == i && *slot_gen == view_gen {
+                    return Some(view.clone());
+                }
+            }
+        } else {
+            self.clear();
+            self.generation = generation;
+        }
+        let view = crate::descriptor::view_at(i, view_gen)?;
+        if crate::descriptor::views_generation() == generation {
+            self.entries[self.next] = Some((i, view_gen, view.clone()));
+            self.next = (self.next + 1) % LIST_CACHE_SLOTS;
+        } else {
+            self.clear();
+        }
+        Some(view)
+    }
+}
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -481,6 +874,8 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                shadow_cache: Mutex::default(),
+                view_cache: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -877,12 +1272,53 @@ impl HostList {
         }
     }
 
+    /// Looks up the shadow buffer covering `[address, address + len)` using
+    /// this list's generation-checked inline cache before querying `shadow`.
+    pub(crate) fn find_shadow(
+        &self,
+        address: u64,
+        len: u64,
+    ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        self.shadow_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lookup(address, len)
+    }
+
+    /// Looks up the descriptor view recorded at `handle` using this list's
+    /// generation-checked inline cache.
+    pub(crate) fn lookup_view(&self, handle: u64) -> Option<crate::descriptor::View> {
+        let (i, view_gen) = crate::descriptor::slot_key(handle)?;
+        self.lookup_view_at(i, view_gen)
+    }
+
+    /// Looks up view entry `(i, view_gen)` using this list's generation-checked
+    /// inline cache before querying `descriptor::view_at`.
+    pub(crate) fn lookup_view_at(
+        &self,
+        i: u32,
+        view_gen: u32,
+    ) -> Option<crate::descriptor::View> {
+        self.view_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lookup(i, view_gen)
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.shadow_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.view_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {

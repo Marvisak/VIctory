@@ -5,7 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -24,7 +24,7 @@ pub(crate) struct HostHeap {
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    made: RwLock<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -143,7 +143,7 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: RwLock::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
         };
@@ -333,6 +333,29 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_with(index, handle, for_draw, view_at)
+    }
+
+    /// As [`HostHeap::mirror`] for draws, resolving already-materialized
+    /// slots through `list`'s per-list view cache under a shared read lock.
+    pub(crate) fn mirror_cached(
+        &self,
+        list: &crate::host::HostList,
+        index: u32,
+        handle: u64,
+    ) -> Option<View> {
+        self.mirror_with(index, handle, true, |i, generation| {
+            list.lookup_view_at(i, generation)
+        })
+    }
+
+    fn mirror_with(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        lookup: impl Fn(u32, u32) -> Option<View>,
+    ) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -351,7 +374,23 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // Fast path: shared read lock when the slot is already materialized
+        // for this exact record (or already null for an empty slot).
+        {
+            let made = self.made.read().unwrap_or_else(|e| e.into_inner());
+            let current = made[index as usize];
+            if tag != VIEW_TAG {
+                if current == 0 {
+                    return None;
+                }
+            } else if current == key {
+                drop(made);
+                if let Some(view) = lookup(i, generation) {
+                    return Some(view);
+                }
+            }
+        }
+        let mut made = self.made.write().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -383,7 +422,7 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = *self.made.read().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         if key == 0 {
             return Some("null".into());
         }

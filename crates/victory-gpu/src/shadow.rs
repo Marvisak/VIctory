@@ -16,8 +16,8 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -371,42 +371,111 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+static BUFFERS: RwLock<BTreeMap<(u64, usize), Entry>> = RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+/// Bumped on every buffer registration or removal so per-list VA caches
+/// invalidate immediately without holding a global lock on cache hits.
+static GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Current buffer-table generation for per-list VA cache validation.
+pub(crate) fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
+
+/// Range over which a cached lookup result is guaranteed to match
+/// [`find`] identically while [`generation`] is unchanged.
+#[derive(Clone, Copy)]
+pub(crate) enum CachedRange {
+    /// Any query `[address, end)` inside `[lo, hi]` maps to this shadow.
+    Subrange(u64, u64),
+    /// Only the exact `(address, end)` query maps to this shadow.
+    Exact(u64, u64),
+}
+
+impl CachedRange {
+    pub(crate) fn matches(&self, address: u64, end: u64) -> bool {
+        match *self {
+            Self::Subrange(lo, hi) => address >= lo && end <= hi,
+            Self::Exact(a, e) => address == a && end == e,
+        }
+    }
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    GENERATION.fetch_add(1, Ordering::Release);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let mut map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
+    if map.remove(&(start, resource)).is_some() {
+        GENERATION.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Finds the innermost registered buffer covering `[address, end)` and the
+/// maximal subrange around it that no neighboring/nested buffer shadows.
+fn lookup_entry(
+    map: &BTreeMap<(u64, usize), Entry>,
+    address: u64,
+    end: u64,
+) -> Option<((u64, usize), CachedRange)> {
+    let mut skipped_end = 0u64;
+    let mut matched = None;
+    for (&key, entry) in map.range(..=(address, usize::MAX)).rev().take(64) {
+        if entry.end >= end {
+            matched = Some((key, entry.end));
+            break;
+        }
+        skipped_end = skipped_end.max(entry.end);
+    }
+    let (key, k_end) = matched?;
+    let safe_lo = key.0.max(skipped_end);
+    let next_key = (address.saturating_add(1), 0);
+    let safe_hi = if next_key < (k_end, 0) {
+        map.range(next_key..(k_end, 0))
+            .next()
+            .map_or(k_end, |(&(next_start, _), _)| next_start)
+    } else {
+        k_end
+    };
+    let range = if safe_lo <= address && end <= safe_hi {
+        CachedRange::Subrange(safe_lo, safe_hi)
+    } else {
+        CachedRange::Exact(address, end)
+    };
+    Some((key, range))
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
-/// len)`, made on first use.
-pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+/// len)`, made on first use, together with its cache-safe VA range.
+pub(crate) fn find_with_range(address: u64, len: u64) -> Option<(Arc<Shadow>, CachedRange)> {
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
+    // Fast path: concurrent shared read lock once the shadow copy exists.
+    {
+        let map = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+        let Some((key, range)) = lookup_entry(&map, address, end) else {
+            drop(map);
+            return loose(address, end).map(|s| (s, CachedRange::Exact(address, end)));
+        };
+        if let Some(shadow) = &map[&key].shadow {
+            return Some((shadow.clone(), range));
+        }
+    }
+    // Slow path: first use of this buffer — take write lock and re-lookup.
+    let mut map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
+    let Some((key, range)) = lookup_entry(&map, address, end) else {
         drop(map);
-        return loose(address, end);
+        return loose(address, end).map(|s| (s, CachedRange::Exact(address, end)));
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -432,7 +501,13 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         }
         entry.shadow = Some(Arc::new(Shadow::new(buffer, data, gpu, key.0, len)));
     }
-    entry.shadow.clone()
+    entry.shadow.clone().map(|s| (s, range))
+}
+
+/// The copy of the innermost title buffer holding `[address, address +
+/// len)`, made on first use.
+pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_with_range(address, len).map(|(s, _)| s)
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -443,12 +518,18 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = map.get(&(start, len)) {
+            return Some(shadow.clone());
+        }
+    }
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
@@ -469,13 +550,15 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = BUFFERS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
     all.extend(
         LOOSE
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|s| (s.gpu, s.start, s.len)),

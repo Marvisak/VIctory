@@ -1144,14 +1144,20 @@ pub(crate) extern "system" fn create_at_address(
 /// description viewed); release them when the title unmaps or reuses the
 /// memory once streaming grows VRAM use.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static PLACED_TEXTURES: std::sync::RwLock<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let map = PLACED_TEXTURES.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(&r) = map.get(&(address, *desc)) {
+            return Some(r as This);
+        }
+    }
+    let mut map = PLACED_TEXTURES.write().unwrap_or_else(|e| e.into_inner());
     if let Some(&r) = map.get(&(address, *desc)) {
         return Some(r as This);
     }
