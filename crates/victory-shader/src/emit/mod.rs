@@ -217,6 +217,19 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// Every container part [`translate`] and [`emit`] read: the programs
+/// (`DXIL`), the signatures and the mesh thread count (`PSV0`). Containers
+/// that agree on these translate the same way, whatever else they carry
+/// (digest, debug name, statistics), so the offline batch deduplicates on
+/// them. A part read here must be added to the list.
+pub const INPUT_PARTS: [FourCC; 5] = [
+    FourCC::DXIL,
+    FourCC::ISG1,
+    FourCC::OSG1,
+    FourCC::PSG1,
+    FourCC::PSV0,
+];
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,

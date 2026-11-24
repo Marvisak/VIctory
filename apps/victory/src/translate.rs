@@ -229,7 +229,7 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    if !is_new(seen, &container) {
         t.duplicates += 1;
         return;
     }
@@ -416,6 +416,30 @@ fn check(
             t.fail(format!("validator: {first}"), label);
         }
     }
+}
+
+/// Whether no container that translates the same way was seen before. The
+/// key covers every part translation reads ([`emit::INPUT_PARTS`]), not the
+/// DXIL part alone: containers sharing their programs but not their
+/// signatures emit different shaders. Parts nothing reads (the digest, a
+/// debug name) are left out, so they do not defeat the dedup.
+fn is_new(seen: &Mutex<HashSet<blake3::Hash>>, container: &Container<'_>) -> bool {
+    let mut key = blake3::Hasher::new();
+    for fourcc in emit::INPUT_PARTS {
+        key.update(&fourcc.0);
+        // Length-prefixed, and a missing part apart from an empty one.
+        match container.part(fourcc) {
+            Some(part) => {
+                key.update(&[1]);
+                key.update(&(part.data.len() as u64).to_le_bytes());
+                key.update(part.data);
+            }
+            None => {
+                key.update(&[0]);
+            }
+        }
+    }
+    lock(seen).insert(key.finalize())
 }
 
 /// Writes a `VICTORY_EMIT_DUMP` file. A dump is a debugging aid, so a
@@ -612,6 +636,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use victory_shader::Part;
 
     #[test]
     fn dump_is_written() {
@@ -627,5 +652,49 @@ mod tests {
         let path = dir.path().join("missing").join("a.dxil");
         assert!(!write_dump(&path, b"DXBC"));
         assert!(!path.exists());
+    }
+
+    /// A synthetic container of `parts`; only the parts are read by the key.
+    fn container<'a>(digest: u8, parts: &[(FourCC, &'a [u8])]) -> Container<'a> {
+        Container {
+            digest: [digest; 16],
+            version: (1, 0),
+            parts: parts
+                .iter()
+                .map(|&(fourcc, data)| Part {
+                    fourcc,
+                    offset: 0,
+                    data,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn same_dxil_with_other_signatures_is_translated_too() {
+        let seen = Mutex::new(HashSet::new());
+        let a = container(0, &[(FourCC::DXIL, b"program"), (FourCC::ISG1, b"a")]);
+        let b = container(0, &[(FourCC::DXIL, b"program"), (FourCC::ISG1, b"b")]);
+        assert!(is_new(&seen, &a));
+        assert!(is_new(&seen, &b));
+        assert!(!is_new(&seen, &a));
+    }
+
+    #[test]
+    fn parts_emit_does_not_read_do_not_defeat_dedup() {
+        let seen = Mutex::new(HashSet::new());
+        let a = container(1, &[(FourCC::DXIL, b"program"), (FourCC::ILDN, b"a.pdb")]);
+        let b = container(2, &[(FourCC::ILDN, b"b.pdb"), (FourCC::DXIL, b"program")]);
+        assert!(is_new(&seen, &a));
+        assert!(!is_new(&seen, &b));
+    }
+
+    #[test]
+    fn a_missing_part_differs_from_an_empty_one() {
+        let seen = Mutex::new(HashSet::new());
+        let a = container(0, &[(FourCC::DXIL, b"program")]);
+        let b = container(0, &[(FourCC::DXIL, b"program"), (FourCC::PSV0, b"")]);
+        assert!(is_new(&seen, &a));
+        assert!(is_new(&seen, &b));
     }
 }
