@@ -61,4 +61,16 @@ jobs:
         run: file target/release/victory | grep -E 'ELF.*x86-64'
 
       - name: Synthetic offline CLI
-        run: bash tests/offline-cli.sh target/release/victory
+        shell: bash
+        run: |
+          set -o pipefail
+          bash tests/offline-cli.sh target/release/victory 2>&1 | tee "$RUNNER_TEMP/offline-cli.log"
+
+      - name: Upload synthetic test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-linux-x64
+          path: ${{ runner.temp }}/offline-cli.log
+          if-no-files-found: ignore
+          retention-days: 7

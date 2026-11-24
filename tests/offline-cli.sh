@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 python3 -E - "${1:?Path to victory binary required}" "$repo_root" <<'PY'
+import hashlib
 import os
 import struct
 import subprocess
@@ -105,6 +106,7 @@ def verify_dxil(path):
     assert 32 + count * 4 <= total
 
     parts = {}
+    ranges = []
 
     for i in range(count):
         offset = struct.unpack_from(
@@ -120,12 +122,41 @@ def verify_dxil(path):
 
         assert offset + 8 + size <= total
 
+        assert kind not in parts, (path, kind)
+        ranges.append((offset, offset + 8 + size))
+
         parts[kind] = data[
             offset + 8:offset + 8 + size
         ]
 
+    ranges.sort()
+
+    for (_, end), (start, _) in zip(ranges, ranges[1:]):
+        assert end <= start, ("overlapping DXBC parts", path)
+
     assert b"DXIL" in parts
     assert b"SFI0" in parts
+
+    program = parts[b"DXIL"]
+    assert len(program) >= 24
+
+    version, dwords = struct.unpack_from("<II", program)
+    assert version >> 16 == 5, ("expected compute shader", path)
+
+    size = dwords * 4
+    assert 24 <= size <= len(program)
+    assert program[8:12] == b"DXIL"
+
+    offset, length = struct.unpack_from("<II", program, 16)
+    start = 8 + offset
+
+    assert start >= 24
+    assert length >= 4
+    assert start + length <= size
+
+    assert program[start:start + 4] == bytes([
+        0x42, 0x43, 0xC0, 0xDE
+    ]), ("invalid LLVM bitcode magic", path)
 
     print(
         "Valid container structure:",
@@ -210,6 +241,66 @@ with tempfile.TemporaryDirectory(
     for path in emitted:
         verify_dxil(path)
 
+    # Multiple containers in ONE file are required to exercise
+    # translate's per-file worker pool. Duplicate labels can vary
+    # with scheduling, so compare a multiset of content hashes.
+    parallel_input = root / "parallel.dxbc"
+
+    parallel_input.write_bytes(
+        empty + bytes(16)
+        + perm + bytes(16)
+        + empty
+    )
+
+    baseline = None
+    runs = 0
+
+    for jobs in (1, 2, 4, 64):
+        for repeat in range(3):
+            dest = root / f"jobs-{jobs}-{repeat}"
+            dest.mkdir()
+
+            env["VICTORY_EMIT_DUMP"] = str(dest)
+
+            result = run(
+                "translate", parallel_input,
+                "--jobs", jobs, "--list"
+            )
+
+            assert "3 (1 duplicates skipped)" in result
+            assert "2 translated of 2" in result
+            assert "2 emitted of 2 compute programs" in result
+
+            files = sorted(dest.glob("*.dxil"))
+            assert len(files) == 2, (jobs, repeat, files)
+
+            for path in files:
+                verify_dxil(path)
+
+            hashes = sorted(
+                hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in files
+            )
+
+            if baseline is None:
+                baseline = hashes
+
+            assert hashes == baseline, (
+                "non-deterministic DXIL", jobs, repeat,
+                baseline, hashes
+            )
+
+            runs += 1
+
+            print(
+                f"DETERMINISM PASS: jobs={jobs} "
+                f"repeat={repeat + 1} shaders={len(files)}"
+            )
+
+    env.pop("VICTORY_EMIT_DUMP", None)
+
+    print(f"DETERMINISM RUNS PASSED: {runs}")
+
     if sys.platform != "win32":
         for option in ("--validate", "--pipelines"):
             error = run(
@@ -220,4 +311,19 @@ with tempfile.TemporaryDirectory(
             assert "needs Windows" in error
 
     print("OFFLINE CLI SMOKE TEST: PASS")
+
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+
+    if summary:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write("\n## Offline shader regressions\n\n")
+            f.write("| Check | Result |\n")
+            f.write("|---|---|\n")
+            f.write("| Discovery and deduplication | PASS |\n")
+            f.write("| DXBC and DXIL structure | PASS |\n")
+            f.write("| LLVM bitcode header | PASS |\n")
+            f.write(f"| Determinism runs | {runs}/{runs} |\n")
+            f.write("| Worker counts | 1, 2, 4, 64 |\n")
+            f.write("| Synthetic fixtures only | Yes |\n")
+
 PY
