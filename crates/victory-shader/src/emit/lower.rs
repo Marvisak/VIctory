@@ -394,6 +394,21 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+/// A lane-mask operand of `v_cndmask_b32` or a carry-in (source 2) that
+/// structurisation did not record: a number, which the lane reads its own
+/// bit of ([`Lower::select_mask`]).
+fn selects_on_a_number(st: &Structured, i: &Inst) -> bool {
+    let Fields::Valu(v) = &i.fields else {
+        return false;
+    };
+    if i.name() != "v_cndmask_b32" && !i.name().ends_with("_co_ci_u32") {
+        return false;
+    }
+    matches!(v.src.get(2), Some(&Operand::Scalar { code, .. })
+        if code != NULL
+            && i.read(Reg::S(code)).is_some_and(|m| !st.masks.contains_key(&m)))
+}
+
 /// Where half `h` (dword h / 2, the high half when odd) of the parameter
 /// whose first element is in row `a` comes from, when the console packs
 /// 16-bit values two per dword: a row and channel of `elements`, none for
@@ -496,6 +511,7 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
+                    || selects_on_a_number(x.st, i)
             }) || {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
@@ -2432,6 +2448,37 @@ impl<'a> Lower<'a> {
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
+    }
+
+    /// This lane's bit of the lane mask `op` (source 2 of `v_cndmask_b32`
+    /// and the carry-ins) where the current instruction reads it. A mask
+    /// structurisation recorded is its boolean; with console lanes, any
+    /// other is a number the lane reads its own bit of, from the dwords the
+    /// instruction reads (both in wave64: a scalar operation may have
+    /// written either alone). Otherwise `untracked`.
+    fn select_mask(&mut self, inst: &Inst, op: Option<&Operand>, untracked: Why) -> Result<V, Why> {
+        let Some(&Operand::Scalar { code, .. }) = op else {
+            return Err(untracked);
+        };
+        if code == NULL {
+            return Ok(self.s.m.bool(false));
+        }
+        let lo = inst.read(Reg::S(code)).ok_or(untracked)?;
+        if let Some(&m) = self.x.st.masks.get(&lo) {
+            return self.boolean(m, self.cur);
+        }
+        if !self.console_lanes {
+            return Err(untracked);
+        }
+        let lo = self.i32_of(lo)?;
+        let hi = if self.x.native.wave64 {
+            let hi = inst.read(Reg::S(code + 1)).ok_or(untracked)?;
+            Some(self.i32_of(hi)?)
+        } else {
+            None
+        };
+        self.s.flags |= flags::WAVE_OPS;
+        Ok(self.lane_bit(self.cur, lo, hi))
     }
 
     /// The bit of lane `lane` in the mask `lo`, `hi`.
@@ -5720,14 +5767,7 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                    _ => None,
-                };
-                let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
-                    .ok_or("a select on an untracked mask")?;
-                let cond = self.boolean(m, c)?;
+                let cond = self.select_mask(inst, v.src.get(2), "a select on an untracked mask")?;
                 if v.abs != 0 || v.neg != 0 {
                     // Sign-bit moves on the bits a select passes through
                     // (a host `fabs`/`fneg` may flush a denormal).
@@ -5769,14 +5809,11 @@ impl<'a> Lower<'a> {
                     std::mem::swap(&mut a, &mut bb);
                 }
                 let cin = if name.ends_with("_ci_u32") {
-                    let m = match v.src.get(2) {
-                        Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                        _ => None,
-                    };
-                    let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
-                        .ok_or("a carry-in from an untracked mask")?;
-                    Some(self.boolean(m, c)?)
+                    Some(self.select_mask(
+                        inst,
+                        v.src.get(2),
+                        "a carry-in from an untracked mask",
+                    )?)
                 } else {
                     None
                 };
@@ -10012,6 +10049,75 @@ mod tests {
         for head in bit_tests {
             let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
             lowers(&words, 0).unwrap();
+        }
+    }
+
+    /// A view table at s0 (the output UAV) and, for [`numeric_mask_select`],
+    /// two root constants at s2..s3: a lane mask the title passes as data.
+    fn mask_data_layout() -> (Vec<RootParam>, Vec<UsedResource>) {
+        let mut constants = root(RootType::Constants, 2, 1);
+        constants.sgprs = 2;
+        (
+            vec![root(RootType::Table, 0, 0), constants],
+            vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+        )
+    }
+
+    /// `v_cndmask_b32 v3, v1, v2, s[2:3]` on a mask no compare wrote (a root
+    /// constant), stored per lane.
+    fn numeric_mask_select() -> Vec<u32> {
+        vec![
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0200,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], null
+            0x7E02_028B, // v_mov_b32 v1, 11
+            0x7E04_029D, // v_mov_b32 v2, 29
+            0xD501_0003,
+            0x000A_0501, // v_cndmask_b32_e64 v3, v1, v2, s[2:3]
+            0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+            0xE070_1000,
+            0x8002_0304, // buffer_store_dword v3, v4, s[8:11], 0 offen
+            S_ENDPGM,
+        ]
+    }
+
+    #[test]
+    fn compute_selects_on_a_lane_mask_held_as_data() {
+        // Compute: lane n is console lane n, so the lane tests its own bit
+        // of the number (both dwords in wave64).
+        for wave64 in [false, true] {
+            let (layout, used) = mask_data_layout();
+            let l = lower_wave(&numeric_mask_select(), layout, used, wave64)
+                .unwrap_or_else(|e| panic!("wave64 {wave64}: {e}"));
+            assert!(
+                l.wave_ops,
+                "wave64 {wave64}: the lane index is a wave operation"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_carries_in_from_a_lane_mask_held_as_data() {
+        for wave64 in [false, true] {
+            let mut words = numeric_mask_select();
+            // v_add_co_ci_u32_e64 v3, null, v1, v2, s[2:3]
+            words[5] = 0xD528_7D03;
+            let (layout, used) = mask_data_layout();
+            let l = lower_wave(&words, layout, used, wave64)
+                .unwrap_or_else(|e| panic!("wave64 {wave64}: {e}"));
+            assert!(
+                l.wave_ops,
+                "wave64 {wave64}: the lane index is a wave operation"
+            );
         }
     }
 
