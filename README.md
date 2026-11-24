@@ -69,6 +69,21 @@ cargo build --release -p victory
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+Without an executable to point at, `victory` opens a window instead, so the
+game can be located with the mouse (double-clicking `victory.exe` does this):
+
+```powershell
+target\release\victory.exe            # or: victory run
+```
+
+Pick the folder that holds the game. We look in it, and one level below, for
+the title's executable: the one its `MicrosoftGame.config` names, or a 64-bit
+program importing DLLs only the console's platform answers for. A folder with
+several gets a numbered question; a folder with none opens an executable
+picker instead. The folder is remembered (`<cache>\picker\last-folder.txt`),
+so the window opens there next time; a title chosen this way always starts, as
+`--execute` was given.
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
@@ -88,13 +103,14 @@ title's window has focus:
 ## Commands
 
 ```
+victory                          # pick the game in a window and run it
 victory inspect <exe|dll> [--imports] [--exports]
 victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
+victory run [exe] [--execute] [--unimplemented trap|zero] [--strict]
+             [--console series-x|series-s] [-- <title arguments>]
 victory config
 ```
 

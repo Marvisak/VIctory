@@ -20,6 +20,18 @@ memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# The game picker's folder and file dialogs.
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.

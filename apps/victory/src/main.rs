@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod pick;
 mod run;
 mod shader;
 mod translate;
@@ -18,11 +19,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[command(
     name = "victory",
     version,
-    about = "Run an Xbox Series title natively on Windows"
+    about = "Run an Xbox Series title natively on Windows",
+    long_about = "Run an Xbox Series title natively on Windows.\n\n\
+                  With no arguments, opens a window to locate the game and runs it."
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -86,8 +89,10 @@ enum Command {
         jobs: Option<usize>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
+    /// Without an executable, a window asks where the game is and the title
+    /// is run.
     Run {
-        exe: PathBuf,
+        exe: Option<PathBuf>,
         /// What unimplemented imports do when called.
         #[arg(long, value_enum, default_value_t = Unimplemented::Trap)]
         unimplemented: Unimplemented,
@@ -95,6 +100,7 @@ enum Command {
         #[arg(long)]
         strict: bool,
         /// Actually start the title. Without it, stop after binding.
+        /// A game chosen in the window always starts.
         #[arg(long)]
         execute: bool,
         /// The console model the title sees (device type, memory).
@@ -129,7 +135,18 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
-    match cli.command {
+    // No arguments at all: double-clicked, so ask for the game in a window
+    // and keep the console open afterwards to show what happened.
+    let picked = cli.command.is_none();
+    let command = cli.command.unwrap_or(Command::Run {
+        exe: None,
+        unimplemented: Unimplemented::Trap,
+        strict: false,
+        execute: false,
+        console: Console::SeriesX,
+        title_args: Vec::new(),
+    });
+    let result = match command {
         Command::Inspect {
             file,
             imports,
@@ -160,9 +177,30 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => match exe {
+            Some(exe) => run::run(&exe, unimplemented, strict, execute, console),
+            None => {
+                let cfg = victory_core::Config::load()?;
+                let exe = pick::choose_exe(&cfg)?;
+                // Chosen in a window: the user means to play, not to bind.
+                run::run(&exe, unimplemented, strict, true, console)
+            }
+        },
         Command::Config => show_config(),
+    };
+    if picked {
+        wait_before_closing();
     }
+    result
+}
+
+/// Double-clicked, so the console window would vanish with the result.
+fn wait_before_closing() {
+    use std::io::{self, BufRead, Write};
+    print!("\npress Enter to close: ");
+    io::stdout().flush().ok();
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line).ok();
 }
 
 fn show_config() -> Result<()> {
