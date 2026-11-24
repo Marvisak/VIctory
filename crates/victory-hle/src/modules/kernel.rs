@@ -2,10 +2,14 @@
 //!
 //! Only the differences live here; everything else passes through to the
 //! host (see `HostPolicy`).
-#![allow(non_snake_case)]
-// Title code calls these through its import table, passing pointers the real
-// API would trust.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    non_snake_case,
+    reason = "exports carry the exact API names (`GetModuleHandleW`) that `hle_export!` binds imports by"
+)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::ffi::{CStr, c_void};
 
@@ -569,6 +573,10 @@ mod host {
         0
     }
 
+    #[allow(
+        clippy::exit,
+        reason = "the stand-in for the CRT's `exit`, which the title asked for"
+    )]
     pub(super) fn exit(code: i32) -> ! {
         std::process::exit(code)
     }
@@ -577,6 +585,10 @@ mod host {
         std::process::abort()
     }
 
+    #[allow(
+        clippy::exit,
+        reason = "the stand-in for `TerminateProcess`, which the title asked for"
+    )]
     pub(super) fn terminate_process(_: *mut c_void, code: u32) -> i32 {
         std::process::exit(code as i32)
     }

@@ -60,6 +60,10 @@ struct Aligned(CONTEXT);
 /// Prints every other thread's stack to stderr. Each thread is suspended
 /// only while its context is read and unwound into a buffer allocated
 /// beforehand (it may hold the heap lock).
+#[allow(
+    clippy::print_stderr,
+    reason = "documented to print to stderr, as a debugger aid"
+)]
 pub fn dump_stacks() {
     // SAFETY: plain queries and a snapshot of this process's threads.
     let (me, process, snapshot) = unsafe {
@@ -193,6 +197,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(
+        clippy::unused_result_ok,
+        reason = "the parked thread's wait ends alike on a stop message or a dropped sender"
+    )]
     fn another_threads_stack_unwinds_to_its_start() {
         let (tx, rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();

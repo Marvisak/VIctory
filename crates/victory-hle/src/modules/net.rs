@@ -15,9 +15,18 @@
 //!   downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
 //! * A bind to all interfaces is narrowed to loopback, so nothing on the
 //!   network can connect in.
-#![allow(non_snake_case)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
-#![allow(clippy::too_many_arguments)]
+#![allow(
+    non_snake_case,
+    reason = "exports carry the exact API names (`WSAConnect`) that `hle_export!` binds imports by"
+)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
+#![allow(
+    clippy::too_many_arguments,
+    reason = "the signature is fixed by the API title code calls"
+)]
 
 use std::ffi::{CStr, c_char, c_void};
 use std::net::{IpAddr, SocketAddr};

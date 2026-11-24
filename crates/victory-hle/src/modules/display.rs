@@ -1,6 +1,9 @@
 //! The display and what the system shell does for a title: HDR mode, screen
 //! timeout deferrals, launching URIs, screenshots.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::ffi::{c_char, c_void};
 
@@ -170,7 +173,8 @@ static CAPTURE_VTABLE: Methods<6> = Methods([
     take_screenshot as *const (), // 0x28
 ]);
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::{S_OK, method};

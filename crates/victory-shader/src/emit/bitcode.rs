@@ -105,7 +105,10 @@ pub(crate) mod pred {
     pub const OLE: u8 = 5;
     // Not emitted: the AMD D3D12 driver treats it as UNE, so `v_cmp_lg`
     // lowers as OLT | OGT instead.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "keeps the predicate table complete; see the comment above"
+    )]
     pub const ONE: u8 = 6;
     pub const ORD: u8 = 7;
     pub const UNO: u8 = 8;

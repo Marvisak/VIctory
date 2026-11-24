@@ -13,8 +13,14 @@
 //! middleware reach through COM like on PC. fmod's console build sets up
 //! the coprocessor inside `System_Create` and waits there for its first
 //! command to be acknowledged; Grand Theft Auto VI uses only XMA contexts.
-#![allow(non_snake_case)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    non_snake_case,
+    reason = "exports carry the exact API names (`ApuCreateHeap`) that `hle_export!` binds imports by"
+)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};

@@ -50,6 +50,24 @@ unused_must_use = "deny"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
+# An unexplained `allow` hides a problem from every later reader and reviewer.
+allow_attributes_without_reason = "warn"
+# Debug leftovers and placeholders must not reach main: a `todo!` in a path
+# title code reaches is an abort across the FFI boundary.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+# Libraries log through `tracing`; the two binaries opt out at their roots,
+# tests are exempt through clippy.toml.
+print_stdout = "warn"
+print_stderr = "warn"
+# Leaving the process from library code skips destructors and the crash log;
+# the few legitimate exits carry an `allow` with the reason.
+exit = "warn"
+# Leaks belong in `Box::leak`/`ManuallyDrop`, where the intent is visible.
+mem_forget = "warn"
+# `result.ok();` is a silently swallowed error.
+unused_result_ok = "warn"
 
 [profile.dev.package."*"]
 # Dependencies (hashing, parsing) are hot paths when chewing through

@@ -5,7 +5,10 @@
 // speech synthesis) needs COM bindings this crate has only in diagnostics
 // builds, plus voice enumeration and SSML the title sends (slot 0xa8); the
 // title then plays the empty stream and goes on.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::ffi::{c_char, c_void};
 

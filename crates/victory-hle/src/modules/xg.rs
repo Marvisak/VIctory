@@ -7,9 +7,14 @@
 //! `XGSuggestSwizzleMode` and calls these computer methods: Release (0x08),
 //! the layout (0x10), copies into (0x40) and out of (0x48) a subresource,
 //! and the 64 KiB tiling (0x50). The other slots log and fail.
-#![allow(non_snake_case)]
-// Title code passes pointers the real library would trust.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    non_snake_case,
+    reason = "exports carry the exact API names (`XGSuggestSwizzleMode`) that `hle_export!` binds imports by"
+)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -407,7 +412,10 @@ extern "system" fn copy_into(
 
 /// `(linear, plane, subresource, sample, tiled base, row pitch, depth
 /// pitch)`.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the signature is fixed by the API title code calls"
+)]
 extern "system" fn copy_from(
     this: This,
     linear: *mut u8,

@@ -1,0 +1,175 @@
+# AGENTS.md
+
+The contract for anyone changing this repository, coding agents and humans
+alike. VIctory runs an Xbox Series title's x86-64 code natively on Windows:
+we load its image, implement the console APIs it imports, and translate its
+GPU work and shaders to host D3D12. Read `README.md`,
+`docs/architecture.md` and `docs/asset-policy.md` before your first change.
+
+Merges here are fast and review of intent cannot be assumed. CI and the
+rules below are the filter, so they are strict on purpose.
+
+## Project map
+
+| Crate | Owns | Must not contain | Builds off Windows |
+|-------|------|------------------|--------------------|
+| `victory-core` | config, `ensure_outside_repo`, logging setup | title-specific logic | yes |
+| `victory-pe` | read-only PE32+ and import-library parsing | I/O, `unsafe`, mapping | yes (pure) |
+| `victory-formats` | texture tiling/detiling, BCPack, XMA2 | I/O, logging, host APIs | yes (pure) |
+| `victory-shader` | GFX10 → SSA IR → structured → DXIL | host APIs outside `emit::host`/`emit::validator` | yes (pure apart from those and one env switch) |
+| `victory-pipeline` | `Converter` trait, content-addressed cache | format knowledge | yes |
+| `victory-game` | GTA VI formats and build identities | anything from the game (asset policy) | yes (pure) |
+| `victory-loader` | prepare, map, bind, start the title image; crash reports | API implementations | compiles; most of it is `cfg(windows)` |
+| `victory-gpu` | D3D12.X objects, command lists, GPU memory → host D3D12 | shader translation logic | compiles, with dead-code warnings |
+| `victory-hle` | console API implementations called by title code | format decoders (call `victory-formats`) | **no** (see the ratchet) |
+| `apps/victory` | CLI: inspect, census, translate, run | library logic that other crates need | no (depends on `victory-hle`) |
+| `xtask` | asset-policy check, git hooks | product code | yes |
+
+Dependency direction (enforced by review, keep it acyclic and downward):
+
+- Pure crates (`victory-pe`, `victory-formats`, `victory-game`, and
+  `victory-shader` outside `emit::host`/`emit::validator`) depend on no
+  internal crate, do no file, network or process I/O, and must build and
+  pass their tests on Linux. Tests that need real files read their paths
+  from environment variables and skip when unset.
+- `victory-gpu` → `victory-shader`, `victory-pipeline`, `victory-formats`.
+- `victory-hle` → `victory-gpu`, `victory-loader`, `victory-pe`, `victory-formats`.
+- `victory-loader` → `victory-core`, `victory-pe`; `victory-pipeline` → `victory-core`.
+- Only `apps/victory` depends on `victory-hle`. Nothing depends on the app.
+- Windows-only code is gated with `#[cfg(windows)]` and Windows-only
+  dependencies go under `[target.'cfg(windows)'.dependencies]`. A
+  portable item must never call a `cfg(windows)` one (that is how
+  `victory-gpu` stopped building on Linux; see Pitfalls).
+
+## Verify
+
+Linux (what the `portable` CI job runs; `victory-hle` and `apps/victory`
+do not compile there yet):
+
+```sh
+cargo check  --workspace --all-targets --locked --exclude victory-hle --exclude victory
+cargo clippy --workspace --all-targets --locked --exclude victory-hle --exclude victory --exclude victory-gpu -- -D warnings
+cargo test   --workspace --locked --exclude victory-hle --exclude victory
+```
+
+Windows (what the `check` CI job runs; the only place all code compiles):
+
+```powershell
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --locked          # includes the asset-policy check
+cargo xtask policy                       # also run by the pre-commit hook
+```
+
+If you can only run Linux, say so in the commit or PR, and do not touch
+`cfg(windows)` code beyond what you can prove by reading (attributes,
+docs). Never use `#[expect(...)]` in code you could not compile: an
+unfulfilled expectation is itself a warning, and CI runs `-D warnings`.
+
+## Hard rules
+
+1. **Asset policy.** Nothing from the game or any other proprietary title,
+   in any form (`docs/asset-policy.md`). Tests use synthetic data our code
+   generates, or paths from environment variables.
+2. **`unsafe`.** Every `unsafe` block has a `// SAFETY:` comment stating the
+   invariant that makes it sound, not what the block does. Every
+   `unsafe fn` has a `# Safety` section.
+3. **No raw-pointer dereference in a safe fn.** Make it `unsafe fn` (an
+   `unsafe extern "system" fn` can still sit in a function table) or take a
+   validated type. New code may not add `not_unsafe_ptr_arg_deref` allows.
+4. **No `#[allow]` without `reason = "..."`** (enforced by
+   `clippy::allow_attributes_without_reason`). The reason says why the
+   code is right as it is, not which lint it silences.
+5. **No panics on paths title code reaches.** Everything called through
+   FFI (`victory-hle` exports, `victory-gpu` table methods, and what they
+   call, including shader translation at pipeline creation) returns the
+   API's failure code instead of `unwrap`/`expect`/`panic!`/indexing that
+   can fail. A panic in an `extern "system" fn` aborts the title.
+6. **No swallowed errors.** No `let _ = fallible()`, bare `.ok()`, or
+   `filter_map(Result::ok)` without a `tracing` line saying what was
+   skipped. Propagate with `?` where the caller can act on it.
+7. **No `_ =>` over enums we own** when the arm means "the remaining
+   cases". List the variants so adding one is a compile error.
+8. **Aggregates are destructured without `..`** in merge/sum/compare code,
+   so a new field cannot be silently dropped.
+9. **Size.** New functions stay under ~100 lines and new files under
+   ~1,200; split by responsibility before you cross either.
+10. **Docs match code in the same commit.** Do not call implemented things
+    "planned", or planned things done. Cite only documents that exist in
+    the repository; there is no `docs/decisions/` directory.
+11. **Lints.** Libraries log through `tracing`, never `println!`/`eprintln!`;
+    no `dbg!`, `todo!`, `unimplemented!`, `std::process::exit`,
+    `mem::forget`, or `result.ok();` (all enforced). Lints are configured
+    once, in the root `Cargo.toml`; every crate has `[lints] workspace = true`.
+
+## Pitfalls seen in this repository
+
+| Symptom | Real example | Do instead |
+|---------|--------------|------------|
+| Portable code calls a `cfg(windows)` item; Windows CI passes, every other host fails to build | `victory-gpu` `resource::view_format` called `host_resource` (fixed by gating it); `victory-hle` `d3d12x.rs` uses `super::xmem`, `xgame.rs` uses `super::lifecycle`, `xgameui.rs` uses `windows_sys` unconditionally | Gate the caller too, or give the item a non-Windows body. Run the Linux commands above. |
+| Tests assume the test binary is a PE image | `victory-pe` `image.rs` and `victory-loader` `prepare.rs` tests reading `current_exe()` (now `cfg(windows)`) | Gate with `#[cfg(windows)]` and a comment saying why, or build a synthetic image (`synthetic_image` in `image.rs`). |
+| Safe signature, raw-pointer dereference inside | 38 module-level `not_unsafe_ptr_arg_deref` allows (13 in `victory-gpu`, 25 in `victory-hle/src/modules`) | `unsafe extern "system" fn` with a `# Safety` section; see the ratchet. |
+| Swallowed I/O errors | `apps/victory/src/translate.rs`: `let _ = std::fs::write(...)` for dumps, `.filter_map(Result::ok)` over `walkdir` | `if let Err(e) = ... { tracing::warn!(...) }`; count and report skipped entries. |
+| Hand-written field-by-field merge | `Tally::merge` in `apps/victory/src/translate.rs` adds ~40 fields one by one | `let Tally { a, b, .. } = other;` without `..`, so a new field fails to compile until merged. |
+| `_ =>` standing for "vertex/pixel" | `counter()` and `check()` in `apps/victory/src/translate.rs` treat every `HwStage` (8 variants) other than `Cs`/`Ms`/`Vs` as one group | Name the variants: `HwStage::Ls \| HwStage::Hs \| ... =>`. |
+| Panic reachable from title code | `victory-shader/src/emit/bitcode.rs` `panic!`s on internal invariants, reached from `victory-gpu` pipeline creation; `host!` in `victory-hle/src/modules/files.rs` panics if a host export is missing; `Stage::translated` in `victory-gpu/src/pipeline/host.rs` uses `expect` | Return `Result` and map it to the API's failure (`E_FAIL`, a dropped draw) with a log line. |
+| Giant functions and files | `victory-shader/src/emit/lower.rs` is 7,424 lines; clippy counts 32 functions over 100 lines in the portable crates alone | New logic goes in a new, focused module; extract before extending. |
+| Docs promise what the code does not do (or deny what it does) | see Known doc drift below | Update the doc in the same commit as the code. |
+| A Windows-only test helper prints, Linux CI is green and Windows clippy fails | `emit/valu_tests.rs` was gated `#[cfg(all(test, windows))]`; clippy only exempts code under a plain `#[cfg(test)]`, so its `eprintln!` in `run_cases` broke PR #1 | Gate test modules with `#[cfg(test)]` and `#[cfg(windows)]` as two attributes, never `cfg(all(test, ...))` (the `portable` CI job rejects it). |
+| Unverifiable lint suppression | `#[allow(dead_code)] // unused in test builds` | `#[allow(dead_code, reason = "...")]`; never `#[expect]` on code CI compiles differently per cfg. |
+
+## Known doc drift (to fix, not to copy)
+
+- `crates/victory-formats/src/lib.rs` lists BCPack and XMA2 as "Planned";
+  both are implemented (`bcpack.rs`, `xma.rs`). It also lists Opus and
+  zlib, which live in `victory-hle` (`opus-pure`, `miniz_oxide`).
+- `docs/architecture.md` crate table: "planned: BCPack" for
+  `victory-formats` (implemented).
+- `docs/architecture.md` diagram: game assets go through
+  `victory-pipeline + victory-game`. Neither converts assets today; the only
+  real `Converter` is shader translation in `victory-gpu/src/shader_cache.rs`.
+- `crates/victory-game/src/lib.rs` and `docs/architecture.md` promise
+  "hooks" placed in the title's code; the crate has `sgd5` and
+  `KnownBuild` only.
+- "decision 0003" is cited 10 times (in `victory-shader` and
+  `victory-gpu`) and "decision 0007" 16 times (`victory-gpu`,
+  `victory-hle`); no decision records exist in the repository.
+- `victory-hle/src/modules/mod.rs` lists `xstore` stubs as planned;
+  `xstore.rs` exists.
+
+## Lint ratchet
+
+Lints deliberately not enabled yet. Counts are from Linux clippy over the
+crates that build there; Windows-only code is not included. Enable one
+only with a commit that makes it pass, verified on Windows CI.
+
+| Lint | Why not yet | Enable when |
+|------|-------------|-------------|
+| remove `not_unsafe_ptr_arg_deref` allows | 38 module-level allows over FFI code that cannot be compiled off Windows | one module per change, its functions made `unsafe extern "system"`, verified on Windows |
+| `clippy::let_underscore_must_use`, `let_underscore_drop` | 16 / 4 hits in portable code; Windows code (many `let _ = unsafe { Win32Call() }`) unmeasured | portable hits fixed, then a Windows run is clean |
+| `clippy::unwrap_used`, `expect_used`, `panic` | 212 / 35 / 40 hits in portable code, tests included (mostly `victory-shader`); tests need `allow-unwrap-in-tests`/`allow-expect-in-tests` in `clippy.toml` | start per crate with `victory-hle`, `victory-gpu`, `victory-shader::emit` (title-reachable) |
+| `clippy::too_many_lines`, `cognitive_complexity` | 32 / 9 hits in portable code, more in Windows code | a `clippy.toml` threshold that passes today, then lowered step by step |
+| `clippy::wildcard_enum_match_arm` | 79 hits, and it also fires on foreign and `#[non_exhaustive]` enums, so it would force noise | rule 7 is enforced by review; reconsider with a crate-local `warn` in `apps/victory` and `victory-shader` |
+| `clippy::allow_attributes` (prefer `#[expect]`) | not viable: several allows are true only on some cfgs (Windows-only code is dead on Linux, `xgameui` dead in test builds), where `expect` would itself warn | not planned |
+| `missing_docs`, `unreachable_pub`, `unused_qualifications`, `missing_debug_implementations` | 486 / 86 / 31 / 7 hits in portable code, Windows code unmeasured | per crate, after a Windows run |
+| `clippy::multiple_unsafe_ops_per_block`, `large_stack_arrays` | 24 (`victory-gpu`) / 3 (`victory-formats`) hits | after the `not_unsafe_ptr_arg_deref` work |
+| `cargo fmt --all -- --check` in CI | 182 rustfmt differences in 35 files today | one `cargo fmt --all` commit, then add the CI step |
+| Linux clippy on `victory-gpu` | 23 dead-code/unused warnings from items only `cfg(windows)` code uses | those items gated `#[cfg(windows)]` (no-op on Windows), then drop its `--exclude` |
+| Linux build of `victory-hle` and `apps/victory` | does not compile: `d3d12x.rs`, `storage.rs` (test), `xgame.rs`, `xgameui.rs` reach Windows-only modules | each gated or given a non-Windows body; then the Linux job uses plain `--workspace` |
+
+## Definition of done
+
+- [ ] The Linux commands pass; if you touched Windows code, the Windows ones
+      too (or the PR says they were not run and why).
+- [ ] No new `#[allow]` without a reason, no new `unsafe` without
+      `// SAFETY:`, no new raw-pointer dereference in a safe fn.
+- [ ] No `unwrap`/`expect`/`panic!` on a path title code reaches; no
+      swallowed error.
+- [ ] New `match`es over our enums list their variants; merges destructure
+      without `..`.
+- [ ] New functions < ~100 lines, files < ~1,200 lines.
+- [ ] Docs (crate docs, `docs/`, README status) updated in the same commit;
+      nothing cited that does not exist.
+- [ ] `cargo xtask policy` passes; nothing derived from a title is added.
+- [ ] Commits are small, Conventional Commits (`fix(gpu): ...`), each one
+      building on its own.

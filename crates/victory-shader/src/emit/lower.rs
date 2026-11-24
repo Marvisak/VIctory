@@ -4467,7 +4467,10 @@ impl<'a> Lower<'a> {
         Some(self.valu16_op(inst, name, guard, FLOAT1, FLOAT2, FLOAT3))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "three per-arity name tables beside the instruction and its guard"
+    )]
     fn valu16_op(
         &mut self,
         inst: &Inst,

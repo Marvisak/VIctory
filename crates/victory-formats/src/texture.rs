@@ -615,7 +615,10 @@ impl Layout {
     }
 
     /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared core of `tile` and `detile`, taking their public arguments as they are"
+    )]
     fn walk(
         &self,
         tiled_len: usize,

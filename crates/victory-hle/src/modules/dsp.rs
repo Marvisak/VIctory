@@ -14,8 +14,14 @@
 //! is not known. Outputs are silence, so reverb returns are dry.
 // shortcut: no convolution or block transform; outputs are zeros. Needs the
 // coprocessor's impulse response and spectrum layouts to do better.
-#![allow(non_snake_case)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    non_snake_case,
+    reason = "exports carry the exact API names (`XDspDisconnect`) that `hle_export!` binds imports by"
+)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::ffi::c_void;
 use std::sync::Mutex;

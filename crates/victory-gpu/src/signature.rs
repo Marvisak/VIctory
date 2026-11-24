@@ -1,6 +1,9 @@
 //! Command signatures: the record layout of indirect execution. Kept for
 //! translating it later.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use crate::object::{
     self, COMMAND_SIGNATURE, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid,

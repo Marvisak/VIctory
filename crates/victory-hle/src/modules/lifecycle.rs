@@ -3,9 +3,18 @@
 //! routines run, and it has a second to save) and then ends the process.
 //! Closing the title's window does the same here; a new launch then starts
 //! `victory` again, which waits for this process to be gone.
-#![allow(non_snake_case)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
-#![allow(clippy::too_many_arguments)]
+#![allow(
+    non_snake_case,
+    reason = "exports carry the exact API names (`RegisterAppStateChangeNotification`) that `hle_export!` binds imports by"
+)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
+#![allow(
+    clippy::too_many_arguments,
+    reason = "the signature is fixed by the API title code calls"
+)]
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

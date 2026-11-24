@@ -1,0 +1,3 @@
+# Tests may print what they measured or why they skipped. Clippy applies this
+# only under a plain `#[cfg(test)]`, not `cfg(all(test, ...))`.
+allow-print-in-tests = true

@@ -3,7 +3,10 @@
 //! Heaps and resources are host memory and a resource's GPU address is its
 //! CPU address, as on the console; textures also get a host copy, and
 //! buffers a host copy when a draw reads them (`shadow`).
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these methods through its function tables with pointers the real D3D12.X API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::c_void;
@@ -279,6 +282,7 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
@@ -913,8 +917,10 @@ fn resource<'a>(this: This) -> &'a Resource {
     unsafe { &*this.cast::<Resource>() }
 }
 
-// The creation methods' own arguments, passed on.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the creation methods' own arguments, passed on"
+)]
 fn hand_out_resource(
     desc: ResourceDesc,
     heap: HeapProperties,
@@ -1030,7 +1036,10 @@ pub(crate) extern "system" fn create_committed(
 /// `(heap, heap flags, desc1, initial layout, clear value, protected
 /// session, castable format count, castable formats, iid, out)`. The host
 /// copy starts in the common state, as layouts are not tracked.
-#[allow(clippy::too_many_arguments)] // the method's own arguments
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the method's own arguments, fixed by the D3D12.X table it sits in"
+)]
 pub(crate) extern "system" fn create_committed3(
     this: This,
     heap: *const HeapProperties,

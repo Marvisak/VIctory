@@ -5,8 +5,14 @@
 //! (activate, process, reset, deactivate) and dequeues one result per
 //! command. We decode each command when it is queued, so its result is ready
 //! at once; the order of results is the order of commands.
-#![allow(non_snake_case)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    non_snake_case,
+    reason = "exports carry the exact API names (`XApuConnect`) that `hle_export!` binds imports by"
+)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::alloc::Layout;
 use std::collections::VecDeque;

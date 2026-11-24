@@ -15,10 +15,14 @@
 //! saves (`xgamesave`), networking (`xnetworking`), the package
 //! (`xpackage`), the store (`xstore`), system dialogs (`xgameui`), speech
 //! (`speech`), HDR, URIs, display deferrals and screenshots (`display`).
-#![allow(non_snake_case)]
-// Title code calls these through its import table, passing pointers the real
-// API would trust.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(
+    non_snake_case,
+    reason = "exports carry the exact API names (`XGameRuntimeInitialize`) that `hle_export!` binds imports by"
+)]
+#![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "title code calls these exports through its import table or our objects' tables with pointers the real API trusts; debt tracked in AGENTS.md (lint ratchet)"
+)]
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Mutex;
