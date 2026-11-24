@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -276,6 +276,51 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    /// The chunk sizes of `list`'s scratch, in order.
+    fn chunk_sizes(list: &HostList) -> Vec<u64> {
+        let s = list.scratch.lock().unwrap();
+        s.chunks.iter().map(|c| c.3).collect()
+    }
+
+    #[test]
+    fn scratch_starts_small_grows_by_big_chunks_and_keeps_its_first() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        // A few KiB fit the small first chunk, side by side.
+        let (a, _) = list.scratch(1000).unwrap();
+        let (b, _) = list.scratch(1000).unwrap();
+        assert_eq!(b - a, 1024, "requests are 256-byte aligned and packed");
+        assert_eq!(chunk_sizes(&list), [SCRATCH_FIRST]);
+        // A request the first chunk cannot hold takes a big one after it.
+        let (c, _) = list.scratch(SCRATCH_FIRST).unwrap();
+        assert_eq!(chunk_sizes(&list), [SCRATCH_FIRST, SCRATCH_CHUNK]);
+        assert!(c < a || c >= a + SCRATCH_FIRST, "not inside the first chunk");
+        // Requests past a chunk's end move on, never overlap.
+        let (d, _) = list.scratch(SCRATCH_CHUNK - SCRATCH_FIRST).unwrap();
+        assert_eq!(d, c + SCRATCH_FIRST);
+        // Bigger than a chunk: a buffer of its own, no chunk.
+        list.scratch(SCRATCH_CHUNK + 1).unwrap();
+        assert_eq!(chunk_sizes(&list), [SCRATCH_FIRST, SCRATCH_CHUNK]);
+        // A reset keeps the first chunk only, and hands it out again.
+        // SAFETY: an open list of ours, never submitted.
+        unsafe { list.list.Close() }.unwrap();
+        list.reset();
+        assert_eq!(chunk_sizes(&list), [SCRATCH_FIRST]);
+        assert_eq!(list.scratch(16).unwrap().0, a);
+    }
+
+    #[test]
+    fn a_first_request_bigger_than_the_small_chunk_takes_a_big_one() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        list.scratch(SCRATCH_FIRST + 256).unwrap();
+        assert_eq!(chunk_sizes(&list), [SCRATCH_CHUNK]);
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -353,11 +398,11 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     }
 }
 
-/// Upload chunks handed out front to back: the chunks, the one in use and
-/// the bytes used in it.
-#[derive(Default)]
+/// Upload chunks handed out front to back: the chunks (buffer, CPU and GPU
+/// address, bytes), the one in use and the bytes used in it. One per host
+/// list.
 struct Scratch {
-    chunks: Vec<(ID3D12Resource, usize, u64)>,
+    chunks: Vec<(ID3D12Resource, usize, u64, u64)>,
     current: usize,
     used: u64,
 }
@@ -366,6 +411,79 @@ struct Scratch {
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+
+/// A list's first chunk. Every list keeps its first chunk across resets,
+/// and the title records with hundreds of lists, most of which use a few
+/// KiB: with 4 MiB first chunks, 369 lists held 1.5 GB of upload memory, a
+/// minute into the world on an RTX 3060 Ti, until upload buffers failed
+/// with `E_OUTOFMEMORY` and the device was removed. Lists that need more
+/// get [`SCRATCH_CHUNK`]s after it.
+const SCRATCH_FIRST: u64 = 256 << 10;
+
+/// Chunks a list keeps across a reset: its first.
+const SCRATCH_KEPT: usize = 1;
+
+/// Scratch bytes held by all lists, and the lists (one scratch each).
+static SCRATCH_BYTES: AtomicU64 = AtomicU64::new(0);
+static SCRATCH_LISTS: AtomicU64 = AtomicU64::new(0);
+
+impl Default for Scratch {
+    fn default() -> Self {
+        SCRATCH_LISTS.fetch_add(1, Ordering::Relaxed);
+        Scratch {
+            chunks: Vec::new(),
+            current: 0,
+            used: 0,
+        }
+    }
+}
+
+impl Scratch {
+    /// Rewinds to the first chunk and lets go of the chunks past
+    /// [`SCRATCH_KEPT`]; the list is not executing.
+    fn rewind(&mut self) {
+        (self.current, self.used) = (0, 0);
+        if self.chunks.len() > SCRATCH_KEPT {
+            let bytes: u64 = self.chunks.drain(SCRATCH_KEPT..).map(|c| c.3).sum();
+            SCRATCH_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let bytes: u64 = self.chunks.iter().map(|c| c.3).sum();
+        SCRATCH_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+        SCRATCH_LISTS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Host memory in use against Windows' budget, in MB: video memory, then
+/// system memory the GPU reads (upload heaps live there). `None` if the
+/// adapter does not say.
+fn memory_use(device: &ID3D12Device) -> Option<[(u64, u64); 2]> {
+    static ADAPTER: OnceLock<Option<IDXGIAdapter3>> = OnceLock::new();
+    let adapter = ADAPTER
+        .get_or_init(|| {
+            // SAFETY: plain DXGI queries on a live device.
+            unsafe {
+                let luid = device.GetAdapterLuid();
+                let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+                factory.EnumAdapterByLuid::<IDXGIAdapter3>(luid).ok()
+            }
+        })
+        .as_ref()?;
+    let query = |group| {
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: a plain query into a structure of ours.
+        unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }.ok()?;
+        Some((info.CurrentUsage >> 20, info.Budget >> 20))
+    };
+    Some([
+        query(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?,
+        query(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?,
+    ])
+}
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -885,10 +1003,10 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
-            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-            (scratch.current, scratch.used) = (0, 0);
-        }
+        self.scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rewind();
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1090,18 +1208,26 @@ impl HostList {
             self.deferred().uploads.push(buffer);
             return Some((gpu, data));
         }
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        // Past the chunks this does not fit in (only the first is smaller
+        // than a request can be).
+        while s.current < s.chunks.len() && s.used + len > s.chunks[s.current].3 {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
+            let size = if s.chunks.is_empty() && len <= SCRATCH_FIRST {
+                SCRATCH_FIRST
+            } else {
+                SCRATCH_CHUNK
+            };
+            let (buffer, data) = host.upload_buffer(size)?;
             name(&buffer, || "list scratch".into());
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            s.chunks.push((buffer, data as usize, gpu));
+            s.chunks.push((buffer, data as usize, gpu, size));
+            SCRATCH_BYTES.fetch_add(size, Ordering::Relaxed);
             s.used = 0;
         }
-        let (_, data, gpu) = s.chunks[s.current];
+        let (_, data, gpu, _) = s.chunks[s.current];
         let at = s.used;
         s.used += len;
         Some((gpu + at, (data + at as usize) as *mut u8))
@@ -1535,6 +1661,17 @@ impl Meter {
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
+            if let Some(host) = host() {
+                let lists = SCRATCH_LISTS.load(Ordering::Relaxed);
+                let scratch_mb = SCRATCH_BYTES.load(Ordering::Relaxed) >> 20;
+                match memory_use(&host.device) {
+                    Some([(local, local_budget), (system, system_budget)]) => tracing::info!(
+                        "host memory: video {local}/{local_budget} MB, system {system}/\
+                         {system_budget} MB; list scratch {scratch_mb} MB in {lists} lists"
+                    ),
+                    None => tracing::info!("list scratch {scratch_mb} MB in {lists} lists"),
+                }
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
