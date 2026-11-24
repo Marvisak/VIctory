@@ -566,7 +566,7 @@ mod tests {
             s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
         }
         s.m.terminate(b, super::bitcode::Term::Ret);
-        s.finish()
+        s.finish().unwrap()
     }
 
     #[test]

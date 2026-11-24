@@ -34,16 +34,19 @@ use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::SetLastError;
 
-use crate::modules::files::host;
+use crate::modules::files::try_host;
 use crate::{HleExport, HleModule, hle_export};
 
 const SOCKET_ERROR: i32 = -1;
 const INVALID_SOCKET: Socket = !0;
 const WSAEINVAL: i32 = 10022;
 const WSAEADDRNOTAVAIL: i32 = 10049;
+const WSAENETDOWN: i32 = 10050;
 const WSAENETUNREACH: i32 = 10051;
 const WSASERVICE_NOT_FOUND: i32 = 10108;
 const WSAHOST_NOT_FOUND: i32 = 11001;
+const WSANO_RECOVERY: i32 = 11003;
+const ERROR_WINHTTP_INTERNAL_ERROR: u32 = 12004;
 const ERROR_WINHTTP_CANNOT_CONNECT: u32 = 12029;
 const ERROR_WINHTTP_AUTODETECTION_FAILED: u32 = 12180;
 const AF_INET: u16 = 2;
@@ -85,8 +88,41 @@ fn once(what: &'static str, destination: String) {
     }
 }
 
+/// Sets the thread's Winsock error. Without the host's `WSASetLastError`
+/// the code goes to `SetLastError`: `WSAGetLastError` reads the thread's
+/// last-error value, the one `SetLastError` sets.
 fn wsa_error(code: i32) {
-    host!("ws2_32.dll", "WSASetLastError": extern "system" fn(i32))(code);
+    match try_host!("ws2_32.dll", "WSASetLastError": extern "system" fn(i32)) {
+        Some(set) => set(code),
+        None => {
+            // SAFETY: no pointers.
+            unsafe { SetLastError(code.cast_unsigned()) };
+        }
+    }
+}
+
+/// A Winsock call's failure when the host lacks the function behind it:
+/// `WSAENETDOWN` (the network subsystem has failed, an error every Winsock
+/// caller handles) as the thread's Winsock error, then `value`.
+fn winsock_failure<T>(value: T) -> T {
+    wsa_error(WSAENETDOWN);
+    value
+}
+
+/// A name lookup's failure when the host lacks the function behind it:
+/// `WSANO_RECOVERY` (`EAI_FAIL`, a nonrecoverable failure), set as the
+/// thread's Winsock error and returned, as the lookup functions do.
+fn lookup_failure() -> i32 {
+    wsa_error(WSANO_RECOVERY);
+    WSANO_RECOVERY
+}
+
+/// A WinHTTP call's failure when the host lacks the function behind it:
+/// `ERROR_WINHTTP_INTERNAL_ERROR` as the thread's last error, then `value`.
+fn winhttp_failure<T>(value: T) -> T {
+    // SAFETY: no pointers.
+    unsafe { SetLastError(ERROR_WINHTTP_INTERNAL_ERROR) };
+    value
 }
 
 fn narrow(text: *const c_char) -> Option<String> {
@@ -233,7 +269,10 @@ pub extern "system" fn connect(s: Socket, name: *const u8, len: i32) -> i32 {
     if !reachable("network connect blocked", name, len) {
         return SOCKET_ERROR;
     }
-    host!("ws2_32.dll", "connect": extern "system" fn(Socket, *const u8, i32) -> i32)(s, name, len)
+    match try_host!("ws2_32.dll", "connect": extern "system" fn(Socket, *const u8, i32) -> i32) {
+        Some(f) => f(s, name, len),
+        None => winsock_failure(SOCKET_ERROR),
+    }
 }
 
 pub extern "system" fn WSAConnect(
@@ -248,15 +287,11 @@ pub extern "system" fn WSAConnect(
     if !reachable("network connect blocked", name, len) {
         return SOCKET_ERROR;
     }
-    host!("ws2_32.dll", "WSAConnect": extern "system" fn(Socket, *const u8, i32, *const c_void, *mut c_void, *const c_void, *const c_void) -> i32)(
-        s,
-        name,
-        len,
-        caller_data,
-        callee_data,
-        sqos,
-        gqos,
-    )
+    match try_host!("ws2_32.dll", "WSAConnect": extern "system" fn(Socket, *const u8, i32, *const c_void, *mut c_void, *const c_void, *const c_void) -> i32)
+    {
+        Some(f) => f(s, name, len, caller_data, callee_data, sqos, gqos),
+        None => winsock_failure(SOCKET_ERROR),
+    }
 }
 
 pub extern "system" fn WSAConnectByNameA(
@@ -273,9 +308,13 @@ pub extern "system" fn WSAConnectByNameA(
     if !reachable_name(narrow(node)) {
         return 0;
     }
-    host!("ws2_32.dll", "WSAConnectByNameA": extern "system" fn(Socket, *const c_char, *const c_char, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
-        s, node, service, local_len, local, remote_len, remote, timeout, reserved,
-    )
+    match try_host!("ws2_32.dll", "WSAConnectByNameA": extern "system" fn(Socket, *const c_char, *const c_char, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)
+    {
+        Some(f) => f(
+            s, node, service, local_len, local, remote_len, remote, timeout, reserved,
+        ),
+        None => winsock_failure(0),
+    }
 }
 
 pub extern "system" fn WSAConnectByNameW(
@@ -292,9 +331,13 @@ pub extern "system" fn WSAConnectByNameW(
     if !reachable_name(wide(node)) {
         return 0;
     }
-    host!("ws2_32.dll", "WSAConnectByNameW": extern "system" fn(Socket, *const u16, *const u16, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
-        s, node, service, local_len, local, remote_len, remote, timeout, reserved,
-    )
+    match try_host!("ws2_32.dll", "WSAConnectByNameW": extern "system" fn(Socket, *const u16, *const u16, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)
+    {
+        Some(f) => f(
+            s, node, service, local_len, local, remote_len, remote, timeout, reserved,
+        ),
+        None => winsock_failure(0),
+    }
 }
 
 /// `SOCKET_ADDRESS`; a `SOCKET_ADDRESS_LIST` is an `i32` count, then these
@@ -329,9 +372,13 @@ pub extern "system" fn WSAConnectByList(
             return 0;
         }
     }
-    host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
-        s, list, local_len, local, remote_len, remote, timeout, reserved,
-    )
+    match try_host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)
+    {
+        Some(f) => f(
+            s, list, local_len, local, remote_len, remote, timeout, reserved,
+        ),
+        None => winsock_failure(0),
+    }
 }
 
 pub extern "system" fn WSAJoinLeaf(
@@ -347,16 +394,11 @@ pub extern "system" fn WSAJoinLeaf(
     if !reachable("network connect blocked", name, len) {
         return INVALID_SOCKET;
     }
-    host!("ws2_32.dll", "WSAJoinLeaf": extern "system" fn(Socket, *const u8, i32, *const c_void, *mut c_void, *const c_void, *const c_void, u32) -> Socket)(
-        s,
-        name,
-        len,
-        caller_data,
-        callee_data,
-        sqos,
-        gqos,
-        flags,
-    )
+    match try_host!("ws2_32.dll", "WSAJoinLeaf": extern "system" fn(Socket, *const u8, i32, *const c_void, *mut c_void, *const c_void, *const c_void, u32) -> Socket)
+    {
+        Some(f) => f(s, name, len, caller_data, callee_data, sqos, gqos, flags),
+        None => winsock_failure(INVALID_SOCKET),
+    }
 }
 
 /// `ConnectEx` as `WSAIoctl` hands it out: vetted, then the socket's own.
@@ -373,7 +415,10 @@ extern "system" fn connect_ex(
         return 0;
     }
     let (mut real, mut size) = (0usize, 0u32);
-    let ioctl = host!("ws2_32.dll", "WSAIoctl": extern "system" fn(Socket, u32, *const c_void, u32, *mut c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32);
+    let Some(ioctl) = try_host!("ws2_32.dll", "WSAIoctl": extern "system" fn(Socket, u32, *const c_void, u32, *mut c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32)
+    else {
+        return winsock_failure(0);
+    };
     let guid = WSAID_CONNECTEX;
     let found = ioctl(
         s,
@@ -425,7 +470,11 @@ pub extern "system" fn WSAIoctl(
         wsa_error(WSAEINVAL);
         return SOCKET_ERROR;
     }
-    let result = host!("ws2_32.dll", "WSAIoctl": extern "system" fn(Socket, u32, *const c_void, u32, *mut c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32)(
+    let Some(ioctl) = try_host!("ws2_32.dll", "WSAIoctl": extern "system" fn(Socket, u32, *const c_void, u32, *mut c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32)
+    else {
+        return winsock_failure(SOCKET_ERROR);
+    };
+    let result = ioctl(
         s, code, input, input_len, output, output_len, returned, overlapped, completion,
     );
     if result == 0 && code == SIO_GET_EXTENSION_FUNCTION_POINTER && input_len >= 16 {
@@ -457,9 +506,11 @@ pub extern "system" fn sendto(
     if !to.is_null() && !stream(s) && !reachable("network datagram blocked", to, to_len) {
         return SOCKET_ERROR;
     }
-    host!("ws2_32.dll", "sendto": extern "system" fn(Socket, *const u8, i32, i32, *const u8, i32) -> i32)(
-        s, buf, len, flags, to, to_len,
-    )
+    match try_host!("ws2_32.dll", "sendto": extern "system" fn(Socket, *const u8, i32, i32, *const u8, i32) -> i32)
+    {
+        Some(f) => f(s, buf, len, flags, to, to_len),
+        None => winsock_failure(SOCKET_ERROR),
+    }
 }
 
 pub extern "system" fn WSASendTo(
@@ -476,18 +527,27 @@ pub extern "system" fn WSASendTo(
     if !to.is_null() && !stream(s) && !reachable("network datagram blocked", to, to_len) {
         return SOCKET_ERROR;
     }
-    host!("ws2_32.dll", "WSASendTo": extern "system" fn(Socket, *const c_void, u32, *mut u32, u32, *const u8, i32, *mut c_void, *const c_void) -> i32)(
-        s, buffers, count, sent, flags, to, to_len, overlapped, completion,
-    )
+    match try_host!("ws2_32.dll", "WSASendTo": extern "system" fn(Socket, *const c_void, u32, *mut u32, u32, *const u8, i32, *mut c_void, *const c_void) -> i32)
+    {
+        Some(f) => f(
+            s, buffers, count, sent, flags, to, to_len, overlapped, completion,
+        ),
+        None => winsock_failure(SOCKET_ERROR),
+    }
 }
 
 /// A connection-oriented socket, whose sends go to the peer `connect` vetted.
+/// Without the host's `getsockopt` no socket counts as one, so every
+/// destination is still vetted.
 fn stream(s: Socket) -> bool {
     const SOL_SOCKET: i32 = 0xffff;
     const SO_TYPE: i32 = 0x1008;
     const SOCK_STREAM: i32 = 1;
     let (mut kind, mut len) = (0i32, 4i32);
-    let getsockopt = host!("ws2_32.dll", "getsockopt": extern "system" fn(Socket, i32, i32, *mut i32, *mut i32) -> i32);
+    let Some(getsockopt) = try_host!("ws2_32.dll", "getsockopt": extern "system" fn(Socket, i32, i32, *mut i32, *mut i32) -> i32)
+    else {
+        return false;
+    };
     getsockopt(s, SOL_SOCKET, SO_TYPE, &mut kind, &mut len) == 0 && kind == SOCK_STREAM
 }
 
@@ -513,9 +573,11 @@ pub extern "system" fn WSASendMsg(
     {
         return SOCKET_ERROR;
     }
-    host!("ws2_32.dll", "WSASendMsg": extern "system" fn(Socket, *const c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32)(
-        s, message, flags, sent, overlapped, completion,
-    )
+    match try_host!("ws2_32.dll", "WSASendMsg": extern "system" fn(Socket, *const c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32)
+    {
+        Some(f) => f(s, message, flags, sent, overlapped, completion),
+        None => winsock_failure(SOCKET_ERROR),
+    }
 }
 
 /// All interfaces become loopback, the only one an unplugged console has;
@@ -523,7 +585,11 @@ pub extern "system" fn WSASendMsg(
 // shortcut: `[::]` becomes `[::1]`, so a dual-stack listener no longer hears
 // 127.0.0.1; bind both families if a title relies on that.
 pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
-    let host_bind = host!("ws2_32.dll", "bind": extern "system" fn(Socket, *const u8, i32) -> i32);
+    let Some(host_bind) =
+        try_host!("ws2_32.dll", "bind": extern "system" fn(Socket, *const u8, i32) -> i32)
+    else {
+        return winsock_failure(SOCKET_ERROR);
+    };
     match socket_addr(name, len) {
         Some(a) if loopback(a.ip()) => host_bind(s, name, len),
         Some(a) if a.ip().is_unspecified() => {
@@ -555,9 +621,11 @@ pub extern "system" fn getaddrinfo(
     if !resolvable(narrow(node)) {
         return WSAHOST_NOT_FOUND;
     }
-    host!("ws2_32.dll", "getaddrinfo": extern "system" fn(*const c_char, *const c_char, *const c_void, *mut *mut c_void) -> i32)(
-        node, service, hints, result,
-    )
+    match try_host!("ws2_32.dll", "getaddrinfo": extern "system" fn(*const c_char, *const c_char, *const c_void, *mut *mut c_void) -> i32)
+    {
+        Some(f) => f(node, service, hints, result),
+        None => lookup_failure(),
+    }
 }
 
 pub extern "system" fn GetAddrInfoW(
@@ -569,9 +637,11 @@ pub extern "system" fn GetAddrInfoW(
     if !resolvable(wide(node)) {
         return WSAHOST_NOT_FOUND;
     }
-    host!("ws2_32.dll", "GetAddrInfoW": extern "system" fn(*const u16, *const u16, *const c_void, *mut *mut c_void) -> i32)(
-        node, service, hints, result,
-    )
+    match try_host!("ws2_32.dll", "GetAddrInfoW": extern "system" fn(*const u16, *const u16, *const c_void, *mut *mut c_void) -> i32)
+    {
+        Some(f) => f(node, service, hints, result),
+        None => lookup_failure(),
+    }
 }
 
 pub extern "system" fn GetAddrInfoExA(
@@ -589,9 +659,14 @@ pub extern "system" fn GetAddrInfoExA(
     if !resolvable(narrow(name)) {
         return WSAHOST_NOT_FOUND;
     }
-    host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
-        name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
-    )
+    match try_host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)
+    {
+        Some(f) => f(
+            name, service, namespace, provider, hints, result, timeout, overlapped, completion,
+            handle,
+        ),
+        None => lookup_failure(),
+    }
 }
 
 pub extern "system" fn GetAddrInfoExW(
@@ -609,16 +684,25 @@ pub extern "system" fn GetAddrInfoExW(
     if !resolvable(wide(name)) {
         return WSAHOST_NOT_FOUND;
     }
-    host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
-        name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
-    )
+    match try_host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)
+    {
+        Some(f) => f(
+            name, service, namespace, provider, hints, result, timeout, overlapped, completion,
+            handle,
+        ),
+        None => lookup_failure(),
+    }
 }
 
 pub extern "system" fn gethostbyname(name: *const c_char) -> *mut c_void {
     if !resolvable(narrow(name)) {
         return std::ptr::null_mut();
     }
-    host!("ws2_32.dll", "gethostbyname": extern "system" fn(*const c_char) -> *mut c_void)(name)
+    match try_host!("ws2_32.dll", "gethostbyname": extern "system" fn(*const c_char) -> *mut c_void)
+    {
+        Some(f) => f(name),
+        None => winsock_failure(std::ptr::null_mut()),
+    }
 }
 
 pub extern "system" fn WSAAsyncGetHostByName(
@@ -631,9 +715,11 @@ pub extern "system" fn WSAAsyncGetHostByName(
     if !resolvable(narrow(name)) {
         return std::ptr::null_mut();
     }
-    host!("ws2_32.dll", "WSAAsyncGetHostByName": extern "system" fn(Handle, u32, *const c_char, *mut c_char, i32) -> Handle)(
-        window, message, name, buf, buf_len,
-    )
+    match try_host!("ws2_32.dll", "WSAAsyncGetHostByName": extern "system" fn(Handle, u32, *const c_char, *mut c_char, i32) -> Handle)
+    {
+        Some(f) => f(window, message, name, buf, buf_len),
+        None => winsock_failure(std::ptr::null_mut()),
+    }
 }
 
 /// Name-space queries (DNS, also network lists and Bluetooth) are refused
@@ -666,9 +752,11 @@ pub extern "system" fn gethostbyaddr(addr: *const c_char, len: i32, kind: i32) -
         wsa_error(WSAHOST_NOT_FOUND);
         return std::ptr::null_mut();
     }
-    host!("ws2_32.dll", "gethostbyaddr": extern "system" fn(*const c_char, i32, i32) -> *mut c_void)(
-        addr, len, kind,
-    )
+    match try_host!("ws2_32.dll", "gethostbyaddr": extern "system" fn(*const c_char, i32, i32) -> *mut c_void)
+    {
+        Some(f) => f(addr, len, kind),
+        None => winsock_failure(std::ptr::null_mut()),
+    }
 }
 
 pub extern "system" fn WSAAsyncGetHostByAddr(
@@ -684,9 +772,11 @@ pub extern "system" fn WSAAsyncGetHostByAddr(
         wsa_error(WSAHOST_NOT_FOUND);
         return std::ptr::null_mut();
     }
-    host!("ws2_32.dll", "WSAAsyncGetHostByAddr": extern "system" fn(Handle, u32, *const c_char, i32, i32, *mut c_char, i32) -> Handle)(
-        window, message, addr, len, kind, buf, buf_len,
-    )
+    match try_host!("ws2_32.dll", "WSAAsyncGetHostByAddr": extern "system" fn(Handle, u32, *const c_char, i32, i32, *mut c_char, i32) -> Handle)
+    {
+        Some(f) => f(window, message, addr, len, kind, buf, buf_len),
+        None => winsock_failure(std::ptr::null_mut()),
+    }
 }
 
 pub extern "system" fn getnameinfo(
@@ -701,9 +791,11 @@ pub extern "system" fn getnameinfo(
     let Some(flags) = name_info_flags(sa, sa_len, !host.is_null(), flags) else {
         return WSAHOST_NOT_FOUND;
     };
-    host!("ws2_32.dll", "getnameinfo": extern "system" fn(*const u8, i32, *mut c_char, u32, *mut c_char, u32, i32) -> i32)(
-        sa, sa_len, host, host_len, serv, serv_len, flags,
-    )
+    match try_host!("ws2_32.dll", "getnameinfo": extern "system" fn(*const u8, i32, *mut c_char, u32, *mut c_char, u32, i32) -> i32)
+    {
+        Some(f) => f(sa, sa_len, host, host_len, serv, serv_len, flags),
+        None => lookup_failure(),
+    }
 }
 
 pub extern "system" fn GetNameInfoW(
@@ -718,9 +810,11 @@ pub extern "system" fn GetNameInfoW(
     let Some(flags) = name_info_flags(sa, sa_len, !host.is_null(), flags) else {
         return WSAHOST_NOT_FOUND;
     };
-    host!("ws2_32.dll", "GetNameInfoW": extern "system" fn(*const u8, i32, *mut u16, u32, *mut u16, u32, i32) -> i32)(
-        sa, sa_len, host, host_len, serv, serv_len, flags,
-    )
+    match try_host!("ws2_32.dll", "GetNameInfoW": extern "system" fn(*const u8, i32, *mut u16, u32, *mut u16, u32, i32) -> i32)
+    {
+        Some(f) => f(sa, sa_len, host, host_len, serv, serv_len, flags),
+        None => lookup_failure(),
+    }
 }
 
 // WinHTTP.
@@ -741,9 +835,11 @@ pub extern "system" fn WinHttpConnect(
         unsafe { SetLastError(ERROR_WINHTTP_CANNOT_CONNECT) };
         return std::ptr::null_mut();
     }
-    host!("winhttp.dll", "WinHttpConnect": extern "system" fn(Handle, *const u16, u16, u32) -> Handle)(
-        session, server, port, reserved,
-    )
+    match try_host!("winhttp.dll", "WinHttpConnect": extern "system" fn(Handle, *const u16, u16, u32) -> Handle)
+    {
+        Some(f) => f(session, server, port, reserved),
+        None => winhttp_failure(std::ptr::null_mut()),
+    }
 }
 
 /// Sessions never use a proxy: only loopback is reachable, and a proxy
@@ -758,13 +854,17 @@ pub extern "system" fn WinHttpOpen(
     if access != WINHTTP_ACCESS_TYPE_NO_PROXY {
         once("HTTP proxy ignored", format!("access type {access}"));
     }
-    host!("winhttp.dll", "WinHttpOpen": extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> Handle)(
-        agent,
-        WINHTTP_ACCESS_TYPE_NO_PROXY,
-        std::ptr::null(),
-        std::ptr::null(),
-        flags,
-    )
+    match try_host!("winhttp.dll", "WinHttpOpen": extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> Handle)
+    {
+        Some(f) => f(
+            agent,
+            WINHTTP_ACCESS_TYPE_NO_PROXY,
+            std::ptr::null(),
+            std::ptr::null(),
+            flags,
+        ),
+        None => winhttp_failure(std::ptr::null_mut()),
+    }
 }
 
 /// See [`WinHttpOpen`]: a proxy set later is accepted and not used.
@@ -778,9 +878,11 @@ pub extern "system" fn WinHttpSetOption(
         once("HTTP proxy ignored", "WINHTTP_OPTION_PROXY".into());
         return 1;
     }
-    host!("winhttp.dll", "WinHttpSetOption": extern "system" fn(Handle, u32, *const c_void, u32) -> i32)(
-        handle, option, buffer, len,
-    )
+    match try_host!("winhttp.dll", "WinHttpSetOption": extern "system" fn(Handle, u32, *const c_void, u32) -> i32)
+    {
+        Some(f) => f(handle, option, buffer, len),
+        None => winhttp_failure(0),
+    }
 }
 
 /// Proxy auto-detection asks the network (DHCP, DNS, a PAC download).
@@ -904,14 +1006,34 @@ mod tests {
     const AWAY: [u8; 4] = [192, 0, 2, 1];
     const HOME: [u8; 4] = [127, 0, 0, 1];
 
+    /// What a call returns when the host lacks the function behind it.
+    #[test]
+    #[cfg(windows)]
+    fn a_missing_host_export_fails_the_call() {
+        let _starts_winsock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let last_error = try_host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32)
+            .expect("ws2_32 exports WSAGetLastError");
+        assert_eq!(winsock_failure(SOCKET_ERROR), SOCKET_ERROR);
+        assert_eq!(last_error(), WSAENETDOWN);
+        assert_eq!(lookup_failure(), WSANO_RECOVERY);
+        assert_eq!(last_error(), WSANO_RECOVERY);
+        assert!(winhttp_failure(std::ptr::null_mut::<c_void>()).is_null());
+        // SAFETY: no arguments.
+        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        assert_eq!(error, ERROR_WINHTTP_INTERNAL_ERROR);
+    }
+
     #[test]
     fn only_loopback_is_reachable() {
         // Also starts Winsock for the raw calls below.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
-        let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
-        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+        let socket = try_host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket)
+            .expect("ws2_32 exports socket");
+        let close = try_host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32)
+            .expect("ws2_32 exports closesocket");
+        let last_error = try_host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32)
+            .expect("ws2_32 exports WSAGetLastError");
         let null = std::ptr::null_mut::<c_void>();
 
         // Connects.

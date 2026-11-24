@@ -4,6 +4,7 @@
 
 use super::bitcode::{Attr, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
+use crate::ShaderError;
 
 /// Where the shader reads its user data: `b0` in this space.
 pub const USER_DATA_SPACE: u32 = 0;
@@ -304,8 +305,8 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
-    /// The finished container.
-    pub fn finish(mut self) -> Vec<u8> {
+    /// The finished container, or the emitter invariant the module broke.
+    pub fn finish(mut self) -> Result<Vec<u8>, ShaderError> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -555,7 +556,7 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
-        let bitcode = self.m.write();
+        let bitcode = self.m.write()?;
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());
@@ -611,7 +612,7 @@ impl Shader {
             parts.push((b"PSG1", &psg1));
         }
         parts.extend([(b"PSV0", &psv0[..]), (b"HASH", &hash), (b"DXIL", &dxil)]);
-        container::build(&parts)
+        Ok(container::build(&parts))
     }
 
     /// The user-data buffer's annotation carries its size, known only now.

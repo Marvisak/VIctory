@@ -27,24 +27,42 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
+use windows_sys::Win32::Foundation::{ERROR_PROC_NOT_FOUND, INVALID_HANDLE_VALUE, SetLastError};
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
 use crate::{HleExport, HleModule, hle_export};
 
-/// The host's own function: what the import would have been bound to.
-macro_rules! host {
+/// The host's own function: what the import would have been bound to, or
+/// `None` if the host lacks it. Looked up once per call site; the caller
+/// returns its API's failure for `None` (see [`host_function`]).
+macro_rules! try_host {
     ($dll:literal, $name:literal: $ty:ty) => {{
-        static ADDRESS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let address = *ADDRESS.get_or_init(|| {
-            crate::host::function($dll, $name)
-                .unwrap_or_else(|| panic!("the host lacks {}!{}", $dll, $name))
-        });
-        // SAFETY: the host exports this function with this signature.
-        unsafe { std::mem::transmute::<usize, $ty>(address) }
+        static ADDRESS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let address = *ADDRESS.get_or_init(|| $crate::modules::files::host_function($dll, $name));
+        address.map(|address| {
+            // SAFETY: `address` is the host's export of `$dll!$name`, whose
+            // documented signature is `$ty`.
+            unsafe { std::mem::transmute::<usize, $ty>(address) }
+        })
     }};
 }
-pub(crate) use host;
+pub(crate) use try_host;
+
+/// The host's `dll!name`; `None` if the host lacks it, logged the first
+/// time for each export.
+pub(crate) fn host_function(dll: &'static str, name: &'static str) -> Option<usize> {
+    let address = crate::host::function(dll, name);
+    if address.is_none() {
+        static MISSING: Mutex<Vec<(&str, &str)>> = Mutex::new(Vec::new());
+        let mut missing = MISSING.lock().unwrap_or_else(|e| e.into_inner());
+        if !missing.contains(&(dll, name)) {
+            tracing::error!("the host lacks {dll}!{name}; calls to it fail");
+            missing.push((dll, name));
+        }
+    }
+    address
+}
 
 /// Mounted drives: upper-case letter and host root (UTF-16, no trailing
 /// separator, no NUL).
@@ -260,6 +278,32 @@ fn widen(mode: *const c_char) -> Vec<u16> {
 type Handle = *mut c_void;
 type File = *mut c_void;
 
+/// `ENOSYS` in the Microsoft C runtime: function not supported.
+const ENOSYS: i32 = 40;
+const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+
+/// A Win32 call's failure when the host lacks the function behind it:
+/// `ERROR_PROC_NOT_FOUND` as the thread's last error, then `value`.
+fn win32_failure<T>(value: T) -> T {
+    // SAFETY: no pointers.
+    unsafe { SetLastError(ERROR_PROC_NOT_FOUND) };
+    value
+}
+
+/// A C runtime call's failure when the host lacks the function behind it:
+/// `ENOSYS` in `errno` (if the host's CRT has one to set), then `value`.
+fn crt_failure<T>(value: T) -> T {
+    if let Some(errno) = try_host!("ucrtbase.dll", "_errno": extern "C" fn() -> *mut i32) {
+        let slot = errno();
+        if !slot.is_null() {
+            // SAFETY: `_errno` returns the calling thread's `errno`, checked
+            // non-null; the title's CRT imports bind to this same ucrtbase.
+            unsafe { slot.write(ENOSYS) };
+        }
+    }
+    value
+}
+
 // kernel32 and its file API sets.
 
 pub extern "system" fn CreateFileW(
@@ -272,7 +316,11 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+    let Some(create) = try_host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)
+    else {
+        return win32_failure(INVALID_HANDLE_VALUE);
+    };
+    create(
         p.ptr(),
         access,
         share,
@@ -294,7 +342,11 @@ pub extern "system" fn CreateFileA(
 ) -> Handle {
     match narrow(path) {
         Some(p) => {
-            host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+            let Some(create) = try_host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)
+            else {
+                return win32_failure(INVALID_HANDLE_VALUE);
+            };
+            create(
                 p.as_ptr(),
                 access,
                 share,
@@ -305,15 +357,11 @@ pub extern "system" fn CreateFileA(
             )
         }
         None => {
-            host!("kernel32.dll", "CreateFileA": extern "system" fn(*const c_char, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
-                path,
-                access,
-                share,
-                security,
-                disposition,
-                flags,
-                template,
-            )
+            let Some(create) = try_host!("kernel32.dll", "CreateFileA": extern "system" fn(*const c_char, u32, u32, *const c_void, u32, u32, Handle) -> Handle)
+            else {
+                return win32_failure(INVALID_HANDLE_VALUE);
+            };
+            create(path, access, share, security, disposition, flags, template)
         }
     }
 }
@@ -327,65 +375,82 @@ pub extern "system" fn CreateFile2(
     params: *const c_void,
 ) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
-        p.ptr(),
-        access,
-        share,
-        disposition,
-        params,
-    )
+    let Some(create) = try_host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)
+    else {
+        return win32_failure(INVALID_HANDLE_VALUE);
+    };
+    create(p.ptr(), access, share, disposition, params)
 }
 
 pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
     match narrow(path) {
         Some(p) => {
-            host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32)(p.as_ptr())
+            match try_host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32) {
+                Some(delete) => delete(p.as_ptr()),
+                None => win32_failure(0),
+            }
         }
         None => {
-            host!("kernel32.dll", "DeleteFileA": extern "system" fn(*const c_char) -> i32)(path)
+            match try_host!("kernel32.dll", "DeleteFileA": extern "system" fn(*const c_char) -> i32)
+            {
+                Some(delete) => delete(path),
+                None => win32_failure(0),
+            }
         }
     }
 }
 
 pub extern "system" fn DeleteFileW(path: *const u16) -> i32 {
     let p = wide(path);
-    host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32)(p.ptr())
+    match try_host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32) {
+        Some(delete) => delete(p.ptr()),
+        None => win32_failure(0),
+    }
 }
 
 pub extern "system" fn RemoveDirectoryW(path: *const u16) -> i32 {
     let p = wide(path);
-    host!("kernel32.dll", "RemoveDirectoryW": extern "system" fn(*const u16) -> i32)(p.ptr())
+    match try_host!("kernel32.dll", "RemoveDirectoryW": extern "system" fn(*const u16) -> i32) {
+        Some(remove_directory) => remove_directory(p.ptr()),
+        None => win32_failure(0),
+    }
 }
 
 pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32 {
     let p = wide(path);
-    host!("kernel32.dll", "SetFileAttributesW": extern "system" fn(*const u16, u32) -> i32)(
-        p.ptr(),
-        attributes,
-    )
+    match try_host!("kernel32.dll", "SetFileAttributesW": extern "system" fn(*const u16, u32) -> i32)
+    {
+        Some(set) => set(p.ptr(), attributes),
+        None => win32_failure(0),
+    }
 }
 
 pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
     match narrow(path) {
         Some(p) => {
-            host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(
-                p.as_ptr(),
-            )
+            match try_host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)
+            {
+                Some(get) => get(p.as_ptr()),
+                None => win32_failure(INVALID_FILE_ATTRIBUTES),
+            }
         }
         None => {
-            host!("kernel32.dll", "GetFileAttributesA": extern "system" fn(*const c_char) -> u32)(
-                path,
-            )
+            match try_host!("kernel32.dll", "GetFileAttributesA": extern "system" fn(*const c_char) -> u32)
+            {
+                Some(get) => get(path),
+                None => win32_failure(INVALID_FILE_ATTRIBUTES),
+            }
         }
     }
 }
 
 pub extern "system" fn CreateDirectoryW(path: *const u16, security: *const c_void) -> i32 {
     let p = wide(path);
-    host!("kernel32.dll", "CreateDirectoryW": extern "system" fn(*const u16, *const c_void) -> i32)(
-        p.ptr(),
-        security,
-    )
+    match try_host!("kernel32.dll", "CreateDirectoryW": extern "system" fn(*const u16, *const c_void) -> i32)
+    {
+        Some(create) => create(p.ptr(), security),
+        None => win32_failure(0),
+    }
 }
 
 pub extern "system" fn GetFileAttributesExW(
@@ -394,16 +459,19 @@ pub extern "system" fn GetFileAttributesExW(
     info: *mut c_void,
 ) -> i32 {
     let p = wide(path);
-    host!("kernel32.dll", "GetFileAttributesExW": extern "system" fn(*const u16, i32, *mut c_void) -> i32)(
-        p.ptr(),
-        level,
-        info,
-    )
+    match try_host!("kernel32.dll", "GetFileAttributesExW": extern "system" fn(*const u16, i32, *mut c_void) -> i32)
+    {
+        Some(get) => get(p.ptr(), level, info),
+        None => win32_failure(0),
+    }
 }
 
 pub extern "system" fn GetFileAttributesW(path: *const u16) -> u32 {
     let p = wide(path);
-    host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(p.ptr())
+    match try_host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32) {
+        Some(get) => get(p.ptr()),
+        None => win32_failure(INVALID_FILE_ATTRIBUTES),
+    }
 }
 
 pub extern "system" fn GetDiskFreeSpaceExW(
@@ -413,12 +481,11 @@ pub extern "system" fn GetDiskFreeSpaceExW(
     free: *mut u64,
 ) -> i32 {
     let p = wide(path);
-    host!("kernel32.dll", "GetDiskFreeSpaceExW": extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32)(
-        p.ptr(),
-        available,
-        total,
-        free,
-    )
+    match try_host!("kernel32.dll", "GetDiskFreeSpaceExW": extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32)
+    {
+        Some(get) => get(p.ptr(), available, total, free),
+        None => win32_failure(0),
+    }
 }
 
 /// Wants a volume root: a virtual drive answers for the host volume its
@@ -438,7 +505,11 @@ pub extern "system" fn GetDiskFreeSpaceW(
     {
         *host = vec![letter, colon, sep, 0];
     }
-    host!("kernel32.dll", "GetDiskFreeSpaceW": extern "system" fn(*const u16, *mut u32, *mut u32, *mut u32, *mut u32) -> i32)(
+    let Some(get) = try_host!("kernel32.dll", "GetDiskFreeSpaceW": extern "system" fn(*const u16, *mut u32, *mut u32, *mut u32, *mut u32) -> i32)
+    else {
+        return win32_failure(0);
+    };
+    get(
         p.ptr(),
         sectors_per_cluster,
         bytes_per_sector,
@@ -449,10 +520,11 @@ pub extern "system" fn GetDiskFreeSpaceW(
 
 pub extern "system" fn FindFirstFileW(path: *const u16, data: *mut c_void) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "FindFirstFileW": extern "system" fn(*const u16, *mut c_void) -> Handle)(
-        p.ptr(),
-        data,
-    )
+    match try_host!("kernel32.dll", "FindFirstFileW": extern "system" fn(*const u16, *mut c_void) -> Handle)
+    {
+        Some(find) => find(p.ptr(), data),
+        None => win32_failure(INVALID_HANDLE_VALUE),
+    }
 }
 
 pub extern "system" fn FindFirstFileExW(
@@ -464,36 +536,37 @@ pub extern "system" fn FindFirstFileExW(
     flags: u32,
 ) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "FindFirstFileExW": extern "system" fn(*const u16, i32, *mut c_void, i32, *mut c_void, u32) -> Handle)(
-        p.ptr(),
-        level,
-        data,
-        search,
-        filter,
-        flags,
-    )
+    let Some(find) = try_host!("kernel32.dll", "FindFirstFileExW": extern "system" fn(*const u16, i32, *mut c_void, i32, *mut c_void, u32) -> Handle)
+    else {
+        return win32_failure(INVALID_HANDLE_VALUE);
+    };
+    find(p.ptr(), level, data, search, filter, flags)
 }
 
 pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32 {
     let (from, to) = (wide(from), wide(to));
-    host!("kernel32.dll", "MoveFileExW": extern "system" fn(*const u16, *const u16, u32) -> i32)(
-        from.ptr(),
-        to.ptr(),
-        flags,
-    )
+    match try_host!("kernel32.dll", "MoveFileExW": extern "system" fn(*const u16, *const u16, u32) -> i32)
+    {
+        Some(move_file) => move_file(from.ptr(), to.ptr(), flags),
+        None => win32_failure(0),
+    }
 }
 
 pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
     match narrow(path) {
         Some(p) => {
-            host!("kernel32.dll", "SetCurrentDirectoryW": extern "system" fn(*const u16) -> i32)(
-                p.as_ptr(),
-            )
+            match try_host!("kernel32.dll", "SetCurrentDirectoryW": extern "system" fn(*const u16) -> i32)
+            {
+                Some(set) => set(p.as_ptr()),
+                None => win32_failure(0),
+            }
         }
         None => {
-            host!("kernel32.dll", "SetCurrentDirectoryA": extern "system" fn(*const c_char) -> i32)(
-                path,
-            )
+            match try_host!("kernel32.dll", "SetCurrentDirectoryA": extern "system" fn(*const c_char) -> i32)
+            {
+                Some(set) => set(path),
+                None => win32_failure(0),
+            }
         }
     }
 }
@@ -502,25 +575,30 @@ pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
 
 pub extern "C" fn _wfopen(path: *const u16, mode: *const u16) -> File {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(p.ptr(), mode)
+    match try_host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File) {
+        Some(open) => open(p.ptr(), mode),
+        None => crt_failure(std::ptr::null_mut()),
+    }
 }
 
+/// Without the host's `_wfopen_s`, `out` is left as the title passed it;
+/// the error code is what callers check.
 pub extern "C" fn _wfopen_s(out: *mut File, path: *const u16, mode: *const u16) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
-        out,
-        p.ptr(),
-        mode,
-    )
+    match try_host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)
+    {
+        Some(open) => open(out, p.ptr(), mode),
+        None => crt_failure(ENOSYS),
+    }
 }
 
 pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> File {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)(
-        p.ptr(),
-        mode,
-        share,
-    )
+    match try_host!("ucrtbase.dll", "_wfsopen": extern "C" fn(*const u16, *const u16, i32) -> File)
+    {
+        Some(open) => open(p.ptr(), mode, share),
+        None => crt_failure(std::ptr::null_mut()),
+    }
 }
 
 // Kernel reads into title memory. The GPU side leaves blocks of title GPU
@@ -538,46 +616,59 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
-        file, buffer, len, read, overlapped,
-    )
+    match try_host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)
+    {
+        Some(read_file) => read_file(file, buffer, len, read, overlapped),
+        None => win32_failure(0),
+    }
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
+/// Without the host's `fread` nothing is read; the stream's error flag
+/// cannot be set without it, so `errno` carries the failure.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
     victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
-        buffer, size, count, stream,
-    )
+    match try_host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize) {
+        Some(read) => read(buffer, size, count, stream),
+        None => crt_failure(0),
+    }
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
     match narrow(path) {
-        Some(p) => host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
-            p.as_ptr(),
-            widen(mode).as_ptr(),
-        ),
+        Some(p) => {
+            match try_host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)
+            {
+                Some(open) => open(p.as_ptr(), widen(mode).as_ptr()),
+                None => crt_failure(std::ptr::null_mut()),
+            }
+        }
         None => {
-            host!("ucrtbase.dll", "fopen": extern "C" fn(*const c_char, *const c_char) -> File)(
-                path, mode,
-            )
+            match try_host!("ucrtbase.dll", "fopen": extern "C" fn(*const c_char, *const c_char) -> File)
+            {
+                Some(open) => open(path, mode),
+                None => crt_failure(std::ptr::null_mut()),
+            }
         }
     }
 }
 
+/// See [`_wfopen_s`] for `out` when the host lacks the function.
 pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
     match narrow(path) {
         Some(p) => {
-            host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
-                out,
-                p.as_ptr(),
-                widen(mode).as_ptr(),
-            )
+            match try_host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)
+            {
+                Some(open) => open(out, p.as_ptr(), widen(mode).as_ptr()),
+                None => crt_failure(ENOSYS),
+            }
         }
         None => {
-            host!("ucrtbase.dll", "fopen_s": extern "C" fn(*mut File, *const c_char, *const c_char) -> i32)(
-                out, path, mode,
-            )
+            match try_host!("ucrtbase.dll", "fopen_s": extern "C" fn(*mut File, *const c_char, *const c_char) -> i32)
+            {
+                Some(open) => open(out, path, mode),
+                None => crt_failure(ENOSYS),
+            }
         }
     }
 }
@@ -586,69 +677,89 @@ pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_ch
 /// travels in the same register either way, so it is passed on as is.
 pub extern "C" fn _open(path: *const c_char, flags: i32, mode: i32) -> i32 {
     match narrow(path) {
-        Some(p) => host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
-            p.as_ptr(),
-            flags,
-            mode,
-        ),
-        None => host!("ucrtbase.dll", "_open": extern "C" fn(*const c_char, i32, i32) -> i32)(
-            path, flags, mode,
-        ),
+        Some(p) => {
+            match try_host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32) {
+                Some(open) => open(p.as_ptr(), flags, mode),
+                None => crt_failure(-1),
+            }
+        }
+        None => {
+            match try_host!("ucrtbase.dll", "_open": extern "C" fn(*const c_char, i32, i32) -> i32)
+            {
+                Some(open) => open(path, flags, mode),
+                None => crt_failure(-1),
+            }
+        }
     }
 }
 
 /// See [`_open`]; used by libHttpClient.
 pub extern "C" fn _wopen(path: *const u16, flags: i32, mode: i32) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32)(
-        p.ptr(),
-        flags,
-        mode,
-    )
+    match try_host!("ucrtbase.dll", "_wopen": extern "C" fn(*const u16, i32, i32) -> i32) {
+        Some(open) => open(p.ptr(), flags, mode),
+        None => crt_failure(-1),
+    }
 }
 
 pub extern "C" fn _wstat64(path: *const u16, stat: *mut c_void) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wstat64": extern "C" fn(*const u16, *mut c_void) -> i32)(p.ptr(), stat)
+    match try_host!("ucrtbase.dll", "_wstat64": extern "C" fn(*const u16, *mut c_void) -> i32) {
+        Some(stat64) => stat64(p.ptr(), stat),
+        None => crt_failure(-1),
+    }
 }
 
 pub extern "C" fn _stat64i32(path: *const c_char, stat: *mut c_void) -> i32 {
     match narrow(path) {
         Some(p) => {
-            host!("ucrtbase.dll", "_wstat64i32": extern "C" fn(*const u16, *mut c_void) -> i32)(
-                p.as_ptr(),
-                stat,
-            )
+            match try_host!("ucrtbase.dll", "_wstat64i32": extern "C" fn(*const u16, *mut c_void) -> i32)
+            {
+                Some(stat64) => stat64(p.as_ptr(), stat),
+                None => crt_failure(-1),
+            }
         }
         None => {
-            host!("ucrtbase.dll", "_stat64i32": extern "C" fn(*const c_char, *mut c_void) -> i32)(
-                path, stat,
-            )
+            match try_host!("ucrtbase.dll", "_stat64i32": extern "C" fn(*const c_char, *mut c_void) -> i32)
+            {
+                Some(stat64) => stat64(path, stat),
+                None => crt_failure(-1),
+            }
         }
     }
 }
 
 pub extern "C" fn remove(path: *const c_char) -> i32 {
     match narrow(path) {
-        Some(p) => host!("ucrtbase.dll", "_wremove": extern "C" fn(*const u16) -> i32)(p.as_ptr()),
-        None => host!("ucrtbase.dll", "remove": extern "C" fn(*const c_char) -> i32)(path),
+        Some(p) => match try_host!("ucrtbase.dll", "_wremove": extern "C" fn(*const u16) -> i32) {
+            Some(host_remove) => host_remove(p.as_ptr()),
+            None => crt_failure(-1),
+        },
+        None => match try_host!("ucrtbase.dll", "remove": extern "C" fn(*const c_char) -> i32) {
+            Some(host_remove) => host_remove(path),
+            None => crt_failure(-1),
+        },
     }
 }
 
 pub extern "C" fn _wchmod(path: *const u16, mode: i32) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wchmod": extern "C" fn(*const u16, i32) -> i32)(p.ptr(), mode)
+    match try_host!("ucrtbase.dll", "_wchmod": extern "C" fn(*const u16, i32) -> i32) {
+        Some(chmod) => chmod(p.ptr(), mode),
+        None => crt_failure(-1),
+    }
 }
 
 pub extern "C" fn _wutime64(path: *const u16, times: *mut c_void) -> i32 {
     let p = wide(path);
-    host!("ucrtbase.dll", "_wutime64": extern "C" fn(*const u16, *mut c_void) -> i32)(
-        p.ptr(),
-        times,
-    )
+    match try_host!("ucrtbase.dll", "_wutime64": extern "C" fn(*const u16, *mut c_void) -> i32) {
+        Some(utime) => utime(p.ptr(), times),
+        None => crt_failure(-1),
+    }
 }
 
-// The C++ library: `std::basic_filebuf::open` goes through `_Fiopen`.
+// The C++ library: `std::basic_filebuf::open` goes through `_Fiopen`, and
+// a null stream from it makes `open` fail.
 
 const FIOPEN: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z";
 const FIOPEN_WIDE: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z";
@@ -656,27 +767,29 @@ const FIOPEN_WIDE: &str = "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z";
 /// `_Fiopen(const wchar_t* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File {
     let p = wide(path);
-    host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
-        p.ptr(),
-        mode,
-        protection,
-    )
+    match try_host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)
+    {
+        Some(open) => open(p.ptr(), mode, protection),
+        None => crt_failure(std::ptr::null_mut()),
+    }
 }
 
 /// `_Fiopen(const char* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
     match narrow(path) {
         Some(p) => {
-            host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
-                p.as_ptr(),
-                mode,
-                protection,
-            )
+            match try_host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)
+            {
+                Some(open) => open(p.as_ptr(), mode, protection),
+                None => crt_failure(std::ptr::null_mut()),
+            }
         }
         None => {
-            host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z": extern "C" fn(*const c_char, i32, i32) -> File)(
-                path, mode, protection,
-            )
+            match try_host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z": extern "C" fn(*const c_char, i32, i32) -> File)
+            {
+                Some(open) => open(path, mode, protection),
+                None => crt_failure(std::ptr::null_mut()),
+            }
         }
     }
 }
@@ -747,6 +860,28 @@ mod tests {
         s.encode_utf16().chain([0]).collect()
     }
 
+    /// A host export that does not exist is `None`, not a panic, and the
+    /// failures the call sites return then carry their APIs' error codes.
+    #[test]
+    #[cfg(windows)]
+    fn a_missing_host_export_fails_the_call() {
+        let missing = try_host!("kernel32.dll", "VictoryNoSuchExport": extern "system" fn() -> i32);
+        assert!(missing.is_none());
+        let missing = try_host!("victory-no-such.dll", "CreateFileW": extern "system" fn() -> i32);
+        assert!(missing.is_none());
+
+        assert_eq!(win32_failure(INVALID_HANDLE_VALUE), INVALID_HANDLE_VALUE);
+        // SAFETY: no arguments.
+        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        assert_eq!(error, ERROR_PROC_NOT_FOUND);
+
+        assert_eq!(crt_failure(-1), -1);
+        let errno = try_host!("ucrtbase.dll", "_errno": extern "C" fn() -> *mut i32)
+            .expect("ucrtbase exports _errno")();
+        // SAFETY: `_errno` returns the calling thread's `errno`.
+        assert_eq!(unsafe { errno.read() }, ENOSYS);
+    }
+
     #[test]
     fn kernel_reads_reach_the_buffer() {
         use std::os::windows::io::AsRawHandle;
@@ -756,7 +891,10 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let (mut out, mut n) = ([0u8; 10], 0);
         let handle = file.as_raw_handle().cast();
-        assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
+        assert_ne!(
+            ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()),
+            0
+        );
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
@@ -825,7 +963,8 @@ mod tests {
         let file = format!("{deep}/../{}/f.txt", "b".repeat(100));
         let f = _wfopen(w(&file).as_ptr(), w("wb").as_ptr());
         assert!(!f.is_null(), "{file}");
-        host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(f);
+        try_host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)
+            .expect("ucrtbase exports fclose")(f);
         assert_ne!(DeleteFileW(w(&format!("{deep}/f.txt")).as_ptr()), 0);
         assert_ne!(RemoveDirectoryW(w(&deep).as_ptr()), 0);
     }
@@ -836,8 +975,10 @@ mod tests {
         let letter = mount(dir.path()).unwrap();
         const GENERIC_WRITE: u32 = 0x4000_0000;
         const CREATE_ALWAYS: u32 = 2;
-        let close = host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32);
-        let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
+        let close = try_host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32)
+            .expect("kernel32 exports CloseHandle");
+        let fclose = try_host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)
+            .expect("ucrtbase exports fclose");
 
         let path = w(&format!(r"{letter}:\created.bin"));
         let null = std::ptr::null_mut();
@@ -888,7 +1029,8 @@ mod tests {
         let path = format!("{letter}:/low.bin\0");
         let fd = _open(path.as_ptr().cast(), O_WRONLY | O_CREAT, S_IWRITE);
         assert!(fd >= 0);
-        host!("ucrtbase.dll", "_close": extern "C" fn(i32) -> i32)(fd);
+        try_host!("ucrtbase.dll", "_close": extern "C" fn(i32) -> i32)
+            .expect("ucrtbase exports _close")(fd);
         assert!(dir.path().join("low.bin").is_file());
 
         // Other paths pass through untouched.
