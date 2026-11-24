@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -161,17 +161,6 @@ pub fn run(
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
-    if validate {
-        Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
-        println!(
-            "validator    {}",
-            dll.as_ref()
-                .map_or("dxil.dll".into(), |p| p.display().to_string())
-        );
-    }
-    if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
-    }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -179,6 +168,32 @@ pub fn run(
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let make_checks = || -> Result<Checks> {
+        let validator = validate
+            .then(|| Validator::load(dll.as_deref()))
+            .transpose()
+            .map_err(anyhow::Error::msg)
+            .context("initializing the DXIL validator")?;
+        let host = pipelines
+            .then(|| Host::new(false).map(|h| (h, host::stub_ps())))
+            .transpose()
+            .map_err(anyhow::Error::msg)
+            .context("initializing D3D12 pipeline checks")?;
+        Ok(Checks {
+            keep: (!pairs.is_empty()).then(|| kept.clone()),
+            validator,
+            host,
+        })
+    };
+    // Validate the options before scanning. Reuse this worker's checks for
+    // every file and initialize more checkers only as more workers are needed.
+    let mut workers = vec![make_checks()?];
+    if validate {
+        println!(
+            "validator    {}",
+            dll.as_deref().unwrap_or(Path::new("dxil.dll")).display()
+        );
+    }
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
@@ -195,27 +210,27 @@ pub fn run(
                 continue;
             };
             let jobs = sources(&data);
+            let count = threads.min(jobs.len());
+            while workers.len() < count {
+                let worker = workers.len() + 1;
+                workers.push(
+                    make_checks().with_context(|| format!("starting shader worker {worker}"))?,
+                );
+            }
             let next = AtomicUsize::new(0);
+            let path = entry.path();
+            let (jobs, next, seen, total) = (&jobs, &next, &seen, &total);
             std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
+                for checks in &mut workers[..count] {
+                    s.spawn(move || {
                         let mut t = Tally {
                             list,
                             ..Tally::default()
                         };
-                        let mut checks = Checks {
-                            keep: (!pairs.is_empty()).then(|| kept.clone()),
-                            validator: validate
-                                .then(|| Validator::load(dll.as_deref()).ok())
-                                .flatten(),
-                            host: pipelines
-                                .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                .flatten(),
-                        };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            translate(job, path, seen, &mut t, checks);
                         }
-                        lock(&total).merge(t);
+                        lock(total).merge(t);
                     });
                 }
             });
