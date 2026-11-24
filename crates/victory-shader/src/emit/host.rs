@@ -125,23 +125,24 @@ impl Host {
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Constants: D3D12_ROOT_CONSTANTS {
                         ShaderRegister: 0,
-                        RegisterSpace: super::USER_DATA_SPACE,
+                        RegisterSpace: super::USER_DATA_SPACE + s.space_shift(),
                         Num32BitValues: s.user_data_dwords().max(1),
                     },
                 },
                 ShaderVisibility: vis,
             })
             .collect();
-        let mut views: Vec<(u8, bool)> = stages
+        let mut views: Vec<(u32, u8, bool)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
-                cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
+                let shift = s.space_shift();
+                let cbvs = s.root_cbvs.iter().map(move |&r| (shift, r, false));
+                cbvs.chain(s.root_srvs.iter().map(move |&r| (shift, r, true)))
             })
             .collect();
         views.sort_unstable();
         views.dedup();
-        for (slot, srv) in views {
+        for (shift, slot, srv) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: if srv {
                     D3D12_ROOT_PARAMETER_TYPE_SRV
@@ -151,7 +152,7 @@ impl Host {
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: u32::from(slot),
-                        RegisterSpace: super::ROOT_CBV_SPACE,
+                        RegisterSpace: super::ROOT_CBV_SPACE + shift,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
                 },
@@ -174,7 +175,7 @@ impl Host {
                     MinLOD: d.min_lod,
                     MaxLOD: d.max_lod,
                     ShaderRegister: n as u32,
-                    RegisterSpace: super::SAMPLER_SPACE,
+                    RegisterSpace: super::SAMPLER_SPACE + s.space_shift(),
                     ShaderVisibility: vis,
                 });
             }
