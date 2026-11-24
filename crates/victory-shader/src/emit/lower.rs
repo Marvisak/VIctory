@@ -43,6 +43,12 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether `dx.op.isHelperLane.i1` is declared/called.
+    #[cfg(test)]
+    pub has_is_helper_lane: bool,
+    /// Whether `select(dx.op.isHelperLane.i1(), own, dx.op.waveReadLaneFirst.i32(...))` was emitted.
+    #[cfg(test)]
+    pub has_helper_guard: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -910,6 +916,18 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            has_is_helper_lane: self
+                .s
+                .m
+                .func_names()
+                .iter()
+                .any(|n| n == "dx.op.isHelperLane.i1"),
+            #[cfg(test)]
+            has_helper_guard: self
+                .s
+                .m
+                .has_select_guard("dx.op.isHelperLane.i1", "dx.op.waveReadLaneFirst.i32"),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4243,7 +4261,7 @@ impl<'a> Lower<'a> {
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
-                let r = self.s.op(
+                let first = self.s.op(
                     c,
                     "waveReadLaneFirst.i32",
                     Attr::NoUnwind,
@@ -4251,6 +4269,21 @@ impl<'a> Lower<'a> {
                     118,
                     &[a],
                 );
+                let r = if self.s.pixel {
+                    // Host DXIL `waveReadLaneFirst` skips helper lanes, whereas console WQM keeps
+                    // them active in `EXEC`; give each helper lane its own value so loops exit.
+                    let helper = self.s.op(
+                        c,
+                        "isHelperLane.i1",
+                        Attr::ReadOnly,
+                        self.s.t.i1,
+                        221,
+                        &[],
+                    );
+                    self.s.m.select(c, helper, a, first)
+                } else {
+                    first
+                };
                 int(self, r)
             }
             _ => {
@@ -7417,5 +7450,295 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[cfg(windows)]
+    fn validate_dxil_blob(dxil: &[u8]) {
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            let mut copy = dxil.to_vec();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn validate_dxil_blob(_dxil: &[u8]) {}
+
+    const UNMASKED_PS_WATERFALL: &[u32] = &[
+        0xD765_0000,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0x7E18_0500, // v_readfirstlane_b32 s12, v0
+        0x7D84_000C, // v_cmp_eq_u32 vcc, s12, v0
+        0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+        0xBF80_0000, // s_nop 0
+        0x7E02_02FF,
+        0x3F80_0000, // v_mov_b32 v1, 1.0f
+        0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+        0xBF89_FFF8, // s_cbranch_execnz -> loop
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xF800_180F,
+        0x0101_0101, // exp mrt0, v1, v1, v1, v1 done vm
+        S_ENDPGM,
+    ];
+
+    fn lower_stage(
+        words: &[u32],
+        stage: HwStage,
+        io_stage: StageIo,
+        outputs: Vec<super::super::container::SigElement>,
+    ) -> Lowered {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: io_stage,
+            code,
+        };
+        let p = ir::build(&native.code, false, 16).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &[], native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs,
+            prims: vec![],
+            mesh_stride: if stage == HwStage::Ms { 32 } else { 0 },
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn pixel_wave_read_first_guards_helper_lanes_and_validates() {
+        use super::super::container::SigElement;
+        use crate::native::MeshIo;
+
+        let ps = lower_stage(
+            UNMASKED_PS_WATERFALL,
+            HwStage::Ps,
+            StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            vec![],
+        );
+        assert!(ps.wave_ops);
+        assert!(ps.has_is_helper_lane, "pixel v_readfirstlane_b32 must emit isHelperLane");
+        assert!(
+            ps.has_helper_guard,
+            "pixel v_readfirstlane_b32 must select helper own value over waveReadLaneFirst"
+        );
+        validate_dxil_blob(&ps.dxil);
+
+        // Non-pixel stages (CS, VS, MS) must never emit `dx.op.isHelperLane`.
+        let cs = lower_stage(
+            &[0x7E04_0500, 0xBE80_0302, S_ENDPGM],
+            HwStage::Cs,
+            StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            vec![],
+        );
+        assert!(!cs.has_is_helper_lane);
+        assert!(!cs.has_helper_guard);
+
+        let sv_pos = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let vs = lower_stage(
+            &[0x7E04_0500, 0x7E02_0202, 0xF800_08CF, 0x0101_0101, S_ENDPGM],
+            HwStage::Vs,
+            StageIo::Vs {
+                inputs: vec![],
+                outputs: vec![],
+            },
+            vec![sv_pos.clone()],
+        );
+        assert!(!vs.has_is_helper_lane);
+        assert!(!vs.has_helper_guard);
+
+        let ms = lower_stage(
+            &[
+                0x7E04_0500,
+                0x7E02_0202,
+                0xF800_08CF,
+                0x0101_0101,
+                0xF800_094F,
+                0x0101_0101,
+                S_ENDPGM,
+            ],
+            HwStage::Ms,
+            StageIo::Ms(MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 3,
+                max_primitives: 1,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            vec![sv_pos],
+        );
+        assert!(!ms.has_is_helper_lane);
+        assert!(!ms.has_helper_guard);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pixel_waterfall_loop_partial_quad_renders_with_helper_lanes() {
+        use super::super::bitcode::{Attr, Term};
+        use super::super::container::{SigElement, signature};
+        use super::super::host::{Draw, Host, Root};
+        use super::super::shader::Shader;
+        use super::super::{HostShader, emit};
+        use crate::dxbc::{Container, build as dxbc_build};
+
+        let _one = super::super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut s = Shader::new(false);
+        let b = s.entry;
+        for col in 0..4u8 {
+            let args_in = [s.m.i32(0), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+            let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args_in);
+            let args_out = [s.m.i32(0), s.m.i32(0), s.m.i8(col), v];
+            s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args_out);
+        }
+        s.inputs.push(SigElement {
+            name: "POSITION".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        });
+        s.outputs.push(SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        });
+        s.m.terminate(b, Term::Ret);
+        let vs = HostShader {
+            stage: HwStage::Vs,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+        };
+        validate_dxil_blob(&vs.dxil);
+
+        let osg1 = signature(
+            &[SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            }],
+            false,
+        );
+        let container_bytes = dxbc_build(&[(crate::dxbc::FourCC::OSG1, &osg1)]);
+        let container = Container::parse(&container_bytes).unwrap();
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: UNMASKED_PS_WATERFALL
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect(),
+        };
+        let p = ir::build(&ps_native.code, false, 16).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &[], HwStage::Ps, Some(&st)).unwrap();
+        let io = io::raise(&p, &ps_native).unwrap();
+        let ps = emit(&container, &ps_native, &p, &st, &io, &res).unwrap();
+        validate_dxil_blob(&ps.dxil);
+
+        // Cover only pixel (0, 0) in a 2x2 target so pixels (1, 0), (0, 1), (1, 1) run as helpers.
+        let verts: [f32; 12] = [
+            -1.0, 1.0, 0.0, 1.0, //
+            0.2, 1.0, 0.0, 1.0, //
+            -1.0, -0.2, 0.0, 1.0, //
+        ];
+
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("{label}: SM 6.6 device unavailable");
+                continue;
+            };
+            let (root, pso) = host.pipeline(&vs, &ps).expect("graphics pipeline");
+            let pixels = host
+                .draw(
+                    &root,
+                    &pso,
+                    &Draw {
+                        roots: vec![
+                            (0, Root::Constants(vec![0; 4])),
+                            (1, Root::Constants(vec![0; 4])),
+                        ],
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &verts,
+                        stride: 16,
+                        size: (2, 2),
+                        mesh_groups: 0,
+                    },
+                )
+                .expect("partial-quad pixel draw");
+            assert_eq!(pixels, [[1.0, 1.0, 1.0, 1.0], [0.0; 4], [0.0; 4], [0.0; 4]], "{label}");
+            ran += 1;
+        }
+        assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
     }
 }

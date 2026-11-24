@@ -486,6 +486,26 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
+    #[cfg(test)]
+    pub fn func_names(&self) -> Vec<String> {
+        self.funcs.iter().map(|f| f.name.clone()).collect()
+    }
+
+    /// True when any `select` uses `cond_fn`'s call result and chooses `false_fn` on false.
+    #[cfg(test)]
+    pub fn has_select_guard(&self, cond_fn: &str, false_fn: &str) -> bool {
+        let is_call = |v: V, target: &str| {
+            matches!(v, V::Inst(idx) if matches!(
+                &self.insts[idx as usize].op,
+                Op::Call(f, _) if self.funcs[*f as usize].name == target
+            ))
+        };
+        self.insts.iter().any(|inst| match inst.op {
+            Op::Select(c, _, f) => is_call(c, cond_fn) && is_call(f, false_fn),
+            _ => false,
+        })
+    }
+
     /// The module as bitcode.
     /// Which instructions are written: every body instruction, the branch
     /// conditions, and whatever they read, transitively (a phi nothing reads
