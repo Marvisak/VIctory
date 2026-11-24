@@ -530,6 +530,15 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                #[cfg(feature = "diagnostics")]
+                if tracing::enabled!(target: "victory_gpu::sync_write", tracing::Level::TRACE) {
+                    let sent = if groups.len() == 1 { runs } else { &runs[i..=i] };
+                    for list in sent {
+                        for &(at, what, bytes) in &list.deferred().writes {
+                            list.trace_value_write("submitted", at, what, bytes, Some(*submitted));
+                        }
+                    }
+                }
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -601,6 +610,8 @@ impl Host {
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
+                #[cfg(feature = "diagnostics")]
+                list.trace_value_write("stored", at, what, bytes, None);
             }
         }
         self.log_messages();
@@ -1063,6 +1074,19 @@ impl HostList {
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
+        #[cfg(feature = "diagnostics")]
+        self.trace_value_write("recorded", dst as usize, what, bytes, None);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn trace_value_write(
+        &self, stage: &'static str, address: usize, what: crate::queue::Written,
+        bytes: usize, fence: Option<u64>,
+    ) {
+        if let crate::queue::Written::Value(value) = what {
+            tracing::trace!(target: "victory_gpu::sync_write", stage, host_list = ?std::ptr::from_ref(self),
+                address, value, bytes, fence, "command-list memory write");
+        }
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is

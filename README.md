@@ -112,6 +112,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | Variable | Effect |
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
+| `VICTORY_LOG=victory_gpu::sync_wait=trace,victory_gpu::sync_write=trace` | requested command-list memory waits and their constant-value producers at recording, submission, and storage in guest memory |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
