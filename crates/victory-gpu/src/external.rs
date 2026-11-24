@@ -27,6 +27,8 @@ pub fn host_texture(
     let host = crate::list::host_list(list)?;
     let texture = crate::resource::host_resource(resource)?.clone();
     crate::list::ensure_state(host, resource, state);
+    // The caller records into the list next (`record`).
+    host.flush_barriers();
     let state = crate::host::legal_state(&texture, state);
     Some((texture, state))
 }
@@ -41,6 +43,7 @@ pub fn record<R>(
 ) -> Option<R> {
     let mut out = None;
     crate::list::with_state(list, |host, state| {
+        host.flush_barriers();
         out = Some(f(&host.list));
         state.host_state_lost();
     });

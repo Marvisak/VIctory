@@ -156,6 +156,7 @@ pub(crate) fn bound(
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return false;
     }
+    list.flush_barriers();
     let l = &list.list;
     let constants = [kind, stride, records, 0];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
@@ -184,6 +185,7 @@ pub(crate) fn bound(
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
+    list.flush_barriers();
     // SAFETY: an open list and a live buffer.
     unsafe {
         list.list.ResourceBarrier(&[transition(

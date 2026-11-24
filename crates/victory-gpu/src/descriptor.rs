@@ -546,9 +546,36 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
+        mirror_range(dst, count, step);
+    }
+}
+
+/// [`mirror`] for `count` descriptors `step` bytes apart from `dst`: the
+/// heap holding `dst` looked up (and its pending queue locked) once for the
+/// slots that lie in it, the rest one by one.
+#[cfg(windows)]
+fn mirror_range(dst: u64, count: u32, step: u64) {
+    let done = match shader_slot(dst) {
+        Some((heap, first)) if step != 0 => {
+            let n = count.min(heap.desc.count - first);
+            let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+            match heap.host.get() {
+                None => pending.extend(first..first + n),
+                Some(host) => {
+                    drop(pending);
+                    if let Some(host) = host {
+                        for k in 0..n {
+                            host.mirror(first + k, dst + u64::from(k) * step, false);
+                        }
+                    }
+                }
+            }
+            n
         }
+        _ => 0,
+    };
+    for i in u64::from(done)..u64::from(count) {
+        mirror(dst + i * step);
     }
 }
 
@@ -837,6 +864,52 @@ mod tests {
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         crate::watch::tests::free(memory);
+    }
+
+    /// A simple copy makes each slot of its range on the host, whether the
+    /// host heap exists yet (queued) or not, and empties slots it copies
+    /// nothing into.
+    #[cfg(windows)]
+    #[test]
+    fn simple_copies_mirror_each_slot_of_their_range() {
+        let null = std::ptr::null();
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 16,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = null;
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let step = u64::from(increment(SAMPLERS).unwrap());
+        let start = heap(h).start;
+        // Two samplers and an empty slot.
+        let mut source = [0u64; 3 * 4];
+        let base = source.as_mut_ptr() as u64;
+        let at = |i: u64| base + i * step;
+        for i in 0..2 {
+            create_sampler(
+                null,
+                &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0],
+                at(i),
+            );
+        }
+        copy_simple(null, 3, start + 4 * step, at(0), SAMPLERS);
+        if let Some(host) = heap(h).host() {
+            assert!(
+                host.made(4) && host.made(5) && !host.made(6),
+                "queued, then made"
+            );
+            copy_simple(null, 3, start + 8 * step, at(0), SAMPLERS);
+            assert!(host.made(8) && host.made(9) && !host.made(10));
+            copy_simple(null, 1, start + 8 * step, at(2), SAMPLERS);
+            assert!(!host.made(8), "emptied");
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
     }
 
     /// Grand Theft Auto VI places its shader-visible heap in its own memory

@@ -89,6 +89,9 @@ pub(crate) struct State {
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
+    /// The user data of the stage being bound, kept for the next one (no
+    /// allocation per draw).
+    user_data: Vec<u32>,
 }
 
 impl Drop for State {
@@ -220,8 +223,10 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
+        let user_data = std::mem::take(&mut self.user_data);
         *self = State::default();
         self.pipeline = pipeline as usize;
+        self.user_data = user_data;
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -320,7 +325,8 @@ impl State {
             return;
         };
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut rtvs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
+        let mut n = 0;
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -332,10 +338,15 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
+            if n == rtvs.len() {
+                once!("more than 8 render targets: the rest not bound");
+                break;
+            }
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            rtvs[n] = host.rtv(texture, record.desc().as_ref());
+            n += 1;
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -348,8 +359,8 @@ impl State {
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
-                rtvs.len() as u32,
-                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                n as u32,
+                (n > 0).then_some(rtvs.as_ptr()),
                 false,
                 dsv.as_ref().map(std::ptr::from_ref),
             )
@@ -591,7 +602,9 @@ impl State {
             // their addresses go into the page table.
             let mut roots = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                let mut values = std::mem::take(&mut self.user_data);
+                values.clear();
+                values.resize(dwords as usize, 0);
                 for u in &t.host.user_data {
                     if u.root == RootType::Descriptor
                         && u.dword == 0
@@ -641,6 +654,7 @@ impl State {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     }
                 }
+                self.user_data = values;
             }
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
@@ -806,19 +820,26 @@ impl State {
             self.heaps
         };
         if self.host_heaps != want {
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+            // Ours first, then the title's (at most one of each kind).
+            let mut heaps: [Option<ID3D12DescriptorHeap>; 3] = [None, None, None];
+            let mut n = 0;
+            let ours = memory_heap
+                .then(crate::memory::heap)
+                .flatten()
+                .map(|h| &h.heap);
+            let title = self
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            if memory_heap && let Some(h) = crate::memory::heap() {
-                heaps.insert(0, Some(h.heap.clone()));
+                .map(|h| &h.heap);
+            for heap in ours.into_iter().chain(title) {
+                list.keep(heap);
+                heaps[n] = Some(heap.clone());
+                n += 1;
             }
-            heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
-            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            unsafe { list.list.SetDescriptorHeaps(&heaps[..n]) };
             self.host_heaps = want;
             self.host_roots = [0; 2];
         }
@@ -870,6 +891,7 @@ impl State {
         readable(list, &written, &view);
         self.bind_heaps(list, false);
         list.keep(&resource);
+        list.flush_barriers();
         let gpu = visible.gpu(slot);
         // SAFETY: an open list; both slots view the live resource.
         unsafe {
@@ -912,6 +934,7 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        list.flush_barriers();
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
@@ -996,6 +1019,7 @@ impl State {
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
+                    list.flush_barriers();
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
@@ -1264,9 +1288,9 @@ impl State {
                         UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
                     },
                 };
-                // SAFETY: an open list.
-                unsafe { list.list.ResourceBarrier(&[all]) };
+                list.queue_barrier(all);
                 crate::list::ensure_state(list, r as This, COPY_SOURCE);
+                list.flush_barriers();
                 let read = crate::capture::read_back(&host.device, &list.list, t);
                 crate::list::ensure_state(list, r as This, UNORDERED);
                 let Some((buffer, f)) = read else { continue };
@@ -1363,6 +1387,7 @@ impl State {
                 false
             });
         if ran {
+            list.flush_barriers();
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
                 (vertices / 3 * 6, 0)
@@ -1465,6 +1490,7 @@ impl State {
         }
         let ran = !rects && self.prepare(list, true);
         if ran {
+            list.flush_barriers();
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -1580,6 +1606,7 @@ impl State {
             }
             return false;
         }
+        list.flush_barriers();
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
@@ -2062,6 +2089,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         out: Option<&ID3D12Resource>,
         groups: (u32, u32),
     ) {
+        list.flush_barriers();
         // SAFETY: an open list and live objects.
         unsafe {
             list.list.SetDescriptorHeaps(&[Some(slots.0.clone())]);
@@ -2233,6 +2261,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(list.take_rebind(), "the conversion ran in the list");
         run(&list, &slots, &read, 2, Some(&out), (8, 8));
         crate::list::ensure_state(&list, depth, 0x800);
+        list.flush_barriers();
         let at = |r: &ID3D12Resource, sub: u32| D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the copy does not release.
             pResource: unsafe { std::mem::transmute_copy(r) },
@@ -2274,6 +2303,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // the unordered view: copied to the twin, converted back.
         list.reset();
         crate::list::ensure_state(&list, depth, 0x10);
+        list.flush_barriers();
         let dsv = D3D12_DEPTH_STENCIL_VIEW_DESC {
             Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D24_UNORM_S8_UINT,
             ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,

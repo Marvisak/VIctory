@@ -328,6 +328,10 @@ pub(crate) struct HostList {
     /// by host copy: the side its first use needs and the side it leaves
     /// newer.
     twins: Mutex<std::collections::HashMap<usize, crate::twin::Use>>,
+    /// Barriers recorded but not yet given to the list: given at once, in
+    /// order, before the next command that may depend on them
+    /// ([`HostList::flush_barriers`]).
+    pending_barriers: Mutex<Vec<D3D12_RESOURCE_BARRIER>>,
     /// A copy of ours replaced the list's compute root signature and
     /// pipeline: draws and dispatches set theirs again.
     rebind: std::sync::atomic::AtomicBool,
@@ -395,18 +399,25 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
 }
 
 /// Upload chunks handed out front to back: the chunks, the one in use and
-/// the bytes used in it.
+/// the bytes used in it; and upload buffers too big for a chunk, kept
+/// across resets for copies of a similar size ([`HostList::upload`]).
 #[derive(Default)]
 struct Scratch {
     chunks: Vec<(ID3D12Resource, usize, u64)>,
     current: usize,
     used: u64,
+    /// Big upload buffers free for reuse: buffer, mapping, size.
+    large_free: Vec<(ID3D12Resource, usize, u64)>,
+    /// Big upload buffers the open list uses, free again at its reset.
+    large_used: Vec<(ID3D12Resource, usize, u64)>,
 }
 
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+/// Big upload buffers a list keeps across resets.
+const MAX_LARGE_UPLOADS: usize = 2;
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -567,6 +578,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                pending_barriers: Mutex::default(),
                 rebind: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
@@ -1073,6 +1085,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.flush_barriers();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1096,6 +1109,10 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.pending_barriers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1104,6 +1121,14 @@ impl HostList {
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
+            let used = std::mem::take(&mut scratch.large_used);
+            scratch.large_free.extend(used);
+            if scratch.large_free.len() > MAX_LARGE_UPLOADS {
+                scratch
+                    .large_free
+                    .sort_by_key(|&(_, _, size)| std::cmp::Reverse(size));
+                scratch.large_free.truncate(MAX_LARGE_UPLOADS);
+            }
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -1114,6 +1139,53 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+    }
+
+    /// Queues a transition of `resource`, if it changes its state, until
+    /// the next [`HostList::flush_barriers`].
+    pub(crate) fn queue_transition(
+        &self,
+        resource: &ID3D12Resource,
+        before: D3D12_RESOURCE_STATES,
+        after: D3D12_RESOURCE_STATES,
+    ) {
+        if before != after {
+            self.queue_barrier(transition(resource, before, after));
+        }
+    }
+
+    /// Queues `barrier` until the next [`HostList::flush_barriers`]; its
+    /// resource must live until the list is reset.
+    pub(crate) fn queue_barrier(&self, barrier: D3D12_RESOURCE_BARRIER) {
+        let mut pending = self
+            .pending_barriers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        push_barrier(&mut pending, barrier);
+    }
+
+    /// Records the queued barriers in one call. Everything that records a
+    /// command into the list (or a barrier of its own) calls this first.
+    pub(crate) fn flush_barriers(&self) {
+        let mut pending = self
+            .pending_barriers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if pending.is_empty() {
+            return;
+        }
+        // SAFETY: an open list; every resource queued lives until the list
+        // is reset (`queue_barrier`).
+        unsafe { self.list.ResourceBarrier(&pending) };
+        pending.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_barrier_count(&self) -> usize {
+        self.pending_barriers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -1410,15 +1482,56 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
-    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().uploads.push(buffer.clone());
-        Some((buffer, data))
+    /// `size` bytes of mapped upload memory until the list is reset: the
+    /// buffer, the offset in it (512-byte aligned, as texture copies need)
+    /// and the CPU pointer. Small ones come from the list's scratch
+    /// chunks, big ones from buffers it keeps across resets.
+    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        const ALIGN: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
+        let len = size.max(1).next_multiple_of(ALIGN);
+        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if len <= SCRATCH_CHUNK {
+            let at = s.used.next_multiple_of(ALIGN);
+            if at + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+                (s.current, s.used) = (s.current + 1, 0);
+            } else {
+                s.used = at;
+            }
+            if s.current == s.chunks.len() {
+                let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
+                name(&buffer, || "list scratch".into());
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                s.chunks.push((buffer, data as usize, gpu));
+                s.used = 0;
+            }
+            let (buffer, data, _) = &s.chunks[s.current];
+            let (buffer, data, at) = (buffer.clone(), *data, s.used);
+            s.used += len;
+            return Some((buffer, at, (data + at as usize) as *mut u8));
+        }
+        // A kept buffer at most twice the size needed, the smallest.
+        if let Some(i) = s
+            .large_free
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, cap))| (len..=len.saturating_mul(2)).contains(cap))
+            .min_by_key(|(_, (_, _, cap))| *cap)
+            .map(|(i, _)| i)
+        {
+            let entry = s.large_free.swap_remove(i);
+            let found = (entry.0.clone(), 0, entry.1 as *mut u8);
+            s.large_used.push(entry);
+            return Some(found);
+        }
+        let (buffer, data) = host.upload_buffer(len)?;
+        name(&buffer, || format!("list upload {len:#x}"));
+        if s.large_used.len() + s.large_free.len() < MAX_LARGE_UPLOADS {
+            s.large_used.push((buffer.clone(), data as usize, len));
+        } else {
+            self.deferred().uploads.push(buffer.clone());
+        }
+        Some((buffer, 0, data))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
@@ -2376,6 +2489,80 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
     text
 }
 
+/// Appends `barrier` to the queued `barriers`, folding a transition into
+/// the queued one of the same resource it continues (`A -> B` and `B -> C`
+/// make `A -> C`; `A -> B -> A` makes none, or a UAV barrier if `A` is
+/// unordered access) and dropping a global UAV
+/// barrier right after another. Split barriers are never folded.
+fn push_barrier(barriers: &mut Vec<D3D12_RESOURCE_BARRIER>, barrier: D3D12_RESOURCE_BARRIER) {
+    if barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION
+        && barrier.Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE
+    {
+        // SAFETY: a transition barrier.
+        let t = unsafe { &barrier.Anonymous.Transition };
+        let (raw, sub) = (t.pResource.as_ref().map(Interface::as_raw), t.Subresource);
+        let (before, after) = (t.StateBefore, t.StateAfter);
+        if before == after {
+            return;
+        }
+        // Back over transitions only: past any other barrier, order counts.
+        for i in (0..barriers.len()).rev() {
+            if barriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION {
+                break;
+            }
+            let flags = barriers[i].Flags;
+            // SAFETY: a transition barrier.
+            let prev = unsafe { &mut barriers[i].Anonymous.Transition };
+            if prev.pResource.as_ref().map(Interface::as_raw) != raw {
+                continue;
+            }
+            if flags == D3D12_RESOURCE_BARRIER_FLAG_NONE
+                && prev.Subresource == sub
+                && prev.StateAfter == before
+            {
+                if prev.StateBefore != after {
+                    prev.StateAfter = after;
+                    return;
+                }
+                // Back where it was: no transition, but shader writes
+                // before still finish before shader access after.
+                let unordered = after.0 & D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 != 0;
+                // SAFETY: a borrowed pointer; the barrier never releases it.
+                let resource =
+                    unordered.then(|| unsafe { std::mem::transmute_copy(&prev.pResource) });
+                match resource {
+                    Some(resource) => {
+                        barriers[i] = D3D12_RESOURCE_BARRIER {
+                            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                    pResource: resource,
+                                }),
+                            },
+                        };
+                    }
+                    None => {
+                        barriers.remove(i);
+                    }
+                }
+                return;
+            }
+            break;
+        }
+    } else if barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV
+        // SAFETY: a UAV barrier.
+        && unsafe { barrier.Anonymous.UAV.pResource.is_none() }
+        && barriers.last().is_some_and(|last| {
+            // SAFETY: a UAV barrier.
+            last.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV && unsafe { last.Anonymous.UAV.pResource.is_none() }
+        })
+    {
+        return;
+    }
+    barriers.push(barrier);
+}
+
 pub(crate) fn transition(
     resource: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
@@ -2491,6 +2678,120 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!batch.texture_due(&a));
         assert!(!batch.texture_due(&a.clone()));
         assert!(!batch.texture_due(&b));
+    }
+
+    /// Queued transitions of a resource fold into one; one back where it
+    /// was is dropped, or kept as a UAV barrier from unordered access; the
+    /// batch is valid on the device (closed and run).
+    #[test]
+    fn queued_barriers_fold_and_run() {
+        use super::host;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = host() else {
+            return;
+        };
+        let texture = || {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+                    | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut out: Option<ID3D12Resource> = None;
+            // SAFETY: a plain default texture.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut out,
+                    )
+                    .unwrap();
+            }
+            out.unwrap()
+        };
+        let (a, b, c) = (texture(), texture(), texture());
+        let list = host.new_list().unwrap();
+        let (common, target, source, dest, unordered) = (
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        // a: common -> target -> source is one transition.
+        list.queue_transition(&a, common, target);
+        list.queue_transition(&a, target, source);
+        // b: common -> target -> common is none; then common -> dest.
+        list.queue_transition(&b, common, target);
+        list.queue_transition(&b, target, common);
+        list.queue_transition(&b, common, dest);
+        assert_eq!(list.pending_barrier_count(), 2);
+        // c: unordered -> source -> unordered is a UAV barrier.
+        list.queue_transition(&c, common, unordered);
+        list.flush_barriers();
+        list.queue_transition(&c, unordered, source);
+        list.queue_transition(&c, source, unordered);
+        assert_eq!(list.pending_barrier_count(), 1);
+        list.flush_barriers();
+        assert_eq!(list.pending_barrier_count(), 0);
+        // SAFETY: an open list; a in the copy source state, b copy dest.
+        unsafe { list.list.CopyResource(&b, &a) };
+        // Queued at close.
+        list.queue_transition(&a, source, common);
+        list.queue_transition(&b, dest, common);
+        list.queue_transition(&c, unordered, common);
+        list.close();
+        assert_eq!(list.pending_barrier_count(), 0);
+        host.execute(&[&list]);
+        list.reset();
+    }
+
+    /// Uploads share the list's scratch chunks at 512-byte offsets; a big
+    /// one's buffer is used again after the list is reset.
+    #[test]
+    fn uploads_are_pooled_across_resets() {
+        use super::{SCRATCH_CHUNK, host};
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let (small, at, _) = list.upload(host, 100).unwrap();
+        let (next, next_at, _) = list.upload(host, 300).unwrap();
+        assert_eq!(small.as_raw(), next.as_raw(), "one chunk");
+        assert_eq!((at, next_at), (0, 512));
+        let big = SCRATCH_CHUNK + 4096;
+        let (first, first_at, _) = list.upload(host, big).unwrap();
+        assert_eq!(first_at, 0);
+        list.close();
+        list.reset();
+        let (again, again_at, _) = list.upload(host, 100).unwrap();
+        assert_eq!(
+            (again.as_raw(), again_at),
+            (small.as_raw(), 0),
+            "the chunk again"
+        );
+        let (second, _, _) = list.upload(host, big).unwrap();
+        assert_eq!(second.as_raw(), first.as_raw(), "the big buffer again");
+        list.close();
     }
 
     #[test]

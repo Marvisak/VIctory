@@ -435,6 +435,7 @@ pub(crate) fn read_indirect(
     (kind, stride, max): (u32, u32, u32),
     name: String,
 ) {
+    list.flush_barriers();
     struct Readback(ID3D12Resource);
     // SAFETY: D3D12 objects are free-threaded.
     unsafe impl Send for Readback {}

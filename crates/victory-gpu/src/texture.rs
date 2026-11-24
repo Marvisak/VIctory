@@ -152,6 +152,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     crate::texture::host_written(to);
     crate::list::ensure_state(list, from, COPY_SOURCE);
     crate::list::ensure_state(list, to, COPY_DEST);
+    list.flush_barriers();
     let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the copy does not release.
         pResource: unsafe { std::mem::transmute_copy(r) },
@@ -235,6 +236,7 @@ pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Re
 fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &Staging) {
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
+    list.flush_barriers();
     for (i, footprint) in staging.footprints.iter().enumerate() {
         #[cfg(feature = "diagnostics")]
         {

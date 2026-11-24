@@ -292,6 +292,8 @@ fn integer(format: u32) -> bool {
 /// unordered access the twin's planes are moved there and true returned:
 /// the depth texture itself is not used.
 pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, wanted: u32) -> bool {
+    // What the list queued comes before the copy and barriers recorded here.
+    list.flush_barriers();
     let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
     let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
     if let Some(to_depth) = list.twin_use(depth, side, writes)
