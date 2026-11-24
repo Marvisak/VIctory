@@ -5,9 +5,8 @@
 //!
 //! Host pipelines are made on a pipeline's first draw, not at creation:
 //! Grand Theft Auto VI creates some 60,000 pipelines in its first 20
-//! seconds and draws with a few dozen (decision 0007, step 3). Shader
-//! containers are shared by content hash and translated once, on first
-//! use (decision 0003).
+//! seconds and draws with a few dozen. Shader containers are shared by
+//! content hash and translated once, on first use.
 //!
 //! shortcut: only vertex plus pixel pipelines from streams and compute
 //! pipelines get host pipelines; mesh, tessellation and geometry stages,

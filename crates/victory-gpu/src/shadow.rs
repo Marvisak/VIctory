@@ -1,5 +1,5 @@
-//! Host copies of title buffers (decision 0007, step 3 and "Copies of title
-//! memory"). Title buffers are title memory, which the host GPU cannot
+//! Host copies of title buffers.
+//! Title buffers are title memory, which the host GPU cannot
 //! read, so a buffer a draw uses gets a persistent host buffer of its size
 //! on first use (system memory shaders may also write), and the ranges each
 //! submission reads (vertex, index and constant data, buffer views) are

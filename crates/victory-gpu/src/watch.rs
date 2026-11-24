@@ -1,5 +1,5 @@
-//! Which title memory the title wrote since a host copy took it (decision
-//! 0007, "Copies of title memory"). The runtime reserves title GPU memory
+//! Which title memory the title wrote since a host copy took it.
+//! The runtime reserves title GPU memory
 //! with write watching (`victory-hle` xmem), so the kernel keeps a dirty bit
 //! per 4 KiB page; asking for a range's written pages also clears them. Host
 //! copies of the same memory can overlap (nested buffers, textures in

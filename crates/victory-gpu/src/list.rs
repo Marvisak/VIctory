@@ -5,8 +5,8 @@
 //! lists keep the pointer and every limit at zero, so every command reaches
 //! the table as a call.
 //!
-//! Each list records onto a host command list as its methods are called
-//! (decision 0007); draw state lives in `crate::draw`. Methods not
+//! Each list records onto a host command list as its methods are called;
+//! draw state lives in `crate::draw`. Methods not
 //! written yet log once with their caller, so a run lists what to do next.
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
@@ -116,7 +116,7 @@ struct List {
     newer: [u32; 256],
     /// Ours, after the console layout: memory handed out by
     /// [`allocate_upload`], kept until the list is reset; the host list the
-    /// calls record into (decision 0007), and the draw state the title set.
+    /// calls record into, and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Vec<u8>>>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
@@ -915,7 +915,7 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// arguments, nothing returned.
 extern "system" fn ignored_state(_: This) {}
 
-/// The title's draw state (decision 0007, step 3), kept for its draws or
+/// The title's draw state, kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
@@ -1140,7 +1140,7 @@ fn count_draw() {
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
 /// dispatches, counted per frame for the log.
-/// shortcut: dropped until their shaders translate (decision 0007).
+/// shortcut: dropped until their shaders translate.
 #[cfg(not(windows))]
 extern "system" fn draw(_: This) {
     count_draw();

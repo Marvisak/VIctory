@@ -1,5 +1,5 @@
-//! Host descriptor heaps behind the title's shader-visible heaps (decision
-//! 0007, step 3). Translated shaders index the heaps directly at the
+//! Host descriptor heaps behind the title's shader-visible heaps.
+//! Translated shaders index the heaps directly at the
 //! title's descriptor positions, so each host heap keeps the title heap's
 //! order: slot `i` is made from what the title wrote at slot `i`, when it
 //! writes it (view creation and descriptor copies) and again when a draw
