@@ -123,6 +123,10 @@ deletion has to update the contract in the same commit. What it checks:
   `// SAFETY:`), are not citations and are not checked.
 - To mention a path that must not exist, say it in words, not in a code
   span.
+- The repository has no decision records, so the `portable` job also
+  fails on any `.rs` or `.md` line citing one by number (the word
+  "decision", a space, then a four-digit number starting with 0). Put the
+  reason itself in the comment instead.
 
 ## Pitfalls seen in this repository
 
