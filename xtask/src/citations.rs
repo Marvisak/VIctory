@@ -176,7 +176,7 @@ mod tests {
     fn bare_names_globs_and_code_are_not_citations() {
         let doc = "`lib.rs` `Cargo.toml` `*.rs` `crates/*/src` `// SAFETY:` \
                    `unwrap`/`expect` `emit::host` `a/b c` `../x/y` `./x` `a//b` \
-                   `x/y:` `x/y:3a` `cfg(all(test, ...))` `https://example.com/x`\n";
+                   `x/y:` `x/y:3a` `foo(a, b)` `https://example.com/x`\n";
         assert_eq!(extract(doc), []);
     }
 
