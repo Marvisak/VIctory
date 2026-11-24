@@ -5,3 +5,8 @@ too-many-arguments-threshold = 5
 cognitive-complexity-threshold = 15
 # Keep this aligned with workspace.package.rust-version in Cargo.toml.
 msrv = "1.88"
+# `unwrap_used`/`expect_used` are on workspace-wide (root Cargo.toml) to keep
+# panics off paths title code reaches; a failing test should panic, so tests
+# are exempt (again only under a plain `#[cfg(test)]`).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

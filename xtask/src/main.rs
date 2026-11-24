@@ -47,7 +47,7 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    let root = workspace_root();
+    let root = workspace_root()?;
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
         Cmd::Citations { docs } => citations::run(&root, &docs),
@@ -58,13 +58,19 @@ fn main() -> Result<()> {
                 .current_dir(&root)
                 .status()
                 .context("running git")?;
-            anyhow::ensure!(status.success(), "git config failed (is this a git repository?)");
+            anyhow::ensure!(
+                status.success(),
+                "git config failed (is this a git repository?)"
+            );
             println!("hooks installed: commits now run `cargo xtask policy --staged`");
             Ok(())
         }
     }
 }
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask lives in the workspace").into()
+fn workspace_root() -> Result<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .context("xtask's manifest directory has no parent (the workspace root)")
 }

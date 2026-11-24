@@ -48,7 +48,9 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
 
 fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
     let u32_at = |o: usize| {
-        file.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
+        file.get(o..)?
+            .first_chunk()
+            .map(|&b| u32::from_le_bytes(b) as usize)
     };
     let n = u32_at(at.checked_sub(4)?)?;
     let unpacked_size = u32_at(at + 8)?;
@@ -67,7 +69,10 @@ fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
 
 /// The printable name that ends at `nul` and follows its length byte.
 fn name_before(file: &[u8], nul: usize) -> Option<&str> {
-    let run = file[..nul].iter().rposition(|b| !b.is_ascii_graphic()).map_or(0, |p| p + 1);
+    let run = file[..nul]
+        .iter()
+        .rposition(|b| !b.is_ascii_graphic())
+        .map_or(0, |p| p + 1);
     // From 32 characters on, the length byte is printable too.
     (run.saturating_sub(1)..nul)
         .find(|&l| usize::from(file[l]) == nul - l)
@@ -96,7 +101,11 @@ mod tests {
         let long = format!("PS_{}_Wrapped", "x".repeat(40));
         let mut file = MAGIC.to_vec();
         file.extend_from_slice(&[1, 2, 3, 4]);
-        file.extend(record_bytes("VS_Blit_0011aabb_Wrapped", 0x32, b"first container"));
+        file.extend(record_bytes(
+            "VS_Blit_0011aabb_Wrapped",
+            0x32,
+            b"first container",
+        ));
         // A marker whose sizes disagree is not a record.
         file.extend_from_slice(&[9, 0, 0, 0, 0xE7, 0xDC, 0x0D, 0, 8, 0, 0, 0]);
         file.extend(record_bytes(&long, 0x41, &[7; 300]));

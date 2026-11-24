@@ -234,12 +234,15 @@ impl Bools {
             return false;
         }
         all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
-        if all.is_empty() || *budget == 0 {
+        let top = |b: Bool| self.nodes[b.0 as usize].0;
+        // No decision left (`min` of nothing): every lane meets it.
+        let Some(v) = all.iter().map(|&(b, _)| top(b)).min() else {
+            return true;
+        };
+        if *budget == 0 {
             return true;
         }
         *budget -= 1;
-        let top = |b: Bool| self.nodes[b.0 as usize].0;
-        let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
         [false, true].into_iter().any(|value| {
             let next = all
                 .iter()
