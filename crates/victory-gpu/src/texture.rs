@@ -297,7 +297,12 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     }
     let host = host()?;
     // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
+    let mut d = unsafe { texture.GetDesc() };
+    // Use the title's concrete format when the host texture is typeless so
+    // `CopyTextureRegion` footprints never carry a `TYPELESS` format.
+    if let Some(concrete) = crate::resource::view_format(resource) {
+        d.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(concrete as i32);
+    }
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {

@@ -598,6 +598,133 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
+/// Builds a default SRV description for a typeless host texture using the
+/// title's concrete `format`.
+fn default_srv_desc(
+    texture: &ID3D12Resource,
+    format: DXGI_FORMAT,
+) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if d.DepthOrArraySize > 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+            desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::MAX,
+                FirstArraySlice: 0,
+                ArraySize: u32::from(d.DepthOrArraySize),
+                ResourceMinLODClamp: 0.0,
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+            desc.Anonymous.Texture1D = D3D12_TEX1D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::MAX,
+                ResourceMinLODClamp: 0.0,
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.SampleDesc.Count > 1 && d.DepthOrArraySize > 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+            desc.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV {
+                FirstArraySlice: 0,
+                ArraySize: u32::from(d.DepthOrArraySize),
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.SampleDesc.Count > 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.DepthOrArraySize > 1 => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::MAX,
+                FirstArraySlice: 0,
+                ArraySize: u32::from(d.DepthOrArraySize),
+                PlaneSlice: 0,
+                ResourceMinLODClamp: 0.0,
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::MAX,
+                PlaneSlice: 0,
+                ResourceMinLODClamp: 0.0,
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: u32::MAX,
+                ResourceMinLODClamp: 0.0,
+            };
+        }
+        _ => return None,
+    }
+    Some(desc)
+}
+
+/// Builds a default UAV description for a typeless host texture using the
+/// title's concrete `format`.
+fn default_uav_desc(
+    texture: &ID3D12Resource,
+    format: DXGI_FORMAT,
+) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if d.SampleDesc.Count > 1 {
+        return None;
+    }
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: format,
+        ..Default::default()
+    };
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if d.DepthOrArraySize > 1 => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+            desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                MipSlice: 0,
+                FirstArraySlice: 0,
+                ArraySize: u32::from(d.DepthOrArraySize),
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.DepthOrArraySize > 1 => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                MipSlice: 0,
+                FirstArraySlice: 0,
+                ArraySize: u32::from(d.DepthOrArraySize),
+                PlaneSlice: 0,
+            };
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                MipSlice: 0,
+                FirstWSlice: 0,
+                WSize: u32::MAX,
+            };
+        }
+        _ => return None,
+    }
+    Some(desc)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -626,6 +753,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
                 let mut desc = desc.as_ref().map(srv_desc);
+                if let Some(view_fmt) = crate::resource::view_format(resource) {
+                    let concrete = DXGI_FORMAT(view_fmt as i32);
+                    match desc.as_mut() {
+                        Some(d) if d.Format == DXGI_FORMAT_UNKNOWN => d.Format = concrete,
+                        Some(_) => {}
+                        None => desc = default_srv_desc(texture, concrete),
+                    }
+                }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -657,6 +792,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 };
             };
             let mut desc = desc.as_ref().map(uav_desc);
+            if let Some(view_fmt) = crate::resource::view_format(resource) {
+                let concrete = DXGI_FORMAT(view_fmt as i32);
+                match desc.as_mut() {
+                    Some(d) if d.Format == DXGI_FORMAT_UNKNOWN => d.Format = concrete,
+                    Some(_) => {}
+                    None => desc = default_uav_desc(texture, concrete),
+                }
+            }
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
@@ -870,5 +1013,162 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+    }
+
+    /// sRGB-castable textures are backed by typeless host resources so explicit
+    /// `_SRGB` SRVs and RTVs keep their sRGB format, UAVs map cleanly to linear
+    /// UNORM, and null-description views still succeed.
+    #[test]
+    fn srgb_views_preserved_on_srgb_castable_textures() {
+        use crate::object::{This, slot};
+
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let resource = crate::resource::test_committed_texture(
+            4,
+            4,
+            1,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            0x1 | 0x4, // ALLOW_RENDER_TARGET | ALLOW_UNORDERED_ACCESS
+        );
+        let tex = crate::resource::host_resource(resource).expect("host texture");
+        // SAFETY: live host texture.
+        let tex_desc = unsafe { tex.GetDesc() };
+        assert_eq!(tex_desc.Format, DXGI_FORMAT_R8G8B8A8_TYPELESS);
+
+        // Explicit `_SRGB` SRV format is preserved rather than forced linear.
+        let mut srgb = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        assert!(fits(tex, Some(&mut srgb), false));
+        assert_eq!(srgb, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+
+        // UAV maps `_SRGB` to its linear UNORM twin as D3D12 requires.
+        let mut uav_fmt = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        assert!(fits(tex, Some(&mut uav_fmt), true));
+        assert_eq!(uav_fmt, DXGI_FORMAT_R8G8B8A8_UNORM);
+
+        // Build real host descriptors for explicit `_SRGB` SRV, null-desc SRV,
+        // UNKNOWN-format SRV, and null-desc UAV.
+        let mut srgb_srv_words = [0u32; 10];
+        srgb_srv_words[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB.0 as u32;
+        srgb_srv_words[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+        srgb_srv_words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        // MipLevels sits at word 5 (after 4-byte union alignment pad at word 3
+        // and MostDetailedMip at word 4).
+        srgb_srv_words[5] = 1;
+        assert!(
+            make(
+                &View::Shader(resource as usize, Some(srgb_srv_words)),
+                heap.cpu(0)
+            )
+            .is_some()
+        );
+
+        let mut unknown_srv_words = srgb_srv_words;
+        unknown_srv_words[0] = 0;
+        assert!(
+            make(
+                &View::Shader(resource as usize, Some(unknown_srv_words)),
+                heap.cpu(1)
+            )
+            .is_some()
+        );
+        assert!(make(&View::Shader(resource as usize, None), heap.cpu(2)).is_some());
+        assert!(make(&View::Unordered(resource as usize, 0, None), heap.cpu(3)).is_some());
+
+        // RTV records preserve explicit `_SRGB` and fill `None`/UNKNOWN with concrete format.
+        let mut rtv_slot = [0u8; 112];
+        let srgb_rtv = [
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB.0 as u32,
+            D3D12_RTV_DIMENSION_TEXTURE2D.0 as u32,
+            0,
+            0,
+            0,
+            0,
+        ];
+        crate::descriptor::create_rtv(
+            std::ptr::null(),
+            resource,
+            &srgb_rtv,
+            rtv_slot.as_mut_ptr() as u64,
+        );
+        let rec = crate::descriptor::rtv_record(rtv_slot.as_ptr() as u64).unwrap();
+        assert_eq!(rec.desc().unwrap().Format, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+
+        crate::descriptor::create_rtv(
+            std::ptr::null(),
+            resource,
+            std::ptr::null(),
+            rtv_slot.as_mut_ptr() as u64,
+        );
+        let rec = crate::descriptor::rtv_record(rtv_slot.as_ptr() as u64).unwrap();
+        let rtv_desc = rec.desc().unwrap();
+        assert_eq!(rtv_desc.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(rtv_desc.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2D);
+        let host = host().unwrap();
+        let _ = host.rtv(tex, Some(&rtv_desc));
+
+        // Null-desc RTV on 2D-array and MSAA sRGB-castable textures must
+        // synthesize the matching RTV dimension (not hardcoded TEXTURE2D).
+        let array_res = crate::resource::test_committed_texture(
+            4,
+            4,
+            2,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            0x1, // ALLOW_RENDER_TARGET
+        );
+        let array_tex = crate::resource::host_resource(array_res).expect("array texture");
+        crate::descriptor::create_rtv(
+            std::ptr::null(),
+            array_res,
+            std::ptr::null(),
+            rtv_slot.as_mut_ptr() as u64,
+        );
+        let array_rec = crate::descriptor::rtv_record(rtv_slot.as_ptr() as u64).unwrap();
+        let array_rtv = array_rec.desc().unwrap();
+        assert_eq!(array_rtv.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(array_rtv.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: reading `Texture2DArray` union arm just asserted above.
+        assert_eq!(unsafe { array_rtv.Anonymous.Texture2DArray.ArraySize }, 2);
+        let _ = host.rtv(array_tex, Some(&array_rtv));
+
+        let msaa_res = crate::resource::test_committed_texture(
+            4,
+            4,
+            1,
+            4,
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            0x1, // ALLOW_RENDER_TARGET
+        );
+        let msaa_tex = crate::resource::host_resource(msaa_res).expect("msaa texture");
+        crate::descriptor::create_rtv(
+            std::ptr::null(),
+            msaa_res,
+            std::ptr::null(),
+            rtv_slot.as_mut_ptr() as u64,
+        );
+        let msaa_rec = crate::descriptor::rtv_record(rtv_slot.as_ptr() as u64).unwrap();
+        let msaa_rtv = msaa_rec.desc().unwrap();
+        assert_eq!(msaa_rtv.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(msaa_rtv.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DMS);
+        let _ = host.rtv(msaa_tex, Some(&msaa_rtv));
+
+        // SAFETY: plain device health check after creating all views.
+        let removed = unsafe { host.device.GetDeviceRemovedReason() };
+        assert!(removed.is_ok());
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(msaa_res, 0x10)(msaa_res),
+            0
+        );
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(array_res, 0x10)(array_res),
+            0
+        );
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource),
+            0
+        );
     }
 }

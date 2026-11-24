@@ -197,8 +197,66 @@ impl RtvRecord {
     pub(crate) fn desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 4;
-        self.host_desc(TEXTURE_2D)
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        if self.described != 0 {
+            return self.described_host_desc();
+        }
+        let format = DXGI_FORMAT(crate::resource::pc_format(crate::resource::view_format(self.resource)?) as i32);
+        let tex = crate::resource::host_resource(self.resource)?;
+        // SAFETY: live host texture.
+        let d = unsafe { tex.GetDesc() };
+        let mut desc = D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ..Default::default()
+        };
+        match d.Dimension {
+            D3D12_RESOURCE_DIMENSION_TEXTURE1D if d.DepthOrArraySize > 1 => {
+                desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE1DARRAY;
+                desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_RTV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: u32::from(d.DepthOrArraySize),
+                };
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+                desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE1D;
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                if d.SampleDesc.Count > 1 && d.DepthOrArraySize > 1 =>
+            {
+                desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+                desc.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_RTV {
+                    FirstArraySlice: 0,
+                    ArraySize: u32::from(d.DepthOrArraySize),
+                };
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.SampleDesc.Count > 1 => {
+                desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.DepthOrArraySize > 1 => {
+                desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_RTV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: u32::from(d.DepthOrArraySize),
+                    PlaneSlice: 0,
+                };
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+                desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+                desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+                desc.Anonymous.Texture3D = D3D12_TEX3D_RTV {
+                    MipSlice: 0,
+                    FirstWSlice: 0,
+                    WSize: u32::MAX,
+                };
+            }
+            _ => return None,
+        }
+        Some(desc)
     }
 
     /// The depth view description in the host's type (the same layout).
@@ -206,28 +264,71 @@ impl RtvRecord {
     pub(crate) fn depth_desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 3;
-        self.host_desc(TEXTURE_2D)
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        if self.described != 0 {
+            return self.described_host_desc();
+        }
+        let format = DXGI_FORMAT(crate::resource::pc_format(crate::resource::view_format(self.resource)?) as i32);
+        let tex = crate::resource::host_resource(self.resource)?;
+        // SAFETY: live host texture.
+        let d = unsafe { tex.GetDesc() };
+        let mut desc = D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: format,
+            ..Default::default()
+        };
+        match d.Dimension {
+            D3D12_RESOURCE_DIMENSION_TEXTURE1D if d.DepthOrArraySize > 1 => {
+                desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE1DARRAY;
+                desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_DSV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: u32::from(d.DepthOrArraySize),
+                };
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+                desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE1D;
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                if d.SampleDesc.Count > 1 && d.DepthOrArraySize > 1 =>
+            {
+                desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY;
+                desc.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_DSV {
+                    FirstArraySlice: 0,
+                    ArraySize: u32::from(d.DepthOrArraySize),
+                };
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.SampleDesc.Count > 1 => {
+                desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS;
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D if d.DepthOrArraySize > 1 => {
+                desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+                desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_DSV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: u32::from(d.DepthOrArraySize),
+                };
+            }
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+                desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+            }
+            _ => return None,
+        }
+        Some(desc)
     }
 
-    /// The description words as a host type, the format as the host has it.
-    /// Without one, a typeless host copy gets a 2D view (`dimension`) in
-    /// the title's format, which the host needs spelled out.
+    /// Converts an explicit title RTV/DSV description (`self.described != 0`)
+    /// into its host type, filling `DXGI_FORMAT_UNKNOWN` on typeless host
+    /// copies with the title's concrete format.
     #[cfg(windows)]
-    fn host_desc<T>(&self, dimension: u32) -> Option<T> {
+    fn described_host_desc<T>(&self) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
-        let mut words = if self.described != 0 {
-            self.desc
-        } else {
-            [
-                crate::resource::view_format(self.resource)?,
-                dimension,
-                0,
-                0,
-                0,
-                0,
-            ]
-        };
+        let mut words = self.desc;
+        if words[0] == 0
+            && let Some(format) = crate::resource::view_format(self.resource)
+        {
+            words[0] = format;
+        }
         words[0] = crate::resource::pc_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })

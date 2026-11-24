@@ -273,8 +273,23 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
-/// sRGB formats and their linear twins.
-pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
+/// sRGB formats and their linear UNORM twins (color targets and BC formats).
+pub(crate) const SRGB: [(u32, u32); 7] = [
+    (29, 28), // R8G8B8A8
+    (91, 87), // B8G8R8A8
+    (93, 88), // B8G8R8X8
+    (72, 71), // BC1
+    (75, 74), // BC2
+    (78, 77), // BC3
+    (99, 98), // BC7
+];
+
+/// Whether `format` belongs to an sRGB/UNORM pair whose views titles freely
+/// cast between linear and `_SRGB` on the console.
+pub(crate) fn srgb_castable(format: u32) -> bool {
+    SRGB.iter()
+        .any(|&(srgb, linear)| format == srgb || format == linear)
+}
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
@@ -316,7 +331,7 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
+    pub(crate) format: u32,
     width: u32,
     height: u32,
     depth: u32,
@@ -829,9 +844,10 @@ fn host_texture(
     {
         d.format = typeless;
     }
-    // The host has no sRGB unordered access: such textures are typeless,
-    // their unordered access views plain UNORM.
-    if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
+    // Make sRGB-castable textures typeless on the host so both linear UNORM
+    // and `_SRGB` SRV/RTV views (as well as linear UAVs) remain D3D12-valid
+    // without losing sRGB hardware conversion.
+    if srgb_castable(d.format) {
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
@@ -982,6 +998,54 @@ impl Drop for Resource {
             );
         }
     }
+}
+
+/// Test helper: creates a committed 2D texture with the given dimensions,
+/// array slice count, sample count, format, and flags.
+#[cfg(all(test, windows))]
+pub(crate) fn test_committed_texture(
+    width: u64,
+    height: u32,
+    array_size: u16,
+    sample_count: u32,
+    format: u32,
+    flags: u32,
+) -> This {
+    let desc = ResourceDesc {
+        dimension: 3, // TEXTURE_2D
+        alignment: 0,
+        width,
+        height,
+        depth_or_array_size: array_size,
+        mip_levels: 1,
+        format,
+        sample_count,
+        sample_quality: 0,
+        layout: 0,
+        flags,
+    };
+    let props = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 1,
+        visible_nodes: 1,
+    };
+    let mut out = std::ptr::null();
+    assert_eq!(
+        create_committed(
+            std::ptr::null(),
+            &props,
+            0,
+            &desc,
+            0,
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut out,
+        ),
+        S_OK
+    );
+    out
 }
 
 pub(crate) extern "system" fn create_committed(
@@ -1780,6 +1844,147 @@ mod tests {
         for row in 0..4 {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
+        }
+    }
+
+    /// Texture -> buffer `CopyTextureRegion` readback copies host texture
+    /// pixels back into the destination title buffer's memory.
+    #[cfg(windows)]
+    #[test]
+    fn texture_to_buffer_copy_reads_back_into_title_memory() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        const COPY_DEST: u32 = 0x400;
+        let (mut image, mut src_buf, mut dst_buf) = (null, null, null);
+        let rgba = texture(4, 4, 28, 1);
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &rgba,
+                COPY_DEST,
+                null.cast(),
+                iid,
+                &mut image
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(1024),
+                0,
+                null.cast(),
+                iid,
+                &mut src_buf
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &buffer(1024),
+                0,
+                null.cast(),
+                iid,
+                &mut dst_buf
+            ),
+            S_OK
+        );
+        let (src_data, _) = buffer_bytes(src_buf).unwrap();
+        let (dst_data, _) = buffer_bytes(dst_buf).unwrap();
+        // SAFETY: both buffers hold 1024 bytes.
+        let src_bytes = unsafe { std::slice::from_raw_parts_mut(src_data, 1024) };
+        for (i, b) in src_bytes.iter_mut().enumerate() {
+            *b = ((i * 7 + 13) % 251) as u8;
+        }
+        // SAFETY: destination buffer holds 1024 bytes.
+        let dst_bytes = unsafe { std::slice::from_raw_parts_mut(dst_data, 1024) };
+        dst_bytes.fill(0);
+
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            S_OK
+        );
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let rows = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 4,
+            height: 4,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let tex_loc = Location {
+            resource: image,
+            kind: 0,
+            footprint: PlacedFootprint { offset: 0, ..rows },
+        };
+        let src_loc = Location {
+            resource: src_buf,
+            kind: 1,
+            footprint: rows,
+        };
+        let dst_loc = Location {
+            resource: dst_buf,
+            kind: 1,
+            footprint: rows,
+        };
+        type Copy =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        // 1) Upload buffer -> texture, 2) Readback texture -> title buffer.
+        slot::<Copy>(list, 0x80)(list, &tex_loc, 0, 0, 0, &src_loc, null.cast());
+        slot::<Copy>(list, 0x80)(list, &dst_loc, 0, 0, 0, &tex_loc, null.cast());
+        slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+        // SAFETY: submission finished and copied back into `dst_buf`.
+        let got = unsafe { std::slice::from_raw_parts(dst_data, 1024) };
+        for row in 0..4 {
+            let at = row * 256;
+            assert_eq!(got[at..at + 16], src_bytes[at..at + 16], "row {row}");
         }
     }
 

@@ -327,16 +327,28 @@ pub(crate) extern "system" fn create_graphics(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description (null is tolerated).
-    let Some(desc) = (unsafe { desc.as_ref() }) else {
+    // SAFETY: the title passes a full `D3D12_GRAPHICS_PIPELINE_STATE_DESC`
+    // (null is tolerated).
+    let Some(head) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    let stages = GRAPHICS_STAGES.iter().zip(&desc.stages);
+    let stages = GRAPHICS_STAGES.iter().zip(&head.stages);
     let shaders = stages.filter_map(|(s, c)| copy(s, c)).collect();
+    #[cfg(windows)]
+    let graphics = {
+        use windows::Win32::Graphics::Direct3D12::D3D12_GRAPHICS_PIPELINE_STATE_DESC;
+        // SAFETY: `CreateGraphicsPipelineState` receives a complete
+        // `D3D12_GRAPHICS_PIPELINE_STATE_DESC` starting with `GraphicsHead`.
+        let full = unsafe { &*desc.cast::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>() };
+        // SAFETY: `full` is valid for the duration of this call.
+        Some(Box::new(unsafe {
+            host::GraphicsState::from_graphics_desc(full)
+        }))
+    };
     hand_out(
         shaders,
         #[cfg(windows)]
-        None,
+        graphics,
         iid,
         out,
     )
@@ -385,10 +397,21 @@ pub(crate) struct StreamDesc {
     stream: *const u8,
 }
 
-/// A subobject type's size (type included), and the stage it is if it is a
-/// shader. The console numbers amplification and mesh shaders 23 and 24
-/// (PC: 24 and 25); its own types from 25 on are not sized yet.
+/// A subobject type's size (type included, padded to 8 bytes), and the stage
+/// it is if it is a shader. The console numbers amplification and mesh
+/// shaders 23 and 24 (PC: 24 and 25); standard D3D12 subobjects 25..=28
+/// (PC `MS`, `DEPTH_STENCIL2`, `RASTERIZER1`, `RASTERIZER2`) are also sized
+/// so streams containing them continue parsing subsequent subobjects cleanly.
 fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
+    #[cfg(windows)]
+    const _: () = {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_DEPTH_STENCIL_DESC2, D3D12_RASTERIZER_DESC1, D3D12_RASTERIZER_DESC2,
+        };
+        assert!((4 + size_of::<D3D12_DEPTH_STENCIL_DESC2>()).next_multiple_of(8) == 64);
+        assert!((4 + size_of::<D3D12_RASTERIZER_DESC1>()).next_multiple_of(8) == 48);
+        assert!((4 + size_of::<D3D12_RASTERIZER_DESC2>()).next_multiple_of(8) == 48);
+    };
     let stage = |name| Some((24, Some(name)));
     match kind {
         1 => stage("vertex"),
@@ -398,15 +421,15 @@ fn subobject(kind: u32) -> Option<(usize, Option<&'static str>)> {
         5 => stage("geometry"),
         6 => stage("compute"),
         23 => stage("amplification"),
-        24 => stage("mesh"),
+        24 | 25 => stage("mesh"),
         0 => Some((16, None)),
         12 | 19 => Some((24, None)),
         7 | 15 => Some((40, None)),
         8 => Some((336, None)),
-        10 => Some((48, None)),
+        10 | 27 | 28 => Some((48, None)),
         11 => Some((56, None)),
         17 => Some((16, None)),
-        21 => Some((64, None)),
+        21 | 26 => Some((64, None)),
         22 => Some((32, None)),
         9 | 13 | 14 | 16 | 18 | 20 => Some((8, None)),
         _ => None,
@@ -439,17 +462,28 @@ pub(crate) extern "system" fn create_stream(
             tracing::warn!(
                 kind,
                 at,
+                remaining = desc.size - at,
                 "pipeline subobject of unknown size; the rest is ignored"
             );
             break;
         };
+        if at + size > desc.size {
+            tracing::warn!(
+                kind,
+                at,
+                size,
+                remaining = desc.size - at,
+                "truncated pipeline subobject; the rest is ignored"
+            );
+            break;
+        }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
+            // SAFETY: a shader subobject has its bytecode at +8 and `at + size <= desc.size`.
             let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
             shaders.extend(copy(stage, code));
         }
         #[cfg(windows)]
-        // SAFETY: a whole subobject of this kind lies at `at`.
+        // SAFETY: a whole subobject of this kind lies within `desc.size` at `at`.
         unsafe {
             graphics.read(kind, desc.stream.add(at))
         };
@@ -527,42 +561,183 @@ mod tests {
     #[test]
     fn pipelines_keep_their_shaders() {
         let (vs, ps) = ([1u8, 2, 3], [4u8; 5]);
-        let none = || Bytecode {
-            code: std::ptr::null(),
-            size: 0,
-        };
-        let desc = GraphicsHead {
-            root: std::ptr::null(),
-            stages: [
-                Bytecode {
-                    code: vs.as_ptr(),
-                    size: vs.len(),
+        #[cfg(windows)]
+        let (p, q) = {
+            use windows::Win32::Graphics::Direct3D12::*;
+            use windows::Win32::Graphics::Dxgi::Common::*;
+            let semantic = c"POSITION";
+            let element = D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: windows::core::PCSTR(semantic.as_ptr().cast()),
+                SemanticIndex: 0,
+                Format: DXGI_FORMAT_R32G32B32_FLOAT,
+                InputSlot: 0,
+                AlignedByteOffset: 0,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            };
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                VS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: vs.as_ptr().cast(),
+                    BytecodeLength: vs.len(),
                 },
-                Bytecode {
-                    code: ps.as_ptr(),
-                    size: ps.len(),
+                PS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: ps.as_ptr().cast(),
+                    BytecodeLength: ps.len(),
                 },
-                none(),
-                none(),
-                none(),
-            ],
+                SampleMask: 0x0f,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                    pInputElementDescs: &element,
+                    NumElements: 1,
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                DSVFormat: DXGI_FORMAT_D32_FLOAT,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            let mut p = std::ptr::null();
+            assert_eq!(
+                create_graphics(
+                    std::ptr::null(),
+                    (&raw const desc).cast::<GraphicsHead>(),
+                    &PIPELINE_IIDS[0],
+                    &mut p
+                ),
+                S_OK
+            );
+            let g = pipeline(p)
+                .host
+                .graphics
+                .as_deref()
+                .expect("plain graphics PSO must capture GraphicsState");
+            assert_eq!(g.topology, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+            assert_eq!(g.targets.NumRenderTargets, 1);
+            assert_eq!(g.targets.RTFormats[0], DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+            let mut q = std::ptr::null();
+            assert_eq!(
+                create_graphics(
+                    std::ptr::null(),
+                    (&raw const desc).cast::<GraphicsHead>(),
+                    &PIPELINE_IIDS[0],
+                    &mut q
+                ),
+                S_OK
+            );
+            (p, q)
         };
-        let mut p = std::ptr::null();
-        assert_eq!(
-            create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
-            S_OK
-        );
+        #[cfg(not(windows))]
+        let (p, q) = {
+            let none = || Bytecode {
+                code: std::ptr::null(),
+                size: 0,
+            };
+            let desc = GraphicsHead {
+                root: std::ptr::null(),
+                stages: [
+                    Bytecode {
+                        code: vs.as_ptr(),
+                        size: vs.len(),
+                    },
+                    Bytecode {
+                        code: ps.as_ptr(),
+                        size: ps.len(),
+                    },
+                    none(),
+                    none(),
+                    none(),
+                ],
+            };
+            let mut p = std::ptr::null();
+            assert_eq!(
+                create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+                S_OK
+            );
+            let mut q = std::ptr::null();
+            create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q);
+            (p, q)
+        };
         assert_eq!(
             shaders(p),
             [("vertex", vs.to_vec()), ("pixel", ps.to_vec())]
         );
         // A second pipeline with the same pixel shader shares its container.
-        let mut q = std::ptr::null();
-        create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q);
         assert!(Arc::ptr_eq(
             &pipeline(p).shaders[1],
             &pipeline(q).shaders[1]
         ));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    #[test]
+    fn stream_parses_subobjects_25_to_28_without_aborting() {
+        let (ms, ps) = ([7u8; 6], [8u8; 4]);
+        // Stream layout:
+        // 0x00: kind 25 (PC MS, 24 bytes)
+        // 0x18: kind 26 (DEPTH_STENCIL2, 64 bytes)
+        // 0x58: kind 27 (RASTERIZER1, 48 bytes)
+        // 0x88: kind 28 (RASTERIZER2, 48 bytes)
+        // 0xb8: kind 2  (PS, 24 bytes)
+        // 0xd0: kind 14 (PRIMITIVE_TOPOLOGY = 3, 8 bytes)
+        // 0xd8: kind 15 (RENDER_TARGET_FORMATS = 1 x 29, 40 bytes)
+        let mut stream = vec![0u8; 0x100];
+        let put_u32 = |buf: &mut [u8], at: usize, v: u32| {
+            buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        let put_u64 = |buf: &mut [u8], at: usize, v: u64| {
+            buf[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        };
+
+        put_u32(&mut stream, 0x00, 25);
+        put_u64(&mut stream, 0x08, ms.as_ptr() as u64);
+        put_u64(&mut stream, 0x10, ms.len() as u64);
+
+        put_u32(&mut stream, 0x18, 26); // DEPTH_STENCIL2
+        put_u32(&mut stream, 0x58, 27); // RASTERIZER1
+        put_u32(&mut stream, 0x88, 28); // RASTERIZER2
+        put_u32(&mut stream, 0x8c, 3); // FillMode = SOLID
+        put_u32(&mut stream, 0x90, 1); // CullMode = NONE
+
+        put_u32(&mut stream, 0xb8, 2);
+        put_u64(&mut stream, 0xc0, ps.as_ptr() as u64);
+        put_u64(&mut stream, 0xc8, ps.len() as u64);
+
+        put_u32(&mut stream, 0xd0, 14);
+        put_u32(&mut stream, 0xd4, 3); // TRIANGLE
+
+        put_u32(&mut stream, 0xd8, 15);
+        put_u32(&mut stream, 0xdc, 29); // R8G8B8A8_UNORM_SRGB
+        put_u32(&mut stream, 0xfc, 1); // NumRenderTargets
+
+        let desc = StreamDesc {
+            size: stream.len(),
+            stream: stream.as_ptr(),
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(
+            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
+        assert_eq!(shaders(p), [("mesh", ms.to_vec()), ("pixel", ps.to_vec())]);
+        #[cfg(windows)]
+        {
+            let g = pipeline(p).host.graphics.as_deref().unwrap();
+            assert_eq!(g.topology.0, 3);
+            assert_eq!(
+                (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
+                (1, 29)
+            );
+        }
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 

@@ -107,7 +107,13 @@ pub(crate) fn read_back(
     let mut total = 0;
     // SAFETY: a live texture; outputs for one subresource.
     unsafe {
-        let desc = texture.GetDesc();
+        let mut desc = texture.GetDesc();
+        desc.Format = match desc.Format {
+            DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_FORMAT_B8G8R8X8_TYPELESS => DXGI_FORMAT_B8G8R8X8_UNORM,
+            other => other,
+        };
         device.GetCopyableFootprints(
             &desc,
             0,

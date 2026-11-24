@@ -24,6 +24,10 @@ pub(crate) struct GraphicsState {
     sample_mask: u32,
     rasterizer: D3D12_RASTERIZER_DESC,
     depth: D3D12_DEPTH_STENCIL_DESC,
+    /// The stream's `DEPTH_STENCIL2` description as given (separate front
+    /// and back stencil masks, the depth bounds flag); `depth` holds it
+    /// narrowed to the front masks.
+    depth2: Option<D3D12_DEPTH_STENCIL_DESC2>,
     /// Input elements, their names pointing into `names`.
     inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
     names: Vec<CString>,
@@ -75,6 +79,7 @@ impl Default for GraphicsState {
                 BackFace: keep,
                 ..Default::default()
             },
+            depth2: None,
             inputs: Vec::new(),
             names: Vec::new(),
             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
@@ -90,6 +95,87 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    /// Copies owned input layout elements and semantic names from a title
+    /// `D3D12_INPUT_LAYOUT_DESC`.
+    ///
+    /// # Safety
+    /// If `layout.pInputElementDescs` is non-null, it must point to
+    /// `layout.NumElements` valid `D3D12_INPUT_ELEMENT_DESC` entries whose
+    /// non-null `SemanticName` pointers are NUL-terminated C strings.
+    unsafe fn copy_input_layout(
+        layout: D3D12_INPUT_LAYOUT_DESC,
+    ) -> (Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<CString>) {
+        if layout.pInputElementDescs.is_null() || layout.NumElements == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        // SAFETY: caller guarantees `NumElements` valid input element entries.
+        let elements = unsafe {
+            std::slice::from_raw_parts(layout.pInputElementDescs, layout.NumElements as usize)
+        };
+        let names: Vec<CString> = elements
+            .iter()
+            .map(|e| {
+                if e.SemanticName.0.is_null() {
+                    CString::default()
+                } else {
+                    // SAFETY: caller guarantees valid NUL-terminated C string.
+                    unsafe { CStr::from_ptr(e.SemanticName.0.cast()).to_owned() }
+                }
+            })
+            .collect();
+        let inputs = elements
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                Format: DXGI_FORMAT(crate::resource::pc_format(e.Format.0 as u32) as i32),
+                ..*e
+            })
+            .collect();
+        (inputs, names)
+    }
+
+    /// Captures owned graphics state from a plain
+    /// `D3D12_GRAPHICS_PIPELINE_STATE_DESC`.
+    ///
+    /// # Safety
+    /// `desc` must be a valid `D3D12_GRAPHICS_PIPELINE_STATE_DESC` whose
+    /// `InputLayout` pointers (if non-null) are valid for the duration of
+    /// this call.
+    pub(crate) unsafe fn from_graphics_desc(desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Self {
+        // SAFETY: caller guarantees `desc.InputLayout` is valid.
+        let (inputs, names) = unsafe { Self::copy_input_layout(desc.InputLayout) };
+        let mut rt_formats = desc.RTVFormats;
+        for f in &mut rt_formats {
+            f.0 = crate::resource::pc_format(f.0 as u32) as i32;
+        }
+        let samples = if desc.SampleDesc.Count == 0 {
+            DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            }
+        } else {
+            desc.SampleDesc
+        };
+        GraphicsState {
+            blend: desc.BlendState,
+            sample_mask: desc.SampleMask,
+            rasterizer: desc.RasterizerState,
+            depth: desc.DepthStencilState,
+            depth2: None,
+            inputs,
+            names,
+            strip_cut: desc.IBStripCutValue,
+            topology: desc.PrimitiveTopologyType,
+            targets: D3D12_RT_FORMAT_ARRAY {
+                RTFormats: rt_formats,
+                NumRenderTargets: desc.NumRenderTargets.min(8),
+            },
+            depth_format: DXGI_FORMAT(crate::resource::pc_format(desc.DSVFormat.0 as u32) as i32),
+            samples,
+        }
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -103,8 +189,12 @@ impl GraphicsState {
                 8 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
                 9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
                 10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
-                11 => self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned(),
+                11 => {
+                    self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned();
+                    self.depth2 = None;
+                }
                 21 => {
+                    self.depth2 = None;
                     // shortcut: the depth bounds test is dropped (the host
                     // pipeline uses the plain description); bring it back
                     // with a stream if a title enables it.
@@ -120,30 +210,72 @@ impl GraphicsState {
                         BackFace: d.BackFace,
                     };
                 }
+                26 => {
+                    let d = data.cast::<D3D12_DEPTH_STENCIL_DESC2>().read_unaligned();
+                    self.depth2 = Some(d);
+                    self.depth = D3D12_DEPTH_STENCIL_DESC {
+                        DepthEnable: d.DepthEnable,
+                        DepthWriteMask: d.DepthWriteMask,
+                        DepthFunc: d.DepthFunc,
+                        StencilEnable: d.StencilEnable,
+                        StencilReadMask: d.FrontFace.StencilReadMask,
+                        StencilWriteMask: d.FrontFace.StencilWriteMask,
+                        FrontFace: D3D12_DEPTH_STENCILOP_DESC {
+                            StencilFailOp: d.FrontFace.StencilFailOp,
+                            StencilDepthFailOp: d.FrontFace.StencilDepthFailOp,
+                            StencilPassOp: d.FrontFace.StencilPassOp,
+                            StencilFunc: d.FrontFace.StencilFunc,
+                        },
+                        BackFace: D3D12_DEPTH_STENCILOP_DESC {
+                            StencilFailOp: d.BackFace.StencilFailOp,
+                            StencilDepthFailOp: d.BackFace.StencilDepthFailOp,
+                            StencilPassOp: d.BackFace.StencilPassOp,
+                            StencilFunc: d.BackFace.StencilFunc,
+                        },
+                    };
+                }
+                27 => {
+                    let d = data.cast::<D3D12_RASTERIZER_DESC1>().read_unaligned();
+                    self.rasterizer = D3D12_RASTERIZER_DESC {
+                        FillMode: d.FillMode,
+                        CullMode: d.CullMode,
+                        FrontCounterClockwise: d.FrontCounterClockwise,
+                        DepthBias: d.DepthBias as i32,
+                        DepthBiasClamp: d.DepthBiasClamp,
+                        SlopeScaledDepthBias: d.SlopeScaledDepthBias,
+                        DepthClipEnable: d.DepthClipEnable,
+                        MultisampleEnable: d.MultisampleEnable,
+                        AntialiasedLineEnable: d.AntialiasedLineEnable,
+                        ForcedSampleCount: d.ForcedSampleCount,
+                        ConservativeRaster: d.ConservativeRaster,
+                    };
+                }
+                28 => {
+                    let d = data.cast::<D3D12_RASTERIZER_DESC2>().read_unaligned();
+                    let multisample = matches!(
+                        d.LineRasterizationMode,
+                        D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE
+                            | D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW
+                    );
+                    let antialiased =
+                        d.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED;
+                    self.rasterizer = D3D12_RASTERIZER_DESC {
+                        FillMode: d.FillMode,
+                        CullMode: d.CullMode,
+                        FrontCounterClockwise: d.FrontCounterClockwise,
+                        DepthBias: d.DepthBias as i32,
+                        DepthBiasClamp: d.DepthBiasClamp,
+                        SlopeScaledDepthBias: d.SlopeScaledDepthBias,
+                        DepthClipEnable: d.DepthClipEnable,
+                        MultisampleEnable: multisample.into(),
+                        AntialiasedLineEnable: antialiased.into(),
+                        ForcedSampleCount: d.ForcedSampleCount,
+                        ConservativeRaster: d.ConservativeRaster,
+                    };
+                }
                 12 => {
                     let layout = at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned();
-                    if layout.pInputElementDescs.is_null() {
-                        return;
-                    }
-                    let elements = std::slice::from_raw_parts(
-                        layout.pInputElementDescs,
-                        layout.NumElements as usize,
-                    );
-                    self.names = elements
-                        .iter()
-                        .map(|e| CStr::from_ptr(e.SemanticName.0.cast()).to_owned())
-                        .collect();
-                    self.inputs = elements
-                        .iter()
-                        .zip(&self.names)
-                        .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
-                            SemanticName: PCSTR(name.as_ptr().cast()),
-                            Format: DXGI_FORMAT(
-                                crate::resource::pc_format(e.Format.0 as u32) as i32
-                            ),
-                            ..*e
-                        })
-                        .collect();
+                    (self.inputs, self.names) = Self::copy_input_layout(layout);
                 }
                 13 => {
                     self.strip_cut =
@@ -184,17 +316,43 @@ impl GraphicsState {
             })
             .collect();
         format!(
-            "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
+            "{:?} {} {:?} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
             self.blend,
             self.sample_mask,
             self.rasterizer,
             self.depth,
+            self.depth2,
             self.strip_cut.0,
             self.topology.0,
             self.targets,
             self.depth_format.0,
             self.samples
         )
+    }
+
+    /// The `DEPTH_STENCIL2` description when the plain one would change
+    /// what the pipeline does: stencil on with back-face masks that differ
+    /// from the front ones.
+    ///
+    /// shortcut: the depth bounds flag is cleared (as for kind 21), since
+    /// bounds are not forwarded yet; carry it through when they are.
+    fn per_face_depth(&self) -> Option<D3D12_DEPTH_STENCIL_DESC2> {
+        let d = self.depth2?;
+        let differ = d.FrontFace.StencilReadMask != d.BackFace.StencilReadMask
+            || d.FrontFace.StencilWriteMask != d.BackFace.StencilWriteMask;
+        (d.StencilEnable.as_bool() && differ).then_some(D3D12_DEPTH_STENCIL_DESC2 {
+            DepthBoundsTestEnable: false.into(),
+            ..d
+        })
+    }
+
+    /// The topology type of the host pipeline: the console's rectangle and
+    /// quad types draw as triangles on the host (see `draw`).
+    fn host_topology(&self) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
+        match self.topology.0 {
+            RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            _ => self.topology,
+        }
     }
 
     /// The vertex buffer slots the input layout reads.
@@ -457,6 +615,20 @@ impl HostPipeline {
             return refuse("graphics state not kept (plain description)", shaders);
         };
         let state = g.describe();
+        let depth2 = g.per_face_depth().filter(|_| {
+            let kept = host.independent_stencil_masks();
+            if !kept {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        "back-face stencil masks differ from the front ones, but the host has no \
+                         independent front and back stencil masks: the front ones are used for \
+                         both (logged once)"
+                    )
+                });
+            }
+            kept
+        });
         if mesh.is_some() {
             let name = super::library::name(
                 "mesh",
@@ -464,7 +636,16 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let pso = match stream_pipeline(
+                &host.device,
+                &root,
+                code(0),
+                code(1),
+                false,
+                g,
+                depth2,
+                &name,
+            ) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -500,12 +681,7 @@ impl HostPipeline {
                 NumElements: g.inputs.len() as u32,
             },
             IBStripCutValue: g.strip_cut,
-            // The console's rectangle and quad types draw as triangles on
-            // the host (see `draw`).
-            PrimitiveTopologyType: match g.topology.0 {
-                RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                _ => g.topology,
-            },
+            PrimitiveTopologyType: g.host_topology(),
             NumRenderTargets: g.targets.NumRenderTargets,
             RTVFormats: g.targets.RTFormats,
             DSVFormat: g.depth_format,
@@ -518,13 +694,27 @@ impl HostPipeline {
             &[&code_bytes(&code(0)), &code_bytes(&code(1))],
             &state,
         );
-        let made = super::library::pipeline(
-            &name,
-            // SAFETY: the description points at live data.
-            |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
-            // SAFETY: as above.
-            || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
-        );
+        let made = if depth2.is_some() {
+            // Separate front and back stencil masks need the stream form.
+            stream_pipeline(
+                &host.device,
+                &root,
+                code(0),
+                code(1),
+                true,
+                g,
+                depth2,
+                &name,
+            )
+        } else {
+            super::library::pipeline(
+                &name,
+                // SAFETY: the description points at live data.
+                |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
+                // SAFETY: as above.
+                || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
+            )
+        };
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
@@ -557,48 +747,93 @@ impl HostPipeline {
     }
 }
 
-/// A mesh pipeline from the title's graphics state: the pipeline-state
-/// stream form (no input layout or topology).
-fn mesh_pipeline(
+/// A pipeline-state stream being built: whole subobjects, each its type
+/// then its description, pointer-aligned.
+#[derive(Default)]
+struct Stream(Vec<u64>);
+
+impl Stream {
+    fn push<T: Copy>(&mut self, kind: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, value: T) {
+        // The layout of `struct alignas(void*) { TYPE type; T value; }`.
+        let offset = size_of_val(&kind).next_multiple_of(align_of::<T>());
+        let size = (offset + size_of::<T>()).next_multiple_of(8);
+        let at = self.0.len();
+        self.0.resize(at + size / 8, 0);
+        // SAFETY: the `size` bytes just added hold the type at their start
+        // and the value at `offset`; the writes are unaligned-tolerant.
+        unsafe {
+            let base = self.0.as_mut_ptr().add(at).cast::<u8>();
+            base.cast::<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE>()
+                .write_unaligned(kind);
+            base.add(offset).cast::<T>().write_unaligned(value);
+        }
+    }
+}
+
+/// A pipeline from the title's graphics state in the pipeline-state
+/// stream form: a mesh pipeline (no input layout or topology), or with
+/// `vertex` a vertex one; with `depth2` its depth-stencil state is the
+/// `DEPTH_STENCIL2` subobject (separate front and back stencil masks).
+#[allow(clippy::too_many_arguments)]
+fn stream_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
-    ms: D3D12_SHADER_BYTECODE,
+    first: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
+    vertex: bool,
     g: &GraphicsState,
+    depth2: Option<D3D12_DEPTH_STENCIL_DESC2>,
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
-    /// A stream subobject: its type, then its description, pointer-aligned.
-    #[repr(C, align(8))]
-    struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
-    #[repr(C)]
-    struct Stream {
-        root: Sub<*mut std::ffi::c_void>,
-        ms: Sub<D3D12_SHADER_BYTECODE>,
-        ps: Sub<D3D12_SHADER_BYTECODE>,
-        blend: Sub<D3D12_BLEND_DESC>,
-        mask: Sub<u32>,
-        raster: Sub<D3D12_RASTERIZER_DESC>,
-        depth: Sub<D3D12_DEPTH_STENCIL_DESC>,
-        targets: Sub<D3D12_RT_FORMAT_ARRAY>,
-        dsv: Sub<DXGI_FORMAT>,
-        samples: Sub<DXGI_SAMPLE_DESC>,
+    let mut stream = Stream::default();
+    stream.push(
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+        root.as_raw(),
+    );
+    if vertex {
+        stream.push(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, first);
+        stream.push(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT,
+            D3D12_INPUT_LAYOUT_DESC {
+                pInputElementDescs: g.inputs.as_ptr(),
+                NumElements: g.inputs.len() as u32,
+            },
+        );
+        stream.push(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE,
+            g.strip_cut,
+        );
+        stream.push(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+            g.host_topology(),
+        );
+    } else {
+        stream.push(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, first);
     }
-    let mut stream = Stream {
-        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
-        ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
-        ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
-        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
-        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
-        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
-        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
-        samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
-    };
+    stream.push(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
+    stream.push(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend);
+    stream.push(
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+        g.sample_mask,
+    );
+    stream.push(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer);
+    match depth2 {
+        Some(d) => stream.push(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2, d),
+        None => stream.push(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
+    }
+    stream.push(
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+        g.targets,
+    );
+    stream.push(
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+        g.depth_format,
+    );
+    stream.push(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples);
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
-        SizeInBytes: size_of::<Stream>(),
-        pPipelineStateSubobjectStream: (&raw mut stream).cast(),
+        SizeInBytes: stream.0.len() * 8,
+        pPipelineStateSubobjectStream: stream.0.as_mut_ptr().cast(),
     };
     let device = device.cast::<ID3D12Device2>()?;
     super::library::pipeline(
@@ -663,5 +898,106 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `DEPTH_STENCIL2` subobject (kind 26) with stencil on and back
+    /// masks that differ from the front ones.
+    fn depth2_subobject() -> (Vec<u8>, D3D12_DEPTH_STENCIL_DESC2) {
+        let face = |read, write| D3D12_DEPTH_STENCILOP_DESC1 {
+            StencilFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilDepthFailOp: D3D12_STENCIL_OP_INCR,
+            StencilPassOp: D3D12_STENCIL_OP_REPLACE,
+            StencilFunc: D3D12_COMPARISON_FUNC_EQUAL,
+            StencilReadMask: read,
+            StencilWriteMask: write,
+        };
+        let d = D3D12_DEPTH_STENCIL_DESC2 {
+            DepthEnable: true.into(),
+            DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+            DepthFunc: D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+            StencilEnable: true.into(),
+            FrontFace: face(0x0f, 0xf0),
+            BackFace: face(0x3c, 0xc3),
+            DepthBoundsTestEnable: true.into(),
+        };
+        let mut sub = vec![0u8; 64];
+        sub[..4].copy_from_slice(&26u32.to_le_bytes());
+        // SAFETY: the description fits at +4 of the 64-byte subobject.
+        unsafe {
+            sub.as_mut_ptr()
+                .add(4)
+                .cast::<D3D12_DEPTH_STENCIL_DESC2>()
+                .write_unaligned(d)
+        };
+        (sub, d)
+    }
+
+    #[test]
+    fn depth_stencil2_keeps_back_face_masks() {
+        let (sub, d) = depth2_subobject();
+        let mut g = GraphicsState::default();
+        // SAFETY: a whole kind 26 subobject.
+        unsafe { g.read(26, sub.as_ptr()) };
+        // The plain description falls back to the front masks.
+        assert_eq!(
+            (g.depth.StencilReadMask, g.depth.StencilWriteMask),
+            (0x0f, 0xf0)
+        );
+        assert_eq!(g.depth.BackFace.StencilFunc, D3D12_COMPARISON_FUNC_EQUAL);
+        // The host pipeline gets both faces' masks as given.
+        let kept = g.per_face_depth().expect("back masks differ, stencil on");
+        assert_eq!(
+            (
+                kept.BackFace.StencilReadMask,
+                kept.BackFace.StencilWriteMask
+            ),
+            (0x3c, 0xc3)
+        );
+        assert_eq!(kept.FrontFace, d.FrontFace);
+        assert_eq!(kept.DepthFunc, d.DepthFunc);
+        // A later plain depth-stencil subobject replaces it.
+        let mut plain = [0u8; 56];
+        plain[..4].copy_from_slice(&11u32.to_le_bytes());
+        // SAFETY: a whole kind 11 subobject.
+        unsafe { g.read(11, plain.as_ptr()) };
+        assert!(g.per_face_depth().is_none());
+    }
+
+    #[test]
+    fn depth_stencil2_with_equal_masks_stays_plain_and_stream_is_laid_out() {
+        let (mut sub, _) = depth2_subobject();
+        // Back masks equal to the front ones: the plain description is exact.
+        let back = 4
+            + std::mem::offset_of!(D3D12_DEPTH_STENCIL_DESC2, BackFace)
+            + std::mem::offset_of!(D3D12_DEPTH_STENCILOP_DESC1, StencilReadMask);
+        sub[back..back + 2].copy_from_slice(&[0x0f, 0xf0]);
+        let mut g = GraphicsState::default();
+        // SAFETY: a whole kind 26 subobject.
+        unsafe { g.read(26, sub.as_ptr()) };
+        assert!(g.per_face_depth().is_none());
+
+        // Stream subobjects: type, then the value at its alignment, each
+        // padded to 8 bytes.
+        let mut s = Stream::default();
+        s.push(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+            0xdead_beefu32,
+        );
+        s.push(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+            0x1234usize as *mut u8,
+        );
+        assert_eq!(s.0, [0xdead_beef << 32 | 9, 0, 0x1234]);
+        s.push(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2,
+            g.depth2.unwrap(),
+        );
+        assert_eq!(s.0.len() * 8, 24 + 64);
+        assert_eq!(s.0[3] as u32, 26);
     }
 }
