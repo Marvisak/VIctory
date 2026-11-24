@@ -85,7 +85,9 @@ fn give_back(v: Vec<u8>) {
 const POOL_BYTES: usize = 2 << 30;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
-// written only on the submitting thread.
+// written by the submitting thread, and by the thread finishing an earlier
+// submission only in ranges that one's shaders wrote (which the submitting
+// thread leaves alone until it has finished).
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
@@ -252,10 +254,15 @@ impl Shadow {
         // The segments the range overlaps or touches.
         let first = segments.partition_point(|(at, bytes)| at + bytes.len() < from);
         let last = first + segments[first..].iter().take_while(|(at, _)| *at <= to).count();
-        if let [(at, bytes)] = &segments[first..last]
+        if let [(at, bytes)] = &mut segments[first..last]
             && *at <= from
-            && to <= at + bytes.len()
+            && to <= *at + bytes.len()
         {
+            // Refresh `[from, to)` even when the hull did not grow: an earlier
+            // submission on this range may have copied back while a disjoint
+            // submission kept `before` alive (`settle` guarantees no writer of
+            // `[from, to)` is in flight).
+            bytes[from - *at..to - *at].copy_from_slice(host(from, to));
             return;
         }
         let start = segments.get(first).filter(|_| first < last).map_or(from, |s| s.0.min(from));
@@ -266,7 +273,9 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::SnapshotBytes, (end - start) as u64);
         #[cfg(feature = "diagnostics")]
         crate::copystat::snapshot(self.start, self.len, (end - start) as u64);
-        // Parts newly covered from the copy, the rest as it was taken.
+        // Parts newly covered and the new range itself come fresh from the
+        // copy; other already-covered parts belong to disjoint in-flight
+        // submissions and keep their bytes as taken.
         let mut grown = pooled(end - start);
         let mut at = start;
         for (taken, bytes) in segments.drain(first..last) {
@@ -276,6 +285,7 @@ impl Shadow {
             give_back(bytes);
         }
         grown.extend_from_slice(host(at, end));
+        grown[from - start..to - start].copy_from_slice(host(from, to));
         segments.insert(first, (start, grown));
     }
 
@@ -303,11 +313,13 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
+        if let Some((taken, before)) = segments
+            .iter_mut()
+            .find(|(at, bytes)| *at <= from && to <= *at + bytes.len())
             && back
             && from < to
         {
-            let before = &before[from - taken..to - taken];
+            let before_slice = &mut before[from - *taken..to - *taken];
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
             // By 64 KiB piece: the copy compared with its bytes before the
@@ -321,7 +333,7 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = &mut before_slice[at - from..at - from + n];
                 let title = &mut title[..n];
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
@@ -336,7 +348,7 @@ impl Shadow {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old.iter()) {
                         if *h != *o && *t != *h {
                             *t = *h;
                             changed = true;
@@ -348,6 +360,9 @@ impl Shadow {
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
                     }
+                    // Keep the snapshot current for this range in case another
+                    // disjoint in-flight submission keeps `snapshot` alive.
+                    old.copy_from_slice(host);
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
@@ -361,8 +376,10 @@ impl Shadow {
                 t.taken(&whole);
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
+        // Every submitted step that declared the range is done with it
+        // (submissions in flight do not declare overlapping ranges of a
+        // copy: a later one finishes the earlier first), and the snapshot
+        // with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.remove(&(address, address + len));
         if pending.is_empty() {
@@ -409,6 +426,31 @@ impl Shadow {
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// Whether the title may have written a page of `[from, to)` (title
+    /// addresses) since the copy last took it (always, for memory that is
+    /// not tracked).
+    pub(crate) fn stale(&self, from: usize, to: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return false;
+        }
+        self.tracked
+            .as_ref()
+            .is_none_or(|t| t.any_changed(from, to))
+    }
+
+    /// Once a submission's ranges of the copy have all gone back: the next
+    /// submission compares its pieces afresh (several may be in flight
+    /// while the snapshot lives).
+    pub(crate) fn submission_done(&self) {
+        self.before
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .clear();
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -732,6 +774,42 @@ mod tests {
         let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
+        unregister(p, p as u64);
+    }
+
+    /// Submissions in flight on one copy: a range declared again while an
+    /// earlier submission's snapshot lives starts from the copy as it is
+    /// now, so what went back meanwhile is not taken for the GPU's again.
+    #[test]
+    fn snapshot_stays_fresh_across_disjoint_in_flight_submissions() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, 256);
+        let Some(copy) = find(p as u64, 256) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, 256);
+        // SAFETY: our pool.
+        let title = || unsafe { (p as *const u8).read_volatile() };
+        // S1 declares range A, S2 the disjoint range B while S1 is in flight.
+        copy.writing(p, 64);
+        copy.writing(p + 128, 64);
+        // S1's shaders write byte 0 of A; it goes back while S2 runs.
+        copy.write_host(p as u64, &[0x11]);
+        copy.copy_back(p, 64);
+        copy.submission_done();
+        assert_eq!(title(), 0x11);
+        // S3 declares A again while S2 keeps the snapshot; the title then
+        // writes byte 0 while S3 runs (S3's shaders leave it alone).
+        copy.writing(p, 64);
+        // SAFETY: our pool.
+        unsafe { (p as *mut u8).write_volatile(0x22) };
+        copy.copy_back(p, 64);
+        copy.submission_done();
+        assert_eq!(title(), 0x22, "the title's byte, not S1's again");
+        // S2 finishes last and releases the snapshot.
+        copy.copy_back(p + 128, 64);
+        assert!(copy.before.lock().unwrap().0.is_empty());
         unregister(p, p as u64);
     }
 }

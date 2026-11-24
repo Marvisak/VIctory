@@ -316,6 +316,20 @@ impl Tracked {
             .contains(&page)
     }
 
+    /// Whether a page of `[from, to)` (bytes) changed since it was taken.
+    pub(crate) fn any_changed(&self, from: usize, to: usize) -> bool {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        from < to
+            && self
+                .changed
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .range(from / PAGE..to.div_ceil(PAGE))
+                .next()
+                .is_some()
+    }
+
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
     pub(crate) fn taken(&self, pages: &[usize]) {
