@@ -111,8 +111,27 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
-    /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Sets the motor speeds of the pad in host slot `slot`.
+    fn rumble(&mut self, slot: usize, motors: Motors);
+}
+
+/// Motor speeds, 0 (off) to `u16::MAX` (full), in the title's order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Motors {
+    /// Low frequency, the left grip.
+    low: u16,
+    /// High frequency, the right grip.
+    high: u16,
+    left_trigger: u16,
+    right_trigger: u16,
+}
+
+/// Whether the one host pad Windows.Gaming.Input sees is the pad in slot
+/// `slot`. That API does not say which XInput slot its pads are, so trigger
+/// motors are driven only when a single pad is connected.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sole_pad(connected: &[bool; PADS], slot: usize) -> bool {
+    connected.get(slot) == Some(&true) && connected.iter().filter(|&&c| c).count() == 1
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -908,24 +927,29 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+/// `SetRumbleState(params)`: four motor levels, 0 to 1, low frequency, high
+/// frequency, left trigger, right trigger (Grand Theft Auto VI sends trigger
+/// levels too); null stops them all.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let [low, high, left_trigger, right_trigger] = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
         unsafe { *params }
     };
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    let motors = Motors {
+        low: speed(low),
+        high: speed(high),
+        left_trigger: speed(left_trigger),
+        right_trigger: speed(right_trigger),
+    };
+    lock(&device.hub().source).rumble(device.index, motors);
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -1072,6 +1096,8 @@ pub(crate) fn module() -> HleModule {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows::Gaming::Input::{Gamepad, GamepadVibration};
+    use windows::Win32::System::Com::CoIncrementMTAUsage;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1130,6 +1156,45 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Slots whose last query found a pad.
+        connected: [bool; PADS],
+        /// Trigger motors were last set running (so stopping them is sent).
+        triggers_on: bool,
+    }
+
+    /// Windows.Gaming.Input needs a multithreaded apartment in the process.
+    /// The title's threads are not ours to initialise, so one is kept for
+    /// the process instead.
+    fn apartment() -> bool {
+        static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // SAFETY: plain call; the usage is never released (process lifetime).
+        *READY.get_or_init(|| unsafe { CoIncrementMTAUsage() }.is_ok())
+    }
+
+    /// All four motors of the one Windows.Gaming.Input pad; false if there
+    /// is not exactly one (that API has no XInput slots, see [`sole_pad`]).
+    /// Its pads show up a moment after start, so the first calls can fail.
+    fn wgi_rumble(m: Motors) -> bool {
+        if !apartment() {
+            return false;
+        }
+        let Ok(pads) = Gamepad::Gamepads() else {
+            return false;
+        };
+        if pads.Size() != Ok(1) {
+            return false;
+        }
+        let Ok(pad) = pads.GetAt(0) else {
+            return false;
+        };
+        let level = |s: u16| f64::from(s) / f64::from(u16::MAX);
+        pad.SetVibration(GamepadVibration {
+            LeftMotor: level(m.low),
+            RightMotor: level(m.high),
+            LeftTrigger: level(m.left_trigger),
+            RightTrigger: level(m.right_trigger),
+        })
+        .is_ok()
     }
 
     impl Source for Host {
@@ -1141,9 +1206,11 @@ mod host {
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                self.connected[slot] = false;
                 return None;
             }
             self.empty_until[slot] = None;
+            self.connected[slot] = true;
             Some(convert(&state.Gamepad))
         }
 
@@ -1174,13 +1241,25 @@ mod host {
                 .collect()
         }
 
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+        /// Grip motors through XInput; trigger motors (XInput has none)
+        /// through Windows.Gaming.Input, which then sets the grips to the
+        /// same speeds.
+        /// shortcut: with more than one pad connected the triggers stay
+        /// still, as no host API pairs XInput slots with the pads that
+        /// drive trigger motors.
+        fn rumble(&mut self, slot: usize, m: Motors) {
             let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
+                wLeftMotorSpeed: m.low,
+                wRightMotorSpeed: m.high,
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+            let wanted = (m.left_trigger, m.right_trigger) != (0, 0);
+            if !wanted && !self.triggers_on {
+                return;
+            }
+            let sent = (self.triggers_on || sole_pad(&self.connected, slot)) && wgi_rumble(m);
+            self.triggers_on = wanted && sent;
         }
     }
 
@@ -1270,7 +1349,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        rumble: Vec<(usize, u16, u16)>,
+        rumble: Vec<(usize, Motors)>,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
@@ -1282,8 +1361,8 @@ mod tests {
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
+        fn rumble(&mut self, slot: usize, motors: Motors) {
+            self.0.lock().unwrap().rumble.push((slot, motors));
         }
     }
 
@@ -1607,9 +1686,33 @@ mod tests {
 
         type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
         let rumble = slot::<Rumble, _>(device, 0x50);
-        rumble(device, &[0.5, 1.0, 1.0, 1.0]);
+        rumble(device, &[0.5, 1.0, 0.25, 0.75]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
+        rumble(device, &[-1.0, 2.0, f32::NAN, 1.0]);
         rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        let motors = |low, high, left_trigger, right_trigger| Motors {
+            low,
+            high,
+            left_trigger,
+            right_trigger,
+        };
+        assert_eq!(
+            host.lock().unwrap().rumble,
+            [
+                (2, motors(32767, 65535, 16383, 49151)),
+                // Out of range: clamped; NaN: off.
+                (2, motors(0, 65535, 0, 65535)),
+                (2, Motors::default()),
+            ]
+        );
+    }
+
+    #[test]
+    fn trigger_motors_need_a_single_pad() {
+        assert!(sole_pad(&[false, true, false, false], 1));
+        assert!(!sole_pad(&[false, true, false, false], 0), "another slot");
+        assert!(!sole_pad(&[true, true, false, false], 1), "two pads");
+        assert!(!sole_pad(&[false; PADS], 0), "none");
+        assert!(!sole_pad(&[true, false, false, false], PADS), "out of range");
     }
 }
