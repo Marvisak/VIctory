@@ -937,3 +937,152 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn buffer_atomics_sub_csub_inc_dec_and_float_match_rdna2() {
+    let mubuf = |op: u8, vdata: u8, srsrc: u8, glc: bool| -> [u32; 2] {
+        [
+            0x38 << 26
+                | (u32::from(op) & 0x7F) << 18
+                | (u32::from(op) >> 7 & 1) << 25
+                | u32::from(glc) << 14,
+            0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+        ]
+    };
+    // Stores inputs[0] to uav[0], runs atomic(op, v2, glc=true) (v3 is compare
+    // for fcmpswap), then loads uav[0] into v0. When inputs[3] != 0, returns
+    // the old value from v2 instead of the new value in v0.
+    let build_atomic = |op: u8| -> HostShader {
+        let mut body = Vec::new();
+        body.extend_from_slice(&buffer_store_dword(1, 8, 0));
+        body.extend_from_slice(&mubuf(op, 2, 8, true));
+        body.extend_from_slice(&mubuf(0x0C, 0, 8, false)); // buffer_load_dword v0
+        body.extend_from_slice(&vop3(0x0C5, 106, 0x80, vgpr(4), 0)); // v_cmp_ne_u32 vcc, 0, v4
+        body.extend_from_slice(&vop3(0x101, 0, vgpr(0), vgpr(2), 106)); // v_cndmask_b32 v0, v0, v2, vcc
+        build_valu_cs(&body)
+    };
+    let check_op = |label: &str, op: u8, pairs: &[([u32; 3], u32)]| {
+        let shader = build_atomic(op);
+        let mut inputs = Vec::with_capacity(pairs.len() * 2);
+        let mut wants = Vec::with_capacity(pairs.len() * 2);
+        for &(args, want_new) in pairs {
+            inputs.push([args[0], args[1], args[2], 0]); // check new memory value
+            wants.push(want_new);
+            inputs.push([args[0], args[1], args[2], 1]); // check returned old value
+            wants.push(args[0]);
+        }
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let kind = if inp[3] == 0 { "new" } else { "old" };
+            assert_eq!(
+                got, wants[i],
+                "{backend}: {label}({kind}, init={:#010x}, arg={:#010x}, cmp={:#010x}) = {got:#010x}, want {:#010x}",
+                inp[0], inp[1], inp[2], wants[i],
+            );
+        });
+    };
+
+    // buffer_atomic_sub (0x33): wrapping 32-bit subtraction.
+    check_op(
+        "buffer_atomic_sub",
+        0x33,
+        &[
+            ([10, 3, 0], 7),
+            ([3, 10, 0], 3u32.wrapping_sub(10)),
+            ([0, 1, 0], u32::MAX),
+        ],
+    );
+
+    // buffer_atomic_csub (0x34): unsigned saturating subtract (clamps to 0).
+    check_op(
+        "buffer_atomic_csub",
+        0x34,
+        &[
+            ([10, 3, 0], 7),
+            ([3, 10, 0], 0),
+            ([5, 5, 0], 0),
+            ([0, 1, 0], 0),
+        ],
+    );
+
+    // buffer_atomic_inc (0x3C): (old >= arg) ? 0 : old + 1.
+    check_op(
+        "buffer_atomic_inc",
+        0x3C,
+        &[
+            ([0, 3, 0], 1),
+            ([2, 3, 0], 3),
+            ([3, 3, 0], 0),
+            ([10, 3, 0], 0),
+            ([u32::MAX, u32::MAX, 0], 0),
+        ],
+    );
+
+    // buffer_atomic_dec (0x3D): (old == 0 || old > arg) ? arg : old - 1.
+    check_op(
+        "buffer_atomic_dec",
+        0x3D,
+        &[
+            ([3, 3, 0], 2),
+            ([1, 3, 0], 0),
+            ([0, 3, 0], 3),
+            ([10, 3, 0], 3),
+            ([0, 0, 0], 0),
+        ],
+    );
+
+    // buffer_atomic_fcmpswap (0x3E): float equality (+0.0 == -0.0, NaN != NaN).
+    check_op(
+        "buffer_atomic_fcmpswap",
+        0x3E,
+        &[
+            // Matching normal float -> swaps to new value.
+            (
+                [1.5f32.to_bits(), 9.0f32.to_bits(), 1.5f32.to_bits()],
+                9.0f32.to_bits(),
+            ),
+            // Non-matching -> keeps old value.
+            (
+                [1.5f32.to_bits(), 9.0f32.to_bits(), 2.5f32.to_bits()],
+                1.5f32.to_bits(),
+            ),
+            // -0.0 equals +0.0 as f32 -> swaps!
+            (
+                [0x8000_0000, 4.0f32.to_bits(), 0x0000_0000],
+                4.0f32.to_bits(),
+            ),
+            // NaN never equals NaN -> keeps old NaN.
+            ([0x7FC0_0000, 4.0f32.to_bits(), 0x7FC0_0000], 0x7FC0_0000),
+        ],
+    );
+
+    // buffer_atomic_fmin (0x3F) and buffer_atomic_fmax (0x40): IEEE min/max
+    // with RDNA2's -0.0 < +0.0 and non-NaN-wins rules.
+    check_op(
+        "buffer_atomic_fmin",
+        0x3F,
+        &[
+            (
+                [2.0f32.to_bits(), (-1.0f32).to_bits(), 0],
+                (-1.0f32).to_bits(),
+            ),
+            (
+                [(-3.0f32).to_bits(), 1.0f32.to_bits(), 0],
+                (-3.0f32).to_bits(),
+            ),
+            ([0x0000_0000, 0x8000_0000, 0], 0x8000_0000), // min(+0.0, -0.0) = -0.0
+            ([0x7FC0_0000, 2.0f32.to_bits(), 0], 2.0f32.to_bits()), // non-NaN wins
+            ([2.0f32.to_bits(), 0x7FC0_0000, 0], 2.0f32.to_bits()),
+        ],
+    );
+    check_op(
+        "buffer_atomic_fmax",
+        0x40,
+        &[
+            ([2.0f32.to_bits(), 5.0f32.to_bits(), 0], 5.0f32.to_bits()),
+            ([5.0f32.to_bits(), (-1.0f32).to_bits(), 0], 5.0f32.to_bits()),
+            ([0x8000_0000, 0x0000_0000, 0], 0x0000_0000), // max(-0.0, +0.0) = +0.0
+            ([0x7FC0_0000, (-2.0f32).to_bits(), 0], (-2.0f32).to_bits()), // non-NaN wins
+            ([(-2.0f32).to_bits(), 0x7FC0_0000, 0], (-2.0f32).to_bits()),
+        ],
+    );
+}

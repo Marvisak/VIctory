@@ -6176,20 +6176,38 @@ impl<'a> Lower<'a> {
         let guard = self.guard(b, i)?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
+        enum BufferAtomic {
+            Bin(u32),
+            Sub,
+            CmpSwap,
+            Csub,
+            Inc,
+            Dec,
+            FCmpSwap,
+            FMin,
+            FMax,
+        }
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
-        // min and max, exchange; compare-exchange apart.
+        // min and max, exchange; sub, compare-exchange, and CAS-emulated ops apart.
         let atomic = match name.strip_prefix("buffer_atomic_") {
             None => None,
-            Some("add") => Some(0),
-            Some("and") => Some(1),
-            Some("or") => Some(2),
-            Some("xor") => Some(3),
-            Some("smin") => Some(4),
-            Some("smax") => Some(5),
-            Some("umin") => Some(6),
-            Some("umax") => Some(7),
-            Some("swap") => Some(8),
-            Some("cmpswap") => Some(u32::MAX),
+            Some("add") => Some(BufferAtomic::Bin(0)),
+            Some("sub") => Some(BufferAtomic::Sub),
+            Some("and") => Some(BufferAtomic::Bin(1)),
+            Some("or") => Some(BufferAtomic::Bin(2)),
+            Some("xor") => Some(BufferAtomic::Bin(3)),
+            Some("smin") => Some(BufferAtomic::Bin(4)),
+            Some("smax") => Some(BufferAtomic::Bin(5)),
+            Some("umin") => Some(BufferAtomic::Bin(6)),
+            Some("umax") => Some(BufferAtomic::Bin(7)),
+            Some("swap") => Some(BufferAtomic::Bin(8)),
+            Some("cmpswap") => Some(BufferAtomic::CmpSwap),
+            Some("csub") => Some(BufferAtomic::Csub),
+            Some("inc") => Some(BufferAtomic::Inc),
+            Some("dec") => Some(BufferAtomic::Dec),
+            Some("fcmpswap") => Some(BufferAtomic::FCmpSwap),
+            Some("fmin") => Some(BufferAtomic::FMin),
+            Some("fmax") => Some(BufferAtomic::FMax),
             Some(_) => return Err(name),
         };
         // d16: two 16-bit channels per VGPR, low half first.
@@ -6274,7 +6292,8 @@ impl<'a> Lower<'a> {
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
-            let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
+            let two_vals = matches!(op, BufferAtomic::CmpSwap | BufferAtomic::FCmpSwap);
+            let vals = self.vgprs(inst, d, if two_vals { 2 } else { 1 })?;
             let (h, coords) = match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
@@ -6296,25 +6315,112 @@ impl<'a> Lower<'a> {
             };
             let at = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
-            let r = if op == u32::MAX {
-                // cmpswap: data is (new, compare).
+            let cmpxchg = |l: &mut Self, cmp_v: V, new_v: V| -> V {
                 let mut args = vec![h];
                 args.extend(coords);
-                args.extend([vals[1], vals[0]]);
-                self.s.op(
-                    self.cur,
+                args.extend([cmp_v, new_v]);
+                l.s.op(
+                    l.cur,
                     "atomicCompareExchange.i32",
                     Attr::NoUnwind,
                     i32t,
                     79,
                     &args,
                 )
-            } else {
-                let mut args = vec![h, self.s.m.i32(op)];
-                args.extend(coords);
-                args.push(vals[0]);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+            };
+            let r = match op {
+                BufferAtomic::Bin(code) => {
+                    let mut args = vec![h, self.s.m.i32(code)];
+                    args.extend(coords);
+                    args.push(vals[0]);
+                    self.s
+                        .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                }
+                BufferAtomic::Sub => {
+                    let z = self.s.m.i32(0);
+                    let neg = self.s.m.bin(self.cur, Bin::Sub, z, vals[0]);
+                    let mut args = vec![h, self.s.m.i32(0)];
+                    args.extend(coords);
+                    args.push(neg);
+                    self.s
+                        .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                }
+                BufferAtomic::CmpSwap => {
+                    // cmpswap: data is (new, compare).
+                    cmpxchg(self, vals[1], vals[0])
+                }
+                BufferAtomic::FCmpSwap => {
+                    // Float compare-and-swap: IEEE equality (+0.0 == -0.0, NaN != NaN).
+                    let pre = self.cur;
+                    let z = self.s.m.i32(0);
+                    let init = cmpxchg(self, z, z);
+                    let loop_bb = self.s.m.new_block();
+                    let try_bb = self.s.m.new_block();
+                    let exit_bb = self.s.m.new_block();
+                    self.s.m.terminate(pre, Term::Br(loop_bb));
+                    self.cur = loop_bb;
+                    let cur = self.s.m.phi(loop_bb, i32t);
+                    let cur_f = self.as_float(cur);
+                    let cmp_f = self.as_float(vals[1]);
+                    let eq = self.s.m.cmp(loop_bb, pred::OEQ, cur_f, cmp_f);
+                    self.s.m.terminate(loop_bb, Term::CondBr(eq, try_bb, exit_bb));
+                    self.cur = try_bb;
+                    let prev = cmpxchg(self, cur, vals[0]);
+                    let ok = self.s.m.cmp(try_bb, pred::EQ, prev, cur);
+                    self.s.m.terminate(try_bb, Term::CondBr(ok, exit_bb, loop_bb));
+                    self.s.m.set_phi(cur, vec![(init, pre), (prev, try_bb)]);
+                    self.cur = exit_bb;
+                    cur
+                }
+                BufferAtomic::Csub
+                | BufferAtomic::Inc
+                | BufferAtomic::Dec
+                | BufferAtomic::FMin
+                | BufferAtomic::FMax => {
+                    let pre = self.cur;
+                    let z = self.s.m.i32(0);
+                    let init = cmpxchg(self, z, z);
+                    let loop_bb = self.s.m.new_block();
+                    let exit_bb = self.s.m.new_block();
+                    self.s.m.terminate(pre, Term::Br(loop_bb));
+                    self.cur = loop_bb;
+                    let cur = self.s.m.phi(loop_bb, i32t);
+                    let next = match op {
+                        BufferAtomic::Csub => {
+                            let ge = self.s.m.cmp(loop_bb, pred::IUGE, cur, vals[0]);
+                            let diff = self.s.m.bin(loop_bb, Bin::Sub, cur, vals[0]);
+                            self.s.m.select(loop_bb, ge, diff, z)
+                        }
+                        BufferAtomic::Inc => {
+                            let one = self.s.m.i32(1);
+                            let ge = self.s.m.cmp(loop_bb, pred::IUGE, cur, vals[0]);
+                            let inc = self.s.m.bin(loop_bb, Bin::Add, cur, one);
+                            self.s.m.select(loop_bb, ge, z, inc)
+                        }
+                        BufferAtomic::Dec => {
+                            let one = self.s.m.i32(1);
+                            let is0 = self.s.m.cmp(loop_bb, pred::EQ, cur, z);
+                            let gt = self.s.m.cmp(loop_bb, pred::IUGT, cur, vals[0]);
+                            let wrap = self.s.m.bin(loop_bb, Bin::Or, is0, gt);
+                            let dec = self.s.m.bin(loop_bb, Bin::Sub, cur, one);
+                            self.s.m.select(loop_bb, wrap, vals[0], dec)
+                        }
+                        BufferAtomic::FMin | BufferAtomic::FMax => {
+                            let is_max = matches!(op, BufferAtomic::FMax);
+                            let a = self.as_float(cur);
+                            let b = self.as_float(vals[0]);
+                            let m = self.max_min(is_max, a, b);
+                            self.as_int(m)
+                        }
+                        _ => unreachable!(),
+                    };
+                    let prev = cmpxchg(self, cur, next);
+                    let ok = self.s.m.cmp(loop_bb, pred::EQ, prev, cur);
+                    self.s.m.terminate(loop_bb, Term::CondBr(ok, exit_bb, loop_bb));
+                    self.s.m.set_phi(cur, vec![(init, pre), (prev, loop_bb)]);
+                    self.cur = exit_bb;
+                    cur
+                }
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
