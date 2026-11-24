@@ -87,7 +87,10 @@ edit and shell command (configured in `.claude/settings.json`; needs
 `not_unsafe_ptr_arg_deref` allows (hard rule 3), citations of decision
 records, and `git commit` with `--no-verify` or `-n`. It checks only the
 text being written, so it shortens the loop; it replaces none of the
-commands above.
+commands above. After each edit of a `.rs` file,
+`.claude/hooks/rustfmt_edit.ps1` runs rustfmt on that file alone if it
+was already formatted at `HEAD`, and leaves the files rustfmt has not
+been run on as they are (see the `cargo fmt` row of the lint ratchet).
 
 ## Hard rules
 
