@@ -937,3 +937,62 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn float_phi_select_and_sibling_bool_branches_execute() {
+    // build_valu_cs copies s0..s3 into v1..v4:
+    //   s0/v1 = loop count, s1/v2 = f32 step, s2/v3 = f32 cap, s3/v4 = branch selector.
+    // Accumulates v0 = float phi over s0 iterations adding v2 when v0 < v3 via
+    // float v_cndmask_b32, then exercises two non-dominating sibling branches
+    // that each evaluate a guarded float add under (v2 != 0 && v3 != 0).
+    let body: Vec<u32> = vec![
+        vop1(0x001, 0, 0x80), // v_mov_b32 v0, 0
+        s_mov_b32(6, 0),      // s6 = s0 (loop count)
+        // loop:
+        0x060A_0400 | 0x100, // v_add_f32 v5, v0, v2 (VOP2 op 3: dst=5, vsrc1=2, src0=v0)
+        0x7C02_0600 | 0x100, // v_cmp_lt_f32 vcc_lo, v0, v3 (VOPC op 1: vsrc1=3, src0=v0)
+        0x0200_0A00 | 0x100, // v_cndmask_b32 v0, v0, v5, vcc_lo
+        sop2(0x01, 6, 6, 0x81), // s_sub_u32 s6, s6, 1
+        0xBF07_8006,         // s_cmp_lg_u32 s6, 0
+        0xBF85_FFFA,         // s_cbranch_scc1 -6
+        // Non-dominating sibling if/else both evaluating (v2 != 0 && v3 != 0):
+        // if (s3 == 0) { guarded add 1.0 } else { guarded add 2.0 }
+        0xBF06_8003, // s_cmp_eq_u32 s3, 0
+        0xBF84_0008, // s_cbranch_scc0 +8 (else)
+        // then branch (8 dwords):
+        0xD4C5_000C, // v_cmp_ne_u32 s12, v2, 0
+        0x0001_0102,
+        0xD4C5_000D, // v_cmp_ne_u32 s13, v3, 0
+        0x0001_0103,
+        0x877E_0D0C, // s_and_b32 exec_lo, s12, s13
+        0x0600_00F2, // v_add_f32 v0, 1.0, v0 (guarded float write)
+        0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+        0xBF82_0007, // s_branch +7 (join)
+        // else branch (7 dwords):
+        0xD4C5_000C, // v_cmp_ne_u32 s12, v2, 0
+        0x0001_0102,
+        0xD4C5_000D, // v_cmp_ne_u32 s13, v3, 0
+        0x0001_0103,
+        0x877E_0D0C, // s_and_b32 exec_lo, s12, s13
+        0x0600_00F4, // v_add_f32 v0, 2.0, v0 (guarded float write)
+        0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+    ];
+    let shader = build_valu_cs(&body);
+    let cases = [
+        // 5 iterations adding 1.5 capped when >= 4.0 -> 0 -> 1.5 -> 3.0 -> 4.5 (then stays 4.5), +1.0 = 5.5
+        ([5, 1.5f32.to_bits(), 4.0f32.to_bits(), 0], 5.5f32),
+        // Same loop -> 4.5, else branch adds +2.0 = 6.5
+        ([5, 1.5f32.to_bits(), 4.0f32.to_bits(), 1], 6.5f32),
+        // v1 = 0.0 -> loop stays 0.0, guard (v1 != 0 && v2 != 0) is false -> stays 0.0
+        ([3, 0.0f32.to_bits(), 4.0f32.to_bits(), 0], 0.0f32),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let got_f = f32::from_bits(got);
+        let want = cases[i].1;
+        assert!(
+            (got_f - want).abs() < 1e-6,
+            "{backend}: case {i} got {got_f} ({got:#010x}), want {want}"
+        );
+    });
+}

@@ -390,7 +390,55 @@ impl Module {
         self.push(block, ty, Op::Bin(op, a, b))
     }
     pub fn cast(&mut self, block: usize, op: Cast, v: V, to: Ty) -> V {
+        if op == Cast::Bitcast {
+            if self.type_of(v) == to {
+                return v;
+            }
+            match v {
+                V::Const(i) => match (&self.consts[i as usize].1, &self.types[to.0 as usize]) {
+                    (&Const::Int(n), TypeDef::Float) => return self.f32(n as u32),
+                    (&Const::Float(bits), TypeDef::Int(32)) => return self.i32(bits),
+                    (Const::Undef, _) => return self.undef(to),
+                    _ => {}
+                },
+                V::Inst(i) => {
+                    if let Op::Cast(Cast::Bitcast, inner) = self.insts[i as usize].op
+                        && self.type_of(inner) == to
+                    {
+                        return inner;
+                    }
+                }
+                _ => {}
+            }
+        }
         self.push(block, to, Op::Cast(op, v))
+    }
+
+    #[cfg(test)]
+    pub fn count_bitcasts(&self) -> usize {
+        self.insts
+            .iter()
+            .filter(|i| matches!(i.op, Op::Cast(Cast::Bitcast, _)))
+            .count()
+    }
+
+    #[cfg(test)]
+    pub fn count_f32_phis(&self) -> usize {
+        self.insts
+            .iter()
+            .filter(|i| matches!(i.op, Op::Phi(_)) && self.types[i.ty.0 as usize] == TypeDef::Float)
+            .count()
+    }
+
+    #[cfg(test)]
+    pub fn count_i1_ops(&self) -> usize {
+        self.insts
+            .iter()
+            .filter(|i| {
+                self.types[i.ty.0 as usize] == TypeDef::Int(1)
+                    && matches!(i.op, Op::Bin(..) | Op::Select(..))
+            })
+            .count()
     }
     pub fn cmp(&mut self, block: usize, pred: u8, a: V, b: V) -> V {
         let t = self.int(1);

@@ -25,6 +25,7 @@ type Why = &'static str;
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
+    F32(V),
     Bit(V),
     Missing(Why),
 }
@@ -153,11 +154,16 @@ struct Lower<'a> {
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
-    floats: HashMap<Value, V>,
+    /// SSA phis inferred to carry float (`f32`) values across incoming paths.
+    float_phis: HashSet<Value>,
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
+    /// Immediate dominator of each DXIL block (`0` for entry, `usize::MAX` for
+    /// unreachable/abort blocks).
+    dxil_idom: Vec<usize>,
     cur: usize,
     bools: HashMap<(usize, Bool), V>,
+    atoms: HashMap<(usize, Atom), V>,
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
@@ -342,6 +348,218 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PhiKind {
+    Const,
+    Float,
+    Int,
+}
+
+fn join_phi_kind(a: PhiKind, b: PhiKind) -> PhiKind {
+    match (a, b) {
+        (PhiKind::Int, _) | (_, PhiKind::Int) => PhiKind::Int,
+        (PhiKind::Float, _) | (_, PhiKind::Float) => PhiKind::Float,
+        (PhiKind::Const, PhiKind::Const) => PhiKind::Const,
+    }
+}
+
+/// Infers SSA phis whose reachable incoming values are all float-typed (or
+/// constants) with at least one float producer, so they lower as native
+/// `float` phis instead of `i32` phis with roundtrip bitcasts.
+fn infer_float_phis(
+    p: &Program,
+    st: &Structured,
+    io: &Io,
+    inputs: &[SigElement],
+    bad: &HashMap<Value, Why>,
+) -> HashSet<Value> {
+    let max_v = p
+        .inputs
+        .iter()
+        .map(|i| i.1.0 as usize + 1)
+        .chain(p.blocks.iter().flat_map(|b| {
+            b.phis.iter().map(|phi| phi.value.0 as usize + 1).chain(
+                b.insts
+                    .iter()
+                    .flat_map(|i| i.writes.iter().map(|w| w.1.0 as usize + 1)),
+            )
+        }))
+        .max()
+        .unwrap_or(0);
+    if max_v == 0 {
+        return HashSet::new();
+    }
+    let mut kind = vec![PhiKind::Int; max_v];
+    let io_inputs: HashMap<Value, Input> = io.inputs.iter().copied().collect();
+    for &(reg, v) in &p.inputs {
+        if let Reg::V(_) = reg {
+            match io_inputs.get(&v) {
+                None => kind[v.0 as usize] = PhiKind::Const,
+                Some(Input::Position(_)) => kind[v.0 as usize] = PhiKind::Float,
+                Some(&Input::Attribute { row, channel }) => {
+                    let is_f32 = inputs.iter().any(|e| {
+                        e.row == Some(u32::from(row))
+                            && channel >= e.col
+                            && channel < e.col + e.cols
+                            && e.comp == 9
+                            && !e.half
+                    });
+                    if is_f32 {
+                        kind[v.0 as usize] = PhiKind::Float;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut copy_selects: Vec<(Value, Vec<Value>)> = Vec::new();
+    let mut candidate_phis: Vec<(usize, usize)> = Vec::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, phi) in block.phis.iter().enumerate() {
+            let eligible = !matches!(phi.reg, Reg::Scc)
+                && !matches!(phi.reg, Reg::S(c) if c == EXEC || c == EXEC + 1)
+                && !bad.contains_key(&phi.value);
+            if eligible {
+                kind[phi.value.0 as usize] = PhiKind::Const;
+                candidate_phis.push((b, i));
+            }
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            let name = inst.name();
+            match &inst.fields {
+                Fields::Valu(v) => {
+                    let Some(Operand::Vector { reg, .. }) = v.dst else {
+                        continue;
+                    };
+                    let Some(w) = inst.write(Reg::V(reg)) else {
+                        continue;
+                    };
+                    if Lower::sdwa_dst(inst).is_some() {
+                        continue;
+                    }
+                    let float_op = name.ends_with("_f32")
+                        || matches!(
+                            name,
+                            "v_cvt_f32_i32"
+                                | "v_cvt_f32_u32"
+                                | "v_cvt_f32_f16"
+                                | "v_cvt_f32_ubyte0"
+                                | "v_cvt_f32_ubyte1"
+                                | "v_cvt_f32_ubyte2"
+                                | "v_cvt_f32_ubyte3"
+                        )
+                        || (name == "v_mov_b32"
+                            && (v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0))
+                        || (name == "v_cndmask_b32" && (v.abs != 0 || v.neg != 0));
+                    if float_op {
+                        kind[w.0 as usize] = PhiKind::Float;
+                    } else if matches!(name, "v_mov_b32" | "v_cndmask_b32")
+                        && v.dpp.is_none()
+                        && Lower::sdwa_src(inst, 0).is_none()
+                        && (name == "v_mov_b32" || Lower::sdwa_src(inst, 1).is_none())
+                    {
+                        let n_ops = if name == "v_mov_b32" { 1 } else { 2 };
+                        let mut srcs = Vec::new();
+                        let mut ok = true;
+                        for op in v.src.iter().take(n_ops) {
+                            match *op {
+                                Operand::Const(_)
+                                | Operand::Literal(_)
+                                | Operand::Scalar { code: NULL, .. } => {}
+                                Operand::Vector { reg: r, .. } => match inst.read(Reg::V(r)) {
+                                    Some(sv) => srcs.push(sv),
+                                    None => ok = false,
+                                },
+                                Operand::Scalar { code, .. } => match inst.read(Reg::S(code)) {
+                                    Some(sv) => srcs.push(sv),
+                                    None => ok = false,
+                                },
+                                Operand::Attr { .. } => ok = false,
+                            }
+                        }
+                        if ok {
+                            if st.guards[b][i].is_some()
+                                && let Some(old) = inst.read(Reg::V(reg))
+                            {
+                                srcs.push(old);
+                            }
+                            kind[w.0 as usize] = PhiKind::Const;
+                            if !srcs.is_empty() {
+                                copy_selects.push((w, srcs));
+                            }
+                        }
+                    }
+                }
+                Fields::Image { d16, .. }
+                    if !*d16
+                        && !name.starts_with("image_store")
+                        && !name.starts_with("image_atomic_")
+                        && name != "image_get_resinfo" =>
+                {
+                    for &(r, w) in &inst.writes {
+                        if matches!(r, Reg::V(_)) {
+                            kind[w.0 as usize] = PhiKind::Float;
+                        }
+                    }
+                }
+                Fields::Buffer { .. }
+                    if name.starts_with("buffer_load_format_")
+                        && !name.contains("_format_d16_") =>
+                {
+                    for &(r, w) in &inst.writes {
+                        if matches!(r, Reg::V(_)) {
+                            kind[w.0 as usize] = PhiKind::Float;
+                        }
+                    }
+                }
+                Fields::Vintrp { .. } if !name.ends_with("_f16") => {
+                    for &(r, w) in &inst.writes {
+                        if matches!(r, Reg::V(_)) {
+                            kind[w.0 as usize] = PhiKind::Float;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if candidate_phis.is_empty() {
+        return HashSet::new();
+    }
+    for _ in 0..32 {
+        let mut changed = false;
+        for (w, srcs) in &copy_selects {
+            let new = srcs.iter().fold(PhiKind::Const, |acc, &s| {
+                join_phi_kind(acc, kind[s.0 as usize])
+            });
+            if new != kind[w.0 as usize] {
+                kind[w.0 as usize] = new;
+                changed = true;
+            }
+        }
+        for &(b, i) in &candidate_phis {
+            let phi = &p.blocks[b].phis[i];
+            let new = phi.args.iter().fold(PhiKind::Const, |acc, &a| {
+                join_phi_kind(acc, kind[a.0 as usize])
+            });
+            if new != kind[phi.value.0 as usize] {
+                kind[phi.value.0 as usize] = new;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    candidate_phis
+        .into_iter()
+        .map(|(b, i)| p.blocks[b].phis[i].value)
+        .filter(|v| kind[v.0 as usize] == PhiKind::Float)
+        .collect()
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -449,16 +667,19 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let float_phis = infer_float_phis(p, x.st, x.io, &s.inputs, bad);
         Lower {
             s,
             x,
             bad,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
-            floats: HashMap::new(),
+            float_phis,
             block: vec![None; p.blocks.len()],
+            dxil_idom: vec![0],
             cur: 0,
             bools: HashMap::new(),
+            atoms: HashMap::new(),
             lane_bits: HashMap::new(),
             phi_at,
             mask_phis: HashMap::new(),
@@ -821,17 +1042,54 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
+    fn new_dxil_block(&mut self, idom: usize) -> usize {
+        let b = self.s.m.new_block();
+        if self.dxil_idom.len() <= b {
+            self.dxil_idom.resize(b + 1, usize::MAX);
+        }
+        self.dxil_idom[b] = idom;
+        b
+    }
+
     fn run(mut self) -> Result<Lowered, Stop> {
+        self.run_body()?;
+        let user_data = self.user_reads.values().copied().collect();
+        self.s.samplers = self.samplers.len() as u32;
+        let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
+        let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let cmp_samplers = self.s.cmp_samplers;
+        Ok(Lowered {
+            cmp_samplers,
+            root_cbvs,
+            root_srvs,
+            #[cfg(test)]
+            nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            dxil: self.s.finish(),
+            user_data,
+            samplers: self.samplers,
+        })
+    }
+
+    #[cfg(test)]
+    fn run_keep_module(mut self) -> Result<super::bitcode::Module, Stop> {
+        self.run_body()?;
+        Ok(self.s.m)
+    }
+
+    fn run_body(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
         }
+        let ir_idom = crate::ir::idoms(&p.blocks, &order, &self.rpo);
         for (n, &b) in order.iter().enumerate() {
             self.block[b] = Some(if n == 0 {
                 self.s.entry
             } else {
-                self.s.m.new_block()
+                self.new_dxil_block(usize::MAX)
             });
         }
         // Loop headers count iterations (`LOOP_LIMIT`).
@@ -853,8 +1111,18 @@ impl<'a> Lower<'a> {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
         }
-        for &b in &order {
-            self.cur = self.block[b].expect("reachable");
+        for (n, &b) in order.iter().enumerate() {
+            let blk = self.block[b].expect("reachable");
+            if n > 0 {
+                let d = ir_idom[b];
+                if d != b
+                    && d < self.tail.len()
+                    && let Some(tail_d) = self.tail[d]
+                {
+                    self.dxil_idom[blk] = tail_d;
+                }
+            }
+            self.cur = blk;
             self.cur_ir = b;
             let preds: Vec<usize> = p.blocks[b]
                 .preds
@@ -871,6 +1139,11 @@ impl<'a> Lower<'a> {
                         let v = self.s.m.phi(self.cur, self.s.t.i1);
                         self.data_phis.push((v, b, i));
                         Val::Bit(v)
+                    }
+                    _ if self.float_phis.contains(&phi.value) => {
+                        let v = self.s.m.phi(self.cur, self.s.t.f32);
+                        self.data_phis.push((v, b, i));
+                        Val::F32(v)
                     }
                     _ => {
                         let v = self.s.m.phi(self.cur, self.s.t.i32);
@@ -896,24 +1169,7 @@ impl<'a> Lower<'a> {
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
-        self.fill_phis()?;
-        let user_data = self.user_reads.values().copied().collect();
-        self.s.samplers = self.samplers.len() as u32;
-        let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
-        let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
-        let cmp_samplers = self.s.cmp_samplers;
-        Ok(Lowered {
-            cmp_samplers,
-            root_cbvs,
-            root_srvs,
-            #[cfg(test)]
-            nonuniform_handles: self.s.nonuniform_handles,
-            #[cfg(test)]
-            wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            dxil: self.s.finish(),
-            user_data,
-            samplers: self.samplers,
-        })
+        self.fill_phis()
     }
 
     fn exported_out(&self, b: usize) -> bool {
@@ -1106,7 +1362,7 @@ impl<'a> Lower<'a> {
         } else if int {
             Val::I32(v)
         } else {
-            Val::I32(self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.i32))
+            Val::F32(v)
         }
     }
 
@@ -1135,6 +1391,7 @@ impl<'a> Lower<'a> {
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
         match self.get(v)? {
             Val::I32(x) => Ok(x),
+            Val::F32(f) => Ok(self.as_int(f)),
             Val::Bit(x) => Ok(self.s.m.cast(self.cur, Cast::ZExt, x, self.s.t.i32)),
             Val::Missing(w) => Err(w),
         }
@@ -1307,27 +1564,23 @@ impl<'a> Lower<'a> {
                 let x = self.src0.expect("checked");
                 self.as_float(x)
             }
-            Operand::Vector { reg, .. } | Operand::Scalar { code: reg, .. }
-                if !matches!(op, Operand::Scalar { code: NULL, .. }) =>
-            {
+            Operand::Scalar { code: NULL, .. } => self.s.m.f32(0),
+            Operand::Const(c) => {
+                let bits = crate::resource::inline(c)
+                    .ok_or("a special operand (vccz, execz, scc, lds_direct)")?;
+                self.s.m.f32(bits)
+            }
+            Operand::Literal(x) => self.s.m.f32(x),
+            Operand::Vector { reg, .. } | Operand::Scalar { code: reg, .. } => {
                 let r = if matches!(op, Operand::Vector { .. }) {
                     Reg::V(reg)
                 } else {
                     Reg::S(reg)
                 };
                 let val = inst.read(r).ok_or("an unread operand")?;
-                match self.floats.get(&val) {
-                    Some(&f) => f,
-                    None => {
-                        let x = self.i32_of(val)?;
-                        self.as_float(x)
-                    }
-                }
+                self.float_of(val)?
             }
-            _ => {
-                let x = self.operand(inst, &op)?;
-                self.as_float(x)
-            }
+            Operand::Attr { .. } => return Err("an attribute operand"),
         };
         if v.abs >> k & 1 != 0 {
             f = self.unary(6, f);
@@ -1554,8 +1807,16 @@ impl<'a> Lower<'a> {
         if b == Bool::TRUE || b == Bool::FALSE {
             return Ok(self.s.m.bool(b == Bool::TRUE));
         }
-        if let Some(&v) = self.bools.get(&(at, b)) {
-            return Ok(v);
+        let mut d = at;
+        loop {
+            if let Some(&v) = self.bools.get(&(d, b)) {
+                return Ok(v);
+            }
+            let parent = self.dxil_idom.get(d).copied().unwrap_or(usize::MAX);
+            if parent == d || parent == usize::MAX {
+                break;
+            }
+            d = parent;
         }
         let (atom, lo, hi) = self.x.st.bools.node(b).expect("not a constant");
         let a = self.atom(atom, at)?;
@@ -1585,20 +1846,39 @@ impl<'a> Lower<'a> {
     }
 
     fn atom(&mut self, atom: Atom, at: usize) -> Result<V, Why> {
-        match atom {
+        let cacheable = matches!(atom, Atom::Uniform(_) | Atom::Opaque(_) | Atom::Constant(_));
+        if cacheable {
+            let mut d = at;
+            loop {
+                if let Some(&v) = self.atoms.get(&(d, atom)) {
+                    return Ok(v);
+                }
+                let parent = self.dxil_idom.get(d).copied().unwrap_or(usize::MAX);
+                if parent == d || parent == usize::MAX {
+                    break;
+                }
+                d = parent;
+            }
+        }
+        let v = match atom {
             Atom::Lane(v) => self.lane_bits.get(&v).copied().ok_or_else(|| {
                 self.lane_fail
                     .get(&v)
                     .copied()
                     .unwrap_or("a lane mask from a carry")
-            }),
+            })?,
             Atom::Uniform(v) => match self.get(v)? {
-                Val::Bit(x) => Ok(x),
+                Val::Bit(x) => x,
                 Val::I32(x) => {
                     let z = self.s.m.i32(0);
-                    Ok(self.s.m.cmp(at, pred::NE, x, z))
+                    self.s.m.cmp(at, pred::NE, x, z)
                 }
-                Val::Missing(w) => Err(w),
+                Val::F32(f) => {
+                    let x = self.s.m.cast(at, Cast::Bitcast, f, self.s.t.i32);
+                    let z = self.s.m.i32(0);
+                    self.s.m.cmp(at, pred::NE, x, z)
+                }
+                Val::Missing(w) => return Err(w),
             },
             Atom::Phi(id) => {
                 if let Some(&v) = self.mask_phis.get(&id) {
@@ -1612,12 +1892,12 @@ impl<'a> Lower<'a> {
                 let v = self.s.m.phi(blk, self.s.t.i1);
                 self.mask_phis.insert(id, v);
                 self.pending_masks.push((v, b, i));
-                Ok(v)
+                return Ok(v);
             }
             // shortcut: "some lane of the quad is set" is taken as true: the
             // lanes it adds only feed derivatives, and exports keep their own
             // masks. Wrong if such a section had a side effect.
-            Atom::Quad(_) => Ok(self.s.m.bool(true)),
+            Atom::Quad(_) => return Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
@@ -1626,22 +1906,30 @@ impl<'a> Lower<'a> {
                     None => None,
                 };
                 let lo = self.get(v)?;
-                let word = |w: Val| match w {
+                let word = |l: &mut Self, w: Val| match w {
                     Val::I32(x) => Ok(x),
+                    Val::F32(f) => Ok(l.s.m.cast(at, Cast::Bitcast, f, l.s.t.i32)),
                     _ => Err("an opaque lane mask"),
                 };
-                let lo = word(lo)?;
-                let hi = hi.map(word).transpose()?;
-                Ok(self.lane_bit(at, lo, hi))
+                let lo = word(self, lo)?;
+                let hi = match hi {
+                    Some(h) => Some(word(self, h)?),
+                    None => None,
+                };
+                self.lane_bit(at, lo, hi)
             }
             Atom::Constant(k) if self.console_lanes => {
                 let lo = self.s.m.i32(k as u32);
                 let hi = self.s.m.i32((k >> 32) as u32);
-                Ok(self.lane_bit(at, lo, Some(hi)))
+                self.lane_bit(at, lo, Some(hi))
             }
-            Atom::Opaque(_) => Err("an opaque lane mask"),
-            Atom::Constant(_) => Err("a constant lane mask"),
+            Atom::Opaque(_) => return Err("an opaque lane mask"),
+            Atom::Constant(_) => return Err("a constant lane mask"),
+        };
+        if cacheable {
+            self.atoms.insert((at, atom), v);
         }
+        Ok(v)
     }
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
@@ -1784,6 +2072,23 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, old, field)
     }
 
+    /// Writes a float (`f32`) result to `reg`, preserving float representation
+    /// across lane guards via `select i1, float, float`.
+    fn write_float(&mut self, inst: &Inst, reg: Reg, f: V, guard: Option<V>) {
+        let Some(new) = inst.write(reg) else { return };
+        let f = match (guard, reg) {
+            (Some(g), Reg::V(_)) => {
+                let old = match inst.read(reg).map(|o| self.float_of(o)) {
+                    Some(Ok(o)) => o,
+                    _ => self.s.m.f32(0),
+                };
+                self.s.m.select(self.cur, g, f, old)
+            }
+            _ => f,
+        };
+        self.vals.insert(new, Val::F32(f));
+    }
+
     fn write_f(&mut self, inst: &Inst, f: V, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -1803,13 +2108,11 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err("a float result outside a VGPR");
         };
-        let x = self.as_int(f);
-        self.write(inst, Reg::V(reg), x, guard);
-        if guard.is_none()
-            && Self::sdwa_dst(inst).is_none()
-            && let Some(new) = inst.write(Reg::V(reg))
-        {
-            self.floats.insert(new, f);
+        if Self::sdwa_dst(inst).is_some() {
+            let x = self.as_int(f);
+            self.write(inst, Reg::V(reg), x, guard);
+        } else {
+            self.write_float(inst, Reg::V(reg), f, guard);
         }
         Ok(())
     }
@@ -1833,9 +2136,10 @@ impl<'a> Lower<'a> {
     /// lane guard): returns where it started and the join block.
     fn begin_guarded(&mut self, guard: Option<V>) -> Option<(usize, usize)> {
         let g = guard?;
-        let (then, join) = (self.s.m.new_block(), self.s.m.new_block());
-        self.s.m.terminate(self.cur, Term::CondBr(g, then, join));
         let head = self.cur;
+        let then = self.new_dxil_block(head);
+        let join = self.new_dxil_block(head);
+        self.s.m.terminate(head, Term::CondBr(g, then, join));
         self.cur = then;
         Some((head, join))
     }
@@ -2041,11 +2345,39 @@ impl<'a> Lower<'a> {
 
     /// The float value of a register value.
     fn float_of(&mut self, v: Value) -> Result<V, Why> {
-        if let Some(&f) = self.floats.get(&v) {
-            return Ok(f);
+        match self.get(v)? {
+            Val::F32(f) => Ok(f),
+            Val::I32(x) => Ok(self.as_float(x)),
+            Val::Bit(x) => {
+                let z = self.s.m.cast(self.cur, Cast::ZExt, x, self.s.t.i32);
+                Ok(self.as_float(z))
+            }
+            Val::Missing(w) => Err(w),
         }
-        let x = self.i32_of(v)?;
-        Ok(self.as_float(x))
+    }
+
+    /// Whether a VALU source operand is float-typed (`Val::F32` register) or a
+    /// neutral constant/literal that converts to `f32` without a bitcast.
+    /// Returns `(is_float_compatible, is_float_reg)`.
+    fn float_operand_kind(&self, inst: &Inst, op: &Operand) -> (bool, bool) {
+        match *op {
+            Operand::Const(_) | Operand::Literal(_) | Operand::Scalar { code: NULL, .. } => {
+                (true, false)
+            }
+            Operand::Vector { reg, .. } => {
+                let is_f = inst
+                    .read(Reg::V(reg))
+                    .is_some_and(|v| matches!(self.vals.get(&v), Some(Val::F32(_))));
+                (is_f, is_f)
+            }
+            Operand::Scalar { code, .. } => {
+                let is_f = inst
+                    .read(Reg::S(code))
+                    .is_some_and(|v| matches!(self.vals.get(&v), Some(Val::F32(_))));
+                (is_f, is_f)
+            }
+            Operand::Attr { .. } => (false, false),
+        }
     }
 
     /// The values of VGPRs `reg..reg + n` as `inst` reads them.
@@ -3899,6 +4231,16 @@ impl<'a> Lower<'a> {
                     let a = f(self, 0)?;
                     return float(self, a);
                 }
+                if self.src0.is_none()
+                    && Self::sdwa_dst(inst).is_none()
+                    && Self::sdwa_src(inst, 0).is_none()
+                    && v.src
+                        .first()
+                        .is_some_and(|op| self.float_operand_kind(inst, op).1)
+                {
+                    let a = f(self, 0)?;
+                    return float(self, a);
+                }
                 let a = s(self, 0)?;
                 int(self, a)
             }
@@ -3928,13 +4270,7 @@ impl<'a> Lower<'a> {
                     return Err("an accumulator");
                 };
                 let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
-                let acc = match self.floats.get(&acc) {
-                    Some(&x) => x,
-                    None => {
-                        let x = self.i32_of(acc)?;
-                        self.as_float(x)
-                    }
-                };
+                let acc = self.float_of(acc)?;
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
@@ -4160,7 +4496,21 @@ impl<'a> Lower<'a> {
                     .and_then(|m| self.x.st.masks.get(&m).copied())
                     .ok_or("a select on an untracked mask")?;
                 let cond = self.boolean(m, c)?;
-                if v.abs != 0 || v.neg != 0 {
+                let float_select = v.abs != 0
+                    || v.neg != 0
+                    || (self.src0.is_none()
+                        && Self::sdwa_dst(inst).is_none()
+                        && Self::sdwa_src(inst, 0).is_none()
+                        && Self::sdwa_src(inst, 1).is_none()
+                        && match (v.src.first(), v.src.get(1)) {
+                            (Some(o0), Some(o1)) => {
+                                let (c0, r0) = self.float_operand_kind(inst, o0);
+                                let (c1, r1) = self.float_operand_kind(inst, o1);
+                                c0 && c1 && (r0 || r1)
+                            }
+                            _ => false,
+                        });
+                if float_select {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
                     let r = self.s.m.select(c, cond, bb, a);
                     return float(self, r);
@@ -5487,7 +5837,7 @@ impl<'a> Lower<'a> {
             return Err("an interpolation");
         };
         // A channel of an input element, interpolated as `mode` says.
-        let channel = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
+        let channel = |l: &mut Self, row: u8, ch: u8| -> Result<Val, Why> {
             let (id, col) = l
                 .find_input(row, ch)
                 .ok_or("an input the signature lacks")?;
@@ -5497,7 +5847,7 @@ impl<'a> Lower<'a> {
             }
             e.interp = mode;
             match l.load_any_input(id, col) {
-                Val::I32(x) => Ok(x),
+                v @ (Val::I32(_) | Val::F32(_)) => Ok(v),
                 _ => Err("an input"),
             }
         };
@@ -5509,7 +5859,7 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let f16 = inst.name().ends_with("_f16");
-        let x = match packing {
+        let val = match packing {
             None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
             None => channel(self, attribute.row, attribute.channel)?,
             Some((pack2, b)) => {
@@ -5524,8 +5874,11 @@ impl<'a> Lower<'a> {
                     let Some((row, ch)) = src else {
                         return Ok(None);
                     };
-                    let x = channel(l, row, ch)?;
-                    let f = l.as_float(x);
+                    let f = match channel(l, row, ch)? {
+                        Val::F32(f) => f,
+                        Val::I32(x) => l.as_float(x),
+                        _ => return Err("an input"),
+                    };
                     let i32t = l.s.t.i32;
                     Ok(Some(l.s.op(
                         l.cur,
@@ -5541,7 +5894,7 @@ impl<'a> Lower<'a> {
                 if f16 {
                     let lo = half(self, h + u8::from(attribute.high))?
                         .ok_or("a packed input half no element holds")?;
-                    self.low_half(inst, reg, lo)
+                    Val::I32(self.low_half(inst, reg, lo))
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
                     let z = self.s.m.i32(0);
@@ -5549,14 +5902,18 @@ impl<'a> Lower<'a> {
                     let hi = half(self, h + 1)?.unwrap_or(z);
                     let k16 = self.s.m.i32(16);
                     let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                    self.s.m.bin(c, Bin::Or, lo, hi)
+                    Val::I32(self.s.m.bin(c, Bin::Or, lo, hi))
                 } else {
                     return Err("32-bit interpolation of a 16-bit input");
                 }
             }
         };
         // A pixel interpolates in every lane; guards only hide inactive ones.
-        self.write(inst, Reg::V(reg), x, None);
+        match val {
+            Val::F32(f) => self.write_float(inst, Reg::V(reg), f, None),
+            Val::I32(x) => self.write(inst, Reg::V(reg), x, None),
+            _ => unreachable!(),
+        }
         Ok(())
     }
 
@@ -6078,33 +6435,36 @@ impl<'a> Lower<'a> {
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
         };
+        if !*d16 {
+            for (k, ch) in channels.into_iter().enumerate() {
+                let x = self.s.m.extract(c, r, ch);
+                self.write_float(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         let mut xs = Vec::new();
         for ch in channels {
             let x = self.s.m.extract(c, r, ch);
-            xs.push(if *d16 {
-                // shortcut: d16 results are taken as floats (rounded to
-                // nearest even); integer formats would keep 16 bits.
-                let i32t = self.s.t.i32;
+            // shortcut: d16 results are taken as floats (rounded to
+            // nearest even); integer formats would keep 16 bits.
+            let i32t = self.s.t.i32;
+            xs.push(
                 self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
-            } else {
-                self.as_int(x)
-            });
+                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x]),
+            );
         }
-        if *d16 {
-            // Two channels per VGPR, low half first (an odd last high half 0).
-            let k16 = self.s.m.i32(16);
-            xs = xs
-                .chunks(2)
-                .map(|p| match *p {
-                    [lo, hi] => {
-                        let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                        self.s.m.bin(c, Bin::Or, lo, hi)
-                    }
-                    _ => p[0],
-                })
-                .collect();
-        }
+        // Two channels per VGPR, low half first (an odd last high half 0).
+        let k16 = self.s.m.i32(16);
+        let xs: Vec<V> = xs
+            .chunks(2)
+            .map(|p| match *p {
+                [lo, hi] => {
+                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                    self.s.m.bin(c, Bin::Or, lo, hi)
+                }
+                _ => p[0],
+            })
+            .collect();
         for (k, x) in xs.into_iter().enumerate() {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
@@ -6476,8 +6836,12 @@ impl<'a> Lower<'a> {
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
-            let x = self.as_int(x);
-            self.write(inst, Reg::V(reg + k as u8), x, guard);
+            if typed {
+                self.write_float(inst, Reg::V(reg + k as u8), x, guard);
+            } else {
+                let x = self.as_int(x);
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
         }
         Ok(())
     }
@@ -6641,33 +7005,39 @@ impl<'a> Lower<'a> {
             (true, true) => ("storePrimitiveOutput", 172),
         };
         for (id, col, value, half) in stores {
-            let mut x = self.i32_of(value)?;
-            if let Some(high) = half {
-                // An f16 half, declared a 32-bit float on the host.
-                let c = self.cur;
-                if high {
-                    let k16 = self.s.m.i32(16);
-                    x = self.s.m.bin(c, Bin::LShr, x, k16);
-                }
-                let f32t = self.s.t.f32;
-                let f = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                x = self.as_int(f);
-            }
-            let el = &mut elements(self, primitive)[id];
-            el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
-                9 => {
-                    let f = match self.floats.get(&value) {
-                        Some(&f) => f,
-                        None => self.as_float(x),
-                    };
+            let comp = elements(self, primitive)[id].comp;
+            let (suffix, x) = match (comp, half) {
+                (9, Some(high)) => {
+                    let mut raw = self.i32_of(value)?;
+                    let c = self.cur;
+                    if high {
+                        let k16 = self.s.m.i32(16);
+                        raw = self.s.m.bin(c, Bin::LShr, raw, k16);
+                    }
+                    let f32t = self.s.t.f32;
+                    let f = self
+                        .s
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[raw]);
                     (".f32", f)
                 }
-                _ => (".i32", x),
+                (9, None) => (".f32", self.float_of(value)?),
+                (_, Some(high)) => {
+                    let mut raw = self.i32_of(value)?;
+                    let c = self.cur;
+                    if high {
+                        let k16 = self.s.m.i32(16);
+                        raw = self.s.m.bin(c, Bin::LShr, raw, k16);
+                    }
+                    let f32t = self.s.t.f32;
+                    let f = self
+                        .s
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[raw]);
+                    (".i32", self.as_int(f))
+                }
+                (_, None) => (".i32", self.i32_of(value)?),
             };
+            let el = &mut elements(self, primitive)[id];
+            el.usage |= 1 << col;
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),
@@ -6851,7 +7221,7 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.abort {
             return a;
         }
-        let a = self.s.m.new_block();
+        let a = self.new_dxil_block(usize::MAX);
         if self.s.pixel {
             let t = self.s.m.bool(true);
             self.s
@@ -6874,7 +7244,7 @@ impl<'a> Lower<'a> {
         if preds < 2 || self.rpo[to] <= self.rpo[from] {
             return target;
         }
-        let e = self.s.m.new_block();
+        let e = self.new_dxil_block(self.cur);
         self.s.m.terminate(e, Term::Br(target));
         self.edges.insert((from, to), e);
         e
@@ -6899,23 +7269,33 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            let f32_phi = !bit && self.s.m.type_of(v) == self.s.t.f32;
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                let x = match (self.vals.get(&arg).copied(), bit) {
-                    (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
+                let x = match (self.vals.get(&arg).copied(), bit, f32_phi) {
+                    (Some(Val::F32(f)), false, true) => f,
+                    (Some(Val::I32(x)), false, true) => {
+                        self.s.m.cast(qb, Cast::Bitcast, x, self.s.t.f32)
+                    }
+                    (Some(Val::I32(x)), false, false) => x,
+                    (Some(Val::F32(f)), false, false) => {
+                        self.s.m.cast(qb, Cast::Bitcast, f, self.s.t.i32)
+                    }
+                    (Some(Val::Bit(x)), true, false) => x,
+                    (Some(Val::Bit(_)), false, _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Missing(why)), _, _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
                     }
                     _ if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "a join of mismatched values"));
                     }
                     _ if bit => self.s.m.bool(false),
+                    _ if f32_phi => self.s.m.f32(0),
                     _ => self.s.m.i32(0),
                 };
                 incoming.push((x, qb));
@@ -7417,5 +7797,118 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    fn lower_stats(native: &NativeProgram) -> (usize, usize, usize) {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, native).unwrap();
+        let parts = Parts {
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        let mut bad = std::collections::HashMap::new();
+        loop {
+            let cur = super::Lower::new(&parts, &bad);
+            match cur.run_keep_module() {
+                Ok(m) => return (m.count_bitcasts(), m.count_f32_phis(), m.count_i1_ops()),
+                Err(super::Stop::Retry(v, w)) => {
+                    bad.insert(v, w);
+                }
+                Err(super::Stop::Fail(e)) => panic!("lower failed: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn float_phi_and_select_eliminate_bitcasts() {
+        // Loop accumulating f32 in v0 with float constant 1.0 and float v_cndmask_b32:
+        let words: &[u32] = &[
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xBE80_0384, // s_mov_b32 s0, 4
+            0x0602_00F2, // v_add_f32 v1, 1.0, v0  (VOP2 op 3)
+            0x7C02_00F4, // v_cmp_lt_f32 vcc_lo, 2.0, v0 (VOPC op 0x01)
+            0x0200_0300, // v_cndmask_b32 v0, v0, v1, vcc_lo (VOP2 op 1)
+            0x8080_8100, // s_sub_u32 s0, s0, 1
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_FFFA, // s_cbranch_scc1 -6
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let (bitcasts, f32_phis, _) = lower_stats(&native);
+        assert!(
+            f32_phis >= 1,
+            "float accumulator loop should use native f32 phi(s), got {f32_phis}"
+        );
+        assert_eq!(
+            bitcasts, 0,
+            "pure float loop + float select + float constants should emit zero bitcasts"
+        );
+    }
+
+    #[test]
+    fn dominator_bool_cache_reuses_predicates_across_guarded_splits() {
+        use crate::native::{RootParam, RootType};
+
+        // Compute a compound lane guard (s0 & s1) without branching, apply it in
+        // the entry block, then branch on root constant s2 into a dominated block
+        // that uses the exact same compound guard.
+        let words: &[u32] = &[
+            0xD4C2_0000, // v_cmp_eq_u32 s0, v0, 0
+            0x0001_0100,
+            0xD4C2_0001, // v_cmp_eq_u32 s1, v1, 0
+            0x0001_0101,
+            0x877E_0100, // s_and_b32 exec_lo, s0, s1
+            0x4A04_0200, // v_add_nc_u32 v2, v0, v1 (guarded)
+            0xBF06_8002, // s_cmp_eq_u32 s2, 0 (uniform branch on root constant)
+            0xBF84_0001, // s_cbranch_scc0 +1
+            0x4A06_0481, // v_add_nc_u32 v3, 1, v2 (in dominated block, same guard!)
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let (_, _, i1_ops) = lower_stats(&native);
+        // Only ONE `and i1` for `(s0 & s1)` is emitted across the entry block and
+        // its dominated child block (without dominator caching this emitted 2).
+        assert_eq!(
+            i1_ops, 1,
+            "compound guard should be cached across dominator blocks"
+        );
     }
 }
