@@ -173,6 +173,7 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let mut device: Option<ID3D12Device> = None;
+        let mut chosen: Option<DXGI_ADAPTER_DESC1> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
@@ -181,7 +182,19 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let filter = std::env::var("VICTORY_ADAPTER")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            match pick_hardware_adapter(filter.as_deref()) {
+                Ok((adapter, desc)) => {
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                    chosen = Some(desc);
+                }
+                Err(e) if filter.is_some() => return Err(e),
+                Err(_) => {
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -207,7 +220,18 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        tracing::info!("host D3D12 device ready");
+        if let Some(desc) = chosen {
+            let name = adapter_name(&desc.Description);
+            tracing::info!(
+                adapter = %name,
+                vendor = format_args!("{:#06x}", desc.VendorId),
+                device = format_args!("{:#06x}", desc.DeviceId),
+                vram_mb = desc.DedicatedVideoMemory >> 20,
+                "host D3D12 device ready"
+            );
+        } else {
+            tracing::info!("host D3D12 device ready");
+        }
         Ok(Host {
             device,
             queue,
@@ -245,34 +269,6 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
             ));
         }
         Ok(adapter)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn warp_adapter_accepts_only_software() {
-        // This probes DXGI without creating a D3D12 device or running a title.
-        // SAFETY: plain DXGI adapter queries.
-        let raw = unsafe {
-            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            else {
-                return;
-            };
-            factory.EnumWarpAdapter::<IDXGIAdapter>()
-        };
-        let Ok(raw) = raw else { return };
-        let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
-        eprintln!(
-            "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
-            desc.VendorId, desc.Flags
-        );
-        assert_eq!(
-            warp_adapter().is_ok(),
-            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
-        );
     }
 }
 
@@ -1970,8 +1966,124 @@ fn pump() {
     }
 }
 
+fn adapter_name(raw: &[u16]) -> String {
+    let len = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+    String::from_utf16_lossy(&raw[..len])
+}
+
+fn adapter_matches(name: &str, filter: &str) -> bool {
+    name.to_ascii_lowercase()
+        .contains(&filter.trim().to_ascii_lowercase())
+}
+
+/// Picks a D3D12-capable adapter, preferring the high-performance GPU on
+/// dual-GPU systems so integrated graphics are not chosen over a discrete GPU.
+/// When `filter` is given (`VICTORY_ADAPTER`), requires a case-insensitive
+/// substring match on the adapter description.
+fn pick_hardware_adapter(
+    filter: Option<&str>,
+) -> windows::core::Result<(IDXGIAdapter1, DXGI_ADAPTER_DESC1)> {
+    // SAFETY: plain DXGI enumeration and D3D12 capability probe.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let factory6 = factory.cast::<IDXGIFactory6>().ok();
+        let mut i = 0u32;
+        loop {
+            let adapter: IDXGIAdapter1 = match &factory6 {
+                Some(f6) => {
+                    match f6.EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE) {
+                        Ok(a) => a,
+                        Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+                        Err(e) => return Err(e),
+                    }
+                }
+                None => match factory.EnumAdapters1(i) {
+                    Ok(a) => a,
+                    Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+                    Err(e) => return Err(e),
+                },
+            };
+            i += 1;
+            let desc = adapter.GetDesc1()?;
+            let is_sw = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            if let Some(needle) = filter {
+                if !adapter_matches(&adapter_name(&desc.Description), needle) {
+                    continue;
+                }
+            } else if is_sw {
+                continue;
+            }
+            if D3D12CreateDevice(
+                &adapter,
+                D3D_FEATURE_LEVEL_12_0,
+                std::ptr::null_mut::<Option<ID3D12Device>>(),
+            )
+            .is_ok()
+            {
+                return Ok((adapter, desc));
+            }
+        }
+        Err(windows::core::Error::from_hresult(DXGI_ERROR_NOT_FOUND))
+    }
+}
+
 #[cfg(test)]
-mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warp_adapter_accepts_only_software() {
+        // This probes DXGI without creating a D3D12 device or running a title.
+        // SAFETY: plain DXGI adapter queries.
+        let raw = unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return;
+            };
+            factory.EnumWarpAdapter::<IDXGIAdapter>()
+        };
+        let Ok(raw) = raw else { return };
+        let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
+        eprintln!(
+            "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
+            desc.VendorId, desc.Flags
+        );
+        assert_eq!(
+            warp_adapter().is_ok(),
+            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+        );
+    }
+
+    #[test]
+    fn adapter_name_stops_at_nul() {
+        let raw = [b'R' as u16, b'T' as u16, b'X' as u16, 0, b'X' as u16];
+        assert_eq!(adapter_name(&raw), "RTX");
+        assert_eq!(adapter_name(&[b'X' as u16, b'e' as u16]), "Xe");
+    }
+
+    #[test]
+    fn adapter_filter_matches_case_insensitively() {
+        assert!(adapter_matches("NVIDIA GeForce RTX 3070 Ti", "rtx 3070"));
+        assert!(adapter_matches("Intel(R) Iris(R) Xe Graphics", "  INTEL "));
+        assert!(!adapter_matches("Intel(R) Iris(R) Xe Graphics", "RTX"));
+    }
+
+    #[test]
+    fn unknown_adapter_filter_fails_instead_of_falling_back() {
+        let err = pick_hardware_adapter(Some("__victory_no_such_adapter__")).unwrap_err();
+        assert_eq!(err.code(), DXGI_ERROR_NOT_FOUND);
+    }
+
+    #[test]
+    fn default_adapter_is_hardware_when_present() {
+        if let Ok((_, desc)) = pick_hardware_adapter(None) {
+            assert_eq!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod batch {   // Batch::texture_due lives here; `mod tests` is already taken above
     use super::Batch;
     use std::sync::Arc;
 

@@ -62,8 +62,65 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+fn pick_adapter(filter: Option<&str>) -> Result<IDXGIAdapter1, String> {
+    let needle = filter.map(|s| s.trim().to_ascii_lowercase());
+    // SAFETY: plain DXGI enumeration and D3D12 capability probe.
+    unsafe {
+        let factory: IDXGIFactory4 =
+            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+        let factory6 = factory.cast::<IDXGIFactory6>().ok();
+        let mut i = 0u32;
+        loop {
+            let adapter: IDXGIAdapter1 = match &factory6 {
+                Some(f6) => {
+                    match f6.EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE) {
+                        Ok(a) => a,
+                        Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+                        Err(e) => return Err(err(e)),
+                    }
+                }
+                None => match factory.EnumAdapters1(i) {
+                    Ok(a) => a,
+                    Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+                    Err(e) => return Err(err(e)),
+                },
+            };
+            i += 1;
+            let desc = adapter.GetDesc1().map_err(err)?;
+            let is_sw = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            if let Some(ref want) = needle {
+                let len = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                let name = String::from_utf16_lossy(&desc.Description[..len]).to_ascii_lowercase();
+                if !name.contains(want) {
+                    continue;
+                }
+            } else if is_sw {
+                continue;
+            }
+            if D3D12CreateDevice(
+                &adapter,
+                D3D_FEATURE_LEVEL_12_0,
+                std::ptr::null_mut::<Option<ID3D12Device>>(),
+            )
+            .is_ok()
+            {
+                return Ok(adapter);
+            }
+        }
+        Err(match filter {
+            Some(f) => format!("no D3D12 adapter matching VICTORY_ADAPTER={f:?}"),
+            None => "no hardware D3D12 adapter found".into(),
+        })
+    }
+}
+
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The high-performance adapter (or `VICTORY_ADAPTER` substring match), or
+    /// WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
@@ -75,7 +132,20 @@ impl Host {
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                let filter = std::env::var("VICTORY_ADAPTER")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty());
+                match pick_adapter(filter.as_deref()) {
+                    Ok(adapter) => {
+                        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                            .map_err(err)?;
+                    }
+                    Err(e) if filter.is_some() => return Err(e),
+                    Err(_) => {
+                        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
+                            .map_err(err)?;
+                    }
+                }
             }
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
