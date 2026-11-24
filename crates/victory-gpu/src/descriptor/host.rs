@@ -199,6 +199,12 @@ impl HostHeap {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
+        // One statistic per call site, so one site per name.
+        if sampler {
+            victory_profile::record!("gpu", "sampler heap", count + extra, started.elapsed());
+        } else {
+            victory_profile::record!("gpu", "view heap", count + extra, started.elapsed());
+        }
         // What shaders read instead of a slot without a buffer view where
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.

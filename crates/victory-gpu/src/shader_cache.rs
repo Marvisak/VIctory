@@ -106,6 +106,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
+        victory_profile::scope!("shader", "dxil translation", input.len() - 32);
         Ok(encode(&(self.translate)(&input[32..])))
     }
 }
@@ -132,8 +133,10 @@ fn cached(
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let hit = !converter.ran.load(Ordering::Relaxed);
             let (counter, what) = if hit {
+                victory_profile::cache!("shader", "disk cache", Hit);
                 (&HITS, "from the cache")
             } else {
+                victory_profile::cache!("shader", "disk cache", Miss);
                 (&MISSES, "translated and cached")
             };
             counter.fetch_add(1, Ordering::Relaxed);
@@ -141,6 +144,7 @@ fn cached(
             return (shader, hit);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
+        victory_profile::cache!("shader", "disk cache", Evict);
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);

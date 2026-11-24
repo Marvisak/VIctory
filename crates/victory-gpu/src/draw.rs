@@ -141,6 +141,13 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Counts a draw or dispatch not run on the host (and for
+/// `VICTORY_PROFILE`, in its frame).
+fn count_dropped() {
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+    victory_profile::gpu::dropped();
+}
+
 /// Marks the last traced draw as not run on the host, counts it by why
 /// (the reason [`not_run`] gave, if its pipeline has a host one) and notes
 /// it in the list (diagnostics).
@@ -888,7 +895,7 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             dropped(list, self.pipeline, "dispatch");
             return;
         }
@@ -897,7 +904,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
@@ -907,7 +914,7 @@ impl State {
             return;
         }
         if !self.bind(list, p, true) {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
@@ -916,6 +923,9 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
+        if x == 0 || y == 0 || z == 0 {
+            victory_profile::gpu::zero_groups();
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
@@ -998,6 +1008,9 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    if x == 0 {
+                        victory_profile::gpu::zero_groups();
+                    }
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1006,7 +1019,7 @@ impl State {
                 Err(_) => false,
             };
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "mesh");
         }
@@ -1373,6 +1386,9 @@ impl State {
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             #[cfg(feature = "diagnostics")]
             self.probe_small(list, false);
+            if count == 0 || instances == 0 {
+                victory_profile::gpu::zero_groups();
+            }
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1381,7 +1397,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "draw");
         }
@@ -1467,6 +1483,9 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            if indices == 0 || instances == 0 {
+                victory_profile::gpu::zero_groups();
+            }
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1475,7 +1494,7 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
+            count_dropped();
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "indexed");
         }

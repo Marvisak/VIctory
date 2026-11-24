@@ -40,6 +40,8 @@ pub mod list;
 #[cfg(windows)]
 mod memory;
 pub mod object;
+#[cfg(windows)]
+mod overlay;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;

@@ -22,6 +22,8 @@ pub fn run(
     // Before the import registry is first used: it holds the module only
     // when the host's FidelityFX serves.
     victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
+    // `VICTORY_PROFILE`: frame times, memory, caches and loads.
+    victory_profile::init();
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -133,6 +135,8 @@ pub fn run(
 #[cfg(all(windows, feature = "diagnostics"))]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
+    // `VICTORY_PROFILE_DUMP` shows where every thread is as well.
+    victory_profile::with_dump(victory_loader::dump_stacks);
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
     poke(image.base(), image.info().size_of_image as usize);

@@ -43,6 +43,7 @@ title's), so a run finds them under the names it gives them itself.
 | `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), audio codecs; planned: BCPack |
 | `victory-pipeline` | converter trait, content-addressed cache |
 | `victory-game` | Grand Theft Auto VI-specific formats, build identities, hooks |
+| `victory-profile` | opt-in profiling (`VICTORY_PROFILE`): frame times, scopes, caches, loads, memory; the on-screen panel's text and pixels; GPU command times, drops and live lines with stall warnings |
 | `apps/victory` | command-line front end |
 | `xtask` | asset-policy check, git hooks |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |

@@ -620,6 +620,7 @@ impl Memory {
             NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
         // SAFETY: the allocator handed out `size` bytes.
         unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
+        victory_profile::resident!("gpu", "memory", layout.size());
         Ok(Memory {
             ptr,
             layout,
@@ -645,6 +646,7 @@ impl Memory {
             .ok_or(E_INVALIDARG)?;
         // SAFETY: the size is non-zero.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
+        victory_profile::resident!("gpu", "memory", layout.size());
         Ok(Memory {
             ptr,
             layout,
@@ -655,6 +657,7 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        victory_profile::resident!("gpu", "memory", -(self.layout.size() as i64));
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.

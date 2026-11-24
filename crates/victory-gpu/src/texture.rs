@@ -294,6 +294,13 @@ impl Staging {
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
+        victory_profile::record!("gpu", "texture refresh", read, started.elapsed());
+        // Asked and unchanged is a hit: the detiled copy was reused.
+        if read > 0 && !changed {
+            victory_profile::cache!("gpu", "detiled textures", Hit);
+        } else if changed {
+            victory_profile::cache!("gpu", "detiled textures", Miss);
+        }
         changed
     }
 
