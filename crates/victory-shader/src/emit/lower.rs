@@ -1343,10 +1343,40 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let op = *v.src.get(k).ok_or("a missing operand")?;
         if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
             return Err("integer operand modifiers");
         }
+        self.unmodified_src(inst, k)
+    }
+
+    /// A source's bits with abs/neg applied to the sign bit alone, as the
+    /// hardware does for moves and selects (`v_mov_b32`, `v_cndmask_b32`):
+    /// float operations would flush denormals and quiet signaling NaNs,
+    /// changing bits a move only copies (#883).
+    fn sign_modified_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let (abs, neg) = (v.abs >> k & 1 != 0, v.neg >> k & 1 != 0);
+        let mut x = self.unmodified_src(inst, k)?;
+        let c = self.cur;
+        if abs {
+            let m = self.s.m.i32(0x7FFF_FFFF);
+            x = self.s.m.bin(c, Bin::And, x, m);
+        }
+        if neg {
+            let m = self.s.m.i32(0x8000_0000);
+            x = self.s.m.bin(c, Bin::Xor, x, m);
+        }
+        Ok(x)
+    }
+
+    /// A source's bits, any SDWA selection applied, modifiers not.
+    fn unmodified_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let op = *v.src.get(k).ok_or("a missing operand")?;
         match self.src0 {
             Some(x) if k == 0 => Ok(x),
             _ => {
@@ -3895,11 +3925,11 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_mov_b32" => {
-                if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
+                if v.clamp || v.omod != 0 {
                     let a = f(self, 0)?;
                     return float(self, a);
                 }
-                let a = s(self, 0)?;
+                let a = self.sign_modified_src(inst, 0)?;
                 int(self, a)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
@@ -4160,12 +4190,8 @@ impl<'a> Lower<'a> {
                     .and_then(|m| self.x.st.masks.get(&m).copied())
                     .ok_or("a select on an untracked mask")?;
                 let cond = self.boolean(m, c)?;
-                if v.abs != 0 || v.neg != 0 {
-                    let (a, bb) = (f(self, 0)?, f(self, 1)?);
-                    let r = self.s.m.select(c, cond, bb, a);
-                    return float(self, r);
-                }
-                let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                let a = self.sign_modified_src(inst, 0)?;
+                let bb = self.sign_modified_src(inst, 1)?;
                 let r = self.s.m.select(c, cond, bb, a);
                 int(self, r)
             }

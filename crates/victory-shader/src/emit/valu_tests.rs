@@ -937,3 +937,67 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// VOP3 `op vdst, src0, src1, src2` with `abs` and `neg` bit masks (bit k for
+/// source k).
+const fn vop3_mod(
+    op: u16,
+    vdst: u8,
+    [src0, src1, src2]: [u16; 3],
+    abs: u8,
+    neg: u8,
+) -> [u32; 2] {
+    let [w0, w1] = vop3(op, vdst, src0, src1, src2);
+    [w0 | (abs as u32 & 7) << 8, w1 | (neg as u32 & 7) << 29]
+}
+
+/// `v_mov_b32` and `v_cndmask_b32` with abs/neg change only the sign bit, as
+/// on RDNA2: denormals keep their bits and signaling NaNs stay signaling,
+/// where float operations would flush or quiet them (#883).
+#[test]
+fn move_and_select_modifiers_change_only_the_sign_bit() {
+    const V_MOV_B32: u16 = 0x181;
+    const V_CNDMASK_B32: u16 = 0x101;
+    const V_CMP_EQ_U32: u16 = 0x0C2;
+    let values = [
+        0x0000_0001, // smallest denormal
+        0x807F_FFFF, // negative denormal
+        0x7F80_0001, // signaling NaN
+        0xFF80_0001, // negative signaling NaN
+        0x3F80_0000, // 1.0
+    ];
+    let modifiers = [(1, 0), (0, 1), (1, 1)];
+    let modified = |x: u32, abs: u8, neg: u8| {
+        let x = if abs != 0 { x & 0x7FFF_FFFF } else { x };
+        if neg != 0 { x ^ 0x8000_0000 } else { x }
+    };
+    for (abs, neg) in modifiers {
+        let mov = build_valu_cs(&vop3_mod(V_MOV_B32, 0, [vgpr(1), 0, 0], abs, neg));
+        let cases: Vec<[u32; 4]> = values.iter().map(|&x| [x, 0, 0, 0]).collect();
+        run_cases(&mov, &cases, |backend, _, inp, got| {
+            let want = modified(inp[0], abs, neg);
+            assert_eq!(got, want, "{backend}: v_mov_b32 abs={abs} neg={neg} {inp:x?}");
+        });
+
+        // v_cmp_eq_u32 s12, v3, v4; v_cndmask_b32 v0, v1, v2, s12 with the
+        // modifiers on both choices.
+        let mut body = vop3(V_CMP_EQ_U32, 12, vgpr(3), vgpr(4), 0).to_vec();
+        body.extend(vop3_mod(
+            V_CNDMASK_B32,
+            0,
+            [vgpr(1), vgpr(2), sgpr(12)],
+            abs * 3,
+            neg * 3,
+        ));
+        let select = build_valu_cs(&body);
+        let cases: Vec<[u32; 4]> = values
+            .iter()
+            .flat_map(|&x| [[x, 0x3F80_0000, 1, 0], [0x3F80_0000, x, 1, 1]])
+            .collect();
+        run_cases(&select, &cases, |backend, _, inp, got| {
+            let chosen = if inp[2] == inp[3] { inp[1] } else { inp[0] };
+            let want = modified(chosen, abs, neg);
+            assert_eq!(got, want, "{backend}: v_cndmask_b32 abs={abs} neg={neg} {inp:x?}");
+        });
+    }
+}
