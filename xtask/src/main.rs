@@ -7,6 +7,7 @@
 
 mod citations;
 mod policy;
+mod wincheck;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,6 +38,10 @@ enum Cmd {
         #[arg(default_value = "AGENTS.md")]
         docs: Vec<String>,
     },
+    /// Type-check and lint the whole workspace for x86_64-pc-windows-msvc
+    /// from any host: both clippy runs of the Windows CI job, with
+    /// `--target`. Does not link or run tests.
+    Wincheck,
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
 }
@@ -46,6 +51,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
         Cmd::Citations { docs } => citations::run(&root, &docs),
+        Cmd::Wincheck => wincheck::run(&root),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

@@ -23,7 +23,7 @@ rules below are the filter, so they are strict on purpose.
 | `victory-gpu` | D3D12.X objects, command lists, GPU memory → host D3D12 | shader translation logic | compiles, with dead-code warnings |
 | `victory-hle` | console API implementations called by title code | format decoders (call `victory-formats`) | **no** (see the ratchet) |
 | `apps/victory` | CLI: inspect, census, translate, run | library logic that other crates need | no (depends on `victory-hle`) |
-| `xtask` | asset-policy check, citation check, git hooks | product code | yes |
+| `xtask` | asset-policy check, citation check, Windows-target clippy (`wincheck`), git hooks | product code | yes |
 
 Dependency direction (enforced by review, keep it acyclic and downward):
 
@@ -51,7 +51,18 @@ cargo check  --workspace --all-targets --locked --exclude victory-hle --exclude 
 cargo clippy --workspace --all-targets --locked --exclude victory-hle --exclude victory --exclude victory-gpu -- -D warnings
 cargo test   --workspace --locked --exclude victory-hle --exclude victory
 cargo xtask citations                    # also part of cargo test
+cargo xtask wincheck                     # Windows target: type-check and lint, no tests
 ```
+
+`cargo xtask wincheck` runs the two Windows clippy commands below with
+`--target x86_64-pc-windows-msvc`, from any host, so it covers what the
+Linux commands cannot: `cfg(windows)` code, `victory-hle` and
+`apps/victory`. It needs that target's standard library (`rustup target
+add x86_64-pc-windows-msvc`; a toolchain installed from
+`rust-toolchain.toml` has it). It does not link or run anything, and it
+enables `blake3`'s `pure` feature on its command line only, because
+`blake3`'s assembly needs MSVC tools that other hosts lack. Tests and the
+real Windows build still run only on Windows.
 
 Windows (what the `check` CI job runs; the only place all code compiles):
 
@@ -62,10 +73,12 @@ cargo test --workspace --locked          # includes the asset-policy check
 cargo xtask policy                       # also run by the pre-commit hook
 ```
 
-If you can only run Linux, say so in the commit or PR, and do not touch
-`cfg(windows)` code beyond what you can prove by reading (attributes,
-docs). Never use `#[expect(...)]` in code you could not compile: an
-unfulfilled expectation is itself a warning, and CI runs `-D warnings`.
+If you can only run Linux, run `cargo xtask wincheck`: Windows code then
+type-checks and lints, but its tests have not run. Say so in the commit or
+PR, and do not change what `cfg(windows)` code does beyond what you can
+prove by reading and by `wincheck`. Never use `#[expect(...)]` in code you
+could not compile for every configuration CI builds: an unfulfilled
+expectation is itself a warning, and CI runs `-D warnings`.
 
 ## Hard rules
 
