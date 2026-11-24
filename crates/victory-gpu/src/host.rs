@@ -181,7 +181,11 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            #[cfg(all(test, feature = "diagnostics"))]
+            let adapter = present_tests::adapter()?;
+            #[cfg(not(all(test, feature = "diagnostics")))]
+            let adapter: Option<windows::core::IUnknown> = None;
+            D3D12CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -1638,6 +1642,18 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            #[cfg(all(test, feature = "diagnostics"))]
+            let back_readback = present_tests::ACTIVE.get().then(|| {
+                list.ResourceBarrier(&[transition(
+                    &back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let copy = crate::capture::read_back(&self.device, list, &back)
+                    .expect("back-buffer readback");
+                list.ResourceBarrier(&[transition(
+                    &back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                copy
+            });
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -1660,7 +1676,14 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            #[cfg(all(test, feature = "diagnostics"))]
+            if let Some((buffer, footprint)) = back_readback {
+                assert_eq!(status.0, 0, "DXGI Present");
+                present_tests::check_pixels(frame, &buffer, &footprint);
+                eprintln!("PresentX frame {frame}, back buffer {index}: all pixels matched");
+            }
+            let _ = status;
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -2053,3 +2076,6 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         );
     }
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod present_tests;
