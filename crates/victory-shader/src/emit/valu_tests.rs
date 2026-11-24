@@ -11,6 +11,9 @@ use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
 use crate::{io, ir, resource, structure};
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
@@ -69,6 +72,10 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_with_threads(body, 1)
+}
+
+fn build_valu_cs_with_threads(body: &[u32], threads: u32) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -117,7 +124,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code,
     };
@@ -172,6 +179,15 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_cases_with_wave_size(shader, cases, None, check);
+}
+
+fn run_cases_with_wave_size(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    wave_size: Option<u32>,
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -181,6 +197,24 @@ fn run_cases(
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        if let Some(size) = wave_size {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the feature selector requires a writable OPTIONS1 of this size.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .expect("D3D12_OPTIONS1");
+            if !options.WaveOps.as_bool()
+                || !(options.WaveLaneCountMin..=options.WaveLaneCountMax).contains(&size)
+            {
+                eprintln!("no wave{size} on {label}; skipped");
+                continue;
+            }
+        }
         let (root, pso) = host
             .compute_pipeline(shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
@@ -209,7 +243,42 @@ fn run_cases(
         }
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    assert!(
+        ran > 0 || wave_size.is_some(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
+}
+
+#[test]
+fn ds_swizzle_reads_only_active_compute_lanes() {
+    let value = 0xdead_beef;
+    for (offset, threads, narrow, expected) in [
+        (0x041f, 1, false, 0), // bitmask-mode swap adjacent lanes
+        (0x041f, 2, true, 0),
+        (0x80b1, 2, true, 0), // quad-mode swap adjacent lanes
+        (0x041f, 2, false, value),
+        (0x80b1, 2, false, value),
+    ] {
+        let mut words = vec![vop1(0x001, 5, 128)];
+        if narrow {
+            words.push(0x7DA4_0080); // v_cmpx_eq_u32 0, v0 (local thread ID)
+        }
+        words.extend([0xD8D4_0000 | offset, 0x0500_0001]); // ds_swizzle_b32 v5, v1
+        // Only one lane writes the output, even if both ran the swizzle.
+        words.extend([0x7DA4_0080, vop1(0x001, 0, vgpr(5))]);
+        let shader = build_valu_cs_with_threads(&words, threads);
+        run_cases_with_wave_size(
+            &shader,
+            &[[value, 0, 0, 0]],
+            Some(32),
+            |backend, _, _, got| {
+                assert_eq!(
+                    got, expected,
+                    "{backend}: offset {offset:#x}, {threads} threads, narrowed {narrow}"
+                );
+            },
+        );
+    }
 }
 
 fn is_f16_nan(bits: u16) -> bool {
