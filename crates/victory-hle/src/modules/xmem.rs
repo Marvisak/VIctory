@@ -78,7 +78,7 @@ const MEM_WRITE_WATCH: u32 = 0x20_0000;
 /// from the field at bit 12, or 40 bits without one: the console keeps
 /// title memory there, and its ray-tracing structures must be (Grand Theft
 /// Auto VI's BVH builder refuses one above; the title asks for its GPU heap
-/// with no field). Decision 0001.
+/// with no field).
 fn address_range(flags: u64) -> (usize, usize) {
     let bits = match (flags & ADDRESS_32BIT, flags >> 12 & 7) {
         (0, 0) => 40,
@@ -134,7 +134,7 @@ pub extern "system" fn XMemVirtualAlloc(
     if constrained {
         kind |= MEM_RESERVE;
         // The GPU side copies only the pages the title wrote since its last
-        // copy (`victory_gpu`, decision 0007); placeholders cannot be
+        // copy (`victory_gpu`); placeholders cannot be
         // watched (their physical-page views are copied whole).
         if kind & MEM_RESERVE_PLACEHOLDER == 0 {
             kind |= MEM_WRITE_WATCH;
