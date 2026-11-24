@@ -518,7 +518,33 @@ mod tests {
     }
 
     use super::*;
-    use crate::object::{S_OK, slot};
+    use crate::object::{E_INVALIDARG, S_OK, slot};
+
+    #[test]
+    fn pipeline_creation_refuses_null_descriptions() {
+        let null = std::ptr::null();
+        let mut p = null;
+        assert_eq!(
+            create_graphics(null, std::ptr::null(), &PIPELINE_IIDS[0], &mut p),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create_compute(null, std::ptr::null(), &PIPELINE_IIDS[0], &mut p),
+            E_INVALIDARG
+        );
+        let stream = StreamDesc {
+            size: 0,
+            stream: std::ptr::null(),
+        };
+        assert_eq!(
+            create_stream(null, &stream, &PIPELINE_IIDS[0], &mut p),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create_stream(null, std::ptr::null(), &PIPELINE_IIDS[0], &mut p),
+            E_INVALIDARG
+        );
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

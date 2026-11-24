@@ -1785,6 +1785,101 @@ mod tests {
     }
 
     #[test]
+    fn page_pools_hand_out_handles_and_refuse_bad_registration() {
+        let device = crate::device::device();
+        type Register = extern "system" fn(This, u64, u32, *mut usize) -> HRESULT;
+        type Unregister = extern "system" fn(This, usize) -> HRESULT;
+        let reg = slot::<Register>(device, 0x250);
+        let unreg = slot::<Unregister>(device, 0x258);
+        let mut handle = 0;
+        assert_eq!(
+            reg(device, KIB_64 + 1, 4, &mut handle),
+            E_INVALIDARG,
+            "misaligned"
+        );
+        assert_eq!(reg(device, KIB_64, 0, &mut handle), E_INVALIDARG, "no pages");
+        assert_eq!(reg(device, KIB_64, 4, std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(reg(device, KIB_64, 4, &mut handle), S_OK);
+        assert_eq!(handle, 1);
+        assert_eq!(reg(device, KIB_64 * 2, 8, &mut handle), S_OK);
+        assert_eq!(handle, 2);
+        assert_eq!(unreg(device, 0), E_INVALIDARG);
+        assert_eq!(unreg(device, handle + 1), E_INVALIDARG);
+        assert_eq!(unreg(device, 1), S_OK);
+        assert_eq!(unreg(device, 1), E_INVALIDARG, "already removed");
+        assert_eq!(unreg(device, 2), S_OK);
+    }
+
+    #[test]
+    fn committed_and_addressed_resources_refuse_bad_descriptions() {
+        let null = std::ptr::null();
+        let mut out = null;
+        let desc = buffer(64);
+        assert_eq!(
+            create_committed(
+                null,
+                std::ptr::null(),
+                0,
+                &desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut out
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                std::ptr::null(),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut out
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &texture(1, 1, 999, 1),
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut out
+            ),
+            E_INVALIDARG
+        );
+        let device = crate::device::device();
+        type At = extern "system" fn(
+            This,
+            u64,
+            *const ResourceDesc,
+            u32,
+            *const c_void,
+            *const Iid,
+            *mut This,
+        ) -> HRESULT;
+        let create_at = slot::<At>(device, 0x428);
+        assert_eq!(
+            create_at(
+                device,
+                KIB_64,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut out
+            ),
+            E_INVALIDARG
+        );
+    }
+
+    #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
         let null = std::ptr::null();
         let mut committed = null;
