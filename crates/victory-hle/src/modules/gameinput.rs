@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
@@ -105,14 +105,64 @@ struct KeyState {
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
+/// Four-motor rumble levels in `[0.0, 1.0]`: low/high grip motors plus
+/// left/right impulse trigger motors (matching `GameInputRumbleParams`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Rumble {
+    low_frequency: f32,
+    high_frequency: f32,
+    left_trigger: f32,
+    right_trigger: f32,
+}
+
+impl Rumble {
+    fn from_raw(raw: [f32; 4]) -> Self {
+        let clamp = |v: f32| {
+            if v.is_finite() {
+                v.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        };
+        Self {
+            low_frequency: clamp(raw[0]),
+            high_frequency: clamp(raw[1]),
+            left_trigger: clamp(raw[2]),
+            right_trigger: clamp(raw[3]),
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    fn xinput_speeds(self) -> (u16, u16) {
+        let speed = |level: f32| (level * f32::from(u16::MAX)) as u16;
+        (speed(self.low_frequency), speed(self.high_frequency))
+    }
+
+    #[cfg(any(windows, test))]
+    fn is_zero(self) -> bool {
+        self.low_frequency == 0.0
+            && self.high_frequency == 0.0
+            && self.left_trigger == 0.0
+            && self.right_trigger == 0.0
+    }
+}
+
+/// Non-blocking sink for sending 4-motor rumble commands off the title thread.
+type RumbleSink = Arc<dyn Fn(usize, Rumble) + Send + Sync>;
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
-    /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Motor speeds in `[0.0, 1.0]` for all four motors (grip + triggers).
+    fn rumble(&mut self, slot: usize, rumble: Rumble);
+    /// Optional lock-free / non-blocking rumble dispatcher so `SetRumbleState`
+    /// never contends with `poll()` or stalls the title thread on I/O.
+    fn rumble_sink(&self) -> Option<RumbleSink> {
+        None
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -201,8 +251,8 @@ impl Device {
             id,
             root_id: id,
             supported_input: kind(index),
-            // Low and high frequency.
-            rumble_motors: if index < PADS { 0x3 } else { 0 },
+            // Low/high grip motors (0x1 | 0x2) + left/right impulse triggers (0x4 | 0x8).
+            rumble_motors: if index < PADS { 0xF } else { 0 },
             ..Default::default()
         };
         Device {
@@ -333,6 +383,9 @@ pub struct Hub {
     /// Apart from the state: XInput can be slow, and the title reads
     /// readings every frame.
     source: Mutex<Box<dyn Source>>,
+    /// Dedicated non-blocking rumble sink when the host source provides one,
+    /// avoiding contention with `poll()`'s `source` lock.
+    rumble_sink: Option<RumbleSink>,
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
@@ -357,6 +410,7 @@ fn now() -> u64 {
 
 impl Hub {
     fn new(source: Box<dyn Source>) -> &'static Hub {
+        let rumble_sink = source.rumble_sink();
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
@@ -364,6 +418,7 @@ impl Hub {
             },
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
+            rumble_sink,
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
@@ -406,8 +461,28 @@ impl Hub {
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             (pads, source.keys())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let (events, disconnected) = {
+            let mut state = self.state();
+            let was_connected: [bool; PADS] = std::array::from_fn(|i| state.slots[i].connected);
+            let events = state.poll(&self.devices, pads, keys);
+            let disconnected: [bool; PADS] =
+                std::array::from_fn(|i| was_connected[i] && !state.slots[i].connected);
+            (events, disconnected)
+        };
+        for (slot, went_offline) in disconnected.into_iter().enumerate() {
+            if went_offline {
+                self.send_rumble(slot, Rumble::default());
+            }
+        }
         self.deliver(events);
+    }
+
+    fn send_rumble(&self, slot: usize, rumble: Rumble) {
+        if let Some(sink) = &self.rumble_sink {
+            sink(slot, rumble);
+        } else {
+            lock(&self.source).rumble(slot, rumble);
+        }
     }
 
     /// Runs callbacks, never under our lock: they call back into us. One
@@ -525,7 +600,7 @@ fn host() -> Box<dyn Source> {
         fn keys(&mut self) -> Vec<KeyState> {
             Vec::new()
         }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        fn rumble(&mut self, _: usize, _: Rumble) {}
     }
     Box::new(Nothing)
 }
@@ -908,24 +983,23 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+/// Forwards all four `GameInputRumbleParams` motor levels (low/high grip +
+/// left/right impulse triggers) without blocking the title thread.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let raw = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
         unsafe { *params }
     };
-    let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    device
+        .hub()
+        .send_rumble(device.index, Rumble::from_raw(raw));
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -1067,11 +1141,17 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-/// Host input: XInput pads, the keyboard while our process has focus.
+/// Host input: XInput pads, WinRT `Windows.Gaming.Input` 4-motor impulse
+/// trigger haptics with XInput fallback, and the keyboard while focused.
 #[cfg(windows)]
 mod host {
+    use std::ffi::c_void;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::FreeLibrary;
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1089,9 +1169,363 @@ mod host {
     };
 
     use super::*;
+    use crate::modules::xgameruntime::Guid;
 
     /// Asking XInput about an empty slot is slow; look again this often.
     const EMPTY_SLOT_RECHECK: Duration = Duration::from_secs(1);
+
+    /// `Windows.Gaming.Input.GamepadVibration` (4 × `f64`, 32 bytes).
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    struct GamepadVibration {
+        left_motor: f64,
+        right_motor: f64,
+        left_trigger: f64,
+        right_trigger: f64,
+    }
+    const _: () = assert!(size_of::<GamepadVibration>() == 32);
+
+    /// `HSTRING_HEADER` (24 bytes, pointer-aligned on 64-bit Windows).
+    #[repr(C)]
+    #[derive(Default)]
+    struct HStringHeader([usize; 3]);
+
+    /// `IID_IGamepadStatics`: `{8BBCE529-D49C-39E9-9560-E47DDE96B7C8}`.
+    const IID_IGAMEPAD_STATICS: Guid = Guid::new(
+        0x8bbc_e529,
+        0xd49c,
+        0x39e9,
+        [0x95, 0x60, 0xe4, 0x7d, 0xde, 0x96, 0xb7, 0xc8],
+    );
+
+    /// Owned raw COM interface pointer; releases via vtable slot 2 on drop.
+    struct ComPtr(*mut c_void);
+
+    impl ComPtr {
+        unsafe fn vtable(&self, slot: usize) -> *const () {
+            // SAFETY: COM object begins with a pointer to its vtable.
+            unsafe { *(*(self.0 as *const *const *const ())).add(slot) }
+        }
+    }
+
+    impl Drop for ComPtr {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: slot 2 is `IUnknown::Release`.
+                let release: extern "system" fn(*mut c_void) -> u32 =
+                    unsafe { std::mem::transmute(self.vtable(2)) };
+                release(self.0);
+            }
+        }
+    }
+
+    type RoInitializeFn = unsafe extern "system" fn(i32) -> HRESULT;
+    type RoUninitializeFn = unsafe extern "system" fn();
+    type WindowsCreateStringRefFn =
+        unsafe extern "system" fn(*const u16, u32, *mut HStringHeader, *mut *mut c_void) -> HRESULT;
+    type RoGetActivationFactoryFn =
+        unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> HRESULT;
+
+    /// Dynamically loaded WinRT `Windows.Gaming.Input.Gamepad` session on the
+    /// haptics worker thread. Falls back cleanly when WinRT is unavailable.
+    struct WgiSession {
+        combase: *mut c_void,
+        ro_uninit: Option<RoUninitializeFn>,
+        statics: ComPtr,
+    }
+
+    impl WgiSession {
+        fn open() -> Option<Self> {
+            const RO_INIT_MULTITHREADED: i32 = 1;
+            const RPC_E_CHANGED_MODE: HRESULT = 0x8001_0106_u32 as i32;
+            let dll: Vec<u16> = "combase.dll\0".encode_utf16().collect();
+            // SAFETY: NUL-terminated system DLL name.
+            let combase = unsafe { LoadLibraryW(dll.as_ptr()) };
+            if combase.is_null() {
+                return None;
+            }
+            let sym = |name: &std::ffi::CStr| -> Option<*const ()> {
+                // SAFETY: valid module handle and NUL-terminated export name.
+                unsafe { GetProcAddress(combase, name.as_ptr().cast()) }.map(|f| f as *const ())
+            };
+            let (Some(ro_init), Some(ro_uninit), Some(make_str), Some(get_factory)) = (
+                sym(c"RoInitialize"),
+                sym(c"RoUninitialize"),
+                sym(c"WindowsCreateStringReference"),
+                sym(c"RoGetActivationFactory"),
+            ) else {
+                // SAFETY: loaded above.
+                unsafe { FreeLibrary(combase) };
+                return None;
+            };
+            // SAFETY: export signatures match combase.dll WinRT APIs.
+            let (ro_init, ro_uninit, make_str, get_factory) = unsafe {
+                (
+                    std::mem::transmute::<*const (), RoInitializeFn>(ro_init),
+                    std::mem::transmute::<*const (), RoUninitializeFn>(ro_uninit),
+                    std::mem::transmute::<*const (), WindowsCreateStringRefFn>(make_str),
+                    std::mem::transmute::<*const (), RoGetActivationFactoryFn>(get_factory),
+                )
+            };
+            // SAFETY: initialize WinRT MTA on this dedicated haptics thread.
+            let init_hr = unsafe { ro_init(RO_INIT_MULTITHREADED) };
+            let owns_init = if init_hr >= 0 {
+                true
+            } else if init_hr == RPC_E_CHANGED_MODE {
+                false
+            } else {
+                // SAFETY: loaded above.
+                unsafe { FreeLibrary(combase) };
+                return None;
+            };
+            let class_name: Vec<u16> = "Windows.Gaming.Input.Gamepad\0".encode_utf16().collect();
+            let mut header = HStringHeader::default();
+            let mut hstring = std::ptr::null_mut();
+            let mut factory = std::ptr::null_mut();
+            // SAFETY: `class_name` outlives `hstring` for the `RoGetActivationFactory` call.
+            let hr = unsafe {
+                let hr = make_str(
+                    class_name.as_ptr(),
+                    (class_name.len() - 1) as u32,
+                    &mut header,
+                    &mut hstring,
+                );
+                if hr >= 0 {
+                    get_factory(hstring, &IID_IGAMEPAD_STATICS, &mut factory)
+                } else {
+                    hr
+                }
+            };
+            if hr < 0 || factory.is_null() {
+                if owns_init {
+                    // SAFETY: matched to successful `RoInitialize`.
+                    unsafe { ro_uninit() };
+                }
+                // SAFETY: loaded above.
+                unsafe { FreeLibrary(combase) };
+                return None;
+            }
+            Some(Self {
+                combase,
+                ro_uninit: owns_init.then_some(ro_uninit),
+                statics: ComPtr(factory),
+            })
+        }
+
+        /// Attempts to apply 4-motor vibration via `IGamepad::put_Vibration`.
+        /// Returns `true` if a WinRT gamepad at `slot` accepted the update.
+        fn set_vibration(&self, slot: usize, rumble: Rumble) -> bool {
+            type GetGamepads = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+            type GetSize = unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT;
+            type GetAt = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT;
+            type PutVibration = unsafe extern "system" fn(*mut c_void, GamepadVibration) -> HRESULT;
+
+            let mut view_raw = std::ptr::null_mut();
+            // SAFETY: `IGamepadStatics` slot 10 is `get_Gamepads`.
+            let hr = unsafe {
+                let get_gamepads: GetGamepads = std::mem::transmute(self.statics.vtable(10));
+                get_gamepads(self.statics.0, &mut view_raw)
+            };
+            if hr < 0 || view_raw.is_null() {
+                return false;
+            }
+            let view = ComPtr(view_raw);
+            let mut count = 0u32;
+            // SAFETY: `IVectorView<IGamepad>` slot 7 is `get_Size`.
+            let hr = unsafe {
+                let get_size: GetSize = std::mem::transmute(view.vtable(7));
+                get_size(view.0, &mut count)
+            };
+            if hr < 0 || (slot as u32) >= count {
+                return false;
+            }
+            let mut pad_raw = std::ptr::null_mut();
+            // SAFETY: `IVectorView<IGamepad>` slot 6 is `GetAt`.
+            let hr = unsafe {
+                let get_at: GetAt = std::mem::transmute(view.vtable(6));
+                get_at(view.0, slot as u32, &mut pad_raw)
+            };
+            if hr < 0 || pad_raw.is_null() {
+                return false;
+            }
+            let pad = ComPtr(pad_raw);
+            let vib = GamepadVibration {
+                left_motor: f64::from(rumble.low_frequency),
+                right_motor: f64::from(rumble.high_frequency),
+                left_trigger: f64::from(rumble.left_trigger),
+                right_trigger: f64::from(rumble.right_trigger),
+            };
+            // SAFETY: `IGamepad` slot 7 is `put_Vibration`.
+            let hr = unsafe {
+                let put_vib: PutVibration = std::mem::transmute(pad.vtable(7));
+                put_vib(pad.0, vib)
+            };
+            hr >= 0
+        }
+    }
+
+    impl Drop for WgiSession {
+        fn drop(&mut self) {
+            // Drop `statics` before `RoUninitialize` and `FreeLibrary`.
+            let ptr = std::mem::replace(&mut self.statics.0, std::ptr::null_mut());
+            drop(ComPtr(ptr));
+            if let Some(ro_uninit) = self.ro_uninit {
+                // SAFETY: matched to `RoInitialize` on this same thread.
+                unsafe { ro_uninit() };
+            }
+            if !self.combase.is_null() {
+                // SAFETY: loaded in `open`.
+                unsafe { FreeLibrary(self.combase) };
+            }
+        }
+    }
+
+    /// Low-level haptics delivery backend run exclusively on the dedicated
+    /// rumble worker thread.
+    pub(super) trait RumbleBackend {
+        /// Tries native 4-motor output; returns `false` to trigger 2-motor fallback.
+        fn try_four_motor(&mut self, slot: usize, rumble: Rumble) -> bool;
+        /// 2-motor XInput fallback (`low`, `high` in `0..=65535`).
+        fn fallback_two_motor(&mut self, slot: usize, low: u16, high: u16);
+    }
+
+    pub(super) struct WindowsRumbleBackend {
+        wgi: Option<WgiSession>,
+        probed: bool,
+    }
+
+    impl WindowsRumbleBackend {
+        pub(super) fn new() -> Self {
+            Self {
+                wgi: None,
+                probed: false,
+            }
+        }
+    }
+
+    impl RumbleBackend for WindowsRumbleBackend {
+        fn try_four_motor(&mut self, slot: usize, rumble: Rumble) -> bool {
+            if !self.probed {
+                self.probed = true;
+                self.wgi = WgiSession::open();
+                tracing::debug!(
+                    wgi_available = self.wgi.is_some(),
+                    "gameinput impulse trigger backend initialized"
+                );
+            }
+            self.wgi
+                .as_ref()
+                .is_some_and(|wgi| wgi.set_vibration(slot, rumble))
+        }
+
+        fn fallback_two_motor(&mut self, slot: usize, low: u16, high: u16) {
+            let speeds = XINPUT_VIBRATION {
+                wLeftMotorSpeed: low,
+                wRightMotorSpeed: high,
+            };
+            // SAFETY: a valid vibration; an empty slot just fails.
+            unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+    }
+
+    #[derive(Default)]
+    struct RumbleMailbox {
+        pending: [Option<Rumble>; PADS],
+        stop: bool,
+    }
+
+    /// Coalescing non-blocking haptics worker: keeps only the latest requested
+    /// motor state per slot and applies it on a dedicated background thread.
+    pub(super) struct RumbleWorker {
+        mailbox: Arc<(Mutex<RumbleMailbox>, Condvar)>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl RumbleWorker {
+        pub(super) fn new<B: RumbleBackend>(
+            make_backend: impl FnOnce() -> B + Send + 'static,
+        ) -> Self {
+            let mailbox = Arc::new((Mutex::new(RumbleMailbox::default()), Condvar::new()));
+            let worker_box = Arc::clone(&mailbox);
+            let thread = std::thread::Builder::new()
+                .name("victory-rumble".into())
+                .spawn(move || Self::run(worker_box, make_backend()))
+                .ok();
+            Self { mailbox, thread }
+        }
+
+        pub(super) fn sink(&self) -> RumbleSink {
+            let mailbox = Arc::clone(&self.mailbox);
+            Arc::new(move |slot, rumble| {
+                if slot >= PADS {
+                    return;
+                }
+                let mut state = lock(&mailbox.0);
+                state.pending[slot] = Some(rumble);
+                mailbox.1.notify_one();
+            })
+        }
+
+        pub(super) fn submit(&self, slot: usize, rumble: Rumble) {
+            if slot >= PADS {
+                return;
+            }
+            let mut state = lock(&self.mailbox.0);
+            state.pending[slot] = Some(rumble);
+            self.mailbox.1.notify_one();
+        }
+
+        fn apply(backend: &mut impl RumbleBackend, slot: usize, rumble: Rumble) {
+            if !backend.try_four_motor(slot, rumble) {
+                let (low, high) = rumble.xinput_speeds();
+                backend.fallback_two_motor(slot, low, high);
+            }
+        }
+
+        fn run(mailbox: Arc<(Mutex<RumbleMailbox>, Condvar)>, mut backend: impl RumbleBackend) {
+            let mut active = [false; PADS];
+            loop {
+                let (batch, stop) = {
+                    let mut state = lock(&mailbox.0);
+                    while !state.stop && state.pending.iter().all(Option::is_none) {
+                        state = mailbox
+                            .1
+                            .wait(state)
+                            .unwrap_or_else(PoisonError::into_inner);
+                    }
+                    let batch = std::mem::take(&mut state.pending);
+                    (batch, state.stop)
+                };
+                for (slot, item) in batch.into_iter().enumerate() {
+                    if let Some(rumble) = item {
+                        Self::apply(&mut backend, slot, rumble);
+                        active[slot] = !rumble.is_zero();
+                    }
+                }
+                if stop {
+                    for (slot, is_active) in active.into_iter().enumerate() {
+                        if is_active {
+                            Self::apply(&mut backend, slot, Rumble::default());
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    impl Drop for RumbleWorker {
+        fn drop(&mut self) {
+            {
+                let mut state = lock(&self.mailbox.0);
+                state.stop = true;
+                self.mailbox.1.notify_all();
+            }
+            if let Some(handle) = self.thread.take() {
+                let _ = handle.join();
+            }
+        }
+    }
 
     const BUTTONS: [(u16, u32); 14] = [
         (XINPUT_GAMEPAD_START, MENU),
@@ -1127,9 +1561,20 @@ mod host {
         }
     }
 
-    #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        rumble: RumbleWorker,
+        was_focused: bool,
+    }
+
+    impl Default for Host {
+        fn default() -> Self {
+            Self {
+                empty_until: [None; PADS],
+                rumble: RumbleWorker::new(WindowsRumbleBackend::new),
+                was_focused: false,
+            }
+        }
     }
 
     impl Source for Host {
@@ -1152,7 +1597,13 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
-            if focused() {
+            let is_focused = focused();
+            if std::mem::replace(&mut self.was_focused, is_focused) && !is_focused {
+                for slot in 0..PADS {
+                    self.rumble.submit(slot, Rumble::default());
+                }
+            }
+            if is_focused {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
@@ -1174,13 +1625,12 @@ mod host {
                 .collect()
         }
 
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
-            };
-            // SAFETY: a valid vibration; an empty slot just fails.
-            unsafe { XInputSetState(slot as u32, &speeds) };
+        fn rumble(&mut self, slot: usize, rumble: Rumble) {
+            self.rumble.submit(slot, rumble);
+        }
+
+        fn rumble_sink(&self) -> Option<RumbleSink> {
+            Some(self.rumble.sink())
         }
     }
 
@@ -1270,7 +1720,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        rumble: Vec<(usize, u16, u16)>,
+        rumble: Vec<(usize, Rumble)>,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
@@ -1282,8 +1732,8 @@ mod tests {
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
+        fn rumble(&mut self, slot: usize, rumble: Rumble) {
+            self.0.lock().unwrap().rumble.push((slot, rumble));
         }
     }
 
@@ -1605,11 +2055,148 @@ mod tests {
         assert_eq!(find(&hub.object, &[1; 32], &mut out), DEVICE_NOT_FOUND);
         assert!(out.is_null());
 
-        type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
-        let rumble = slot::<Rumble, _>(device, 0x50);
-        rumble(device, &[0.5, 1.0, 1.0, 1.0]);
+        type RumbleFn = extern "system" fn(*const Device, *const [f32; 4]);
+        let rumble = slot::<RumbleFn, _>(device, 0x50);
+        assert_eq!(hub.devices[2].info.rumble_motors, 0xF);
+        rumble(device, &[0.5, 1.0, 0.25, 0.75]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        assert_eq!(
+            host.lock().unwrap().rumble,
+            [
+                (
+                    2,
+                    Rumble {
+                        low_frequency: 0.5,
+                        high_frequency: 1.0,
+                        left_trigger: 0.25,
+                        right_trigger: 0.75,
+                    }
+                ),
+                (2, Rumble::default()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rumble_clamps_out_of_range_and_non_finite_levels() {
+        let r = Rumble::from_raw([-0.5, 1.8, f32::NAN, f32::INFINITY]);
+        assert_eq!(
+            r,
+            Rumble {
+                low_frequency: 0.0,
+                high_frequency: 1.0,
+                left_trigger: 0.0,
+                right_trigger: 0.0,
+            }
+        );
+        assert_eq!(r.xinput_speeds(), (0, 65535));
+
+        let mid = Rumble::from_raw([0.5, 1.0, 0.4, 0.8]);
+        assert_eq!(mid.xinput_speeds(), (32767, 65535));
+        assert!(!mid.is_zero());
+        assert!(Rumble::default().is_zero());
+    }
+
+    #[test]
+    fn disconnect_zeroes_active_rumble_for_that_slot() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[1] = Some(PadState::default());
+        hub.poll();
+        type RumbleFn = extern "system" fn(*const Device, *const [f32; 4]);
+        let rumble = slot::<RumbleFn, _>(&hub.devices[1] as *const Device, 0x50);
+        rumble(&hub.devices[1], &[0.8, 0.6, 0.4, 0.2]);
+        host.lock().unwrap().pads[1] = None;
+        hub.poll();
+        let log = &host.lock().unwrap().rumble;
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[1], (1, Rumble::default()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rumble_worker_handles_four_motor_fallback_and_zeroes_on_drop() {
+        struct MockBackend {
+            allow_four_motor: bool,
+            four_motor: Arc<Mutex<Vec<(usize, Rumble)>>>,
+            fallback: Arc<Mutex<Vec<(usize, u16, u16)>>>,
+        }
+        impl host::RumbleBackend for MockBackend {
+            fn try_four_motor(&mut self, slot: usize, rumble: Rumble) -> bool {
+                if self.allow_four_motor {
+                    self.four_motor.lock().unwrap().push((slot, rumble));
+                    true
+                } else {
+                    false
+                }
+            }
+            fn fallback_two_motor(&mut self, slot: usize, low: u16, high: u16) {
+                self.fallback.lock().unwrap().push((slot, low, high));
+            }
+        }
+
+        use host::RumbleBackend;
+
+        // Native 4-motor path delivers triggers and zeroes active motors on Drop.
+        let four = Arc::new(Mutex::new(Vec::new()));
+        let fb = Arc::new(Mutex::new(Vec::new()));
+        {
+            let four_bg = Arc::clone(&four);
+            let fb_bg = Arc::clone(&fb);
+            let worker = host::RumbleWorker::new(move || MockBackend {
+                allow_four_motor: true,
+                four_motor: four_bg,
+                fallback: fb_bg,
+            });
+            let sink = worker.sink();
+            sink(
+                0,
+                Rumble {
+                    low_frequency: 0.5,
+                    high_frequency: 0.25,
+                    left_trigger: 0.9,
+                    right_trigger: 0.7,
+                },
+            );
+            // Dropping joins the worker and automatically zeroes active slot 0.
+        }
+        let log = four.lock().unwrap();
+        assert!(!log.is_empty());
+        assert_eq!(log.last(), Some(&(0, Rumble::default())));
+        assert!(fb.lock().unwrap().is_empty());
+
+        // When native 4-motor provider is unavailable, falls back to 2-motor XInput speeds.
+        let four2 = Arc::new(Mutex::new(Vec::new()));
+        let fb2 = Arc::new(Mutex::new(Vec::new()));
+        {
+            let four2_bg = Arc::clone(&four2);
+            let fb2_bg = Arc::clone(&fb2);
+            let worker = host::RumbleWorker::new(move || MockBackend {
+                allow_four_motor: false,
+                four_motor: four2_bg,
+                fallback: fb2_bg,
+            });
+            worker.submit(
+                1,
+                Rumble {
+                    low_frequency: 0.5,
+                    high_frequency: 1.0,
+                    left_trigger: 1.0,
+                    right_trigger: 1.0,
+                },
+            );
+        }
+        assert!(four2.lock().unwrap().is_empty());
+        let fb_log = fb2.lock().unwrap();
+        assert_eq!(*fb_log, [(1, 32767, 65535), (1, 0, 0)]);
+
+        // Smoke-test live Windows.Gaming.Input probing & clean teardown on a fresh thread
+        // (succeeds whether or not a physical Xbox controller is attached).
+        std::thread::spawn(|| {
+            let mut backend = host::WindowsRumbleBackend::new();
+            let _ = backend.try_four_motor(0, Rumble::default());
+        })
+        .join()
+        .unwrap();
     }
 }
