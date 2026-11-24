@@ -74,6 +74,15 @@ const DYNAMIC: u32 = 1 << 18;
 const MIN_DYNAMIC: u32 = 1 << 16;
 
 impl HostHeap {
+    pub(crate) fn dynamic_capacity(&self) -> u32 {
+        self.dynamic
+    }
+
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(super) fn retains_resource(&self, index: u32) -> bool {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some()
+    }
+
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
         let kind = if sampler {
