@@ -2207,24 +2207,36 @@ impl<'a> Lower<'a> {
             .map(|n| n.replace("_rtn", ""))
             .ok_or("an LDS operation")?;
         use super::bitcode::Rmw;
-        let rmw = match op.as_str() {
-            "add_u32" => Some(Rmw::Add),
-            "sub_u32" => Some(Rmw::Sub),
-            "and_b32" => Some(Rmw::And),
-            "or_b32" => Some(Rmw::Or),
-            "xor_b32" => Some(Rmw::Xor),
-            "min_i32" => Some(Rmw::Min),
-            "max_i32" => Some(Rmw::Max),
-            "min_u32" => Some(Rmw::UMin),
-            "max_u32" => Some(Rmw::UMax),
-            "wrxchg_b32" => Some(Rmw::Xchg),
-            "cmpst_b32" => None,
+        enum DsAtomic {
+            Rmw(Rmw),
+            CmpSwap,
+            AddF32,
+            CmpSwapF32,
+        }
+        let kind = match op.as_str() {
+            "add_u32" => DsAtomic::Rmw(Rmw::Add),
+            "sub_u32" => DsAtomic::Rmw(Rmw::Sub),
+            "and_b32" => DsAtomic::Rmw(Rmw::And),
+            "or_b32" => DsAtomic::Rmw(Rmw::Or),
+            "xor_b32" => DsAtomic::Rmw(Rmw::Xor),
+            "min_i32" => DsAtomic::Rmw(Rmw::Min),
+            "max_i32" => DsAtomic::Rmw(Rmw::Max),
+            "min_u32" => DsAtomic::Rmw(Rmw::UMin),
+            "max_u32" => DsAtomic::Rmw(Rmw::UMax),
+            "wrxchg_b32" => DsAtomic::Rmw(Rmw::Xchg),
+            "cmpst_b32" => DsAtomic::CmpSwap,
+            "add_f32" => DsAtomic::AddF32,
+            "cmpst_f32" => DsAtomic::CmpSwapF32,
             _ => return Err("an LDS operation"),
         };
         let v0 = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?[0];
         let v1 = match data.get(1) {
             Some(d) => Some(self.vgprs(inst, d, 1)?[0]),
             None => None,
+        };
+        let cmp_new = match kind {
+            DsAtomic::CmpSwap | DsAtomic::CmpSwapF32 => Some(v1.ok_or("an LDS compare")?),
+            _ => None,
         };
         let old_reg = dst_reg.and_then(|r| inst.read(Reg::V(r)).map(|v| (r, v)));
         let outside = match old_reg {
@@ -2233,13 +2245,66 @@ impl<'a> Lower<'a> {
         };
         let p = dword(self, offset);
         let at = self.begin_guarded(guard);
-        let r = match rmw {
-            Some(op) => self.s.m.atomic(self.cur, op, p, v0),
+        let r = match kind {
+            DsAtomic::Rmw(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
-            None => self
-                .s
-                .m
-                .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
+            DsAtomic::CmpSwap => self.s.m.cmpxchg(self.cur, p, v0, cmp_new.expect("checked")),
+            DsAtomic::AddF32 => {
+                let i32t = self.s.t.i32;
+                let pre = self.cur;
+                let add_f = self.as_float(v0);
+                let init = self.s.m.load(pre, p);
+                let loop_blk = self.s.m.new_block();
+                let done_blk = self.s.m.new_block();
+                self.s.m.terminate(pre, Term::Br(loop_blk));
+
+                self.cur = loop_blk;
+                let cur = self.s.m.phi(loop_blk, i32t);
+                let cur_f = self.as_float(cur);
+                let sum_f = self.s.m.bin(loop_blk, Bin::Add, cur_f, add_f);
+                let next = self.as_int(sum_f);
+                let prev = self.s.m.cmpxchg(loop_blk, p, cur, next);
+                let ok = self.s.m.cmp(loop_blk, pred::EQ, prev, cur);
+                self.s
+                    .m
+                    .terminate(loop_blk, Term::CondBr(ok, done_blk, loop_blk));
+                self.s.m.set_phi(cur, vec![(init, pre), (prev, loop_blk)]);
+
+                self.cur = done_blk;
+                prev
+            }
+            DsAtomic::CmpSwapF32 => {
+                let new = cmp_new.expect("checked");
+                let i32t = self.s.t.i32;
+                let pre = self.cur;
+                let cmp_f = self.as_float(v0);
+                let init = self.s.m.load(pre, p);
+                let loop_blk = self.s.m.new_block();
+                let try_blk = self.s.m.new_block();
+                let done_blk = self.s.m.new_block();
+                self.s.m.terminate(pre, Term::Br(loop_blk));
+
+                self.cur = loop_blk;
+                let cur = self.s.m.phi(loop_blk, i32t);
+                let cur_f = self.as_float(cur);
+                let eq = self.s.m.cmp(loop_blk, pred::OEQ, cur_f, cmp_f);
+                self.s
+                    .m
+                    .terminate(loop_blk, Term::CondBr(eq, try_blk, done_blk));
+
+                self.cur = try_blk;
+                let prev = self.s.m.cmpxchg(try_blk, p, cur, new);
+                let ok = self.s.m.cmp(try_blk, pred::EQ, prev, cur);
+                self.s
+                    .m
+                    .terminate(try_blk, Term::CondBr(ok, done_blk, loop_blk));
+                self.s.m.set_phi(cur, vec![(init, pre), (prev, try_blk)]);
+
+                self.cur = done_blk;
+                let r = self.s.m.phi(done_blk, i32t);
+                self.s.m.set_phi(r, vec![(cur, loop_blk), (prev, try_blk)]);
+                r
+            }
         };
         let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {
