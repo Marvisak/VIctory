@@ -68,6 +68,11 @@ exit = "warn"
 mem_forget = "warn"
 # `result.ok();` is a silently swallowed error.
 unused_result_ok = "warn"
+# A panic on a path title code reaches aborts the title (AGENTS.md, rule 5):
+# return the API's error, or shape the code so no `Option`/`Result` is left
+# to unwrap. Tests are exempt through clippy.toml.
+unwrap_used = "warn"
+expect_used = "warn"
 
 [profile.dev.package."*"]
 # Dependencies (hashing, parsing) are hot paths when chewing through

@@ -1,3 +1,8 @@
 # Tests may print what they measured or why they skipped. Clippy applies this
 # only under a plain `#[cfg(test)]`, not `cfg(all(test, ...))`.
 allow-print-in-tests = true
+# `unwrap_used`/`expect_used` are on workspace-wide (root Cargo.toml) to keep
+# panics off paths title code reaches; a failing test should panic, so tests
+# are exempt (again only under a plain `#[cfg(test)]`).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
