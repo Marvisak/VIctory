@@ -51,6 +51,7 @@ cargo check  --workspace --all-targets --locked --exclude victory-hle --exclude 
 cargo clippy --workspace --all-targets --locked --exclude victory-hle --exclude victory --exclude victory-gpu -- -D warnings
 cargo test   --workspace --locked --exclude victory-hle --exclude victory
 cargo xtask citations                    # also part of cargo test
+cargo xtask wincheck                     # Windows target: type-check and lint, no tests
 ```
 
 `cargo xtask wincheck` runs the two Windows clippy commands below with
