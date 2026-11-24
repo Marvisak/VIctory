@@ -455,10 +455,18 @@ impl Module {
     }
     /// The old value of a compare-exchange.
     pub fn cmpxchg(&mut self, block: usize, ptr: V, expected: V, new: V) -> V {
+        let r = self.raw_cmpxchg(block, ptr, expected, new);
+        self.extract(block, r, 0)
+    }
+    /// The old value and whether a compare-exchange stored `new`.
+    pub fn cmpxchg_pair(&mut self, block: usize, ptr: V, expected: V, new: V) -> (V, V) {
+        let r = self.raw_cmpxchg(block, ptr, expected, new);
+        (self.extract(block, r, 0), self.extract(block, r, 1))
+    }
+    fn raw_cmpxchg(&mut self, block: usize, ptr: V, expected: V, new: V) -> V {
         let (i32t, i1) = (self.type_of(new), self.int(1));
         let pair = self.ty(TypeDef::Struct(None, vec![i32t, i1]));
-        let r = self.push(block, pair, Op::CmpXchg(ptr, expected, new));
-        self.extract(block, r, 0)
+        self.push(block, pair, Op::CmpXchg(ptr, expected, new))
     }
 
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {

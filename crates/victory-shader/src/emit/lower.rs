@@ -2207,24 +2207,62 @@ impl<'a> Lower<'a> {
             .map(|n| n.replace("_rtn", ""))
             .ok_or("an LDS operation")?;
         use super::bitcode::Rmw;
-        let rmw = match op.as_str() {
-            "add_u32" => Some(Rmw::Add),
-            "sub_u32" => Some(Rmw::Sub),
-            "and_b32" => Some(Rmw::And),
-            "or_b32" => Some(Rmw::Or),
-            "xor_b32" => Some(Rmw::Xor),
-            "min_i32" => Some(Rmw::Min),
-            "max_i32" => Some(Rmw::Max),
-            "min_u32" => Some(Rmw::UMin),
-            "max_u32" => Some(Rmw::UMax),
-            "wrxchg_b32" => Some(Rmw::Xchg),
-            "cmpst_b32" => None,
-            _ => return Err("an LDS operation"),
-        };
         let v0 = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?[0];
         let v1 = match data.get(1) {
             Some(d) => Some(self.vgprs(inst, d, 1)?[0]),
             None => None,
+        };
+        if matches!(op.as_str(), "wrxchg2_b32" | "wrxchg2st64_b32") {
+            let v1 = v1.ok_or("an LDS exchange pair")?;
+            let reg = dst_reg.ok_or("an LDS atomic result")?;
+            let out = |l: &mut Self, k: u8| {
+                inst.read(Reg::V(reg + k))
+                    .and_then(|v| l.i32_of(v).ok())
+                    .unwrap_or_else(|| l.s.m.i32(0))
+            };
+            let (out0, out1) = (out(self, 0), out(self, 1));
+            let offs = pair(name);
+            let (p0, p1) = (dword(self, offs[0].0), dword(self, offs[1].0));
+            let at = self.begin_guarded(guard);
+            let r0 = self.s.m.atomic(self.cur, Rmw::Xchg, p0, v0);
+            let r1 = self.s.m.atomic(self.cur, Rmw::Xchg, p1, v1);
+            let rs = self.end_guarded(at, &[(r0, out0), (r1, out1)]);
+            self.write(inst, Reg::V(reg), rs[0], None);
+            self.write(inst, Reg::V(reg + 1), rs[1], None);
+            return Ok(());
+        }
+        #[derive(Clone, Copy)]
+        enum DsAtomic {
+            Rmw(Rmw),
+            CmpSt,
+            RSub,
+            Inc,
+            Dec,
+            MskOr,
+            Wrap,
+        }
+        let kind = match op.as_str() {
+            "add_u32" => DsAtomic::Rmw(Rmw::Add),
+            "sub_u32" => DsAtomic::Rmw(Rmw::Sub),
+            "and_b32" => DsAtomic::Rmw(Rmw::And),
+            "or_b32" => DsAtomic::Rmw(Rmw::Or),
+            "xor_b32" => DsAtomic::Rmw(Rmw::Xor),
+            "min_i32" => DsAtomic::Rmw(Rmw::Min),
+            "max_i32" => DsAtomic::Rmw(Rmw::Max),
+            "min_u32" => DsAtomic::Rmw(Rmw::UMin),
+            "max_u32" => DsAtomic::Rmw(Rmw::UMax),
+            "wrxchg_b32" => DsAtomic::Rmw(Rmw::Xchg),
+            "cmpst_b32" => DsAtomic::CmpSt,
+            "rsub_u32" => DsAtomic::RSub,
+            "inc_u32" => DsAtomic::Inc,
+            "dec_u32" => DsAtomic::Dec,
+            "mskor_b32" => DsAtomic::MskOr,
+            "wrap_b32" => DsAtomic::Wrap,
+            _ => return Err("an LDS operation"),
+        };
+        let v1 = match kind {
+            DsAtomic::CmpSt | DsAtomic::MskOr | DsAtomic::Wrap => Some(v1.ok_or("an LDS atomic")?),
+            _ => None,
         };
         let old_reg = dst_reg.and_then(|r| inst.read(Reg::V(r)).map(|v| (r, v)));
         let outside = match old_reg {
@@ -2233,13 +2271,53 @@ impl<'a> Lower<'a> {
         };
         let p = dword(self, offset);
         let at = self.begin_guarded(guard);
-        let r = match rmw {
-            Some(op) => self.s.m.atomic(self.cur, op, p, v0),
+        let r = match kind {
+            DsAtomic::Rmw(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
-            None => self
-                .s
-                .m
-                .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
+            DsAtomic::CmpSt => self.s.m.cmpxchg(self.cur, p, v0, v1.expect("checked")),
+            _ => {
+                let pre = self.cur;
+                let init = self.s.m.load(pre, p);
+                let keep = matches!(kind, DsAtomic::MskOr).then(|| {
+                    let ones = self.s.m.i32(u32::MAX);
+                    self.s.m.bin(pre, Bin::Xor, v0, ones)
+                });
+                let (head, exit) = (self.s.m.new_block(), self.s.m.new_block());
+                self.s.m.terminate(pre, Term::Br(head));
+                let cur = self.s.m.phi(head, self.s.t.i32);
+                let new = match kind {
+                    DsAtomic::RSub => self.s.m.bin(head, Bin::Sub, v0, cur),
+                    DsAtomic::Inc => {
+                        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+                        let inc = self.s.m.bin(head, Bin::Add, cur, one);
+                        let wrap = self.s.m.cmp(head, pred::IUGE, cur, v0);
+                        self.s.m.select(head, wrap, zero, inc)
+                    }
+                    DsAtomic::Dec => {
+                        // cur == 0 || cur > v0 wraps to v0; both make cur - 1 >= v0 unsigned.
+                        let one = self.s.m.i32(1);
+                        let dec = self.s.m.bin(head, Bin::Sub, cur, one);
+                        let wrap = self.s.m.cmp(head, pred::IUGE, dec, v0);
+                        self.s.m.select(head, wrap, v0, dec)
+                    }
+                    DsAtomic::MskOr => {
+                        let kept = self.s.m.bin(head, Bin::And, cur, keep.expect("mskor"));
+                        self.s.m.bin(head, Bin::Or, kept, v1.expect("checked"))
+                    }
+                    DsAtomic::Wrap => {
+                        let sub = self.s.m.bin(head, Bin::Sub, cur, v0);
+                        let add = self.s.m.bin(head, Bin::Add, cur, v1.expect("checked"));
+                        let wrap = self.s.m.cmp(head, pred::IUGE, cur, v0);
+                        self.s.m.select(head, wrap, sub, add)
+                    }
+                    _ => unreachable!(),
+                };
+                let (old, ok) = self.s.m.cmpxchg_pair(head, p, cur, new);
+                self.s.m.terminate(head, Term::CondBr(ok, exit, head));
+                self.s.m.set_phi(cur, vec![(init, pre), (old, head)]);
+                self.cur = exit;
+                old
+            }
         };
         let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {

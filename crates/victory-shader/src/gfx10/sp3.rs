@@ -757,6 +757,14 @@ mod tests {
             "ds_read2_b32 v[6:7], v1 offset0:2 offset1:3"
         );
         assert_eq!(
+            one(&[0xD8BC_0302, 0x0605_0401], true),
+            "ds_wrxchg2st64_rtn_b32 v[6:7], v1, v4, v5 offset0:2 offset1:3"
+        );
+        assert_eq!(
+            one(&[0xD8D0_0010, 0x0302_0100], false),
+            "ds_wrap_rtn_b32 v3, v0, v1, v2 offset:16"
+        );
+        assert_eq!(
             one(&[0xF800_1C0F, 0x0000_0302], true),
             "exp mrt0, v2, v2, v3, v3 done compr vm"
         );
