@@ -99,6 +99,9 @@ expectation is itself a warning, and CI runs `-D warnings`.
    call, including shader translation at pipeline creation) returns the
    API's failure code instead of `unwrap`/`expect`/`panic!`/indexing that
    can fail. A panic in an `extern "system" fn` aborts the title.
+   `unwrap`/`expect` are denied outside tests everywhere
+   (`clippy::unwrap_used`, `expect_used`): return the error, or restructure
+   (`let ... else`, a typed value) so there is nothing to unwrap.
 6. **No swallowed errors.** No `let _ = fallible()`, bare `.ok()`, or
    `filter_map(Result::ok)` without a `tracing` line saying what was
    skipped. Propagate with `?` where the caller can act on it.
@@ -114,7 +117,8 @@ expectation is itself a warning, and CI runs `-D warnings`.
     Paths cited here are checked; see Citations.
 11. **Lints.** Libraries log through `tracing`, never `println!`/`eprintln!`;
     no `dbg!`, `todo!`, `unimplemented!`, `std::process::exit`,
-    `mem::forget`, or `result.ok();` (all enforced). Lints are configured
+    `mem::forget`, `result.ok();`, or `unwrap`/`expect` outside tests (all
+    enforced). Lints are configured
     once, in the root `Cargo.toml`; every crate has `[lints] workspace = true`.
 
 ## Citations
@@ -172,7 +176,7 @@ only with a commit that makes it pass, verified on Windows CI.
 |------|-------------|-------------|
 | remove `not_unsafe_ptr_arg_deref` allows | 38 module-level allows over FFI code that cannot be compiled off Windows | one module per change, its functions made `unsafe extern "system"`, verified on Windows |
 | `clippy::let_underscore_must_use`, `let_underscore_drop` | 16 / 4 hits in portable code; Windows code (many `let _ = unsafe { Win32Call() }`) unmeasured | portable hits fixed, then a Windows run is clean |
-| `clippy::unwrap_used`, `expect_used`, `panic` | 216 / 32 / 34 hits in portable code, tests included (mostly `victory-shader`); tests need `allow-unwrap-in-tests`/`allow-expect-in-tests` in `clippy.toml` | start per crate with `victory-hle`, `victory-gpu`, `victory-shader::emit` (title-reachable) |
+| `clippy::panic`, `unreachable` | `panic!`: 0 outside tests, 50 in tests (needs `allow-panic-in-tests` in `clippy.toml`); `unreachable!`: 39, tests not separated (the lint has no test exemption), 27 of them in `crates/victory-shader/src/emit/lower.rs`. Measured with `cargo xtask wincheck`'s two clippy runs plus `-W clippy::panic -W clippy::unreachable`, so Windows-only code is included | `panic`: add the `clippy.toml` key and enable; `unreachable`: the `lower.rs` sites turned into `let ... else` returning the lowering's error |
 | `clippy::too_many_lines`, `cognitive_complexity` | 32 / 9 hits in portable code, more in Windows code | a `clippy.toml` threshold that passes today, then lowered step by step |
 | `clippy::wildcard_enum_match_arm` | 79 hits, and it also fires on foreign and `#[non_exhaustive]` enums, so it would force noise | rule 7 is enforced by review; reconsider with a crate-local `warn` in `apps/victory` and `victory-shader` |
 | `clippy::allow_attributes` (prefer `#[expect]`) | not viable: several allows are true only on some cfgs (Windows-only code is dead on Linux, `xgameui` dead in test builds), where `expect` would itself warn | not planned |
