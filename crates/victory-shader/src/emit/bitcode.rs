@@ -128,6 +128,24 @@ pub(crate) mod pred {
     pub const SLE: u8 = 41;
 }
 
+/// The low `w` bits of `x`, as an unsigned value.
+fn bits_of(x: i64, w: u32) -> u64 {
+    if w >= 64 {
+        x as u64
+    } else {
+        (x as u64) & ((1u64 << w) - 1)
+    }
+}
+
+/// `x`'s low `w` bits, sign-extended.
+fn sext_bits(x: i64, w: u32) -> i64 {
+    if w >= 64 {
+        return x;
+    }
+    let m = 1i64 << (w - 1);
+    (x ^ m) - m
+}
+
 #[derive(Debug, Clone)]
 enum Op {
     Bin(Bin, V, V),
@@ -312,6 +330,261 @@ impl Module {
         }
     }
 
+    /// The value of an i1 constant (`Some(true)`/`Some(false)`); `None` for
+    /// anything else.
+    fn bool_value(&self, v: V) -> Option<bool> {
+        let V::Const(i) = v else { return None };
+        let (ty, c) = &self.consts[i as usize];
+        if !matches!(self.types[ty.0 as usize], TypeDef::Int(1)) {
+            return None;
+        }
+        match c {
+            Const::Int(x) => Some(*x != 0),
+            _ => None,
+        }
+    }
+
+    /// Folds `op a b` when both operands are constants of `ty`; `None` when
+    /// it must stay an instruction (a poisonous shift, division by zero, an
+    /// overflowing signed divide, or a NaN whose payload could differ).
+    fn fold_bin(&mut self, op: Bin, ty: Ty, a: V, b: V) -> Option<V> {
+        if self.type_of(b) != ty {
+            return None;
+        }
+        let kind = match &self.types[ty.0 as usize] {
+            TypeDef::Int(w) => Some(*w),
+            TypeDef::Float => None,
+            _ => return None,
+        };
+        match kind {
+            Some(w) => {
+                let (x, y) = (self.int_value(a)?, self.int_value(b)?);
+                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                let xu = (x as u64) & mask;
+                let yu = (y as u64) & mask;
+                let xs = sext_bits(x, w);
+                let ys = sext_bits(y, w);
+                let raw: u64 = match op {
+                    Bin::Add => xu.wrapping_add(yu),
+                    Bin::Sub => xu.wrapping_sub(yu),
+                    Bin::Mul => xu.wrapping_mul(yu),
+                    Bin::And => xu & yu,
+                    Bin::Or => xu | yu,
+                    Bin::Xor => xu ^ yu,
+                    Bin::Shl => {
+                        if yu >= u64::from(w) {
+                            return None; // poison in LLVM
+                        }
+                        xu.wrapping_shl(yu as u32)
+                    }
+                    Bin::LShr => {
+                        if yu >= u64::from(w) {
+                            return None;
+                        }
+                        xu >> yu
+                    }
+                    Bin::AShr => {
+                        if yu >= u64::from(w) {
+                            return None;
+                        }
+                        (xs >> yu) as u64
+                    }
+                    Bin::UDiv => {
+                        if yu == 0 {
+                            return None;
+                        }
+                        xu / yu
+                    }
+                    Bin::URem => {
+                        if yu == 0 {
+                            return None;
+                        }
+                        xu % yu
+                    }
+                    Bin::SDiv => {
+                        if yu == 0 || (xs == i64::MIN && ys == -1) {
+                            return None;
+                        }
+                        (xs / ys) as u64
+                    }
+                };
+                Some(self.int_const(ty, sext_bits((raw & mask) as i64, w)))
+            }
+            None => {
+                let (V::Const(x), V::Const(y)) = (a, b) else {
+                    return None;
+                };
+                let (Const::Float(fa), Const::Float(fb)) =
+                    (&self.consts[x as usize].1, &self.consts[y as usize].1)
+                else {
+                    return None;
+                };
+                let (fa, fb) = (f32::from_bits(*fa), f32::from_bits(*fb));
+                if fa.is_nan() || fb.is_nan() {
+                    return None;
+                }
+                let r = match op {
+                    Bin::Add => fa + fb,
+                    Bin::Sub => fa - fb,
+                    Bin::Mul => fa * fb,
+                    Bin::UDiv | Bin::SDiv => fa / fb,
+                    Bin::URem => fa % fb,
+                    _ => return None,
+                };
+                Some(self.constant(ty, Const::Float(r.to_bits())))
+            }
+        }
+    }
+
+    /// Folds `op a b` when one operand's constant makes the other the
+    /// answer (`x & -1`, `x | 0`, `x + 0`, `x * 1`, `x << 0`, `x / 1`).
+    fn fold_bin_identity(&self, op: Bin, ty: Ty, a: V, b: V) -> Option<V> {
+        if !matches!(self.types[ty.0 as usize], TypeDef::Int(_)) {
+            return None;
+        }
+        let (x, y) = (self.int_value(a), self.int_value(b));
+        match op {
+            Bin::And => {
+                if x == Some(-1) {
+                    Some(b)
+                } else if y == Some(-1) {
+                    Some(a)
+                } else {
+                    None
+                }
+            }
+            Bin::Or | Bin::Xor => {
+                if x == Some(0) {
+                    Some(b)
+                } else if y == Some(0) {
+                    Some(a)
+                } else {
+                    None
+                }
+            }
+            Bin::Add | Bin::Sub => (y == Some(0)).then_some(a),
+            Bin::Mul => {
+                if x == Some(1) {
+                    Some(b)
+                } else if y == Some(1) {
+                    Some(a)
+                } else {
+                    None
+                }
+            }
+            Bin::UDiv => (y == Some(1)).then_some(a),
+            Bin::Shl | Bin::LShr | Bin::AShr => (y == Some(0)).then_some(a),
+            _ => None,
+        }
+    }
+
+    /// Folds `cmp pred a b` when both operands are constants.
+    fn fold_cmp(&mut self, pred: u8, a: V, b: V) -> Option<V> {
+        let ty = self.type_of(a);
+        if self.type_of(b) != ty {
+            return None;
+        }
+        let kind = match &self.types[ty.0 as usize] {
+            TypeDef::Int(w) => Some(*w),
+            TypeDef::Float => None,
+            _ => return None,
+        };
+        let r = match kind {
+            Some(w) => {
+                let (x, y) = (self.int_value(a)?, self.int_value(b)?);
+                let (xu, yu) = (bits_of(x, w), bits_of(y, w));
+                let (xs, ys) = (sext_bits(x, w), sext_bits(y, w));
+                match pred {
+                    pred::EQ => xu == yu,
+                    pred::NE => xu != yu,
+                    pred::IUGT => xu > yu,
+                    pred::IUGE => xu >= yu,
+                    pred::IULT => xu < yu,
+                    pred::IULE => xu <= yu,
+                    pred::SGT => xs > ys,
+                    pred::SGE => xs >= ys,
+                    pred::SLT => xs < ys,
+                    pred::SLE => xs <= ys,
+                    _ => return None,
+                }
+            }
+            None => {
+                let (V::Const(x), V::Const(y)) = (a, b) else {
+                    return None;
+                };
+                let (Const::Float(fa), Const::Float(fb)) =
+                    (&self.consts[x as usize].1, &self.consts[y as usize].1)
+                else {
+                    return None;
+                };
+                let (fa, fb) = (f32::from_bits(*fa), f32::from_bits(*fb));
+                match pred {
+                    pred::OEQ => fa == fb,
+                    pred::OGT => fa > fb,
+                    pred::OGE => fa >= fb,
+                    pred::OLT => fa < fb,
+                    pred::OLE => fa <= fb,
+                    pred::ONE => fa != fb,
+                    pred::ORD => !fa.is_nan() && !fb.is_nan(),
+                    pred::UNO => fa.is_nan() || fb.is_nan(),
+                    pred::UEQ => fa == fb || fa.is_nan() || fb.is_nan(),
+                    pred::UGT => fa > fb || fb.is_nan(),
+                    pred::UGE => fa >= fb || fb.is_nan(),
+                    pred::ULT => fa < fb || fb.is_nan(),
+                    pred::ULE => fa <= fb || fb.is_nan(),
+                    pred::UNE => !(fa == fb || fa.is_nan() || fb.is_nan()),
+                    pred::TRUE => true,
+                    pred::FALSE => false,
+                    _ => return None,
+                }
+            }
+        };
+        Some(self.bool(r))
+    }
+
+    /// Folds a cast of a constant (integer width changes, i32 <-> f32
+    /// bitcasts).
+    fn fold_cast(&mut self, op: Cast, v: V, to: Ty) -> Option<V> {
+        let V::Const(x) = v else { return None };
+        let (from, c) = self.consts[x as usize].clone();
+        let from_kind = match &self.types[from.0 as usize] {
+            TypeDef::Int(w) => Some(*w),
+            TypeDef::Float => None,
+            _ => return None,
+        };
+        match (from_kind, c) {
+            (Some(w), Const::Int(val)) => match op {
+                Cast::ZExt => Some(self.int_const(to, bits_of(val, w) as i64)),
+                Cast::SExt => Some(self.int_const(to, sext_bits(val, w))),
+                Cast::Trunc => {
+                    let TypeDef::Int(dw) = &self.types[to.0 as usize] else {
+                        return None;
+                    };
+                    let dw = *dw;
+                    Some(self.int_const(to, sext_bits(bits_of(val, dw) as i64, dw)))
+                }
+                Cast::Bitcast => {
+                    if w == 32 && matches!(&self.types[to.0 as usize], TypeDef::Float) {
+                        Some(self.constant(to, Const::Float(bits_of(val, 32) as u32)))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            (None, Const::Float(bits)) => {
+                if matches!(op, Cast::Bitcast)
+                    && matches!(&self.types[to.0 as usize], TypeDef::Int(32))
+                {
+                    Some(self.int_const(to, sext_bits(bits as i64, 32)))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// A function declaration (or `main` with `body`), found by name.
     pub fn function(&mut self, name: &str, ty: Ty, attr: Option<Attr>, body: bool) -> V {
         if let Some(&i) = self.func_ids.get(name) {
@@ -387,16 +660,37 @@ impl Module {
 
     pub fn bin(&mut self, block: usize, op: Bin, a: V, b: V) -> V {
         let ty = self.type_of(a);
+        // Constant folding: the driver folds these at PSO compile time, but
+        // emitting the constant here keeps the DXIL (and so validation, the
+        // disk cache and the driver's work) smaller.
+        if let Some(c) = self.fold_bin(op, ty, a, b) {
+            return c;
+        }
+        if let Some(v) = self.fold_bin_identity(op, ty, a, b) {
+            return v;
+        }
         self.push(block, ty, Op::Bin(op, a, b))
     }
     pub fn cast(&mut self, block: usize, op: Cast, v: V, to: Ty) -> V {
+        if let Some(c) = self.fold_cast(op, v, to) {
+            return c;
+        }
         self.push(block, to, Op::Cast(op, v))
     }
     pub fn cmp(&mut self, block: usize, pred: u8, a: V, b: V) -> V {
         let t = self.int(1);
+        if let Some(c) = self.fold_cmp(pred, a, b) {
+            return c;
+        }
         self.push(block, t, Op::Cmp(pred, a, b))
     }
     pub fn select(&mut self, block: usize, c: V, t: V, f: V) -> V {
+        if t == f {
+            return t;
+        }
+        if let Some(b) = self.bool_value(c) {
+            return if b { t } else { f };
+        }
         let ty = self.type_of(t);
         self.push(block, ty, Op::Select(c, t, f))
     }
@@ -1015,6 +1309,171 @@ impl Writer {
 mod tests {
     use super::*;
 
+    /// A module with one block, for fold tests.
+    fn one_block() -> (Module, usize) {
+        let mut m = Module::default();
+        let b = m.new_block();
+        (m, b)
+    }
+
+    #[test]
+    fn constant_bin_ops_fold() {
+        let (mut m, b) = one_block();
+        let a = m.i32(0xFFFF_FFF0);
+        let c = m.i32(0x20);
+        // Wrapping add folds to a constant, not an instruction.
+        let r = m.bin(b, Bin::Add, a, c);
+        assert_eq!(m.int_value(r), Some(0x10), "wraps in 32 bits");
+        assert!(matches!(r, V::Const(_)));
+        let r = m.bin(b, Bin::Sub, a, c);
+        assert_eq!(
+            m.int_value(r),
+            Some(-48),
+            "0xFFFFFFD0 sign-extended, as i32() stores it"
+        );
+        let m1 = m.i32(0x10000);
+        let r = m.bin(b, Bin::Mul, m1, m1);
+        assert_eq!(m.int_value(r), Some(0));
+        let f0 = m.i32(0xF0F0);
+        let f1 = m.i32(0x0FF0);
+        let r = m.bin(b, Bin::And, f0, f1);
+        assert_eq!(m.int_value(r), Some(0x00F0));
+        let o1 = m.i32(0x0F0F);
+        let r = m.bin(b, Bin::Or, f0, o1);
+        assert_eq!(m.int_value(r), Some(0xFFFF));
+        // Shifts fold when the amount is in range, and stay instructions at
+        // or past the width (LLVM poison).
+        let one = m.i32(1);
+        let s31 = m.i32(31);
+        let r = m.bin(b, Bin::Shl, one, s31);
+        assert_eq!(m.int_value(r), Some(i64::from(0x8000_0000u32 as i32)));
+        let s32 = m.i32(32);
+        let wide = m.bin(b, Bin::Shl, one, s32);
+        assert!(
+            matches!(wide, V::Inst(_)),
+            "shift by 32 stays an instruction"
+        );
+        // Division by zero stays an instruction.
+        let five = m.i32(5);
+        let zero = m.i32(0);
+        let dz = m.bin(b, Bin::UDiv, five, zero);
+        assert!(matches!(dz, V::Inst(_)));
+        let seven = m.i32(7);
+        let two = m.i32(2);
+        let r = m.bin(b, Bin::UDiv, seven, two);
+        assert_eq!(m.int_value(r), Some(3));
+        // i8 arithmetic wraps at 8 bits.
+        let i8t = m.int(8);
+        let c200 = m.int_const(i8t, 200);
+        let c100 = m.int_const(i8t, 100);
+        let r = m.bin(b, Bin::Add, c200, c100);
+        assert_eq!(m.int_value(r), Some(44), "300 wraps to 44 in i8");
+        // Signed compare folds on sign-extended values.
+        let n1 = m.int_const(i8t, -1);
+        let p1 = m.int_const(i8t, 1);
+        let r = m.cmp(b, pred::SLT, n1, p1);
+        assert_eq!(m.bool_value(r), Some(true));
+        let r = m.cmp(b, pred::IULT, n1, p1);
+        assert_eq!(m.bool_value(r), Some(false), "0xFF > 1 unsigned");
+        // Only the two un-foldable ops (the poisonous shift, the divide by
+        // zero) became instructions; everything else is a constant.
+        assert_eq!(m.insts.len(), 2, "the rest folded to constants");
+    }
+
+    #[test]
+    fn constant_float_ops_fold_and_nan_does_not() {
+        let (mut m, b) = one_block();
+        let f = m.f32(1.5f32.to_bits());
+        let g = m.f32(2.25f32.to_bits());
+        let r = m.bin(b, Bin::Add, f, g);
+        let V::Const(ri) = r else { panic!("folded") };
+        assert_eq!(m.consts[ri as usize].1, Const::Float(3.75f32.to_bits()));
+        let nan = m.f32(f32::NAN.to_bits());
+        let r = m.bin(b, Bin::Add, nan, g);
+        assert!(
+            matches!(r, V::Inst(_)),
+            "NaN operand keeps the instruction (payload)"
+        );
+        // Float compares fold, with NaN unordered semantics.
+        let r = m.cmp(b, pred::OEQ, f, f);
+        assert_eq!(m.bool_value(r), Some(true));
+        let r = m.cmp(b, pred::UNO, nan, g);
+        assert_eq!(m.bool_value(r), Some(true));
+        let r = m.cmp(b, pred::OLT, nan, g);
+        assert_eq!(m.bool_value(r), Some(false));
+    }
+
+    #[test]
+    fn identity_bin_ops_drop_the_instruction() {
+        let (mut m, b) = one_block();
+        // A non-constant value to simplify onto.
+        let i32t = m.int(32);
+        let u = m.undef(i32t);
+        let one = m.i32(1);
+        let y = m.bin(b, Bin::Add, u, one);
+        assert!(matches!(y, V::Inst(_)));
+        // x & -1 -> x, x | 0 -> x, x * 1 -> x, x << 0 -> x, x + 0 -> x
+        let all = m.i32(u32::MAX);
+        let zero = m.i32(0);
+        for op in [
+            Bin::And,
+            Bin::Or,
+            Bin::Xor,
+            Bin::Mul,
+            Bin::Add,
+            Bin::Sub,
+            Bin::Shl,
+            Bin::LShr,
+            Bin::AShr,
+            Bin::UDiv,
+        ] {
+            let other = match op {
+                Bin::And => all,
+                Bin::Mul | Bin::UDiv => one,
+                _ => zero,
+            };
+            let r = m.bin(b, op, y, other);
+            assert_eq!(
+                r, y,
+                "{op:?} with the identity constant returns the operand"
+            );
+        }
+        // A non-identity constant still emits.
+        let ff = m.i32(0xFF);
+        let r = m.bin(b, Bin::And, y, ff);
+        assert!(matches!(r, V::Inst(_)));
+    }
+
+    #[test]
+    fn select_and_cast_fold_on_constants() {
+        let (mut m, b) = one_block();
+        let t = m.i32(1);
+        let f = m.i32(2);
+        let bt = m.bool(true);
+        let bf = m.bool(false);
+        assert_eq!(m.select(b, bt, t, f), t);
+        assert_eq!(m.select(b, bf, t, f), f);
+        // Same arms drop the select whatever the condition.
+        let i32t = m.int(32);
+        let u = m.undef(i32t);
+        let cond = m.cmp(b, pred::EQ, u, u);
+        assert!(matches!(cond, V::Inst(_)));
+        assert_eq!(m.select(b, cond, t, t), t);
+        // i32 <-> f32 bitcast of a constant folds.
+        let f32t = m.float();
+        let c = m.i32(0x3F80_0000);
+        let r = m.cast(b, Cast::Bitcast, c, f32t);
+        let V::Const(ri) = r else { panic!("folded") };
+        assert_eq!(m.consts[ri as usize].1, Const::Float(0x3F80_0000));
+        let back = m.cast(b, Cast::Bitcast, r, i32t);
+        assert_eq!(m.int_value(back), Some(i64::from(0x3F80_0000u32 as i32)));
+        // Trunc folds.
+        let i8t = m.int(8);
+        let big = m.i32(0x1234_5678);
+        let r = m.cast(b, Cast::Trunc, big, i8t);
+        assert_eq!(m.int_value(r), Some(0x78));
+    }
+
     #[test]
     fn vbr_and_blocks() {
         let mut w = Writer::default();
@@ -1172,13 +1631,15 @@ mod tests {
         assert_eq!(&*successors(Some(Term::CondBr(V::Const(0), 3, 5))), &[3, 5]);
     }
 
-    /// The written bytes are pinned to what the writer produced before the
-    /// worklist and the reused record buffers.
+    /// The written bytes are pinned: the writer's worklist and reused record
+    /// buffers must not change them, and neither must the constant folding
+    /// change them except where it folds (the values below are after the
+    /// folding in `bin`/`cmp`/`select`/`cast`).
     #[test]
     fn written_bytes_unchanged() {
         for ((regs, stages, read), len, hash) in [
-            ((64, 64, 64), 38_916, 0x9586_730c_f953_4a45),
-            ((128, 256, 32), 295_952, 0x89e5_de2d_64f0_8785),
+            ((64, 64, 64), 38_920, 0xb6a9_db87_d257_884a),
+            ((128, 256, 32), 295_952, 0xf89b_de6f_8b2c_fd69),
         ] {
             let bytes = synthetic(regs, stages, read).write();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
