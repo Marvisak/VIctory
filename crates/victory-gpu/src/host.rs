@@ -177,8 +177,7 @@ fn create() -> windows::core::Result<Host> {
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
         if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
-            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-            let adapter: IDXGIAdapter = factory.EnumWarpAdapter()?;
+            let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
@@ -227,6 +226,58 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
+/// Reject it before creating a device in diagnostics' software-only mode.
+fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let adapter: IDXGIAdapter = factory.EnumWarpAdapter()?;
+        let desc = adapter.cast::<IDXGIAdapter1>()?.GetDesc1()?;
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+            tracing::warn!(
+                vendor = format_args!("{:#x}", desc.VendorId),
+                flags = format_args!("{:#x}", desc.Flags),
+                "DXGI did not identify the WARP adapter as software; refusing device"
+            );
+            return Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_FAIL,
+            ));
+        }
+        Ok(adapter)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warp_adapter_accepts_only_software() {
+        // This probes DXGI without creating a D3D12 device or running a title.
+        // SAFETY: plain DXGI adapter queries.
+        let raw = unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return;
+            };
+            factory.EnumWarpAdapter::<IDXGIAdapter>()
+        };
+        let Ok(raw) = raw else { return };
+        // SAFETY: EnumWarpAdapter returns a DXGI adapter, which implements
+        // IDXGIAdapter1; `raw` owns that interface.
+        let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
+        eprintln!(
+            "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
+            desc.VendorId, desc.Flags
+        );
+        assert_eq!(
+            warp_adapter().is_ok(),
+            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+        );
+    }
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -254,7 +305,15 @@ pub(crate) struct HostList {
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
+    /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
+    /// and at the end, and where they are read back.
+    #[cfg(feature = "diagnostics")]
+    stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
 }
+
+/// Timestamps per list (diagnostics); commands past them are not timed.
+#[cfg(feature = "diagnostics")]
+const STAMPS: u32 = 4096;
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -272,6 +331,15 @@ pub(crate) fn dred_on() -> bool {
     *ON.get_or_init(|| {
         cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
     })
+}
+
+/// Whether each list of a submission runs and is timed on its own, slow
+/// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
+/// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
+#[cfg(feature = "diagnostics")]
+fn timing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -316,6 +384,9 @@ enum Step {
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Brings a texture's staging buffer up to date: once per submission,
+    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
+    Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -412,42 +483,77 @@ impl Host {
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
+                stamps: OnceLock::new(),
             })
         }
     }
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // One submission at a time from preparation to copy-back: snapshots
+        // and the ranges shaders write are per host copy, not per submission.
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        // Where each run's lists start in `lists`.
+        let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
+            firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
         }
         batch.flush();
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        *submitted += 1;
         let prepared = std::time::Instant::now();
-        // SAFETY: closed lists; the fence and event are ours.
-        unsafe {
-            self.queue.ExecuteCommandLists(&lists);
-            let waited = self
-                .queue
-                .Signal(&self.fence, *submitted)
-                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-            match waited {
-                Ok(()) => {
-                    WaitForSingleObject(self.event, INFINITE);
+        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        #[cfg(feature = "diagnostics")]
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+            firsts
+                .iter()
+                .zip(firsts.iter().skip(1).chain([&lists.len()]))
+                .map(|(&a, &b)| &lists[a..b])
+                .collect()
+        } else {
+            vec![&lists[..]]
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let groups = [&lists[..]];
+        for (i, group) in groups.iter().enumerate() {
+            *submitted += 1;
+            let started = std::time::Instant::now();
+            // SAFETY: closed lists; the fence and event are ours.
+            unsafe {
+                self.queue.ExecuteCommandLists(group);
+                let waited = self
+                    .queue
+                    .Signal(&self.fence, *submitted)
+                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                match waited {
+                    Ok(()) => {
+                        WaitForSingleObject(self.event, INFINITE);
+                    }
+                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
-                Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
             }
+            #[cfg(feature = "diagnostics")]
+            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+                // SAFETY: a plain query.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                for (ms, op) in runs[i].slowest(frequency, 6) {
+                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                }
+            }
+            let _ = (i, started);
         }
+        let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -677,7 +783,92 @@ impl Host {
 }
 
 impl HostList {
+    /// The timestamp heap and its read-back buffer (diagnostics, timing on).
+    #[cfg(feature = "diagnostics")]
+    fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
+        if !timing() {
+            return None;
+        }
+        self.stamps
+            .get_or_init(|| {
+                let device = &host()?.device;
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                let mut back: Option<ID3D12Resource> = None;
+                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: u64::from(STAMPS) * 8,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                // SAFETY: plain object creation.
+                unsafe {
+                    device
+                        .CreateQueryHeap(
+                            &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0 },
+                            &mut heap,
+                        )
+                        .ok()?;
+                    device
+                        .CreateCommittedResource(
+                            &readback,
+                            D3D12_HEAP_FLAG_NONE,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            None,
+                            &mut back,
+                        )
+                        .ok()?;
+                }
+                Some((heap?, back?))
+            })
+            .as_ref()
+    }
+
+    /// The noted commands that took longest on the GPU, longest first, as
+    /// (milliseconds, text) (diagnostics, timing on, after the list ran).
+    #[cfg(feature = "diagnostics")]
+    fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+            return Vec::new();
+        };
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        // SAFETY: a read-back buffer the finished list resolved into.
+        let stamps: Vec<u64> = unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return Vec::new();
+            }
+            let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
+            back.Unmap(0, None);
+            s
+        };
+        let mut times: Vec<(f64, String)> = (0..count)
+            .map(|i| {
+                let ticks = stamps[i + 1].saturating_sub(stamps[i]);
+                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+            })
+            .collect();
+        times.sort_by(|a, b| b.0.total_cmp(&a.0));
+        times.truncate(n);
+        times
+    }
+
     pub(crate) fn close(&self) {
+        #[cfg(feature = "diagnostics")]
+        if let Some((heap, back)) = self.stamps() {
+            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+            // SAFETY: an open list, our heap and read-back buffer.
+            unsafe {
+                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+            }
+        }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -790,6 +981,11 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if dred_on() {
+            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
+                // SAFETY: an open list and our query heap.
+                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+            }
             let what = what();
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
@@ -959,6 +1155,12 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// Brings a texture's staging buffer up to date when the list is
+    /// submitted, keeping it alive until the list is reset.
+    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
+        self.deferred().copies.push(Step::Texture(staging));
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
@@ -974,7 +1176,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.flush();
+                    batch.title_written();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -998,7 +1200,7 @@ impl HostList {
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
-                        batch.flush();
+                        batch.title_written();
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -1014,6 +1216,12 @@ impl HostList {
                     shadow.writing(*address, *len);
                     continue;
                 }
+                Step::Texture(staging) => {
+                    if batch.texture_due(staging) {
+                        staging.refresh();
+                    }
+                    continue;
+                }
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
@@ -1024,20 +1232,46 @@ impl HostList {
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
+///
+/// Also the textures brought up to date in the submission so far: most
+/// lists of a world submission sample the same textures, and a texture in
+/// physical-page memory is hashed whole each time it is checked. Checked
+/// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
-struct Batch(Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>);
+struct Batch {
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Staging buffers (by address) refreshed since the last title write.
+    textures: std::collections::HashSet<usize>,
+}
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
-        match self.0.iter_mut().find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow)) {
+        match self
+            .refreshes
+            .iter_mut()
+            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
+        {
             Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.0.push((shadow.clone(), address, end)),
+            None => self.refreshes.push((shadow.clone(), address, end)),
         }
     }
 
+    /// Whether `staging` is still to be refreshed in this submission (and
+    /// notes it refreshed).
+    fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
+        self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+    }
+
+    /// Before a step that writes title memory: pending refreshes are done
+    /// first, and textures are checked again after it.
+    fn title_written(&mut self) {
+        self.flush();
+        self.textures.clear();
+    }
+
     fn flush(&mut self) {
-        for (shadow, from, to) in self.0.drain(..) {
+        for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
@@ -1234,6 +1468,8 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    #[cfg(feature = "diagnostics")]
+    copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
@@ -1246,6 +1482,8 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            #[cfg(feature = "diagnostics")]
+            copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
@@ -1257,6 +1495,10 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.copy_stats_frames += 1;
+        }
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -1280,16 +1522,29 @@ impl Meter {
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        // Over the same frames as the counts above.
+        #[cfg(feature = "diagnostics")]
+        let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                 dropped {dropped:.0} without a host pipeline and {indirect:.0} indirect"
+                 dropped {dropped:.0} without a host pipeline ({making} being made) and \
+                 {indirect:.0} indirect",
+                making = crate::pipeline::making()
             );
             #[cfg(feature = "diagnostics")]
-            crate::copystat::log(frames);
+            {
+                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                for (why, n) in drops.iter().take(40) {
+                    tracing::info!(
+                        "dropped {:.1}/frame without a host pipeline: {why}",
+                        *n as f64 / frames
+                    );
+                }
+            }
         }
         if self.caption.is_none() {
             // The window's own text, read without a message.
@@ -1722,5 +1977,79 @@ fn pump() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(test)]
+mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
+    use super::Batch;
+    use std::sync::Arc;
+
+    #[test]
+    fn a_texture_is_checked_once_per_submission() {
+        let mut batch = Batch::default();
+        let (a, b) = (Arc::new([0u8; 16]), Arc::new([0u8; 16]));
+        // The first list sampling each texture checks it ...
+        assert!(batch.texture_due(&a));
+        assert!(batch.texture_due(&b));
+        // ... later lists of the same submission do not.
+        assert!(!batch.texture_due(&a));
+        assert!(!batch.texture_due(&a.clone()));
+        assert!(!batch.texture_due(&b));
+    }
+
+    #[test]
+    fn title_writes_make_textures_due_again() {
+        let mut batch = Batch::default();
+        let a = Arc::new(1u32);
+        assert!(batch.texture_due(&a));
+        assert!(!batch.texture_due(&a));
+        // A copy into title memory or work that may write it may have
+        // changed the texture's memory.
+        batch.title_written();
+        assert!(batch.texture_due(&a));
+        assert!(!batch.texture_due(&a));
+        // A fresh submission starts over.
+        let mut next = Batch::default();
+        assert!(next.texture_due(&a));
+    }
+
+    /// The hashing a submission does for textures in physical-page memory,
+    /// with every list checking the textures it samples (before) and with
+    /// each checked once (after). Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture texture_checks`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn texture_checks_per_submission() {
+        const TEXTURES: usize = 48;
+        const SIZE: usize = 4 << 20;
+        const LISTS: usize = 12;
+        let textures: Vec<Arc<Vec<u8>>> = (0..TEXTURES)
+            .map(|t| Arc::new((0..SIZE).map(|i| (i * 31 + t) as u8).collect()))
+            .collect();
+        let submit = |dedupe: bool| {
+            let mut batch = Batch::default();
+            let mut hashed = 0usize;
+            let started = std::time::Instant::now();
+            for _ in 0..LISTS {
+                for t in &textures {
+                    if !dedupe || batch.texture_due(t) {
+                        std::hint::black_box(blake3::hash(t));
+                        hashed += 1;
+                    }
+                }
+            }
+            (started.elapsed(), hashed)
+        };
+        submit(false); // warm up
+        let (before, n_before) = submit(false);
+        let (after, n_after) = submit(true);
+        assert_eq!((n_before, n_after), (TEXTURES * LISTS, TEXTURES));
+        println!(
+            "{LISTS} lists sampling {TEXTURES} textures of {} MiB: \
+             before {n_before} hashes in {before:?}, after {n_after} in {after:?} ({:.1}x)",
+            SIZE >> 20,
+            before.as_secs_f64() / after.as_secs_f64()
+        );
     }
 }

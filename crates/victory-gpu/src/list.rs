@@ -6,7 +6,7 @@
 //! the table as a call.
 //!
 //! Each list records onto a host command list as its methods are called
-//! (decision 0007); draw state lives in [`crate::draw`]. Methods not
+//! (decision 0007); draw state lives in `crate::draw`. Methods not
 //! written yet log once with their caller, so a run lists what to do next.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -446,6 +446,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if crate::texture::title_written(from) {
+                crate::texture::upload(list, src, from);
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -522,7 +525,9 @@ extern "system" fn copy_texture_region(
             let Some((buffer, staging)) = list.upload(host, bytes) else {
                 return;
             };
-            list.defer_copy(staging, data, bytes as usize);
+            // The list owns this mapped D3D12 upload buffer. Wine can report
+            // its address as MEM_FREE, so use the host-upload path.
+            list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]
@@ -535,6 +540,9 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::texture::title_written(texture) {
+                crate::texture::upload(list, src.resource, texture);
+            }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
@@ -1007,7 +1015,11 @@ mod state {
         views: *const VertexView,
     ) {
         with_state(this, |_, s| {
-            s.set_vertex_buffers(start, items(views, count))
+            if views.is_null() {
+                s.clear_vertex_buffers(start, count);
+            } else {
+                s.set_vertex_buffers(start, items(views, count));
+            }
         });
     }
     /// `(count, handles, one range, depth)`: with one range, the handles
@@ -1129,14 +1141,14 @@ extern "system" fn draw(_: This) {
 }
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
-/// offset)`. Grand Theft Auto VI's signatures (2026-11-23) hold one
-/// argument each: draw (stride 16), indexed draw (20), dispatch (12), mesh
-/// dispatch (12), and a console type 105 (stride 12, fields 0, 60000, 0,
-/// over its 174 MB buffer) whose meaning is unknown. Those of PC types run
+/// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
+/// hold one argument each: draw (stride 16), indexed draw (20), dispatch
+/// (12), mesh dispatch (12), and the console's single-pass dispatch, type
+/// 105 (stride 12: the three group counts; its flags live in the
+/// signature, the title passes none), run as a plain dispatch. They run
 /// through the host's indirect execution (`State::execute_indirect`).
-/// shortcut: type 105 and signatures that change root arguments are
-/// dropped (logged once per signature); decode 105 when its draws are
-/// missed.
+/// shortcut: signatures that change root arguments are dropped (logged
+/// once per signature).
 extern "system" fn execute_indirect(
     this: This,
     signature: This,
@@ -1153,22 +1165,23 @@ extern "system" fn execute_indirect(
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
-    // shortcut: off unless `VICTORY_INDIRECT` is set (diagnostics builds):
-    // with it the world presented no frame for 30 s and the title's own
-    // GPU watchdog ended it (2026-11-24, cause not found); without it the
-    // world runs, with most geometry missing.
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_INDIRECT").is_some()
-    });
     #[cfg(windows)]
-    if on
-        && let ([[kind, ..]], Some(address)) = (args, address)
+    if let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
     {
+        const DISPATCH: u32 = 2;
+        const DISPATCH_SINGLE: u32 = 105;
+        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (*kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
+    } else {
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::pipeline::note_why(format!(
+            "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
+            address.is_some(),
+            count.is_null() || counter.is_some()
+        ));
     }
     if ran {
         return;
