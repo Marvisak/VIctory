@@ -48,34 +48,41 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
 
 fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
     let u32_at = |o: usize| {
-        file.get(o..o + 4)
+        let end = o.checked_add(4)?;
+        file.get(o..end)
             .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
     };
     let n = u32_at(at.checked_sub(4)?)?;
-    let unpacked_size = u32_at(at + 8)?;
-    if u32_at(at + 4)? != n || n < 12 || unpacked_size > MAX_UNPACKED {
+    let unpacked_size = u32_at(at.checked_add(8)?)?;
+    if u32_at(at.checked_add(4)?)? != n || n < 12 || unpacked_size > MAX_UNPACKED {
         return None;
     }
     let nul = at.checked_sub(6)?;
+    let start = at.checked_add(12)?;
+    let end = at.checked_add(n)?;
+    if start > end {
+        return None;
+    }
     Some(Record {
         offset: at,
-        name: (file[nul] == 0).then(|| name_before(file, nul)).flatten(),
-        kind: file[at - 5],
-        packed: file.get(at + 12..at + n)?,
+        name: (file.get(nul) == Some(&0)).then(|| name_before(file, nul)).flatten(),
+        kind: *file.get(at.checked_sub(5)?)?,
+        packed: file.get(start..end)?,
         unpacked_size,
     })
 }
 
 /// The printable name that ends at `nul` and follows its length byte.
 fn name_before(file: &[u8], nul: usize) -> Option<&str> {
-    let run = file[..nul]
+    let prefix = file.get(..nul)?;
+    let run = prefix
         .iter()
         .rposition(|b| !b.is_ascii_graphic())
         .map_or(0, |p| p + 1);
     // From 32 characters on, the length byte is printable too.
     (run.saturating_sub(1)..nul)
-        .find(|&l| usize::from(file[l]) == nul - l)
-        .and_then(|l| std::str::from_utf8(&file[l + 1..nul]).ok())
+        .find(|&l| usize::from(*file.get(l).unwrap_or(&0)) == nul - l)
+        .and_then(|l| std::str::from_utf8(file.get(l + 1..nul)?).ok())
 }
 
 #[cfg(test)]
@@ -132,5 +139,42 @@ mod tests {
         file[27] = 0xFF; // first packed byte: reserved block type
         let r = records(&file).next().unwrap();
         assert_eq!(r.unpack(), None);
+    }
+
+    #[test]
+    fn rejects_boundary_and_malformed_records() {
+        // Marker at offset 0, 2, or 4 cannot have header prefix (at < 6).
+        let mut short = vec![0u8; 8];
+        short[..4].copy_from_slice(&MARKER);
+        assert_eq!(record(&short, 0), None);
+
+        // Marker with n < 12.
+        let mut too_short_n = vec![0u8; 32];
+        let at = 10;
+        too_short_n[at - 4..at].copy_from_slice(&8u32.to_le_bytes()); // n = 8 < 12
+        too_short_n[at..at + 4].copy_from_slice(&MARKER);
+        too_short_n[at + 4..at + 8].copy_from_slice(&8u32.to_le_bytes());
+        too_short_n[at + 8..at + 12].copy_from_slice(&64u32.to_le_bytes());
+        assert_eq!(record(&too_short_n, at), None);
+
+        // Marker with mismatched size fields.
+        let mut mismatched = too_short_n.clone();
+        mismatched[at - 4..at].copy_from_slice(&16u32.to_le_bytes());
+        mismatched[at + 4..at + 8].copy_from_slice(&20u32.to_le_bytes()); // != 16
+        assert_eq!(record(&mismatched, at), None);
+
+        // Marker with unpacked_size exceeding MAX_UNPACKED.
+        let mut huge = too_short_n.clone();
+        huge[at - 4..at].copy_from_slice(&16u32.to_le_bytes());
+        huge[at + 4..at + 8].copy_from_slice(&16u32.to_le_bytes());
+        huge[at + 8..at + 12].copy_from_slice(&((MAX_UNPACKED as u32) + 1).to_le_bytes());
+        assert_eq!(record(&huge, at), None);
+
+        // Truncated payload: n specifies bytes beyond file end.
+        let mut truncated = too_short_n;
+        truncated[at - 4..at].copy_from_slice(&1000u32.to_le_bytes());
+        truncated[at + 4..at + 8].copy_from_slice(&1000u32.to_le_bytes());
+        truncated[at + 8..at + 12].copy_from_slice(&64u32.to_le_bytes());
+        assert_eq!(record(&truncated, at), None);
     }
 }
