@@ -404,7 +404,10 @@ mod tests {
         // The IAT and its slot are left for us to bind.
         let iat = layout::data_directory_offset(bytes, dir::IAT).unwrap();
         assert_eq!(bytes[iat..iat + 8], original[iat..iat + 8]);
-        assert_eq!(bytes[at(0x1140)..at(0x1148)], original[at(0x1140)..at(0x1148)]);
+        assert_eq!(
+            bytes[at(0x1140)..at(0x1148)],
+            original[at(0x1140)..at(0x1148)]
+        );
         // The callback pointer is cleared, and so is only its relocation.
         let tls = patched.tls.as_ref().unwrap();
         assert_eq!(tls.callbacks_va, 0);
@@ -412,7 +415,10 @@ mod tests {
         assert_eq!(dir64_relocations(bytes, &patched), [(at(0x1388), 0x1210)]);
         assert_eq!(bytes[at(0x138A)..at(0x138C)], [0, 0]);
         // Nothing else changed: the callback array itself is intact.
-        assert_eq!(bytes[at(0x1240)..at(0x1248)], original[at(0x1240)..at(0x1248)]);
+        assert_eq!(
+            bytes[at(0x1240)..at(0x1248)],
+            original[at(0x1240)..at(0x1248)]
+        );
     }
 
     #[test]
