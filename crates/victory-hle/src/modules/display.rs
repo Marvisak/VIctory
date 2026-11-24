@@ -5,7 +5,7 @@
 use std::ffi::{c_char, c_void};
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, S_OK, add_ref, missing, put, text,
 };
 
 /// HDR mode; asked for with this interface id since 2020.
@@ -127,13 +127,20 @@ fn last_error() -> HRESULT {
     (0x8007_0000 | (code & 0xffff)) as i32
 }
 
-// shortcut: screenshots fail as if capture were unavailable. Taking one needs
-// a hook in the GPU side: the last presented frame read back as BGRA8 (size,
-// row pitch, bytes) on request, e.g. `victory_gpu::last_frame() ->
-// Option<Frame>`, copied from the back buffer after `PresentX`.
+// The screenshot's path lands in the log; the API's `result` structure is
+// not written (its layout is not known), so the title reads the file
+// through its own storage.
 extern "system" fn take_screenshot(_: This, _user: *const c_void, _result: *mut c_void) -> HRESULT {
-    tracing::info!("screenshot not taken");
-    NOT_SUPPORTED
+    match victory_gpu::save_screenshot() {
+        Some(path) => {
+            tracing::info!(path = %path.display(), "screenshot taken");
+            S_OK
+        }
+        None => {
+            tracing::info!("screenshot not taken");
+            NOT_SUPPORTED
+        }
+    }
 }
 
 static HDR_VTABLE: Methods<5> = Methods([

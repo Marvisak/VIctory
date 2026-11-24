@@ -1267,7 +1267,7 @@ impl State {
                 // SAFETY: an open list.
                 unsafe { list.list.ResourceBarrier(&[all]) };
                 crate::list::ensure_state(list, r as This, COPY_SOURCE);
-                let read = crate::capture::read_back(&host.device, &list.list, t);
+                let read = crate::screenshot::read_back(&host.device, &list.list, t);
                 crate::list::ensure_state(list, r as This, UNORDERED);
                 let Some((buffer, f)) = read else { continue };
                 list.keep(&buffer);

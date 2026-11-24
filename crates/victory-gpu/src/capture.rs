@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+use crate::screenshot::chunk;
+
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
@@ -102,100 +104,8 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     }
 }
 
-fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-    png.extend((data.len() as u32).to_be_bytes());
-    let start = png.len();
-    png.extend(kind);
-    png.extend(data);
-    let crc = crc32(&png[start..]);
-    png.extend(crc.to_be_bytes());
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
-        }
-    }
-    !crc
-}
-
-/// Records a copy of `texture` (in the copy-source state) into a
-/// readback buffer.
-pub(crate) fn read_back(
-    device: &ID3D12Device,
-    list: &ID3D12GraphicsCommandList,
-    texture: &ID3D12Resource,
-) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
-    let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-    let mut total = 0;
-    // SAFETY: a live texture; outputs for one subresource.
-    unsafe {
-        let desc = texture.GetDesc();
-        device.GetCopyableFootprints(
-            &desc,
-            0,
-            1,
-            0,
-            Some(&mut footprint),
-            None,
-            None,
-            Some(&mut total),
-        );
-    }
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_READBACK,
-        ..Default::default()
-    };
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: total,
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        ..Default::default()
-    };
-    let mut buffer: Option<ID3D12Resource> = None;
-    // SAFETY: plain creation; an open list; locations naming live resources.
-    unsafe {
-        device
-            .CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut buffer,
-            )
-            .ok()?;
-        let buffer = buffer?;
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: std::mem::transmute_copy(&buffer),
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: footprint,
-            },
-        };
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            pResource: std::mem::transmute_copy(texture),
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
-            },
-        };
-        list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
-        Some((buffer, footprint))
-    }
-}
-
-/// Saves a frame read back by [`read_back`] (8-bit color only).
+/// Saves a frame read back by [`crate::screenshot::read_back`] (8-bit
+/// color only).
 pub(crate) fn save_read_back(
     frame: u64,
     buffer: &ID3D12Resource,
@@ -537,7 +447,7 @@ fn dump_one(
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
         }
-        let read = read_back(&host.device, &list.list, texture);
+        let read = crate::screenshot::read_back(&host.device, &list.list, texture);
         if state != copy {
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
@@ -842,7 +752,7 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
-        assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+        assert_eq!(crate::screenshot::crc32(b"IEND"), 0xae42_6082);
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
