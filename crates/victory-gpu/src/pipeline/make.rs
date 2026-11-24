@@ -59,8 +59,7 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -166,9 +165,8 @@ fn queue(p: Arc<Pending>) {
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
             let receiver = receiver.clone();
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
+            let spawned = std::thread::Builder::new().name(format!("victory-pipelines-{i}")).spawn(
+                move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -185,7 +183,8 @@ fn queue(p: Arc<Pending>) {
                             super::library::save(false);
                         }
                     }
-                });
+                },
+            );
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
             }

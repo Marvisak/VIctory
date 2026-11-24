@@ -121,11 +121,7 @@ trait Source: Send {
 
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
-            1.0
-        } else {
-            0.0
-        }
+        if keys.iter().any(|k| k.virtual_key == vk) { 1.0 } else { 0.0 }
     };
     PadState {
         buttons: FALLBACK_BUTTONS
@@ -165,10 +161,7 @@ pub struct Device {
 /// follows the public layout and is zero where we have nothing to say.
 #[repr(C)]
 #[derive(Default)]
-#[allow(
-    dead_code,
-    reason = "fields are written for title code to read; Rust never reads them"
-)]
+#[allow(dead_code, reason = "fields are written for title code to read; Rust never reads them")]
 struct DeviceInfo {
     size: u32,
     vendor: u16,
@@ -191,11 +184,7 @@ struct DeviceInfo {
 const _: () = assert!(std::mem::offset_of!(DeviceInfo, id) == 0x20);
 
 fn kind(index: usize) -> u32 {
-    if index == KEYBOARD {
-        KEYBOARD_KIND
-    } else {
-        GAMEPAD_KIND
-    }
+    if index == KEYBOARD { KEYBOARD_KIND } else { GAMEPAD_KIND }
 }
 
 impl Device {
@@ -212,12 +201,7 @@ impl Device {
             rumble_motors: if index < PADS { 0x3 } else { 0 },
             ..Default::default()
         };
-        Device {
-            vtable: &DEVICE,
-            hub: std::ptr::null(),
-            index,
-            info,
-        }
+        Device { vtable: &DEVICE, hub: std::ptr::null(), index, info }
     }
 
     fn hub(&self) -> &'static Hub {
@@ -300,13 +284,7 @@ impl Registration {
     }
 
     fn event(&self, device: usize, timestamp: u64, current: u32, previous: u32) -> Event {
-        Event {
-            registration: *self,
-            device,
-            timestamp,
-            current,
-            previous,
-        }
+        Event { registration: *self, device, timestamp, current, previous }
     }
 }
 
@@ -365,10 +343,7 @@ fn now() -> u64 {
 impl Hub {
     fn new(source: Box<dyn Source>) -> &'static Hub {
         let hub = Box::into_raw(Box::new(Hub {
-            object: Object {
-                vtable: &INPUT,
-                hub: std::ptr::null(),
-            },
+            object: Object { vtable: &INPUT, hub: std::ptr::null() },
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
             state: Mutex::new(State {
@@ -502,11 +477,8 @@ impl State {
         }
         if was != slot.connected {
             tracing::info!(device = index, connected = !was, "input device");
-            let (current, previous) = if was {
-                (0, STATUS_CONNECTED)
-            } else {
-                (STATUS_CONNECTED, 0)
-            };
+            let (current, previous) =
+                if was { (0, STATUS_CONNECTED) } else { (STATUS_CONNECTED, 0) };
             events.extend(
                 self.callbacks
                     .iter()
@@ -601,12 +573,7 @@ extern "system" fn current_reading(
 ) -> HRESULT {
     let hub = hub(this);
     let state = hub.state();
-    let newest = |i: usize| {
-        state.slots[i]
-            .history
-            .back()
-            .filter(|r| r.kind() & kind != 0)
-    };
+    let newest = |i: usize| state.slots[i].history.back().filter(|r| r.kind() & kind != 0);
     let found = if device.is_null() {
         (0..DEVICES)
             .filter(|&i| state.slots[i].connected)
@@ -654,24 +621,14 @@ fn relative(
     }
     let state = hub.state();
     let history = &state.slots[index].history;
-    if history
-        .front()
-        .is_none_or(|oldest| reference.sequence < oldest.sequence)
-    {
+    if history.front().is_none_or(|oldest| reference.sequence < oldest.sequence) {
         return fail(out, REFERENCE_TOO_OLD);
     }
     let wanted = |r: &&Ref| r.kind() & kind != 0;
     let found = if forward {
-        history
-            .iter()
-            .filter(|r| r.sequence > reference.sequence)
-            .find(wanted)
+        history.iter().filter(|r| r.sequence > reference.sequence).find(wanted)
     } else {
-        history
-            .iter()
-            .rev()
-            .filter(|r| r.sequence < reference.sequence)
-            .find(wanted)
+        history.iter().rev().filter(|r| r.sequence < reference.sequence).find(wanted)
     };
     hand(out, found)
 }
@@ -909,11 +866,7 @@ extern "system" fn device_info(this: *const Device) -> *const DeviceInfo {
 extern "system" fn device_status(this: *const Device) -> u32 {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
-    if device.hub().state().slots[device.index].connected {
-        STATUS_CONNECTED
-    } else {
-        0
-    }
+    if device.hub().state().slots[device.index].connected { STATUS_CONNECTED } else { 0 }
 }
 // shortcut: trigger motors are dropped (XInput has none). The host API that
 // drives them without a redistributable is Windows.Gaming.Input (WinRT
@@ -935,10 +888,7 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
-    tracing::warn!(
-        slot = format_args!("{SLOT:#x}"),
-        "input device method not implemented"
-    );
+    tracing::warn!(slot = format_args!("{SLOT:#x}"), "input device method not implemented");
     E_NOTIMPL
 }
 
@@ -986,11 +936,7 @@ extern "system" fn input_kind(this: *const Reading) -> u32 {
 }
 extern "system" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
     let reading = reading(this);
-    if reading.kind() & kind != 0 {
-        reading.sequence
-    } else {
-        0
-    }
+    if reading.kind() & kind != 0 { reading.sequence } else { 0 }
 }
 extern "system" fn reading_timestamp(this: *const Reading) -> u64 {
     reading(this).timestamp
@@ -1067,10 +1013,7 @@ pub(crate) fn module() -> HleModule {
         name: "gameinput",
         dlls: &["gameinput.dll"],
         // Titles import it by ordinal only.
-        exports: vec![HleExport {
-            name: "#1",
-            address: GameInputCreate as *const () as usize,
-        }],
+        exports: vec![HleExport { name: "#1", address: GameInputCreate as *const () as usize }],
     }
 }
 
@@ -1182,10 +1125,7 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
-            };
+            let speeds = XINPUT_VIBRATION { wLeftMotorSpeed: low, wRightMotorSpeed: high };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
@@ -1215,10 +1155,7 @@ mod host {
                     }
                     _ => return None,
                 };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
+                Some((Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?, vk))
             });
             (Instant::now(), keys.collect())
         });
@@ -1252,12 +1189,7 @@ mod host {
         let state = convert(&pad);
         assert_eq!(state.buttons, A | MENU | LEFT);
         assert_eq!(
-            (
-                state.left_trigger,
-                state.left_x,
-                state.left_y,
-                state.right_x
-            ),
+            (state.left_trigger, state.left_x, state.left_y, state.right_x),
             (1.0, -1.0, 1.0, 0.0)
         );
     }
@@ -1302,11 +1234,7 @@ mod tests {
     }
 
     fn key(virtual_key: u8) -> KeyState {
-        KeyState {
-            scan_code: u32::from(virtual_key) + 0x100,
-            virtual_key,
-            ..Default::default()
-        }
+        KeyState { scan_code: u32::from(virtual_key) + 0x100, virtual_key, ..Default::default() }
     }
 
     fn slot<F: Copy, T>(object: *const T, offset: usize) -> F {
@@ -1412,10 +1340,7 @@ mod tests {
     #[test]
     fn ordinal_one_resolves_to_create() {
         let r = HleResolver::new(HostPolicy::none());
-        assert_eq!(
-            r.classify("GameInput.dll", &ImportSymbol::Ordinal(1)),
-            Some(Provenance::Hle)
-        );
+        assert_eq!(r.classify("GameInput.dll", &ImportSymbol::Ordinal(1)), Some(Provenance::Hle));
         assert_eq!(r.classify("GameInput.dll", &ImportSymbol::Ordinal(2)), None);
     }
 
@@ -1428,11 +1353,8 @@ mod tests {
         // host pad the keyboard's stand-in is the only one.
         assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
 
-        host.lock().unwrap().pads[1] = Some(PadState {
-            buttons: A,
-            left_x: 0.5,
-            ..Default::default()
-        });
+        host.lock().unwrap().pads[1] =
+            Some(PadState { buttons: A, left_x: 0.5, ..Default::default() });
         hub.poll();
         assert_eq!(
             log.lock().unwrap()[1..],
@@ -1571,7 +1493,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());

@@ -58,16 +58,8 @@ pub(crate) extern "system" fn set_interval(
     };
     tracing::info!(?interval, "frame interval");
     // A new interval starts from now, after the last tick handed out.
-    let first = LAST
-        .iter()
-        .map(|t| t.load(Ordering::Relaxed))
-        .max()
-        .unwrap_or(0);
-    *clock() = Some(Clock {
-        start: Instant::now(),
-        interval,
-        first,
-    });
+    let first = LAST.iter().map(|t| t.load(Ordering::Relaxed)).max().unwrap_or(0);
+    *clock() = Some(Clock { start: Instant::now(), interval, first });
     S_OK
 }
 
@@ -100,20 +92,14 @@ fn last(kind: u32) -> &'static AtomicU64 {
 /// let the next one end on the same tick), and how long until it.
 fn next_tick(kind: u32) -> (u64, Duration) {
     let mut clock = clock();
-    let c = clock.get_or_insert_with(|| Clock {
-        start: Instant::now(),
-        interval: SIXTIETH,
-        first: 0,
-    });
+    let c =
+        clock.get_or_insert_with(|| Clock { start: Instant::now(), interval: SIXTIETH, first: 0 });
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
     let tick =
         (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
     let at = u128::from(tick - c.first) * interval;
-    (
-        tick,
-        Duration::from_nanos(at.saturating_sub(elapsed) as u64),
-    )
+    (tick, Duration::from_nanos(at.saturating_sub(elapsed) as u64))
 }
 
 /// Device method: blocks until the next tick (or the time-out); an origin
@@ -196,10 +182,7 @@ mod tests {
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
         let flags = TOKEN_ON_TIMEOUT;
-        assert_eq!(
-            wait(null, 0, 0, std::ptr::null(), flags, &mut early),
-            TIMEOUT
-        );
+        assert_eq!(wait(null, 0, 0, std::ptr::null(), flags, &mut early), TIMEOUT);
         let mut next = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut next), S_OK);
         assert!(early == second + 1 && next == early + 1);
@@ -214,10 +197,7 @@ mod tests {
         let flips: Vec<u64> = (0..4)
             .map(|_| {
                 let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
-                assert_eq!(
-                    wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
-                    S_OK
-                );
+                assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
                 LAST[2].load(Ordering::Relaxed)
             })
             .collect();

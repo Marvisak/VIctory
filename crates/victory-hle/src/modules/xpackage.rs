@@ -16,22 +16,14 @@ use super::xgameruntime::{
 };
 use crate::runtime;
 
-pub const PROVIDER: Guid = Guid::new(
-    0xaf40_6016,
-    0xe850,
-    0x4aa8,
-    [0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e],
-);
+pub const PROVIDER: Guid =
+    Guid::new(0xaf40_6016, 0xe850, 0x4aa8, [0xa8, 0x8d, 0x2f, 0x3d, 0xcb, 0x9d, 0xac, 0x7e]);
 
 /// As Grand Theft Auto VI (2026) asks for it. Its slots up to 0xd0 take the
 /// arguments the public API lists in the same order; 0x110 uninstalls a
 /// package, 0x128/0x130 mount one with UI, 0x138 enumerates packages.
-pub const IID_2026: Guid = Guid::new(
-    0x0b9d_556e,
-    0xab70,
-    0x43f4,
-    [0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40],
-);
+pub const IID_2026: Guid =
+    Guid::new(0x0b9d_556e, 0xab70, 0x43f4, [0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40]);
 
 pub static OBJECT: Object = Object::new("package", &VTABLE);
 pub const INTERFACES: &[Interface] = &[(PROVIDER, IID_2026, &OBJECT)];
@@ -178,11 +170,7 @@ extern "system" fn install_chunks_async(
     _suppress_confirmation: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let result = if is_ours(id) {
-        Ok(xasync::bytes(monitor()))
-    } else {
-        Err(NO_PACKAGE)
-    };
+    let result = if is_ours(id) { Ok(xasync::bytes(monitor())) } else { Err(NO_PACKAGE) };
     xasync::finished_with(block, (&raw const INSTALL).cast(), result)
 }
 extern "system" fn install_chunks_result(
@@ -233,20 +221,14 @@ extern "system" fn close_mount(_: This, _: *const c_void) {}
 
 /// Only other packages are uninstalled this way, and none is installed.
 extern "system" fn uninstall_package(_: This, id: *const c_char) -> bool {
-    tracing::info!(
-        id = text(id).unwrap_or_default(),
-        "package uninstall refused"
-    );
+    tracing::info!(id = text(id).unwrap_or_default(), "package uninstall refused");
     false
 }
 
 static MOUNT: u8 = 0;
 
 extern "system" fn mount_async(_: This, id: *const c_char, block: *mut AsyncBlock) -> HRESULT {
-    tracing::info!(
-        id = text(id).unwrap_or_default(),
-        "package mount: not installed"
-    );
+    tracing::info!(id = text(id).unwrap_or_default(), "package mount: not installed");
     xasync::finished(block, (&raw const MOUNT).cast(), NO_PACKAGE)
 }
 extern "system" fn mount_result(
@@ -327,9 +309,7 @@ mod tests {
         assert_eq!(method::<Id>(&OBJECT, 0x18)(this, 33, id.as_mut_ptr()), S_OK);
         let len = id.iter().position(|&b| b == 0).unwrap();
         assert_eq!(std::str::from_utf8(&id[..len]).unwrap(), identifier());
-        assert!(method::<extern "system" fn(This) -> bool>(&OBJECT, 0x20)(
-            this
-        ));
+        assert!(method::<extern "system" fn(This) -> bool>(&OBJECT, 0x20)(this));
 
         type Find =
             extern "system" fn(This, *const c_char, u32, *const c_void, *mut u32) -> HRESULT;
@@ -337,15 +317,9 @@ mod tests {
         let ours = format!("{}\0", identifier());
         let find = method::<Find>(&OBJECT, 0x60);
         let none = std::ptr::null();
-        assert_eq!(
-            find(this, ours.as_ptr().cast(), 0, none, &mut availability),
-            S_OK
-        );
+        assert_eq!(find(this, ours.as_ptr().cast(), 0, none, &mut availability), S_OK);
         assert_eq!(availability, 0, "ready");
-        assert_eq!(
-            find(this, c"dlc".as_ptr(), 0, none, &mut availability),
-            NO_PACKAGE
-        );
+        assert_eq!(find(this, c"dlc".as_ptr(), 0, none, &mut availability), NO_PACKAGE);
 
         type Progress_ = extern "system" fn(This, *const c_void, *mut Progress);
         let mut p = Progress {
@@ -365,10 +339,7 @@ mod tests {
             callback: None,
             internal: [0; 4],
         };
-        assert_eq!(
-            method::<Mount>(&OBJECT, 0x128)(this, c"dlc".as_ptr(), &mut block),
-            S_OK
-        );
+        assert_eq!(method::<Mount>(&OBJECT, 0x128)(this, c"dlc".as_ptr(), &mut block), S_OK);
         assert_eq!(xasync::XAsyncGetStatus(&mut block, true), NO_PACKAGE);
     }
 }

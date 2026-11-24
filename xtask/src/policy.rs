@@ -90,11 +90,8 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
 
 fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
     let git = |args: &[&str]| -> Result<Option<Vec<String>>> {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .context("running git")?;
+        let out =
+            Command::new("git").args(args).current_dir(root).output().context("running git")?;
         if !out.status.success() {
             return Ok(None);
         }
@@ -107,22 +104,12 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
         ))
     };
     if staged {
-        return git(&[
-            "diff",
-            "--cached",
-            "--name-only",
-            "--diff-filter=ACMR",
-            "-z",
-        ])?
-        .context("--staged needs a git repository");
+        return git(&["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"])?
+            .context("--staged needs a git repository");
     }
-    if let Some(mut tracked) = git(&[
-        "ls-files",
-        "-z",
-        "--cached",
-        "--others",
-        "--exclude-standard",
-    ])? {
+    if let Some(mut tracked) =
+        git(&["ls-files", "-z", "--cached", "--others", "--exclude-standard"])?
+    {
         tracked.sort();
         tracked.dedup();
         return Ok(tracked);
@@ -134,10 +121,7 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
         .filter_map(|e| {
-            e.path()
-                .strip_prefix(root)
-                .ok()
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
+            e.path().strip_prefix(root).ok().map(|p| p.to_string_lossy().replace('\\', "/"))
         })
         .collect())
 }
@@ -148,17 +132,12 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     let allowed = ALLOWED_NAMES.contains(&name)
-        || ext
-            .as_deref()
-            .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
+        || ext.as_deref().is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }
     if content.len() > MAX_FILE_SIZE {
-        problems.push(format!(
-            "{} bytes exceeds the {MAX_FILE_SIZE}-byte limit",
-            content.len()
-        ));
+        problems.push(format!("{} bytes exceeds the {MAX_FILE_SIZE}-byte limit", content.len()));
     }
     for (magic, what) in FORBIDDEN_MAGIC {
         if content.starts_with(magic) {
@@ -201,18 +180,9 @@ mod tests {
     #[test]
     fn rejects_game_like_files() {
         assert!(!check("assets/tex.dds", b"DDS \x7c\0\0\0").is_empty());
-        assert!(
-            !check("notes.txt", b"MZ\x90\0").is_empty(),
-            "magic wins over extension"
-        );
-        assert!(
-            !check("data.bin", b"hello").is_empty(),
-            "extension not allowed"
-        );
-        assert!(
-            !check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(),
-            "too big"
-        );
+        assert!(!check("notes.txt", b"MZ\x90\0").is_empty(), "magic wins over extension");
+        assert!(!check("data.bin", b"hello").is_empty(), "extension not allowed");
+        assert!(!check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(), "too big");
     }
 
     #[test]

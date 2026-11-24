@@ -138,9 +138,7 @@ pub(crate) fn dispatched() -> u64 {
 /// other views as 1 MiB (both cut at their buffer's end).
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { 1 << 20 } else { 1 << 16 });
+    let len = shadow.left(address).min(if srv { 1 << 20 } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
@@ -185,10 +183,7 @@ impl State {
             t => t,
         };
         // SAFETY: an open list.
-        unsafe {
-            list.list
-                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(host as i32))
-        };
+        unsafe { list.list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(host as i32)) };
     }
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
@@ -206,11 +201,7 @@ impl State {
     }
 
     fn roots(&mut self, compute: bool) -> &mut Vec<Root> {
-        if compute {
-            &mut self.compute
-        } else {
-            &mut self.graphics
-        }
+        if compute { &mut self.compute } else { &mut self.graphics }
     }
 
     pub(crate) fn set_table(&mut self, compute: bool, slot: u32, handle: u64) {
@@ -263,10 +254,7 @@ impl State {
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
-                once!(
-                    handle = format_args!("{h:#x}"),
-                    "render target without a recorded view"
-                );
+                once!(handle = format_args!("{h:#x}"), "render target without a recorded view");
                 continue;
             };
             let Some(texture) = crate::resource::host_resource(record.resource) else {
@@ -314,11 +302,7 @@ impl State {
                 c.get(dword as usize).copied().unwrap_or(0)
             }
             _ => {
-                once!(
-                    slot,
-                    ?root,
-                    "a shader reads a root argument the title did not set"
-                );
+                once!(slot, ?root, "a shader reads a root argument the title did not set");
                 0
             }
         }
@@ -474,9 +458,7 @@ impl State {
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
-                    let fresh = made
-                        .iter()
-                        .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                    let fresh = made.iter().find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
@@ -611,11 +593,7 @@ impl State {
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
-        if compute {
-            &self.compute
-        } else {
-            &self.graphics
-        }
+        if compute { &self.compute } else { &self.graphics }
     }
 
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
@@ -686,22 +664,15 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            let entries: Vec<&UsedResource> =
+                used.iter().filter(tables).filter(|u| u.slot == slot).collect();
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
-                .max()
-                .unwrap_or(1);
+            let n = entries.iter().map(|u| u.table_offset_dwords / 8 + 1).max().unwrap_or(1);
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -733,8 +704,7 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            self.dynamic.push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -848,18 +818,11 @@ impl State {
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
-            let (count, from) = if rects {
-                (vertices / 3 * 6, 0)
-            } else {
-                (vertices, first)
-            };
+            let (count, from) = if rects { (vertices / 3 * 6, 0) } else { (vertices, first) };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawInstanced(count, instances, from, first_instance)
-            };
+            unsafe { list.list.DrawInstanced(count, instances, from, first_instance) };
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -944,8 +907,7 @@ impl State {
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
             unsafe {
-                list.list
-                    .DrawIndexedInstanced(indices, instances, first, base, first_instance)
+                list.list.DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -1038,7 +1000,10 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
+            )
         });
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.

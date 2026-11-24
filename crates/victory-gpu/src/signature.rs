@@ -11,12 +11,7 @@ use crate::object::{
 use crate::resource::PAGEABLE_IIDS;
 
 const SIGNATURE_IIDS: [Iid; 4] = [
-    guid(
-        0xc36a797c,
-        0xec80,
-        0x4f0a,
-        [0x89, 0x85, 0xa7, 0xb2, 0x47, 0x50, 0x82, 0xd1],
-    ),
+    guid(0xc36a797c, 0xec80, 0x4f0a, [0x89, 0x85, 0xa7, 0xb2, 0x47, 0x50, 0x82, 0xd1]),
     PAGEABLE_IIDS[0],
     PAGEABLE_IIDS[1],
     PAGEABLE_IIDS[2],
@@ -60,11 +55,8 @@ pub(crate) extern "system" fn create(
         unsafe { std::slice::from_raw_parts(desc.arguments, desc.count as usize) }.to_vec()
     };
     tracing::debug!(stride = desc.stride, ?arguments, "command signature");
-    let signature = Box::new(Signature {
-        object: Object::new(&FUNCTIONS),
-        stride: desc.stride,
-        arguments,
-    });
+    let signature =
+        Box::new(Signature { object: Object::new(&FUNCTIONS), stride: desc.stride, arguments });
     object::hand_out(COMMAND_SIGNATURE, signature, iid, &SIGNATURE_IIDS, out)
 }
 

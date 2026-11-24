@@ -21,11 +21,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(
-    name = "victory",
-    version,
-    about = "Run an Xbox Series title natively on Windows"
-)]
+#[command(name = "victory", version, about = "Run an Xbox Series title natively on Windows")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -136,37 +132,18 @@ fn main() -> Result<()> {
     }
     let cli = Cli::parse();
     match cli.command {
-        Command::Inspect {
-            file,
-            imports,
-            exports,
-        } => inspect::run(&file, imports, exports),
-        Command::Census {
-            paths,
-            strict,
-            missing,
-        } => census::run(paths, strict, missing),
+        Command::Inspect { file, imports, exports } => inspect::run(&file, imports, exports),
+        Command::Census { paths, strict, missing } => census::run(paths, strict, missing),
         Command::LibExports { lib, list } => inspect::lib_exports(&lib, list),
-        Command::ShaderInfo {
-            paths,
-            verbose,
-            disasm,
-        } => shader::run(paths, verbose || disasm, disasm),
-        Command::Translate {
-            paths,
-            validate,
-            pipelines,
-            list,
-            jobs,
-        } => translate::run(paths, validate, pipelines, list, jobs),
-        Command::Run {
-            exe,
-            unimplemented,
-            strict,
-            execute,
-            console,
-            title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        Command::ShaderInfo { paths, verbose, disasm } => {
+            shader::run(paths, verbose || disasm, disasm)
+        }
+        Command::Translate { paths, validate, pipelines, list, jobs } => {
+            translate::run(paths, validate, pipelines, list, jobs)
+        }
+        Command::Run { exe, unimplemented, strict, execute, console, title_args: _ } => {
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
         Command::Config => show_config(),
     }
 }
@@ -180,9 +157,7 @@ fn show_config() -> Result<()> {
     };
     println!(
         "config file : {}",
-        cfg.source
-            .as_ref()
-            .map_or("(none)".into(), |p| p.display().to_string())
+        cfg.source.as_ref().map_or("(none)".into(), |p| p.display().to_string())
     );
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
@@ -190,12 +165,7 @@ fn show_config() -> Result<()> {
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
-    for p in cfg
-        .game_dir
-        .iter()
-        .chain(&cfg.test_titles)
-        .chain([&cfg.cache_dir, &cfg.data_dir])
-    {
+    for p in cfg.game_dir.iter().chain(&cfg.test_titles).chain([&cfg.cache_dir, &cfg.data_dir]) {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");
         }

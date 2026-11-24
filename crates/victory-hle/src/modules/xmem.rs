@@ -99,11 +99,7 @@ pub extern "system" fn XMemVirtualAlloc(
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
-        Alignment: if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
-            2 * MIB
-        } else {
-            0
-        },
+        Alignment: if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M { 2 * MIB } else { 0 },
     };
     let mut protect = match protect & HOST_PROTECTION {
         0 => PAGE_NOACCESS,
@@ -149,11 +145,7 @@ pub extern "system" fn XMemVirtualAlloc(
             size,
             kind,
             protect,
-            if constrained {
-                &mut parameter
-            } else {
-                std::ptr::null_mut()
-            },
+            if constrained { &mut parameter } else { std::ptr::null_mut() },
             constrained.into(),
         )
     };
@@ -196,11 +188,7 @@ pub extern "system" fn XMemVirtualQuery(
             return 0;
         }
         let info = &mut *out;
-        info.flags = if info.host.State == MEM_COMMIT {
-            GRAPHICS
-        } else {
-            0
-        };
+        info.flags = if info.host.State == MEM_COMMIT { GRAPHICS } else { 0 };
         info.tag_code = 0;
         info.tag = [0; 4];
     }
@@ -306,9 +294,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     // `size` bytes.
     unsafe {
         let user = block.add(layout.align());
-        user.sub(HEADER)
-            .cast::<[usize; 2]>()
-            .write([layout.size(), layout.align()]);
+        user.sub(HEADER).cast::<[usize; 2]>().write([layout.size(), layout.align()]);
         user.cast()
     }
 }
@@ -327,10 +313,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
-        dealloc(
-            user.sub(align),
-            Layout::from_size_align_unchecked(size, align),
-        );
+        dealloc(user.sub(align), Layout::from_size_align_unchecked(size, align));
     }
 }
 
@@ -427,20 +410,13 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         unsafe { count.write(0) };
         return 0;
     }
-    tracing::debug!(
-        n,
-        flags = format_args!("{flags:#x}"),
-        "XMemAllocatePhysicalPages"
-    );
+    tracing::debug!(n, flags = format_args!("{flags:#x}"), "XMemAllocatePhysicalPages");
     let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
     for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
+        let slice = Slice { section: section.clone(), index };
         let number = first + index * FRAMES;
         physical.pages.insert(number, slice);
         // SAFETY: the title passes room for `n` page numbers.
@@ -584,11 +560,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
-    Some(PageWindow {
-        view: View::map(slice, *n)?,
-        within: offset % PAGE,
-        len,
-    })
+    Some(PageWindow { view: View::map(slice, *n)?, within: offset % PAGE, len })
 }
 
 /// Maps `n` pages at `address`, in place of what is mapped there; null
@@ -645,11 +617,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         let (address, page) = unsafe {
             (
                 *addresses.add(i),
-                if pages.is_null() || *pages.add(i) == 0 {
-                    std::ptr::null()
-                } else {
-                    pages.add(i)
-                },
+                if pages.is_null() || *pages.add(i) == 0 { std::ptr::null() } else { pages.add(i) },
             )
         };
         if XMemMapPhysicalPages(address, 1, page).is_null() {
@@ -699,11 +667,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
     let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
+        VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
         MapViewOfFile3(
             slice.section.0,
             GetCurrentProcess(),
@@ -773,10 +737,7 @@ fn commit_limit_message(
 
         let committed = info.CommitTotal * info.PageSize / MIB;
         let limit = info.CommitLimit * info.PageSize / MIB;
-        let _ = writeln!(
-            message,
-            "System commit: {committed} MiB of {limit} MiB in use."
-        );
+        let _ = writeln!(message, "System commit: {committed} MiB of {limit} MiB in use.");
     }
     message.push_str(
         "Close other applications or increase the Windows paging file size, then retry.\n",
@@ -802,10 +763,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .next_back()
         .filter(|(at, (size, _))| *at + size > base)
         .map(|(at, _)| *at);
-    let hit: Vec<usize> = first
-        .into_iter()
-        .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
-        .collect();
+    let hit: Vec<usize> =
+        first.into_iter().chain(physical.views.range(base + 1..end).map(|(at, _)| *at)).collect();
     for at in hit {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
@@ -815,9 +774,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: at as *mut c_void,
-                },
+                MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void },
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
@@ -985,13 +942,8 @@ mod tests {
         assert_eq!(query(p).flags, 0);
         // No address field: above the 32-bit range and below 2^40, where
         // the console keeps it.
-        let p = XMemVirtualAlloc(
-            std::ptr::null_mut(),
-            16 << 30,
-            MEM_RESERVE,
-            GRAPHICS,
-            PAGE_NOACCESS,
-        );
+        let p =
+            XMemVirtualAlloc(std::ptr::null_mut(), 16 << 30, MEM_RESERVE, GRAPHICS, PAGE_NOACCESS);
         assert!(!p.is_null() && (p as usize) >= 1 << 32, "{p:p}");
         assert!((p as usize) + (16 << 30) <= 1 << 40, "{p:p}");
         // SAFETY: our own reservation.
@@ -1065,10 +1017,7 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
 
         // The same page at a second address shows the same bytes.
-        assert_eq!(
-            XMemMapPhysicalPages(at(b, 1), 1, pages[2..].as_ptr()),
-            at(b, 1)
-        );
+        assert_eq!(XMemMapPhysicalPages(at(b, 1), 1, pages[2..].as_ptr()), at(b, 1));
         // SAFETY: both pages are mapped read-write.
         unsafe {
             at(a, 2).cast::<u8>().write(7);
@@ -1081,10 +1030,7 @@ mod tests {
         assert_eq!(unsafe { at(b, 1).cast::<u8>().add(1).read() }, 9);
 
         // Unmapping the middle page keeps its neighbours.
-        assert_eq!(
-            XMemMapPhysicalPages(at(a, 1), 1, std::ptr::null()),
-            at(a, 1)
-        );
+        assert_eq!(XMemMapPhysicalPages(at(a, 1), 1, std::ptr::null()), at(a, 1));
         assert_eq!(query(at(a, 1)).host.State, MEM_RESERVE);
         assert_eq!(query(a).host.State, MEM_COMMIT);
         assert_eq!(query(at(a, 2)).host.State, MEM_COMMIT);
@@ -1093,17 +1039,11 @@ mod tests {
 
         // A scattered page lands in the hole.
         let addresses = [at(a, 1)];
-        assert_eq!(
-            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 1, pages.as_ptr()),
-            1
-        );
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 1, pages.as_ptr()), 1);
         // SAFETY: page 0 is now mapped at both `a` and `a + PAGE`.
         assert_eq!(unsafe { at(a, 1).cast::<u8>().read() }, 1);
         // Page number 0 unmaps.
-        assert_eq!(
-            XMemMapPhysicalPagesScatter(addresses.as_ptr(), 1, [0usize].as_ptr()),
-            1
-        );
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 1, [0usize].as_ptr()), 1);
         assert_eq!(query(at(a, 1)).host.State, MEM_RESERVE);
         // The GPU's page-mapping copy: what `a + 2 pages` shows, at `b`.
         assert!(map_alias(b as u64, at(a, 2) as u64, PAGE as u64));
@@ -1160,10 +1100,7 @@ mod tests {
     /// `n` pages of one new allocation.
     fn allocate(n: usize) -> Vec<usize> {
         let (mut pages, mut given) = (vec![0; n], n);
-        assert_eq!(
-            XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),
-            1
-        );
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()), 1);
         assert_eq!(given, n);
         pages
     }
@@ -1186,10 +1123,7 @@ mod tests {
         assert_eq!(lengths(&a, PAGE - 1, 2), Some(vec![2]));
         assert_eq!(lengths(&a, 0, 0), Some(vec![]));
         // Out of order, or across allocations: one run each.
-        assert_eq!(
-            lengths(&[a[0], a[2], a[1]], 0, 3 * PAGE),
-            Some(vec![1, 1, 1])
-        );
+        assert_eq!(lengths(&[a[0], a[2], a[1]], 0, 3 * PAGE), Some(vec![1, 1, 1]));
         assert_eq!(lengths(&[a[1], a[2], b[0]], 0, 3 * PAGE), Some(vec![2, 1]));
         // A slice that follows on in another section starts a run.
         assert_eq!(lengths(&[b[0], a[1]], 0, 2 * PAGE), Some(vec![1, 1]));
@@ -1214,10 +1148,7 @@ mod tests {
         assert!(seen[..offset].iter().all(|&b| b == 0), "before the offset");
         assert_eq!(seen[offset..offset + 2 * PAGE], data[..2 * PAGE]);
         assert!(seen[offset + 2 * PAGE..].iter().all(|&b| b == 0), "after");
-        assert!(
-            !write_physical(&[a[0], 0x10], 0, &data[..PAGE + 1]),
-            "unknown page"
-        );
+        assert!(!write_physical(&[a[0], 0x10], 0, &data[..PAGE + 1]), "unknown page");
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }

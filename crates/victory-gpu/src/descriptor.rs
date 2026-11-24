@@ -17,12 +17,7 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 pub(crate) mod host;
 
 const HEAP_IIDS: [Iid; 4] = [
-    guid(
-        0x8efb471d,
-        0x616c,
-        0x4f49,
-        [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
-    ),
+    guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]),
     PAGEABLE_IIDS[0],
     PAGEABLE_IIDS[1],
     PAGEABLE_IIDS[2],
@@ -124,9 +119,7 @@ static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let &(_, _, at) = heaps
-        .iter()
-        .find(|&&(start, end, _)| (start..end).contains(&handle))?;
+    let &(_, _, at) = heaps.iter().find(|&&(start, end, _)| (start..end).contains(&handle))?;
     // SAFETY: registered heaps are live (removed when dropped).
     let heap = unsafe { &*(at as *const Heap) };
     Some((heap, heap.index(handle)?))
@@ -225,14 +218,7 @@ impl RtvRecord {
         let mut words = if self.described != 0 {
             self.desc
         } else {
-            [
-                crate::resource::view_format(self.resource)?,
-                dimension,
-                0,
-                0,
-                0,
-                0,
-            ]
+            [crate::resource::view_format(self.resource)?, dimension, 0, 0, 0, 0]
         };
         words[0] = crate::resource::pc_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
@@ -540,12 +526,7 @@ pub(crate) extern "system" fn copy(
         (0..n as usize)
             .map(|i| {
                 // SAFETY: the title passes `n` starts and sizes (or null sizes).
-                unsafe {
-                    (
-                        *starts.add(i),
-                        if sizes.is_null() { 1 } else { *sizes.add(i) },
-                    )
-                }
+                unsafe { (*starts.add(i), if sizes.is_null() { 1 } else { *sizes.add(i) }) }
             })
             .collect()
     };
@@ -690,16 +671,8 @@ mod tests {
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
-        let desc = HeapDesc {
-            kind: 0,
-            count: 1000,
-            flags: 1,
-            nodes: 0,
-        };
-        let none = Placement {
-            address: 0,
-            size: 0,
-        };
+        let desc = HeapDesc { kind: 0, count: 1000, flags: 1, nodes: 0 };
+        let none = Placement { address: 0, size: 0 };
         let mut h = null;
         assert_eq!(create(desc, none, &mut h), S_OK);
         let cpu = slot::<extern "system" fn(This) -> u64>(h, 0x48)(h);
@@ -726,21 +699,10 @@ mod tests {
         // The same view twice is one entry.
         create_srv(null, null, std::ptr::null(), s2);
         // SAFETY: both slots are in `heap`.
-        assert_eq!(unsafe { *(s1 as *const [u32; 3]) }, unsafe {
-            *(s2 as *const [u32; 3])
-        });
+        assert_eq!(unsafe { *(s1 as *const [u32; 3]) }, unsafe { *(s2 as *const [u32; 3]) });
         // Two ranges of one into one range of two.
         let (dst, dst_n, src, src_n) = ([s2], [2u32], [s0, s1], [1u32, 1]);
-        copy(
-            null,
-            1,
-            dst.as_ptr(),
-            dst_n.as_ptr(),
-            2,
-            src.as_ptr(),
-            src_n.as_ptr(),
-            0,
-        );
+        copy(null, 1, dst.as_ptr(), dst_n.as_ptr(), 2, src.as_ptr(), src_n.as_ptr(), 0);
         assert_eq!(view(s2), view(s0));
         assert_eq!(view(s3), view(s1));
         assert_eq!(view(at(0) + 8), None);
@@ -772,24 +734,9 @@ mod tests {
     fn placed_heaps_start_at_the_title_memory() {
         let mut memory = vec![0u8; 64 * 32];
         let address = memory.as_mut_ptr() as u64;
-        let desc = HeapDesc {
-            kind: 0,
-            count: 64,
-            flags: 1,
-            nodes: 1,
-        };
+        let desc = HeapDesc { kind: 0, count: 64, flags: 1, nodes: 1 };
         let mut h = std::ptr::null();
-        assert_eq!(
-            create(
-                desc,
-                Placement {
-                    address,
-                    size: 64 * 32
-                },
-                &mut h
-            ),
-            S_OK
-        );
+        assert_eq!(create(desc, Placement { address, size: 64 * 32 }, &mut h), S_OK);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), address);
         // A size that does not match the count is not a placement.

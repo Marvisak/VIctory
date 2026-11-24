@@ -27,10 +27,7 @@ pub fn dump_stacks_on_schedule() {
     let Ok(list) = std::env::var("VICTORY_STACKS") else {
         return;
     };
-    let mut times: Vec<f64> = list
-        .split(',')
-        .filter_map(|t| t.trim().parse().ok())
-        .collect();
+    let mut times: Vec<f64> = list.split(',').filter_map(|t| t.trim().parse().ok()).collect();
     times.sort_by(f64::total_cmp);
     let start = std::time::Instant::now();
     std::thread::spawn(move || {
@@ -60,10 +57,7 @@ struct Aligned(CONTEXT);
 /// Prints every other thread's stack to stderr. Each thread is suspended
 /// only while its context is read and unwound into a buffer allocated
 /// beforehand (it may hold the heap lock).
-#[allow(
-    clippy::print_stderr,
-    reason = "documented to print to stderr, as a debugger aid"
-)]
+#[allow(clippy::print_stderr, reason = "documented to print to stderr, as a debugger aid")]
 pub fn dump_stacks() {
     // SAFETY: plain queries and a snapshot of this process's threads.
     let (me, process, snapshot) = unsafe {
@@ -95,11 +89,7 @@ pub fn dump_stacks() {
     for id in ids {
         // SAFETY: opens a thread of our own process.
         let thread = unsafe {
-            OpenThread(
-                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
-                0,
-                id,
-            )
+            OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, id)
         };
         if thread.is_null() {
             continue;
@@ -212,11 +202,7 @@ mod tests {
         let id = rx.recv().unwrap();
         // SAFETY: a thread of this process.
         let thread = unsafe {
-            OpenThread(
-                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
-                0,
-                id,
-            )
+            OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, id)
         };
         assert!(!thread.is_null());
         let (frames, _) = frames_of(thread);

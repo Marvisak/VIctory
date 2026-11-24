@@ -37,11 +37,8 @@ struct Journal {
     found: Vec<usize>,
 }
 
-static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
-    asked: 0,
-    written: BTreeMap::new(),
-    found: Vec::new(),
-});
+static JOURNAL: Mutex<Journal> =
+    Mutex::new(Journal { asked: 0, written: BTreeMap::new(), found: Vec::new() });
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
@@ -91,13 +88,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
 /// Guarded blocks of view memory.
@@ -110,10 +101,8 @@ struct Guards {
     clean: BTreeSet<usize>,
 }
 
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
-    protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
-});
+static GUARDS: Mutex<Guards> =
+    Mutex::new(Guards { protected: BTreeSet::new(), clean: BTreeSet::new() });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -163,12 +152,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
         unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            ) != 0
+            VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READONLY, &mut old)
+                != 0
         }
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
@@ -190,11 +175,8 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let blocks: Vec<usize> =
+        g.protected.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
@@ -218,11 +200,8 @@ pub fn writing(at: usize, len: usize) {
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
-    let blocks: Vec<usize> = g
-        .protected
-        .range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let blocks: Vec<usize> =
+        g.protected.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
@@ -257,11 +236,7 @@ fn install() {
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
-        }
+        if writable(at) { EXCEPTION_CONTINUE_EXECUTION } else { EXCEPTION_CONTINUE_SEARCH }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.
@@ -315,12 +290,7 @@ mod tests {
         assert_eq!(again, [(p / PAGE + 1, now)]);
         let mut plain = vec![0u8; PAGE];
         assert!(
-            writes(
-                plain.as_mut_ptr() as usize,
-                plain.as_ptr() as usize + PAGE,
-                true
-            )
-            .is_none()
+            writes(plain.as_mut_ptr() as usize, plain.as_ptr() as usize + PAGE, true).is_none()
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
@@ -362,10 +332,15 @@ mod tests {
         writing(view + 100, 13);
         assert!(read(&mut file));
         // SAFETY: the bytes just read.
-        assert_eq!(unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) }, b"from the disk");
+        let read_back = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
+        assert_eq!(read_back, b"from the disk");
         assert_eq!(guard(view, view + 2 * BLOCK), Some((view / PAGE..view / PAGE + 1).collect()));
         // SAFETY: our view.
-        unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        unsafe {
+            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            })
+        };
         title_memory_remapped(view, 2 * BLOCK);
     }
 

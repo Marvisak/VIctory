@@ -18,12 +18,7 @@ use crate::object::{
 use crate::resource::PAGEABLE_IIDS;
 
 const ROOT_SIGNATURE_IIDS: [Iid; 3] = [
-    guid(
-        0xc54a6b66,
-        0x72df,
-        0x4ee8,
-        [0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14],
-    ),
+    guid(0xc54a6b66, 0x72df, 0x4ee8, [0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14]),
     PAGEABLE_IIDS[1],
     PAGEABLE_IIDS[2],
 ];
@@ -64,11 +59,7 @@ fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
             let dll: Vec<u16> = "d3d12.dll".encode_utf16().chain([0]).collect();
             // SAFETY: a NUL-terminated name; System32 only.
             let module = unsafe {
-                LoadLibraryExW(
-                    dll.as_ptr(),
-                    std::ptr::null_mut(),
-                    LOAD_LIBRARY_SEARCH_SYSTEM32,
-                )
+                LoadLibraryExW(dll.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32)
             };
             if module.is_null() {
                 return None;
@@ -88,10 +79,7 @@ fn without_console_flags(desc: Desc) -> Desc {
             "console root signature flags dropped"
         );
     }
-    Desc {
-        flags: desc.flags & !CONSOLE_FLAGS,
-        ..desc
-    }
+    Desc { flags: desc.flags & !CONSOLE_FLAGS, ..desc }
 }
 
 /// `d3d12_xs!D3D12SerializeRootSignature`.
@@ -136,10 +124,7 @@ pub extern "system" fn serialize_versioned(
         tracing::warn!("no host d3d12.dll to serialize root signatures");
         return E_NOTIMPL;
     };
-    let desc = VersionedDesc {
-        desc: without_console_flags(desc.desc),
-        ..desc
-    };
+    let desc = VersionedDesc { desc: without_console_flags(desc.desc), ..desc };
     // SAFETY: the export has this signature; it takes what the title passed.
     unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
 }
@@ -191,10 +176,7 @@ pub(crate) extern "system" fn create(
     // SAFETY: the title passes `size` bytes.
     let blob = unsafe { std::slice::from_raw_parts(blob, size) }.to_vec();
     tracing::debug!(size, "root signature");
-    let root = Box::new(RootSignature {
-        object: Object::new(&FUNCTIONS),
-        blob,
-    });
+    let root = Box::new(RootSignature { object: Object::new(&FUNCTIONS), blob });
     object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
 }
 
@@ -254,10 +236,7 @@ mod tests {
         assert!(size > 0);
         let null = std::ptr::null();
         let mut root = null;
-        assert_eq!(
-            create(null, 0, data, size, &ROOT_SIGNATURE_IIDS[0], &mut root),
-            S_OK
-        );
+        assert_eq!(create(null, 0, data, size, &ROOT_SIGNATURE_IIDS[0], &mut root), S_OK);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(root, 0x10)(root), 0);
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
     }

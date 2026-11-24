@@ -16,10 +16,7 @@
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
 /// triangles turn the same way. `elements` are (byte offset, format).
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
-    for (rect, out) in src
-        .chunks_exact(3 * stride)
-        .zip(dst.chunks_exact_mut(6 * stride))
-    {
+    for (rect, out) in src.chunks_exact(3 * stride).zip(dst.chunks_exact_mut(6 * stride)) {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
         for (slot, i) in [0, 1, 2, 0, 2].into_iter().enumerate() {
             out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i));
@@ -163,12 +160,8 @@ mod tests {
             v.extend([r, 0, 0, 255]);
             v
         };
-        let src: Vec<u8> = [
-            vertex(-1.0, 1.0, 0),
-            vertex(-1.0, -1.0, 100),
-            vertex(1.0, -1.0, 150),
-        ]
-        .concat();
+        let src: Vec<u8> =
+            [vertex(-1.0, 1.0, 0), vertex(-1.0, -1.0, 100), vertex(1.0, -1.0, 150)].concat();
         let mut dst = vec![0u8; 6 * 12];
         expand_rects(&src, &mut dst, 12, &[(0, 16), (8, 28)]);
         assert_eq!(dst[..36], src[..]);
@@ -189,10 +182,8 @@ mod tests {
         assert_eq!(f32_to_half(65520.0), 0x7c00, "past the largest half");
         // An R16_FLOAT element at 1.0, 2^-12 and 1.0: the fourth corner is
         // 2 - 2^-12, which rounds to 2.0.
-        let src: Vec<u8> = [0x3c00_u16, 0x0c00, 0x3c00]
-            .iter()
-            .flat_map(|h| h.to_le_bytes())
-            .collect();
+        let src: Vec<u8> =
+            [0x3c00_u16, 0x0c00, 0x3c00].iter().flat_map(|h| h.to_le_bytes()).collect();
         let mut dst = vec![0u8; 6 * 2];
         expand_rects(&src, &mut dst, 2, &[(0, 54)]);
         assert_eq!(dst[10..], 0x4000_u16.to_le_bytes());

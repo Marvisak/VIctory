@@ -238,12 +238,7 @@ fn pattern(kind: usize, element_log2: u32, block_log2: u32) -> [Vec<u32>; 3] {
 /// Byte offsets inside a block for coordinates 0..2^bits of one axis.
 fn spread(bits: &[u32]) -> Vec<u32> {
     (0..1u32 << bits.len())
-        .map(|c| {
-            bits.iter()
-                .enumerate()
-                .map(|(i, &to)| ((c >> i) & 1) << to)
-                .sum()
-        })
+        .map(|c| bits.iter().enumerate().map(|(i, &to)| ((c >> i) & 1) << to).sum())
         .collect()
 }
 
@@ -281,11 +276,7 @@ impl Layout {
         if !valid {
             return Err(Error::Invalid);
         }
-        if block_log2 == 0 {
-            Ok(Layout::linear(d))
-        } else {
-            Ok(Layout::tiled(d, block_log2))
-        }
+        if block_log2 == 0 { Ok(Layout::linear(d)) } else { Ok(Layout::tiled(d, block_log2)) }
     }
 
     /// `HwlComputeSurfaceInfoLinear`: rows aligned to 256 bytes, mips packed
@@ -330,7 +321,8 @@ impl Layout {
         let element_log2 = d.element_bytes.trailing_zeros();
         let bpe = u64::from(d.element_bytes);
         let block_bytes = 1u64 << block_log2;
-        let thick = d.dimension == Dimension::Tex3d && (d.swizzle.standard() || d.swizzle.display());
+        let thick =
+            d.dimension == Dimension::Tex3d && (d.swizzle.standard() || d.swizzle.display());
         let block = if thick {
             // ComputeThickBlockDimension
             let amp = (block_log2 - 10) / 3;
@@ -367,10 +359,8 @@ impl Layout {
                 offset: 0,
                 tail: None,
             });
-            slice_size = u64::from(mips[0].pitch)
-                * u64::from(mips[0].rows)
-                * bpe
-                * u64::from(d.samples);
+            slice_size =
+                u64::from(mips[0].pitch) * u64::from(mips[0].rows) * bpe * u64::from(d.samples);
         } else {
             // GetMipTailDim: the largest mip the tail takes.
             let mut tail_max = block;
@@ -385,11 +375,7 @@ impl Layout {
             }
             // GetMaxNumMipsInTail; 256-byte blocks have no tail
             // (`ComputeSurfaceInfoMicroTiled`).
-            let effective = if thick {
-                block_log2 - (block_log2 - 8) / 3
-            } else {
-                block_log2
-            };
+            let effective = if thick { block_log2 - (block_log2 - 8) / 3 } else { block_log2 };
             let max_in_tail = match effective {
                 8 => 0,
                 9..=11 => 1 + (1 << (effective - 9)),
@@ -428,11 +414,7 @@ impl Layout {
                 });
             }
             // Standard mips from the smallest up, after the tail block.
-            let mut offset = if first_tail_mip < d.mips {
-                block_bytes
-            } else {
-                0
-            };
+            let mut offset = if first_tail_mip < d.mips { block_bytes } else { 0 };
             for i in (0..first_tail_mip as usize).rev() {
                 mips[i].offset = offset;
                 offset += sizes[i];
@@ -469,11 +451,7 @@ impl Layout {
                         1
                     },
                     offset: 0,
-                    tail: Some(Tail {
-                        offset,
-                        x: x * micro[0],
-                        y: y * micro[1],
-                    }),
+                    tail: Some(Tail { offset, x: x * micro[0], y: y * micro[1] }),
                 });
                 pitch = (pitch >> 1).max(micro[0]);
                 rows = (rows >> 1).max(micro[1]);
@@ -485,11 +463,7 @@ impl Layout {
         let slices = slices / block[2];
         let addressable = !d.swizzle.xor() && d.samples == 1;
         let pattern = if addressable {
-            let kind = if thick {
-                2
-            } else {
-                usize::from(d.swizzle.display())
-            };
+            let kind = if thick { 2 } else { usize::from(d.swizzle.display()) };
             pattern(kind, element_log2, block_log2).map(|bits| spread(&bits))
         } else {
             Default::default()
@@ -522,29 +496,17 @@ impl Layout {
     /// The slice and the depth inside it for `z` (an array slice or a 3D
     /// depth slice).
     fn split(&self, z: u32) -> (u32, u32) {
-        if self.thick {
-            (z / self.block[2], z % self.block[2])
-        } else {
-            (z, 0)
-        }
+        if self.thick { (z / self.block[2], z % self.block[2]) } else { (z, 0) }
     }
 
     /// Byte offset of element (`x`, `y`) of mip `mip` in array slice or
     /// depth slice `z`. Coordinates must lie inside the mip.
     pub fn offset(&self, mip: u32, x: u32, y: u32, z: u32) -> Result<u64, Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
-        let depth = if self.desc.dimension == Dimension::Tex3d {
-            m.depth
-        } else {
-            self.slices
-        };
+        let depth = if self.desc.dimension == Dimension::Tex3d { m.depth } else { self.slices };
         let inside = x < m.width && y < m.height && z < depth;
         if !inside || !self.addressable() {
-            return Err(if inside {
-                Error::Unsupported
-            } else {
-                Error::Invalid
-            });
+            return Err(if inside { Error::Unsupported } else { Error::Invalid });
         }
         let (slice, z) = self.split(z);
         let base = u64::from(slice) * self.slice_size + m.offset;
@@ -564,7 +526,8 @@ impl Layout {
         // offset inside the tail block.
         let y = y + m.tail.map_or(0, |t| t.y);
         let blocks = u64::from(y / bh) * u64::from(m.pitch / bw);
-        (blocks << log2) + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
+        (blocks << log2)
+            + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
     }
 
     /// The part of an address that depends on the column.
@@ -722,11 +685,7 @@ pub fn format(dxgi: u32) -> Option<Format> {
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
         _ => return None,
     };
-    Some(Format {
-        bytes,
-        block,
-        stencil,
-    })
+    Some(Format { bytes, block, stencil })
 }
 
 /// A texture as the console allocates it: a D3D12-style description with
@@ -773,11 +732,7 @@ pub struct Texture {
 impl Texture {
     pub fn new(desc: &TextureDesc) -> Result<Texture, Error> {
         let f = format(desc.format).ok_or(Error::Invalid)?;
-        let depth3d = if desc.dimension == Dimension::Tex3d {
-            desc.depth_or_array
-        } else {
-            1
-        };
+        let depth3d = if desc.dimension == Dimension::Tex3d { desc.depth_or_array } else { 1 };
         let mips = match desc.mips {
             0 => 32 - desc.width.max(desc.height).max(depth3d).max(1).leading_zeros(),
             n => n,
@@ -793,28 +748,17 @@ impl Texture {
             samples: desc.samples.max(1),
             swizzle: desc.swizzle,
         };
-        let mut planes = vec![Plane {
-            offset: 0,
-            stencil: false,
-            layout: Layout::new(&plane(f.bytes))?,
-        }];
+        let mut planes =
+            vec![Plane { offset: 0, stencil: false, layout: Layout::new(&plane(f.bytes))? }];
         if f.stencil {
             let layout = Layout::new(&plane(1))?;
             let offset = planes[0].layout.size.next_multiple_of(layout.alignment);
-            planes.push(Plane {
-                offset,
-                stencil: true,
-                layout,
-            });
+            planes.push(Plane { offset, stencil: true, layout });
         }
         let last = &planes[planes.len() - 1];
         let size = last.offset + last.layout.size;
         let alignment = planes.iter().map(|p| p.layout.alignment).max().unwrap_or(1);
-        Ok(Texture {
-            planes,
-            size,
-            alignment,
-        })
+        Ok(Texture { planes, size, alignment })
     }
 }
 
@@ -843,11 +787,7 @@ mod tests {
         for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_D_X] {
             let largest = Layout::new(&desc(MAX_EXTENT, MAX_EXTENT, 15, 16, swizzle)).unwrap();
             assert!(largest.size >= u64::from(MAX_EXTENT) * u64::from(MAX_EXTENT) * 16);
-            for (w, h) in [
-                (MAX_EXTENT + 1, 1),
-                (1, MAX_EXTENT + 1),
-                (u32::MAX, u32::MAX),
-            ] {
+            for (w, h) in [(MAX_EXTENT + 1, 1), (1, MAX_EXTENT + 1), (u32::MAX, u32::MAX)] {
                 let result = Layout::new(&desc(w, h, 1, 16, swizzle));
                 assert_eq!(result, Err(Error::Invalid), "{w}x{h}");
             }
@@ -892,14 +832,8 @@ mod tests {
             desc(40, 9, 3, 2, Swizzle::SW_64KB_S),
             desc(30, 20, 5, 4, Swizzle::LINEAR),
             desc(83, 31, 6, 1, Swizzle::SW_256B_S),
-            Desc {
-                block: 4,
-                ..desc(109, 71, 6, 16, Swizzle::SW_256B_D)
-            },
-            Desc {
-                depth: 3,
-                ..desc(70, 70, 4, 16, Swizzle::SW_4KB_S)
-            },
+            Desc { block: 4, ..desc(109, 71, 6, 16, Swizzle::SW_256B_D) },
+            Desc { depth: 3, ..desc(70, 70, 4, 16, Swizzle::SW_4KB_S) },
             Desc {
                 dimension: Dimension::Tex3d,
                 depth: 16,
@@ -975,14 +909,7 @@ mod tests {
         assert_eq!(l.first_tail_mip, 1);
         assert_eq!(l.size, 2 * 65536);
         assert_eq!(l.mips[0].offset, 65536);
-        assert_eq!(
-            l.mips[1].tail,
-            Some(Tail {
-                offset: 32768,
-                x: 32,
-                y: 0
-            })
-        );
+        assert_eq!(l.mips[1].tail, Some(Tail { offset: 32768, x: 32, y: 0 }));
         assert_eq!(l.offset(1, 0, 0, 0), Ok(32768));
         // 4 KiB blocks hold fewer tail mips: 16x16 BC7 mips stay outside.
         let l = Layout::new(&desc(64, 64, 9, 16, Swizzle::SW_4KB_S)).unwrap();
@@ -1018,14 +945,8 @@ mod tests {
         let layout = Layout::new(&desc(4, 2, 1, 4, Swizzle::LINEAR)).unwrap();
         let mut tiled = vec![0; layout.size as usize];
         let mut linear = [0; 32];
-        assert_eq!(
-            layout.detile(&tiled, 0, 0, &mut linear, usize::MAX, 0),
-            Err(Error::TooSmall)
-        );
-        assert_eq!(
-            layout.tile(&mut tiled, 0, 0, &linear, usize::MAX, 0),
-            Err(Error::TooSmall)
-        );
+        assert_eq!(layout.detile(&tiled, 0, 0, &mut linear, usize::MAX, 0), Err(Error::TooSmall));
+        assert_eq!(layout.tile(&mut tiled, 0, 0, &linear, usize::MAX, 0), Err(Error::TooSmall));
     }
 
     #[test]
@@ -1038,32 +959,17 @@ mod tests {
         .unwrap();
         let tiled = vec![0; layout.size as usize];
         let mut linear = [0; 96];
-        assert_eq!(
-            layout.detile(&tiled, 0, 0, &mut linear, 16, usize::MAX),
-            Err(Error::TooSmall)
-        );
+        assert_eq!(layout.detile(&tiled, 0, 0, &mut linear, 16, usize::MAX), Err(Error::TooSmall));
     }
 
     #[test]
     fn bad_descriptions_and_buffers_are_refused() {
-        assert_eq!(
-            Layout::new(&desc(0, 4, 1, 4, Swizzle::SW_4KB_S)),
-            Err(Error::Invalid)
-        );
-        assert_eq!(
-            Layout::new(&desc(4, 4, 1, 12, Swizzle::SW_4KB_S)),
-            Err(Error::Invalid)
-        );
-        assert_eq!(
-            Layout::new(&desc(4, 4, 1, 4, Swizzle(3))),
-            Err(Error::Invalid)
-        );
+        assert_eq!(Layout::new(&desc(0, 4, 1, 4, Swizzle::SW_4KB_S)), Err(Error::Invalid));
+        assert_eq!(Layout::new(&desc(4, 4, 1, 12, Swizzle::SW_4KB_S)), Err(Error::Invalid));
+        assert_eq!(Layout::new(&desc(4, 4, 1, 4, Swizzle(3))), Err(Error::Invalid));
         let l = Layout::new(&desc(64, 64, 1, 4, Swizzle::SW_4KB_S)).unwrap();
         let mut out = vec![0; 64 * 64 * 4];
-        assert_eq!(
-            l.detile(&[0; 100], 0, 0, &mut out, 256, 0),
-            Err(Error::TooSmall)
-        );
+        assert_eq!(l.detile(&[0; 100], 0, 0, &mut out, 256, 0), Err(Error::TooSmall));
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
     }
 }

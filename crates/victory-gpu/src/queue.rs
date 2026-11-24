@@ -11,12 +11,7 @@ use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table
 use crate::resource::PAGEABLE_IIDS;
 
 const QUEUE_IIDS: [Iid; 4] = [
-    guid(
-        0x0ec870a6,
-        0x5d7e,
-        0x4c22,
-        [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
-    ),
+    guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]),
     PAGEABLE_IIDS[0],
     PAGEABLE_IIDS[1],
     PAGEABLE_IIDS[2],
@@ -92,22 +87,12 @@ pub(crate) extern "system" fn create_x(
         return E_INVALIDARG;
     };
     tracing::debug!(desc = ?x, "console command queue");
-    let desc = QueueDesc {
-        kind: x.kind,
-        priority: 0,
-        flags: x.flags,
-        nodes: 1,
-    };
+    let desc = QueueDesc { kind: x.kind, priority: 0, flags: x.flags, nodes: 1 };
     create(this, &desc, iid, out)
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    object::answer(
-        QUEUE,
-        iid,
-        object::is(iid, &QUEUE_IIDS).then_some(this),
-        out,
-    )
+    object::answer(QUEUE, iid, object::is(iid, &QUEUE_IIDS).then_some(this), out)
 }
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
@@ -123,10 +108,7 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let host_lists: Vec<_> = lists
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
+        let host_lists: Vec<_> = lists.iter().filter_map(|&l| crate::list::host_list(l)).collect();
         host.execute(&host_lists);
         return;
     }
@@ -254,10 +236,7 @@ extern "system" fn present(
             static DRAWN: AtomicU64 = AtomicU64::new(0);
             static DISPATCHED: AtomicU64 = AtomicU64::new(0);
             let since = |last: &AtomicU64, now: u64| now - last.swap(now, Ordering::Relaxed);
-            (
-                since(&DRAWN, crate::draw::drawn()),
-                since(&DISPATCHED, crate::draw::dispatched()),
-            )
+            (since(&DRAWN, crate::draw::drawn()), since(&DISPATCHED, crate::draw::dispatched()))
         };
         #[cfg(not(windows))]
         let (drawn, dispatched) = (0, 0);
@@ -407,7 +386,9 @@ extern "system" fn copy_page_mappings(
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
     S_OK
 }
@@ -476,38 +457,23 @@ mod tests {
     fn signal_slot(q: This) -> usize {
         // SAFETY: one of our queues; its first field is the table.
         let table = unsafe { *q.cast::<*const *const ()>() };
-        if table == NEWER_FUNCTIONS.0.as_ptr() {
-            0x80
-        } else {
-            0x70
-        }
+        if table == NEWER_FUNCTIONS.0.as_ptr() { 0x80 } else { 0x70 }
     }
 
     #[test]
     fn queue_signals_complete_at_once() {
         let null = std::ptr::null();
-        let desc = QueueDesc {
-            kind: 0,
-            priority: 0,
-            flags: 0,
-            nodes: 0,
-        };
+        let desc = QueueDesc { kind: 0, priority: 0, flags: 0, nodes: 0 };
         let mut q = null;
         assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
         // SAFETY: the title reads the type at +0x10.
         assert_eq!(unsafe { q.cast::<u8>().add(0x10).cast::<u32>().read() }, 0);
         let mut fence = null;
         let fence_iid = &crate::fence::FENCE_IIDS[0];
-        assert_eq!(
-            crate::fence::create(null, 0, 0, fence_iid, &mut fence),
-            S_OK
-        );
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut fence), S_OK);
         let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));
         assert_eq!(signal(q, fence, 7), S_OK);
-        assert_eq!(
-            slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),
-            7
-        );
+        assert_eq!(slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence), 7);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 
@@ -515,12 +481,7 @@ mod tests {
     #[test]
     fn console_queues_are_created_as_on_pc() {
         let null = std::ptr::null();
-        let desc = QueueDescX {
-            kind: 2,
-            flags: 0,
-            engine_or_pipe: 1,
-            queue: 0,
-        };
+        let desc = QueueDescX { kind: 2, flags: 0, engine_or_pipe: 1, queue: 0 };
         let mut q = null;
         assert_eq!(create_x(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
         assert_eq!(queue(q).desc.kind, 2);

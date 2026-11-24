@@ -62,10 +62,7 @@ static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
 /// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
 pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
     let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    let e = map
-        .get_or_insert_with(HashMap::new)
-        .entry((src, len))
-        .or_insert((0, 0, 0, kind));
+    let e = map.get_or_insert_with(HashMap::new).entry((src, len)).or_insert((0, 0, 0, kind));
     e.0 += 1;
     e.1 += len as u64;
     e.2 += us;
@@ -91,10 +88,7 @@ pub(crate) fn log(frames: f64) {
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
-    let c: Vec<f64> = COUNT
-        .iter()
-        .map(|a| a.swap(0, Relaxed) as f64 / frames)
-        .collect();
+    let c: Vec<f64> = COUNT.iter().map(|a| a.swap(0, Relaxed) as f64 / frames).collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(

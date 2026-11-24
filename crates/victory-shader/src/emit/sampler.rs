@@ -53,11 +53,8 @@ impl StaticSampler {
         };
         let lod = |v: u32| v as f32 / 256.0;
         // Without a mip filter the base level is sampled.
-        let (min_lod, max_lod) = if mip == 0 {
-            (0.0, 0.0)
-        } else {
-            (lod(bits(w[1], 0, 12)), lod(bits(w[1], 12, 12)))
-        };
+        let (min_lod, max_lod) =
+            if mip == 0 { (0.0, 0.0) } else { (lod(bits(w[1], 0, 12)), lod(bits(w[1], 12, 12))) };
         StaticSampler {
             filter,
             address: [0, 3, 6].map(|at| address(bits(w[0], at, 3))),
@@ -96,16 +93,10 @@ mod tests {
             }
         );
         let aniso = StaticSampler::from_words([0x369E, 0x00FF_F000, 0x18F0_3E00, 0x8000_0000]);
-        assert_eq!(
-            (aniso.filter, aniso.address, aniso.max_anisotropy),
-            (0x55, [4, 5, 3], 8)
-        );
+        assert_eq!((aniso.filter, aniso.address, aniso.max_anisotropy), (0x55, [4, 5, 3], 8));
         assert_eq!((aniso.mip_lod_bias, aniso.max_lod), (-2.0, 4095.0 / 256.0));
         let compare = StaticSampler::from_words([0x3006, 0x00FF_F000, 0x1450_0000, 0x4000_0000]);
-        assert_eq!(
-            (compare.filter, compare.address, compare.border),
-            (0x14, [4, 1, 1], 1)
-        );
+        assert_eq!((compare.filter, compare.address, compare.border), (0x14, [4, 1, 1], 1));
         let minimum =
             StaticSampler::from_words([0x2000_3003, 0x00FF_F000, 0x1850_0000, 0x8000_0000]);
         assert_eq!((minimum.filter, minimum.address[0]), (0x115, 5));
@@ -114,11 +105,7 @@ mod tests {
         let max_aniso =
             StaticSampler::from_words([0x4000_3800, 0x00FF_F000, 0x18F0_0F00, 0x8000_0000]);
         assert_eq!(
-            (
-                max_aniso.filter,
-                max_aniso.max_anisotropy,
-                max_aniso.mip_lod_bias
-            ),
+            (max_aniso.filter, max_aniso.max_anisotropy, max_aniso.mip_lod_bias),
             (0x1D5, 16, 15.0)
         );
     }

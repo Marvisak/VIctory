@@ -53,20 +53,12 @@ impl Fields {
             AddressV: D3D12_TEXTURE_ADDRESS_MODE(self.address[1] as i32),
             AddressW: D3D12_TEXTURE_ADDRESS_MODE(self.address[2] as i32),
             MipLODBias: self.bias,
-            MaxAnisotropy: if aniso {
-                self.anisotropy.clamp(1, 16)
-            } else {
-                1
-            },
+            MaxAnisotropy: if aniso { self.anisotropy.clamp(1, 16) } else { 1 },
             ComparisonFunc: D3D12_COMPARISON_FUNC(self.compare.max(1) as i32),
             BorderColor: self.border,
             MinLOD: self.min_lod,
             // Without a mip filter the console samples mip 0 only.
-            MaxLOD: if self.mip == 0 {
-                self.min_lod
-            } else {
-                self.max_lod
-            },
+            MaxLOD: if self.mip == 0 { self.min_lod } else { self.max_lod },
         }
     }
 }

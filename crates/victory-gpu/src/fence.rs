@@ -13,12 +13,7 @@ use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, T
 use crate::resource::PAGEABLE_IIDS;
 
 pub(crate) const FENCE_IIDS: [Iid; 4] = [
-    guid(
-        0x0a753dcf,
-        0xc4d8,
-        0x4b91,
-        [0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76],
-    ),
+    guid(0x0a753dcf, 0xc4d8, 0x4b91, [0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76]),
     PAGEABLE_IIDS[0],
     PAGEABLE_IIDS[1],
     PAGEABLE_IIDS[2],
@@ -68,12 +63,7 @@ fn set_event(event: usize) {
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    object::answer(
-        FENCE,
-        iid,
-        object::is(iid, &FENCE_IIDS).then_some(this),
-        out,
-    )
+    object::answer(FENCE, iid, object::is(iid, &FENCE_IIDS).then_some(this), out)
 }
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
