@@ -148,3 +148,124 @@ fn a_broken_module_fails_the_shader() {
     s.m.terminate(s.entry, Term::Ret);
     assert!(matches!(s.finish(), Err(ShaderError::Internal(_))));
 }
+
+#[test]
+fn a_function_value_has_its_pointer_type() {
+    let (mut m, _, i32t) = module();
+    let fty = m.func_ty(i32t, vec![]);
+    // No `m.ptr(fty)` first: declaring the function is enough.
+    let f = m.function("f", fty, None, false);
+    let t = m.type_of(f);
+    assert_eq!(t, m.ptr(fty));
+}
+
+#[test]
+fn a_module_without_blocks() {
+    assert_broken(&Module::default(), "no blocks");
+}
+
+#[test]
+fn an_unterminated_block() {
+    let (mut m, b, _) = module();
+    inst(&mut m, b);
+    assert_broken(&m, "block 0 is not terminated");
+}
+
+#[test]
+fn a_use_of_a_void_value() {
+    let (mut m, b, _) = module();
+    let void = m.void();
+    let fty = m.func_ty(void, vec![]);
+    let f = m.function("f", fty, None, false);
+    let v = m.call(b, f, vec![]);
+    m.bin(b, Bin::Add, v, v);
+    m.terminate(b, Term::Ret);
+    assert_broken(&m, "use of a void or unplaced value");
+}
+
+#[test]
+fn a_use_of_a_value_from_an_unreachable_block() {
+    let (mut m, b, _) = module();
+    let dead = m.new_block();
+    let x = inst(&mut m, dead);
+    m.terminate(dead, Term::Ret);
+    m.bin(b, Bin::Add, x, x);
+    m.terminate(b, Term::Ret);
+    assert_broken(&m, "use of a void or unplaced value");
+}
+
+#[test]
+fn a_forward_reference() {
+    let (mut m, b, _) = module();
+    let later = m.new_block();
+    let x = inst(&mut m, later);
+    m.bin(b, Bin::Add, x, x);
+    m.terminate(b, Term::Br(later));
+    m.terminate(later, Term::Ret);
+    assert_broken(&m, "forward reference");
+}
+
+#[test]
+fn a_branch_on_a_later_value() {
+    let (mut m, b, _) = module();
+    let (t, f) = (m.new_block(), m.new_block());
+    let one = m.i32(1);
+    let c = m.cmp(t, pred::EQ, one, one);
+    m.terminate(b, Term::CondBr(c, t, f));
+    m.terminate(t, Term::Ret);
+    m.terminate(f, Term::Ret);
+    assert_broken(&m, "forward reference");
+}
+
+#[test]
+fn an_instruction_in_a_missing_block() {
+    let (mut m, b, _) = module();
+    let one = m.i32(1);
+    m.bin(b + 7, Bin::Add, one, one);
+    m.terminate(b, Term::Ret);
+    assert_broken(&m, "block 7 does not exist");
+}
+
+#[test]
+fn a_phi_in_a_missing_block() {
+    let (mut m, b, i32t) = module();
+    m.phi(b + 7, i32t);
+    m.terminate(b, Term::Ret);
+    assert_broken(&m, "block 7 does not exist");
+}
+
+#[test]
+fn a_branch_to_a_missing_block() {
+    let (mut m, b, _) = module();
+    m.terminate(b, Term::Br(b + 7));
+    assert_broken(&m, "block 7 does not exist");
+}
+
+#[test]
+fn a_terminator_of_a_missing_block() {
+    let (mut m, b, _) = module();
+    m.terminate(b, Term::Ret);
+    m.terminate(b + 7, Term::Ret);
+    assert_broken(&m, "block 7 does not exist");
+}
+
+#[test]
+fn a_phi_from_a_missing_block() {
+    let (mut m, b, i32t) = module();
+    let next = m.new_block();
+    let p = m.phi(next, i32t);
+    let one = m.i32(1);
+    m.set_phi(p, vec![(one, b + 7)]);
+    m.bin(next, Bin::Add, p, p);
+    m.terminate(b, Term::Br(next));
+    m.terminate(next, Term::Ret);
+    assert_broken(&m, "block 7 does not exist");
+}
+
+#[test]
+fn a_block_closed_twice() {
+    let mut w = Writer::default();
+    w.enter(8, 3);
+    assert_eq!(w.exit(), Ok(()));
+    assert!(matches!(w.exit(), Err(ShaderError::Internal(_))));
+}

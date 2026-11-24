@@ -5,6 +5,7 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 
 use crate::ShaderError;
@@ -186,6 +187,8 @@ pub(crate) enum Attr {
 struct Func {
     name: String,
     ty: Ty,
+    /// Its pointer type (the type of the function as a value).
+    ptr: Ty,
     attr: Option<Attr>,
     body: bool,
 }
@@ -340,9 +343,11 @@ impl Module {
             return V::Func(i);
         }
         let i = self.funcs.len() as u32;
+        let ptr = self.ptr(ty);
         self.funcs.push(Func {
             name: name.into(),
             ty,
+            ptr,
             attr,
             body,
         });
@@ -391,19 +396,23 @@ impl Module {
             V::Global(i) => self.globals[i as usize].ptr,
             V::Const(i) => self.consts[i as usize].0,
             V::Inst(i) => self.insts[i as usize].ty,
-            V::Func(i) => {
-                let t = self.funcs[i as usize].ty;
-                *self
-                    .type_ids
-                    .get(&TypeDef::Ptr(t, 0))
-                    .map(|t| Ty(*t))
-                    .as_ref()
-                    .expect("function pointer type")
-            }
+            V::Func(i) => self.funcs[i as usize].ptr,
         }
     }
 
+    /// Whether `block` exists; records a broken invariant if not.
+    fn has_block(&mut self, block: usize) -> bool {
+        let ok = block < self.blocks.len();
+        if !ok {
+            self.broke(format!("block {block} does not exist"));
+        }
+        ok
+    }
+
     fn push(&mut self, block: usize, ty: Ty, op: Op) -> V {
+        if !self.has_block(block) {
+            return self.broke(format!("an instruction in block {block}"));
+        }
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
@@ -457,6 +466,9 @@ impl Module {
     }
     /// A phi at the top of `block`; incoming values come with [`Module::set_phi`].
     pub fn phi(&mut self, block: usize, ty: Ty) -> V {
+        if !self.has_block(block) {
+            return self.broke(format!("a phi in block {block}"));
+        }
         let i = self.insts.len() as u32;
         self.insts.push(Inst {
             ty,
@@ -500,6 +512,9 @@ impl Module {
     }
 
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
+        if !incoming.iter().all(|&(_, b)| self.has_block(b)) {
+            return;
+        }
         match phi {
             V::Inst(i) if matches!(self.insts[i as usize].op, Op::Phi(_)) => {
                 self.insts[i as usize].op = Op::Phi(incoming);
@@ -510,7 +525,10 @@ impl Module {
         }
     }
     pub fn terminate(&mut self, block: usize, t: Term) {
-        self.blocks[block].term = Some(t);
+        let targets_exist = successors(Some(t)).iter().all(|&b| self.has_block(b));
+        if targets_exist && self.has_block(block) {
+            self.blocks[block].term = Some(t);
+        }
     }
 
     pub fn md_str(&mut self, s: &str) -> Md {
@@ -566,10 +584,15 @@ impl Module {
         if let Some(what) = &self.broken {
             return Err(ShaderError::Internal(what.clone()));
         }
-        Ok(self.write_bitcode())
+        if self.blocks.is_empty() {
+            return Err(ShaderError::Internal("the module has no blocks".into()));
+        }
+        self.write_bitcode()
     }
 
-    fn write_bitcode(&self) -> Vec<u8> {
+    /// The bitcode of a module with at least one block, every block id in
+    /// it naming one of its blocks (the builder checks both).
+    fn write_bitcode(&self) -> Result<Vec<u8>, ShaderError> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
         w.enter(MODULE_BLOCK, 3);
@@ -589,12 +612,12 @@ impl Module {
             }
             w.record(3, &r);
         }
-        w.exit();
+        w.exit()?;
         w.enter(PARAMATTR_BLOCK, 3);
         for id in 1..=4 {
             w.record(2, &[id]);
         }
-        w.exit();
+        w.exit()?;
 
         w.enter(TYPE_BLOCK, 4);
         w.record(1, &[self.types.len() as u64]);
@@ -623,7 +646,7 @@ impl Module {
                 }
             }
         }
-        w.exit();
+        w.exit()?;
 
         w.record(2, &chars("dxil-ms-dx"));
         w.record(
@@ -699,7 +722,7 @@ impl Module {
                 }
             }
         }
-        w.exit();
+        w.exit()?;
 
         // Phis nothing reads are left out (one register per phi makes many).
         let live = self.live();
@@ -775,6 +798,8 @@ impl Module {
                 }
             }
         }
+        // The first misplaced use found below; the module is not written.
+        let bad = OnceCell::new();
         let abs = |v: V| -> u32 {
             match v {
                 V::Global(i) => i,
@@ -782,10 +807,22 @@ impl Module {
                 V::Const(i) => funcs + i,
                 V::Inst(i) => {
                     let id = ids[i as usize];
-                    assert_ne!(id, u32::MAX, "use of a void value");
+                    if id == u32::MAX {
+                        bad.get_or_init(|| format!("use of a void or unplaced value {v:?}"));
+                        return 0;
+                    }
                     id
                 }
             }
+        };
+        // `inst_id - abs(v)`: the relative id of a value defined earlier.
+        let back = |v: V, inst_id: u32| -> u64 {
+            let a = abs(v);
+            if a >= inst_id {
+                bad.get_or_init(|| format!("forward reference outside a phi to {v:?}"));
+                return 0;
+            }
+            u64::from(inst_id - a)
         };
 
         w.enter(METADATA_BLOCK, 3);
@@ -807,7 +844,7 @@ impl Module {
             let r: Vec<u64> = nodes.iter().map(|m| u64::from(m.0)).collect();
             w.record(10, &r);
         }
-        w.exit();
+        w.exit()?;
         // The metadata kinds an LLVM 3.7 module declares, as DXC writes them.
         w.enter(METADATA_BLOCK, 3);
         for (id, kind) in [
@@ -833,7 +870,7 @@ impl Module {
             r.extend(chars(kind));
             w.record(6, &r);
         }
-        w.exit();
+        w.exit()?;
 
         w.enter(VALUE_SYMTAB_BLOCK, 4);
         let names = self.globals.iter().map(|g| &g.name);
@@ -842,21 +879,18 @@ impl Module {
             r.extend(chars(name));
             w.record(1, &r);
         }
-        w.exit();
+        w.exit()?;
 
         w.enter(FUNCTION_BLOCK, 4);
         w.record(1, &[layout.len() as u64]);
         let mut inst_id = base;
         // The operands of variable-length records, reused across them.
         let mut r: Vec<u64> = Vec::new();
-        for b in layout.iter().map(|&b| &self.blocks[b]) {
+        for &n in &layout {
+            let b = &self.blocks[n];
             for &i in b.phis.iter().filter(|&&i| live[i as usize]).chain(&b.body) {
                 let inst = &self.insts[i as usize];
-                let rel = |v: V| {
-                    let a = abs(v);
-                    assert!(a < inst_id, "forward reference outside a phi");
-                    u64::from(inst_id - a)
-                };
+                let rel = |v: V| back(v, inst_id);
                 match &inst.op {
                     Op::Bin(op, a, b) => w.record(2, &[rel(*a), rel(*b), *op as u64]),
                     Op::Cast(op, v) => w.record(3, &[rel(*v), u64::from(inst.ty.0), *op as u64]),
@@ -900,19 +934,26 @@ impl Module {
                     inst_id += 1;
                 }
             }
-            match b.term.expect("unterminated block") {
+            let Some(term) = b.term else {
+                return Err(ShaderError::Internal(format!(
+                    "block {n} is not terminated"
+                )));
+            };
+            match term {
                 Term::Ret => w.record(10, &[]),
                 Term::Br(t) => w.record(11, &[target(t)]),
                 Term::CondBr(c, t, f) => {
-                    let a = abs(c);
-                    assert!(a < inst_id);
-                    w.record(11, &[target(t), target(f), u64::from(inst_id - a)]);
+                    let rel = back(c, inst_id);
+                    w.record(11, &[target(t), target(f), rel]);
                 }
             }
         }
-        w.exit();
-        w.exit();
-        w.finish()
+        if let Some(what) = bad.into_inner() {
+            return Err(ShaderError::Internal(what));
+        }
+        w.exit()?;
+        w.exit()?;
+        Ok(w.finish())
     }
 }
 
@@ -964,7 +1005,7 @@ fn successors(term: Option<Term>) -> Succs {
     match term {
         Some(Term::Br(t)) => Succs { to: [t, 0], len: 1 },
         Some(Term::CondBr(_, t, f)) => Succs { to: [t, f], len: 2 },
-        _ => Succs { to: [0, 0], len: 0 },
+        None | Some(Term::Ret) => Succs { to: [0, 0], len: 0 },
     }
 }
 
@@ -1039,11 +1080,16 @@ impl Writer {
         self.stack.push((width, self.words.len()));
     }
 
-    fn exit(&mut self) {
-        self.emit(0, self.width()); // END_BLOCK
+    /// Closes the innermost open block; there must be one.
+    fn exit(&mut self) -> Result<(), ShaderError> {
+        let Some((width, start)) = self.stack.pop() else {
+            return Err(ShaderError::Internal("a block closed twice".into()));
+        };
+        self.emit(0, width); // END_BLOCK, in the closed block's width
         self.align();
-        let (_, start) = self.stack.pop().expect("open block");
+        // `enter` pushed `start` after the length word, so `start >= 1`.
         self.words[start - 1] = (self.words.len() - start) as u32;
+        Ok(())
     }
 
     /// An unabbreviated record.
@@ -1078,7 +1124,7 @@ mod tests {
         let mut w = Writer::default();
         w.enter(8, 3);
         w.record(1, &[1]);
-        w.exit();
+        w.exit().unwrap();
         let bytes = w.finish();
         // header word, length word, one record word, end word.
         assert_eq!(bytes.len() % 4, 0);
@@ -1231,8 +1277,8 @@ mod tests {
     #[test]
     fn written_bytes_unchanged() {
         for ((regs, stages, read), len, hash) in [
-            ((64, 64, 64), 38_916, 0x9586_730c_f953_4a45),
-            ((128, 256, 32), 295_952, 0x89e5_de2d_64f0_8785),
+            ((64, 64, 64), 38_924, 0x387a_5041_1fbc_cc4e),
+            ((128, 256, 32), 295_960, 0x4c54_0779_a84c_2797),
         ] {
             let bytes = synthetic(regs, stages, read).write().unwrap();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
