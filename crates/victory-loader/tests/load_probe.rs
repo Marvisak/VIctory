@@ -23,7 +23,7 @@ fn workspace_root() -> PathBuf {
 /// lock on the main one while tests run), in the outer one's scratch folder
 /// for tests, so that it follows `CARGO_TARGET_DIR` like the rest of the
 /// build.
-fn build_probe() -> PathBuf {
+fn build_probe() -> std::io::Result<PathBuf> {
     let manifest = workspace_root().join("tests/fixtures/hle-probe/Cargo.toml");
     let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hle-probe");
     let status = Command::new(env!("CARGO"))
@@ -31,10 +31,9 @@ fn build_probe() -> PathBuf {
         .arg(&manifest)
         .arg("--target-dir")
         .arg(&target)
-        .status()
-        .expect("running cargo");
+        .status()?;
     assert!(status.success(), "building hle-probe failed");
-    target.join("debug").join("hle_probe.dll")
+    Ok(target.join("debug").join("hle_probe.dll"))
 }
 
 extern "system" fn fake_xgameruntime_initialize() -> i32 {
@@ -98,7 +97,7 @@ fn host(dll: &str, name: &str) -> Option<usize> {
 
 #[test]
 fn loads_binds_and_calls_probe() {
-    let dll = build_probe();
+    let dll = build_probe().expect("running cargo");
     let original = std::fs::read(&dll).unwrap();
     let prepared = prepare(&original).unwrap();
 
