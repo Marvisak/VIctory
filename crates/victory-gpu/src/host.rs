@@ -1330,8 +1330,16 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    if title_dst {
+                        // A committed title page may be read-only, or may
+                        // have been unmapped since the check above. Let the
+                        // kernel check it again instead of faulting here.
+                        const ZERO: [u8; 4096] = [0; 4096];
+                        read(ZERO.as_ptr(), to, n);
+                    } else {
+                        // SAFETY: the host destination is mapped writable.
+                        unsafe { to.write_bytes(0, n) };
+                    }
                 }
             });
         }
@@ -1388,6 +1396,85 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
         let next = ((at / step + 1) * step).min(end);
         f(at, next - at);
         at = next;
+    }
+}
+
+#[cfg(test)]
+mod protected_title_copy {
+    #[test]
+    fn unreadable_source_still_zeroes_a_writable_title_destination() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+        const LEN: usize = 4096;
+        // SAFETY: a private committed page that the kernel cannot read.
+        let source = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_NOACCESS,
+            )
+        };
+        assert!(!source.is_null());
+        let mut destination = [0x5a; LEN];
+        super::copy_mapped(destination.as_mut_ptr(), source.cast(), LEN, true);
+        assert_eq!(destination, [0; LEN]);
+        // SAFETY: release the reservation created above.
+        assert_ne!(unsafe { VirtualFree(source, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn copy_to_readonly_title_memory_does_not_fault() {
+        const CHILD: &str = "VICTORY_TEST_READONLY_COPY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "host::protected_title_copy::copy_to_readonly_title_memory_does_not_fault",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child exited {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        use windows_sys::Win32::System::Diagnostics::Debug::{SEM_NOGPFAULTERRORBOX, SetErrorMode};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        // SAFETY: suppress an interactive crash dialog in this isolated test process.
+        unsafe { SetErrorMode(SEM_NOGPFAULTERRORBOX) };
+        const LEN: usize = 4096;
+        // SAFETY: allocate our own page, initialize it, then make it read-only.
+        let page = unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+            page.write_bytes(0x5a, LEN);
+            let mut old = 0;
+            assert_ne!(VirtualProtect(page.cast(), LEN, PAGE_READONLY, &mut old), 0);
+            page
+        };
+        let source = [0x33; LEN];
+        super::copy_mapped(page, source.as_ptr(), LEN, true);
+        // SAFETY: the page remains committed and readable throughout the test.
+        let contents = unsafe { std::slice::from_raw_parts(page, LEN) };
+        assert!(contents.iter().all(|&v| v == 0x5a));
+        // SAFETY: release the reservation created above.
+        assert_ne!(unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) }, 0);
     }
 }
 
