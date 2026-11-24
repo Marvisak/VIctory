@@ -749,8 +749,8 @@ struct Resource {
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
-    /// Textures also live on the host GPU (decision 0007); buffers do not
-    /// yet.
+    /// Textures also live on the host GPU, which samples them; buffers do
+    /// not yet.
     #[cfg(windows)]
     host: Option<std::sync::Arc<HostTexture>>,
 }

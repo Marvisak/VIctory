@@ -66,6 +66,16 @@ jobs:
       - name: AGENTS.md citations
         if: ${{ !cancelled() }}
         run: cargo xtask citations
+      # The repository has no decision records; citing one points readers at
+      # nothing (issue #10 removed 28 such citations). State the reason inline.
+      - name: No citations of decision records
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          if git grep -nE 'decision 0[0-9]{3}' -- '*.rs' '*.md'; then
+            echo "::error::no decision records exist; state the reason inline instead (AGENTS.md, Citations)"
+            exit 1
+          fi
       - name: Check
         if: ${{ !cancelled() }}
         run: cargo check --workspace --all-targets --locked --keep-going --exclude victory-hle --exclude victory

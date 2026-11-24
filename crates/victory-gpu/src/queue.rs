@@ -113,7 +113,8 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
+/// Runs the lists' host lists and waits for them (`crate::host` waits for
+/// every submission).
 extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;

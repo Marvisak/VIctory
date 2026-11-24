@@ -3,27 +3,32 @@
 ```
  user's files (outside repo)             VIctory
  ───────────────────────────             ─────────────────────────────────────────
- game assets ──────────────────────────► victory-pipeline + victory-game
-                                         (victory-formats, victory-shader)
-                                                    │
-                                                    ▼
-                                         cache_dir: converted data
-                                                    │
  game executable ─► victory-loader ────► title code (native x86-64)
                     prepare, map, bind      │ imports
-                                            ▼
-                                         victory-hle ── host Windows (shared APIs)
-                                            │ D3D12.X
+                    (prepared image         │
+                     kept in cache_dir)     ▼
+ game assets ◄── read by the title ───── victory-hle ── host Windows (shared APIs)
+                 through these APIs         │ D3D12.X
                                             ▼
                                          victory-gpu ─► host D3D12
                                             │ shaders at pipeline creation
                                             ▼
                                          victory-shader ◄─► cache_dir
+                                         (through victory-pipeline)
 ```
+
+Game assets are not converted ahead of time. The title reads its own files
+at run time, and what the console's hardware would decode is decoded where
+the title hands it over: BCPack and zlib in DirectStorage and XMA2 and Opus
+in the audio modules (`victory-hle`), tiled textures in `victory-gpu`, with
+the decoders of `victory-formats` where they are pure. The only converter
+behind `victory-pipeline`'s content-addressed cache is shader translation
+(`crates/victory-gpu/src/shader_cache.rs`).
 
 Shaders are translated when the title creates a pipeline, from the bytes it
 passes, wherever it loaded them from (executable, archive, memory).
-Converting them ahead of time from files is only a warm-up.
+`victory translate` runs the translator over shader files ahead of time to
+show what it cannot handle; it does not fill the cache.
 
 ## Crates
 
@@ -35,9 +40,9 @@ Converting them ahead of time from files is only a warm-up.
 | `victory-hle` | console API implementations, host pass-through policy |
 | `victory-gpu` | D3D12.X objects, command lists and GPU memory → host D3D12 |
 | `victory-shader` | Xbox shader containers → host shaders |
-| `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), audio codecs; planned: BCPack |
-| `victory-pipeline` | converter trait, content-addressed cache |
-| `victory-game` | Grand Theft Auto VI-specific formats, build identities, hooks |
+| `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), BCPack, XMA2 |
+| `victory-pipeline` | converter trait, content-addressed cache (used for translated shaders) |
+| `victory-game` | Grand Theft Auto VI-specific formats (SGD5 shader files), build identities |
 | `apps/victory` | command-line front end |
 | `xtask` | asset-policy check, `AGENTS.md` citation check, git hooks |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |

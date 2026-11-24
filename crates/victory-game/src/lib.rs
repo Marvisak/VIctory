@@ -1,7 +1,7 @@
-//! Everything specific to Grand Theft Auto VI: its container formats, build
-//! identities, and the hooks we place in its code (located by per-build
-//! offsets or byte-pattern signatures). What may and may not be stored here
-//! is defined in docs/asset-policy.md.
+//! Everything specific to Grand Theft Auto VI: its container formats
+//! ([`sgd5`], the engine's shader files) and the builds we know
+//! ([`KnownBuild`]); it places no hooks in the title's code. What may and
+//! may not be stored here is defined in docs/asset-policy.md.
 
 pub mod sgd5;
 

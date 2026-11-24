@@ -1,4 +1,5 @@
-//! Translated shaders kept on disk (decision 0003): under the configured
+//! Translated shaders kept on disk, so a run does not translate again what
+//! an earlier one did: under the configured
 //! cache folder, keyed by the container's content and by the VIctory build
 //! that translated it (the BLAKE3 of our executable), so a rebuilt
 //! translator never serves an old translation. Entries go through

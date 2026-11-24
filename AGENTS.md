@@ -123,6 +123,10 @@ deletion has to update the contract in the same commit. What it checks:
   `// SAFETY:`), are not citations and are not checked.
 - To mention a path that must not exist, say it in words, not in a code
   span.
+- The repository has no decision records, so the `portable` job also
+  fails on any `.rs` or `.md` line citing one by number (the word
+  "decision", a space, then a four-digit number starting with 0). Put the
+  reason itself in the comment instead.
 
 ## Pitfalls seen in this repository
 
@@ -136,28 +140,14 @@ deletion has to update the contract in the same commit. What it checks:
 | `_ =>` standing for "vertex/pixel" | `counter()` and `check()` in `apps/victory/src/translate.rs` treated every `HwStage` (8 variants) other than `Cs`/`Ms`/`Vs` as one group (fixed: both list the variants) | Name the variants: `HwStage::Ls \| HwStage::Hs \| ... =>`. |
 | Panic reachable from title code | `crates/victory-shader/src/emit/bitcode.rs` `panic!`s on internal invariants, reached from `victory-gpu` pipeline creation; `host!` in `crates/victory-hle/src/modules/files.rs` panics if a host export is missing; `Stage::translated` in `crates/victory-gpu/src/pipeline/host.rs` uses `expect` | Return `Result` and map it to the API's failure (`E_FAIL`, a dropped draw) with a log line. |
 | Giant functions and files | `crates/victory-shader/src/emit/lower.rs` is 7,424 lines; clippy counts 32 functions over 100 lines in the portable crates alone | New logic goes in a new, focused module; extract before extending. |
-| Docs promise what the code does not do (or deny what it does) | see Known doc drift below | Update the doc in the same commit as the code. |
+| Docs promise what the code does not do (or deny what it does) | `crates/victory-formats/src/lib.rs` called BCPack and XMA2 "Planned" beside the modules implementing them; `docs/architecture.md` routed game assets through a converter that does not exist; module docs cited numbered decision records the repository never held (all fixed) | Update the doc in the same commit as the code; cite only what exists. |
 | A Windows-only test helper prints, Linux CI is green and Windows clippy fails | `crates/victory-shader/src/emit/valu_tests.rs` was gated `#[cfg(all(test, windows))]`; clippy only exempts code under a plain `#[cfg(test)]`, so its `eprintln!` in `run_cases` broke PR #1 | Gate test modules with `#[cfg(test)]` and `#[cfg(windows)]` as two attributes, never `cfg(all(test, ...))` (the `portable` CI job rejects it). |
 | Unverifiable lint suppression | `#[allow(dead_code)] // unused in test builds` | `#[allow(dead_code, reason = "...")]`; never `#[expect]` on code CI compiles differently per cfg. |
 
 ## Known doc drift (to fix, not to copy)
 
-- `crates/victory-formats/src/lib.rs` lists BCPack and XMA2 as "Planned";
-  both are implemented (`bcpack.rs`, `xma.rs`). It also lists Opus and
-  zlib, which live in `victory-hle` (`opus-pure`, `miniz_oxide`).
-- `docs/architecture.md` crate table: "planned: BCPack" for
-  `victory-formats` (implemented).
-- `docs/architecture.md` diagram: game assets go through
-  `victory-pipeline + victory-game`. Neither converts assets today; the only
-  real `Converter` is shader translation in `crates/victory-gpu/src/shader_cache.rs`.
-- `crates/victory-game/src/lib.rs` and `docs/architecture.md` promise
-  "hooks" placed in the title's code; the crate has `sgd5` and
-  `KnownBuild` only.
-- "decision 0003" is cited 10 times (in `victory-shader` and
-  `victory-gpu`) and "decision 0007" 16 times (`victory-gpu`,
-  `victory-hle`); no decision records exist in the repository.
-- `crates/victory-hle/src/modules/mod.rs` lists `xstore` stubs as planned;
-  `xstore.rs` exists.
+None known. When you find a doc that contradicts the code, fix it in the
+same change, or list it here with the file and what is wrong.
 
 ## Lint ratchet
 
