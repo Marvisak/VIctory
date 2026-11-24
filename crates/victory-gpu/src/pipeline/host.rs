@@ -245,6 +245,8 @@ const QUADS: i32 = 32;
 
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
+    /// Its shader, for the diagnostics reports in `draw` (its hash).
+    #[cfg(feature = "diagnostics")]
     pub(crate) shader: Arc<Shader>,
     /// The shader's translation, held from construction (private: a stage
     /// exists only through [`Stage::new`], so it always has one).
@@ -262,6 +264,7 @@ impl Stage {
     fn new(shader: &Arc<Shader>) -> Option<Stage> {
         Some(Stage {
             translated: Arc::clone(shader.translated()?),
+            #[cfg(feature = "diagnostics")]
             shader: Arc::clone(shader),
             user_data: None,
             root_cbvs: Vec::new(),
