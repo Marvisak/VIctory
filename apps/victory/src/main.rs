@@ -8,6 +8,7 @@ mod inspect;
 mod run;
 mod shader;
 mod translate;
+mod walk;
 
 use std::path::PathBuf;
 

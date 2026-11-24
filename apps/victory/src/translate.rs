@@ -1,7 +1,9 @@
 //! The offline batch: every shader found goes through the translator, and
 //! what it cannot handle yet is tallied (decision 0003).
 
-use std::collections::{BTreeMap, HashSet};
+mod tally;
+
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,130 +17,9 @@ use victory_shader::{
 };
 use victory_shader::{io, resource};
 
-use crate::shader::{MAX_FILE, Source, sources};
-
-#[derive(Default)]
-struct Tally {
-    containers: usize,
-    duplicates: usize,
-    programs: usize,
-    translated: usize,
-    instructions: usize,
-    structured: usize,
-    vector: usize,
-    guarded: usize,
-    /// Guards that read a mask the pass cannot see into.
-    opaque: usize,
-    lane_branches: usize,
-    uniform_branches: usize,
-    tracked: usize,
-    loaded: usize,
-    built: usize,
-    constant: usize,
-    /// Descriptors and scalar accesses with a computed address term.
-    dynamic: usize,
-    scalar: usize,
-    used: usize,
-    /// Used-resource entries whose root parameter no descriptor traces
-    /// to, by resource and root type.
-    untraced_used: BTreeMap<String, usize>,
-    /// Root parameters descriptors trace to that no used entry names.
-    unlisted: usize,
-    /// Vertex and pixel programs, and those whose I/O was raised.
-    io_programs: usize,
-    io_raised: usize,
-    interpolated: usize,
-    vertex_values: usize,
-    /// Exports by target kind.
-    exports: BTreeMap<&'static str, usize>,
-    /// Exports still packed as f16 pairs after the export patch.
-    compressed: usize,
-    /// Vertex and pixel programs every earlier stage handled, and how far
-    /// emission got with them.
-    emit_programs: usize,
-    emitted: usize,
-    validated: usize,
-    pipelines: usize,
-    /// The same for compute programs.
-    cs_programs: usize,
-    cs_emitted: usize,
-    cs_validated: usize,
-    cs_pipelines: usize,
-    /// The same for mesh programs.
-    ms_programs: usize,
-    ms_emitted: usize,
-    ms_validated: usize,
-    ms_pipelines: usize,
-    /// Reason → programs stopped by it, and the first one.
-    failed: BTreeMap<String, (usize, String)>,
-    /// With `--list`: one line per program and outcome.
-    list: bool,
-    lines: Vec<String>,
-}
-
-impl Tally {
-    fn fail(&mut self, reason: String, example: impl FnOnce() -> String) {
-        if self.list {
-            let e = example();
-            self.lines.push(format!("{e}  {reason}"));
-            self.failed.entry(reason).or_insert((0, e)).0 += 1;
-            return;
-        }
-        self.failed
-            .entry(reason)
-            .or_insert_with(|| (0, example()))
-            .0 += 1;
-    }
-
-    fn merge(&mut self, other: Tally) {
-        self.containers += other.containers;
-        self.duplicates += other.duplicates;
-        self.programs += other.programs;
-        self.translated += other.translated;
-        self.instructions += other.instructions;
-        self.structured += other.structured;
-        self.vector += other.vector;
-        self.guarded += other.guarded;
-        self.opaque += other.opaque;
-        self.lane_branches += other.lane_branches;
-        self.uniform_branches += other.uniform_branches;
-        self.tracked += other.tracked;
-        self.loaded += other.loaded;
-        self.built += other.built;
-        self.constant += other.constant;
-        self.dynamic += other.dynamic;
-        self.scalar += other.scalar;
-        self.used += other.used;
-        for (k, n) in other.untraced_used {
-            *self.untraced_used.entry(k).or_default() += n;
-        }
-        self.unlisted += other.unlisted;
-        self.io_programs += other.io_programs;
-        self.io_raised += other.io_raised;
-        self.interpolated += other.interpolated;
-        self.vertex_values += other.vertex_values;
-        self.compressed += other.compressed;
-        self.emit_programs += other.emit_programs;
-        self.emitted += other.emitted;
-        self.validated += other.validated;
-        self.pipelines += other.pipelines;
-        self.cs_programs += other.cs_programs;
-        self.cs_emitted += other.cs_emitted;
-        self.cs_validated += other.cs_validated;
-        self.cs_pipelines += other.cs_pipelines;
-        self.ms_programs += other.ms_programs;
-        self.ms_emitted += other.ms_emitted;
-        self.ms_validated += other.ms_validated;
-        self.ms_pipelines += other.ms_pipelines;
-        for (k, n) in other.exports {
-            *self.exports.entry(k).or_default() += n;
-        }
-        self.lines.extend(other.lines);
-        for (reason, (n, example)) in other.failed {
-            self.failed.entry(reason).or_insert((0, example)).0 += n;
-        }
-    }
-}
+use crate::shader::{Source, sources};
+use crate::walk::{self, MAX_FILE};
+use tally::{Reasons, Tally};
 
 /// Emitted shaders by label, shared between threads.
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
@@ -150,6 +31,35 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    /// Validator failures seen so far by first error line, for the dumps.
+    dumped: HashMap<String, usize>,
+}
+
+impl Checks {
+    /// Built before the walk, not in the workers: a validator or device
+    /// that does not come up is the environment's failure and must stop the
+    /// run, where a worker going without would silently thin out the counts.
+    fn new(
+        dll: Option<&Path>,
+        validate: bool,
+        pipelines: bool,
+        keep: Option<Kept>,
+    ) -> Result<Self> {
+        let validator = validate
+            .then(|| Validator::load(dll))
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
+        let host = pipelines
+            .then(|| Host::new(false).map(|h| (h, host::stub_ps())))
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
+        Ok(Self {
+            keep,
+            validator,
+            host,
+            dumped: HashMap::new(),
+        })
+    }
 }
 
 pub fn run(
@@ -161,17 +71,6 @@ pub fn run(
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
-    if validate {
-        Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
-        println!(
-            "validator    {}",
-            dll.as_ref()
-                .map_or("dxil.dll".into(), |p| p.display().to_string())
-        );
-    }
-    if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
-    }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -179,49 +78,52 @@ pub fn run(
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    // At least one: with none, every file would be read and nothing counted.
+    let threads = jobs
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+        .max(1);
+    let mut checks = (0..threads)
+        .map(|_| {
+            let keep = (!pairs.is_empty()).then(|| kept.clone());
+            Checks::new(dll.as_deref(), validate, pipelines, keep)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if validate {
+        println!(
+            "validator    {}",
+            dll.as_ref()
+                .map_or("dxil.dll".into(), |p| p.display().to_string())
+        );
+    }
     let seen = Mutex::new(HashSet::new());
-    let total = Mutex::new(Tally::default());
-    for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+    let total = Mutex::new(Tally::new(list));
+    for (path, data) in walk::files(&paths, MAX_FILE) {
+        let data = match data {
+            Ok(data) => data,
+            Err(skip) => {
+                lock(&total).infra(skip.reason(), || path.display().to_string());
                 continue;
             }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
-            };
-            let jobs = sources(&data);
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        let mut t = Tally {
-                            list,
-                            ..Tally::default()
-                        };
-                        let mut checks = Checks {
-                            keep: (!pairs.is_empty()).then(|| kept.clone()),
-                            validator: validate
-                                .then(|| Validator::load(dll.as_deref()).ok())
-                                .flatten(),
-                            host: pipelines
-                                .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                .flatten(),
-                        };
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
-                        }
-                        lock(&total).merge(t);
-                    });
-                }
-            });
-        }
+        };
+        lock(&total).files += 1;
+        let jobs = sources(&data);
+        let next = AtomicUsize::new(0);
+        let (jobs, next, seen, total, path) = (&jobs, &next, &seen, &total, &path);
+        std::thread::scope(|s| {
+            for checks in checks.iter_mut().take(jobs.len()) {
+                s.spawn(move || {
+                    let mut t = Tally::new(list);
+                    while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        translate(job, path, seen, &mut t, checks);
+                    }
+                    lock(total).merge(t);
+                });
+            }
+        });
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    let verdict = t.verdict();
+    println!("files        {} read", t.files);
     println!(
         "containers   {} ({} duplicates skipped)",
         t.containers, t.duplicates
@@ -293,12 +195,20 @@ pub fn run(
     for l in lines {
         println!("{l}");
     }
-    let mut failed: Vec<_> = t.failed.into_iter().collect();
-    failed.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
-    for (reason, (n, example)) in failed {
+    print_reasons(t.failed);
+    if !t.infra.is_empty() {
+        println!("infrastructure failures (every count above is a lower bound):");
+        print_reasons(t.infra);
+    }
+    verdict
+}
+
+fn print_reasons(reasons: Reasons) {
+    let mut reasons: Vec<_> = reasons.into_iter().collect();
+    reasons.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+    for (reason, (n, example)) in reasons {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
-    Ok(())
 }
 
 fn translate(
@@ -329,83 +239,97 @@ fn translate(
     };
     for p in programs {
         t.programs += 1;
-        match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
-            Ok(program) => {
-                t.translated += 1;
-                t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
-                let res = match resource::track(&program, &p.layout, p.stage) {
+        t.isolate(
+            || format!("{} {:?}", example(), p.stage),
+            |t| program(&container, &p, &example, t, checks),
+        );
+    }
+}
+
+/// One program through every stage, counted into `t`.
+fn program(
+    container: &Container<'_>,
+    p: &NativeProgram,
+    example: &dyn Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks,
+) {
+    match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
+        Ok(program) => {
+            t.translated += 1;
+            t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
+            let res = match resource::track(&program, &p.layout, p.stage) {
+                Ok(r) => {
+                    tally_resources(p, &r, t);
+                    Some(r)
+                }
+                Err(ShaderError::Unsupported { offset, what }) => {
+                    t.fail(format!("resources: {what}"), || {
+                        format!("{} {:?} at {offset:#x}", example(), p.stage)
+                    });
+                    None
+                }
+                Err(e) => {
+                    t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage));
+                    None
+                }
+            };
+            let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
+            let compute = p.stage == HwStage::Cs;
+            let mut raised = None;
+            if graphics || compute || p.stage == HwStage::Ms {
+                t.io_programs += usize::from(graphics);
+                match io::raise(&program, p) {
                     Ok(r) => {
-                        tally_resources(&p, &r, t);
-                        Some(r)
+                        if graphics {
+                            tally_io(&r, t);
+                        }
+                        raised = Some(r);
                     }
-                    Err(ShaderError::Unsupported { offset, what }) => {
-                        t.fail(format!("resources: {what}"), || {
+                    Err(ShaderError::Unsupported { offset, what }) => t
+                        .fail(format!("I/O: {what}"), || {
                             format!("{} {:?} at {offset:#x}", example(), p.stage)
-                        });
-                        None
-                    }
-                    Err(e) => {
-                        t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage));
-                        None
-                    }
-                };
-                let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
-                let compute = p.stage == HwStage::Cs;
-                let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms {
-                    t.io_programs += usize::from(graphics);
-                    match io::raise(&program, &p) {
-                        Ok(r) => {
-                            if graphics {
-                                tally_io(&r, t);
-                            }
-                            raised = Some(r);
-                        }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("I/O: {what}"), || {
-                                format!("{} {:?} at {offset:#x}", example(), p.stage)
-                            }),
-                        Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
-                    }
-                }
-                let structured = match structure::structure(&program) {
-                    Ok(s) => {
-                        tally_structured(&program, &s, t);
-                        Some(s)
-                    }
-                    Err(e) => {
-                        let reason = match e {
-                            ShaderError::Unsupported { what, .. } => format!("structure: {what}"),
-                            ShaderError::Isa { reason, .. } => format!("structure: {reason}"),
-                            e => e.to_string(),
-                        };
-                        t.fail(reason, || format!("{} {:?}", example(), p.stage));
-                        None
-                    }
-                };
-                if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
-                    let label = || format!("{} {:?}", example(), p.stage);
-                    *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
-                        Ok(shader) => {
-                            *counter(t, p.stage, 1) += 1;
-                            check(shader, t, checks, label);
-                        }
-                        Err(ShaderError::Unsupported { offset, what }) => t
-                            .fail(format!("emit: {what}"), || {
-                                format!("{} at {offset:#x}", label())
-                            }),
-                        Err(e) => t.fail(format!("emit: {e}"), label),
-                    }
+                        }),
+                    Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
                 }
             }
-            Err(e) => {
-                let reason = match e {
-                    ShaderError::Unsupported { what, .. } => format!("unsupported: {what}"),
-                    e => e.to_string(),
-                };
-                t.fail(reason, || format!("{} {:?}", example(), p.stage));
+            let structured = match structure::structure(&program) {
+                Ok(s) => {
+                    tally_structured(&program, &s, t);
+                    Some(s)
+                }
+                Err(e) => {
+                    let reason = match e {
+                        ShaderError::Unsupported { what, .. } => format!("structure: {what}"),
+                        ShaderError::Isa { reason, .. } => format!("structure: {reason}"),
+                        e => e.to_string(),
+                    };
+                    t.fail(reason, || format!("{} {:?}", example(), p.stage));
+                    None
+                }
+            };
+            if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
+                let label = || format!("{} {:?}", example(), p.stage);
+                *counter(t, p.stage, 0) += 1;
+                match emit::emit(container, p, &program, &s, &i, &r) {
+                    Ok(shader) => {
+                        *counter(t, p.stage, 1) += 1;
+                        check(shader, t, checks, label);
+                    }
+                    Err(ShaderError::Unsupported { offset, what }) => t
+                        .fail(format!("emit: {what}"), || {
+                            format!("{} at {offset:#x}", label())
+                        }),
+                    Err(e) => t.fail(format!("emit: {e}"), label),
+                }
             }
+        }
+        Err(e) => {
+            let reason = match e {
+                ShaderError::Unsupported { what, .. } => format!("unsupported: {what}"),
+                e => e.to_string(),
+            };
+            t.fail(reason, || format!("{} {:?}", example(), p.stage));
         }
     }
 }
@@ -467,10 +391,9 @@ fn check(
                 .unwrap_or(text.lines().next().unwrap_or(""))
                 .to_owned();
             if let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP") {
-                let n = t
-                    .failed
-                    .get(&format!("validator: {first}"))
-                    .map_or(0, |f| f.0);
+                let seen = checks.dumped.entry(first.clone()).or_default();
+                let n = *seen;
+                *seen += 1;
                 if n < 3 {
                     let name = format!(
                         "{dir}/{}_{n}",
