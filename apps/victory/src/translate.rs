@@ -723,3 +723,74 @@ mod offhost {
         }
     }
 }
+
+/// Off Windows: the checks that need a host refuse up front, and the walk
+/// itself still runs.
+#[cfg(all(test, not(windows)))]
+mod host_free_tests {
+    use super::offhost::{self, Host, Validator};
+    use std::path::{Path, PathBuf};
+    use victory_shader::HwStage;
+    use victory_shader::emit::HostShader;
+
+    const NONE: &str = "needs Windows (D3D12 / dxil.dll)";
+
+    /// Never created: the walk skips what it cannot read.
+    fn missing() -> Vec<PathBuf> {
+        vec![PathBuf::from("/nonexistent/victory/shaders")]
+    }
+
+    #[test]
+    fn validation_and_pipelines_are_refused_before_the_walk() {
+        for (validate, pipelines) in [(true, false), (false, true), (true, true)] {
+            for list in [false, true] {
+                let err = super::run(missing(), validate, pipelines, list, Some(1)).unwrap_err();
+                assert_eq!(err.to_string(), NONE, "{validate} {pipelines} {list}");
+            }
+        }
+    }
+
+    #[test]
+    fn translation_alone_walks_paths_it_cannot_read() {
+        // Missing roots and empty job counts are not errors; no check
+        // asks for a host.
+        for jobs in [None, Some(1), Some(64)] {
+            super::run(missing(), false, false, false, jobs).unwrap();
+        }
+        super::run(missing(), false, false, true, Some(2)).unwrap();
+    }
+
+    #[test]
+    fn the_host_stand_ins_report_themselves_unavailable() {
+        assert_eq!(Validator::default_path(), None);
+        for dll in [None, Some(Path::new("dxil.dll")), Some(Path::new(""))] {
+            assert_eq!(Validator::load(dll).err().as_deref(), Some(NONE));
+        }
+        for data in [&mut [][..], &mut [0u8; 16][..]] {
+            assert_eq!(Validator.validate(data), Err(NONE.into()));
+        }
+        for debug in [false, true] {
+            assert_eq!(Host::new(debug).err().as_deref(), Some(NONE));
+        }
+        // No stub vertex shader to pair with, and no pipeline of any kind.
+        let shader = |stage| HostShader {
+            stage,
+            dxil: Vec::new(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+        };
+        let (vs, ps, cs, ms) = (
+            shader(HwStage::Vs),
+            shader(HwStage::Ps),
+            shader(HwStage::Cs),
+            shader(HwStage::Ms),
+        );
+        assert_eq!(offhost::host::stub_vs(&ps), Err(NONE.into()));
+        assert_eq!(Host.pipeline(&vs, &ps), Err(NONE.into()));
+        assert_eq!(Host.compute_pipeline(&cs), Err(NONE.into()));
+        assert_eq!(Host.mesh_pipeline(&ms, &ps), Err(NONE.into()));
+    }
+}

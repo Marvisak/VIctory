@@ -338,3 +338,26 @@ mod tests {
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }
+
+/// The Windows test above holds the host loader lock; off Windows `run`
+/// refuses before touching the title.
+#[cfg(all(test, not(windows)))]
+mod host_free_tests {
+    use crate::{Console, Unimplemented};
+
+    #[test]
+    fn running_a_title_is_refused_off_windows_for_any_options() {
+        // A path that does not exist: the refusal comes first, so it is
+        // never read.
+        let title = std::path::Path::new("/nonexistent/victory/title.exe");
+        for unimplemented in [Unimplemented::Trap, Unimplemented::Zero] {
+            for console in [Console::SeriesX, Console::SeriesS] {
+                for (a, b) in [(false, false), (true, false), (false, true), (true, true)] {
+                    let err = super::run(title, unimplemented, a, b, console).unwrap_err();
+                    assert_eq!(err.to_string(), "running titles requires Windows");
+                }
+            }
+        }
+        assert!(!title.exists());
+    }
+}
