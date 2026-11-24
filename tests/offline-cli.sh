@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-python3 - "${1:?Path to victory binary required}" <<'PY'
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+python3 -E - "${1:?Path to victory binary required}" "$repo_root" <<'PY'
 import os
 import struct
 import subprocess
@@ -11,6 +13,17 @@ import zlib
 from pathlib import Path
 
 binary = Path(sys.argv[1]).resolve()
+repo = Path(sys.argv[2]).resolve()
+
+# Keep generated artifacts outside the checkout.
+temp_dir = Path(tempfile.gettempdir()).resolve()
+
+if temp_dir == repo or repo in temp_dir.parents:
+    if os.name == "posix":
+        temp_dir = Path("/tmp").resolve()
+
+if not temp_dir.is_dir() or temp_dir == repo or repo in temp_dir.parents:
+    raise SystemExit("Set TMPDIR outside the checkout")
 
 def fixture(words, lds=0, threads=1):
     payload = bytearray(0x68)
@@ -120,7 +133,7 @@ def verify_dxil(path):
     )
 
 with tempfile.TemporaryDirectory(
-    prefix="victory-offline-"
+    prefix="victory-offline-", dir=temp_dir
 ) as tmp:
     root = Path(tmp)
 
@@ -153,6 +166,7 @@ with tempfile.TemporaryDirectory(
     )
 
     env = os.environ.copy()
+    env.update(TMPDIR=str(root), TMP=str(root), TEMP=str(root))
 
     env.pop("VICTORY_PAIRS", None)
     env.pop("VICTORY_EMIT_DUMP", None)
