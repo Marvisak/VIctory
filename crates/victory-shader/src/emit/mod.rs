@@ -77,7 +77,8 @@
 
 mod bitcode;
 mod container;
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -86,9 +87,11 @@ mod sampler;
 mod shader;
 #[cfg(windows)]
 pub mod validator;
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 mod valu_tests;
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 mod waterfall_tests;
 mod wave;
 

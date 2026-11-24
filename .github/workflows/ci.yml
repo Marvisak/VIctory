@@ -44,6 +44,17 @@ jobs:
       - uses: actions/checkout@v5
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # Clippy treats a module as test code only under a plain `#[cfg(test)]`;
+      # `cfg(all(test, windows))` turns its helpers into library code for the
+      # print/exit lints, and Linux never compiles them, so only Windows CI
+      # would notice (PR #1 failed exactly that way).
+      - name: Test modules use a plain cfg(test)
+        shell: bash
+        run: |
+          if git grep -nE 'cfg\(all\(test|cfg\(all\([^)]*,\s*test' -- '*.rs'; then
+            echo "::error::split into #[cfg(test)] and #[cfg(<platform>)]; see AGENTS.md, Pitfalls"
+            exit 1
+          fi
       - name: Check
         run: cargo check --workspace --all-targets --locked --exclude victory-hle --exclude victory
       - name: Clippy

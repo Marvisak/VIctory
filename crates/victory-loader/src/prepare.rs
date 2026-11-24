@@ -175,7 +175,8 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 
 // Every test here prepares the test binary itself, which is a PE image
 // only on Windows.
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 mod tests {
     use super::*;
 

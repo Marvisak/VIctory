@@ -5,10 +5,6 @@
 //! Needs `VICTORY_CONSOLE_DXC` (the console SDK's `dxc.exe`) and a PC
 //! `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's); skipped
 //! without them. Set `VICTORY_WARP=1` to draw on WARP.
-#![allow(
-    clippy::print_stderr,
-    reason = "tests say what they skipped and compared; clippy's test exemption misses `cfg(all(test, windows))` helpers"
-)]
 
 use std::path::{Path, PathBuf};
 

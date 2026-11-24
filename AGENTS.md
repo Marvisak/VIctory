@@ -115,6 +115,7 @@ unfulfilled expectation is itself a warning, and CI runs `-D warnings`.
 | Panic reachable from title code | `victory-shader/src/emit/bitcode.rs` `panic!`s on internal invariants, reached from `victory-gpu` pipeline creation; `host!` in `victory-hle/src/modules/files.rs` panics if a host export is missing; `Stage::translated` in `victory-gpu/src/pipeline/host.rs` uses `expect` | Return `Result` and map it to the API's failure (`E_FAIL`, a dropped draw) with a log line. |
 | Giant functions and files | `victory-shader/src/emit/lower.rs` is 7,424 lines; clippy counts 32 functions over 100 lines in the portable crates alone | New logic goes in a new, focused module; extract before extending. |
 | Docs promise what the code does not do (or deny what it does) | see Known doc drift below | Update the doc in the same commit as the code. |
+| A Windows-only test helper prints, Linux CI is green and Windows clippy fails | `emit/valu_tests.rs` was gated `#[cfg(all(test, windows))]`; clippy only exempts code under a plain `#[cfg(test)]`, so its `eprintln!` in `run_cases` broke PR #1 | Gate test modules with `#[cfg(test)]` and `#[cfg(windows)]` as two attributes, never `cfg(all(test, ...))` (the `portable` CI job rejects it). |
 | Unverifiable lint suppression | `#[allow(dead_code)] // unused in test builds` | `#[allow(dead_code, reason = "...")]`; never `#[expect]` on code CI compiles differently per cfg. |
 
 ## Known doc drift (to fix, not to copy)

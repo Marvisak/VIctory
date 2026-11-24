@@ -309,7 +309,8 @@ impl LoaderLock {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 mod tests {
     use std::sync::{Arc, Mutex};
 

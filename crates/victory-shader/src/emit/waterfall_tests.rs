@@ -2,10 +2,6 @@
 //! synthetic GFX10 programs of `resource::tests` lowered to DXIL, validated
 //! by `dxil.dll` when present, and run on the host GPU and WARP, each lane
 //! reading the resource its own descriptor names.
-#![allow(
-    clippy::print_stderr,
-    reason = "tests say what they skipped and compared; clippy's test exemption misses `cfg(all(test, windows))` helpers"
-)]
 
 use windows::Win32::Graphics::Direct3D12::*;
 
