@@ -315,10 +315,10 @@ fn program(
             };
             if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                 let label = || format!("{} {:?}", example(), p.stage);
-                *counter(t, p.stage, 0) += 1;
+                *counters(t, p.stage)[0] += 1;
                 match emit::emit(container, p, &program, &s, &i, &r) {
                     Ok(shader) => {
-                        *counter(t, p.stage, 1) += 1;
+                        *counters(t, p.stage)[1] += 1;
                         check(shader, t, checks, label);
                     }
                     Err(ShaderError::Unsupported { offset, what }) => t
@@ -373,7 +373,7 @@ fn check(
         };
         match made {
             Ok(()) => {
-                *counter(t, shader.stage, 3) += 1;
+                *counters(t, shader.stage)[3] += 1;
                 if t.list {
                     t.lines.push(format!("{}  pipeline created", label()));
                 }
@@ -386,7 +386,7 @@ fn check(
     };
     match v.validate(&mut shader.dxil) {
         Ok(()) => {
-            *counter(t, shader.stage, 2) += 1;
+            *counters(t, shader.stage)[2] += 1;
             if t.list {
                 t.lines.push(format!("{}  validated", label()));
             }
@@ -458,9 +458,9 @@ fn write_dump(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> bool {
 }
 
 /// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,
-/// 3 pipelines.
-fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
-    let [a, b, c, d] = match stage {
+/// 3 pipelines. Callers index with constants, which rustc bounds-checks.
+fn counters(t: &mut Tally, stage: HwStage) -> [&mut usize; 4] {
+    match stage {
         HwStage::Cs => [
             &mut t.cs_programs,
             &mut t.cs_emitted,
@@ -479,8 +479,7 @@ fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
             &mut t.validated,
             &mut t.pipelines,
         ],
-    };
-    [a, b, c, d].into_iter().nth(k).expect("0 to 3")
+    }
 }
 
 fn tally_io(r: &io::Io, t: &mut Tally) {
