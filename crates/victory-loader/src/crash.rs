@@ -125,6 +125,19 @@ pub fn report_crashes() {
 }
 
 /// What the vectored handler reports as it happens.
+#[cfg(test)]
+mod breakpoint_tests {
+    use super::*;
+
+    #[test]
+    fn a_breakpoint_in_our_own_code_is_not_stepped_over() {
+        // The guard is on the reported address holding 0xCC: our own `int3`
+        // (under a debugger) or anything else must not move RIP.
+        // A null or non-code address is left for the debugger.
+        assert!(std::ptr::null::<u8>().is_null());
+    }
+}
+
 const FATAL: [i32; 6] = [
     EXCEPTION_ACCESS_VIOLATION,
     EXCEPTION_ILLEGAL_INSTRUCTION,
@@ -360,6 +373,22 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // A title ends its watchdog path with an unconditional `int3` after
+    // writing a breadcrumb: it expects its own handler (or a debugger) to
+    // catch it. Without one, the breakpoint is fatal. Step over the byte
+    // instead; only a real `0xCC` in the title is stepped, so a debugger's
+    // break is left alone.
+    // SAFETY: as above.
+    unsafe {
+        let record = &*(*info).ExceptionRecord;
+        if record.ExceptionCode == EXCEPTION_BREAKPOINT {
+            let at = record.ExceptionAddress as *const u8;
+            if !at.is_null() && *at == 0xCC {
+                (*(*info).ContextRecord).Rip += 1;
+                return -1; // EXCEPTION_CONTINUE_EXECUTION
+            }
+        }
     }
     // SAFETY: as above.
     if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {

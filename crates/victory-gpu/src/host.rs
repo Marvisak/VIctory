@@ -413,6 +413,96 @@ struct Deferred {
     budget_zeroed: bool,
 }
 
+/// The title writes a breadcrumb through a null pointer
+/// (`mov dword ptr [0], 0x4d8bd421`) after its watchdog fires: the console
+/// keeps a null page. The PC keeps none, and no allocator places memory at
+/// zero, so the write faulted and killed the run. Reserves a low page and
+/// rewrites each such instruction's absolute address to it.
+///
+/// Call before the title runs; returns how many instructions were pointed
+/// elsewhere (0 when the page or the image could not be had).
+pub fn redirect_null_write(image: usize, size: usize) -> usize {
+    // SAFETY: a plain low reservation and a read/write of the mapped image.
+    unsafe {
+        use windows_sys::Win32::System::Memory::{
+            PAGE_READWRITE, MEM_RESERVE, MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualAlloc,
+            VirtualProtect, VirtualQuery, MEM_COMMIT as _,
+        };
+        // A whole 64 KiB: some breadcrumbs write small offsets like `[4]`.
+        let page = VirtualAlloc(
+            0x1_0000 as *const core::ffi::c_void,
+            0x1_0000,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        );
+        let at = page as usize;
+        if at == 0 || at > 0x4000_0000 {
+            return 0;
+        }
+        // `mov dword ptr ds:0, imm32`: opcode, SIB, then the absolute address.
+        const OPCODE: [u8; 3] = [0xC7, 0x04, 0x25];
+        let base = image as *const u8;
+        let end = base.add(size);
+        let mut patched = 0usize;
+        let mut cursor = base;
+        let mut old = 0u32;
+        while cursor < end {
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            let got = VirtualQuery(
+                cursor.cast(),
+                &mut info,
+                core::mem::size_of_val(&info),
+            );
+            if got == 0 {
+                break;
+            }
+            let region = info.RegionSize;
+            let readable = info.State == MEM_COMMIT
+                && info.Protect & 0x01 == 0
+                && info.Protect & 0x100 == 0;
+            if readable {
+                let bytes = core::slice::from_raw_parts(cursor, region);
+                let mut i = 0;
+                while i + OPCODE.len() <= bytes.len() {
+                    if bytes[i..i + OPCODE.len()] == OPCODE {
+                        let here = cursor.add(i + 3);
+                        let was = u32::from_le_bytes([
+                            *bytes.get(i + 3).unwrap_or(&0),
+                            *bytes.get(i + 4).unwrap_or(&0),
+                            *bytes.get(i + 5).unwrap_or(&0),
+                            *bytes.get(i + 6).unwrap_or(&0),
+                        ]);
+                        if was < 0x1_0000 {
+                            let mut back = 0u32;
+                            let page = (here as usize & !0xFFF) as *const core::ffi::c_void;
+                            // Four bytes may straddle two pages.
+                            let span =
+                                if (here as usize & 0xFFF) > 0xFFC { 0x2_000 } else { 0x1_000 };
+                            if VirtualProtect(page, span, 0x40, &mut old) != 0 {
+                                (here as *mut u8).copy_from_nonoverlapping(
+                                    ((at as u32).wrapping_add(was)).to_le_bytes().as_ptr(),
+                                    4,
+                                );
+                                VirtualProtect(page, span, old, &mut back);
+                                patched += 1;
+                            }
+                            i += OPCODE.len();
+                            continue;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            cursor = cursor.add(region);
+        }
+        if patched > 0 {
+            use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+            FlushInstructionCache(-1isize as *mut core::ffi::c_void, base.cast(), size);
+        }
+        patched
+    }
+}
+
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
