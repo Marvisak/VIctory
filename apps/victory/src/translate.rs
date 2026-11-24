@@ -356,7 +356,7 @@ fn check(
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
-        let _ = std::fs::write(
+        write_dump(
             format!("{dir}/{}.dxil", &name[name.len().saturating_sub(100)..]),
             &shader.dxil,
         );
@@ -409,11 +409,25 @@ fn check(
                             .take(40)
                             .collect::<String>()
                     );
-                    let _ = std::fs::write(format!("{name}.dxil"), &shader.dxil);
-                    let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
+                    write_dump(format!("{name}.dxil"), &shader.dxil);
+                    write_dump(format!("{name}.txt"), format!("{}\n{text}", label()));
                 }
             }
             t.fail(format!("validator: {first}"), label);
+        }
+    }
+}
+
+/// Writes a `VICTORY_EMIT_DUMP` file. A dump is a debugging aid, so a
+/// failed write does not stop the run, but it is logged with its path;
+/// returns whether the file was written.
+fn write_dump(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> bool {
+    let path = path.as_ref();
+    match std::fs::write(path, contents) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "emit dump not written");
+            false
         }
     }
 }
@@ -593,4 +607,25 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dump_is_written() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("a.dxil");
+        assert!(write_dump(&path, b"DXBC"));
+        assert_eq!(std::fs::read(&path).expect("dump read back"), b"DXBC");
+    }
+
+    #[test]
+    fn failed_dump_is_reported_not_swallowed() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("missing").join("a.dxil");
+        assert!(!write_dump(&path, b"DXBC"));
+        assert!(!path.exists());
+    }
 }
