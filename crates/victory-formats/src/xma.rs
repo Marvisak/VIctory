@@ -180,6 +180,11 @@ impl Bits<'_> {
         if n == 0 {
             return 0;
         }
+        if n >= 32 {
+            let v = self.peek32();
+            self.pos += n as usize;
+            return v;
+        }
         let v = self.peek32() >> (32 - n);
         self.pos += n as usize;
         v
@@ -190,6 +195,12 @@ impl Bits<'_> {
     }
 
     fn signed(&mut self, n: u32) -> i32 {
+        if n == 0 {
+            return 0;
+        }
+        if n >= 32 {
+            return self.read(n) as i32;
+        }
         ((self.read(n) << (32 - n)) as i32) >> (32 - n)
     }
 
@@ -1117,6 +1128,33 @@ mod tests {
     fn packet_rejects_out_of_range_indices_and_partial_headers() {
         assert!(packet(&[0; 4], usize::MAX / PACKET_BYTES + 1).is_none());
         assert!(packet(&[0; 3], 0).is_none());
+    }
+
+    #[test]
+    fn bitstream_handles_zero_and_boundary_bit_widths() {
+        let data = [0xAA, 0x55, 0xCC, 0x33, 0xFF];
+        let mut bits = Bits {
+            data: &data,
+            pos: 0,
+            end: data.len() * 8,
+        };
+        assert_eq!(bits.read(0), 0);
+        assert_eq!(bits.signed(0), 0);
+        assert_eq!(bits.consumed(), 0);
+
+        let word = bits.read(32);
+        assert_eq!(word, 0xAA55_CC33);
+        assert_eq!(bits.consumed(), 32);
+
+        let mut bits2 = Bits {
+            data: &[0b1111_0000, 0b0000_1111],
+            pos: 0,
+            end: 16,
+        };
+        assert_eq!(bits2.signed(4), -1);
+        assert_eq!(bits2.signed(4), 0);
+        assert_eq!(bits2.signed(4), 0);
+        assert_eq!(bits2.signed(4), -1);
     }
 
     #[test]
