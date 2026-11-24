@@ -155,7 +155,7 @@ mod tests {
     /// Enforces the citations wherever tests run, so Windows CI checks them too.
     #[test]
     fn agents_md_citations_resolve() {
-        super::run(&crate::workspace_root(), &["AGENTS.md".to_owned()]).unwrap();
+        super::run(&crate::workspace_root().unwrap(), &["AGENTS.md".to_owned()]).unwrap();
     }
 
     #[test]
