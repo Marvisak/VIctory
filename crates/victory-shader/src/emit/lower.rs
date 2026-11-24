@@ -65,6 +65,21 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    if let StageIo::Cs(cs) = &parts.native.io
+        && !thread_group_fits(cs.threads)
+    {
+        return Err(ShaderError::Malformed("a thread group past D3D12's limits"));
+    }
+    // The size goes into `PSV0` whether or not the program reads LDS, and
+    // was rounded up to dwords and back (overflowing `u32` near its top).
+    if let StageIo::Ms(ms) = &parts.native.io
+        && ms.lds_bytes > MS_SHARED_BYTES
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "mesh group shared memory past D3D12's 28 KB",
+        });
+    }
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad).run() {
@@ -81,6 +96,21 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
         }
     }
 }
+
+/// Whether a compute program's `numthreads` is one D3D12 runs (and the
+/// console's compiler accepts): 1-1024 by 1-1024 by 1-64, at most 1024
+/// threads. The size comes from the title's stage data; the lowering
+/// multiplies its components in `u32` and divides by them.
+fn thread_group_fits([x, y, z]: [u32; 3]) -> bool {
+    (1..=1024).contains(&x) && (1..=1024).contains(&y) && (1..=64).contains(&z) && x * y * z <= 1024
+}
+
+/// `D3D12_CS_TGSM_REGISTER_COUNT` dwords: the group shared memory a compute
+/// program may declare. The console's `LDS_SIZE` reaches 64 KB (and its
+/// field 255.5 KB); the validator refuses a module over this.
+const CS_SHARED_BYTES: u32 = 32 * 1024;
+/// The group shared memory a mesh program may declare (`PSV0`'s count too).
+const MS_SHARED_BYTES: u32 = 28 * 1024;
 
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
@@ -1001,25 +1031,26 @@ impl<'a> Lower<'a> {
             .map(|r| r + 1)
             .max()
             .unwrap_or(0);
+        // D3D12 links stages through 32 registers. A signature that already
+        // uses r31 leaves no row for an id lowering adds, and one at r32 got
+        // the pipeline refused.
+        let fits = free < super::SIGNATURE_REGISTERS;
         let id = match self.s.inputs.iter().position(|e| e.kind == kind) {
             Some(id) => {
-                if kind != 3 {
-                    self.s.inputs[id].row.get_or_insert(free);
+                if kind != 3 && self.s.inputs[id].row.is_none() {
+                    if !fits {
+                        return Val::Missing("a system input past the 32 input registers");
+                    }
+                    self.s.inputs[id].row = Some(free);
                 }
                 id
             }
             None if kind >= 3 => return Val::Missing("a pixel system input the signature lacks"),
+            None if !fits => return Val::Missing("a system input past the 32 input registers"),
             None => {
                 // The console signature leaves out vertex and instance ids; PC
                 // gives them a row after the others.
-                let row = self
-                    .s
-                    .inputs
-                    .iter()
-                    .filter_map(|e| e.row)
-                    .map(|r| r + 1)
-                    .max()
-                    .unwrap_or(0);
+                let row = free;
                 self.s.inputs.push(SigElement {
                     name: ["", "SV_VertexID", "SV_InstanceID"][kind as usize].into(),
                     index: 0,
@@ -2028,6 +2059,28 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// Source `k`, a console lane select, as the hardware takes it: only
+    /// its low 5 (wave32) or 6 (wave64) bits, so lane 35 of a wave32 is
+    /// lane 3. Unmasked, a write to lane 35 would match no lane and a read
+    /// of it would ask the host for a lane past its wave. A constant folds.
+    fn lane_select(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let m = self.wave() - 1;
+        let constant = match v.src.get(k) {
+            Some(&Operand::Const(c)) => crate::resource::inline(c),
+            Some(&Operand::Literal(x)) => Some(x),
+            _ => None,
+        };
+        if let Some(x) = constant {
+            return Ok(self.s.m.i32(x & m));
+        }
+        let lane = self.src(inst, k)?;
+        let m = self.s.m.i32(m);
+        Ok(self.s.m.bin(self.cur, Bin::And, lane, m))
+    }
+
     fn read_lane(&mut self, x: V, lane: V) -> V {
         self.s.op(
             self.cur,
@@ -2129,6 +2182,11 @@ impl<'a> Lower<'a> {
         }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
+        }
+        // A compute program that allocates more but never reads it still
+        // translates: the host array exists only once LDS is used.
+        if self.s.lds_dwords > CS_SHARED_BYTES / 4 {
+            return Err("group shared memory past D3D12's 32 KB");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
@@ -4203,20 +4261,24 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_readlane_b32" => {
-                let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                let a = s(self, 0)?;
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                let constant =
+                    matches!(v.src.get(1), Some(Operand::Const(_) | Operand::Literal(_)));
+                let lane = if self.mask_data == MaskData::Host && !constant {
                     self.s.flags |= flags::WAVE_OPS;
+                    s(self, 1)?
                 } else {
                     self.cross_lane(false)?;
-                }
+                    self.lane_select(inst, 1)?
+                };
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
-                let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                let (a, lane) = (s(self, 0)?, self.lane_select(inst, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
                 };
@@ -6523,6 +6585,12 @@ impl<'a> Lower<'a> {
             &self.s.outputs
         };
         let by_kind = |kind: u8| outputs.iter().position(|o| o.kind == kind);
+        // Register component `ch` of element `id`, as the element's own
+        // column; `None` for a component the element does not cover.
+        let column = |id: usize, ch: u8| {
+            let o = &outputs[id];
+            (ch >= o.col && ch < o.col + o.cols).then(|| (id, ch - o.col))
+        };
         // 16-bit vertex outputs: the halves each dword carries, as (output
         // element, channel, high half) per channel.
         let halves = match e.target {
@@ -6563,11 +6631,15 @@ impl<'a> Lower<'a> {
                 break;
             }
             let found = match e.target {
+                // The export's channels are the register's components. A
+                // narrower element (a `float2` target) has columns only for
+                // its own; the rest went out as columns past it, and DXC's
+                // validator refuses a `storeOutput` outside its element.
                 Target::Color(n) => outputs
                     .iter()
                     .position(|o| o.kind == 16 && o.row == Some(u32::from(n)))
-                    .map(|id| (id, ch)),
-                Target::Position(0) => by_kind(3).map(|id| (id, ch)),
+                    .and_then(|id| column(id, ch)),
+                Target::Position(0) => by_kind(3).and_then(|id| column(id, ch)),
                 Target::Depth => match ch {
                     0 => by_kind(17)
                         .or(by_kind(18))
@@ -6957,17 +7029,45 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64: false,
-            vgprs: 256,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Cs(ComputeIo {
+        dxil_io(
+            words,
+            false,
+            StageIo::Cs(ComputeIo {
                 rsrc2,
                 threads: [1, 1, 1],
             }),
+        )
+        .map(|_| ())
+    }
+
+    /// The DXIL of a compute program of constants.
+    fn dxil(words: &[u32], wave64: bool) -> Result<Vec<u8>, crate::ShaderError> {
+        dxil_group(words, wave64, [1, 1, 1])
+    }
+
+    /// The DXIL of a compute program of constants run in `threads` groups.
+    fn dxil_group(
+        words: &[u32],
+        wave64: bool,
+        threads: [u32; 3],
+    ) -> Result<Vec<u8>, crate::ShaderError> {
+        dxil_io(words, wave64, StageIo::Cs(ComputeIo { rsrc2: 0, threads }))
+    }
+
+    /// The DXIL of a program of constants with stage data `io`.
+    fn dxil_io(words: &[u32], wave64: bool, io: StageIo) -> Result<Vec<u8>, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let stage = match io {
+            StageIo::Ms(_) => HwStage::Ms,
+            _ => HwStage::Cs,
+        };
+        let native = NativeProgram {
+            stage,
+            wave64,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io,
             code,
         };
         let p = ir::build(&native.code, false, 256).unwrap();
@@ -6985,7 +7085,205 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+        .map(|l| l.dxil)
+    }
+
+    /// `numthreads` comes from the title's stage data. A size D3D12 cannot
+    /// run is refused before lowering multiplies its components (which
+    /// overflowed `u32` for 65536 x 65536 and wrapped to 0 in a release
+    /// build) or divides by them (0).
+    #[test]
+    fn a_thread_group_past_d3d12s_limits_is_refused() {
+        let refused = Err(crate::ShaderError::Malformed(
+            "a thread group past D3D12's limits",
+        ));
+        for threads in [
+            [0, 1, 1],
+            [1, 0, 1],
+            [1, 1, 0],
+            [1025, 1, 1],
+            [1, 1025, 1],
+            [1, 1, 65],
+            [64, 32, 1],
+            [32, 8, 8],
+            [65536, 65536, 1],
+            [u32::MAX, u32::MAX, u32::MAX],
+        ] {
+            for wave64 in [false, true] {
+                let got = dxil_group(&[S_ENDPGM], wave64, threads).map(|_| ());
+                assert_eq!(got, refused, "{threads:?} wave64 {wave64}");
+            }
+        }
+        for threads in [
+            [1, 1, 1],
+            [1024, 1, 1],
+            [1, 1024, 1],
+            [1, 1, 64],
+            [16, 16, 4],
+            [8, 8, 16],
+        ] {
+            assert!(
+                dxil_group(&[S_ENDPGM], false, threads).is_ok(),
+                "{threads:?}"
+            );
+        }
+    }
+
+    /// D3D12 caps group shared memory at 32 KB for compute and 28 KB for
+    /// mesh programs; the console's LDS size goes past both (its compute
+    /// field to 255.5 KB, a mesh record's to `u32::MAX`). A compute program
+    /// using LDS past the cap is refused where it does, and one that only
+    /// allocates it still translates. A mesh program's size goes into
+    /// `PSV0` regardless, so it is refused up front; `u32::MAX` used to
+    /// overflow rounding to dwords and back.
+    #[test]
+    fn group_shared_memory_past_d3d12s_limits_is_refused() {
+        // ds_write_b32 v0, v1 (a read whose result is unused is dropped)
+        const DS_WRITE: [u32; 2] = [0xD834_0000, 0x0000_0100];
+        let cs = |granules: u32, words: &[u32]| {
+            let io = StageIo::Cs(ComputeIo {
+                rsrc2: granules << 15,
+                threads: [64, 1, 1],
+            });
+            dxil_io(words, false, io).map(|_| ())
+        };
+        let write = [DS_WRITE[0], DS_WRITE[1], S_ENDPGM];
+        for granules in [1, 32, 64] {
+            assert_eq!(cs(granules, &write), Ok(()), "{granules} granules");
+        }
+        for granules in [65, 128, 0x1FF] {
+            assert_eq!(
+                cs(granules, &write),
+                Err(crate::ShaderError::Unsupported {
+                    offset: 0,
+                    what: "group shared memory past D3D12's 32 KB",
+                }),
+                "{granules} granules"
+            );
+            assert_eq!(cs(granules, &[S_ENDPGM]), Ok(()), "{granules} unused");
+        }
+
+        let ms = |lds_bytes: u32| {
+            let io = StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 3,
+                max_primitives: 1,
+                topology: 2,
+                lds_bytes,
+            });
+            dxil_io(&[S_ENDPGM], false, io).map(|_| ())
+        };
+        for lds_bytes in [0, 4, 28 * 1024] {
+            assert_eq!(ms(lds_bytes), Ok(()), "{lds_bytes} bytes");
+        }
+        for lds_bytes in [28 * 1024 + 1, 32 * 1024, 64 * 1024, u32::MAX - 2, u32::MAX] {
+            assert_eq!(
+                ms(lds_bytes),
+                Err(crate::ShaderError::Unsupported {
+                    offset: 0,
+                    what: "mesh group shared memory past D3D12's 28 KB",
+                }),
+                "{lds_bytes} bytes"
+            );
+        }
+    }
+
+    /// A lane select keeps only the bits the wave has lanes for, as the
+    /// hardware does: lane 35 of a wave32 is lane 3 and lane 64 of a wave64
+    /// is lane 0, so the program is the one naming the low lane, and the
+    /// next lane up is another.
+    #[test]
+    fn a_lane_select_past_the_wave_wraps_as_the_hardware_does() {
+        // src1 is the lane's inline constant (128 + lane, lanes 0 to 64).
+        let program = |write: u32, read: u32| {
+            [
+                0xBE80_0387, // s_mov_b32 s0, 7
+                0xD761_0001,
+                (128 + write) << 9, // v_writelane_b32 v1, s0, write
+                0xD760_0002,
+                (128 + read) << 9 | 0x101, // v_readlane_b32 s2, v1, read
+                0xBF07_8002,               // s_cmp_lg_u32 s2, 0
+                0xBF85_0001,               // s_cbranch_scc1 -> s_endpgm
+                0xBE83_0380,               // s_mov_b32 s3, 0
+                S_ENDPGM,
+            ]
+        };
+        for (wave64, lane, past) in [(false, 3, 35), (true, 0, 64)] {
+            let low = dxil(&program(lane, lane), wave64).unwrap();
+            assert_ne!(dxil(&program(lane + 1, lane), wave64).unwrap(), low);
+            assert_eq!(dxil(&program(past, lane), wave64).unwrap(), low);
+            assert_eq!(dxil(&program(lane, past), wave64).unwrap(), low);
+        }
+    }
+
+    /// A lane given as a 32-bit literal, or as a negative inline constant,
+    /// is masked the same way: literal 35 or `0xFFFF_FFE3` is lane 3 of a
+    /// wave32, and -1 is the wave's top lane (31 or 63), not a lane past it.
+    #[test]
+    fn a_literal_or_negative_lane_select_wraps_as_the_hardware_does() {
+        // src1 is an inline constant (`Ok`) or the literal (`Err`) after
+        // the instruction.
+        let program = |write: Result<u32, u32>, read: Result<u32, u32>| {
+            let mut words = vec![0xBE80_0387]; // s_mov_b32 s0, 7
+            for (op, dst, src0, lane) in [(0xD761_0000, 1, 0, write), (0xD760_0000, 2, 0x101, read)]
+            {
+                let code = lane.unwrap_or(0xFF);
+                words.extend([op | dst, code << 9 | src0]);
+                if let Err(literal) = lane {
+                    words.push(literal);
+                }
+            }
+            words.extend([
+                0xBF07_8002, // s_cmp_lg_u32 s2, 0
+                0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+                0xBE83_0380, // s_mov_b32 s3, 0
+                S_ENDPGM,
+            ]);
+            words
+        };
+        let inline = |lane: u32| Ok(128 + lane);
+        for (wave64, lane, literals) in [
+            (false, 3, [35, 0xFFFF_FFE3, 0x8000_0003]),
+            (true, 3, [67, 0xFFFF_FFC3, 0x8000_0003]),
+        ] {
+            let low = dxil(&program(inline(lane), inline(lane)), wave64).unwrap();
+            assert_eq!(dxil(&program(Err(lane), Err(lane)), wave64).unwrap(), low);
+            for x in literals {
+                let at = format!("{x:#x} wave64 {wave64}");
+                assert_eq!(
+                    dxil(&program(Err(x), inline(lane)), wave64).unwrap(),
+                    low,
+                    "{at}"
+                );
+                assert_eq!(
+                    dxil(&program(inline(lane), Err(x)), wave64).unwrap(),
+                    low,
+                    "{at}"
+                );
+            }
+            assert_ne!(
+                dxil(&program(Err(lane + 1), inline(lane)), wave64).unwrap(),
+                low
+            );
+        }
+        // -1 (inline 0xC1) is lane 31 of a wave32 and lane 63 of a wave64.
+        for (wave64, top) in [(false, 31), (true, 63)] {
+            let top_lane = dxil(&program(inline(top), inline(top)), wave64).unwrap();
+            assert_eq!(
+                dxil(&program(Ok(0xC1), inline(top)), wave64).unwrap(),
+                top_lane
+            );
+            assert_eq!(
+                dxil(&program(inline(top), Ok(0xC1)), wave64).unwrap(),
+                top_lane
+            );
+            assert_eq!(
+                dxil(&program(Ok(0xC1), Ok(0xC1)), wave64).unwrap(),
+                top_lane
+            );
+        }
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
@@ -7099,9 +7397,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -7118,9 +7414,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -7137,13 +7436,12 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }

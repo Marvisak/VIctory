@@ -444,11 +444,19 @@ impl<'a> Tracer<'a> {
     }
 
     /// Layout index and dword of the root parameter `reg` holds on entry.
+    /// The SGPR `p`'s first dword arrives in. Counted wider than a register
+    /// number: `user_data` is a byte of the title's root layout, and on a
+    /// merged stage (user data from s8) one past 247 would wrap round onto
+    /// s0-s7 and claim the registers the hardware fills there. Past s105 a
+    /// parameter then matches no register.
+    fn first_sgpr(&self, p: &RootParam) -> u32 {
+        u32::from(self.stage.user_sgpr(0)) + u32::from(p.user_data)
+    }
+
     fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
         let Reg::S(code) = reg else { return None };
         self.layout.iter().enumerate().find_map(|(i, p)| {
-            let first = self.stage.user_sgpr(p.user_data);
-            let dword = u32::from(code).checked_sub(first.into())?;
+            let dword = u32::from(code).checked_sub(self.first_sgpr(p))?;
             (dword < p.sgprs).then_some((i, dword))
         })
     }
@@ -653,8 +661,9 @@ impl<'a> Tracer<'a> {
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
             RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
-                let input = self.p.inputs.iter().find(|i| i.0 == high);
+                let high = u8::try_from(self.first_sgpr(&self.layout[param]) + 1)
+                    .map_err(|_| "a root descriptor without its high half")?;
+                let input = self.p.inputs.iter().find(|i| i.0 == Reg::S(high));
                 Some(input.ok_or("a root descriptor without its high half")?.1)
             }
             _ => return Err("an address from a root parameter that is no address"),
@@ -1597,7 +1606,7 @@ impl<'a> Tracer<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Moved {
     Const(u32),
     Value(Value),
@@ -1616,7 +1625,8 @@ impl Tracer<'_> {
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
+        let lane = lane_of(lane, self.p.wave64)?;
+        self.spilled(inst.read(Reg::V(reg))?, lane, &mut Vec::new())
             .ok()
             .flatten()
     }
@@ -1650,7 +1660,7 @@ impl Tracer<'_> {
         if inst.name() != "v_writelane_b32" {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
+        if lane_of(*at, self.p.wave64).ok_or(())? != lane {
             return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
         }
         match *value {
@@ -1666,13 +1676,17 @@ impl Tracer<'_> {
     }
 }
 
-/// A lane select given as a constant.
-fn lane_of(op: Operand) -> Option<u32> {
-    match op {
+/// A lane select given as a constant, as the hardware takes it: only its
+/// low 5 (wave32) or 6 (wave64) bits, so lane 35 of a wave32 is lane 3.
+/// Compared unmasked, a write to lane 35 would not be seen to replace the
+/// one to lane 3, and a read of lane 3 would trace the older SGPR.
+fn lane_of(op: Operand, wave64: bool) -> Option<u32> {
+    let lane = match op {
         Operand::Const(c) => inline(c),
         Operand::Literal(x) => Some(x),
         _ => None,
-    }
+    }?;
+    Some(lane & if wave64 { 63 } else { 31 })
 }
 
 /// What dword `k` of a move's result copies.
@@ -1886,6 +1900,127 @@ pub(crate) mod tests {
         assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
     }
 
+    /// A lane select keeps only the bits the wave has lanes for: a spill to
+    /// lane 35 of a wave32 overwrites lane 3, so lane 3 then holds s10.
+    #[test]
+    fn a_spill_lane_past_the_wave_wraps_as_the_hardware_does() {
+        let r = track_words(
+            &[
+                0xD761_0000,
+                0x0001_0609, // v_writelane_b32 v0, s9, 3
+                0xD761_0000,
+                0x0001_460A, // v_writelane_b32 v0, s10, 35 (lane 3)
+                0xD760_0002,
+                0x0001_0700, // v_readlane_b32 s2, v0, 3
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1), param(Table, 10, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r.scalar, [((0, 4), at(1, 0x20))]);
+    }
+
+    /// A spill may carry a constant as well as an SGPR: the high half of a
+    /// table's address restored from lane 4, which was written an inline
+    /// zero, is the zero a table needs.
+    #[test]
+    fn a_spilled_constant_is_restored_as_that_constant() {
+        let r = track_words(
+            &[
+                0xD761_0000,
+                0x0001_0609, // v_writelane_b32 v0, s9, 3
+                0xD761_0000,
+                0x0001_0880, // v_writelane_b32 v0, 0, 4
+                0xD760_0002,
+                0x0001_0700, // v_readlane_b32 s2, v0, 3
+                0xD760_0003,
+                0x0001_0900, // v_readlane_b32 s3, v0, 4
+                0xF40C_0001,
+                0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r.scalar, [((0, 4), at(0, 0x20))]);
+    }
+
+    /// The read's lane select wraps as the write's does: in a wave32 a read
+    /// of lane 35 is a read of lane 3, so it restores the SGPR spilled there.
+    #[test]
+    fn a_read_lane_past_the_wave_wraps_as_the_hardware_does() {
+        let r = track_words(
+            &[
+                0xD761_0000,
+                0x0001_0609, // v_writelane_b32 v0, s9, 3
+                0xD760_0002,
+                0x0001_4700, // v_readlane_b32 s2, v0, 35 (lane 3)
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
+    }
+
+    /// A read of a lane no spill wrote reaches the VGPR's incoming value,
+    /// which is no spilled SGPR: the address is refused, not taken for the
+    /// SGPR spilled to the lane beside it.
+    #[test]
+    fn a_read_of_a_lane_no_spill_wrote_is_not_traced() {
+        let err = track_err(
+            &[
+                0xD761_0000,
+                0x0001_0809, // v_writelane_b32 v0, s9, 4
+                0xD760_0002,
+                0x0001_0700, // v_readlane_b32 s2, v0, 3
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(err, unsupported(20, "an address not from a root parameter"));
+    }
+
+    /// A root descriptor's high dword may have its bits set by
+    /// `s_bitset1_b32` rather than `s_or_b32`; the bit index keeps its low
+    /// 5 bits, so bit 52 is bit 20.
+    #[test]
+    fn root_descriptor_bits_set_one_at_a_time() {
+        let r = track_words(
+            &[
+                0xBE8B_1DB4, // s_bitset1_b32 s11, 52 (bit 20)
+                0xBE81_030B, // s_mov_b32 s1, s11
+                0xBE80_030A, // s_mov_b32 s0, s10
+                0xBE82_03C1, // s_mov_b32 s2, -1
+                0xBE83_03FF,
+                0x1101_4FAC, // s_mov_b32 s3, 0x11014fac
+                0xF430_0000,
+                0xFA00_0000, // s_buffer_load_dwordx16 s[0:15], s[0:3], null
+                S_ENDPGM,
+            ],
+            &[param(Descriptor, 10, 2)],
+            HwStage::Vs,
+        );
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: at(0, 0),
+                bits: 0x10_0000,
+                words: [u32::MAX, 0x1101_4FAC]
+            }
+        );
+    }
+
     #[test]
     fn descriptors_joined_by_control_flow_are_traced_per_edge() {
         let r = track_words(
@@ -2015,6 +2150,457 @@ pub(crate) mod tests {
                 what: "an address in an SGPR that is no root parameter"
             }
         );
+    }
+
+    /// A merged stage's user data starts at s8. A root layout byte past 247
+    /// used to wrap round onto s0-s7 (a panic in a debug build), so the load
+    /// below through s[2:3] was taken for a table at user data 250.
+    #[test]
+    fn user_data_past_the_sgprs_names_no_register() {
+        let code: Vec<u8> = [0xF408_0001, 0xFA00_0000, S_ENDPGM] // s_load_dwordx4 s[0:3], s[2:3]
+            .iter()
+            .flat_map(|w: &u32| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        for stage in [
+            HwStage::Ls,
+            HwStage::Hs,
+            HwStage::Es,
+            HwStage::Gs,
+            HwStage::Ms,
+        ] {
+            for user_data in [250, 255] {
+                let err = track(&p, &[param(Table, user_data, 1)], stage, lanes(&p).as_ref())
+                    .unwrap_err();
+                assert_eq!(
+                    err,
+                    ShaderError::Unsupported {
+                        offset: 0,
+                        what: "an address in an SGPR that is no root parameter"
+                    },
+                    "{stage:?} at user data {user_data}"
+                );
+            }
+        }
+        // Wrapped, 250 + 8 named s2 and the load was claimed for the table
+        // (failing later, on its high half); user data at s2 still is.
+        let err = track(&p, &[param(Table, 2, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 0,
+                what: "an address with an untracked high half"
+            }
+        );
+    }
+
+    /// A wave64 has lanes 32-63: a spill to lane 35 sits beside the one to
+    /// lane 3 rather than overwriting it, so lane 3 still holds s9.
+    #[test]
+    fn a_spill_lane_past_32_is_its_own_lane_in_a_wave64() {
+        let words = [
+            0xD761_0000,
+            0x0001_0609, // v_writelane_b32 v0, s9, 3
+            0xD761_0000,
+            0x0001_460A, // v_writelane_b32 v0, s10, 35
+            0xD760_0002,
+            0x0001_0700, // v_readlane_b32 s2, v0, 3
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0001,
+            0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w: &u32| w.to_le_bytes()).collect();
+        let layout = [param(Table, 9, 1), param(Table, 10, 1)];
+        let p = crate::ir::build(&code, true, 256).unwrap();
+        let r = track(&p, &layout, HwStage::Ps, lanes(&p).as_ref()).unwrap();
+        assert_eq!(r.scalar, [((0, 4), at(0, 0x20))]);
+    }
+
+    /// Lane selects keep 5 bits in a wave32 and 6 in a wave64, whether an
+    /// inline constant or a literal; a register select is not a constant.
+    #[test]
+    fn lane_selects_keep_only_the_waves_bits() {
+        let lane = |op: Operand| (lane_of(op, false), lane_of(op, true));
+        assert_eq!(lane(Operand::Const(128 + 3)), (Some(3), Some(3)));
+        assert_eq!(lane(Operand::Const(128 + 35)), (Some(3), Some(35)));
+        assert_eq!(lane(Operand::Const(128 + 64)), (Some(0), Some(0)));
+        assert_eq!(lane(Operand::Literal(99)), (Some(3), Some(35)));
+        assert_eq!(lane(Operand::Literal(u32::MAX)), (Some(31), Some(63)));
+        // -1 as an inline constant is all ones too.
+        assert_eq!(lane(Operand::Const(193)), (Some(31), Some(63)));
+        assert_eq!(lane(Operand::Const(251)), (None, None), "vccz");
+        assert_eq!(lane(Operand::Scalar { code: 4, dwords: 1 }), (None, None));
+        assert_eq!(lane(Operand::Vector { reg: 0, dwords: 1 }), (None, None));
+    }
+
+    /// Inline constants: 0-64, -1 to -16, the nine floats, and nothing for
+    /// the codes between or past them.
+    #[test]
+    fn inline_constants_cover_integers_and_floats_only() {
+        assert_eq!(inline(128), Some(0));
+        assert_eq!(inline(192), Some(64));
+        assert_eq!(inline(193), Some(u32::MAX));
+        assert_eq!(inline(208), Some(-16i32 as u32));
+        let floats: Vec<_> = (240..=247)
+            .map(|c| f32::from_bits(inline(c).unwrap()))
+            .collect();
+        assert_eq!(floats, [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0]);
+        // 1 / (2 * pi), rounded as the hardware has it.
+        let inv_2pi = f32::from_bits(inline(248).unwrap());
+        assert!((inv_2pi - 1.0 / (2.0 * std::f32::consts::PI)).abs() < 1e-7);
+        for c in (0..128).chain(209..240).chain(249..=255) {
+            assert_eq!(inline(c), None, "code {c}");
+        }
+    }
+
+    /// A source's leaves are what it can resolve to: every choice (phi,
+    /// SCC select, per-lane pick, per-lane phi) is flattened depth first in
+    /// argument order, a per-lane phi's untaken edges add nothing, and any
+    /// other source is its own one leaf, borrowed rather than copied.
+    #[test]
+    fn leaves_flatten_every_choice_in_argument_order() {
+        let c = |x: u32| Source::Constant(vec![x]);
+        let loaded = Source::Loaded {
+            load: (0, 1),
+            first: 4,
+        };
+        let fetched = Source::Fetched {
+            load: (2, 0),
+            first: 0,
+        };
+        let built = Source::Built {
+            address: at(0, 16),
+            bits: 0,
+            words: [0, 0],
+        };
+        // Each plain source is its own leaf, the very same one.
+        for s in [&c(7), &loaded, &fetched, &built] {
+            let l = s.leaves();
+            assert_eq!(l.len(), 1);
+            assert!(std::ptr::eq(l[0], s));
+        }
+        // Nested a few deep, every kind of choice inside another.
+        let tree = Source::Phi {
+            block: 3,
+            args: vec![
+                Source::Select {
+                    scc: Value(1),
+                    args: vec![c(1), loaded.clone()],
+                },
+                Source::LanePhi {
+                    block: 4,
+                    args: vec![
+                        None,
+                        Some(Source::Lanes {
+                            mask: Value(2),
+                            args: vec![fetched.clone(), c(2)],
+                        }),
+                        None,
+                        Some(built.clone()),
+                    ],
+                },
+                c(3),
+            ],
+        };
+        let leaves: Vec<Source> = tree.leaves().into_iter().cloned().collect();
+        assert_eq!(leaves, [c(1), loaded, fetched, c(2), built, c(3)]);
+        // A repeat is listed each time it is chosen, not merged.
+        let twice = Source::Select {
+            scc: Value(5),
+            args: vec![c(9), c(9)],
+        };
+        assert_eq!(twice.leaves(), [&c(9), &c(9)]);
+        // A choice with no arguments, or a per-lane phi no lane takes, has
+        // no leaves at all, and neither has a phi of those.
+        let empty = Source::Phi {
+            block: 0,
+            args: vec![
+                Source::Lanes {
+                    mask: Value(0),
+                    args: vec![],
+                },
+                Source::LanePhi {
+                    block: 1,
+                    args: vec![None, None],
+                },
+            ],
+        };
+        assert!(empty.leaves().is_empty());
+    }
+
+    /// The first instruction of `words`, decoded into its SSA form.
+    fn first_inst(words: &[u32]) -> (Program, Inst) {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let inst = p.blocks[0].insts[0].clone();
+        (p, inst)
+    }
+
+    /// The scalar moves fold to the constant each dword receives: inline
+    /// and literal sources, the bit-reversed and inverted inline forms,
+    /// `s_movk_i32`'s sign-extended 16 bits, and a 64-bit inline integer
+    /// sign-extended into its high dword.
+    #[test]
+    fn scalar_moves_fold_to_the_constant_each_dword_receives() {
+        let moved = |words: &[u32], k: usize| copy_source(&first_inst(words).1, k);
+        let c = |x: u32| Some(Moved::Const(x));
+        // s_mov_b32 s0, 5 / -3 / 0x1234_5678
+        assert_eq!(moved(&[0xBE80_0385, S_ENDPGM], 0), c(5));
+        assert_eq!(moved(&[0xBE80_03C3, S_ENDPGM], 0), c(-3i32 as u32));
+        assert_eq!(
+            moved(&[0xBE80_03FF, 0x1234_5678, S_ENDPGM], 0),
+            c(0x1234_5678)
+        );
+        // s_mov_b32 s0, 1.0 keeps the float's bits.
+        assert_eq!(moved(&[0xBE80_03F2, S_ENDPGM], 0), c(1.0f32.to_bits()));
+        // s_brev_b32 s0, 1 and s_not_b32 s0, 0
+        assert_eq!(moved(&[0xBE80_0B81, S_ENDPGM], 0), c(0x8000_0000));
+        assert_eq!(moved(&[0xBE80_0780, S_ENDPGM], 0), c(u32::MAX));
+        // s_movk_i32 s0, 0x8000 / 0x7fff
+        assert_eq!(moved(&[0xB000_8000, S_ENDPGM], 0), c(0xFFFF_8000));
+        assert_eq!(moved(&[0xB000_7FFF, S_ENDPGM], 0), c(0x7FFF));
+        // s_mov_b64 s[0:1], 7 / -1: the high dword is the sign.
+        assert_eq!(moved(&[0xBE80_0487, S_ENDPGM], 0), c(7));
+        assert_eq!(moved(&[0xBE80_0487, S_ENDPGM], 1), c(0));
+        assert_eq!(moved(&[0xBE80_04C1, S_ENDPGM], 0), c(u32::MAX));
+        assert_eq!(moved(&[0xBE80_04C1, S_ENDPGM], 1), c(u32::MAX));
+        // s_mov_b32 s0, null reads as zero.
+        assert_eq!(moved(&[0xBE80_037D, S_ENDPGM], 0), c(0));
+    }
+
+    /// A register move copies the value read from the dword it names, the
+    /// high dword of a 64-bit move from the next register; a float has no
+    /// 64-bit inline integer form, and other operations are not copies.
+    #[test]
+    fn scalar_register_moves_copy_each_dword_and_other_operations_do_not() {
+        // s_mov_b64 s[0:1], s[4:5]
+        let (_, inst) = first_inst(&[0xBE80_0404, S_ENDPGM]);
+        for k in 0..2 {
+            let read = inst.read(Reg::S(4 + k as u8)).unwrap();
+            assert_eq!(copy_source(&inst, k), Some(Moved::Value(read)));
+        }
+        // s_mov_b64 s[0:1], 1.0 and s_brev_b32 s0, s4 do not fold.
+        assert_eq!(
+            copy_source(&first_inst(&[0xBE80_04F2, S_ENDPGM]).1, 0),
+            None
+        );
+        assert_eq!(
+            copy_source(&first_inst(&[0xBE80_0B04, S_ENDPGM]).1, 0),
+            None
+        );
+        // s_add_u32 s0, s1, s2 is no move.
+        assert_eq!(
+            copy_source(&first_inst(&[0x8000_0201, S_ENDPGM]).1, 0),
+            None
+        );
+    }
+
+    /// The edges of the folded moves: a 64-bit move of null is zero in both
+    /// dwords; the inline integer range's ends sign-extend (64 to zero, -16
+    /// to ones); the bit-reversed and inverted forms take a float constant's
+    /// bits; `s_movk_i32` of all ones is -1; and a 64-bit move of a literal,
+    /// whose high dword the folding does not model, is left untraced.
+    #[test]
+    fn folded_moves_at_the_edges_of_their_ranges() {
+        let moved = |words: &[u32], k: usize| copy_source(&first_inst(words).1, k);
+        let c = |x: u32| Some(Moved::Const(x));
+        // s_mov_b64 s[0:1], null
+        assert_eq!(moved(&[0xBE80_047D, S_ENDPGM], 0), c(0));
+        assert_eq!(moved(&[0xBE80_047D, S_ENDPGM], 1), c(0));
+        // s_mov_b64 s[0:1], 64 / -16
+        assert_eq!(moved(&[0xBE80_04C0, S_ENDPGM], 0), c(64));
+        assert_eq!(moved(&[0xBE80_04C0, S_ENDPGM], 1), c(0));
+        assert_eq!(moved(&[0xBE80_04D0, S_ENDPGM], 0), c(-16i32 as u32));
+        assert_eq!(moved(&[0xBE80_04D0, S_ENDPGM], 1), c(u32::MAX));
+        // s_brev_b32 s0, 1.0 and s_not_b32 s0, -1
+        assert_eq!(
+            moved(&[0xBE80_0BF2, S_ENDPGM], 0),
+            c(1.0f32.to_bits().reverse_bits())
+        );
+        assert_eq!(moved(&[0xBE80_07C1, S_ENDPGM], 0), c(0));
+        // s_movk_i32 s0, 0xffff
+        assert_eq!(moved(&[0xB000_FFFF, S_ENDPGM], 0), c(u32::MAX));
+        // s_mov_b64 s[0:1], 0x1234_5678 (literal)
+        assert_eq!(moved(&[0xBE80_04FF, 0x1234_5678, S_ENDPGM], 0), None);
+    }
+
+    /// The folds stop where the compiler's constants do: a 32-bit register
+    /// move copies the one dword it names; the 1/(2*pi) and half inline
+    /// floats keep their bits; `s_movk_i32` of zero is zero; and a
+    /// bit-reversed or inverted literal, a 64-bit move of a float, or a
+    /// move of `vccz` (no inline value) is left untraced.
+    #[test]
+    fn folds_stop_at_literals_floats_and_condition_codes() {
+        let moved = |words: &[u32], k: usize| copy_source(&first_inst(words).1, k);
+        let c = |x: u32| Some(Moved::Const(x));
+        // s_mov_b32 s0, s4
+        let (_, inst) = first_inst(&[0xBE80_0304, S_ENDPGM]);
+        let read = inst.read(Reg::S(4)).unwrap();
+        assert_eq!(copy_source(&inst, 0), Some(Moved::Value(read)));
+        // s_mov_b32 s0, 0.5 / -4.0 / 1/(2*pi)
+        assert_eq!(moved(&[0xBE80_03F0, S_ENDPGM], 0), c(0.5f32.to_bits()));
+        assert_eq!(moved(&[0xBE80_03F7, S_ENDPGM], 0), c((-4.0f32).to_bits()));
+        assert_eq!(moved(&[0xBE80_03F8, S_ENDPGM], 0), c(0x3E22_F983));
+        // s_movk_i32 s0, 0
+        assert_eq!(moved(&[0xB000_0000, S_ENDPGM], 0), c(0));
+        // s_brev_b32 s0, 0x1 and s_not_b32 s0, 0x1 as literals
+        assert_eq!(moved(&[0xBE80_0BFF, 1, S_ENDPGM], 0), None);
+        assert_eq!(moved(&[0xBE80_07FF, 1, S_ENDPGM], 0), None);
+        // s_mov_b64 s[0:1], 0.5 in either dword
+        assert_eq!(moved(&[0xBE80_04F0, S_ENDPGM], 0), None);
+        assert_eq!(moved(&[0xBE80_04F0, S_ENDPGM], 1), None);
+        // s_mov_b32 s0, vccz
+        assert_eq!(moved(&[0xBE80_03FB, S_ENDPGM], 0), None);
+    }
+
+    fn track_err(words: &[u32], layout: &[RootParam], stage: HwStage) -> ShaderError {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        track(&p, layout, stage, lanes(&p).as_ref()).unwrap_err()
+    }
+
+    fn unsupported(offset: usize, what: &'static str) -> ShaderError {
+        ShaderError::Unsupported { offset, what }
+    }
+
+    /// An address with no root parameter under it says where it came from:
+    /// a constant, or a dword an earlier load fetched.
+    #[test]
+    fn addresses_without_a_base_name_their_origin() {
+        let err = track_err(
+            &[
+                0xBE82_03FF,
+                0x0000_1000, // s_mov_b32 s2, 0x1000
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0001,
+                0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(err, unsupported(0xC, "a constant address"));
+        let err = track_err(
+            &[
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xF404_0084,
+                0xFA00_0000, // s_load_dwordx2 s[2:3], s[8:9], null
+                0xF408_0101,
+                0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 8, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(err, unsupported(0xC, "an address loaded from memory"));
+    }
+
+    /// Root constants are no address, and a root parameter is no offset:
+    /// neither is taken for a table.
+    #[test]
+    fn root_parameters_in_the_wrong_place_are_refused() {
+        let load = [0xF408_0001, 0xFA00_0000, S_ENDPGM]; // s_load_dwordx4 s[0:3], s[2:3], null
+        assert_eq!(
+            track_err(&load, &[param(Constants, 2, 2)], HwStage::Ps),
+            unsupported(0, "an address from a root parameter that is no address")
+        );
+        let err = track_err(
+            &[
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0101,
+                0x1200_0000, // s_load_dwordx4 s[4:7], s[2:3], s9
+                S_ENDPGM,
+            ],
+            &[param(Table, 2, 1), param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(err, unsupported(4, "an offset from a root parameter"));
+    }
+
+    /// One computed term rides on a table's base; a second one, from the
+    /// offset register, is refused rather than dropped.
+    #[test]
+    fn an_address_takes_at_most_one_computed_term() {
+        let words = |soffset: u32| {
+            [
+                0x8002_0A02, // s_add_u32 s2, s2, s10
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0101,
+                soffset, // s_load_dwordx4 s[4:7], s[2:3], soffset
+                S_ENDPGM,
+            ]
+        };
+        let layout = [param(Table, 2, 1)];
+        let r = track_words(&words(0xFA00_0040), &layout, HwStage::Ps);
+        let address = r.scalar[0].1;
+        assert_eq!((address.param, address.offset), (0, 0x40));
+        assert!(address.dynamic.is_some());
+        assert_eq!(
+            track_err(&words(0x1600_0000), &layout, HwStage::Ps), // s11
+            unsupported(8, "an address with two computed terms")
+        );
+    }
+
+    /// A root descriptor's high half is its second SGPR, possibly plus the
+    /// carry of the low half. Anything else added to it is taken as a carry
+    /// only with a computed low term; with a constant offset it is refused.
+    #[test]
+    fn a_root_descriptors_high_half_must_be_its_own() {
+        const LOAD: [u32; 3] = [0xF408_0100, 0xFA00_0000, S_ENDPGM]; // s_load_dwordx4 s[4:7], s[0:1], null
+        let layout = [param(Descriptor, 10, 2)];
+        let run = |prefix: &[u32]| {
+            let code: Vec<u8> = prefix
+                .iter()
+                .chain(&LOAD)
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            track(&p, &layout, HwStage::Ps, lanes(&p).as_ref()).map(|r| r.scalar[0].1)
+        };
+        // Another SGPR as the high half: with the descriptor's own never
+        // read, there is no high half to compare it with.
+        assert_eq!(
+            run(&[
+                0xBE80_030A, // s_mov_b32 s0, s10
+                0xBE81_030C, // s_mov_b32 s1, s12
+            ]),
+            Err(unsupported(8, "a root descriptor without its high half"))
+        );
+        assert_eq!(
+            run(&[
+                0xBE82_030B, // s_mov_b32 s2, s11
+                0xBE80_030A, // s_mov_b32 s0, s10
+                0xBE81_030C, // s_mov_b32 s1, s12
+            ]),
+            Err(unsupported(0xC, "an address with an untracked high half"))
+        );
+        // A constant offset with its carry.
+        assert_eq!(
+            run(&[
+                0x8000_FF0A,
+                0x0000_0040, // s_add_u32 s0, s10, 0x40
+                0x8201_800B, // s_addc_u32 s1, s11, 0
+            ]),
+            Ok(at(0, 0x40))
+        );
+        // A constant offset with more than a carry.
+        assert_eq!(
+            run(&[
+                0x8000_FF0A,
+                0x0000_0040, // s_add_u32 s0, s10, 0x40
+                0x8201_0D0B, // s_addc_u32 s1, s11, s13
+            ]),
+            Err(unsupported(0xC, "an address with an untracked high half"))
+        );
+        // A computed offset: the high half's extra term is its carry.
+        let address = run(&[
+            0x8000_0C0A, // s_add_u32 s0, s10, s12
+            0x8201_0D0B, // s_addc_u32 s1, s11, s13
+        ])
+        .unwrap();
+        assert_eq!((address.param, address.offset), (0, 0));
+        assert!(address.dynamic.is_some());
     }
 
     /// A waterfall loop over an image descriptor each lane loads from the
