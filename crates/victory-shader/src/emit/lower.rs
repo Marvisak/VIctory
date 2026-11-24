@@ -2180,7 +2180,12 @@ impl<'a> Lower<'a> {
         }
         if let Some(rest) = name.strip_prefix("ds_write") {
             let elements = if rest.starts_with('2') {
-                pair(name)
+                let mut elements = pair(name);
+                // Equal offsets perform one write with DATA0 (RDNA 2 ISA §10.4.3).
+                if offset0 == offset1 {
+                    elements.truncate(1);
+                }
+                elements
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
                 vec![(offset, width(name))]
             } else {
@@ -2566,7 +2571,7 @@ impl<'a> Lower<'a> {
         }
         let m = &mut self.s.m;
         let _ = m;
-        let (r, carry): (V, Option<V>) = match name {
+        let (r, scc_value): (V, Option<V>) = match name {
             "s_mov_b32" => (src32(self, 0)?, None),
             "s_movk_i32" => (sext16(self), None),
             "s_cselect_b32" => {
@@ -2594,18 +2599,22 @@ impl<'a> Lower<'a> {
                     src32(self, 1)?
                 };
                 let r = self.s.m.bin(c, Bin::Add, a, b);
-                let carry = if name == "s_add_u32" {
-                    Some(self.s.m.cmp(c, pred::IULT, r, a))
+                let flag = if name == "s_add_u32" {
+                    self.s.m.cmp(c, pred::IULT, r, a)
                 } else {
-                    None
+                    self.signed_overflow(c, a, b, r, false)
                 };
-                (r, carry)
+                (r, Some(flag))
             }
             "s_sub_u32" | "s_sub_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let r = self.s.m.bin(c, Bin::Sub, a, b);
-                let carry = (name == "s_sub_u32").then(|| self.s.m.cmp(c, pred::IULT, a, b));
-                (r, carry)
+                let flag = if name == "s_sub_u32" {
+                    self.s.m.cmp(c, pred::IULT, a, b)
+                } else {
+                    self.signed_overflow(c, a, b, r, true)
+                };
+                (r, Some(flag))
             }
             "s_addc_u32" | "s_subb_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -2735,7 +2744,7 @@ impl<'a> Lower<'a> {
         };
         self.set(lo, Val::I32(r));
         if let Some(scc) = scc {
-            let val = match carry {
+            let val = match scc_value {
                 Some(k) => Val::Bit(k),
                 None if matches!(
                     name,
@@ -2749,9 +2758,6 @@ impl<'a> Lower<'a> {
                 {
                     return Ok(());
                 }
-                None if name.starts_with("s_add") || name.starts_with("s_sub") => {
-                    Val::Missing("the carry of a scalar operation")
-                }
                 None => {
                     let z = self.s.m.i32(0);
                     Val::Bit(self.s.m.cmp(c, pred::NE, r, z))
@@ -2760,6 +2766,18 @@ impl<'a> Lower<'a> {
             self.vals.insert(scc, val);
         }
         Ok(())
+    }
+
+    /// RDNA2 sets SCC on signed overflow. The result changes the first
+    /// operand's sign when matching signs are added or opposite signs are
+    /// subtracted. Test the sign bit of both XORs without widening.
+    fn signed_overflow(&mut self, c: usize, a: V, b: V, result: V, subtract: bool) -> V {
+        let m = &mut self.s.m;
+        let sign_change = m.bin(c, Bin::Xor, a, result);
+        let sign_check = m.bin(c, Bin::Xor, if subtract { a } else { result }, b);
+        let overflow_bits = m.bin(c, Bin::And, sign_change, sign_check);
+        let zero = m.i32(0);
+        m.cmp(c, pred::SLT, overflow_bits, zero)
     }
 
     /// `a + b (+ cin)` or `a - b (- cin)` with the carry (borrow) out, as the
