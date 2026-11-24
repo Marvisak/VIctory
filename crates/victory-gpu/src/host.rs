@@ -53,6 +53,8 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// Upload buffers kept for reuse across lists once reset.
+    upload_pool: Mutex<Vec<PooledUpload>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -222,6 +224,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            upload_pool: Mutex::new(Vec::new()),
         })
     }
 }
@@ -367,6 +370,21 @@ unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
 
+/// An upload buffer mapped for writing, kept in a pool for reuse once its
+/// command list has finished executing.
+#[derive(Clone)]
+pub(crate) struct PooledUpload {
+    pub(crate) buffer: ID3D12Resource,
+    /// Mapped CPU pointer (`*mut u8` as usize).
+    pub(crate) data: usize,
+    pub(crate) size: u64,
+}
+
+// SAFETY: the data pointer is a persistent mapping of a live D3D12 upload buffer.
+unsafe impl Send for PooledUpload {}
+// SAFETY: as above.
+unsafe impl Sync for PooledUpload {}
+
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
@@ -396,7 +414,7 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
-    uploads: Vec<ID3D12Resource>,
+    uploads: Vec<PooledUpload>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -880,7 +898,15 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
+        let old_uploads = {
+            let mut deferred = self.deferred();
+            let uploads = std::mem::take(&mut deferred.uploads);
+            *deferred = Deferred::default();
+            uploads
+        };
+        if let Some(host) = host() {
+            host.recycle_uploads(old_uploads);
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -1065,14 +1091,14 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// A mapped upload buffer of `size` bytes from the pool, alive until
+    /// the list is reset.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().uploads.push(buffer.clone());
+        let pooled = host.take_upload(size)?;
+        name(&pooled.buffer, || format!("list upload {size:#x}"));
+        let buffer = pooled.buffer.clone();
+        let data = pooled.data as *mut u8;
+        self.deferred().uploads.push(pooled);
         Some((buffer, data))
     }
 
@@ -1083,11 +1109,12 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
-            name(&buffer, || format!("list scratch {len:#x}"));
+            let pooled = host.take_upload(len)?;
+            name(&pooled.buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().uploads.push(buffer);
+            let gpu = unsafe { pooled.buffer.GetGPUVirtualAddress() };
+            let data = pooled.data as *mut u8;
+            self.deferred().uploads.push(pooled);
             return Some((gpu, data));
         }
         if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
@@ -1435,6 +1462,52 @@ impl Host {
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
+        }
+    }
+
+    /// Maximum number of upload buffers retained in the pool.
+    const MAX_POOLED_UPLOADS: usize = 32;
+
+    /// Takes an upload buffer from the pool if one with sufficient capacity
+    /// exists, or creates a new one. The buffer is aligned to 64 KiB
+    /// (D3D12 placement alignment) or power-of-two for efficient reuse.
+    pub(crate) fn take_upload(&self, size: u64) -> Option<PooledUpload> {
+        let size = size.max(1);
+        let mut pool = self.upload_pool.lock().unwrap_or_else(|e| e.into_inner());
+        let fit = pool
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.size >= size && (b.size <= (size * 2).max(1 << 20)))
+            .min_by_key(|(_, b)| b.size)
+            .map(|(i, _)| i);
+
+        if let Some(i) = fit {
+            return Some(pool.swap_remove(i));
+        }
+        drop(pool);
+
+        let alloc_size = size
+            .checked_next_power_of_two()
+            .unwrap_or(size)
+            .max(64 * 1024);
+        let (buffer, data) = self.upload_buffer(alloc_size)?;
+        Some(PooledUpload {
+            buffer,
+            data: data as usize,
+            size: alloc_size,
+        })
+    }
+
+    /// Returns idle upload buffers back to the pool once a command list is reset.
+    pub(crate) fn recycle_uploads(&self, mut uploads: Vec<PooledUpload>) {
+        if uploads.is_empty() {
+            return;
+        }
+        let mut pool = self.upload_pool.lock().unwrap_or_else(|e| e.into_inner());
+        pool.append(&mut uploads);
+        if pool.len() > Self::MAX_POOLED_UPLOADS {
+            pool.sort_by_key(|b| std::cmp::Reverse(b.size));
+            pool.truncate(Self::MAX_POOLED_UPLOADS);
         }
     }
 }
@@ -2051,5 +2124,52 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn upload_pool_reuses_buffers_and_handles_varying_sizes() {
+        let Some(host) = super::host() else { return };
+        let Ok(list) = host.new_list() else { return };
+
+        // 4096 gets rounded to 64 KiB allocation.
+        let (buf1, ptr1) = list.upload(host, 4096).expect("first upload buffer");
+        let raw1 = ptr1 as usize;
+
+        // Reset recycles the upload buffer back to host.upload_pool.
+        list.close();
+        list.reset();
+
+        // Requesting a buffer of compatible size reuses the pooled buffer.
+        let (buf2, ptr2) = list.upload(host, 4096).expect("second upload buffer");
+        let raw2 = ptr2 as usize;
+
+        assert_eq!(raw1, raw2);
+        assert_eq!(buf1, buf2);
+
+        // 8192 should also reuse the 64 KiB buffer.
+        list.close();
+        list.reset();
+        let (buf_8k, ptr_8k) = list.upload(host, 8192).expect("upload 8k");
+        assert_eq!(raw1, ptr_8k as usize);
+        assert_eq!(buf1, buf_8k);
+
+        // 256 KiB needs a larger buffer than 64 KiB.
+        let (buf_256k, ptr_256k) = list.upload(host, 256 * 1024).expect("upload 256k");
+        let raw_256k = ptr_256k as usize;
+        assert_ne!(raw1, raw_256k);
+        list.close();
+        list.reset();
+
+        // Both 64 KiB and 256 KiB are now pooled.
+        // Requesting 200 KiB should pick the 256 KiB buffer.
+        let (buf_fit_large, _) = list.upload(host, 200 * 1024).expect("upload 200k");
+        assert_eq!(buf_fit_large, buf_256k);
+
+        // Requesting 10 KiB should pick the 64 KiB buffer.
+        let (buf_fit_small, _) = list.upload(host, 10 * 1024).expect("upload 10k");
+        assert_eq!(buf_fit_small, buf1);
+
+        list.close();
+        list.reset();
     }
 }
