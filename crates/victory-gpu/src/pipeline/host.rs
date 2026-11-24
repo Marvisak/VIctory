@@ -246,6 +246,9 @@ const QUADS: i32 = 32;
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
+    /// The shader's translation, held from construction (private: a stage
+    /// exists only through [`Stage::new`], so it always has one).
+    translated: Arc<Translated>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
     /// Root parameters of its root views: (title root parameter, ours).
@@ -254,10 +257,20 @@ pub(crate) struct Stage {
 }
 
 impl Stage {
+    /// A stage of `shader` with no bindings yet; `None` if the shader does
+    /// not translate (logged once by [`Shader::translated`]).
+    fn new(shader: &Arc<Shader>) -> Option<Stage> {
+        Some(Stage {
+            translated: Arc::clone(shader.translated()?),
+            shader: Arc::clone(shader),
+            user_data: None,
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+        })
+    }
+
     pub(crate) fn translated(&self) -> &Translated {
-        self.shader
-            .translated()
-            .expect("host pipelines are made from translated shaders")
+        &self.translated
     }
 }
 
@@ -333,13 +346,9 @@ impl HostPipeline {
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
-            let mut stage = Stage {
-                shader: shader.clone(),
-                user_data: None,
-                root_cbvs: Vec::new(),
-                root_srvs: Vec::new(),
-            };
+            let mut stage = Stage::new(shader)?;
+            let translated = Arc::clone(&stage.translated);
+            let t = &translated.host;
             let dwords = t.user_data_dwords();
             if dwords > 0 {
                 stage.user_data = Some((params.len() as u32, dwords));
@@ -663,5 +672,24 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+// Windows-only like the whole module (`pipeline.rs` declares it under
+// `#[cfg(windows)]`); the attribute repeats that where the test is read.
+#[cfg(test)]
+#[cfg(windows)]
+mod tests {
+    use super::*;
+
+    /// A shader that does not translate makes no stage, so no host
+    /// pipeline (whose draws are then dropped), instead of a stage whose
+    /// translation is missing at draw time.
+    #[test]
+    fn untranslated_shader_makes_no_stage_or_pipeline() {
+        let shader = super::super::shader("vertex", b"not a shader container");
+        assert!(shader.translated().is_none());
+        assert!(Stage::new(&shader).is_none());
+        assert!(HostPipeline::new(&[shader], None).is_none());
     }
 }
