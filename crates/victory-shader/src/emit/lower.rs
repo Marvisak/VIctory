@@ -40,6 +40,9 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// Each heap handle's resource properties, in order.
+    #[cfg(test)]
+    pub heap_props: Vec<(u32, u32)>,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -147,6 +150,10 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// A heap handle made in a block: the block, the descriptor load and its
+/// first dword, whether a sampler, and the resource properties.
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -173,7 +180,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<HandleKey, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -908,6 +915,8 @@ impl<'a> Lower<'a> {
             root_srvs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            heap_props: std::mem::take(&mut self.s.heap_props),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -3308,7 +3317,10 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                // Both properties: one descriptor read as a float image and as an
+                // integer one (an atomic after a size query, #852), or as
+                // structures of two strides, needs a handle for each.
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -7266,6 +7278,42 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    /// A size query, then an atomic on the same image in one block: the
+    /// query's float handle is not reused for the integer atomic, which
+    /// NVIDIA's compiler crashes on (#852).
+    #[test]
+    fn an_image_atomic_after_a_size_query_has_its_own_handle() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0x0
+            0x7E04_0300, // v_mov_b32 v2, v0
+            0x7E06_0300, // v_mov_b32 v3, v0
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0xF038_0F08,
+            0x0002_0400, // image_get_resinfo v[4:7], v0, s[8:15] dmask:0xf dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xF044_0108,
+            0x0002_0402, // image_atomic_add v4, v[2:3], s[8:15] dmask:0x1 dim:2D
+            0xBF81_0000, // s_endpgm
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        let l = lower_with(&words, vec![root(RootType::Table, 0, 0)], used).unwrap();
+        // A float RWTexture2D for the query, a 32-bit integer one for the
+        // atomic (dxil.dll accepts either way; drivers do not).
+        assert_eq!(l.heap_props, [(2 | 0x1000, 0x409), (2 | 0x1000, 0x105)]);
     }
 
     #[test]
