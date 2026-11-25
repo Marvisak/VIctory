@@ -1807,3 +1807,18 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+/// `s_lshlN_add_u32` sets SCC to the carry of its add, which is not lowered:
+/// a shader reading it is refused rather than given "result != 0".
+#[test]
+fn lshl_add_carry_read_is_refused() {
+    for op in 0x2e..=0x31u8 {
+        let refused = try_build_valu_cs(&[
+            sop2(op, 12, 0, 1),
+            sop2(0x0a, 13, 0x81, 0x80), // s_cselect_b32 s13, 1, 0
+            vop1(0x001, 0, sgpr(13)),
+        ]);
+        let err = format!("{:?}", refused.err().expect("refused"));
+        assert!(err.contains("carry"), "op {op:#x}: {err}");
+    }
+}

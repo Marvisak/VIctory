@@ -3828,7 +3828,12 @@ impl<'a> Lower<'a> {
                 {
                     return Ok(());
                 }
-                None if name.starts_with("s_add") || name.starts_with("s_sub") => {
+                // s_lshlN_add_u32 sets SCC to the add's carry, not to
+                // "result != 0".
+                None if name.starts_with("s_add")
+                    || name.starts_with("s_sub")
+                    || name.starts_with("s_lshl") && name.ends_with("_add_u32") =>
+                {
                     Val::Missing("the carry of a scalar operation")
                 }
                 None => {
