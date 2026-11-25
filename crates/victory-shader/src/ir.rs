@@ -841,6 +841,9 @@ fn effects(
             if name.starts_with("v_interp_") || src_indexed || dst_indexed {
                 r.push(Reg::S(M0));
             }
+            if matches!(name, "v_div_fmas_f32" | "v_div_fmas_f64") {
+                r.extend(mask(VCC));
+            }
         }
         Fields::Vintrp { dst, src, .. } => {
             regs(src, &mut r)?;

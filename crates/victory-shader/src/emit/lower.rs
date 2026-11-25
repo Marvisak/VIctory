@@ -3755,6 +3755,188 @@ impl<'a> Lower<'a> {
         (r, carry)
     }
 
+    /// Scales FTZ-flushed IEEE-754 `f32` bits by `2^+64` (`up == true`) or
+    /// `2^-64` (`up == false`) in 32-bit integer arithmetic, matching RDNA2's
+    /// default f32 denormal mode (`FLOAT_MODE = 0xc0`, FTZ input & output):
+    /// subnormal inputs are already zero and any result below `2^-126` flushes
+    /// to a zero of its sign.
+    fn scale_f32_pow2(&mut self, bits: V, up: bool) -> V {
+        let c = self.cur;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let sign_mask = k(self, 0x8000_0000);
+        let abs_mask = k(self, 0x7FFF_FFFF);
+        let mant_mask = k(self, 0x007F_FFFF);
+        let k23 = k(self, 23);
+        let k255 = k(self, 255);
+        let zero = k(self, 0);
+
+        let sign = self.s.m.bin(c, Bin::And, bits, sign_mask);
+        let abs = self.s.m.bin(c, Bin::And, bits, abs_mask);
+        let exp = self.s.m.bin(c, Bin::LShr, abs, k23);
+        let mant = self.s.m.bin(c, Bin::And, bits, mant_mask);
+
+        let is_zero = self.s.m.cmp(c, pred::EQ, abs, zero);
+        let is_special = self.s.m.cmp(c, pred::EQ, exp, k255);
+        let is_nan = {
+            let nz_mant = self.s.m.cmp(c, pred::NE, mant, zero);
+            self.s.m.bin(c, Bin::And, is_special, nz_mant)
+        };
+        let qnan_bit = k(self, 0x0040_0000);
+        let quiet = self.s.m.bin(c, Bin::Or, bits, qnan_bit);
+        let passthrough = self.s.m.select(c, is_nan, quiet, bits);
+        let keep = self.s.m.bin(c, Bin::Or, is_zero, is_special);
+
+        let k64_exp = k(self, 64 << 23);
+        let scaled = if up {
+            // Normal: exp <= 190 stays normal; exp >= 191 overflows to +/-Inf.
+            let norm_res = self.s.m.bin(c, Bin::Add, bits, k64_exp);
+            let inf_bits = k(self, 0x7F80_0000);
+            let ovf_res = self.s.m.bin(c, Bin::Or, sign, inf_bits);
+            let k190 = k(self, 190);
+            let is_ovf = self.s.m.cmp(c, pred::IUGT, exp, k190);
+            self.s.m.select(c, is_ovf, ovf_res, norm_res)
+        } else {
+            // Normal staying normal: exp >= 65 -> exp - 64; exp <= 64 flushes to signed zero.
+            let norm_res = self.s.m.bin(c, Bin::Sub, bits, k64_exp);
+            let k65 = k(self, 65);
+            let stays_norm = self.s.m.cmp(c, pred::IUGE, exp, k65);
+            self.s.m.select(c, stays_norm, norm_res, sign)
+        };
+
+        self.s.m.select(c, keep, passthrough, scaled)
+    }
+
+    /// `v_div_scale_f32`: pre-scales `s0` (equal to denominator `s1` or
+    /// numerator `s2`) for RDNA2's Newton-Raphson f32 division sequence and
+    /// returns `(scaled_f32, vcc_flag)`. Operands and outputs follow the
+    /// console's default f32 FTZ denormal mode (as [`Self::ftz`]).
+    fn div_scale_f32(&mut self, s0: V, s1: V, s2: V) -> (V, V) {
+        let (s0, s1, s2) = (self.ftz(s0), self.ftz(s1), self.ftz(s2));
+        let c = self.cur;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let u0 = self.as_int(s0);
+        let u1 = self.as_int(s1);
+        let u2 = self.as_int(s2);
+
+        let abs_mask = k(self, 0x7FFF_FFFF);
+        let k23 = k(self, 23);
+        let zero = k(self, 0);
+
+        let abs1 = self.s.m.bin(c, Bin::And, u1, abs_mask);
+        let abs2 = self.s.m.bin(c, Bin::And, u2, abs_mask);
+        let e1 = self.s.m.bin(c, Bin::LShr, abs1, k23);
+        let e2 = self.s.m.bin(c, Bin::LShr, abs2, k23);
+
+        // S1 == +/-0.0 || S2 == +/-0.0 (including FTZ-flushed denormals) -> qNaN, flag = 0.
+        let s1_zero = self.s.m.cmp(c, pred::EQ, abs1, zero);
+        let s2_zero = self.s.m.cmp(c, pred::EQ, abs2, zero);
+        let is_zero = self.s.m.bin(c, Bin::Or, s1_zero, s2_zero);
+
+        // exponent(S2) - exponent(S1) >= 96 (N/D near FLT_MAX) -> flag = 1,
+        // scale S0 by +64 iff S0 == S1.
+        let e_diff = self.s.m.bin(c, Bin::Sub, e2, e1);
+        let k96 = k(self, 96);
+        let near_max = self.s.m.cmp(c, pred::SGE, e_diff, k96);
+
+        // 1.0 / S1 is f32 denormal iff finite and |S1| > 2^126.
+        let pow2_126 = k(self, 0x7E80_0000);
+        let inf_bits = k(self, 0x7F80_0000);
+        let s1_gt_126 = self.s.m.cmp(c, pred::IUGT, abs1, pow2_126);
+        let s1_fin = self.s.m.cmp(c, pred::IULT, abs1, inf_bits);
+        let rcp_denorm = self.s.m.bin(c, Bin::And, s1_gt_126, s1_fin);
+
+        // S2 / S1 is f32 denormal (|S2/S1| < 2^-126 for normal S1 and normal
+        // S2): |S2| * 2^64 < |S1| * 2^-62 in 64 <= e1 <= 254, 1 <= e2 <= 190.
+        let s2_up = self.scale_f32_pow2(abs2, true);
+        let k62_exp = k(self, 62 << 23);
+        let s1_dn = self.s.m.bin(c, Bin::Sub, abs1, k62_exp);
+        let k64 = k(self, 64);
+        let k190 = k(self, 190);
+        let e1_ge_64 = self.s.m.cmp(c, pred::IUGE, e1, k64);
+        let e2_le_190 = self.s.m.cmp(c, pred::IULE, e2, k190);
+        let s2_nz = self.s.m.cmp(c, pred::NE, abs2, zero);
+        let lt_q = self.s.m.cmp(c, pred::IULT, s2_up, s1_dn);
+        let q_box = self.s.m.bin(c, Bin::And, e1_ge_64, s1_fin);
+        let q_box = self.s.m.bin(c, Bin::And, q_box, e2_le_190);
+        let q_box = self.s.m.bin(c, Bin::And, q_box, s2_nz);
+        let q_denorm = self.s.m.bin(c, Bin::And, q_box, lt_q);
+
+        // Tiny normal numerator: exponent(S2) <= 23 -> flag = 0, scale both by +64.
+        let tiny_num = self.s.m.cmp(c, pred::IULE, e2, k23);
+
+        let up64 = self.scale_f32_pow2(u0, true);
+        let dn64 = self.scale_f32_pow2(u0, false);
+        let s0_eq_s1 = self.s.m.cmp(c, pred::EQ, u0, u1);
+        let s0_eq_s2 = self.s.m.cmp(c, pred::EQ, u0, u2);
+        let f_false = self.s.m.bool(false);
+        let f_true = self.s.m.bool(true);
+
+        // Priority ladder evaluated bottom-up so earlier clauses win.
+        let mut res = self.s.m.select(c, tiny_num, up64, u0);
+        let mut flag = f_false;
+
+        // S2/S1 denormal: flag = 1, scale only numerator (S0 == S2) by +64.
+        let q_val = self.s.m.select(c, s0_eq_s2, up64, u0);
+        res = self.s.m.select(c, q_denorm, q_val, res);
+        flag = self.s.m.select(c, q_denorm, f_true, flag);
+
+        // 1/S1 denormal: flag = 0, scale both by -64.
+        res = self.s.m.select(c, rcp_denorm, dn64, res);
+        flag = self.s.m.select(c, rcp_denorm, f_false, flag);
+
+        // Both 1/S1 and S2/S1 denormal: flag = 1, scale only denominator
+        // (S0 == S1) by -64 so N'/D' = (N/D)*2^+64 stays normal and
+        // v_div_fmas_f32 unscales by 2^-64.
+        let both_denorm = self.s.m.bin(c, Bin::And, rcp_denorm, q_denorm);
+        let both_val = self.s.m.select(c, s0_eq_s1, dn64, u0);
+        res = self.s.m.select(c, both_denorm, both_val, res);
+        flag = self.s.m.select(c, both_denorm, f_true, flag);
+
+        // N/D near FLT_MAX: flag = 1, scale only denominator (S0 == S1) by +64.
+        let max_val = self.s.m.select(c, s0_eq_s1, up64, u0);
+        res = self.s.m.select(c, near_max, max_val, res);
+        flag = self.s.m.select(c, near_max, f_true, flag);
+
+        // Zero numerator or denominator: qNaN, flag = 0.
+        let qnan = k(self, 0x7FC0_0000);
+        res = self.s.m.select(c, is_zero, qnan, res);
+        flag = self.s.m.select(c, is_zero, f_false, flag);
+
+        (self.as_float(res), flag)
+    }
+
+    /// Resolves this lane's implicit VCC bit for `v_div_fmas_f32`.
+    fn div_fmas_vcc(&mut self, inst: &Inst, c: usize) -> Result<V, Why> {
+        let Some(lo) = inst.read(Reg::S(crate::ir::VCC)) else {
+            return Ok(self.s.m.bool(false));
+        };
+        if let Some(&m) = self.x.st.masks.get(&lo) {
+            return self.boolean(m, c);
+        }
+        // Constant scalar VCC (e.g. `s_mov_b32 vcc_lo, 0` or `-1`) is not
+        // derived from EXEC/VALU so `structure` leaves it outside `st.masks`.
+        let lo_val = self.i32_of(lo)?;
+        let hi_val = if self.x.native.wave64 {
+            match inst.read(Reg::S(crate::ir::VCC + 1)) {
+                Some(hi) => Some(self.i32_of(hi)?),
+                None => return Err("v_div_fmas_f32 with missing vcc_hi"),
+            }
+        } else {
+            None
+        };
+        let lo_k = self.s.m.int_value(lo_val);
+        let hi_k = hi_val.map(|v| self.s.m.int_value(v));
+        match (lo_k, hi_k) {
+            (Some(0), None | Some(Some(0))) => Ok(self.s.m.bool(false)),
+            (Some(-1), None | Some(Some(-1))) => Ok(self.s.m.bool(true)),
+            _ if self.console_lanes => {
+                self.s.flags |= flags::WAVE_OPS;
+                Ok(self.lane_bit(c, lo_val, hi_val))
+            }
+            _ => Err("v_div_fmas_f32 on an untracked VCC mask"),
+        }
+    }
+
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
         match self.get(v)? {
@@ -5814,6 +5996,45 @@ impl<'a> Lower<'a> {
                         .is_some() =>
             {
                 Err("a VGPR of spilled SGPRs read per lane")
+            }
+            "v_div_scale_f32" => {
+                let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let (r, flag) = self.div_scale_f32(a, bb, cc);
+                float(self, r)?;
+                if let Some(Operand::Scalar { code, .. }) = v.carry
+                    && let Some(w) = inst.write(Reg::S(code))
+                {
+                    self.lane_bits.insert(w, flag);
+                }
+                for &(_, w) in &inst.writes {
+                    self.vals
+                        .entry(w)
+                        .or_insert(Val::Missing("a lane mask read as data"));
+                }
+                Ok(())
+            }
+            "v_div_fmas_f32" => {
+                let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let (a, bb, cc) = (self.ftz(a), self.ftz(bb), self.ftz(cc));
+                let vcc = self.div_fmas_vcc(inst, c)?;
+                // shortcut: DXIL FMad (op 46) is not guaranteed to be fused,
+                // as in `v_fma_f32`.
+                let fma = self.fmad(a, bb, cc);
+                let fma = self.ftz(fma);
+                let fma_bits = self.as_int(fma);
+                let c_bits = self.as_int(cc);
+                let k23 = self.s.m.i32(23);
+                let kff = self.s.m.i32(0xFF);
+                let k127 = self.s.m.i32(127);
+                let exp2 = self.s.m.bin(c, Bin::LShr, c_bits, k23);
+                let exp2 = self.s.m.bin(c, Bin::And, exp2, kff);
+                let scale_up = self.s.m.cmp(c, pred::IUGT, exp2, k127);
+                let up64 = self.scale_f32_pow2(fma_bits, true);
+                let dn64 = self.scale_f32_pow2(fma_bits, false);
+                let scaled = self.s.m.select(c, scale_up, up64, dn64);
+                let r_bits = self.s.m.select(c, vcc, scaled, fma_bits);
+                let r = self.as_float(r_bits);
+                float(self, r)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);

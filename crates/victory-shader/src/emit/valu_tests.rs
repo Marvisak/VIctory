@@ -1453,3 +1453,343 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+/// VOP3B `op vdst, sdst, src0, src1, src2` with optional `(neg, omod, clamp)`.
+const fn vop3b(op: u16, vdst: u8, sdst: u8, src: [u16; 3], mods: (u8, u8, bool)) -> [u32; 2] {
+    let (neg, omod, clamp) = mods;
+    [
+        0x35 << 26
+            | (op as u32 & 0x3FF) << 16
+            | (clamp as u32) << 15
+            | (sdst as u32 & 0x7F) << 8
+            | vdst as u32,
+        (neg as u32 & 7) << 29
+            | (omod as u32 & 3) << 27
+            | (src[2] as u32 & 0x1FF) << 18
+            | (src[1] as u32 & 0x1FF) << 9
+            | (src[0] as u32 & 0x1FF),
+    ]
+}
+
+/// VOP3A `op vdst, src0, src1, src2` with optional `(abs, neg, omod, clamp)`.
+const fn vop3a_mod(op: u16, vdst: u8, src: [u16; 3], mods: (u8, u8, u8, bool)) -> [u32; 2] {
+    let (abs, neg, omod, clamp) = mods;
+    [
+        0x35 << 26
+            | (op as u32 & 0x3FF) << 16
+            | (clamp as u32) << 15
+            | (abs as u32 & 7) << 8
+            | vdst as u32,
+        (neg as u32 & 7) << 29
+            | (omod as u32 & 3) << 27
+            | (src[2] as u32 & 0x1FF) << 18
+            | (src[1] as u32 & 0x1FF) << 9
+            | (src[0] as u32 & 0x1FF),
+    ]
+}
+
+#[test]
+fn v_div_scale_f32_matches_rdna2() {
+    // s0=v1 (src0), s1=v2 (denom), s2=v3 (num).
+    // Shader A returns scaled vdst; Shader B returns sdst flag (0 or 1);
+    // Shader C writes sdst=null (0x7D) with neg[0] + mul:2 + clamp.
+    let ds_val = vop3b(0x16d, 0, 6, [vgpr(1), vgpr(2), vgpr(3)], (0, 0, false));
+    let scale_val = build_valu_cs(&[ds_val[0], ds_val[1]]);
+
+    let ds_flg = vop3b(0x16d, 5, 6, [vgpr(1), vgpr(2), vgpr(3)], (0, 0, false));
+    let sel_flg = vop3(0x101, 0, 0x80, 0x81, sgpr(6)); // v_cndmask_b32 v0, 0, 1, s6
+    let scale_flg = build_valu_cs(&[ds_flg[0], ds_flg[1], sel_flg[0], sel_flg[1]]);
+
+    // v_div_scale_f32 v0, null, -v1, v2, v3 mul:2 clamp
+    let ds_mod = vop3b(0x16d, 0, 0x7D, [vgpr(1), vgpr(2), vgpr(3)], (1, 1, true));
+    let scale_mod = build_valu_cs(&[ds_mod[0], ds_mod[1]]);
+
+    let f = |x: f32| x.to_bits();
+    let pow2 = |e: i32| f32::from_bits(((e + 127) as u32) << 23).to_bits();
+    let qnan = 0x7FC0_0000u32;
+
+    // (s0, s1=denom, s2=num, want_val, want_flag)
+    let cases: &[(u32, u32, u32, u32, u32)] = &[
+        // Normal range: unscaled, flag=0
+        (f(7.0), f(3.0), f(7.0), f(7.0), 0),
+        (f(3.0), f(3.0), f(7.0), f(3.0), 0),
+        // Clause 1: zero (or FTZ-flushed subnormal) denominator or numerator -> qNaN, flag=0
+        (f(1.0), 0x0000_0000, f(1.0), qnan, 0),
+        (f(1.0), 0x8000_0000, f(1.0), qnan, 0),
+        (0x0000_0000, f(1.0), 0x0000_0000, qnan, 0),
+        (0x8000_0000, f(1.0), 0x8000_0000, qnan, 0),
+        // Subnormal inputs flush to signed zero under RDNA2 default FLOAT_MODE=0xc0 (mode 0)
+        (0x0000_0001, 0x0000_0001, f(2.0), qnan, 0),
+        (f(2.0), 0x0000_0001, f(2.0), qnan, 0),
+        (0x0040_0000, f(2.0), 0x0040_0000, qnan, 0),
+        (f(2.0), f(2.0), 0x0040_0000, qnan, 0),
+        (0x0040_0000, pow2(-100), 0x0040_0000, qnan, 0),
+        // Clause 2: e2 - e1 >= 96 -> flag=1, scale only denominator (S0 == S1) by +64
+        (pow2(-36), pow2(-36), pow2(60), pow2(28), 1), // diff == 96, S0==S1
+        (pow2(60), pow2(-36), pow2(60), pow2(60), 1),  // diff == 96, S0==S2
+        (pow2(-35), pow2(-35), pow2(60), pow2(-35), 0), // diff == 95 (below threshold)
+        // Clause 4: 1/S1 denormal AND S2/S1 denormal -> flag=1, scale only S1 by -64
+        (pow2(127), pow2(127), f(1.0), pow2(63), 1),
+        (f(1.0), pow2(127), f(1.0), f(1.0), 1),
+        // Clause 5: 1/S1 denormal, S2/S1 normal -> flag=0, scale both by -64
+        (0x7EC0_0000, 0x7EC0_0000, f(4.0), 0x5EC0_0000, 0), // 1.5*2^126 -> 1.5*2^62
+        (f(4.0), 0x7EC0_0000, f(4.0), pow2(-62), 0),
+        // Exact boundary |S1| == 2^126 (1/S1 == 2^-126 normal!) -> unscaled, flag=0
+        (pow2(126), pow2(126), f(4.0), pow2(126), 0),
+        // Clause 6: S2/S1 denormal, 1/S1 normal -> flag=1, scale only S2 by +64
+        (pow2(-64), pow2(64), pow2(-64), f(1.0), 1),
+        (pow2(64), pow2(64), pow2(-64), pow2(64), 1),
+        // Boundary e1 - e2 == 126 (e1=190 -> 2^63, e2=64 -> 2^-63):
+        // m2 < m1 (denormal) vs m2 == m1 (exact 2^-126 normal) vs m2 > m1 (normal)
+        (0x2000_0000, 0x5F00_0001, 0x2000_0000, 0x4000_0000, 1), // m2=0 < m1=1 -> denorm
+        (0x2000_0000, 0x5F40_0000, 0x2000_0000, 0x4000_0000, 1), // 2^-63 / (1.5*2^63) -> denorm
+        (0x2000_0000, 0x5F00_0000, 0x2000_0000, 0x2000_0000, 0), // 2^-63 / 2^63 == 2^-126 normal
+        (0x2040_0000, 0x5F00_0000, 0x2040_0000, 0x2040_0000, 0), // 1.5*2^-63 / 2^63 normal
+        // Clause 7: tiny normal numerator e2 <= 23 -> flag=0, scale both by +64
+        (pow2(-104), pow2(-100), pow2(-104), pow2(-40), 0), // e2 == 23
+        (pow2(-100), pow2(-100), pow2(-104), pow2(-36), 0),
+        (pow2(-103), pow2(-100), pow2(-103), pow2(-103), 0), // e2 == 24 (unscaled)
+        // Infinities: finite/Inf -> unscaled, flag=0; Inf/finite -> e2-e1 >= 96, flag=1
+        (f(1.0), f32::INFINITY.to_bits(), f(1.0), f(1.0), 0),
+        (f(1.0), f(1.0), f32::INFINITY.to_bits(), pow2(64), 1),
+    ];
+
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0, c.1, c.2, 0]).collect();
+    run_cases(&scale_val, &inputs, |backend, i, inp, got| {
+        let want = cases[i].3;
+        if f32::from_bits(want).is_nan() {
+            assert!(
+                f32::from_bits(got).is_nan(),
+                "{backend}: case {i} v_div_scale_f32({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want NaN",
+                inp[0],
+                inp[1],
+                inp[2],
+            );
+        } else {
+            assert_eq!(
+                got, want,
+                "{backend}: case {i} v_div_scale_f32({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1], inp[2],
+            );
+        }
+    });
+    run_cases(&scale_flg, &inputs, |backend, i, inp, got| {
+        let want = cases[i].4;
+        assert_eq!(
+            got, want,
+            "{backend}: case {i} v_div_scale_f32 flag({:#010x}, {:#010x}, {:#010x}) = {got}, want {want}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+
+    // Verify sdst=null, neg[0], omod=mul:2, clamp:
+    // -(-0.25) * 2 = 0.5; -(-1.0) * 2 clamped to 1.0; -(0.5) * 2 clamped to 0.0.
+    let mod_cases: &[([u32; 4], u32)] = &[
+        ([f(-0.25), f(1.0), f(1.0), 0], f(0.5)),
+        ([f(-1.0), f(1.0), f(1.0), 0], f(1.0)),
+        ([f(0.5), f(1.0), f(1.0), 0], f(0.0)),
+    ];
+    let mod_in: Vec<[u32; 4]> = mod_cases.iter().map(|c| c.0).collect();
+    run_cases(&scale_mod, &mod_in, |backend, i, inp, got| {
+        let want = mod_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_div_scale_f32 mod({:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+}
+
+#[test]
+fn v_div_fmas_f32_matches_rdna2() {
+    let fmas = vop3(0x16f, 0, vgpr(1), vgpr(2), vgpr(3));
+    // Constant VCC = 0 (unscaled FMA) and VCC = -1 (scaled by 2^+64 or 2^-64).
+    let fmas_vcc0 = build_valu_cs(&[s_mov_b32(0x6A, 0x80), fmas[0], fmas[1]]);
+    let fmas_vcc1 = build_valu_cs(&[s_mov_b32(0x6A, 0xC1), fmas[0], fmas[1]]);
+    // Modifiers: v_div_fmas_f32 v0, abs(v1), -v2, v3 mul:2 clamp (with VCC = 0).
+    let fmas_m = vop3a_mod(0x16f, 0, [vgpr(1), vgpr(2), vgpr(3)], (1, 2, 1, true));
+    let fmas_mod = build_valu_cs(&[s_mov_b32(0x6A, 0x80), fmas_m[0], fmas_m[1]]);
+
+    let f = |x: f32| x.to_bits();
+    let pow2 = |e: i32| f32::from_bits(((e + 127) as u32) << 23).to_bits();
+
+    // VCC = 0: pure FMA regardless of |src2|.
+    let v0_cases: &[([u32; 4], u32)] = &[
+        ([f(2.0), f(3.0), f(4.0), 0], f(10.0)),
+        ([f(1.5), f(-2.0), f(0.5), 0], f(-2.5)),
+        ([f(0.0), f(0.0), 0x8000_0000, 0], f(0.0)),
+    ];
+    let v0_in: Vec<[u32; 4]> = v0_cases.iter().map(|c| c.0).collect();
+    run_cases(&fmas_vcc0, &v0_in, |backend, i, _, got| {
+        let want = v0_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: fmas(vcc=0) case {i}: {got:#010x} != {want:#010x}"
+        );
+    });
+
+    // VCC = 1: exponent(src2) > 127 (|src2| >= 2.0) -> * 2^+64, else * 2^-64.
+    let v1_cases: &[([u32; 4], u32)] = &[
+        // |src2| == 2.0 (exp == 128 > 127) -> +64
+        (
+            [f(1.0), f(1.0), f(2.0), 0],
+            f32::from_bits((128 + 64) << 23 | 0x40_0000).to_bits(),
+        ), // 3 * 2^64
+        // -2.0 also has exp == 128 > 127 -> +64
+        ([f(0.0), f(0.0), f(-2.0), 0], (pow2(65) | 0x8000_0000)),
+        // Exact boundary |src2| == 2.0 - 2^-23 (0x3FFF_FFFF, exp == 127 <= 127) -> -64!
+        ([f(0.0), f(0.0), 0x3FFF_FFFF, 0], 0x1FFF_FFFF),
+        // |src2| == 1.0 (exp == 127) -> -64
+        (
+            [f(1.0), f(2.0), f(1.0), 0],
+            f32::from_bits(((128 - 64) << 23) | 0x40_0000).to_bits(),
+        ), // 3 * 2^-64
+        // Subnormal outputs flush to signed zero (RDNA2 f32 FTZ mode 0):
+        // exp == 65 stays smallest normal (2^-62 * 2^-64 = 2^-126); exp <= 64 flushes to +/-0.0.
+        ([f(0.0), f(0.0), pow2(-62), 0], 0x0080_0000),
+        ([f(0.0), f(0.0), pow2(-63), 0], 0x0000_0000),
+        ([f(0.0), f(0.0), 0x207F_FFFF, 0], 0x0000_0000),
+        ([f(0.0), f(0.0), pow2(-63) | 0x8000_0000, 0], 0x8000_0000),
+        // Subnormal input flushes to signed zero before scaling
+        ([f(0.0), f(0.0), 0x0040_0000, 0], 0x0000_0000),
+        ([f(-0.0), f(1.0), 0x8040_0000, 0], 0x8000_0000),
+        // Overflow to +/-Inf and -0.0 preservation
+        ([f(0.0), f(0.0), pow2(80), 0], f32::INFINITY.to_bits()),
+        (
+            [f(0.0), f(0.0), pow2(80) | 0x8000_0000, 0],
+            f32::NEG_INFINITY.to_bits(),
+        ),
+        ([f(-0.0), f(1.0), 0x8000_0000, 0], 0x8000_0000),
+    ];
+    let v1_in: Vec<[u32; 4]> = v1_cases.iter().map(|c| c.0).collect();
+    run_cases(&fmas_vcc1, &v1_in, |backend, i, inp, got| {
+        let want = v1_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: fmas(vcc=1) case {i} ({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+
+    // Modifiers: clamp((abs(-0.25) * -(-1.0) + 0.125) * 2) = 0.75.
+    let mod_cases: &[([u32; 4], u32)] = &[
+        ([f(-0.25), f(-1.0), f(0.125), 0], f(0.75)),
+        ([f(-1.0), f(-1.0), f(0.0), 0], f(1.0)),
+        ([f(-1.0), f(1.0), f(0.0), 0], f(0.0)),
+    ];
+    let mod_in: Vec<[u32; 4]> = mod_cases.iter().map(|c| c.0).collect();
+    run_cases(&fmas_mod, &mod_in, |backend, i, _, got| {
+        let want = mod_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: fmas(mod) case {i}: {got:#010x} != {want:#010x}"
+        );
+    });
+
+    // Joined VCC across a branch + SGPR-to-VCC copy: s3 == 0 selects a
+    // div_scale writing s6 (VCC=1: 2^60 / 2^-40) copied into vcc_lo, else a
+    // div_scale writing vcc_lo directly (VCC=0: 2.0 / 2.0); join runs
+    // v_div_fmas_f32 v0, 0.0, 0.0, v1 so v1 == 2.0 becomes 2^65 vs 2.0.
+    let ds_scale1 = vop3b(0x16d, 5, 6, [vgpr(2), vgpr(2), vgpr(3)], (0, 0, false));
+    let ds_scale0 = vop3b(0x16d, 5, 0x6A, [vgpr(1), vgpr(1), vgpr(1)], (0, 0, false));
+    let fmas_join = vop3(0x16f, 0, 0x80, 0x80, vgpr(1));
+    let join_shader = build_valu_cs(&[
+        0xBF06_8003,  // s_cmp_eq_u32 s3, 0
+        0xBF84_0004,  // s_cbranch_scc0 +4 -> else arm
+        ds_scale1[0], // then: v_div_scale_f32 v5, s6, v2, v2, v3 (s6=1)
+        ds_scale1[1],
+        s_mov_b32(0x6A, 6), // s_mov_b32 vcc_lo, s6
+        0xBF82_0002,        // s_branch +2 -> join
+        ds_scale0[0],       // else: v_div_scale_f32 v5, vcc_lo, v1, v1, v1 (vcc=0)
+        ds_scale0[1],
+        fmas_join[0], // join: v_div_fmas_f32 v0, 0, 0, v1
+        fmas_join[1],
+    ]);
+    let join_cases: &[([u32; 4], u32)] = &[
+        ([f(2.0), pow2(-40), pow2(60), 0], pow2(65)), // then arm: vcc=1, |2.0|>=2 -> 2^65
+        ([f(2.0), pow2(-40), pow2(60), 1], f(2.0)),   // else arm: vcc=0 -> unscaled 2.0
+    ];
+    let join_in: Vec<[u32; 4]> = join_cases.iter().map(|c| c.0).collect();
+    run_cases(&join_shader, &join_in, |backend, i, _, got| {
+        let want = join_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: fmas(joined vcc) case {i}: {got:#010x} != {want:#010x}"
+        );
+    });
+}
+
+#[test]
+fn rdna2_fdiv32_pipeline_with_div_scale_and_div_fmas() {
+    // Full LLVM/AMDGPU LowerFDIV32 sequence for finite non-zero v1 / v2:
+    //   v_div_scale_f32 v3, null, v2, v2, v1      ; scaled denom
+    //   v_div_scale_f32 v4, vcc_lo, v1, v2, v1    ; scaled num + VCC flag
+    //   v_rcp_f32       v5, v3                    ; ~1/ds
+    //   v_fma_f32       v6, -v3, v5, 1.0          ; 1 - ds*rcp
+    //   v_fma_f32       v5, v6, v5, v5            ; refined 1/ds
+    //   v_mul_f32       v6, v4, v5                ; approx q
+    //   v_fma_f32       v7, -v3, v6, v4           ; residual 1
+    //   v_fma_f32       v6, v7, v5, v6            ; refined q
+    //   v_fma_f32       v7, -v3, v6, v4           ; residual 2
+    //   v_div_fmas_f32  v0, v7, v5, v6            ; final scaled q using VCC
+    let ds = vop3b(0x16d, 3, 0x7D, [vgpr(2), vgpr(2), vgpr(1)], (0, 0, false));
+    let ns = vop3b(0x16d, 4, 0x6A, [vgpr(1), vgpr(2), vgpr(1)], (0, 0, false));
+    let rcp = vop1(0x02a, 5, vgpr(3));
+    let f0 = vop3a_mod(0x14b, 6, [vgpr(3), vgpr(5), 0xF2], (0, 1, 0, false)); // 0xF2 = 1.0f32
+    let f1 = vop3(0x14b, 5, vgpr(6), vgpr(5), vgpr(5));
+    let mul = vop3(0x108, 6, vgpr(4), vgpr(5), 0); // v_mul_f32_e64
+    let f2 = vop3a_mod(0x14b, 7, [vgpr(3), vgpr(6), vgpr(4)], (0, 1, 0, false));
+    let f3 = vop3(0x14b, 6, vgpr(7), vgpr(5), vgpr(6));
+    let f4 = vop3a_mod(0x14b, 7, [vgpr(3), vgpr(6), vgpr(4)], (0, 1, 0, false));
+    let fmas = vop3(0x16f, 0, vgpr(7), vgpr(5), vgpr(6));
+
+    let fdiv = build_valu_cs(&[
+        ds[0], ds[1], ns[0], ns[1], rcp, f0[0], f0[1], f1[0], f1[1], mul[0], mul[1], f2[0], f2[1],
+        f3[0], f3[1], f4[0], f4[1], fmas[0], fmas[1],
+    ]);
+
+    let f_exp = |e: i32, mant: u32| f32::from_bits((((e + 127) as u32) << 23) | mant);
+    let pairs: &[(f32, f32)] = &[
+        // Normal division
+        (7.0, 3.0),
+        (-123.456, 7.89),
+        (1.0, 10.0),
+        // Huge quotient near FLT_MAX (Clause 2: VCC=1, +64)
+        (f_exp(60, 0), f_exp(-50, 0)),
+        (f_exp(100, 0x40_0000), f_exp(-20, 0x20_0000)),
+        // Huge denominator (1/D denorm) + denormal quotient (Clause 4: VCC=1, denom -64 -> FTZ +/-0.0)
+        (1.0, f_exp(127, 0)),
+        (-3.0, f_exp(127, 0x40_0000)),
+        // Huge denominator (1/D denorm) + normal quotient (Clause 5: VCC=0, both -64)
+        (f_exp(100, 0), f_exp(127, 0)),
+        (f_exp(127, 0x40_0000), f_exp(127, 0x20_0000)),
+        // Normal denominator + denormal quotient (Clause 6: VCC=1, num +64 -> FTZ +/-0.0)
+        (f_exp(-64, 0), f_exp(64, 0)),
+        (-f_exp(-70, 0x40_0000), f_exp(60, 0)),
+        // Tiny normal numerator + normal quotient (Clause 7: VCC=0, both +64)
+        (f_exp(-110, 0), f_exp(-105, 0)),
+        (f_exp(-125, 0x40_0000), f_exp(-100, 0)),
+    ];
+
+    let inputs: Vec<[u32; 4]> = pairs
+        .iter()
+        .map(|&(n, d)| [n.to_bits(), d.to_bits(), 0, 0])
+        .collect();
+    run_cases(&fdiv, &inputs, |backend, i, _, got| {
+        let (n, d) = pairs[i];
+        let raw_want = (n / d).to_bits();
+        // RDNA2 f32 FTZ mode 0 flushes subnormal quotients to a zero of their sign.
+        let want = if (raw_want & 0x7F80_0000) == 0 {
+            raw_want & 0x8000_0000
+        } else {
+            raw_want
+        };
+        assert_eq!(
+            got,
+            want,
+            "{backend}: fdiv32 case {i} ({n:e} / {d:e}): got {got:#010x} ({:e}), want {want:#010x} ({:e})",
+            f32::from_bits(got),
+            f32::from_bits(want),
+        );
+    });
+}

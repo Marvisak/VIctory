@@ -1158,12 +1158,18 @@ impl<'a> Lanes<'a> {
                     l.masks.insert(k, m);
                     l.active.insert(k.0);
                 };
-                // A select reads a mask nothing else may: a join of compare
-                // results is resolved here, as for EXEC.
+                // A select or `v_div_fmas` reads a mask nothing else may: a
+                // join of compare / `v_div_scale` results is resolved here,
+                // as for EXEC.
                 if name == "v_cndmask_b32"
                     && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
                     && code != NULL
                     && let Some(k) = self.key(|r| inst.read(r), code)
+                {
+                    self.mask(k);
+                }
+                if matches!(name, "v_div_fmas_f32" | "v_div_fmas_f64")
+                    && let Some(k) = self.key(|r| inst.read(r), VCC)
                 {
                     self.mask(k);
                 }
@@ -1576,5 +1582,62 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn div_fmas_tracks_implicit_vcc_across_branch_join() {
+        // Branch on s0 == 0: each arm computes v_div_scale_f32 into vcc, then
+        // the join block consumes vcc solely via v_div_fmas_f32.
+        //   0: s_cmp_eq_u32 s0, 0
+        //   4: s_cbranch_scc1 +3 (-> 20: else arm)
+        //   8: v_div_scale_f32 v2, vcc_lo, v1, v0, v1
+        //  16: s_branch +2 (-> 28: join)
+        //  20: v_div_scale_f32 v2, vcc_lo, v0, v0, v1
+        //  28: v_div_fmas_f32 v0, v1, v2, v3
+        //  36: s_endpgm
+        let div_scale_num: [u32; 2] = [
+            0x35 << 26 | 0x16d << 16 | (0x6A << 8) | 2,
+            257 | (256 << 9) | (257 << 18),
+        ];
+        let div_scale_den: [u32; 2] = [
+            0x35 << 26 | 0x16d << 16 | (0x6A << 8) | 2,
+            256 | (256 << 9) | (257 << 18),
+        ];
+        let div_fmas: [u32; 2] = [0x35 << 26 | 0x16f << 16, 257 | (258 << 9) | (259 << 18)];
+        for wave64 in [false, true] {
+            let p = build(
+                &[
+                    0xBF06_8000,      // 0: s_cmp_eq_u32 s0, 0
+                    0xBF85_0003,      // 4: s_cbranch_scc1 -> 20
+                    div_scale_num[0], // 8
+                    div_scale_num[1], // 12
+                    0xBF82_0002,      // 16: s_branch -> 28
+                    div_scale_den[0], // 20
+                    div_scale_den[1], // 24
+                    div_fmas[0],      // 28
+                    div_fmas[1],      // 32
+                    S_ENDPGM,         // 36
+                ],
+                wave64,
+            );
+            let s = structure(&p).unwrap();
+            let join = p
+                .blocks
+                .iter()
+                .find(|b| b.offset == 28)
+                .expect("join block");
+            let fmas_inst = &join.insts[0];
+            assert_eq!(fmas_inst.name(), "v_div_fmas_f32");
+            let vcc_lo = fmas_inst
+                .read(Reg::S(VCC))
+                .expect("v_div_fmas_f32 must implicitly read VCC");
+            if wave64 {
+                assert!(fmas_inst.read(Reg::S(VCC + 1)).is_some());
+            }
+            assert!(
+                s.masks.contains_key(&vcc_lo),
+                "joined VCC from v_div_scale_f32 must be resolved in st.masks (wave64={wave64})"
+            );
+        }
     }
 }
