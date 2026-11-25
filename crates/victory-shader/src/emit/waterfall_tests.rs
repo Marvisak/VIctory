@@ -1,7 +1,8 @@
 //! End-to-end tests of waterfall loops over per-lane descriptors: the
 //! synthetic GFX10 programs of `resource::tests` lowered to DXIL, validated
 //! by `dxil.dll` when present, and run on the host GPU and WARP, each lane
-//! reading the resource its own descriptor names.
+//! reading the resource its own descriptor names. The same harness checks a
+//! uniform `image_get_resinfo` result.
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -16,6 +17,12 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    build_expecting(words, buffers, 1)
+}
+
+/// Like [`build`], with an expected `nonuniform_handles` count (0 for a
+/// uniform `image_get_resinfo`).
+fn build_expecting(words: &[u32], buffers: bool, nonuniform_handles: u32) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -72,8 +79,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         view_marks: false,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
+    assert_eq!(lowered.nonuniform_handles, nonuniform_handles);
     assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -255,6 +261,47 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         let shader = build(&cmpx_waterfall(false, folded), false);
         for (label, red) in sampled(&shader) {
             assert_eq!(red, want, "{label}, folded {folded}");
+        }
+    }
+}
+
+/// A uniform 2D `image_get_resinfo` must return 0 for the unused depth
+/// channel (RDNA2). On `main` it returned 1 (DXIL's unused-channel fill).
+#[test]
+fn image_resinfo_returns_zero_depth_for_a_2d_view() {
+    let shader = build_expecting(
+        &[
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0602,
+            0xFA00_0000, // s_load_dwordx8 s[24:31], s[4:5], 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x7E04_0280, // v_mov_b32 v2, 0 (mip)
+            0x3420_0084, // v_lshlrev_b32 v16, 4, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF038_0F08,
+            0x0006_0C02, // image_get_resinfo v[12:15], v2, s[24:31], dmask:0xf, dim:2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE078_1000,
+            0x800A_0C10, // buffer_store_dwordx4 v[12:15], v16, s[40:43], 0 offen
+            0xBF81_0000, // s_endpgm
+        ],
+        false,
+        0,
+    );
+    let pixels = [[0.0; 4]; 6];
+    let views = [
+        View::Texture(3, 2, &pixels),
+        View::Texture(3, 2, &pixels),
+        View::RawUav(128),
+    ];
+    let results = run(&shader, &views);
+    assert!(!results.is_empty());
+    for (label, words) in results {
+        assert_eq!(words.len(), 128, "{label}");
+        for (lane, dimensions) in words.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(*dimensions, [3, 2, 0, 1], "{label}, lane {lane}");
         }
     }
 }
