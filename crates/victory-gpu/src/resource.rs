@@ -2311,6 +2311,114 @@ mod tests {
     }
     use crate::object::slot;
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn capture_uses_the_bound_render_target_mip() {
+        use crate::object::IUNKNOWN;
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RTV_DIMENSION_TEXTURE2D,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+
+        const TEST: &str = "resource::tests::capture_uses_the_bound_render_target_mip";
+        const CHILD: &str = "VICTORY_TEST_BOUND_MIP_CAPTURE";
+        const UNAVAILABLE: &str = "WARP unavailable for bound-mip capture";
+        if std::env::var_os(CHILD).is_some() {
+            let Some(host) = crate::host::host() else {
+                println!("{UNAVAILABLE}");
+                return;
+            };
+            let null = std::ptr::null();
+            let format = DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32;
+            let desc = ResourceDesc {
+                flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32,
+                ..texture(8, 8, format, 2)
+            };
+            let mut resource = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut resource),
+                S_OK,
+            );
+            let actual = host_resource(resource).expect("a host texture with both mips");
+            // SAFETY: the reference holds a live texture.
+            assert_eq!(unsafe { actual.GetDesc() }.MipLevels, 2);
+
+            let mut allocator = null;
+            let mut guest = null;
+            assert_eq!(crate::list::create_allocator(null, 0, &IUNKNOWN, &mut allocator), S_OK);
+            assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &IUNKNOWN, &mut guest), S_OK);
+            let list = crate::list::host_list(guest).unwrap();
+            let bind = slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(guest, 0x190);
+            let clear = slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const RECT)>(guest, 0x1a0);
+            let mut descriptors = [[0u64; 14]; 2];
+            for (mip, (desc_words, color)) in descriptors
+                .iter_mut()
+                .zip([[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]])
+                .enumerate()
+            {
+                let handle = desc_words.as_mut_ptr() as u64;
+                let view = [format, D3D12_RTV_DIMENSION_TEXTURE2D.0 as u32, mip as u32, 0, 0, 0];
+                crate::descriptor::create_rtv(null, resource, &view, handle);
+                bind(guest, 1, &handle, 0, null.cast());
+                clear(guest, handle, &color, 0, null.cast());
+            }
+            list.close();
+            host.execute(&[list]);
+            crate::capture::dump_targets(1);
+            for o in [guest, allocator, resource] {
+                assert_eq!(slot::<Release>(o, 0x10)(o), 0);
+            }
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env("VICTORY_D3D12_WARP", "1")
+            .env("VICTORY_D3D12_DEBUG", "0")
+            .env("VICTORY_CAPTURE", dir.path())
+            .env("VICTORY_CAPTURE_FRAMES", "1")
+            .env("VICTORY_DUMP_TARGETS", "1")
+            .output()
+            .unwrap();
+        let message = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{message}\n{}", String::from_utf8_lossy(&output.stderr));
+        if message.contains(UNAVAILABLE) {
+            eprintln!("{UNAVAILABLE}; skipped");
+            return;
+        }
+
+        let mut actual = Vec::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "png") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_str().unwrap();
+            let png = std::fs::read(&path).unwrap();
+            let word = |at| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+            let size_in_name = if word(16) == 2 { "-4x4-f28-mip1" } else { "-8x8-f28" };
+            assert!(name.contains(size_in_name), "target filename should include {size_in_name}");
+            let rgb = miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + word(33) as usize]).unwrap();
+            actual.push((name.starts_with("frame-1-s"), word(16), word(20), rgb));
+        }
+        let row = |size, pixel: [u8; 3]| [vec![0], pixel.repeat(size)].concat().repeat(size);
+        let red = row(4, [255, 0, 0]);
+        let green = row(2, [0, 255, 0]);
+        let mut expected = vec![
+            (false, 4, 4, red.clone()),
+            (true, 4, 4, red),
+            (false, 2, 2, green.clone()),
+            (true, 2, 2, green),
+        ];
+        actual.sort_unstable();
+        expected.sort_unstable();
+        println!("bound-mip capture produced {} PNGs", actual.len());
+        assert_eq!(actual, expected, "both named RTV mip slices at submission and at present");
+    }
+
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
         // DXGI_FORMAT values: 60 R8_TYPELESS, 61 R8_UNORM, 62 R8_UINT,

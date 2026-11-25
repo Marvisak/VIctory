@@ -129,6 +129,15 @@ pub(crate) fn read_back(
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
 ) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+    read_back_subresource(device, list, texture, 0)
+}
+
+fn read_back_subresource(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+    subresource: u32,
+) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
     // SAFETY: a live texture; outputs for one subresource.
@@ -136,7 +145,7 @@ pub(crate) fn read_back(
         let desc = texture.GetDesc();
         device.GetCopyableFootprints(
             &desc,
-            0,
+            subresource,
             1,
             0,
             Some(&mut footprint),
@@ -187,7 +196,7 @@ pub(crate) fn read_back(
             pResource: std::mem::transmute_copy(texture),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
+                SubresourceIndex: subresource,
             },
         };
         list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
@@ -237,8 +246,15 @@ pub(crate) fn save_read_back(
 /// a pipeline with one of them writes, the first frame it runs.
 #[allow(clippy::type_complexity)]
 static TARGETS: std::sync::Mutex<
-    Vec<(usize, std::sync::Arc<crate::resource::HostTexture>, String)>,
+    Vec<(Target, std::sync::Arc<crate::resource::HostTexture>, String)>,
 > = std::sync::Mutex::new(Vec::new());
+
+/// The guest resource and mip chosen for a diagnostic readback.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Target {
+    resource: usize,
+    mip: u32,
+}
 
 thread_local! {
     /// The pipeline whose draw or dispatch this thread is binding.
@@ -270,12 +286,34 @@ static BUFFERS: std::sync::Mutex<Vec<(usize, Vec<u8>, String)>> = std::sync::Mut
 /// command of `list`, whose submission dumps it again when the frame is
 /// listed).
 pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object::This) {
+    note_texture(list, resource, 0);
+}
+
+/// An explicit 2D RTV selects the mip in its first plane.
+pub(crate) fn note_rtv(
+    list: &crate::host::HostList,
+    resource: crate::object::This,
+    view: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
+) {
+    let mut mip = 0;
+    if let Some(view) = view.filter(|view| view.ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2D) {
+        // SAFETY: the view dimension selects the active Texture2D member.
+        let view = unsafe { view.Anonymous.Texture2D };
+        if view.PlaneSlice == 0 {
+            mip = view.MipSlice;
+        }
+    }
+    note_texture(list, resource, mip);
+}
+
+fn note_texture(list: &crate::host::HostList, resource: crate::object::This, mip: u32) {
     if resource.is_null() || !dump_on() {
         return;
     }
+    let target = Target { resource: resource as usize, mip };
     let by = WRITER.with(|w| w.borrow().clone());
     // Lists are recorded ahead of the frame that submits them.
-    list.note_target(resource as usize, &by);
+    list.note_target(target, &by);
     if !listed(crate::queue::presented() + 1) {
         let mut writers = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
         let writers = writers.get_or_insert_with(|| {
@@ -297,10 +335,10 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
         }
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.iter().any(|(r, _, _)| *r == resource as usize)
+    if !targets.iter().any(|(key, _, _)| *key == target)
         && let Some(copy) = crate::resource::host_copy(resource)
     {
-        targets.push((resource as usize, copy, by));
+        targets.push((target, copy, by));
     }
 }
 
@@ -344,7 +382,7 @@ pub(crate) fn dump_targets(frame: u64) {
         );
     }
     let Some(host) = crate::host::host() else { return };
-    for (i, (resource, copy, by)) in targets.iter().enumerate() {
+    for (i, (key, copy, by)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
@@ -353,7 +391,7 @@ pub(crate) fn dump_targets(frame: u64) {
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        let target = (i, *resource as crate::object::This, by.as_str());
+        let target = (i, *key, by.as_str());
         dump_one(host, texture, state, &format!("frame-{frame}"), target, &d);
     }
 }
@@ -361,13 +399,13 @@ pub(crate) fn dump_targets(frame: u64) {
 /// After submission `sub` of a listed frame has run: the textures its lists
 /// rendered to or wrote, as `frame-<n>-s<sub>-<i>-...` (what each holds
 /// then, to follow a frame pass by pass).
-pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
+pub(crate) fn dump_submission(sub: u64, targets: &[(Target, String)]) {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = crate::host::host() else { return };
     let frame = crate::queue::presented() + 1;
     peek(&format!("frame-{frame}-s{sub:04}"));
-    for (i, (resource, by)) in targets.iter().enumerate() {
-        let Some(copy) = crate::resource::host_copy(*resource as crate::object::This) else {
+    for (i, (key, by)) in targets.iter().enumerate() {
+        let Some(copy) = crate::resource::host_copy(key.resource as crate::object::This) else {
             continue;
         };
         let texture = &copy.texture;
@@ -377,7 +415,7 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
             continue;
         }
         let state = copy.state.load(Relaxed);
-        let target = (i, *resource as crate::object::This, by.as_str());
+        let target = (i, *key, by.as_str());
         dump_one(host, texture, state, &format!("frame-{frame}-s{sub:04}"), target, &d);
         // A depth texture's writable twin (`crate::twin`): what unordered
         // views wrote, which reaches the depth texture at its next use.
@@ -385,7 +423,7 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
             // SAFETY: a live resource.
             let pd = unsafe { plane.texture.GetDesc() };
             let by = format!("{by}-twin{p}");
-            let target = (i, *resource as crate::object::This, by.as_str());
+            let target = (i, Target { mip: 0, ..*key }, by.as_str());
             dump_one(host, &plane.texture, plane.state.load(Relaxed), &format!("frame-{frame}-s{sub:04}"), target, &pd);
         }
     }
@@ -519,9 +557,13 @@ fn dump_one(
     texture: &ID3D12Resource,
     state: u32,
     prefix: &str,
-    (i, resource, by): (usize, crate::object::This, &str),
+    (i, target, by): (usize, Target, &str),
     d: &D3D12_RESOURCE_DESC,
 ) {
+    if target.mip >= u32::from(d.MipLevels) {
+        return;
+    }
+    let resource = target.resource as crate::object::This;
     let Ok(list) = host.new_list() else { return };
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -531,7 +573,7 @@ fn dump_one(
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
         }
-        let read = read_back(&host.device, &list.list, texture);
+        let read = read_back_subresource(&host.device, &list.list, texture, target.mip);
         if state != copy {
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
@@ -568,8 +610,11 @@ fn dump_one(
         if let Some(rgba) = to_rgba(format as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let mut name = format!(
                 "{prefix}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
+                f.Width, f.Height, d.Format.0
             );
+            if target.mip != 0 {
+                name.push_str(&format!("-mip{}", target.mip));
+            }
             // The pipeline's hashes (its name is "[stage hash, ...]").
             let by: String = by.chars().filter(char::is_ascii_alphanumeric).collect();
             if !by.is_empty() {

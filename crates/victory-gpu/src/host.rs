@@ -832,7 +832,7 @@ pub(crate) struct HostList {
     /// In a frame `crate::capture` lists: the textures the list renders to
     /// or writes, and the pipeline that first wrote each (diagnostics).
     #[cfg(feature = "diagnostics")]
-    targets: Mutex<Vec<(usize, String)>>,
+    targets: Mutex<Vec<(crate::capture::Target, String)>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -1434,7 +1434,7 @@ impl Host {
         if traced {
             let sub = *submitted;
             drop(submitted);
-            let mut targets: Vec<(usize, String)> = Vec::new();
+            let mut targets: Vec<(crate::capture::Target, String)> = Vec::new();
             for r in runs {
                 for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
                     if !targets.iter().any(|x| x.0 == t.0) {
@@ -2030,10 +2030,10 @@ impl HostList {
 
     /// Notes a texture the list renders to or writes, in a listed frame.
     #[cfg(feature = "diagnostics")]
-    pub(crate) fn note_target(&self, resource: usize, by: &str) {
+    pub(crate) fn note_target(&self, target: crate::capture::Target, by: &str) {
         let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
-        if !targets.iter().any(|t| t.0 == resource) {
-            targets.push((resource, by.to_owned()));
+        if !targets.iter().any(|t| t.0 == target) {
+            targets.push((target, by.to_owned()));
         }
     }
 

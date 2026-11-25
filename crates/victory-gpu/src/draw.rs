@@ -425,9 +425,10 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
+            let view = record.desc();
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
+            crate::capture::note_rtv(list, record.resource, view.as_ref());
+            rtvs.push(host.rtv(&texture, view.as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
