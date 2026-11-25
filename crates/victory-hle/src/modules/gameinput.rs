@@ -120,6 +120,45 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
+/// The debug overlay (Alt+Z, `victory_gpu::overlay`) shows the pad the
+/// title reads (the first connected one, else the keyboard's stand-in);
+/// while it shows, the title reads neutral pads (still connected), no keys
+/// and no scripted keys.
+fn overlay(
+    mut pads: [Option<PadState>; PADS],
+    mut keys: Vec<KeyState>,
+    scripted: &mut &[KeyState],
+) -> ([Option<PadState>; PADS], Vec<KeyState>) {
+    #[cfg(windows)]
+    {
+        use victory_gpu::overlay::{Pad, captured, show_pad};
+        let read = pads.iter().flatten().next().copied().unwrap_or_else(|| {
+            let base = fallback(&keys);
+            #[cfg(any(test, feature = "diagnostics"))]
+            if !scripted.is_empty() {
+                return merge_pad(base, fallback(scripted));
+            }
+            base
+        });
+        show_pad(Some(Pad {
+            buttons: read.buttons,
+            triggers: [read.left_trigger, read.right_trigger],
+            left: [read.left_x, read.left_y],
+            right: [read.right_x, read.right_y],
+        }));
+        if captured() {
+            pads.iter_mut()
+                .flatten()
+                .for_each(|p| *p = PadState::default());
+            keys.clear();
+            *scripted = &[];
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = scripted;
+    (pads, keys)
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
@@ -490,7 +529,7 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        scripted: &[KeyState],
+        mut scripted: &[KeyState],
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -510,6 +549,7 @@ impl State {
         merge_scripted(&mut pads, scripted);
         #[cfg(not(any(test, feature = "diagnostics")))]
         let _ = (&mut pads, scripted);
+        let (pads, keys) = overlay(pads, keys, &mut scripted);
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
@@ -655,6 +695,9 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    // The debug overlay times input to present from the frame's first read.
+    #[cfg(windows)]
+    victory_gpu::overlay::note_input_read();
     let hub = hub(this);
     let state = hub.state();
     let newest = |i: usize| {
