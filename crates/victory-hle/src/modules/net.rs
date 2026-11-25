@@ -218,10 +218,30 @@ fn name_info_flags(sa: *const u8, len: i32, host_wanted: bool, flags: i32) -> Op
     }
 }
 
+/// A zero `sockaddr` (all zeros, `0.0.0.0:0` or `[::]:0`), which Winsock
+/// takes in `connect` and `WSAConnect` to disconnect a datagram socket or
+/// reject on stream sockets locally without leaving the machine.
+fn zero_address(addr: *const u8, len: i32) -> bool {
+    let Ok(len) = usize::try_from(len) else {
+        return false;
+    };
+    if addr.is_null() || len < 16 {
+        return false;
+    }
+    // SAFETY: the title passes `len` readable bytes.
+    let b = unsafe { std::slice::from_raw_parts(addr, len) };
+    match u16::from_le_bytes([b[0], b[1]]) {
+        0 => b.iter().all(|&x| x == 0),
+        AF_INET => b[2..8].iter().all(|&x| x == 0),
+        AF_INET6 => len >= 28 && b[2..28].iter().all(|&x| x == 0),
+        _ => false,
+    }
+}
+
 // Connects.
 
 pub extern "system" fn connect(s: Socket, name: *const u8, len: i32) -> i32 {
-    if !reachable("network connect blocked", name, len) {
+    if !zero_address(name, len) && !reachable("network connect blocked", name, len) {
         return SOCKET_ERROR;
     }
     host!("ws2_32.dll", "connect": extern "system" fn(Socket, *const u8, i32) -> i32)(s, name, len)
@@ -236,7 +256,7 @@ pub extern "system" fn WSAConnect(
     sqos: *const c_void,
     gqos: *const c_void,
 ) -> i32 {
-    if !reachable("network connect blocked", name, len) {
+    if !zero_address(name, len) && !reachable("network connect blocked", name, len) {
         return SOCKET_ERROR;
     }
     host!("ws2_32.dll", "WSAConnect": extern "system" fn(Socket, *const u8, i32, *const c_void, *mut c_void, *const c_void, *const c_void) -> i32)(
@@ -1118,5 +1138,139 @@ mod tests {
             }
             assert!(present, "{dll} lacks {}", e.name);
         }
+    }
+
+    fn v6(ip: [u8; 16], port: u16) -> [u8; 28] {
+        let mut a = [0u8; 28];
+        a[..2].copy_from_slice(&AF_INET6.to_le_bytes());
+        a[2..4].copy_from_slice(&port.to_be_bytes());
+        a[8..24].copy_from_slice(&ip);
+        a
+    }
+
+    #[test]
+    fn zero_address_accepts_only_disconnect_forms() {
+        let zero16 = [0u8; 16];
+        let zero28 = [0u8; 28];
+        let v4_zero = v4([0, 0, 0, 0], 0);
+        let v6_zero = v6([0; 16], 0);
+        assert!(zero_address(zero16.as_ptr(), 16));
+        assert!(zero_address(zero28.as_ptr(), 28));
+        assert!(zero_address(v4_zero.as_ptr(), 16));
+        assert!(zero_address(v6_zero.as_ptr(), 28));
+
+        // Non-zero ports, loopback, external addresses, scoped IPv6, null and short buffers are rejected.
+        assert!(!zero_address(std::ptr::null(), 16));
+        assert!(!zero_address(zero16.as_ptr(), -1));
+        assert!(!zero_address(zero16.as_ptr(), 15));
+        assert!(!zero_address(v6_zero.as_ptr(), 16));
+        let mut unspec_nonzero = [0u8; 16];
+        unspec_nonzero[3] = 80;
+        assert!(!zero_address(unspec_nonzero.as_ptr(), 16));
+        assert!(!zero_address(v4([0, 0, 0, 0], 80).as_ptr(), 16));
+        assert!(!zero_address(v6([0; 16], 80).as_ptr(), 28));
+        let mut v6_scoped = v6([0; 16], 0);
+        v6_scoped[24] = 1;
+        assert!(!zero_address(v6_scoped.as_ptr(), 28));
+        assert!(!zero_address(v4(HOME, 0).as_ptr(), 16));
+        assert!(!zero_address(v4(AWAY, 0).as_ptr(), 16));
+        let mut v6_loopback = [0u8; 16];
+        v6_loopback[15] = 1;
+        assert!(!zero_address(v6(v6_loopback, 0).as_ptr(), 28));
+    }
+
+    #[test]
+    fn zero_address_disconnects_datagram_sockets_while_blocking_external_peers() {
+        const WSAEAFNOSUPPORT: i32 = 10047;
+        const WSAENOTCONN: i32 = 10057;
+
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = peer.local_addr().unwrap().port();
+        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
+        let send =
+            host!("ws2_32.dll", "send": extern "system" fn(Socket, *const u8, i32, i32) -> i32);
+        let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
+        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+        let null = std::ptr::null_mut::<c_void>();
+
+        let u = socket(2, 2, 17);
+        assert_ne!(u, INVALID_SOCKET);
+
+        // Connect to loopback, send a datagram, then disconnect via `connect` with 0.0.0.0:0.
+        assert_eq!(connect(u, v4(HOME, port).as_ptr(), 16), 0);
+        assert_eq!(send(u, b"a".as_ptr(), 1, 0), 1);
+        assert_eq!(connect(u, v4([0, 0, 0, 0], 0).as_ptr(), 16), 0);
+        assert_eq!(send(u, b"b".as_ptr(), 1, 0), SOCKET_ERROR);
+        assert_eq!(last_error(), WSAENOTCONN);
+
+        // Reconnect, then disconnect via `connect` with an all-zero AF_UNSPEC sockaddr.
+        assert_eq!(connect(u, v4(HOME, port).as_ptr(), 16), 0);
+        assert_eq!(send(u, b"c".as_ptr(), 1, 0), 1);
+        let zero = [0u8; 16];
+        assert_eq!(connect(u, zero.as_ptr(), 16), 0);
+        assert_eq!(send(u, b"d".as_ptr(), 1, 0), SOCKET_ERROR);
+        assert_eq!(last_error(), WSAENOTCONN);
+
+        // `WSAConnect` forwards the caller's sockaddr unchanged (all-zero and 0.0.0.0:0).
+        assert_eq!(
+            WSAConnect(u, v4(HOME, port).as_ptr(), 16, null, null, null, null),
+            0
+        );
+        assert_eq!(send(u, b"e".as_ptr(), 1, 0), 1);
+        assert_eq!(WSAConnect(u, zero.as_ptr(), 16, null, null, null, null), 0);
+        assert_eq!(send(u, b"f".as_ptr(), 1, 0), SOCKET_ERROR);
+        assert_eq!(last_error(), WSAENOTCONN);
+
+        assert_eq!(
+            WSAConnect(u, v4(HOME, port).as_ptr(), 16, null, null, null, null),
+            0
+        );
+        assert_eq!(send(u, b"g".as_ptr(), 1, 0), 1);
+        assert_eq!(
+            WSAConnect(u, v4([0, 0, 0, 0], 0).as_ptr(), 16, null, null, null, null),
+            0
+        );
+        assert_eq!(send(u, b"h".as_ptr(), 1, 0), SOCKET_ERROR);
+        assert_eq!(last_error(), WSAENOTCONN);
+
+        // Stream sockets receive the host error for each untouched sockaddr form.
+        let tcp = socket(2, 1, 6);
+        assert_ne!(tcp, INVALID_SOCKET);
+        assert_eq!(connect(tcp, v4([0, 0, 0, 0], 0).as_ptr(), 16), SOCKET_ERROR);
+        assert_eq!(last_error(), WSAEADDRNOTAVAIL);
+        assert_eq!(connect(tcp, zero.as_ptr(), 16), SOCKET_ERROR);
+        assert_eq!(last_error(), WSAEAFNOSUPPORT);
+        assert_eq!(
+            WSAConnect(
+                tcp,
+                v4([0, 0, 0, 0], 0).as_ptr(),
+                16,
+                null,
+                null,
+                null,
+                null
+            ),
+            SOCKET_ERROR
+        );
+        assert_eq!(last_error(), WSAEADDRNOTAVAIL);
+        close(tcp);
+
+        // Non-zero port on 0.0.0.0 and off-machine peers remain blocked as unreachable.
+        assert_eq!(connect(u, v4([0, 0, 0, 0], 80).as_ptr(), 16), SOCKET_ERROR);
+        assert_eq!(last_error(), WSAENETUNREACH);
+        assert_eq!(
+            WSAConnect(u, v4([0, 0, 0, 0], 80).as_ptr(), 16, null, null, null, null),
+            SOCKET_ERROR
+        );
+        assert_eq!(last_error(), WSAENETUNREACH);
+        assert_eq!(connect(u, v4(AWAY, 80).as_ptr(), 16), SOCKET_ERROR);
+        assert_eq!(last_error(), WSAENETUNREACH);
+        assert_eq!(
+            WSAConnect(u, v4(AWAY, 80).as_ptr(), 16, null, null, null, null),
+            SOCKET_ERROR
+        );
+        assert_eq!(last_error(), WSAENETUNREACH);
+
+        close(u);
     }
 }
