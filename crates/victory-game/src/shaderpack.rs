@@ -332,7 +332,8 @@ pub fn find(file: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
     loop {
         // The header gives the size once it is whole.
         if let Some(total) = size(&pack).filter(|&t| pack.len() >= t) {
-            return (pack.len() == total).then_some(std::borrow::Cow::Owned(pack));
+            pack.truncate(total);
+            return Some(std::borrow::Cow::Owned(pack));
         }
         at = at.next_multiple_of(16);
         let (out, used) = inflate(at)?;
@@ -483,6 +484,24 @@ mod tests {
         assert_eq!(find(&archive).as_deref(), Some(&pack[..]));
         assert_eq!(find(&pack).as_deref(), Some(&pack[..]));
         assert!(find(&archive[..archive.len() - 200]).is_none());
+    }
+
+    #[test]
+    fn finds_a_pack_with_trailing_bytes_in_final_zlib_stream() {
+        let pack = pack_bytes();
+        let mut archive = vec![0x5A; 0x103];
+        // Two streams: the first contains part of the pack, the second contains
+        // the rest of the pack plus trailing archive data.
+        let split = pack.len() / 2;
+        archive.resize(archive.len().next_multiple_of(16), 0);
+        archive.extend(miniz_oxide::deflate::compress_to_vec_zlib(&pack[..split], 6));
+
+        archive.resize(archive.len().next_multiple_of(16), 0);
+        let mut second = pack[split..].to_vec();
+        second.extend_from_slice(b"trailing archive entry bytes");
+        archive.extend(miniz_oxide::deflate::compress_to_vec_zlib(&second, 6));
+
+        assert_eq!(find(&archive).as_deref(), Some(&pack[..]));
     }
 
     #[test]
