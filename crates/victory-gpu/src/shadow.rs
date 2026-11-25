@@ -287,6 +287,43 @@ impl Shadow {
         self.marks.is_some()
     }
 
+    /// A private root constant upload after the producer fence.
+    pub(crate) fn stage_private(&self, address: usize, len: usize, dst: *mut u8) {
+        let offset = address - self.start as usize;
+        assert!(offset + len <= self.len as usize);
+        // SAFETY: the source is inside the fenced shadow. The caller is
+        // preparing the recorded consumer's nonoverlapping upload span.
+        unsafe { self.data.add(offset).copy_to_nonoverlapping(dst, len) };
+    }
+
+    /// Refresh only bytes delivered by an ordered title copy. A whole
+    /// page refresh at a native fence would replace GPU data on that page.
+    /// Keep the snapshot in sync so these bytes are not copied back as GPU
+    /// writes. The tracker stays dirty for the next logical submission.
+    pub(crate) fn apply_title_copy(&self, address: usize, len: usize) {
+        let (from, to) = self.inside(address, len);
+        if from >= to {
+            return;
+        }
+        let n = to - from;
+        let mut bytes = pooled(n);
+        bytes.resize(n, 0);
+        if crate::host::read_into((self.start as usize + from) as *const u8, &mut bytes) {
+            // SAFETY: the span is inside the mapping. This runs between
+            // native phases after the producer fence.
+            unsafe { self.data.add(from).copy_from_nonoverlapping(bytes.as_ptr(), n) };
+            let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            for (start, old) in &mut before.0 {
+                let a = (*start).max(from);
+                let b = (*start + old.len()).min(to);
+                if a < b {
+                    old[a - *start..b - *start].copy_from_slice(&bytes[a - from..b - from]);
+                }
+            }
+        }
+        give_back(bytes);
+    }
+
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -888,15 +925,50 @@ pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
 }
 
+pub(crate) type WriteRange = (Arc<Shadow>, usize, usize);
+
+fn page_of_mark(m: &Marks, n: u32) -> Option<(Arc<Shadow>, usize)> {
+    let (&base, copy) = m.owners.range(..=n).next_back()?;
+    let copy = copy.upgrade()?;
+    let k = n - base;
+    (k < pages(copy.start, copy.len)).then(|| {
+        let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
+        (copy, page)
+    })
+}
+
+/// View pages marked by the selected shader class. Read after the fence,
+/// without consuming the marks that logical completion will use.
+pub(crate) fn view_write_pages(memory: bool) -> Vec<WriteRange> {
+    let Some(b) = bitmap(memory) else { return Vec::new() };
+    let m = marks();
+    let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
+    let used = (m.end as usize).div_ceil(32).min(words);
+    // SAFETY: the GPU finished using the mapped bitmap at the prefix fence.
+    let bits = unsafe { std::slice::from_raw_parts(b.data as *const u32, used) };
+    let mut held = Vec::new();
+    for (w, &word) in bits.iter().enumerate() {
+        let mut x = word;
+        while x != 0 {
+            let bit = (w * 32) as u32 + x.trailing_zeros();
+            x &= x - 1;
+            if let Some((copy, page)) = page_of_mark(&m, bit) {
+                held.push((copy, page, PAGE));
+            }
+        }
+    }
+    held
+}
+
 /// After a submission: every page its shaders marked as written through
 /// views goes back ([`Shadow::copy_back_marked`]), but for pages in
 /// `withheld` (ranges of copies that lists whose writes stay out of title
 /// memory declared) and, with `memory_withheld`, pages that shaders using
 /// title memory marked; the bitmaps are cleared. Before the copy-backs of
 /// declared ranges, which disarm the copies.
-// shortcut: marks do not tell lists apart: a page that a withheld list and
-// another both wrote through views goes back unless the withheld list
-// declared it.
+// Ordinary marks cannot distinguish the bytes written by individual
+// shaders. The caller also passes any actual pages marked by withheld
+// computed-address programs so an ordinary mark cannot publish them.
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
@@ -923,19 +995,10 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
     marked.sort_unstable();
     marked.dedup();
-    let page_of = |m: &Marks, n: u32| {
-        let (&base, copy) = m.owners.range(..=n).next_back()?;
-        let copy = copy.upgrade()?;
-        let k = n - base;
-        (k < pages(copy.start, copy.len)).then(|| {
-            let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
-            (copy, page)
-        })
-    };
     // Held back: dropped from the copies (`crate::memory::drop_withheld`).
     if !held.is_empty() {
         let m = marks();
-        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+        for (_, page) in held.into_iter().filter_map(|n| page_of_mark(&m, n)) {
             crate::memory::drop_withheld(page, PAGE);
         }
     }
@@ -944,7 +1007,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     }
     let pages: Vec<(Arc<Shadow>, usize)> = {
         let m = marks();
-        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
+        marked.iter().filter_map(|&n| page_of_mark(&m, n)).collect()
     };
     for (copy, page) in pages {
         if withheld

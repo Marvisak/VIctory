@@ -113,6 +113,13 @@ pub(crate) struct Translated {
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn synthetic_compute_shader(host: victory_shader::emit::HostShader, used: Vec<victory_shader::UsedResource>) -> Arc<Shader> {
+    let shader = Shader::new("compute", b"synthetic interleaved buffer consumer");
+    assert!(shader.translated.set(Some(Translated { host, used })).is_ok());
+    Arc::new(shader)
+}
+
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use (or taken from the cache); a

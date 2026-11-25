@@ -213,7 +213,33 @@ struct Shared {
     pairs: HashMap<usize, u32>,
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
-    layout: Arc<Layout>,
+    layout: Arc<Mutex<Arc<Layout>>>,
+}
+
+/// The identity and most recent layout of the particular table a recording
+/// bound. Releasing and reusing the title heap address cannot change it.
+#[derive(Clone)]
+pub(crate) struct BoundTable {
+    key: usize,
+    layout: Arc<Mutex<Arc<Layout>>>,
+}
+
+impl BoundTable {
+    #[cfg(test)]
+    pub(crate) fn unbound(key: usize) -> Self {
+        Self { key, layout: Arc::default() }
+    }
+
+    fn layout(&self) -> Arc<Layout> {
+        self.layout.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn refresh(&self, add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+        // A released heap's old table is still retained by the list. Its
+        // slots cannot be rewritten through the replacement heap's address.
+        let current = prepare_layout(self.key, Some(&self.layout));
+        refresh_layout(current.unwrap_or_else(|| self.layout()), add);
+    }
 }
 
 // SAFETY: `data` is the persistent mapping of `table`, written only under
@@ -539,7 +565,7 @@ impl Shared {
         let out = unsafe { std::slice::from_raw_parts_mut(self.data as *mut u32, TABLE_DWORDS) };
         let (_, blocks, owner) = write_table(&ranges, &slots, self.null, out);
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
-        self.layout = Arc::new(Layout {
+        *self.layout.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
             blocks,
@@ -550,41 +576,36 @@ impl Shared {
     }
 }
 
-/// The page table of view heap `key`, as the last submission using it
-/// left it.
-fn layout(key: usize) -> Arc<Layout> {
-    shared()
-        .iter()
-        .find(|(k, _)| *k == key)
-        .map(|(_, s)| s.layout.clone())
-        .unwrap_or_default()
-}
-
-/// At submission, for a list using title memory with view heap `key`
-/// bound: the heap's page table names every host copy there is, each
-/// brought up to date (`add` takes a copy's range, once per submission
-/// until a step writes title memory).
-pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    let layout = with_heap(key, |heap| {
+/// Updates the current table if it belongs to the recorded generation.
+fn prepare_layout(key: usize, bound: Option<&Arc<Mutex<Arc<Layout>>>>) -> Option<Arc<Layout>> {
+    with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
-        let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
+        let (_, s) = shared.iter_mut().find(|(k, s)| {
+            *k == key && s.host == host && bound.is_none_or(|bound| Arc::ptr_eq(bound, &s.layout))
+        })?;
         let now = crate::shadow::generation();
         if s.generation != now {
             s.rewrite(heap, now);
         }
-        Some(s.layout.clone())
-    })
-    .flatten();
-    // Copies the title has not written since they took it are passed by
-    // without touching them (the table names every copy, ~4,700 in the world).
-    for l in layout.iter() {
-        for (c, bit) in l.copies.iter().zip(&l.bits) {
-            if !crate::watch::clean_bit(*bit) {
-                let (start, len) = c.range();
-                add(c, start as usize, len as usize);
-            }
+        Some(s.layout.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    }).flatten()
+}
+
+fn refresh_layout(layout: Arc<Layout>, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+    // Copies the title has not written since they took it need no refresh.
+    for (c, bit) in layout.copies.iter().zip(&layout.bits) {
+        if !crate::watch::clean_bit(*bit) {
+            let (start, len) = c.range();
+            add(c, start as usize, len as usize);
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn prepare(key: usize, add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+    if let Some(layout) = prepare_layout(key, None) {
+        refresh_layout(layout, add);
     }
 }
 
@@ -612,37 +633,71 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
 /// brought up to date at each submission of the list, its written pages
 /// copied back after.
 pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
-    let table = with_heap(key, |heap| {
+    let (table, layout) = with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
         if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host) {
             list.keep(&s.table);
-            return Some(s.gpu);
+            return Some((s.gpu, s.layout.clone()));
         }
         // A released heap's table goes with it (lists that name it hold it).
         shared.retain(|(k, _)| *k != key);
         let s = Shared::new(heap)?;
         list.keep(&s.table);
-        let gpu = s.gpu;
+        let bound = (s.gpu, s.layout.clone());
         shared.push((key, s));
-        Some(gpu)
+        Some(bound)
     })
     .flatten()?;
     let pooled = Arc::new(PooledBitmap::new(Bitmap::acquire()?));
     let dirty = pooled.gpu();
-    list.defer_memory(key);
+    let bound = BoundTable { key, layout };
+    list.defer_memory(bound.clone());
+    let missed_table = bound.clone();
+    let pages_table = bound.clone();
+    let retain_table = bound.clone();
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
-    let missed_bitmap = Arc::clone(&pooled);
+    let retained: Arc<Mutex<Option<Arc<Layout>>>> = Arc::default();
+    let for_missed = retained.clone();
+    let for_pages = retained.clone();
+    let retain = retained.clone();
+    let missed_bitmap = pooled.clone();
+    let pages_bitmap = pooled.clone();
     list.defer_missed(move || {
-        let l = layout(key);
+        let l = for_missed.lock().unwrap_or_else(|e| e.into_inner())
+            .clone().unwrap_or_else(|| missed_table.layout());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks =
             unsafe { std::slice::from_raw_parts(missed_bitmap.data() as *const u32, BITMAP_WORDS) };
         has_missed(marks, &l)
     });
-    list.defer_after(move || {
-        let Layout { copies, blocks, owner, .. } = &*layout(key);
+    list.defer_memory_pages(move |held| {
+        let l = for_pages.lock().unwrap_or_else(|e| e.into_inner())
+            .clone().unwrap_or_else(|| pages_table.layout());
+        let Layout { copies, blocks, owner, .. } = &*l;
+        // SAFETY: the prefix fence finished the GPU's use of this bitmap.
+        let marks = unsafe { std::slice::from_raw_parts(pages_bitmap.data() as *const u32, BITMAP_WORDS) };
+        for (w, &word) in marks.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let entry = w * 32 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(&l1) = blocks.get(entry / BLOCK).filter(|_| entry / BLOCK != 0)
+                    && let Some(&k) = owner.get(entry).filter(|&&owner| owner != NO_OWNER)
+                {
+                    let address = l1 << 28 | (entry % BLOCK) << 16;
+                    held.push((copies[k as usize].clone(), address, crate::watch::PAGE));
+                }
+            }
+        }
+    });
+    list.defer_memory_completion(move || {
+        *retain.lock().unwrap_or_else(|e| e.into_inner()) = Some(retain_table.layout());
+    }, move || {
+        let l = retained.lock().unwrap_or_else(|e| e.into_inner())
+            .take().unwrap_or_else(|| bound.layout());
+        let Layout { copies, blocks, owner, .. } = &*l;
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks =
@@ -725,6 +780,41 @@ mod tests {
         assert!(withheld_in(7, 7));
         assert!(withheld_in(8, 7), "the next frame reads this one's results");
         assert!(!withheld_in(9, 7));
+    }
+
+    #[test]
+    fn a_recording_keeps_its_table_layout_when_the_key_is_rebound() {
+        use crate::object::{S_OK, guid, slot};
+
+        let Some(host) = crate::host::host() else { return };
+        let mut view_heap = std::ptr::null();
+        let desc = [0u32, 1000, 1, 0, 0, 0, 0, 0];
+        let iid = guid(
+            0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(crate::descriptor::create_heap(
+            std::ptr::null(), desc.as_ptr().cast(), &iid, &mut view_heap,
+        ), S_OK);
+        let key = view_heap as usize;
+        assert!(crate::descriptor::heap(view_heap).host().is_some());
+        let first = host.new_list().unwrap();
+        let second = host.new_list().unwrap();
+        assert!(bind(&first, key).is_some());
+        let old = BoundTable {
+            key,
+            layout: shared().iter().find(|(k, _)| *k == key).unwrap().1.layout.clone(),
+        };
+        let snapshot = prepare_layout(key, Some(&old.layout)).unwrap();
+
+        // Discard the cached table and bind a new table under the same
+        // key. Even the native heap identity still matches in this case.
+        release(key);
+        assert!(bind(&second, key).is_some());
+        let current = prepare_layout(key, None).unwrap();
+        assert!(!Arc::ptr_eq(&snapshot, &current));
+        assert!(prepare_layout(key, Some(&old.layout)).is_none());
+        assert!(Arc::ptr_eq(&snapshot, &old.layout()));
+        assert_eq!(slot::<extern "system" fn(crate::object::This) -> u32>(view_heap, 0x10)(view_heap), 0);
     }
 
     /// The shader's lookup (`victory_shader` lowering) over a table's

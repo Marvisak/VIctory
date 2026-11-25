@@ -213,6 +213,9 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
     if srv || uav || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         if uav {
+            if len < shadow.left(address) {
+                list.note_other_gpu_work();
+            }
             // A host root descriptor: no heap view, so its writes are not
             // marked.
             shadow.gpu_writes(list, address, len, false);
@@ -220,7 +223,7 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
+    list.defer_root_fill(to, address as usize, len as usize, shadow);
     Some(gpu)
 }
 
@@ -240,6 +243,29 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 }
 
 impl State {
+    /// Root CBVs that must use a CPU fill instead of naming the shadow.
+    pub(crate) fn needs_cbv_boundary(&self, list: &HostList, compute: bool) -> bool {
+        let Some(pipeline) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        if !pipeline.stages.iter().any(|stage| !stage.root_cbvs.is_empty()) || !list.has_recorded_writes() {
+            return false;
+        }
+        // A reader that can itself miss cannot complete the computed
+        // prefix. Keep the existing checks for bounded writers there.
+        let opaque = !pipeline.stages.iter().any(|stage| stage.memory.is_some());
+        pipeline.stages.iter().flat_map(|s| &s.root_cbvs).any(|&(slot, _)| {
+            let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                return false;
+            };
+            let Some(shadow) = crate::shadow::find(*address, 1) else {
+                return false;
+            };
+            !shadow.gpu(*address).is_multiple_of(256)
+                && list.writes_for_cpu_reads(&[(*address as usize, shadow.left(*address).min(1 << 16) as usize)], opaque)
+        })
+    }
+
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
@@ -859,6 +885,9 @@ impl State {
                 for (address, shadow) in &roots {
                     if let (Some(shadow), Some((_, map))) = (shadow, &self.memory) {
                         let len = shadow.left(*address).min(1 << 20);
+                        if len < shadow.left(*address) {
+                            list.note_other_gpu_work();
+                        }
                         shadow.refresh(list, *address, len);
                         shadow.gpu_writes(list, *address, len, false);
                         map.precise(*address, len);
@@ -919,6 +948,10 @@ impl State {
         };
         shadow.refresh(list, refresh_at, refresh_len);
         if uav {
+            if !shadow.marked() {
+                // A view with no marks can reach past its fallback snapshot.
+                list.note_other_gpu_work();
+            }
             // Writes through the view are marked wherever they land in the
             // copy; else declared for 1 MiB.
             let len = if shadow.marked() { shadow.left(address) } else { shadow.left(address).min(1 << 20) };
@@ -1023,6 +1056,7 @@ impl State {
         float: bool,
         rects: &[RECT],
     ) {
+        list.note_other_gpu_work();
         let Some(view) = crate::descriptor::view(cpu) else {
             once!("an unordered access clear of a slot without a view");
             return;
@@ -1093,6 +1127,20 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        self.dispatch_bound(list, p, x, y, z);
+    }
+
+    fn dispatch_bound(&mut self, list: &HostList, p: &HostPipeline, x: u32, y: u32, z: u32) {
+        let bounded = p.stages.iter().all(|stage| {
+            let t = stage.translated();
+            !t.host.heap && t.used.iter().all(|r| r.root == RootType::Descriptor)
+                && (t.host.view_marks || !t.host.user_data.iter().any(|u| {
+                    is_root_view(u) && u.dword == victory_shader::emit::ROOT_UAV_VIEW
+                }))
+        });
+        if !bounded {
+            list.note_other_gpu_work();
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1105,6 +1153,9 @@ impl State {
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        if bounded {
+            list.note_buffer_dispatch(p.stages.iter().any(|s| s.memory.is_some()));
+        }
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1178,6 +1229,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        list.note_other_gpu_work();
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
@@ -1539,6 +1591,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        list.note_other_gpu_work();
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
@@ -1643,6 +1696,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        list.note_other_gpu_work();
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -1683,6 +1737,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        list.note_other_gpu_work();
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -2006,6 +2061,10 @@ const QUAD_STRIP: u32 = 20;
 
 #[cfg(test)]
 mod tests {
+    mod interleaved {
+        include!("draw/interleaved_tests.rs");
+    }
+
     use super::*;
 
     /// A root signature that indexes the heaps directly needs one of each
@@ -2604,6 +2663,359 @@ uint ps() : SV_Target { return 1; }
         );
         assert_eq!(made, S_OK);
         out
+    }
+
+    const WRITE_29: &str = r#"
+RWByteAddressBuffer target : register(u0);
+[RootSignature("UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main() { target.Store(0, 29); }
+"#;
+
+    fn title_list() -> (This, This) {
+        let null = std::ptr::null();
+        let alloc_iid = crate::object::guid(
+            0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = crate::object::guid(
+            0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(crate::list::create_allocator(null, 0, &alloc_iid, &mut allocator), S_OK);
+        assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list), S_OK);
+        (list, allocator)
+    }
+
+    fn title_queue() -> This {
+        let iid = crate::object::guid(
+            0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let mut queue = std::ptr::null();
+        let desc = [0u32, 0, 0, 1];
+        assert_eq!(crate::queue::create(std::ptr::null(), desc.as_ptr().cast(), &iid, &mut queue), S_OK);
+        queue
+    }
+
+    /// Root CBVs at a console-aligned but host-unaligned address stage
+    /// title bytes on the CPU. A preceding GPU write must reach that fill.
+    #[test]
+    fn a_gpu_producer_feeds_the_real_root_cbv_staging_path() {
+        const READ: &str = r#"
+cbuffer Input : register(b0) { uint value; }
+RWByteAddressBuffer target : register(u0);
+[RootSignature("CBV(b0), UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main() { target.Store(0, value); }
+"#;
+        let Some(host) = crate::host::host() else {
+            assert!(std::env::var_os("VICTORY_TEST_ORDERING_REQUIRE_GPU").is_none());
+            return;
+        };
+        let (write_root, writer) = compile_cs(WRITE_29);
+        let (read_root, reader) = compile_cs(READ);
+        let mut observed = Vec::new();
+        for (offset, scope) in [(0, "same list"), (16, "separate submissions"), (16, "same batch"), (16, "same list")] {
+            let (input, output) = (buffer(512), buffer(4));
+            let (input_bytes, _) = crate::resource::buffer_bytes(input).unwrap();
+            let (output_bytes, _) = crate::resource::buffer_bytes(output).unwrap();
+            let input_address = input_bytes as u64 + offset;
+            let output_address = output_bytes as u64;
+            // SAFETY: both resources own these dwords and no commands have run.
+            unsafe {
+                (input_address as *mut u32).write(11);
+                output_bytes.cast::<u32>().write(0);
+            }
+            let produced = crate::shadow::find(input_address, 4).unwrap();
+            let result = crate::shadow::find(output_address, 4).unwrap();
+            let (title_list, allocator) = title_list();
+            let first = crate::list::host_list(title_list).unwrap();
+            produced.refresh(first, input_address, 4);
+            produced.gpu_writes(first, input_address, 4, false);
+            // SAFETY: the open list holds the producer's mapped shadow.
+            unsafe {
+                first.list.SetComputeRootSignature(&write_root);
+                first.list.SetPipelineState(&writer);
+                first.list.SetComputeRootUnorderedAccessView(0, produced.gpu(input_address));
+                first.list.Dispatch(1, 1, 1);
+                if offset == 0 {
+                    first.list.ResourceBarrier(&[crate::host::transition(
+                        &produced.buffer,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+                    )]);
+                }
+            }
+            let second = host.new_list().unwrap();
+            let consumer = if scope != "same list" {
+                first.close();
+                if scope == "separate submissions" {
+                    host.execute(&[first]);
+                }
+                &second
+            } else if offset != 0 {
+                crate::list::cpu_source_list(title_list, input_address as usize, produced.left(input_address) as usize).unwrap()
+            } else {
+                first
+            };
+            let constant = root_view(consumer, input_address, false, false).unwrap();
+            assert_eq!(constant == produced.gpu(input_address), offset == 0);
+            result.refresh(consumer, output_address, 4);
+            result.gpu_writes(consumer, output_address, 4, false);
+            // SAFETY: the recording owns the root CBV backing and output shadow.
+            unsafe {
+                consumer.list.SetComputeRootSignature(&read_root);
+                consumer.list.SetPipelineState(&reader);
+                consumer.list.SetComputeRootConstantBufferView(0, constant);
+                consumer.list.SetComputeRootUnorderedAccessView(1, result.gpu(output_address));
+                consumer.list.Dispatch(1, 1, 1);
+            }
+            consumer.close();
+            if scope == "same batch" || (scope == "same list" && offset != 0) {
+                host.execute(&[first, consumer]);
+            } else {
+                host.execute(&[consumer]);
+            }
+            // SAFETY: these mapped title dwords are ours, and the fence completed.
+            let (producer, read) = unsafe {
+                ((input_address as *const u32).read(), output_bytes.cast::<u32>().read())
+            };
+            println!("root CBV byte offset {offset}, {scope}: producer={producer}, consumer={read}");
+            assert_eq!(producer, 29, "the producer executed and copied back");
+            observed.push(read);
+            for resource in [input, output, title_list, allocator] {
+                crate::object::slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+            }
+        }
+        assert_eq!(observed, [29, 29, 29, 29], "each root CBV must see its GPU producer");
+    }
+
+    /// Real GPU writes and dirty marks, decoded by the normal computed
+    /// page table completion. A miss must leave both CPU staging and title
+    /// memory on the still-published value. Run alone: the miss holds
+    /// computed writes for this frame and the next in this process.
+    #[test]
+    #[ignore = "requires a GPU and isolated computed-memory frame state"]
+    fn computed_tail_reads_after_the_fence_without_publishing_a_miss() {
+        computed_tail_regression(false);
+    }
+
+    /// A later CPU copy writes a neighboring dword on the same page.
+    /// The subsequent refresh must not replace the earlier private write.
+    #[test]
+    #[ignore = "requires a GPU and isolated computed-memory frame state"]
+    fn computed_tail_preserves_the_private_producer_across_a_page_refresh() {
+        computed_tail_regression(true);
+    }
+
+    fn computed_tail_regression(overlap_refresh: bool) {
+        const PRODUCE: &str = r#"
+ByteAddressBuffer pageTable : register(t0);
+RWByteAddressBuffer target : register(u0);
+RWByteAddressBuffer dirty : register(u1);
+cbuffer input : register(b0) { uint region; uint page; uint miss; }
+[RootSignature("SRV(t0), UAV(u0), UAV(u1), RootConstants(num32BitConstants=3,b0)")]
+[numthreads(1, 1, 1)]
+void main() {
+    uint block = pageTable.Load(region * 4);
+    uint entry = block * 4096 + page;
+    uint ignored;
+    dirty.InterlockedOr((entry >> 5) * 4, 1u << (entry & 31), ignored);
+    if (miss != 0) { dirty.InterlockedOr(0, 1, ignored); }
+    target.Store(0, 29);
+}
+"#;
+        const CONSUME: &str = r#"
+cbuffer Input : register(b0) { uint value; }
+RWByteAddressBuffer target : register(u0);
+[RootSignature("CBV(b0), UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main() { target.Store(0, value); }
+"#;
+        const OVERLAP: &str = r#"
+RWByteAddressBuffer target : register(u0);
+RWByteAddressBuffer dirty : register(u1);
+cbuffer input : register(b0) { uint bit; }
+[RootSignature("UAV(u0), UAV(u1), RootConstants(num32BitConstants=1,b0)")]
+[numthreads(1, 1, 1)]
+void main() {
+    uint ignored;
+    target.Store(4, target.Load(0));
+    dirty.InterlockedOr((bit >> 5) * 4, 1u << (bit & 31), ignored);
+}
+"#;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+
+        let host = crate::host::host().expect("computed-tail regression needs a host GPU");
+        let (produce_root, produce) = compile_cs(PRODUCE);
+        let (consume_root, consume) = compile_cs(CONSUME);
+        let (overlap_root, overlap) = compile_cs(OVERLAP);
+        let page = crate::watch::PAGE;
+        for (case, miss, expected) in [(0, 0, 29), (1, 1, 11), (2, 0, 11)] {
+            // The translated page table addresses the low 40 bits.
+            let title = (0x54_2000_0000usize + case * page * 64..0x54_2000_0000usize + (case + 1) * page * 64)
+                .step_by(page)
+                .find_map(|at| {
+                    // SAFETY: a private test allocation at an available address.
+                    let data = unsafe {
+                        VirtualAlloc(
+                            at as *const _,
+                            page,
+                            MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
+                            PAGE_READWRITE,
+                        )
+                    };
+                    (!data.is_null()).then_some(data as usize)
+                })
+                .expect("low title page");
+            let address = title + 16;
+            // SAFETY: private allocated title page.
+            unsafe { (address as *mut u32).write(11) };
+            crate::shadow::register(title, title as u64, page as u64);
+            let target = crate::shadow::find(address as u64, 4).unwrap();
+            let result = buffer(4);
+            let (result_data, _) = crate::resource::buffer_bytes(result).unwrap();
+            let output = crate::shadow::find(result_data as u64, 4).unwrap();
+
+            let (title_list, allocator) = title_list();
+            let prefix = crate::list::host_list(title_list).unwrap();
+            let map = crate::memory::bind(prefix, crate::memory::OURS).unwrap();
+            let args = [(title >> 28) as u32, ((title >> 16) & 4095) as u32, miss];
+            // SAFETY: the open prefix list keeps the computed map and the
+            // target lives through submission. UAV addresses are aligned.
+            unsafe {
+                prefix.list.SetComputeRootSignature(&produce_root);
+                prefix.list.SetPipelineState(&produce);
+                prefix.list.SetComputeRootShaderResourceView(0, map.table);
+                prefix.list.SetComputeRootUnorderedAccessView(1, target.gpu(address as u64));
+                prefix.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+                prefix.list.SetComputeRoot32BitConstants(3, 3, args.as_ptr().cast(), 0);
+                prefix.list.Dispatch(1, 1, 1);
+            }
+            let suffix = crate::list::cpu_source_list(title_list, address, 4).unwrap();
+            assert!(!std::ptr::eq(prefix, suffix), "opaque producer must end before CPU staging");
+            // The innermost view can be a different copy than the full
+            // page owner selected by the computed address table.
+            if case == 0 {
+                crate::shadow::register(title + 4, (title + 4) as u64, 64);
+                let inner = crate::shadow::find(address as u64, 4).unwrap();
+                assert!(!std::sync::Arc::ptr_eq(&target, &inner));
+            }
+            let constant = root_view(suffix, address as u64, false, false).unwrap();
+            assert_ne!(constant, target.gpu(address as u64));
+            let mut copied = 0u32;
+            output.refresh(suffix, result_data as u64, 4);
+            output.gpu_writes(suffix, result_data as u64, 4, false);
+            suffix.defer_copy((&raw mut copied).cast(), address as *const u8, 4);
+            // SAFETY: the suffix list holds the CBV and the output shadow.
+            unsafe {
+                suffix.list.SetComputeRootSignature(&consume_root);
+                suffix.list.SetPipelineState(&consume);
+                suffix.list.SetComputeRootConstantBufferView(0, constant);
+                suffix.list.SetComputeRootUnorderedAccessView(1, output.gpu(result_data as u64));
+                suffix.list.Dispatch(1, 1, 1);
+            }
+            let cpu = 55u32;
+            if overlap_refresh && case < 2 {
+                let source = if miss == 0 { address as *const u8 } else { (&raw const cpu).cast() };
+                suffix.defer_copy((address + 8) as *mut u8, source, 4);
+                target.refresh(suffix, address as u64, 16);
+            }
+            if miss != 0 || overlap_refresh && case == 0 {
+                let (bit, _) = target.mark_entry(address as u64).unwrap();
+                let dirty = crate::shadow::view_writes(false).unwrap();
+                target.gpu_writes(suffix, (address + 4) as u64, 4, miss != 0);
+                // SAFETY: the target and the ordinary mark bitmap live
+                // through the list. This writes next to the withheld dword.
+                unsafe {
+                    suffix.list.SetComputeRootSignature(&overlap_root);
+                    suffix.list.SetPipelineState(&overlap);
+                    suffix.list.SetComputeRootUnorderedAccessView(0, target.gpu(address as u64));
+                    suffix.list.SetComputeRootUnorderedAccessView(1, dirty);
+                    suffix.list.SetComputeRoot32BitConstant(2, bit, 0);
+                    suffix.list.Dispatch(1, 1, 1);
+                }
+            }
+            suffix.close();
+            host.execute(&[prefix, suffix]);
+            // SAFETY: the fence is complete and both title allocations live.
+            let read = unsafe { [(address as *const u32).read(), result_data.cast::<u32>().read(), copied] };
+            println!("computed tail case {case}: source, staged CBV, CPU copy = {read:?}");
+            assert_eq!(read, [expected; 3]);
+            // SAFETY: both dwords are inside the title allocation.
+            let more = unsafe { [((address + 4) as *const u32).read(), ((address + 8) as *const u32).read()] };
+            assert_eq!(more, match (overlap_refresh, case) {
+                (true, 0) => [29, 29],
+                (true, 1) => [0, 55],
+                _ => [0, 0],
+            });
+            if miss != 0 || overlap_refresh && case == 0 {
+                let private = target.read_host(address as u64, 4);
+                println!("shadow after suffix: {private:?}");
+                assert_eq!([private[1], private[2]], [29, more[1]]);
+            }
+            for resource in [result, title_list, allocator] {
+                crate::object::slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+            }
+            if case == 0 {
+                crate::shadow::unregister(title + 4, (title + 4) as u64);
+            }
+            crate::shadow::unregister(title, title as u64);
+            crate::memory::prepare(crate::memory::OURS, |_, _, _| {});
+            drop(target);
+            crate::watch::tests::free(title);
+        }
+    }
+
+    #[test]
+    fn title_copy_buffer_region_reads_its_earlier_gpu_producer() {
+        if crate::host::host().is_none() {
+            assert!(std::env::var_os("VICTORY_TEST_ORDERING_REQUIRE_GPU").is_none());
+            return;
+        }
+        let (root, pipeline) = compile_cs(WRITE_29);
+        let (source, dest) = (buffer(4), buffer(4));
+        let (source_bytes, _) = crate::resource::buffer_bytes(source).unwrap();
+        let (dest_bytes, _) = crate::resource::buffer_bytes(dest).unwrap();
+        let source_address = source_bytes as u64;
+        // SAFETY: the committed source and destination each hold one dword.
+        unsafe {
+            source_bytes.cast::<u32>().write(11);
+            dest_bytes.cast::<u32>().write(0);
+        }
+        let (title_list, allocator) = title_list();
+        let list = crate::list::host_list(title_list).unwrap();
+        let shadow = crate::shadow::find(source_address, 4).unwrap();
+        shadow.refresh(list, source_address, 4);
+        shadow.gpu_writes(list, source_address, 4, false);
+        // SAFETY: the producer names a live native UAV shadow.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pipeline);
+            list.list.SetComputeRootUnorderedAccessView(0, shadow.gpu(source_address));
+            list.list.Dispatch(1, 1, 1);
+        }
+        let copy = crate::object::slot::<extern "system" fn(This, This, u64, This, u64, u64)>(
+            title_list, 0x78,
+        );
+        copy(title_list, dest, 0, source, 0, 4);
+        assert_eq!(crate::list::segments(title_list).len(), 2);
+        let close = crate::object::slot::<extern "system" fn(This) -> HRESULT>(title_list, 0x48);
+        assert_eq!(close(title_list), S_OK);
+        let queue = title_queue();
+        let execute = crate::object::slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50);
+        execute(queue, 1, &title_list);
+        // SAFETY: both resources remain live and the submission completed.
+        let (produced, copied) = unsafe {
+            (source_bytes.cast::<u32>().read(), dest_bytes.cast::<u32>().read())
+        };
+        println!("title CopyBufferRegion: producer={produced}, destination={copied}");
+        for object in [source, dest, title_list, allocator, queue] {
+            crate::object::slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+        assert_eq!(produced, 29, "the producer ran");
+        assert_eq!(copied, 29, "the guest copy must see its GPU producer");
     }
 
     /// Root views (`victory_shader::emit`, "Root SRVs and root UAVs") through

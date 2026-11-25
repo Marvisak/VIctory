@@ -800,6 +800,7 @@ pub(crate) struct HostList {
     /// The draw or dispatch being recorded runs a program using title
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
+    other_gpu_work: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -954,7 +955,7 @@ enum Step {
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
     /// A copy of title memory into the list's own upload memory.
-    Fill(usize, usize, usize),
+    Fill(usize, usize, usize, Option<std::sync::Arc<crate::shadow::Shadow>>),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -977,8 +978,10 @@ enum Step {
     /// Shaders read title memory through a view heap's page table (the
     /// heap's key, `crate::memory`): the table names every copy, each
     /// brought up to date.
-    Memory(usize),
+    Memory(crate::memory::BoundTable),
 }
+
+type ReadMemoryPages = Box<dyn Fn(&mut Vec<crate::shadow::WriteRange>) + Send>;
 
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
@@ -1000,10 +1003,17 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// GPU and bottom-of-pipe write ranges needed by the preparation
+    /// dependency check, accumulated as commands are recorded.
+    write_ranges: Vec<(usize, usize)>,
     /// The memory values the list waits for before it starts (a list the
     /// title records with a wait after commands is cut there,
     /// `crate::list`).
     waits: Vec<crate::hold::ValueWait>,
+    /// A computed-address binding may write outside all declared ranges.
+    opaque_writes: bool,
+    /// A declared range written by a computed-address program.
+    computed_writes: bool,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
@@ -1013,6 +1023,158 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// Actual computed-address pages after this list's fence, before the
+    /// completion callback consumes the marks.
+    memory_pages: Vec<ReadMemoryPages>,
+    memory_layouts: Vec<Box<dyn Fn() + Send>>,
+    ordinary_dispatches: usize,
+    computed_dispatches: usize,
+}
+
+impl Deferred {
+    fn uses_title_memory(&self) -> bool {
+        self.opaque_writes || self.computed_writes || !self.missed.is_empty()
+    }
+
+    fn missed_memory(&self) -> bool {
+        self.missed.iter().any(|check| check())
+    }
+}
+
+/// Split only at a CPU read of an earlier list's GPU output. Determine
+/// every boundary before writing anything back. A potentially withheld
+/// write in a later list can suppress overlapping writes even from earlier
+/// ordinary programs, so a prefix may go first only when it cannot affect
+/// that decision. The conditional tail after computed-address work is
+/// handled separately, once the GPU has actually checked those addresses.
+fn cpu_read_boundaries(runs: &[&HostList]) -> Vec<usize> {
+    let mut boundaries = Vec::new();
+    if runs.len() < 2 {
+        return boundaries;
+    }
+    let pages = |(at, len): (usize, usize)| {
+        let page = crate::watch::PAGE;
+        let base = at / page * page;
+        let end = at.saturating_add(len);
+        let padding = (page - end % page) % page;
+        (base, end.saturating_add(padding) - base)
+    };
+    let mut may_withhold = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                // The addresses it writes are unknown until it runs.
+                Step::Memory(_) => return boundaries,
+                &Step::GpuWrite(_, at, len, _, true) if len != 0 => {
+                    // Withholding any bytes can suppress an entire marked page.
+                    may_withhold.push(pages((at, len)));
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut writes = Vec::new();
+    let mut computed = false;
+    for (i, list) in runs.iter().enumerate() {
+        let deferred = list.deferred();
+        if computed {
+            break;
+        }
+        if deferred.copies.iter().any(|s| match s {
+            &Step::Copy(_, src, len) | &Step::Fill(_, src, len, _) => {
+                crate::watch::overlaps_writes((src, len), &writes)
+            }
+            _ => false,
+        }) && !writes.iter().any(|&(at, len)| {
+            len != 0 && crate::watch::overlaps_writes(pages((at, len)), &may_withhold)
+        }) {
+            boundaries.push(i);
+            writes.clear();
+        }
+        computed = deferred.uses_title_memory();
+        writes.extend_from_slice(&deferred.write_ranges);
+    }
+    boundaries
+}
+
+/// The first CPU read after the last list that can make the batch withhold
+/// writes. Until that last list has run, a miss could still invalidate a
+/// prefix's copyback. Opaque bindings do not declare their write addresses.
+fn computed_tail(runs: &[&HostList]) -> Option<usize> {
+    let last = runs.iter().rposition(|list| list.deferred().uses_title_memory())?;
+    if last + 1 == runs.len() {
+        return None;
+    }
+    let mut writes = Vec::new();
+    let mut opaque = false;
+    for (i, list) in runs.iter().enumerate() {
+        let deferred = list.deferred();
+        if i > last && deferred.copies.iter().any(|step| match *step {
+            Step::Copy(_, src, len) | Step::Fill(_, src, len, _) => {
+                len != 0 && (opaque || crate::watch::overlaps_writes((src, len), &writes))
+            }
+            _ => false,
+        }) {
+            // Opaque CPU writes cannot forward exact destination ranges.
+            // The same closed list can appear more than once.
+            drop(deferred);
+            return runs[i..].iter().all(|list| {
+                !list.deferred().copies.iter().any(|step| matches!(step, Step::Run(_)))
+            }).then_some(i);
+        }
+        opaque |= deferred.opaque_writes;
+        writes.extend_from_slice(&deferred.write_ranges);
+    }
+    None
+}
+
+/// One certified ordinary buffer dispatch can stage privately before
+/// later computed dispatches. No external publication or additional
+/// ordinary work is allowed after that reader except tracked buffer writes.
+fn interleaved_reader(runs: &[&HostList]) -> Option<usize> {
+    let last = runs.iter().rposition(|list| list.deferred().computed_dispatches != 0)?;
+    let mut computed = false;
+    for (i, list) in runs[..last].iter().enumerate() {
+        let d = list.deferred();
+        if computed && d.ordinary_dispatches == 1 && d.computed_dispatches == 0
+            && d.copies.iter().any(|s| matches!(s, Step::Fill(_, _, _, Some(_))))
+        {
+            drop(d);
+            let closed = runs[i..].iter().enumerate().all(|(n, list)| {
+                let d = list.deferred();
+                !list.other_gpu_work.load(Ordering::Relaxed) && d.writes.is_empty() && d.waits.is_empty()
+                    && (n == 0 || d.ordinary_dispatches == 0)
+                    && d.copies.iter().all(|s| match s {
+                        Step::Refresh(..) => true,
+                        Step::GpuWrite(_, _, _, _, computed) => *computed == (n != 0),
+                        Step::Memory(_) => n != 0,
+                        Step::Fill(_, _, _, Some(_)) => n == 0,
+                        _ => false,
+                    })
+            });
+            // A bitmap belongs to the recording. Replaying the same list
+            // across this boundary would mix two executions in that bitmap.
+            if closed && !runs[..i].iter().any(|p| runs[i..].iter().any(|r| std::ptr::eq(*p, *r))) {
+                return Some(i);
+            }
+            return None;
+        }
+        if list.other_gpu_work.load(Ordering::Relaxed) {
+            return None;
+        }
+        computed |= d.computed_dispatches != 0;
+    }
+    None
+}
+
+fn computed_write_pages(runs: &[&HostList]) -> Vec<crate::shadow::WriteRange> {
+    let mut pages = crate::shadow::view_write_pages(true);
+    for list in runs {
+        for collect in &list.deferred().memory_pages {
+            collect(&mut pages);
+        }
+    }
+    pages
 }
 
 impl Host {
@@ -1119,6 +1281,7 @@ impl Host {
                 rebind: false.into(),
                 ours: false.into(),
                 memory_writer: false.into(),
+                other_gpu_work: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 id,
@@ -1139,9 +1302,31 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let started = std::time::Instant::now();
+        let mut first = 0;
+        for end in cpu_read_boundaries(runs).into_iter().chain([runs.len()]) {
+            self.execute_batch(&runs[first..end], &mut submitted);
+            first = end;
+        }
+        // Listed-frame captures submit lists of their own after the whole
+        // title batch, when no pending CPU preparation depends on its output.
         #[cfg(feature = "diagnostics")]
-        let faults = crate::copystat::page_faults();
+        if crate::capture::listed(crate::queue::presented() + 1) {
+            let sub = *submitted;
+            drop(submitted);
+            let mut targets: Vec<(usize, String)> = Vec::new();
+            for r in runs {
+                for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                    if !targets.iter().any(|x| x.0 == t.0) {
+                        targets.push(t.clone());
+                    }
+                }
+            }
+            crate::capture::dump_submission(sub, &targets);
+        }
+    }
+
+    fn execute_batch(&self, runs: &[&HostList], submitted: &mut u64) {
+        let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Host textures the title has not used for a while (or past the
@@ -1197,6 +1382,72 @@ impl Host {
             .chain(runs.iter().copied())
             .collect();
         let runs = &runs[..];
+        let mut batch = Batch::default();
+        let holding = crate::memory::withholding();
+        let interleaved = if holding { None } else { interleaved_reader(runs) };
+        let tail = if holding || interleaved.is_some() { None } else { computed_tail(runs) };
+        if let Some(at) = interleaved {
+            let (prefix, suffix) = runs.split_at(at);
+            self.run_batch(prefix, submitted, &mut batch, started);
+            self.require_batch_fence(*submitted);
+            let mut missed = Vec::with_capacity(runs.len());
+            for list in prefix {
+                let d = list.deferred();
+                for retain in &d.memory_layouts {
+                    retain();
+                }
+                missed.push(d.missed_memory());
+            }
+            batch.preserve_gpu_writes(prefix);
+            if !missed.contains(&true) {
+                batch.allow_private_reader(suffix[0]);
+            }
+            self.run_batch(suffix, submitted, &mut batch, std::time::Instant::now());
+            self.require_batch_fence(*submitted);
+            missed.extend(suffix.iter().map(|list| list.deferred().missed_memory()));
+            self.complete_batch(runs, batch, &missed, heaps);
+        } else if let Some(at) = tail {
+            let (prefix, suffix) = runs.split_at(at);
+            self.run_batch(prefix, submitted, &mut batch, started);
+            self.require_batch_fence(*submitted);
+            let mut missed = prefix.iter().map(|list| list.deferred().missed_memory()).collect::<Vec<_>>();
+            let completed = if !missed.contains(&true) && !crate::memory::withholding() {
+                self.complete_batch(prefix, std::mem::take(&mut batch), &missed, Vec::new());
+                missed.clear();
+                suffix
+            } else {
+                // The prefix remains private. Preserve its GPU bytes
+                // through subsequent CPU copies and shadow refreshes.
+                batch.preserve_gpu_writes(prefix);
+                runs
+            };
+            self.run_batch(suffix, submitted, &mut batch, std::time::Instant::now());
+            self.require_batch_fence(*submitted);
+            // By construction no list in the suffix uses computed memory.
+            missed.resize(completed.len(), false);
+            self.complete_batch(completed, batch, &missed, heaps);
+        } else {
+            self.run_batch(runs, submitted, &mut batch, started);
+            let missed = runs.iter().map(|list| list.deferred().missed_memory()).collect::<Vec<_>>();
+            self.complete_batch(runs, batch, &missed, heaps);
+        }
+        // Descriptors retired during the prefix can still be referenced
+        // by the suffix. Both phases have now finished.
+        release_retired();
+    }
+
+    fn require_batch_fence(&self, submitted: u64) {
+        // A failed wait cannot authorize CPU access to the bitmaps or
+        // persistent mappings. The submit mutex owns this fence value.
+        // SAFETY: a plain query of our fence.
+        if unsafe { self.fence.GetCompletedValue() } != submitted {
+            fail(format_args!("GPU did not complete before checking computed-address writes"));
+        }
+    }
+
+    fn run_batch(&self, runs: &[&HostList], submitted: &mut u64, batch: &mut Batch, started: std::time::Instant) {
+        #[cfg(feature = "diagnostics")]
+        let faults = crate::copystat::page_faults();
         // A frame `crate::capture` lists: every command of every list, in
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
@@ -1219,9 +1470,8 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
         for list in runs {
-            list.run_deferred(&mut batch);
+            list.run_deferred(batch);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
@@ -1313,6 +1563,15 @@ impl Host {
                 removed_during(runs, removed_in)
             ));
         }
+    }
+
+    fn complete_batch(
+        &self,
+        runs: &[&HostList],
+        batch: Batch,
+        missed: &[bool],
+        heaps: Vec<std::sync::Arc<crate::bindless::Viewed>>,
+    ) {
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -1332,13 +1591,18 @@ impl Host {
         // those lists write through bounded views from their own inputs:
         // their ranges go back (the imposter transforms beside the BVH
         // builder in one list, run light13).
-        let missed: Vec<bool> = runs
-            .iter()
-            .map(|list| list.deferred().missed.iter().any(|check| check()))
-            .collect();
         crate::memory::note_submission(missed.contains(&true));
         let withholding = crate::memory::withholding();
-        for (list, &missed) in runs.iter().zip(&missed) {
+        // An ordinary marked or declared copy can otherwise take a
+        // computed program's held bytes along from the same shadow page.
+        let mut held_pages = if withholding { computed_write_pages(runs) } else { Vec::new() };
+        if withholding && let Some(reader) = &batch.private_reader && reader.used {
+            for (shadow, at, n) in &reader.outputs {
+                held_pages.push((shadow.clone(), *at, *n));
+                crate::memory::drop_withheld(*at, *n);
+            }
+        }
+        for (list, &missed) in runs.iter().zip(missed) {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();
             for step in &deferred.copies {
@@ -1359,22 +1623,20 @@ impl Host {
         // A range overlapping a withheld one of the same copy is withheld
         // too: its copy-back would take the other's bytes along (pages a
         // program using title memory and another both wrote).
-        let held: Vec<(usize, usize, usize)> = back
+        let mut held: Vec<(usize, usize, usize)> = back
             .iter()
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (std::sync::Arc::as_ptr(s) as usize, *a, *n))
             .collect();
+        held.extend(held_pages.iter().map(|(s, a, n)| (std::sync::Arc::as_ptr(s) as usize, *a, *n)));
         for b in back.iter_mut().filter(|b| b.3) {
             let copy = std::sync::Arc::as_ptr(&b.0) as usize;
             b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
         }
         // Pages shaders marked first: the copy-backs below end what the
         // copies keep for them.
-        let withheld: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = back
-            .iter()
-            .filter(|b| !b.3)
-            .map(|(s, a, n, _)| (s.clone(), *a, *n))
-            .collect();
+        let mut withheld = held_pages;
+        withheld.extend(back.iter().filter(|b| !b.3).map(|(s, a, n, _)| (s.clone(), *a, *n)));
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
@@ -1405,27 +1667,10 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
-        // The submission has run and the next waits for our lock. Host
-        // copies the title gave up meanwhile may have their last holder here.
-        release_retired();
+        // Host copies the title gave up meanwhile may have their last
+        // holder here. Release them away from the submitting thread.
         release_later(Box::new((batch, back, withheld, heaps)));
         self.log_messages();
-        // A listed frame: what this submission's lists drew, as it is now
-        // (the dumps submit lists of their own).
-        #[cfg(feature = "diagnostics")]
-        if traced {
-            let sub = *submitted;
-            drop(submitted);
-            let mut targets: Vec<(usize, String)> = Vec::new();
-            for r in runs {
-                for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-                    if !targets.iter().any(|x| x.0 == t.0) {
-                        targets.push(t.clone());
-                    }
-                }
-            }
-            crate::capture::dump_submission(sub, &targets);
-        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1763,6 +2008,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.other_gpu_work.store(false, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2045,7 +2291,49 @@ impl HostList {
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+            .push(Step::Fill(dst as usize, src as usize, len, None));
+    }
+
+    pub(crate) fn defer_root_fill(
+        &self,
+        dst: *mut u8,
+        src: usize,
+        len: usize,
+        shadow: std::sync::Arc<crate::shadow::Shadow>,
+    ) {
+        self.deferred().copies.push(Step::Fill(dst as usize, src, len, Some(shadow)));
+    }
+
+    /// Records a direct dispatch whose only shader writes are to bounded buffers.
+    pub(crate) fn note_buffer_dispatch(&self, computed: bool) {
+        let mut deferred = self.deferred();
+        if computed {
+            deferred.computed_dispatches += 1;
+        } else {
+            deferred.ordinary_dispatches += 1;
+        }
+    }
+
+    /// Records work whose effects do not meet the buffer-only staging proof.
+    pub(crate) fn note_other_gpu_work(&self) {
+        self.other_gpu_work.store(true, Ordering::Relaxed);
+    }
+
+    /// CPU reads in the next command must follow any overlapping GPU write
+    /// recorded in this segment.
+    pub(crate) fn writes_for_cpu_reads(&self, reads: &[(usize, usize)], opaque: bool) -> bool {
+        if reads.is_empty() {
+            return false;
+        }
+        let deferred = self.deferred();
+        reads.iter().any(|&read| {
+            read.1 != 0 && (opaque && deferred.opaque_writes || crate::watch::overlaps_writes(read, &deferred.write_ranges))
+        })
+    }
+
+    pub(crate) fn has_recorded_writes(&self) -> bool {
+        let deferred = self.deferred();
+        deferred.opaque_writes || !deferred.write_ranges.is_empty()
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -2077,9 +2365,10 @@ impl HostList {
         marked: bool,
     ) {
         let memory = self.memory_writer.load(Ordering::Relaxed);
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
+        deferred.computed_writes |= memory;
+        deferred.write_ranges.push((address, len));
     }
 
     /// Shaders of the list take views from the heap itself
@@ -2095,8 +2384,10 @@ impl HostList {
 
     /// Shaders of the list read title memory through the page table of
     /// view heap `heap` (`crate::memory::prepare` at submission).
-    pub(crate) fn defer_memory(&self, heap: usize) {
-        self.deferred().copies.push(Step::Memory(heap));
+    pub(crate) fn defer_memory(&self, table: crate::memory::BoundTable) {
+        let mut deferred = self.deferred();
+        deferred.opaque_writes = true;
+        deferred.copies.push(Step::Memory(table));
     }
 
     /// After the list has run, before its writes go back: `check` says
@@ -2105,15 +2396,31 @@ impl HostList {
         self.deferred().missed.push(Box::new(check));
     }
 
-    /// Runs `work` once the list has run (each submission), before its
-    /// bottom-of-pipe writes.
+    pub(crate) fn defer_memory_pages(&self, pages: impl Fn(&mut Vec<crate::shadow::WriteRange>) + Send + 'static) {
+        self.deferred().memory_pages.push(Box::new(pages));
+    }
+
+    pub(crate) fn defer_memory_completion(
+        &self,
+        retain_layout: impl Fn() + Send + 'static,
+        work: impl Fn() + Send + 'static,
+    ) {
+        let mut deferred = self.deferred();
+        deferred.memory_layouts.push(Box::new(retain_layout));
+        deferred.after.push(Box::new(work));
+    }
+
+    /// Runs `work` once the list has run, before bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.note_other_gpu_work();
         self.deferred().after.push(Box::new(work));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
-        self.deferred().writes.push((dst as usize, what, bytes));
+        let mut deferred = self.deferred();
+        deferred.writes.push((dst as usize, what, bytes));
+        deferred.write_ranges.push((dst as usize, bytes));
     }
 
     /// A memory value the list waits for before it starts.
@@ -2305,16 +2612,26 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    if batch.preserved.is_empty() {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    } else {
+                        copy_mapped_delivering(dst as *mut u8, src as *const u8, len, true, |at, n| {
+                            batch.apply_title_copy(at, n);
+                        });
+                    }
                     len
                 }
-                &Step::Fill(dst, src, len) => {
+                Step::Fill(dst, src, len, shadow) => {
+                    let (dst, src, len) = (*dst, *src, *len);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    if let Some(shadow) = shadow {
+                        batch.stage_private(self, shadow, dst, src, len);
+                    }
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -2353,8 +2670,8 @@ impl HostList {
                     crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
-                &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                Step::Memory(table) => {
+                    table.refresh(|s, a, l| batch.add(s, a, l));
                     continue;
                 }
             };
@@ -2378,6 +2695,18 @@ impl HostList {
 /// title memory asks for every copy whole. What the title's threads write
 /// meanwhile is for later submissions (on the console it would race the
 /// GPU).
+struct PreservedCopy {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    /// Sorted disjoint intervals, expressed as (start, end).
+    ranges: Vec<(usize, usize)>,
+}
+
+struct PrivateReader {
+    list: usize,
+    outputs: Vec<crate::shadow::WriteRange>,
+    used: bool,
+}
+
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
@@ -2386,9 +2715,120 @@ struct Batch {
     /// The range of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Completed GPU writes that remain private until logical completion.
+    preserved: std::collections::HashMap<usize, PreservedCopy>,
+    private_reader: Option<PrivateReader>,
 }
 
 impl Batch {
+    fn allow_private_reader(&mut self, list: &HostList) {
+        let written: Vec<_> = self.preserved.values()
+            .flat_map(|p| p.ranges.iter().map(|&(a, b)| (a, b - a))).collect();
+        let mut outputs = Vec::new();
+        for step in &list.deferred().copies {
+            if let Step::GpuWrite(shadow, at, len, marked, false) = step {
+                // A raw marked view can name any byte of its backing.
+                let (at, len) = if *marked {
+                    let (at, len) = shadow.range();
+                    (at as usize, len as usize)
+                } else {
+                    (*at, *len)
+                };
+                if crate::watch::overlaps_writes((at, len), &written) {
+                    // Do not suppress an independent prefix output sharing
+                    // the same range as a possibly dependent reader output.
+                    return;
+                }
+                outputs.push((shadow.clone(), at, len));
+            }
+        }
+        if !outputs.is_empty() {
+            self.private_reader = Some(PrivateReader { list: std::ptr::from_ref(list) as usize, outputs, used: false });
+        }
+    }
+
+    fn stage_private(
+        &mut self,
+        list: &HostList,
+        owner: &std::sync::Arc<crate::shadow::Shadow>,
+        dst: usize,
+        src: usize,
+        len: usize,
+    ) {
+        let Some(reader) = &mut self.private_reader else { return };
+        if reader.list != std::ptr::from_ref(list) as usize || len == 0 {
+            return;
+        }
+        let id = std::sync::Arc::as_ptr(owner) as usize;
+        let Some(producer) = self.preserved.get(&id) else { return };
+        let other_writes: Vec<_> = self.preserved.iter().filter(|&(&key, _)| key != id)
+            .flat_map(|(_, p)| p.ranges.iter().map(|&(a, b)| (a, b - a))).collect();
+        if crate::watch::overlaps_writes((src, len), &other_writes) {
+            return;
+        }
+        for &(a, b) in &producer.ranges {
+            let from = a.max(src);
+            let to = b.min(src + len);
+            if from < to && crate::texture::committed(from as *const u8, to - from) {
+                owner.stage_private(from, to - from, (dst + from - src) as *mut u8);
+                reader.used = true;
+            }
+        }
+    }
+
+    fn preserve_gpu_writes(&mut self, prefix: &[&HostList]) {
+        let mut writes = computed_write_pages(prefix);
+        writes.extend(crate::shadow::view_write_pages(false));
+        for list in prefix {
+            for step in &list.deferred().copies {
+                if let Step::GpuWrite(shadow, at, len, false, _) = step {
+                    writes.push((shadow.clone(), *at, *len));
+                }
+            }
+        }
+        writes.sort_unstable_by_key(|(s, at, _)| (std::sync::Arc::as_ptr(s) as usize, *at));
+        for (shadow, at, len) in writes {
+            let (start, bytes) = shadow.range();
+            let from = at.max(start as usize);
+            let end = at.saturating_add(len).min((start + bytes) as usize);
+            if from >= end {
+                continue;
+            }
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            let ranges = &mut self.preserved.entry(key).or_insert_with(|| PreservedCopy {
+                shadow,
+                ranges: Vec::new(),
+            }).ranges;
+            if let Some(last) = ranges.last_mut()
+                && from <= last.1
+            {
+                last.1 = last.1.max(end);
+            } else {
+                ranges.push((from, end));
+            }
+        }
+    }
+
+    fn apply_title_copy(&self, at: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        self.apply_title_range(at, len);
+        for (alias, n) in crate::watch::aliased_ranges(at, len) {
+            self.apply_title_range(alias, n);
+        }
+    }
+
+    fn apply_title_range(&self, at: usize, len: usize) {
+        for preserved in self.preserved.values() {
+            let i = preserved.ranges.partition_point(|&(_, end)| end <= at);
+            for &(a, b) in preserved.ranges[i..].iter().take_while(|&&(start, _)| start < at + len) {
+                let (a, b) = (a.max(at), b.min(at + len));
+                preserved.shadow.apply_title_copy(a, b - a);
+            }
+        }
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
@@ -2426,7 +2866,21 @@ impl Batch {
         let mut total = 0;
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            let mut at = from;
+            let mut copied = 0;
+            if let Some(preserved) = self.preserved.get(&key) {
+                let i = preserved.ranges.partition_point(|&(_, end)| end <= from);
+                for &(a, b) in preserved.ranges[i..].iter().take_while(|&&(start, _)| start < to) {
+                    if at < a {
+                        copied += shadow.update(at, a - at);
+                    }
+                    at = at.max(b);
+                }
+            }
+            if at < to {
+                copied += shadow.update(at, to - at);
+            }
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
@@ -2435,7 +2889,6 @@ impl Batch {
             total += copied;
             // Kept: the union with what was current if they touch, else
             // the larger.
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
             let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
             if from <= *b && *a <= to {
                 (*a, *b) = ((*a).min(from), (*b).max(to));
@@ -2461,11 +2914,22 @@ impl Batch {
 /// its copy has failed (asked before each, the world's 80 copies per frame
 /// cost 60 ms).
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    copy_mapped_delivering(dst, src, len, title_dst, |_, _| {});
+}
+
+fn copy_mapped_delivering(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    title_dst: bool,
+    mut delivered: impl FnMut(usize, usize),
+) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
             // SAFETY: timing only: the caller vouches for the source.
             unsafe { std::ptr::copy(src, dst, len) };
+            delivered(dst as usize, len);
             return;
         }
         2 => return,
@@ -2478,7 +2942,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = read_delivering(src, dst, len, &mut delivered);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -2498,14 +2962,22 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+        if !read_delivering(at as *const u8, to, n, &mut delivered) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
+                if !read_delivering(at as *const u8, to, n, &mut delivered) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    if title_dst {
+                        // The title can remap the destination after the
+                        // commitment check. Let the kernel check it again.
+                        let zeros = [0u8; 4 << 10];
+                        read_delivering(zeros.as_ptr(), to, n, &mut delivered);
+                    } else {
+                        // SAFETY: inside the caller's private upload mapping.
+                        unsafe { to.write_bytes(0, n) };
+                        delivered(to as usize, n);
+                    }
                 }
             });
         }
@@ -2522,13 +2994,21 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// page is not readable or a destination page not writable (the bytes
 /// before that page may have been copied).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    read_delivering(src, dst, len, &mut |_, _| {})
+}
+
+fn read_delivering(src: *const u8, dst: *mut u8, len: usize, delivered: &mut impl FnMut(usize, usize)) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
     // SAFETY: the destination is `len` bytes the caller may write, host
     // memory or title memory; the kernel checks both ranges, and a page it
     // cannot read or write fails the call instead of faulting.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 };
+    if done != 0 {
+        delivered(dst as usize, done);
+    }
+    ok
 }
 
 /// Copies host memory into title memory after a submission (what shaders
@@ -2567,7 +3047,7 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 
 #[cfg(test)]
 mod title_copies {
-    use super::{copy_mapped, write_mapped};
+    use super::{Batch, PreservedCopy, copy_mapped, copy_mapped_delivering, write_mapped};
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
         VirtualAlloc, VirtualFree, VirtualProtect,
@@ -2628,6 +3108,75 @@ mod title_copies {
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
         release(holes);
+    }
+
+    #[test]
+    fn delivery_tracks_mapped_bytes_and_zero_fallback() {
+        let from = holed(0x55);
+        let mut to = vec![0xeeu8; 3 * BLOCK];
+        let start = to.as_mut_ptr() as usize;
+        let mut reported = vec![false; to.len()];
+        copy_mapped_delivering(to.as_mut_ptr(), from, to.len(), true, |at, len| {
+            reported[at - start..at - start + len].fill(true);
+        });
+        assert!(reported.into_iter().all(|b| b));
+        assert!(to[..BLOCK].iter().all(|&b| b == 0x55));
+        assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
+        assert!(to[2 * BLOCK..].iter().all(|&b| b == 0x55));
+
+        let hole = holed(0xee);
+        let mut reported = 0;
+        // SAFETY: pointer arithmetic within the reservation, used only
+        // through the kernel. The destination block is uncommitted.
+        let unmapped = unsafe { hole.add(BLOCK) };
+        copy_mapped_delivering(unmapped, to.as_ptr(), BLOCK, true, |_, n| reported += n);
+        assert_eq!(reported, 0);
+        release(from);
+        release(hole);
+    }
+
+    #[test]
+    fn ordered_copy_through_an_alias_preserves_unwritten_private_bytes() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        if super::host().is_none() {
+            assert!(std::env::var_os("VICTORY_TEST_ORDERING_REQUIRE_GPU").is_none());
+            return;
+        }
+        let (at, alias) = crate::watch::tests::twin_views(1);
+        let initial = [11u32, 0, 11];
+        // SAFETY: our fresh mapped page.
+        unsafe { (at as *mut u32).copy_from_nonoverlapping(initial.as_ptr(), 3) };
+        crate::shadow::register(at, at as u64, PAGE as u64);
+        let shadow = crate::shadow::find(at as u64, PAGE as u64).unwrap();
+        shadow.update(at, PAGE);
+        shadow.write_host(at as u64, &29u32.to_ne_bytes());
+        shadow.write_host((at + 8) as u64, &37u32.to_ne_bytes());
+        let mut batch = Batch::default();
+        batch.preserved.insert(std::sync::Arc::as_ptr(&shadow) as usize, PreservedCopy {
+            shadow: shadow.clone(),
+            ranges: vec![(at, at + PAGE)],
+        });
+        batch.title_written();
+        // The third value equals guest memory but still overrides the
+        // earlier GPU write. The first dword was not copied.
+        let patch = [55u32, 11];
+        copy_mapped_delivering((alias + 4) as *mut u8, patch.as_ptr().cast(), 8, true, |at, len| {
+            batch.apply_title_copy(at, len);
+        });
+        batch.add(&shadow, at, PAGE);
+        batch.flush();
+        assert_eq!(shadow.read_host(at as u64, 3), [29, 55, 11]);
+        // SAFETY: the fenced GPU value must still be invisible in the title.
+        assert_eq!(unsafe { (at as *const u32).read() }, 11);
+        drop(batch);
+        drop(shadow);
+        crate::shadow::unregister(at, at as u64);
+        for mapping in [alias, at] {
+            crate::watch::title_memory_remapped(mapping, PAGE);
+            // SAFETY: these are the two views of the test allocation.
+            assert_ne!(unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: mapping as *mut _ }) }, 0);
+        }
     }
 
     #[test]
@@ -3949,6 +4498,86 @@ mod batch {   // `mod tests` is already taken at the top of this file
 
 #[cfg(test)]
 mod withholding {
+    #[test]
+    fn private_staging_excludes_untracked_publication_and_cross_phase_replay() {
+        let Some(host) = super::host() else {
+            assert!(std::env::var_os("VICTORY_TEST_ORDERING_REQUIRE_GPU").is_none());
+            return;
+        };
+        let page = crate::watch::PAGE;
+        let at = crate::watch::tests::pool(1);
+        crate::shadow::register(at, at as u64, page as u64);
+        let shadow = crate::shadow::find(at as u64, page as u64).unwrap();
+        let prefix = host.new_list().unwrap();
+        let reader = host.new_list().unwrap();
+        let late = host.new_list().unwrap();
+        let (_, dst) = reader.scratch(256).unwrap();
+        prefix.defer_memory(crate::memory::BoundTable::unbound(0));
+        prefix.note_buffer_dispatch(true);
+        reader.defer_root_fill(dst, at + 16, 4, shadow.clone());
+        reader.note_buffer_dispatch(false);
+        late.defer_memory(crate::memory::BoundTable::unbound(0));
+        late.note_buffer_dispatch(true);
+
+        assert_eq!(super::interleaved_reader(&[&prefix, &reader, &late]), Some(1));
+        assert_eq!(super::interleaved_reader(&[&prefix, &reader, &prefix]), None);
+        late.defer_after(|| {});
+        assert_eq!(super::interleaved_reader(&[&prefix, &reader, &late]), None);
+
+        drop((prefix, reader, late, shadow));
+        crate::shadow::unregister(at, at as u64);
+        crate::watch::tests::free(at);
+    }
+
+    #[test]
+    fn only_a_dependency_with_safe_copyback_separates_the_batch() {
+        let Some(host) = super::host() else {
+            assert!(std::env::var_os("VICTORY_TEST_ORDERING_REQUIRE_GPU").is_none());
+            return;
+        };
+        let page = crate::watch::PAGE;
+        let title = crate::watch::tests::pool(2);
+        crate::shadow::register(title, title as u64, (2 * page) as u64);
+        let shadow = crate::shadow::find(title as u64, (2 * page) as u64).unwrap();
+        let (producer, read, disjoint) = (
+            host.new_list().unwrap(), host.new_list().unwrap(), host.new_list().unwrap(),
+        );
+        producer.defer_gpu_write(&shadow, title, 4, false);
+        let mut output = [0u8; 4];
+        read.defer_fill(output.as_mut_ptr(), title as *const u8, 4);
+        disjoint.defer_fill(output.as_mut_ptr(), (title + 4) as *const u8, 4);
+        assert_eq!(super::cpu_read_boundaries(&[&producer, &read]), [1]);
+        assert!(super::cpu_read_boundaries(&[&producer, &disjoint]).is_empty());
+
+        let computed_write = |at| {
+            let list = host.new_list().unwrap();
+            {
+                let _writer = list.writer_uses_memory(true);
+                list.defer_gpu_write(&shadow, at, 4, false);
+                list.defer_missed(|| true);
+            }
+            list
+        };
+        let nonoverlapping = computed_write(title + page);
+        assert_eq!(super::cpu_read_boundaries(&[&producer, &read, &nonoverlapping]), [1]);
+        let same_page = computed_write(title + 4);
+        assert!(super::cpu_read_boundaries(&[&producer, &read, &same_page]).is_empty());
+        let overlapping = computed_write(title);
+        assert!(super::cpu_read_boundaries(&[&producer, &read, &overlapping]).is_empty());
+        assert!(super::cpu_read_boundaries(&[&overlapping, &read]).is_empty());
+        let opaque = host.new_list().unwrap();
+        opaque.defer_memory(crate::memory::BoundTable::unbound(0));
+        assert!(super::cpu_read_boundaries(&[&producer, &read, &opaque]).is_empty());
+        assert_eq!(super::computed_tail(&[&producer, &read, &opaque]), None);
+        assert_eq!(super::computed_tail(&[&producer, &opaque, &read]), Some(2));
+        assert_eq!(super::computed_tail(&[&opaque, &read, &read]), Some(1));
+        assert_eq!(super::computed_tail(&[&producer, &read, &nonoverlapping]), None);
+        assert_eq!(super::computed_tail(&[&overlapping, &read]), Some(1));
+        drop((producer, read, disjoint, nonoverlapping, same_page, overlapping, opaque, shadow));
+        crate::shadow::unregister(title, title as u64);
+        crate::watch::tests::free(title);
+    }
+
     /// A list in which a program using title memory missed memory: what
     /// that program wrote is withheld from title memory and leaves the
     /// copies at once; what an ordinary program wrote in the same list goes

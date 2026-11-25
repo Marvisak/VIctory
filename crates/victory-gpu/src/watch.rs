@@ -884,6 +884,40 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     }
 }
 
+/// Other runtime mappings of the bytes in a delivered title-memory copy.
+pub(crate) fn aliased_ranges(start: usize, len: usize) -> Vec<(usize, usize)> {
+    let end = start.saturating_add(len);
+    let g = guards();
+    g.alias_of.range(start / PAGE..end.div_ceil(PAGE)).flat_map(|(&page, mappings)| {
+        let base = page * PAGE;
+        let from = start.saturating_sub(base);
+        let to = (end - base).min(PAGE);
+        mappings.iter().map(move |alias| (alias * PAGE + from, to - from))
+    }).collect()
+}
+
+/// Does this byte range reach a pending write directly or through another
+/// mapping of the same physical page?
+pub(crate) fn overlaps_writes((start, len): (usize, usize), writes: &[(usize, usize)]) -> bool {
+    if len == 0 || writes.is_empty() {
+        return false;
+    }
+    let overlaps = |from: usize, to: usize| {
+        writes.iter().any(|&(at, len)| len != 0 && at < to && from < at.saturating_add(len))
+    };
+    let end = start.saturating_add(len);
+    if overlaps(start, end) {
+        return true;
+    }
+    let g = guards();
+    g.alias_of.range(start / PAGE..end.div_ceil(PAGE)).any(|(&page, aliases)| {
+        let base = page * PAGE;
+        let from = start.saturating_sub(base);
+        let to = (end - base).min(PAGE);
+        aliases.iter().any(|&alias| overlaps(alias * PAGE + from, alias * PAGE + to))
+    })
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
@@ -1308,6 +1342,8 @@ pub(crate) mod tests {
     #[test]
     fn writes_through_another_mapping_mark_the_tracker() {
         let (a, b) = twin_views(2);
+        assert!(overlaps_writes((b + PAGE + 3, 2), &[(a + PAGE + 4, 1)]));
+        assert!(!overlaps_writes((b + PAGE + 5, 2), &[(a + PAGE + 4, 1)]));
         let t = track(a, 2 * PAGE, true).expect("views are tracked");
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
         // SAFETY: the second view of the pages, guarded by the take.

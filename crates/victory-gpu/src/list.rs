@@ -140,6 +140,30 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+#[cfg(windows)]
+fn with_draw_state(this: This, compute: bool, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    with_state(this, |list, state| {
+        let list = if state.needs_cbv_boundary(list, compute) {
+            cut(this, list, state).unwrap_or(list)
+        } else {
+            list
+        };
+        f(list, state);
+    });
+}
+
+#[cfg(windows)]
+pub(crate) fn cpu_source_list<'a>(this: This, from: usize, len: usize) -> Option<&'a crate::host::HostList> {
+    let list = host_list(this)?;
+    if !list.writes_for_cpu_reads(&[(from, len)], true) {
+        return Some(list);
+    }
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    Some(cut(this, list, &mut state).unwrap_or(list))
+}
+
 /// The host list a title list's calls record into (its current segment),
 /// if there is a host GPU.
 #[cfg(windows)]
@@ -171,8 +195,7 @@ pub(crate) fn segments(this: This) -> Vec<std::sync::Arc<crate::host::HostList>>
     hosts.iter().take(k + 1).cloned().collect()
 }
 
-/// Waits recorded after commands: the title list goes on in a new host
-/// list, which runs once the wait holds.
+/// Waits or CPU preparation that depend on previously recorded commands.
 static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Lists reset or released while a queue still held some of their host
@@ -205,19 +228,31 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
     {
         let Some(current) = host_list(this) else { return };
         if !current.is_empty() {
-            let Some(next) = next_segment(this) else { return };
-            CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            current.close();
             // SAFETY: the title passes one of our lists.
             let list = unsafe { &*this.cast::<List>() };
-            list.state.lock().unwrap_or_else(|e| e.into_inner()).cut(next);
-            next.defer_wait(wait);
+            let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(next) = cut(this, current, &mut state) {
+                next.defer_wait(wait);
+            }
             return;
         }
         current.defer_wait(wait);
     }
     #[cfg(not(windows))]
     let _ = (this, wait);
+}
+
+#[cfg(windows)]
+fn cut<'a>(
+    this: This,
+    current: &'a crate::host::HostList,
+    state: &mut crate::draw::State,
+) -> Option<&'a crate::host::HostList> {
+    let next = next_segment(this)?;
+    CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    current.close();
+    state.cut(next);
+    Some(next)
 }
 
 /// Moves a title list's recording on to its next host list (made, or one
@@ -632,9 +667,10 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if host_list(this).is_some()
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && let Some(list) = cpu_source_list(this, from as usize, len as usize)
     {
         list.defer_copy(to, from, len as usize);
     }
@@ -657,6 +693,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
+            list.note_other_gpu_work();
             crate::texture::host_writes(list, dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
@@ -665,7 +702,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
-        ) {
+        ) && let Some(list) = cpu_source_list(this, from as usize, a.min(b) as usize)
+        {
             list.defer_copy(to, from, a.min(b) as usize);
         }
     }
@@ -712,6 +750,7 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        list.note_other_gpu_work();
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             if dst.kind == FOOTPRINT && src.kind != FOOTPRINT {
                 read_back(list, &dst, [x, y, z], &src, source_box);
@@ -946,6 +985,7 @@ extern "system" fn resolve(
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
+        list.note_other_gpu_work();
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
         ensure_state(list, dst, RESOLVE_DEST);
@@ -1007,6 +1047,7 @@ extern "system" fn clear_rtv(
         else {
             return;
         };
+        list.note_other_gpu_work();
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
@@ -1058,6 +1099,7 @@ extern "system" fn clear_dsv(
         else {
             return;
         };
+        list.note_other_gpu_work();
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
@@ -1327,7 +1369,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, with_state};
+    use super::{This, with_draw_state, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1490,13 +1532,13 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_draw_state(this, false, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_draw_state(this, true, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1506,7 +1548,7 @@ mod state {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        with_draw_state(this, false, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
     /// shortcut: dispatches whose group count is in GPU memory (indirect)
@@ -1524,7 +1566,7 @@ mod state {
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        with_draw_state(this, false, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -1535,7 +1577,7 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
-        with_state(this, |list, s| {
+        with_draw_state(this, false, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
     }
@@ -1614,7 +1656,7 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
-        with_state(this, |list, s| {
+        with_draw_state(this, kind == DISPATCH, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
