@@ -825,6 +825,8 @@ pub(crate) mod tests {
     /// so does a write the runtime reports at the other mapping.
     #[test]
     fn writes_through_another_mapping_mark_the_tracker() {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+
         let (a, b) = twin_views(2);
         let t = track(a, 2 * PAGE, true).expect("views are tracked");
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
@@ -837,12 +839,23 @@ pub(crate) mod tests {
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
         assert!(t.take(a, a + 2 * PAGE).is_empty());
         // A third mapping made later starts guarded, so its writes count.
-        let (c, _) = twin_views(1);
+        let (c, d) = twin_views(1);
         title_memory_aliased(c, &[a]);
         // SAFETY: a view of ours (another section: only the tracking
         // takes it for `a`'s pages here).
         unsafe { (c as *mut u32).write_volatile(1) };
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+
+        drop(t);
+        for (view, len) in [(a, 2 * PAGE), (b, 2 * PAGE), (c, PAGE), (d, PAGE)] {
+            // Clear the guard bookkeeping before Windows can reuse the address.
+            title_memory_remapped(view, len);
+            // SAFETY: each address is the base of a distinct view from twin_views.
+            let unmapped = unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ })
+            };
+            assert_ne!(unmapped, 0);
+        }
     }
 
     /// A write or mapping that runs past the end of the address space (a
