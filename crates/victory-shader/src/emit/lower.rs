@@ -9104,18 +9104,29 @@ impl<'a> Lower<'a> {
             Some("format_xyz") => (true, 3),
             Some("format_xyzw") => (true, 4),
             Some("ubyte" | "sbyte" | "ushort" | "sshort") if !store => (false, 1),
+            Some(
+                "ubyte_d16" | "ubyte_d16_hi" | "sbyte_d16" | "sbyte_d16_hi" | "short_d16"
+                | "short_d16_hi",
+            ) if !store => (false, 1),
             Some("byte" | "short") if store => (false, 1),
             _ => return Err(name),
         };
-        // Loads or stores of a byte or a half: its width and whether signed.
+        // Loads or stores of a byte or a half: its width, whether signed, and
+        // for `_d16` / `_d16_hi` which half of the destination VGPR receives it.
         let sub = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
         {
-            Some("ubyte" | "byte") => Some((8, false)),
-            Some("sbyte") => Some((8, true)),
-            Some("ushort" | "short") => Some((16, false)),
-            Some("sshort") => Some((16, true)),
+            Some("ubyte" | "byte") => Some((8, false, None)),
+            Some("sbyte") => Some((8, true, None)),
+            Some("ushort" | "short") => Some((16, false, None)),
+            Some("sshort") => Some((16, true, None)),
+            Some("ubyte_d16") => Some((8, false, Some(false))),
+            Some("ubyte_d16_hi") => Some((8, false, Some(true))),
+            Some("sbyte_d16") => Some((8, true, Some(false))),
+            Some("sbyte_d16_hi") => Some((8, true, Some(true))),
+            Some("short_d16") => Some((16, false, Some(false))),
+            Some("short_d16_hi") => Some((16, false, Some(true))),
             _ => None,
         };
         let Operand::Vector { reg: areg, .. } = *addr else {
@@ -9169,6 +9180,9 @@ impl<'a> Lower<'a> {
             }
             (_, ix) => ix,
         };
+        if sub.is_some() && !store && used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+            return Err("a sub-dword read of a constant buffer");
+        }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
@@ -9284,7 +9298,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if let (true, Some((width, _))) = (store, sub) {
+        if let (true, Some((width, _, _))) = (store, sub) {
             // The field of the dword holding it, by two atomics on that dword
             // (clear, then set): other lanes' fields in it are left alone.
             // shortcut: the field is taken not to cross a dword.
@@ -9435,39 +9449,82 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if let Some((width, signed)) = sub {
-            // The dword holding the field, as `global_load_ubyte` and kin.
-            // shortcut: the field is taken not to cross a dword.
+        if let Some((width, signed, half)) = sub {
+            // The dword holding the field, as `global_load_ubyte` and kin; a
+            // halfword at byte 3 of a dword reads the next dword too, only for
+            // lanes that cross. `_d16`/`_d16_hi` keep the other half of the
+            // destination register.
             if index.is_some() {
                 return Err("a byte or half buffer load by index");
             }
-            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-            let at = self.s.m.bin(c, Bin::And, off, not3);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, guard)?;
-            let c = self.cur;
-            let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                139,
-                &[h, at, iu, mask, align],
-            );
-            let w = self.s.m.extract(c, r, 0);
-            let w = self.as_int(w);
-            let byte = self.s.m.bin(c, Bin::And, off, three);
-            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-            let x = self.s.m.bin(c, Bin::LShr, w, sh);
-            let left = self.s.m.i32(32 - width);
-            let x = self.s.m.bin(c, Bin::Shl, x, left);
-            let x = self
-                .s
-                .m
-                .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left);
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
+            let word = |l: &mut Self, byte_off: V, active: Option<V>| -> Result<V, Why> {
+                let (h, at) = l.raw_view(site, src, byte_off, 4, (11 | u, 0), false, active)?;
+                let c = l.cur;
+                let (mask, align) = (l.s.m.i8(1), l.s.m.i32(4));
+                let r = l.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    l.s.t.res_ret,
+                    139,
+                    &[h, at, iu, mask, align],
+                );
+                let w = l.s.m.extract(c, r, 0);
+                Ok(l.as_int(w))
+            };
+            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+            let aligned = self.s.m.bin(c, Bin::And, off, not3);
+            let w = word(self, aligned, guard)?;
+            let c = self.cur;
+            let byte = self.s.m.bin(c, Bin::And, off, three);
+            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
+            let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
+            if width == 16 {
+                let mut crosses = self.s.m.cmp(c, pred::EQ, byte, three);
+                if let Some(g) = guard {
+                    crosses = self.s.m.bin(c, Bin::And, crosses, g);
+                }
+                let br = self.begin_guarded(Some(crosses));
+                let four = self.s.m.i32(4);
+                let next = self.s.m.bin(self.cur, Bin::Add, aligned, four);
+                let hi = word(self, next, Some(crosses))?;
+                let cur = self.cur;
+                let eight = self.s.m.i32(8);
+                let hi = self.s.m.bin(cur, Bin::Shl, hi, eight);
+                let both = self.s.m.bin(cur, Bin::Or, x, hi);
+                x = self.end_guarded(br, &[(both, x)])[0];
+            }
+            let c = self.cur;
+            let left = self.s.m.i32(32 - width);
+            let x = self.s.m.bin(c, Bin::Shl, x, left);
+            let mut x = self
+                .s
+                .m
+                .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left);
+            if let Some(high) = half {
+                let old = match inst.read(Reg::V(reg)) {
+                    Some(v) => self.i32_of(v)?,
+                    None => self.s.m.i32(0),
+                };
+                let low = self.s.m.i32(0xFFFF);
+                let (keep, field) = if high {
+                    let k16 = self.s.m.i32(16);
+                    (
+                        self.s.m.bin(c, Bin::And, old, low),
+                        self.s.m.bin(c, Bin::Shl, x, k16),
+                    )
+                } else {
+                    let up = self.s.m.i32(0xFFFF_0000);
+                    (
+                        self.s.m.bin(c, Bin::And, old, up),
+                        self.s.m.bin(c, Bin::And, x, low),
+                    )
+                };
+                x = self.s.m.bin(c, Bin::Or, keep, field);
+            }
             self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }

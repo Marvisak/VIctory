@@ -212,7 +212,7 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(4)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
@@ -1806,4 +1806,64 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         "{:?}",
         refused.err()
     );
+}
+
+/// MUBUF `buffer_load_* vdata, vaddr, s[srsrc:srsrc+3], 0 offen offset:byte_off`.
+const fn buffer_load_offen(op: u8, vdata: u8, vaddr: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+    [
+        0x38 << 26 | (op as u32) << 18 | 1 << 12 | (byte_off as u32 & 0xFFF),
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// RDNA2 ISA, MUBUF: `buffer_load_{ubyte,sbyte,short}_d16` and `_hi` put the loaded byte or
+/// halfword in one half of the destination VGPR and keep the other half (reading the next dword
+/// when a halfword starts at byte 3 mod 4).
+#[test]
+fn d16_sub_dword_buffer_loads_preserve_the_other_half() {
+    // (opcode, width, signed, high half)
+    let loads: [(u8, u32, bool, bool); 6] = [
+        (0x20, 8, false, false),
+        (0x21, 8, false, true),
+        (0x22, 8, true, false),
+        (0x23, 8, true, true),
+        (0x24, 16, false, false),
+        (0x25, 16, false, true),
+    ];
+    let (d1, d2, old) = (0x84F2_81C3u32, 0x7A9B_6D5Eu32, 0xA5B6_C7D8u32);
+    let bytes: Vec<u8> = [0, d1, d2].iter().flat_map(|d| d.to_le_bytes()).collect();
+    for (op, width, signed, high) in loads {
+        // v1 = byte address, v2 and v3 the dwords stored at bytes 4 and 8, v4 the old v0.
+        let mut body = vec![vop1(0x001, 0, vgpr(4))];
+        body.extend_from_slice(&buffer_store_dword(2, 8, 4));
+        body.extend_from_slice(&buffer_store_dword(3, 8, 8));
+        body.extend_from_slice(&buffer_load_offen(op, 0, 1, 8, 0));
+        let shader = build_valu_cs(&body);
+        // Every byte of dwords 1 and 2; a halfword at 7 crosses them.
+        let addresses: Vec<u32> = (4..=if width == 8 { 11 } else { 10 }).collect();
+        let cases: Vec<[u32; 4]> = addresses.iter().map(|&a| [a, d1, d2, old]).collect();
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            let at = addresses[i] as usize;
+            let raw = if width == 8 {
+                u32::from(bytes[at])
+            } else {
+                u32::from(bytes[at]) | u32::from(bytes[at + 1]) << 8
+            };
+            let shift = 32 - width;
+            let field = if signed {
+                ((raw << shift) as i32 >> shift) as u32
+            } else {
+                raw
+            };
+            let want = if high {
+                old & 0xFFFF | field << 16
+            } else {
+                old & 0xFFFF_0000 | field & 0xFFFF
+            };
+            assert_eq!(
+                got, want,
+                "{backend}: op {op:#x} at byte {at}: {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
 }
