@@ -416,6 +416,7 @@ static FUNCTIONS: Table<160> = {
     f[27] = resource::create_committed as *const (); // 0xd8
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
+    f[34] = object::ignore as *const (); // 0x110 MakeResident: memory is always resident
     f[36] = fence::create as *const (); // 0x120
     f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
@@ -599,5 +600,13 @@ mod tests {
         let device = device();
         let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
         assert_eq!(reason(device), S_OK);
+    }
+
+    #[test]
+    fn make_resident_succeeds_without_doing_anything() {
+        type MakeResident = extern "system" fn(This, u32, *const This) -> HRESULT;
+        let device = device();
+        let make_resident = slot::<MakeResident>(device, 0x110);
+        assert_eq!(make_resident(device, 0, std::ptr::null()), S_OK);
     }
 }
