@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod directed;
 
 type Why = &'static str;
 
@@ -6337,6 +6338,7 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            "v_ceil_f64" | "v_floor_f64" => self.round_directed_f64(inst, guard, name == "v_ceil_f64"),
             "v_cvt_i32_f32" | "v_cvt_u32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
                 let mut a = f(self, 0)?;
                 let floor = name != "v_cvt_i32_f32" && name != "v_cvt_u32_f32";
