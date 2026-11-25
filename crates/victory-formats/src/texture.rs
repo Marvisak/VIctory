@@ -612,7 +612,26 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, None, |t, l, len| {
+            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+        })
+    }
+
+    /// Detiles a compact band of element rows from a single 2D subresource.
+    /// The tiled slice keeps its origin; the linear slice starts at the first row.
+    pub fn detile_rows(
+        &self,
+        tiled: &[u8],
+        linear: &mut [u8],
+        row_pitch: usize,
+        rows: std::ops::Range<u32>,
+    ) -> Result<(), Error> {
+        if self.desc.dimension != Dimension::Tex2d || self.slices != 1 || self.mips.len() != 1
+            || self.mips[0].depth != 1
+        {
+            return Err(Error::Invalid);
+        }
+        self.walk(tiled.len(), 0, 0, linear.len(), row_pitch, 0, Some(rows), |t, l, len| {
             linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
         })
     }
@@ -627,7 +646,7 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, None, |t, l, len| {
             tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
         })
     }
@@ -642,9 +661,14 @@ impl Layout {
         linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
+        rows: Option<std::ops::Range<u32>>,
         mut copy: impl FnMut(usize, usize, usize),
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let rows = rows.unwrap_or(0..m.height);
+        if rows.is_empty() || rows.end > m.height {
+            return Err(Error::Invalid);
+        }
         let depth = m.depth;
         let first = if self.desc.dimension == Dimension::Tex3d {
             if slice != 0 {
@@ -662,7 +686,7 @@ impl Layout {
         }
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
-        let slice_bytes = (m.height as usize - 1)
+        let slice_bytes = (rows.len() - 1)
             .checked_mul(row_pitch)
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
@@ -707,8 +731,8 @@ impl Layout {
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+            for y in rows.clone() {
+                let linear_row = z as usize * depth_pitch + (y - rows.start) as usize * row_pitch;
                 if linear {
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
                     copy(tiled_row as usize, linear_row, bytes);
@@ -880,6 +904,28 @@ mod tests {
             block: 1,
             samples: 1,
             swizzle,
+        }
+    }
+
+    #[test]
+    fn compact_detile_rows_match_the_same_rows_from_a_full_detile() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
+            for block in [1, 4] {
+                let element = if block == 4 { 16 } else { 4 };
+                let l = Layout::new(&Desc { block, ..desc(260, 516, 1, element, swizzle) }).unwrap();
+                let tiled: Vec<u8> = (0..l.size).map(|i| (i ^ (i >> 8)) as u8).collect();
+                let m = &l.mips[0];
+                let stride = (m.width * element) as usize;
+                let mut full = vec![0; stride * m.height as usize];
+                l.detile(&tiled, 0, 0, &mut full, stride, 0).unwrap();
+                let first = m.height - 5;
+                let mut band = vec![0; stride * 5];
+                l.detile_rows(&tiled, &mut band, stride, first..m.height).unwrap();
+                assert_eq!(band, full[first as usize * stride..], "{swizzle:?}, {block}");
+                assert_eq!(l.detile_rows(&tiled, &mut band, stride, first..first), Err(Error::Invalid));
+                assert_eq!(l.detile_rows(&tiled, &mut band, stride, first..m.height + 1), Err(Error::Invalid));
+                assert_eq!(l.detile_rows(&tiled, &mut band[..stride], stride, first..m.height), Err(Error::TooSmall));
+            }
         }
     }
 
