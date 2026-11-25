@@ -2393,6 +2393,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let a = crate::resource::host_copy(object).unwrap();
             let b = crate::resource::host_copy(placed as This).unwrap();
+            // Without Device10 the resource uses the legacy creation path.
+            // Still require the alias copy and the correct readback texels.
+            let shared = shared && host.device.cast::<ID3D12Device10>().is_ok();
             assert_eq!(std::sync::Arc::ptr_eq(&a, &b), shared, "round {round}: one host texture");
             let unordered = View::Unordered(object as usize, 0, Some([written, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
             slots.make(0, &unordered);
