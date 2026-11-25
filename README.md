@@ -152,7 +152,10 @@ victory config
 default worker count.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
+info and above). Set `VICTORY_LOG_FILE=<file>` to also write logs as plain
+UTF-8 lines without ANSI colour codes; `stderr` emits colour codes only
+when connected to a terminal (`NO_COLOR` and `CLICOLOR_FORCE` are
+honoured).
 
 ### Windows shader-test validator
 
@@ -185,6 +188,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | Variable | Effect |
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
+| `VICTORY_LOG_FILE=<file>` | also write logs to `<file>` as plain UTF-8 lines without colour codes |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |

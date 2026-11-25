@@ -48,6 +48,22 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
 /// Names the process to record, in the recorder's environment.
 const TARGET: &str = "VICTORY_AUDIO_CAPTURE_OF";
 
+fn target_and_path() -> Option<(u32, std::ffi::OsString)> {
+    Some((
+        std::env::var(TARGET).ok()?.parse().ok()?,
+        std::env::var_os("VICTORY_AUDIO_CAPTURE")?,
+    ))
+}
+
+fn recorder_command(exe: &Path, pid: u32) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    // The parent owns the per-run `VICTORY_LOG_FILE`; clear it in the helper
+    // so the recorder cannot truncate or interleave the parent's log.
+    cmd.env(TARGET, pid.to_string())
+        .env_remove("VICTORY_LOG_FILE");
+    cmd
+}
+
 /// Starts the recorder if `VICTORY_AUDIO_CAPTURE` names a file. With this
 /// module's debug log, also logs once a second what a `Sleep(1)` takes in
 /// this process (the title's millisecond waits get the same).
@@ -67,23 +83,23 @@ pub fn start() {
             });
     }
     if std::env::var_os("VICTORY_AUDIO_CAPTURE").is_some()
-        && let Err(e) = std::env::current_exe().and_then(|exe| {
-            std::process::Command::new(exe)
-                .env(TARGET, std::process::id().to_string())
-                .spawn()
-        })
+        && let Err(e) = std::env::current_exe()
+            .and_then(|exe| recorder_command(&exe, std::process::id()).spawn())
     {
         tracing::warn!("audio capture not started: {e}");
     }
 }
 
+/// True when the current environment asks this process to act as the audio
+/// capture child started by [`start`].
+pub fn is_child() -> bool {
+    target_and_path().is_some()
+}
+
 /// In the recorder (a child started by [`start`]): records until the
 /// target exits and returns true; false in any other process.
 pub fn child() -> bool {
-    let (Some(pid), Some(path)) = (
-        std::env::var(TARGET).ok().and_then(|p| p.parse().ok()),
-        std::env::var_os("VICTORY_AUDIO_CAPTURE"),
-    ) else {
+    let Some((pid, path)) = target_and_path() else {
         return false;
     };
     if let Err(e) = record(pid, Path::new(&path)) {
@@ -225,5 +241,19 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn recorder_command_clears_log_file_env() {
+        let cmd = recorder_command(Path::new("victory.exe"), 4242);
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.contains(&(OsStr::new(TARGET), Some(OsStr::new("4242")))));
+        assert!(envs.contains(&(OsStr::new("VICTORY_LOG_FILE"), None)));
     }
 }

@@ -143,12 +143,15 @@ enum Console {
 static ALLOC: victory_gpu::CountingAlloc = victory_gpu::CountingAlloc;
 
 fn main() -> Result<()> {
-    victory_core::logging::init("info");
-    // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
+    // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`; keep the
+    // helper on stderr only so it cannot truncate the parent's `VICTORY_LOG_FILE`.
     #[cfg(all(windows, feature = "diagnostics"))]
-    if victory_hle::modules::audio::capture::child() {
+    if victory_hle::modules::audio::capture::is_child() {
+        victory_core::logging::init_stderr_only("info");
+        victory_hle::modules::audio::capture::child();
         return Ok(());
     }
+    victory_core::logging::init("info");
     let cli = Cli::parse();
     match cli.command {
         Command::Inspect {
