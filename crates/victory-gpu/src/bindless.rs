@@ -530,6 +530,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
         };
         rounds(src, dst, tex, write);
+        release_resources([src, dst, tex]);
     }
 
     /// The same with the buffer and the texture in one view of physical
@@ -554,6 +555,14 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
         };
         rounds(src, dst, tex, write);
+        release_resources([src, dst, tex]);
+    }
+
+    fn release_resources(resources: [This; 3]) {
+        for resource in resources {
+            let release = crate::object::slot::<extern "system" fn(This) -> u32>(resource, 0x10);
+            assert_eq!(release(resource), 0);
+        }
     }
 
     const PAGE_BYTES: usize = crate::watch::PAGE;
