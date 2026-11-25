@@ -22,6 +22,9 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+# For other crates' tests: guarding title memory as a refresh does
+# (`title_memory_guard`).
+test-support = []
 
 [lints]
 workspace = true

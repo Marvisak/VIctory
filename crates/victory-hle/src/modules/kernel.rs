@@ -60,7 +60,11 @@ pub extern "system" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, siz
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_a(module, out, size);
     };
-    copy_truncated(path.as_bytes(), title_buffer(out, size))
+    // In the code page the title's narrow file calls are decoded with, as
+    // the host gives its own modules' paths: a folder with a letter outside
+    // ASCII is not that folder in UTF-8.
+    let path = host::ansi(&path);
+    copy_truncated(&path, title_buffer(out, size))
 }
 
 /// The title's buffer of `size` elements; none for a null pointer (a slice
@@ -164,13 +168,15 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
-    // Values below 0x10000 are ordinals; we export by name only.
+    // Values below 0x10000 are ordinals; we export by name only. A miss
+    // fails as the host's does, with the last error set.
     if (name as usize) < 0x1_0000 {
         tracing::warn!(
             module = m.name,
             ordinal = name as usize,
             "GetProcAddress by ordinal"
         );
+        host::set_last_error(ERROR_PROC_NOT_FOUND);
         return std::ptr::null_mut();
     }
     // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
@@ -179,6 +185,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         Some(e) => e.address as *mut c_void,
         None => {
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            host::set_last_error(ERROR_PROC_NOT_FOUND);
             std::ptr::null_mut()
         }
     }
@@ -360,6 +367,7 @@ fn refuse(file: &str) {
 }
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 
 pub(crate) fn module() -> HleModule {
     HleModule {
@@ -406,6 +414,41 @@ pub(crate) fn callers() -> String {
 #[cfg(windows)]
 mod host {
     use std::ffi::c_void;
+
+    /// `text` in the process's ANSI code page.
+    pub(super) fn ansi(text: &str) -> Vec<u8> {
+        use windows_sys::Win32::Globalization::{CP_ACP, WideCharToMultiByte};
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let Ok(len) = i32::try_from(wide.len()) else {
+            return text.as_bytes().to_vec();
+        };
+        let (none, unused) = (std::ptr::null(), std::ptr::null_mut());
+        // SAFETY: a sizing call, then a call with room for `n` bytes.
+        unsafe {
+            let n = WideCharToMultiByte(
+                CP_ACP,
+                0,
+                wide.as_ptr(),
+                len,
+                unused,
+                0,
+                none,
+                unused.cast(),
+            );
+            let mut out = vec![0u8; usize::try_from(n).unwrap_or(0)];
+            WideCharToMultiByte(
+                CP_ACP,
+                0,
+                wide.as_ptr(),
+                len,
+                out.as_mut_ptr(),
+                n,
+                none,
+                unused.cast(),
+            );
+            out
+        }
+    }
 
     use windows_sys::Win32::Foundation::{FreeLibrary, SetLastError};
     use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
@@ -542,6 +585,10 @@ mod host {
 mod host {
     use std::ffi::c_void;
 
+    pub(super) fn ansi(text: &str) -> Vec<u8> {
+        text.as_bytes().to_vec()
+    }
+
     pub(super) fn get_module_handle_w(_: *const u16) -> *mut c_void {
         std::ptr::null_mut()
     }
@@ -624,6 +671,35 @@ mod tests {
         let mut small = [0u8; 4];
         assert_eq!(GetModuleFileNameA(module, small.as_mut_ptr(), 4), 4);
         assert_eq!(&small, &[b'C', b':', b'\\', 0]);
+    }
+
+    /// The narrow path is in the ANSI code page: the host's narrow file
+    /// calls, which the title hands it back to, decode it to the wide one.
+    #[cfg(windows)]
+    #[test]
+    fn narrow_title_paths_are_in_the_ansi_code_page() {
+        use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
+        let base = 0x7000_0001_0000;
+        let path = "C:\\Usu\u{e1}rios\\Jo\u{e3}o\\game.exe";
+        runtime::set_image_path(base, std::path::Path::new(path));
+        let mut buf = [0u8; 64];
+        let n = GetModuleFileNameA(base as *mut c_void, buf.as_mut_ptr(), buf.len() as u32);
+        assert_eq!(buf[n as usize], 0);
+        let mut back = [0u16; 64];
+        // SAFETY: `n` bytes in, room for 64 units out.
+        let units = unsafe {
+            MultiByteToWideChar(CP_ACP, 0, buf.as_ptr(), n as i32, back.as_mut_ptr(), 64)
+        };
+        let back = String::from_utf16_lossy(&back[..units as usize]);
+        // A code page without these letters gives its nearest ones, which
+        // UTF-8 bytes read in that code page never are.
+        assert_eq!(back.chars().count(), path.chars().count());
+        if back != path {
+            assert!(
+                back.starts_with("C:\\Usu") && back.ends_with("\\game.exe"),
+                "{back}"
+            );
+        }
     }
 
     /// The host clears the last error when the name fits (titles tell a
@@ -738,6 +814,28 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_export_of_our_modules_sets_the_last_error() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        // SAFETY: sets and reads this thread's last error.
+        let clear = || unsafe { SetLastError(0) };
+        // SAFETY: as above.
+        let last = || unsafe { GetLastError() };
+        // The host's own modules, for comparison.
+        let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());
+        clear();
+        assert!(GetProcAddress(kernel32, c"NotAnExport".as_ptr().cast()).is_null());
+        assert_eq!(last(), ERROR_PROC_NOT_FOUND);
+        // Ours, by name and by ordinal.
+        let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
+        for name in [c"NotAnExport".as_ptr().cast(), 9999 as *const u8] {
+            clear();
+            assert!(GetProcAddress(runtime, name).is_null());
+            assert_eq!(last(), ERROR_PROC_NOT_FOUND, "{name:?}");
+        }
     }
 
     /// No buffer: nothing written, the error says it was too small.

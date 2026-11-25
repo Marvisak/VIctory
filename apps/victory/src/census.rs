@@ -26,6 +26,7 @@ impl From<&ImportSymbol> for FunctionKey {
 
 #[derive(Default)]
 struct DllStats {
+    /// Import library hints can differ for the same named function.
     functions: BTreeSet<FunctionKey>,
     hle: usize,
     host: usize,

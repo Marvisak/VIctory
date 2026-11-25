@@ -44,6 +44,7 @@ impl SigElement {
             18 => 68,
             19 => 67,
             20 => 69,
+            28 => 23, // barycentrics
             30 => 25, // cull primitive
             _ => 0,
         }
@@ -58,36 +59,41 @@ impl SigElement {
         }
     }
 
+    fn sig_name(&self) -> &str {
+        match self.kind {
+            1 => "SV_VertexID",
+            2 => "SV_InstanceID",
+            3 => "SV_Position",
+            4 => "SV_RenderTargetArrayIndex",
+            5 => "SV_ViewportArrayIndex",
+            6 => "SV_ClipDistance",
+            7 => "SV_CullDistance",
+            10 => "SV_PrimitiveID",
+            12 => "SV_SampleIndex",
+            13 => "SV_IsFrontFace",
+            14 => "SV_Coverage",
+            15 => "SV_InnerCoverage",
+            16 => "SV_Target",
+            17 => "SV_Depth",
+            18 => "SV_DepthLessEqual",
+            19 => "SV_DepthGreaterEqual",
+            20 => "SV_StencilRef",
+            28 => "SV_Barycentrics",
+            30 => "SV_CullPrimitive",
+            _ => &self.name,
+        }
+    }
+
+    fn effective_col(&self) -> u8 {
+        if self.row.is_some() { self.col } else { 0 }
+    }
+
     fn mask(&self) -> u8 {
-        ((1u8 << self.cols) - 1) << self.col
+        ((1u8 << self.cols) - 1) << self.effective_col()
     }
 }
 
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
-/// Gives the elements of a row whose interpolation mode nothing decided
-/// (float elements, unless `read` and read) the mode the row's other
-/// elements agree on: DXIL wants one mode per row, and the console's
-/// signature, packed by the source's modes, had one (an int or a system
-/// value beside a float means the float was `nointerpolation`).
-pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
-    let free = |e: &SigElement| e.kind == 0 && e.comp == 9 && !(read && e.usage != 0);
-    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
-    rows.sort_unstable();
-    rows.dedup();
-    for row in rows {
-        let decided = |e: &&SigElement| e.row == Some(row) && !free(e) && e.interp != 0;
-        let mut modes = elements.iter().filter(decided).map(|e| e.interp);
-        let Some(mode) = modes.next() else { continue };
-        if modes.any(|m| m != mode) {
-            continue;
-        }
-        let undecided = |e: &&mut SigElement| e.row == Some(row) && free(e);
-        for e in elements.iter_mut().filter(undecided) {
-            e.interp = mode;
-        }
-    }
-}
-
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend((elements.len() as u32).to_le_bytes());
@@ -95,7 +101,8 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the rows sorted by register (unallocated last), keeping element order
+    // within the same register.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -106,9 +113,10 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         match shared {
             Some(j) => offsets.push(offsets[j]),
             None => {
+                let name = e.sig_name();
                 offsets.push(next);
-                next += e.name.len() as u32 + 1;
-                names.push(&e.name);
+                next += name.len() as u32 + 1;
+                names.push(name);
             }
         }
     }
@@ -116,7 +124,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
-        let used = e.usage << e.col;
+        let used = e.usage << e.effective_col();
         let rw = if input { used } else { !used & 0xf };
         for v in [
             0,
@@ -138,10 +146,27 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     out
 }
 
+/// The most a mesh shader's outputs may take, in bytes (D3D12).
+pub(crate) const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
+
+/// A mesh shader's output size as the DXIL validator measures it against
+/// [`MESH_OUTPUT_LIMIT`]: 4 bytes per component of every vertex element
+/// and primitive element, times the maxima rounded up to multiples of 32.
+pub(crate) fn mesh_output_bytes(
+    vertex: &[SigElement],
+    primitive: &[SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+) -> u64 {
+    let scalars = |els: &[SigElement]| els.iter().map(|e| u64::from(e.cols)).sum::<u64>();
+    let align = |n: u32| u64::from(n).next_multiple_of(32);
+    4 * (scalars(vertex) * align(max_vertices) + scalars(primitive) * align(max_primitives))
+}
+
 /// A resource bound by register, as `PSV0` lists it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Binding {
-    /// PSV resource type: 1 sampler, 2 CBV.
+    /// PSV resource type: 1 sampler, 2 CBV, 4 raw SRV, 7 raw UAV.
     pub kind: u32,
     pub space: u32,
     pub register: u32,
@@ -150,7 +175,7 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct Psv<'a> {
-    /// PSV shader kind: 0 pixel, 1 vertex, 5 compute.
+    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute.
     pub stage: u8,
     /// Vertex: writes `SV_Position`. Pixel: writes depth.
     pub flag: bool,
@@ -160,8 +185,9 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
-    /// Geometry: its maximum output vertices (triangles in, strips out).
-    pub gs: Option<u32>,
+    /// Geometry (triangles in, triangle strips out on stream 0): its
+    /// maximum vertex count. `flag`: writes `SV_Position`.
+    pub geometry: Option<u32>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -215,14 +241,14 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
     }
-    if let Some(max) = p.gs {
-        // Input primitive (triangle), output topology (triangle strip),
-        // stream mask, then whether it writes a position.
-        for (k, v) in [3u32, 5, 1].into_iter().enumerate() {
-            info[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
-        }
+    if let Some(max_vertices) = p.geometry {
+        // Input primitive (3: triangles), output topology (5: triangle
+        // strips), stream mask, position written; the vertex maximum.
+        info[0..4].copy_from_slice(&3u32.to_le_bytes());
+        info[4..8].copy_from_slice(&5u32.to_le_bytes());
+        info[8..12].copy_from_slice(&1u32.to_le_bytes());
         info[12] = u8::from(p.flag);
-        info[26..28].copy_from_slice(&(max as u16).to_le_bytes());
+        info[26..28].copy_from_slice(&(max_vertices as u16).to_le_bytes());
     }
     out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);
@@ -235,20 +261,17 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             );
         }
     }
-    // Names of arbitrary semantics (system values use ""), then indices.
+    // Names of arbitrary semantics (system values and unnamed ones use
+    // ""), then indices. Validators before 1.8 compare this part byte for
+    // byte with their own, which writes every name again, repeats
+    // included; 1.8 compares by content and takes either.
     let mut strings = vec![0u8];
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
-        let name = if e.kind == 0 {
-            let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            match find(&strings, &needle) {
-                Some(at) => at,
-                None => {
-                    strings.extend(&needle);
-                    strings.len() - needle.len()
-                }
-            }
+        let name = if e.kind == 0 && !e.name.is_empty() {
+            strings.extend(e.name.bytes().chain([0]));
+            strings.len() - e.name.len() - 1
         } else {
             0
         };
@@ -305,10 +328,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     out
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The container: parts in order, hashed.
@@ -424,6 +443,54 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 mod tests {
     use super::*;
 
+    /// DXC writes one PSV0 name per named arbitrary element, in element
+    /// order and repeats included, and validators before 1.8 refuse the
+    /// part otherwise ("Pipeline State Validation does not match").
+    #[test]
+    fn psv_names_repeat_as_dxc_writes_them() {
+        let el = |name: &str, index, kind, row| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let inputs = [el("TEXCOORD", 0, 0, 0), el("TEXCOORD", 1, 0, 1)];
+        let outputs = [
+            el("SV_Position", 0, 3, 0),
+            el("TEXCOORD", 0, 0, 1),
+            el("", 2, 0, 2),
+            el("COLOR", 0, 0, 3),
+        ];
+        let part = psv(&Psv {
+            stage: 1,
+            flag: true,
+            inputs: &inputs,
+            outputs: &outputs,
+            prims: &[],
+            mesh: None,
+            geometry: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        let u32_at = |at: usize| u32::from_le_bytes(part[at..at + 4].try_into().unwrap());
+        // Runtime info size and info, no bindings, then the strings.
+        let at = 4 + u32_at(0) as usize + 4;
+        let len = u32_at(at) as usize;
+        let strings = &part[at + 4..at + 4 + len];
+        assert_eq!(strings, b"\0TEXCOORD\0TEXCOORD\0TEXCOORD\0COLOR\0\0\0");
+        let at = at + 4 + len;
+        let elements = at + 4 + 4 * u32_at(at) as usize + 4;
+        let names: Vec<u32> = (0..6).map(|i| u32_at(elements + 16 * i)).collect();
+        assert_eq!(names, [1, 10, 0, 19, 0, 28]);
+    }
+
     #[test]
     fn md5_core_matches_the_standard() {
         // Standard MD5 of "abc" with standard padding, through md5_block.
@@ -439,5 +506,46 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn signature_keeps_same_row_order_canonical_sv_names_and_unalloc_mask() {
+        let mk = |name: &str, kind, row, col, cols, usage| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row,
+            col,
+            cols,
+            usage,
+            half: false,
+        };
+        let bytes = signature(
+            &[
+                mk("COLOR", 0, Some(0), 2, 2, 0b10),
+                mk("TEXCOORD", 0, Some(0), 0, 2, 0b01),
+                mk("SV_POSITION", 3, Some(1), 0, 4, 0),
+                mk("SV_SAMPLEINDEX", 12, None, 2, 1, 1),
+            ],
+            true,
+        );
+        let name_at = |row: usize| {
+            let off = u32::from_le_bytes(bytes[8 + 32 * row + 4..8 + 32 * row + 8].try_into().unwrap()) as usize;
+            let end = bytes[off..].iter().position(|&b| b == 0).unwrap();
+            std::str::from_utf8(&bytes[off..off + end]).unwrap()
+        };
+        let mask_rw = |row: usize| (bytes[8 + 32 * row + 24], bytes[8 + 32 * row + 25]);
+        // Same-row elements keep element order (COLOR col 2 before TEXCOORD col 0).
+        assert_eq!(name_at(0), "COLOR");
+        assert_eq!(mask_rw(0), (0b1100, 0b1000));
+        assert_eq!(name_at(1), "TEXCOORD");
+        assert_eq!(mask_rw(1), (0b0011, 0b0001));
+        // System values use DXIL's canonical casing.
+        assert_eq!(name_at(2), "SV_Position");
+        // Unallocated elements do not shift mask/usage by `col`.
+        assert_eq!(name_at(3), "SV_SampleIndex");
+        assert_eq!(mask_rw(3), (0b0001, 0b0001));
     }
 }

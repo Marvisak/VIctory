@@ -191,8 +191,8 @@ pub extern "system" fn CreateWindowExA(
     hwnd
 }
 
-/// A console title sizes its window to its render target (Grand Theft
-/// Auto VI: 3840x2160 on a Series X), which can exceed the host's screen.
+/// A console title sizes its window to its render target (
+/// the title: 3840x2160 on a Series X), which can exceed the host's screen.
 /// A top-level window larger than the work area is shrunk to fit, keeping
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
@@ -235,12 +235,7 @@ fn window_limit() -> Option<(i32, i32)> {
     })
 }
 
-fn fit_with_limit(
-    area: &RECT,
-    width: i32,
-    height: i32,
-    limit: Option<(i32, i32)>,
-) -> (i32, i32) {
+fn fit_with_limit(area: &RECT, width: i32, height: i32, limit: Option<(i32, i32)>) -> (i32, i32) {
     let Some((max_width, max_height)) = limit else {
         return fit_into(area, width, height);
     };
@@ -439,11 +434,19 @@ extern "system" fn window_proc(
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
+    // Automation can send WM_CLOSE directly to the title's message-only
+    // window. The visible stand-in identifies it; owned dialogs have none.
+    let window = stand_in_of(hwnd);
+    // SAFETY: visibility is a plain query on the stand-in.
+    if message == wm::WM_CLOSE && !window.is_null() && unsafe { wm::IsWindowVisible(window) != 0 } {
+        end_title("window closed", Box::new(|| {}));
+        return 0;
+    }
     // Alt or F10 puts a window into menu mode: the system runs a modal menu
     // loop on the thread that owns the window, which is the title's. The
     // title then stops (no frames, no input) until a key ends the loop, and
-    // nothing shows it, since the window has no menu bar; Grand Theft Auto
-    // VI aborts itself about half a minute later. A console has no window
+    // nothing shows it, since the window has no menu bar;
+    // the title aborts itself about half a minute later. A console has no window
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
@@ -451,7 +454,6 @@ extern "system" fn window_proc(
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);
-        let window = stand_in_of(hwnd);
         if message == wm::WM_NCDESTROY {
             wm::RemovePropW(hwnd, TITLE_PROC);
             if !window.is_null() {
@@ -689,8 +691,14 @@ mod tests {
             right: 2660,
             bottom: 1490,
         };
-        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((1920, 1080))), (1920, 1080));
-        assert_eq!(fit_with_limit(&area, 640, 480, Some((1920, 1080))), (640, 480));
+        assert_eq!(
+            fit_with_limit(&area, 3840, 2160, Some((1920, 1080))),
+            (1920, 1080)
+        );
+        assert_eq!(
+            fit_with_limit(&area, 640, 480, Some((1920, 1080))),
+            (640, 480)
+        );
         assert_eq!(fit_with_limit(&area, 3840, 2160, None), (2560, 1440));
     }
 
@@ -702,7 +710,10 @@ mod tests {
             right: 1920,
             bottom: 1040,
         };
-        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((2560, 1440))), (1848, 1040));
+        assert_eq!(
+            fit_with_limit(&area, 3840, 2160, Some((2560, 1440))),
+            (1848, 1040)
+        );
         assert_eq!(
             fit_with_limit(&area, wm::CW_USEDEFAULT, 0, Some((1920, 1080))),
             (wm::CW_USEDEFAULT, 0)
@@ -717,7 +728,10 @@ mod tests {
             right: 2560,
             bottom: 1440,
         };
-        assert_eq!(fit_with_limit(&area, 1600, 1200, Some((1920, 1080))), (1440, 1080));
+        assert_eq!(
+            fit_with_limit(&area, 1600, 1200, Some((1920, 1080))),
+            (1440, 1080)
+        );
     }
 
     #[test]
@@ -764,6 +778,86 @@ mod tests {
             assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "after");
             assert!(!wm::GetPropW(hwnd, TITLE_PROC).is_null());
             wm::DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn direct_close_suspends_and_exits() {
+        const CHILD: &str = "VICTORY_TEST_DIRECT_CLOSE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::windows::io::AsRawHandle;
+            use std::process::{Command, Stdio};
+            use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "modules::lifecycle::tests::direct_close_suspends_and_exits",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            // Bound the test from outside the child so a slow runner cannot
+            // make the test thread panic while the close worker is ending it.
+            // SAFETY: the child owns the process handle throughout the wait.
+            let wait = unsafe { WaitForSingleObject(child.as_raw_handle(), 15_000) };
+            if wait != WAIT_OBJECT_0 {
+                let _ = child.kill();
+            }
+            let output = child.wait_with_output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_ne!(wait, WAIT_TIMEOUT, "direct close did not exit: {stderr}");
+            assert_eq!(wait, WAIT_OBJECT_0, "could not wait for close: {stderr}");
+            assert!(output.status.success(), "close test child failed: {stderr}");
+            assert!(stderr.contains("suspend routine ran"), "{stderr}");
+            return;
+        }
+
+        extern "system" fn record_suspend(_: u8, _: *mut c_void) {
+            eprintln!("suspend routine ran");
+        }
+
+        let null = std::ptr::null_mut();
+        let create = |owner| {
+            CreateWindowExW(
+                wm::WS_EX_NOACTIVATE | wm::WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!("VIctory close test"),
+                wm::WS_VISIBLE | wm::WS_POPUP,
+                -10_000,
+                -10_000,
+                10,
+                10,
+                owner,
+                null,
+                null,
+                std::ptr::null(),
+            )
+        };
+        let title = create(null);
+        assert!(!title.is_null());
+        let dialog = create(title);
+        assert!(!dialog.is_null());
+        // SAFETY: both windows belong to this test thread. Closing the dialog
+        // goes to its original procedure and leaves the title window alive.
+        unsafe {
+            wm::SendMessageW(dialog, wm::WM_CLOSE, 0, 0);
+            assert_eq!(wm::IsWindow(dialog), 0);
+            assert_ne!(wm::IsWindow(title), 0);
+        }
+        let mut registration = 0;
+        assert_eq!(
+            RegisterAppStateChangeNotification(Some(record_suspend), null, &mut registration),
+            0
+        );
+        // SAFETY: this thread owns the title window.
+        unsafe { wm::SendMessageW(title, wm::WM_CLOSE, 0, 0) };
+        loop {
+            std::thread::park();
         }
     }
 

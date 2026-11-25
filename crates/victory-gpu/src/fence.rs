@@ -1,5 +1,5 @@
-//! Fences: a 64-bit value and the events waiting for it, moved by the
-//! title's Signals and its queues' (once the work before them has run).
+//! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
+//! GPU yet, so only signals (the title's, later our queues') move one.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
@@ -35,9 +35,43 @@ struct Fence {
     /// address.
     value: AtomicU64,
     flags: u32,
-    /// Events to set once the value reaches theirs (handles as integers),
-    /// and since when.
-    waiters: Mutex<Vec<(u64, usize, std::time::Instant)>>,
+    /// Events to set once the value reaches theirs (handles as integers).
+    waiters: Mutex<Vec<(u64, usize)>>,
+}
+
+/// The fences that may have events waiting. A list can write a fence's
+/// value at its GPU address, which is no call of ours: the events of these
+/// are looked at wherever such a write may have landed ([`wake_reached`]).
+/// Locked before a fence's `waiters`.
+static WAITED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        let at = std::ptr::from_ref::<Fence>(self) as usize;
+        let mut waited = WAITED.lock().unwrap_or_else(|e| e.into_inner());
+        waited.retain(|&f| f != at);
+    }
+}
+
+/// Sets the events whose fences have reached their values by a write to the
+/// fence's memory (a list's bottom-of-pipe write), as [`set`] does for a
+/// signal. Called where the queues look at their own fence waits again.
+pub(crate) fn wake_reached() {
+    let mut waited = WAITED.lock().unwrap_or_else(|e| e.into_inner());
+    waited.retain(|&f| {
+        // SAFETY: a live fence: one released is taken off the list.
+        let fence = unsafe { &*(f as *const Fence) };
+        let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        let value = fence.value.load(Ordering::Acquire);
+        waiters.retain(|&(wanted, event)| {
+            let reached = wanted <= value;
+            if reached {
+                set_event(event);
+            }
+            !reached
+        });
+        !waiters.is_empty()
+    });
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -83,14 +117,12 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
-extern "system" fn completed(this: This) -> u64 {
-    // A title polling for a value: held work that may run now does first.
-    crate::queue::pump_held_if_free(crate::queue::Why::Fence);
+pub(crate) extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
-    crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     let fence = fence(this);
+    let mut waited = WAITED.lock().unwrap_or_else(|e| e.into_inner());
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {
@@ -99,63 +131,50 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
+        // With submissions sent to the card and not waited for
+        // (`crate::host::late`) the signal may be behind them: they are
+        // settled, which sets it.
+        #[cfg(windows)]
+        if crate::host::late() {
+            drop(waiters);
+            drop(waited);
+            crate::host::settle_for_fence();
+            if fence.value.load(Ordering::Acquire) >= value {
+                return S_OK;
+            }
+            tracing::warn!(value, "blocking fence wait not implemented");
+            return E_NOTIMPL;
+        }
         // shortcut: a null event means "block until reached"; nothing can
         // reach it while no GPU work runs, so fail instead of hanging.
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
-    waiters.push((value, event as usize, std::time::Instant::now()));
+    waiters.push((value, event as usize));
+    if !waited.contains(&(this as usize)) {
+        waited.push(this as usize);
+    }
     S_OK
 }
-/// The title's Signal from the CPU: what queues hold behind a Wait for it
-/// may run now (`crate::hold`).
-extern "system" fn signal(this: This, value: u64) -> HRESULT {
-    let hr = set(this, value);
-    crate::queue::pump_held(crate::queue::Why::Fence);
-    hr
-}
-
-/// Moves a fence to `value` and wakes the events waiting for it (a queue's
-/// Signal, when the work before it has run).
-pub(crate) fn set(this: This, value: u64) -> HRESULT {
+/// Moves the fence to `value` and sets the events that waited for it.
+pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event, since)| {
+    waiters.retain(|&(wanted, event)| {
         let reached = wanted <= value;
         if reached {
             set_event(event);
-            WAITED.0.fetch_add(1, Ordering::Relaxed);
-            WAITED.1.fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         !reached
     });
+}
+pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
+    set(this, value);
+    // A queue may have waited for it: what it held runs now.
+    #[cfg(windows)]
+    crate::queue::release_held(false);
     S_OK
-}
-
-/// Events the title waited on for a fence value, and their summed waits in
-/// microseconds (the held-work frame line: work held back shows here as the
-/// title's own waits).
-static WAITED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
-
-/// Events set since the last call and how long they waited, summed.
-pub(crate) fn take_waited() -> (u64, std::time::Duration) {
-    let n = WAITED.0.swap(0, Ordering::Relaxed);
-    (n, std::time::Duration::from_micros(WAITED.1.swap(0, Ordering::Relaxed)))
-}
-
-/// A fence's value.
-pub(crate) fn value(this: This) -> u64 {
-    fence(this).value.load(Ordering::Acquire)
-}
-
-/// Keeps a fence alive while a queue holds a Signal of it, until
-/// [`let_go`].
-pub(crate) fn keep(this: This) {
-    object::add_ref(this);
-}
-pub(crate) fn let_go(this: This) {
-    release(this);
 }
 
 extern "system" fn creation_flags(this: This) -> u32 {
@@ -210,13 +229,31 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
         assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
-        // Grand Theft Auto VI reads the value at the fence's address.
+        // The title reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
         assert_eq!(unsafe { *(at as *const u64) }, 5);
+        // A list writes the value at that address: the events waiting for
+        // it are set where such a write may have landed.
+        assert_eq!(wait(f, 8, event), S_OK);
+        wake_reached();
+        // SAFETY: as above.
+        assert_ne!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        // SAFETY: the fence's value.
+        unsafe { (at as *mut u64).write(8) };
+        wake_reached();
+        // SAFETY: as above.
+        assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        // Once: the waiter is gone.
+        wake_reached();
+        // SAFETY: as above.
+        assert_ne!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        // A fence released with a waiter is not looked at again.
+        assert_eq!(wait(f, 20, event), S_OK);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+        wake_reached();
     }
 
     #[test]
@@ -251,4 +288,5 @@ mod tests {
         assert_eq!(slot::<Release>(queried, 0x10)(queried), 1);
         assert_eq!(slot::<Release>(f, 0x10)(f), 0);
     }
+
 }

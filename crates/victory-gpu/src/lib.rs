@@ -16,8 +16,6 @@
 //! libraries recording into title lists. Planned:
 //! `present` (swap chain).
 
-#[cfg(windows)]
-mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -32,18 +30,17 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
-mod hold;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod inplace;
 pub mod list;
 #[cfg(windows)]
 mod memory;
 pub mod object;
 pub mod pipeline;
-#[cfg(windows)]
-mod placement;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
@@ -57,22 +54,23 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+mod live;
 mod switch;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
-mod twin;
-#[cfg(windows)]
 mod watch;
 
-#[cfg(all(windows, feature = "diagnostics"))]
-pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
-    writing as kernel_will_write,
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    with_kernel_write, writing as kernel_will_write,
 };
+#[cfg(all(windows, feature = "test-support"))]
+pub use watch::title_memory_guard;

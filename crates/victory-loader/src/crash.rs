@@ -473,7 +473,7 @@ fn gpr(context: &mut CONTEXT, n: u8) -> &mut u64 {
 }
 
 /// The status flags `cmp a, b` leaves (CF, PF, AF, ZF, SF, OF) as `EFLAGS` bits.
-fn cmp_flags(a: u64, b: u64) -> u32 {
+pub(super) fn cmp_flags(a: u64, b: u64) -> u32 {
     let r = a.wrapping_sub(b);
     u32::from(a < b)
         | u32::from((r as u8).count_ones().is_multiple_of(2)) << 2
@@ -482,7 +482,7 @@ fn cmp_flags(a: u64, b: u64) -> u32 {
         | ((r >> 63) as u32) << 7
         | ((((a ^ b) & (a ^ r)) >> 63) as u32) << 11
 }
-const CMP_FLAGS: u32 = 0x8d5;
+pub(super) const CMP_FLAGS: u32 = 0x8d5;
 
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
 /// the saved XMM registers; returns the instruction's length.
@@ -530,6 +530,15 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+    // an instruction of the console's CPU this one lacks: emulated, the title goes on
+    // SAFETY: the system passes valid exception pointers.
+    if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION {
+        // SAFETY: the faulting thread's context, for the exception being dispatched.
+        let r = unsafe { crate::console_insn::emulate(&mut *(*info).ContextRecord) };
+        if r != 0 {
+            return r;
+        }
+    }
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
@@ -1194,6 +1203,37 @@ mod tests {
             for b in values {
                 assert_eq!(cmp_flags(a, b), native_compare(a, b), "cmp {a:#x}, {b:#x}");
             }
+        }
+    }
+
+    #[test]
+    fn decoded_clzero_loop_leaves_the_state_of_its_last_pass() {
+        #[repr(align(64))]
+        struct Lines([u8; 192]);
+        let code: [u8; 16] = [
+            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4, 0xcc, 0xcc,
+            0xcc, 0xcc,
+        ];
+        let cases = [(0, 100, 128, 128), (5, 100, 133, 128), (64, 64, 128, 64)];
+        for (start, limit, end, cleared) in cases {
+            let mut mem = Lines([0xff; 192]);
+            let base = mem.0.as_mut_ptr() as u64;
+            // SAFETY: an all-zero context is valid.
+            let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+            context.Rip = code.as_ptr() as u64;
+            context.Rax = base + start;
+            context.R10 = base + limit;
+            context.EFlags = 0x202 | CMP_FLAGS;
+            // SAFETY: the saved instruction and all written bytes are in live arrays.
+            assert_eq!(unsafe { crate::console_insn::emulate(&mut context) }, -1);
+            assert_eq!(context.Rip, code.as_ptr() as u64 + 12);
+            assert_eq!(context.Rax, base + end);
+            assert_eq!(context.EFlags, 0x202 | native_compare(base + end, base + limit));
+            let first = start as usize & !63;
+            let last = first + cleared;
+            assert!(mem.0[..first].iter().all(|&byte| byte == 0xff));
+            assert!(mem.0[first..last].iter().all(|&byte| byte == 0));
+            assert!(mem.0[last..].iter().all(|&byte| byte == 0xff));
         }
     }
 

@@ -98,9 +98,11 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         // the loader maps the copy away from its preferred base (Wine always
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
         // from there. Make that entry a no-op.
-        let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
+        let field_rva = tls
+            .directory_rva
+            .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32);
         for (entry, target) in dir64_relocations(&bytes, &info) {
-            if target == field_rva {
+            if Some(target) == field_rva {
                 write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
             }
         }
@@ -147,8 +149,11 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
                 break;
             };
             let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+            // A target past the end of the address space names nothing.
+            if e >> 12 == DIR64
+                && let Some(target) = page.checked_add(u32::from(e & 0xFFF))
+            {
+                out.push((entry, target));
             }
         }
         at += block;

@@ -136,11 +136,6 @@ enum Console {
     SeriesS,
 }
 
-/// Diagnostics: the heap bytes Rust code holds, for the statistics.
-#[cfg(all(windows, feature = "diagnostics"))]
-#[global_allocator]
-static ALLOC: victory_gpu::CountingAlloc = victory_gpu::CountingAlloc;
-
 fn main() -> Result<()> {
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
@@ -169,19 +164,25 @@ fn main() -> Result<()> {
         } => shader::run(paths, verbose || disasm, disasm, effects),
         Command::Translate {
             paths,
-            jobs,
-            pipelines,
-            cache: true,
-            ..
-        } => translate::warm(paths, jobs, pipelines),
-        Command::Translate {
-            paths,
             validate,
             pipelines,
             list,
             jobs,
-            cache: false,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+            cache,
+        } => {
+            // Translate with the same view limit as a host with a capped heap.
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+            {
+                victory_shader::emit::set_view_heap_limit(n);
+            }
+            if cache {
+                translate::warm(paths, jobs, pipelines)
+            } else {
+                translate::run(paths, validate, pipelines, list, jobs)
+            }
+        }
         Command::Run {
             exe,
             unimplemented,

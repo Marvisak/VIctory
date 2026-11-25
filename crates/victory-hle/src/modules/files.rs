@@ -523,10 +523,13 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 
 // Kernel reads into title memory. The GPU side leaves blocks of title GPU
 // buffers read-only to see the title's next write, and the kernel's writes
-// fail there instead of faulting into its handler; Grand Theft Auto VI's
+// fail there instead of faulting into its handler; the title's
 // synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
-// destinations and retry a failed `ReadFile` forever. So the destination
-// is opened first.
+// destinations and retry a failed `ReadFile` forever. Opening the
+// destination before the read is not enough: a refresh on another thread
+// can guard its pages again (through another view of them) while the
+// kernel waits for the bytes. So it stays writable until the read returns
+// (`victory_gpu::with_kernel_write`).
 
 pub extern "system" fn ReadFile(
     file: *mut c_void,
@@ -535,18 +538,89 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    let _writing = victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
-        file, buffer, len, read, overlapped,
-    )
+    use windows_sys::Win32::Foundation::ERROR_IO_PENDING;
+    let (done, error) = victory_gpu::with_kernel_write(buffer as usize, len as usize, || {
+        let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+            file, buffer, len, read, overlapped,
+        );
+        (done, last_error())
+    });
+    if !overlapped.is_null() {
+        overlapped_read(buffer, len, done == 0 && error == ERROR_IO_PENDING);
+    }
+    // The title asks for it next (`ERROR_IO_PENDING` for a read under way).
+    // Reopening the destination and a log line can change the thread's:
+    // Rust's stderr asks the console about a redirected handle, which fails.
+    set_last_error(error);
+    done
+}
+
+/// With an `OVERLAPPED`, a read of a handle opened for asynchronous I/O
+/// can still be under way when `ReadFile` returns, and its destination is
+/// kept writable only until then. If a refresh guards it again before the
+/// bytes land, a cached read fails with `ERROR_INVALID_USER_BUFFER`, and an
+/// unbuffered one lands without a fault, which leaves the GPU side's copy
+/// stale. No such read of the title's is known; the first overlapped read
+/// of any bytes into a title view is logged, and the first one still under
+/// way.
+fn overlapped_read(buffer: *mut u8, len: u32, pending: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    static LOGGED: [AtomicBool; 2] = [const { AtomicBool::new(false) }; 2];
+    let logged = &LOGGED[usize::from(pending)];
+    if len != 0 && !logged.load(Relaxed) && in_view(buffer) && !logged.swap(true, Relaxed) {
+        if pending {
+            tracing::warn!(
+                ?buffer,
+                len,
+                "ReadFile into a title view still under way when it returns: if a refresh guards the destination first, the read fails or lands unseen"
+            );
+        } else {
+            tracing::info!(
+                ?buffer,
+                len,
+                "ReadFile with an OVERLAPPED into a title view, done in the call"
+            );
+        }
+    }
+}
+
+/// Whether `at` is in a view of a section, as the title's views of
+/// physical pages are (`xmem`): the memory the GPU side guards.
+fn in_view(at: *const u8) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+    n != 0 && info.Type == MEM_MAPPED
+}
+
+fn last_error() -> u32 {
+    // SAFETY: reads the thread's last error.
+    unsafe { windows_sys::Win32::Foundation::GetLastError() }
+}
+
+fn set_last_error(error: u32) {
+    // SAFETY: sets the thread's last error.
+    unsafe { windows_sys::Win32::Foundation::SetLastError(error) }
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    let _writing = victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
-        buffer, size, count, stream,
-    )
+    // The length is the title's (`size` times `count`, saturated).
+    victory_gpu::with_kernel_write(buffer as usize, size.saturating_mul(count), || {
+        host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
+            buffer, size, count, stream,
+        )
+    })
+}
+
+/// The CRT's descriptor reads (libHttpClient's) go straight into the
+/// caller's buffer.
+pub extern "C" fn _read(fd: i32, buffer: *mut u8, count: u32) -> i32 {
+    victory_gpu::with_kernel_write(buffer as usize, count as usize, || {
+        host!("ucrtbase.dll", "_read": extern "C" fn(i32, *mut u8, u32) -> i32)(fd, buffer, count)
+    })
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
@@ -696,6 +770,7 @@ pub(crate) fn module() -> HleModule {
         exports: vec![
             hle_export!(ReadFile),
             hle_export!(fread),
+            hle_export!(_read),
             hle_export!(CreateFileW),
             hle_export!(CreateFileA),
             hle_export!(CreateFile2),
@@ -754,8 +829,345 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let (mut out, mut n) = ([0u8; 10], 0);
         let handle = file.as_raw_handle().cast();
-        assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
+        assert_ne!(
+            ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()),
+            0
+        );
         assert_eq!((&out, n), (b"0123456789", 10));
+    }
+
+    /// The GPU side's guarded unit.
+    const BLOCK: usize = 64 << 10;
+
+    /// A pagefile section of two blocks mapped twice, as the runtime maps
+    /// physical pages at two addresses, both told to the GPU side as title
+    /// views; forgotten and unmapped when dropped.
+    struct Views {
+        section: Handle,
+        at: [usize; 2],
+    }
+
+    impl Views {
+        fn new() -> Views {
+            use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            use windows_sys::Win32::System::Memory::{
+                CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
+            };
+            // SAFETY: a fresh pagefile section, mapped twice; `drop` unmaps
+            // the views and closes it.
+            let views = unsafe {
+                let section = CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE,
+                    0,
+                    (2 * BLOCK) as u32,
+                    std::ptr::null(),
+                );
+                assert!(!section.is_null());
+                let map = || MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+                Views {
+                    section,
+                    at: [map(), map()],
+                }
+            };
+            for at in views.at {
+                assert_ne!(at, 0);
+                victory_gpu::title_memory_view(at, 2 * BLOCK, views.section as usize, 0);
+            }
+            views
+        }
+    }
+
+    impl Drop for Views {
+        fn drop(&mut self) {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+            for at in self.at {
+                victory_gpu::title_memory_remapped(at, 2 * BLOCK);
+                // SAFETY: a view mapped by `new`.
+                unsafe {
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: at as *mut _,
+                    })
+                };
+            }
+            // SAFETY: the section `new` made.
+            unsafe { CloseHandle(self.section) };
+        }
+    }
+
+    /// Whether `at` is committed read-write memory now.
+    fn writable(at: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+        };
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+    }
+
+    /// What arrives through the pipe in the tests below.
+    const SENT: &[u8; 14] = b"sent by a pipe";
+    const LEN: u32 = SENT.len() as u32;
+
+    /// Runs `read` on another thread into [`LEN`] bytes of a guarded title
+    /// view that lie in two blocks (their address given), waiting on the
+    /// other end of `pipe`. Once the
+    /// read has opened them, a refresh on this thread guards their pages
+    /// again through the other view of them, as the GPU side's refreshes
+    /// do at any time, and only then does [`SENT`] arrive. The read must
+    /// succeed, by `succeeded`, with the bytes landed and counted written,
+    /// and the next refresh must find the destination guarded again.
+    fn read_across_a_refresh<T: std::fmt::Debug + Send + 'static>(
+        mut pipe: std::io::PipeWriter,
+        read: impl FnOnce(usize) -> T + Send + 'static,
+        succeeded: impl FnOnce(&T) -> bool,
+    ) {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+        let views = Views::new();
+        let [view, other] = views.at;
+        let into = view + BLOCK - 8;
+        assert!(victory_gpu::title_memory_guard(view, 2 * BLOCK).is_some());
+        assert!(!writable(into), "the destination starts guarded");
+        let reading = std::thread::spawn(move || read(into));
+        // The read opens its destination, then waits in the kernel. One
+        // that never opens it fails below.
+        let asked = Instant::now();
+        while !writable(into) && asked.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(victory_gpu::title_memory_guard(other, 2 * BLOCK).is_some());
+        assert!(!writable(other), "the refresh guarded the pages again");
+        // A read that failed at once has closed its end already.
+        let sent = pipe.write_all(SENT);
+        let result = reading.join().unwrap();
+        assert!(succeeded(&result), "the read failed: {result:?}");
+        sent.unwrap();
+        // SAFETY: bytes of our view.
+        let landed = unsafe { std::slice::from_raw_parts(into as *const u8, SENT.len()) };
+        assert_eq!(landed, SENT);
+        // The next refresh copies them.
+        assert_eq!(
+            victory_gpu::title_memory_guard(view, 2 * BLOCK),
+            Some(vec![view / BLOCK, view / BLOCK + 1])
+        );
+        let last = into + SENT.len() - 1;
+        assert!(
+            !writable(into) && !writable(last),
+            "the read no longer holds them open"
+        );
+    }
+
+    /// The title's synchronous reads land in guarded views while refreshes
+    /// on other threads guard the same pages (`(result, read, last error)`).
+    #[test]
+    fn reads_into_title_views_survive_a_refresh_meanwhile() {
+        use std::os::windows::io::AsRawHandle;
+        let (reader, writer) = std::io::pipe().unwrap();
+        read_across_a_refresh(
+            writer,
+            move |into| {
+                let mut n = 0;
+                let done = ReadFile(
+                    reader.as_raw_handle(),
+                    into as *mut u8,
+                    LEN,
+                    &mut n,
+                    std::ptr::null_mut(),
+                );
+                (done, n, last_error())
+            },
+            |&(done, n, _)| (done, n) == (1, LEN),
+        );
+    }
+
+    /// An `OVERLAPPED` (for the offset) on a handle opened for synchronous
+    /// I/O: the read is done when `ReadFile` returns, like one without.
+    #[test]
+    fn overlapped_reads_done_in_the_call_survive_a_refresh_meanwhile() {
+        use std::os::windows::io::AsRawHandle;
+        let (reader, writer) = std::io::pipe().unwrap();
+        read_across_a_refresh(
+            writer,
+            move |into| {
+                // `OVERLAPPED`: two status words, the offset, the event.
+                let mut overlapped = [0usize; 4];
+                let mut n = 0;
+                let done = ReadFile(
+                    reader.as_raw_handle(),
+                    into as *mut u8,
+                    LEN,
+                    &mut n,
+                    overlapped.as_mut_ptr().cast(),
+                );
+                (done, n, last_error())
+            },
+            |&(done, n, _)| (done, n) == (1, LEN),
+        );
+    }
+
+    /// The CRT's own handle over the pipe's read end, which it then owns.
+    fn crt_descriptor(reader: std::io::PipeReader) -> i32 {
+        use std::os::windows::io::IntoRawHandle;
+        const O_BINARY: i32 = 0x8000;
+        let handle = reader.into_raw_handle() as isize;
+        let fd = host!("ucrtbase.dll", "_open_osfhandle": extern "C" fn(isize, i32) -> i32)(
+            handle, O_BINARY,
+        );
+        assert!(fd >= 0);
+        fd
+    }
+
+    /// An unbuffered stream reads straight into the caller's buffer.
+    #[test]
+    fn freads_into_title_views_survive_a_refresh_meanwhile() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let fd = crt_descriptor(reader);
+        read_across_a_refresh(
+            writer,
+            move |into| {
+                const IONBF: i32 = 4;
+                let stream = host!("ucrtbase.dll", "_fdopen": extern "C" fn(i32, *const c_char) -> File)(
+                    fd,
+                    c"rb".as_ptr(),
+                );
+                assert!(!stream.is_null());
+                let setvbuf = host!("ucrtbase.dll", "setvbuf": extern "C" fn(File, *mut c_char, i32, usize) -> i32);
+                assert_eq!(setvbuf(stream, std::ptr::null_mut(), IONBF, 0), 0);
+                // Seven items of two bytes: neither number alone reaches the second block.
+                let n = (fread(into as *mut u8, 2, 7, stream), last_error());
+                host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(stream);
+                n
+            },
+            |&(n, _)| n == 7,
+        );
+    }
+
+    /// libHttpClient reads through the CRT's descriptors.
+    #[test]
+    fn descriptor_reads_into_title_views_survive_a_refresh_meanwhile() {
+        let ours = _read as *const () as usize;
+        let import = crate::registry::lookup("api-ms-win-crt-stdio-l1-1-0.dll", "_read");
+        assert_eq!(import, Some(ours), "the title's import is bound here");
+        let (reader, writer) = std::io::pipe().unwrap();
+        let fd = crt_descriptor(reader);
+        read_across_a_refresh(
+            writer,
+            move |into| {
+                let n = (_read(fd, into as *mut u8, LEN), last_error());
+                host!("ucrtbase.dll", "_close": extern "C" fn(i32) -> i32)(fd);
+                n
+            },
+            |&(n, _)| n == LEN as i32,
+        );
+    }
+
+    /// A read of a handle opened for asynchronous I/O is still under way
+    /// when `ReadFile` returns. The first into a title view is warned of,
+    /// once, and the title still finds `ERROR_IO_PENDING` as the last
+    /// error, though the log's writer changes it, as Rust's stderr does
+    /// when redirected.
+    #[test]
+    fn reads_still_under_way_are_warned_of_once_and_keep_their_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        use windows_sys::Win32::Foundation::{ERROR_INVALID_HANDLE, ERROR_IO_PENDING};
+        /// Counts warnings; every line it writes changes the last error.
+        struct Redirected;
+        static WARNINGS: AtomicUsize = AtomicUsize::new(0);
+        impl tracing::Subscriber for Redirected {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    WARNINGS.fetch_add(1, Relaxed);
+                }
+                set_last_error(ERROR_INVALID_HANDLE);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        const PIPE_ACCESS_INBOUND: u32 = 1;
+        const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const OPEN_EXISTING: u32 = 3;
+        let null = std::ptr::null_mut();
+        let name = w(&format!(
+            r"\\.\pipe\victory-files-test-{}",
+            std::process::id()
+        ));
+        let server = host!("kernel32.dll", "CreateNamedPipeW": extern "system" fn(*const u16, u32, u32, u32, u32, u32, u32, *const c_void) -> Handle)(
+            name.as_ptr(),
+            PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
+            0,
+            1,
+            0,
+            4096,
+            0,
+            null,
+        );
+        assert_ne!(server as isize, -1);
+        let client = host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+            name.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            null,
+            OPEN_EXISTING,
+            0,
+            null,
+        );
+        assert_ne!(client as isize, -1);
+        let event = host!("kernel32.dll", "CreateEventW": extern "system" fn(*const c_void, i32, i32, *const u16) -> Handle)(
+            null,
+            1,
+            0,
+            std::ptr::null(),
+        );
+        assert!(!event.is_null());
+        let write = host!("kernel32.dll", "WriteFile": extern "system" fn(Handle, *const u8, u32, *mut u32, *mut c_void) -> i32);
+        let wait =
+            host!("kernel32.dll", "WaitForSingleObject": extern "system" fn(Handle, u32) -> u32);
+        let views = Views::new();
+        tracing::subscriber::with_default(Redirected, || {
+            // A read of no bytes has nothing to land and is not the one warned of.
+            overlapped_read(views.at[0] as *mut u8, 0, true);
+            assert_eq!(WARNINGS.load(Relaxed), 0);
+            for k in 0..2 {
+                let into = views.at[0] + 100 + k * SENT.len();
+                // `OVERLAPPED`: two status words, the offset, the event.
+                let mut overlapped = [0, 0, 0, event as usize];
+                let done = ReadFile(
+                    server,
+                    into as *mut u8,
+                    LEN,
+                    null.cast(),
+                    overlapped.as_mut_ptr().cast(),
+                );
+                assert_eq!((done, last_error()), (0, ERROR_IO_PENDING));
+                let mut n = 0;
+                assert_ne!(write(client, SENT.as_ptr(), LEN, &mut n, null), 0);
+                assert_eq!(wait(event, 5000), 0);
+                assert_eq!(overlapped[..2], [0, SENT.len()], "status and bytes read");
+                // SAFETY: bytes of our view.
+                let landed = unsafe { std::slice::from_raw_parts(into as *const u8, SENT.len()) };
+                assert_eq!(landed, SENT);
+            }
+        });
+        assert_eq!(WARNINGS.load(Relaxed), 1);
+        let close = host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32);
+        for handle in [client, server, event] {
+            close(handle);
+        }
     }
 
     fn text(v: &[u16]) -> String {

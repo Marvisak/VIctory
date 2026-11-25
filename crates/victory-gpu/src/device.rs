@@ -6,7 +6,10 @@
 //! write next.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::cell::Cell;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::object::{
     self, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HRESULT, Iid, Object, S_FALSE, S_OK, Table, This,
@@ -29,7 +32,7 @@ pub static IID: Iid = guid(
 );
 
 /// The levels the device answers to, as on PC: `ID3D12Device1` to
-/// `ID3D12Device8`, and `ID3D12Device11`, which Grand Theft Auto VI creates
+/// `ID3D12Device8`, and `ID3D12Device11`, which the title creates
 /// its device as. Each level's table is the one before plus its methods.
 const LEVEL_IIDS: [Iid; 9] = [
     guid(
@@ -94,7 +97,7 @@ pub(crate) fn is_device(iid: *const Iid) -> bool {
 }
 
 /// The interface version these layouts were checked against (2.4). Both
-/// Minecraft (March 2022) and Grand Theft Auto VI (April 2026) pass it.
+/// Minecraft (March 2022) and the title (April 2026) pass it.
 pub const CHECKED_VERSION: u32 = 0x0002_0004;
 
 /// Feature level 12_2, what the console hardware supports.
@@ -160,7 +163,7 @@ pub extern "system" fn create(
 /// queues then have the newer layouts (two more methods each; see
 /// `list` and `queue`), although the interface version stays 2.4.
 /// shortcut: the creation interface is the only sign of the newer layouts
-/// we have (Grand Theft Auto VI, April 2026, versus Minecraft, March 2022);
+/// we have (the title, April 2026, versus Minecraft, March 2022);
 /// look for a better one if a title breaks the rule.
 static NEWER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -373,13 +376,350 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// The host device's state: the console's device is removed when the host's is.
+/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
+/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
+/// id, out)` and asks for `ID3D12PipelineState`. What the logged calls'
+/// descriptions held (run of 2026-11-25):
+///
+/// * word 0 is one of our root signatures ([`crate::root`]);
+/// * then (address, length) pairs into title memory. 0x218 passes 12-word
+///   elements of an array (words 12-15 of one call were words 0-3 of the
+///   next): a 0x1c-byte blob shared by neighbouring elements, a 0x14-byte
+///   one ending where the metadata starts, the code, the metadata, two
+///   addresses and a 64-bit value like a hash. 0x1c8 passes two blobs
+///   (0x184, 0x18c or 0x200 bytes, then 0x50 to 0xbc), then groups of four
+///   words (code, length, metadata, length), zero for an absent group;
+///   neighbouring calls can share groups. How many groups there are, and
+///   which stage each is, were not known (that run logged 16 words; this
+///   build logs 40, [`unknown_dump`]);
+/// * code lies on 256-byte boundaries, in lengths of 64-byte units, as
+///   GFX10 programs would (not checked in that run, which logged no code
+///   bytes; this build logs the first 64 bytes of each blob and a hash).
+///   Metadata are 0x18 (0x218) or 0x10 (0x1c8) bytes plus 32-byte units:
+///   not the layout of the `FSSM` records of a container
+///   ([`victory_shader::native`]), whose 20-byte tables would not keep
+///   every length on one 32-byte step.
+///
+/// With one stage per description, 0x218 is likely the compute form and
+/// 0x1c8 the graphics one. The calls fail as they always did, with `out`
+/// null, and the title goes on without the object; whether it then makes
+/// the same pipeline through the standard methods is counted
+/// ([`standard_pipeline`]). Calls 1-4 and each power of two log the
+/// description's first 16 words and the 16 words its first word points at;
+/// the first calls of each layout log every blob it points at
+/// (`unknown_dump`), and every 1024th call the count.
+/// shortcut: not implemented. Answering `S_OK` here without making the
+/// pipeline would hand the title whatever its stack held as an object.
+extern "system" fn unknown_pipeline<const SLOT: usize>(
+    _: This,
+    desc: *const u8,
+    _iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    let calls = UNKNOWN_CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    if !out.is_null() {
+        // SAFETY: the title's out pointer (a local of its own).
+        unsafe { *out = std::ptr::null() };
+    }
+    #[cfg(windows)]
+    unknown_dump::dump::<SLOT>(desc, calls);
+    if calls.is_multiple_of(1024) {
+        tracing::info!(
+            slot = format_args!("{:#x}", SLOT),
+            calls,
+            "a pipeline creation method that is not implemented: calls so far"
+        );
+    }
+    if calls <= 4 || calls.is_power_of_two() {
+        // Sixteen 64-bit words at `at`: neither pointer is known to be mapped,
+        // and a guard page is not read ([`unknown_dump::plain`]).
+        #[cfg(windows)]
+        let words = |at: usize| -> Option<Vec<u64>> {
+            let mut bytes = [0u8; 128];
+            (at != 0 && unknown_dump::plain(at as u64, bytes.len()) && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
+                bytes
+                    .as_chunks::<8>().0.iter()
+                    .map(|c| c.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
+                    .collect()
+            })
+        };
+        #[cfg(not(windows))]
+        let words = |_: usize| None::<Vec<u64>>;
+        let description = words(desc as usize);
+        let first = description
+            .as_ref()
+            .and_then(|w| words(w[0] as usize));
+        tracing::warn!(
+            slot = format_args!("{:#x}", SLOT),
+            calls,
+            description = format_args!("{description:x?}"),
+            first_points_at = format_args!("{first:x?}"),
+            "a pipeline creation method that is not implemented: the title goes without this pipeline"
+        );
+    }
+    LAST_UNKNOWN.with(|l| l.set(Some((SLOT, Instant::now()))));
+    E_NOTIMPL
+}
+
+/// Calls to the unknown pipeline methods ([`unknown_pipeline`]): 0x1c8, 0x218.
+static UNKNOWN_CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+
+thread_local! {
+    /// This thread's last unknown pipeline call not yet followed by a
+    /// pipeline made through a standard method: its slot and when.
+    static LAST_UNKNOWN: Cell<Option<(usize, Instant)>> = const { Cell::new(None) };
+}
+
+/// A title pipeline made through standard method `method` (0x50, 0x58,
+/// 0x1f0, 0x2b0), the title having called at `asked`: counted; and counted
+/// apart, by how soon (under 20 µs, 200 µs, 2 ms, later), when this
+/// thread's last unknown pipeline call came before it: a title that falls
+/// back to the standard methods shows about one per failed call, soon
+/// after it. Called once the method made the pipeline, so calls that fail
+/// count nothing and leave the last unknown call for the next.
+pub(crate) fn standard_pipeline(method: usize, asked: Instant) {
+    const SOON: [Duration; 3] = [Duration::from_micros(20), Duration::from_micros(200), Duration::from_millis(2)];
+    static MADE: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+    /// method * 8 + slot (0 0x1c8, 1 0x218) * 4 + how soon
+    static AFTER: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];
+    /// Per method, how many of its pipelines came after an unknown call.
+    static AFTER_ANY: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+    let Some(m) = [0x50, 0x58, 0x1f0, 0x2b0].iter().position(|&x| x == method) else {
+        return;
+    };
+    let made = MADE[m].fetch_add(1, Ordering::Relaxed) + 1;
+    let mut after_any = 0;
+    if let Some((slot, at)) = LAST_UNKNOWN.with(Cell::take) {
+        let soon = SOON.iter().position(|&l| asked.saturating_duration_since(at) < l).unwrap_or(3);
+        AFTER[m * 8 + usize::from(slot == 0x218) * 4 + soon].fetch_add(1, Ordering::Relaxed);
+        after_any = AFTER_ANY[m].fetch_add(1, Ordering::Relaxed) + 1;
+    }
+    // (also the first pipelines, and each power of two of those after an
+    // unknown call: a method that makes few still says whether it follows one)
+    if made <= 4 || made.is_power_of_two() && made >= 16 || made.is_multiple_of(4096) || after_any.is_power_of_two() {
+        let after = |s: usize| (0..4).map(|k| AFTER[m * 8 + s * 4 + k].load(Ordering::Relaxed)).collect::<Vec<_>>();
+        tracing::info!(
+            method = format_args!("{method:#x}"),
+            made,
+            after_0x1c8 = ?after(0),
+            after_0x218 = ?after(1),
+            calls_0x1c8 = UNKNOWN_CALLS[0].load(Ordering::Relaxed),
+            calls_0x218 = UNKNOWN_CALLS[1].load(Ordering::Relaxed),
+            "pipelines made through a standard method so far; of them right after a failed unknown pipeline call on the same thread (under 20 µs, 200 µs, 2 ms, later)"
+        );
+    }
+}
+
+/// What [`unknown_pipeline`]'s descriptions point at, byte by byte: for the
+/// first 4 calls of each slot and the first 2 of each layout, every blob as
+/// little-endian dwords (512 bytes of state and metadata, 64 of code) and a
+/// hash of all of it. At most `MOST` calls per slot, among its first
+/// `LOOKED`; release builds log it.
+#[cfg(windows)]
+mod unknown_dump {
+    use std::collections::HashMap;
+    use std::fmt::Write as _;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+    /// A 0x218 element is 12 words (the next one follows); 0x1c8 has a root,
+    /// two blobs and four-word stage groups, how many is not known.
+    const WORDS: usize = 40;
+    const SHOWN: usize = 512;
+    const SHOWN_CODE: usize = 64;
+    const SHOWN_POINTED: usize = 64;
+    /// Longest blob read whole (longest seen: code of 0x1f9c0 bytes).
+    const LONGEST: u64 = 4 << 20;
+    const MOST: u32 = 48;
+    /// Calls looked at per slot: past them a call costs nothing here, even
+    /// when the title has fewer layouts than `MOST` dumps would take.
+    const LOOKED: u32 = 256;
+    /// Graphics groups a short read (`MIN_BYTES`) covers in full; the layout
+    /// key names only these, so the length read does not change it.
+    const KEY_GROUPS: u32 = 2;
+
+    static DUMPED: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    /// Calls seen per slot and layout.
+    type Layouts = Mutex<Option<HashMap<(usize, [u64; 3]), u32>>>;
+    static LAYOUTS: Layouts = Mutex::new(None);
+
+    /// Whether `[at, at + len)` is committed memory that can be read and has
+    /// no guard page. What the dump reads is guessed, and the in-process copy
+    /// (`crate::host::read_into`) takes a guard page's one-shot exception,
+    /// which disarms the title's guard (a stack that can then not grow).
+    pub(super) fn plain(at: u64, len: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+        };
+        let end = at.saturating_add(len as u64);
+        let mut p = at;
+        while p < end {
+            // SAFETY: a query of an address into a local structure.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
+            let got = unsafe { VirtualQuery(p as usize as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+            if got == 0 || info.State != MEM_COMMIT || info.Protect == 0 || info.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0 {
+                return false;
+            }
+            p = (info.BaseAddress as u64).saturating_add(info.RegionSize as u64);
+        }
+        true
+    }
+
+    fn read(at: u64, len: u64, most: usize) -> Option<Vec<u8>> {
+        if at == 0 || len == 0 || len > LONGEST {
+            return None;
+        }
+        let mut bytes = vec![0; (len as usize).min(most)];
+        (plain(at, bytes.len()) && crate::host::read_into(at as usize as *const u8, &mut bytes)).then_some(bytes)
+    }
+
+    #[test]
+    fn a_guessed_read_leaves_a_guard_page_armed() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree, VirtualQuery,
+        };
+        // SAFETY: fresh pages of our own, freed below.
+        let (guarded, open) = unsafe {
+            (
+                VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE | PAGE_GUARD),
+                VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE),
+            )
+        };
+        assert!(!guarded.is_null() && !open.is_null());
+        assert!(read(guarded as u64, 64, 64).is_none(), "a guard page is not read");
+        // SAFETY: a structure of integers and pointers, valid all zero.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query into a local structure.
+        unsafe { VirtualQuery(guarded, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        assert_ne!(info.Protect & PAGE_GUARD, 0, "the title's guard is still armed");
+        assert_eq!(read(open as u64, 64, 64).map(|b| b.len()), Some(64), "plain memory is read");
+        // SAFETY: the pages allocated above.
+        unsafe {
+            VirtualFree(guarded, 0, MEM_RELEASE);
+            VirtualFree(open, 0, MEM_RELEASE);
+        }
+    }
+
+    fn dwords(bytes: &[u8]) -> String {
+        let mut s = String::with_capacity(bytes.len() / 4 * 9);
+        for (i, c) in bytes.chunks(4).enumerate() {
+            let mut w = [0; 4];
+            w[..c.len()].copy_from_slice(c);
+            let _ = write!(s, "{}{:08x}", if i == 0 { "" } else { " " }, u32::from_le_bytes(w));
+        }
+        s
+    }
+
+    /// Four words at `at`: an absent group (all zero), a present one (code on
+    /// a 256-byte boundary, length in 64-byte units, metadata, its length),
+    /// or neither (None: the groups end).
+    fn group(w: &[u64], at: usize) -> Option<bool> {
+        let g = w.get(at..at + 4)?;
+        if g.iter().all(|&v| v == 0) {
+            return Some(false);
+        }
+        let code = g[0] != 0 && g[0] % 0x100 == 0 && g[1] % 0x40 == 0 && (0x40..=LONGEST).contains(&g[1]);
+        (code && g[2] != 0 && (1..=LONGEST).contains(&g[3])).then_some(true)
+    }
+
+    pub(super) fn dump<const SLOT: usize>(desc: *const u8, calls: u32) {
+        let compute = SLOT == 0x218;
+        let dumped = &DUMPED[usize::from(compute)];
+        if desc.is_null() || calls > LOOKED || dumped.load(Relaxed) >= MOST {
+            return;
+        }
+        // A 0x218 element is 12 words; 0x1c8 has at least a root, two blobs
+        // and two groups (13 words), read as 16.
+        let min_words = if compute { 12 } else { 16 };
+        let mut bytes = [0u8; WORDS * 8];
+        let readable = |n: usize, bytes: &mut [u8]| plain(desc as u64, n * 8) && crate::host::read_into(desc, &mut bytes[..n * 8]);
+        let n = if readable(WORDS, &mut bytes) {
+            WORDS
+        } else if readable(min_words, &mut bytes) {
+            min_words
+        } else {
+            return;
+        };
+        let w: Vec<u64> = bytes[..n * 8].as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
+        let names = if compute { ["small 1", "small 2"] } else { ["state 1", "state 2"] };
+        let mut blobs: Vec<(String, usize)> = vec![(names[0].into(), 1), (names[1].into(), 3)];
+        let mut filled = 0u64;
+        let class = |v: u64| u64::from(v.checked_ilog2().unwrap_or(0));
+        let (end, sizes) = if compute {
+            blobs.push(("code".into(), 5));
+            blobs.push(("metadata".into(), 7));
+            (12, class(w[8]) << 8 | class(w[6]))
+        } else {
+            // (zeroed memory past the description reads as absent groups: the
+            // description ends with its last present group)
+            let (mut at, mut i, mut last) = (5, 0, 5);
+            while let Some(here) = group(&w, at) {
+                if here {
+                    filled |= 1 << i;
+                    blobs.push((format!("code {i}"), at));
+                    blobs.push((format!("metadata {i}"), at + 2));
+                    last = at + 4;
+                }
+                at += 4;
+                i += 1;
+            }
+            (last, filled & ((1 << KEY_GROUPS) - 1))
+        };
+        // (for graphics, not the end and only the first groups: memory past
+        // the description, or a short read, could make one layout look like two)
+        let layout = [w[2], w[4], if compute { sizes | (end as u64) << 32 } else { sizes }];
+        {
+            let mut layouts = LAYOUTS.lock().unwrap_or_else(|e| e.into_inner());
+            let seen = layouts.get_or_insert_with(HashMap::new).entry((SLOT, layout)).or_default();
+            *seen += 1;
+            if calls > 4 && *seen > 2 {
+                return;
+            }
+        }
+        if dumped.fetch_add(1, Relaxed) >= MOST {
+            return;
+        }
+        let slot = format!("{SLOT:#x}");
+        if compute {
+            tracing::warn!(slot = %slot, calls, words = end, description = format_args!("{:x?}", &w[..n]),
+                "a pipeline creation method that is not implemented: its description");
+        } else {
+            // (`words`: up to the last present group; `read`: how many were read)
+            tracing::warn!(slot = %slot, calls, words = end, read = n, groups = format_args!("{filled:#b}"),
+                description = format_args!("{:x?}", &w[..n]),
+                "a pipeline creation method that is not implemented: its description");
+        }
+        for (name, at) in &blobs {
+            let (to, len) = (w[*at], w[*at + 1]);
+            let most = if name.starts_with("code") { SHOWN_CODE } else { SHOWN };
+            let shown = read(to, len, most).map(|b| dwords(&b));
+            let hash = read(to, len, usize::MAX).map(|b| blake3::hash(&b).to_hex()[..16].to_owned());
+            tracing::warn!(slot = %slot, calls, blob = %name, at = format_args!("{to:#x}"),
+                len = format_args!("{len:#x}"), hash = hash.as_deref().unwrap_or("unreadable"),
+                bytes = shown.as_deref().unwrap_or("unreadable"),
+                "a pipeline creation method that is not implemented: a blob of its description");
+        }
+        if compute {
+            for at in [9, 10] {
+                if let Some(b) = read(w[at], SHOWN_POINTED as u64, SHOWN_POINTED) {
+                    let text: String = b.iter().map(|&c| if c.is_ascii_graphic() { c as char } else { '.' }).collect();
+                    tracing::warn!(slot = %slot, calls, word = at, bytes = %dwords(&b), text = %text,
+                        "a pipeline creation method that is not implemented: what a word of its description points at");
+                }
+            }
+        }
+    }
+}
+
+/// The console device uses the host device's removal state.
 extern "system" fn removed_reason(_: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
-        // SAFETY: a plain query.
-        if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
-            return e.code().0;
+        // SAFETY: a plain query on a live device.
+        if let Err(error) = unsafe { host.device.GetDeviceRemovedReason() } {
+            return error.code().0;
         }
     }
     S_OK
@@ -422,8 +762,10 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
+    f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
+    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
@@ -474,8 +816,15 @@ mod tests {
     }
 
     #[test]
+    fn a_healthy_device_reports_no_removal() {
+        let device = device();
+        let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
+        assert_eq!(reason(device), S_OK);
+    }
+
+    #[test]
     fn newer_device_levels_are_the_same_device() {
-        // ID3D12Device11, as Grand Theft Auto VI asks for it.
+        // ID3D12Device11, as the title asks for it.
         let (hr, device) = create_as(&LEVEL_IIDS[8]);
         assert_eq!((hr, device), (S_OK, super::device()));
         let mut same = std::ptr::null();
@@ -594,10 +943,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_healthy_device_reports_no_removal() {
-        let device = device();
-        let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
-        assert_eq!(reason(device), S_OK);
-    }
 }

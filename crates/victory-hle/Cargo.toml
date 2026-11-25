@@ -51,6 +51,8 @@ windows-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Reads into guarded title views (`modules::files`).
+victory-gpu = { workspace = true, features = ["test-support"] }
 
 [features]
 # Debugging switches (scripted keys and the like).

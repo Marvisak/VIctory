@@ -74,7 +74,8 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
-    // Mapped: the patched bytes (the exe's size, 114 MB) are not needed.
+    // The program is mapped from the copy `load` wrote. The patched bytes
+    // are no longer needed.
     drop(prepared);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
@@ -254,7 +255,7 @@ fn watch(base: usize, size: usize) {
     let rvas: Vec<usize> = list
         .split(',')
         .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
-        .filter(|&rva| rva + 4 <= size)
+        .filter(|&rva| rva.checked_add(4).is_some_and(|end| end <= size))
         .collect();
     std::thread::spawn(move || {
         let mut seen = vec![None; rvas.len()];
@@ -326,7 +327,7 @@ fn absent_title_dlls(
 }
 
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
-/// e.g. Grand Theft Auto VI's upscaler behind its FidelityFX loader.
+/// e.g. The title's upscaler behind its FidelityFX loader.
 #[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,
