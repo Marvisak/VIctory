@@ -592,6 +592,7 @@ fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
         0 => man * 2f32.powi(-24),
+        31 if man != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
     };
@@ -604,6 +605,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
     let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
     match exp {
         0 => m / (1 << man) as f32 * 2f32.powi(-14),
+        31 if m != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + m / (1 << man) as f32) * 2f32.powi(e as i32 - 15),
     }
@@ -618,10 +620,12 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
-    // Channel values as floats, then scaled.
-    type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
+    let half_at = move |b: &[u8], i| f64::from(half(u16_at(b, i)));
+    let float_at = move |b: &[u8], i| f64::from(f32::from_bits(u32_at(b, i)));
+    // Keep all 32-bit integers exact through the range calculation.
+    type Decode = Box<dyn Fn(&[u8]) -> [f64; 3]>;
     let (n, decode): (usize, Decode) = match format {
-        27..=32 => {
+        27..=30 => {
             // The PNG drops alpha: its range and how many texels have each
             // channel zero are logged.
             let (mut low, mut high, mut zero) = ([255u8; 4], [0u8; 4], [0usize; 4]);
@@ -650,64 +654,84 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         }
         23..=25 | 89 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
-            [(v & 0x3ff) as f32, (v >> 10 & 0x3ff) as f32, (v >> 20 & 0x3ff) as f32]
+            [v, v >> 10, v >> 20].map(|bits| {
+                let channel = (bits & 0x3ff) as f32;
+                f64::from(if format == 89 { (channel - 384.0) / 510.0 } else { channel })
+            })
         })),
         26 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
-            [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
+            [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)].map(f64::from)
         })),
-        9..=10 => (8, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))])),
-        11..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),
-        33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0])),
+        9..=10 => (8, Box::new(move |b| [0, 1, 2].map(|i| half_at(b, i)))),
+        11..=12 => (8, Box::new(move |b| [0, 1, 2].map(|i| f64::from(u16_at(b, i))))),
+        33..=34 => (4, Box::new(move |b| [half_at(b, 0), half_at(b, 1), 0.0])),
         1..=2 => (16, Box::new(move |b| {
-            [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
+            [0, 1, 2].map(|i| float_at(b, i))
         })),
-        15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
-        35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
-        48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
+        15..=16 => (8, Box::new(move |b| [float_at(b, 0), float_at(b, 1), 0.0])),
+        35..=36 => (4, Box::new(move |b| [f64::from(u16_at(b, 0)), f64::from(u16_at(b, 1)), 0.0])),
+        48..=50 => (2, Box::new(move |b| [f64::from(b[0]), f64::from(b[1]), 0.0])),
+        13 | 14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f64::from(u16_at(b, i) as i16)))),
+        37 | 38 => (4, Box::new(move |b| [f64::from(u16_at(b, 0) as i16), f64::from(u16_at(b, 1) as i16), 0.0])),
+        51 | 52 => (2, Box::new(|b| [f64::from(b[0] as i8), f64::from(b[1] as i8), 0.0])),
+        31 | 32 => (4, Box::new(|b| [0, 1, 2].map(|i| f64::from(b[i] as i8)))),
         // Single channels (and depth planes): shown as grey.
-        39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
-        19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
-        44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
-        53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
-        55..=59 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
-        60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
+        39..=41 => (4, Box::new(move |b| [float_at(b, 0); 3])),
+        42 => (4, Box::new(move |b| [f64::from(u32_at(b, 0)); 3])),
+        43 => (4, Box::new(move |b| [f64::from(u32_at(b, 0) as i32); 3])),
+        19..=22 => (8, Box::new(move |b| [float_at(b, 0); 3])),
+        44..=47 => (4, Box::new(move |b| [f64::from(u32_at(b, 0) & 0xff_ffff); 3])),
+        53..=54 => (2, Box::new(move |b| [half_at(b, 0); 3])),
+        55..=57 => (2, Box::new(move |b| [f64::from(u16_at(b, 0)); 3])),
+        60..=62 | 65 => (1, Box::new(move |b| [f64::from(b[0]); 3])),
+        58 | 59 => (2, Box::new(move |b| [f64::from(u16_at(b, 0) as i16); 3])),
+        63 | 64 => (1, Box::new(|b| [f64::from(b[0] as i8); 3])),
         _ => return None,
     };
-    let values: Vec<[f32; 3]> = (0..h)
-        .flat_map(|y| (0..w).map(move |x| (x, y)))
-        .map(|(x, y)| decode(px(x, y, n)))
-        .collect();
-    let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
-    let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
-    let (low, max) = if grey {
-        finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))
-    } else {
-        (0.0, finite.fold(0.0f32, f32::max))
+    let values = || {
+        let decode = &decode;
+        (0..h)
+            .flat_map(move |y| (0..w).map(move |x| (x, y)))
+            .map(move |(x, y)| decode(px(x, y, n)))
     };
-    // Colour scaled by the 99th percentile of the non-zero values, so a few
-    // hot pixels do not hide the rest; how many are not zero, and the median.
-    let mut set: Vec<f32> = values
-        .iter()
-        .flatten()
-        .copied()
-        .filter(|v| v.is_finite() && *v != 0.0)
-        .map(f32::abs)
-        .collect();
-    let nonzero = set.len() as f64 / (values.len() * 3).max(1) as f64;
-    let mut at = |q: f64| -> f32 {
+    let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
+    let (mut low, mut max) = if grey {
+        (f64::from(f32::MAX), f64::from(f32::MIN))
+    } else {
+        (0.0, 0.0)
+    };
+    // Keep only the percentile samples, not a second image-sized buffer
+    // of decoded f64 triples. Decode again when writing the final pixels.
+    let mut set = Vec::new();
+    let mut not_finite = 0;
+    for value in values().flatten() {
+        if !value.is_finite() {
+            not_finite += 1;
+            continue;
+        }
+        if grey {
+            low = low.min(value);
+        }
+        max = max.max(value);
+        if value != 0.0 {
+            set.push(value.abs());
+        }
+    }
+    let nonzero = set.len() as f64 / (w * h * 3).max(1) as f64;
+    let mut at = |q: f64| -> f64 {
         if set.is_empty() {
             return 0.0;
         }
         let k = ((set.len() - 1) as f64 * q).round() as usize;
-        *set.select_nth_unstable_by(k, f32::total_cmp).1
+        *set.select_nth_unstable_by(k, f64::total_cmp).1
     };
     let (p50, p99) = (at(0.5), at(0.99));
-    let not_finite = values.iter().flatten().filter(|v| !v.is_finite()).count();
+    drop(set);
     let high = if grey || p99 == 0.0 { max } else { p99 };
-    let range = (high - low).max(1e-20);
+    let range = high - low;
     tracing::info!(format, low, high = max, p50, p99, nonzero, not_finite, "target values");
-    for v in values {
+    for v in values() {
         let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
         out.extend([c[0], c[1], c[2], 255]);
     }
@@ -863,10 +887,68 @@ mod tests {
         // Red 0x8000 (a half-float -0), green 0x4000, blue 0.
         let unorm16 = [0x00, 0x80, 0x00, 0x40, 0, 0, 0xff, 0xff];
         assert_eq!(super::to_rgba(11, 1, 1, 8, &unorm16), Some(vec![255, 127, 0, 255]));
-        // Red 0x3ff, green 0x1ff, blue 0, alpha 3.
-        let xr = (0x3ffu32 | 0x1ff << 10 | 3 << 30).to_le_bytes();
+        // XR stores 1.0, 0.5 and 0.0 as 894, 639 and 384.
+        let xr = (894u32 | 639 << 10 | 384 << 20 | 3 << 30).to_le_bytes();
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+    #[test]
+    fn integer_targets_keep_their_numeric_order() {
+        let ramp = [0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255];
+        let uint: Vec<_> = [0u32, 1, 2].into_iter().flat_map(u32::to_le_bytes).collect();
+        assert_eq!(super::to_rgba(42, 3, 1, 12, &uint).unwrap(), ramp);
+        for format in [43, 58, 59, 63, 64] {
+            let n = match format { 43 => 4, 58 | 59 => 2, _ => 1 };
+            let bytes: Vec<_> = [-1i32, 0, 1].into_iter()
+                .flat_map(|v| v.to_le_bytes().into_iter().take(n)).collect();
+            assert_eq!(super::to_rgba(format, 3, 1, 3 * n, &bytes).unwrap(), ramp, "{format}");
+        }
+    }
+
+    #[test]
+    fn adjacent_large_32_bit_integers_keep_distinct_gray_levels() {
+        for (format, values) in [
+            (42, [16_777_216u32, 16_777_217]),
+            (42, [u32::MAX - 1, u32::MAX]),
+            (43, [(-16_777_217i32) as u32, (-16_777_216i32) as u32]),
+            (43, [i32::MIN as u32, (i32::MIN + 1) as u32]),
+        ] {
+            let bytes: Vec<_> = values.into_iter().flat_map(u32::to_le_bytes).collect();
+            assert_eq!(
+                super::to_rgba(format, 2, 1, 8, &bytes).unwrap(),
+                [0, 0, 0, 255, 255, 255, 255, 255],
+                "format {format}, values {values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn finite_float_ranges_span_the_full_grey_scale() {
+        for scale in [1e-30f32, f32::MAX] {
+            let bytes: Vec<_> = [-scale, 0.0, scale].into_iter().flat_map(f32::to_le_bytes).collect();
+            let rgba = super::to_rgba(41, 3, 1, 12, &bytes).unwrap();
+            assert_eq!([rgba[0], rgba[4], rgba[8]], [0, 127, 255]);
+        }
+    }
+
+    #[test]
+    fn packed_float_special_values_keep_their_class() {
+        assert!(super::half(0x7e00).is_nan());
+        assert!(super::half(0xfc00).is_infinite());
+        for mantissa_bits in [5, 6] {
+            let infinity = 31 << mantissa_bits;
+            assert!(super::small_float(infinity, mantissa_bits).is_infinite());
+            assert!(super::small_float(infinity | 1, mantissa_bits).is_nan());
+        }
+    }
+
+    #[test]
+    fn signed_colour_channels_do_not_wrap_to_white() {
+        for (format, n, channels) in [(13,2,4), (14,2,4), (37,2,2), (38,2,2), (51,1,2), (52,1,2), (31,1,4), (32,1,4)] {
+            let bytes: Vec<_> = [-1i16, 1, 0, 0].into_iter().take(channels)
+                .flat_map(|v| v.to_le_bytes().into_iter().take(n)).collect();
+            assert_eq!(super::to_rgba(format, 1, 1, bytes.len(), &bytes).unwrap(), [0,255,0,255], "{format}");
+        }
     }
 }
