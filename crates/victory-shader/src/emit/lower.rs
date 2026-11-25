@@ -2262,8 +2262,9 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, r, sign)
     }
 
-    /// `f` as an f16 in the low bits, rounded toward zero: the nearest-even
-    /// conversion, one step back toward zero where it rounded away (which
+    /// `f` as an f16 in the low bits, rounded toward zero: the host's
+    /// conversion (toward zero on Windows, to nearest even under vkd3d-proton
+    /// on NVIDIA), one step back toward zero where it rounded away (which
     /// also turns an overflow to infinity into the largest finite half).
     fn f16_toward_zero(&mut self, f: V) -> V {
         let c = self.cur;
@@ -4956,8 +4957,9 @@ impl<'a> Lower<'a> {
 
     /// Channels of buffer format `format`, as [`Self::format_load`] gives
     /// them, as d16 data: 16 bits each, two per dword, low half first (an
-    /// odd last high half 0). Integer formats keep their low 16 bits; the
-    /// others become f16.
+    /// odd last high half 0). Integer formats keep their low 16 bits; float
+    /// ones become f16, cut toward zero; the others become f16 as the host
+    /// converts.
     fn d16_channels(&mut self, format: u8, channels: Vec<V>) -> Result<Vec<V>, Why> {
         let (_, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
@@ -4966,6 +4968,9 @@ impl<'a> Lower<'a> {
             halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
                 let m = self.s.m.i32(0xFFFF);
                 self.s.m.bin(c, Bin::And, x, m)
+            } else if matches!(numeric, Numeric::Float) {
+                let f = self.as_float(x);
+                self.f16_toward_zero(f)
             } else {
                 let (f, i32t) = (self.as_float(x), self.s.t.i32);
                 self.s
