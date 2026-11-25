@@ -6145,8 +6145,13 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
             // A signed 64-bit operand sign-extends its 32-bit literal, as
-            // the hardware does (LLVM's AMDGPU operand rules).
-            Operand::Literal(x) if inst.name().ends_with("_i64") => {
+            // the hardware does (RDNA 2 ISA §6.2.1). v_mad_i64_i32's
+            // addend (src2) is S2.i64, signed, though the name ends in
+            // _i32 (the multiplied inputs).
+            Operand::Literal(x)
+                if inst.name().ends_with("_i64")
+                    || (inst.name() == "v_mad_i64_i32" && k == 2) =>
+            {
                 Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
             _ => {
@@ -10724,5 +10729,19 @@ mod tests {
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
         }
+    }
+
+    #[test]
+    fn v_mad_i64_i32_sign_extends_a_negative_literal_addend() {
+        // v_mad_i64_i32 v[0:1], 0, 0, lit(-100) — the addend (src2) is
+        // S2.i64 (ISA §12.12), so the literal is sign-extended. Without
+        // the fix, the zero-extending arm gives 0x00000000_ffffff9c.
+        // VOP3B: opcode 0x177, vdst=0, sdst=0x6A (VCC).
+        lowers_valu(&[
+            0xD577_006A,
+            0x03FD_0080,
+            0xFFFF_FF9C, // literal -100
+        ])
+        .unwrap();
     }
 }
