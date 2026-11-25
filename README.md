@@ -167,7 +167,7 @@ cargo test -p victory-shader --lib --locked -- --test-threads=1
 Without this override, the validator loader selects the newest installed
 Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
 path when no SDK copy is found. This is a test/offline-validation dependency;
-the translated shaders do not require it at runtime.
+the translated shaders do not require it at runtime. Set `VICTORY_SEMANTICS_REPORT=<file>` to append each semantics probe's summary (input count, model mismatches, hardware/WARP differences) and its mismatch details to that file.
 
 ## Debugging
 
