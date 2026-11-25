@@ -22,11 +22,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 use crate::object::This;
@@ -453,45 +450,6 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     }
 }
 
-/// 16-bit depth (unorm, two per dword) to the host's 24-bit depth plane (in
-/// the low 24 bits of 32) and back, in the scratch buffer: `u * (2^24 - 1)
-/// / 65535` rounded, exactly, and back to the 16-bit value whose 24-bit one
-/// is nearest.
-const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), UAV(u0)"
-cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uint pitch32; uint at32; uint toDepth; uint unused; };
-RWByteAddressBuffer buf : register(u0);
-uint d24(uint u) { return u * 256 + (u * 255 + 32767) / 65535; }
-uint u16(uint d) {
-    d &= 0xffffff;
-    uint u = min(d >> 8, 65535);
-    uint best = u;
-    int err = abs((int)d24(u) - (int)d);
-    if (u > 0 && abs((int)d24(u - 1) - (int)d) < err) { best = u - 1; err = abs((int)d24(u - 1) - (int)d); }
-    if (u < 65535 && abs((int)d24(u + 1) - (int)d) < err) { best = u + 1; }
-    return best;
-}
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    uint x = id.x * 2;
-    uint y = id.y;
-    if (x >= width || y >= height) return;
-    uint a = at16 + y * pitch16 + x * 2;
-    uint b = at32 + y * pitch32 + x * 4;
-    bool two = x + 1 < width;
-    if (toDepth != 0) {
-        uint pair = buf.Load(a);
-        buf.Store(b, d24(pair & 0xffff));
-        if (two) buf.Store(b + 4, d24(pair >> 16));
-    } else {
-        uint lo = u16(buf.Load(b));
-        uint hi = two ? u16(buf.Load(b + 4)) : 0;
-        buf.Store(a, lo | hi << 16);
-    }
-}
-"#;
-
 struct Converter {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
@@ -516,32 +474,8 @@ fn converter() -> Option<&'static Converter> {
 
 fn compile() -> windows::core::Result<Converter> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("depth"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, Some(&mut errors))
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe { std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize()) };
-            tracing::warn!("depth conversion: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
-    unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
-            ..Default::default()
-        })?;
-        Ok(Converter { root, pso })
-    }
+    let (root, pso) = crate::hlsl::pipeline(device, &crate::hlsl::DEPTH)?;
+    Ok(Converter { root, pso })
 }
 
 #[cfg(test)]

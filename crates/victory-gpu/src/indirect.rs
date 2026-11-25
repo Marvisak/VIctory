@@ -3,8 +3,8 @@
 //! translate wrongly leaves whatever the memory held, and a draw of four
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So every record is clamped on the GPU,
-//! just before its execution, by a compute shader of ours (HLSL compiled by
-//! the system's compiler; a 5.1 shader with its root signature inside).
+//! just before its execution, by a compute shader of ours (HLSL, `crate::hlsl`;
+//! a 5.1 shader with its root signature inside).
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -16,95 +16,9 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
 
 use crate::host::{HostList, host, transition};
-
-const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
-RWByteAddressBuffer args : register(u0);
-// The list's work so far (vertex instances, threads): past the budget,
-// records run empty.
-RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
-// Groups of one dispatch; more run empty.
-static const uint GROUPS = 1u << 20;
-// Clamps the record at `at` in place; its cost.
-uint clamped(uint at) {
-    uint cost;
-    if (kind <= 1) {
-        // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
-        cost = count * instances;
-        args.Store2(at, uint2(count, instances));
-    } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
-        }
-        cost = g.x * g.y * g.z * 64;
-        args.Store3(at, g);
-    } else {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128;
-        args.Store3(at, g);
-    }
-    return cost;
-}
-// A record past the budget (no cost reaches it).
-static const uint PAST = 0xffffffffu;
-groupshared uint costs[64];
-// One group walks the records in tiles of 64: every lane clamps its own
-// record, then the first lane charges the tile's records in order. No
-// other group shares the budget: a shared add wraps once enough records
-// are rejected, and a compare-exchange retries more the more records fit.
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint lane : SV_GroupIndex) {
-    uint left = 0;
-    if (lane == 0) {
-        left = BUDGET - min(budget.Load(0), BUDGET);
-    }
-    for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
-        uint record = tile * 64 + lane;
-        uint at = record * stride;
-        uint cost = 0;
-        if (record < records) {
-            cost = clamped(at);
-        }
-        costs[lane] = cost;
-        GroupMemoryBarrierWithGroupSync();
-        if (lane == 0) {
-            for (uint i = 0; i < 64; i++) {
-                if (costs[i] > left) {
-                    // The first record that does not fit takes what is
-                    // left, so those after it run empty too.
-                    costs[i] = PAST;
-                    left = 0;
-                } else {
-                    left -= costs[i];
-                }
-            }
-        }
-        GroupMemoryBarrierWithGroupSync();
-        if (costs[lane] == PAST) {
-            // Draws keep their layout with no vertices; groups become zero.
-            args.Store(at, 0);
-        }
-    }
-    if (lane == 0) {
-        budget.Store(0, BUDGET - left);
-    }
-}
-"#;
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -131,49 +45,8 @@ fn clamp() -> Option<&'static Clamp> {
 
 fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
-            };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
-    unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
-            },
-            ..Default::default()
-        })?;
-        Ok(Clamp { root, pso })
-    }
+    let (root, pso) = crate::hlsl::pipeline(device, &crate::hlsl::CLAMP)?;
+    Ok(Clamp { root, pso })
 }
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
