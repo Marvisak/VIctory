@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
+use victory_gpu::object::{Iid, guid, guid_text};
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -27,6 +28,34 @@ pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
 pub const READING_NOT_FOUND: HRESULT = 0x838A_0003_u32 as i32;
 pub const REFERENCE_TOO_OLD: HRESULT = 0x838A_0004_u32 as i32;
 const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
+
+/// Interface ids, from the GDK's `GameInput.h` (API v0).
+const IID_UNKNOWN: Iid = guid(0, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
+const IID_INPUT: Iid = guid(
+    0x11BE_2A7E,
+    0x4254,
+    0x445A,
+    [0x9C, 0x09, 0xFF, 0xC4, 0x0F, 0x00, 0x69, 0x18],
+);
+const IID_READING: Iid = guid(
+    0x2156_947A,
+    0xE1FA,
+    0x4DE0,
+    [0xA3, 0x0B, 0xD8, 0x12, 0x93, 0x1D, 0xBD, 0x8D],
+);
+const IID_DEVICE: Iid = guid(
+    0x31DD_86FB,
+    0x4C1B,
+    0x408A,
+    [0x86, 0x8F, 0x43, 0x9B, 0x3C, 0xD4, 0x71, 0x25],
+);
+const IID_DISPATCHER: Iid = guid(
+    0x415E_ED2E,
+    0x98CB,
+    0x42C2,
+    [0x8F, 0x28, 0xB9, 0x46, 0x01, 0x07, 0x4E, 0x31],
+);
 
 /// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
@@ -116,8 +145,104 @@ trait Source: Send {
     fn scripted_keys(&mut self) -> Vec<KeyState> {
         Vec::new()
     }
-    /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Sets the four rumble motors of the pad in host slot `slot`.
+    fn rumble(&mut self, slot: usize, rumble: Rumble);
+}
+
+/// The rumble motors a console pad has: low and high frequency, left and
+/// right trigger.
+const RUMBLE_MOTORS: u32 = 0xF;
+
+/// A rumble state: each motor's level, 0 to 1.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Rumble {
+    low: f32,
+    high: f32,
+    left_trigger: f32,
+    right_trigger: f32,
+}
+
+impl Rumble {
+    /// From the title's `GameInputRumbleParams`; none turns all off. Levels
+    /// are clamped to 0..=1, NaN is 0.
+    fn from_params(params: Option<[f32; 4]>) -> Rumble {
+        let level = |v: f32| if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+        let [low, high, left, right] = params.unwrap_or_default().map(level);
+        Rumble {
+            low,
+            high,
+            left_trigger: left,
+            right_trigger: right,
+        }
+    }
+
+    /// XInput's motor speeds: low frequency (left), high frequency (right).
+    fn motor_speeds(&self) -> (u16, u16) {
+        let speed = |level: f32| (level * f32::from(u16::MAX)) as u16;
+        (speed(self.low), speed(self.high))
+    }
+
+    fn triggers_on(&self) -> bool {
+        self.left_trigger > 0.0 || self.right_trigger > 0.0
+    }
+}
+
+/// The host's two big motors per pad slot (XInput).
+trait Motors: Send {
+    fn set(&mut self, slot: usize, low: u16, high: u16);
+}
+
+/// Host pads that can drive trigger motors (Windows.Gaming.Input), in that
+/// API's order.
+trait Triggers: Send {
+    /// Sets all four motors of the `pad`th such pad; false when there is
+    /// none (or the API is unavailable).
+    fn set(&mut self, pad: usize, rumble: Rumble) -> bool;
+}
+
+/// Sends a title's rumble to the host: the big motors through XInput, the
+/// trigger motors (XInput has none) through the trigger API when that has
+/// the pad. That API takes all four levels at once, so it gets the motors'
+/// too, the same as XInput's, and nothing is undone.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct Router<M, T> {
+    motors: M,
+    triggers: T,
+    /// Trigger levels sent per slot are not all zero: the next state goes
+    /// through the trigger API too, to stop them.
+    triggers_on: [bool; PADS],
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl<M: Motors, T: Triggers> Router<M, T> {
+    fn new(motors: M, triggers: T) -> Self {
+        Router {
+            motors,
+            triggers,
+            triggers_on: [false; PADS],
+        }
+    }
+
+    /// `connected`: which XInput slots have a pad.
+    // shortcut: XInput slots and Windows.Gaming.Input pads are matched by
+    // order (the nth connected slot is the nth pad there); neither API says
+    // which of the other's pads is which. Right with one pad; with several
+    // the triggers of another pad may answer.
+    fn rumble(&mut self, slot: usize, connected: [bool; PADS], rumble: Rumble) {
+        let (low, high) = rumble.motor_speeds();
+        self.motors.set(slot, low, high);
+        if !connected[slot] {
+            self.triggers_on[slot] = false;
+            return;
+        }
+        // Without trigger levels to set or clear, XInput did it all.
+        if !rumble.triggers_on() && !self.triggers_on[slot] {
+            return;
+        }
+        let pad = connected[..slot].iter().filter(|&&c| c).count();
+        let sent = self.triggers.set(pad, rumble);
+        self.triggers_on[slot] = sent && rumble.triggers_on();
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -183,7 +308,7 @@ pub struct Object {
 
 #[repr(C)]
 pub struct Device {
-    vtable: &'static Table<21>,
+    vtable: &'static Table<22>,
     hub: *const Hub,
     index: usize,
     info: DeviceInfo,
@@ -233,8 +358,9 @@ impl Device {
             id,
             root_id: id,
             supported_input: kind(index),
-            // Low and high frequency.
-            rumble_motors: if index < PADS { 0x3 } else { 0 },
+            // All four, as a console pad: the triggers' reach the host
+            // through Windows.Gaming.Input where it has the pad.
+            rumble_motors: if index < PADS { RUMBLE_MOTORS } else { 0 },
             ..Default::default()
         };
         Device {
@@ -368,6 +494,13 @@ pub struct Hub {
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
+    /// Live dispatcher objects; while there is one, input is processed by
+    /// `Dispatch` on the title's thread instead of our poll thread.
+    dispatchers: AtomicU32,
+    /// The auto-reset event behind dispatcher wait handles (0 until asked
+    /// for); never closed, the title gets duplicates.
+    #[cfg(windows)]
+    work: std::sync::OnceLock<usize>,
 }
 
 fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -403,6 +536,9 @@ impl Hub {
                 running: Vec::new(),
             }),
             returned: Condvar::new(),
+            dispatchers: AtomicU32::new(0),
+            #[cfg(windows)]
+            work: std::sync::OnceLock::new(),
         }));
         // SAFETY: just allocated and never freed; nothing else sees it yet.
         unsafe {
@@ -421,10 +557,48 @@ impl Hub {
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(POLL);
-                hub.poll();
+                hub.tick();
             }
         });
         hub
+    }
+
+    /// The poll thread's work each period: poll in automatic dispatch mode;
+    /// in manual mode (a dispatcher lives) only tell the title's wait
+    /// handles there is work, which its `Dispatch` then does.
+    fn tick(&self) {
+        if self.manual() {
+            self.signal_work();
+        } else {
+            self.poll();
+        }
+    }
+
+    fn manual(&self) -> bool {
+        self.dispatchers.load(Ordering::Acquire) != 0
+    }
+
+    /// The event behind dispatcher wait handles, made on first use.
+    #[cfg(windows)]
+    fn work_event(&self) -> Option<usize> {
+        use windows_sys::Win32::System::Threading::CreateEventW;
+        let event = *self.work.get_or_init(|| {
+            // SAFETY: an unnamed auto-reset event, not signaled.
+            unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) as usize }
+        });
+        (event != 0).then_some(event)
+    }
+
+    // shortcut: every period counts as work (the host may have changed);
+    // telling whether it did would take the poll `Dispatch` is for.
+    fn signal_work(&self) {
+        #[cfg(windows)]
+        if let Some(&event) = self.work.get()
+            && event != 0
+        {
+            // SAFETY: our event, never closed.
+            unsafe { windows_sys::Win32::System::Threading::SetEvent(event as _) };
+        }
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -564,7 +738,7 @@ fn host() -> Box<dyn Source> {
         fn keys(&mut self) -> Vec<KeyState> {
             Vec::new()
         }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        fn rumble(&mut self, _: usize, _: Rumble) {}
     }
     Box::new(Nothing)
 }
@@ -612,12 +786,42 @@ fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
     }
 }
 
-extern "system" fn no_interface(_: *const c_void, _iid: *const c_void, out: Out) -> HRESULT {
-    tracing::warn!("input QueryInterface not implemented");
-    fail(out, E_NOINTERFACE)
+/// QueryInterface: `this` again, with a reference taken by `add_ref`, when
+/// `iid` is IUnknown or `own`; otherwise null and `E_NOINTERFACE`.
+fn query<T>(
+    this: *const T,
+    iid: *const Iid,
+    own: &Iid,
+    add_ref: extern "system" fn(*const T) -> u32,
+    out: Out,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: the title passes an interface id (null is tolerated).
+    let Some(iid) = (unsafe { iid.as_ref() }) else {
+        return fail(out, E_INVALIDARG);
+    };
+    if *iid != IID_UNKNOWN && iid != own {
+        tracing::warn!(iid = %guid_text(iid), "unknown input interface");
+        return fail(out, E_NOINTERFACE);
+    }
+    add_ref(this);
+    // SAFETY: checked non-null; the title passes room for a pointer.
+    unsafe { out.write(this.cast()) };
+    S_OK
+}
+extern "system" fn query_input(this: This, iid: *const Iid, out: Out) -> HRESULT {
+    query(this, iid, &IID_INPUT, add_ref, out)
+}
+extern "system" fn query_device(this: *const Device, iid: *const Iid, out: Out) -> HRESULT {
+    query(this, iid, &IID_DEVICE, add_ref, out)
+}
+extern "system" fn query_reading(this: *const Reading, iid: *const Iid, out: Out) -> HRESULT {
+    query(this, iid, &IID_READING, reading_add_ref, out)
 }
 /// The input object and devices live as long as the process.
-extern "system" fn add_ref(_: *const c_void) -> u32 {
+extern "system" fn add_ref<T>(_: *const T) -> u32 {
     1
 }
 
@@ -878,13 +1082,119 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
     }
 }
 
-/// Dispatcher and aggregate device: no title of ours asks for them.
-extern "system" fn create_dispatcher(_: This, out: Out) -> HRESULT {
-    tracing::warn!("input dispatcher not implemented");
-    fail(out, E_NOTIMPL)
+/// A dispatcher: while one lives, the title runs input work (polling the
+/// host, device callbacks) with `Dispatch` on its own threads, as
+/// documented: holding one switches to manual dispatch, releasing the last
+/// switches back.
+#[repr(C)]
+pub struct Dispatcher {
+    vtable: &'static Table<5>,
+    refs: AtomicU32,
+    hub: &'static Hub,
 }
-extern "system" fn create_aggregate(_: This, _kind: u32, out: Out) -> HRESULT {
-    tracing::warn!("aggregate input device not implemented");
+
+extern "system" fn create_dispatcher(this: This, out: Out) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    let hub = hub(this);
+    hub.dispatchers.fetch_add(1, Ordering::AcqRel);
+    tracing::info!("input dispatcher: manual dispatch");
+    let dispatcher = Box::leak(Box::new(Dispatcher {
+        vtable: &DISPATCHER,
+        refs: AtomicU32::new(1),
+        hub,
+    }));
+    // SAFETY: checked non-null; the title passes room for a pointer.
+    unsafe { out.write((dispatcher as *const Dispatcher).cast()) };
+    S_OK
+}
+
+fn dispatcher<'a>(this: *const Dispatcher) -> &'a Dispatcher {
+    // SAFETY: a dispatcher we handed out and the title still holds.
+    unsafe { &*this }
+}
+extern "system" fn query_dispatcher(this: *const Dispatcher, iid: *const Iid, out: Out) -> HRESULT {
+    query(this, iid, &IID_DISPATCHER, dispatcher_add_ref, out)
+}
+extern "system" fn dispatcher_add_ref(this: *const Dispatcher) -> u32 {
+    dispatcher(this).refs.fetch_add(1, Ordering::Relaxed) + 1
+}
+extern "system" fn dispatcher_release(this: *const Dispatcher) -> u32 {
+    let left = dispatcher(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if left == 0 {
+        // SAFETY: the last reference is gone; `create_dispatcher` boxed it.
+        let dispatcher = unsafe { Box::from_raw(this.cast_mut()) };
+        if dispatcher.hub.dispatchers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            tracing::info!("input dispatcher: automatic dispatch");
+        }
+    }
+    left
+}
+/// Polls the host and runs the callbacks that brings, on this thread. That
+/// is all the work there is, so none is left: false. A poll is one step, so
+/// the quota is kept (the documented minimum is one item even at zero).
+extern "system" fn dispatch(this: *const Dispatcher, _quota: u64) -> bool {
+    dispatcher(this).hub.poll();
+    false
+}
+/// A new handle to the event our poll thread sets each period while
+/// dispatch is manual; the title closes it.
+extern "system" fn open_wait_handle(this: *const Dispatcher, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: checked non-null; nothing until we have a handle.
+    unsafe { out.write(std::ptr::null_mut()) };
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // HRESULT_FROM_WIN32 of the last error.
+        // SAFETY: plain query.
+        let error = || 0x8007_0000_u32 as i32 | (unsafe { GetLastError() } & 0xFFFF) as i32;
+        let Some(event) = dispatcher(this).hub.work_event() else {
+            return error();
+        };
+        let mut copy = std::ptr::null_mut();
+        // SAFETY: our own event, duplicated within our process.
+        let ok = unsafe {
+            let me = GetCurrentProcess();
+            DuplicateHandle(me, event as _, me, &mut copy, 0, 0, DUPLICATE_SAME_ACCESS)
+        };
+        if ok == 0 {
+            return error();
+        }
+        // SAFETY: checked non-null.
+        unsafe { out.write(copy) };
+        S_OK
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = this;
+        E_NOTIMPL
+    }
+}
+
+static DISPATCHER: Table<5> = Table([
+    query_dispatcher as *const (),
+    dispatcher_add_ref as *const (),
+    dispatcher_release as *const (),
+    dispatch as *const (),         // 0x18
+    open_wait_handle as *const (), // 0x20
+]);
+
+/// Aggregate devices: E_NOTIMPL is what this API version (v0, the one whose
+/// table this is) answers; the GDK documents CreateAggregateDevice as
+/// "introduced but unimplemented" in v0, removed in v1 and implemented,
+/// with another signature, only from v3.
+extern "system" fn create_aggregate(_: This, kind: u32, out: Out) -> HRESULT {
+    tracing::debug!(
+        kind = format_args!("{kind:#x}"),
+        "aggregate input device: not in API v0"
+    );
     fail(out, E_NOTIMPL)
 }
 extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRESULT {
@@ -919,9 +1229,9 @@ extern "system" fn enable_oem_device(
 extern "system" fn set_focus_policy(_: This, _policy: u32) {}
 
 static INPUT: Table<22> = Table([
-    no_interface as *const (),        // 0x00
-    add_ref as *const (),             // 0x08 AddRef
-    add_ref as *const (),             // 0x10 Release
+    query_input as *const (),         // 0x00
+    add_ref::<Object> as *const (),   // 0x08 AddRef
+    add_ref::<Object> as *const (),   // 0x10 Release
     timestamp as *const (),           // 0x18
     current_reading as *const (),     // 0x20
     next_reading as *const (),        // 0x28
@@ -956,55 +1266,124 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+/// The four motors of a host pad (see `Router`); the keyboard and its
+/// stand-in pad have none.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
-        [0.0; 4]
-    } else {
-        // SAFETY: checked non-null; four motor levels.
-        unsafe { *params }
-    };
-    let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    // SAFETY: null or four motor levels.
+    let rumble = Rumble::from_params(unsafe { params.as_ref() }.copied());
+    lock(&device.hub().source).rumble(device.index, rumble);
 }
-extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
-    tracing::warn!(
-        slot = format_args!("{SLOT:#x}"),
-        "input device method not implemented"
-    );
+/// `GameInputBatteryState`: rates and capacities, then a status.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BatteryState {
+    charge_rate: f32,
+    max_charge_rate: f32,
+    remaining_capacity: f32,
+    full_charge_capacity: f32,
+    status: i32,
+}
+const BATTERY_UNKNOWN: i32 = -1;
+
+/// What the methods below answer is that of a device with no battery
+/// report, no force feedback or haptic motors (the info says none), no
+/// input synchronization and no raw reports: what our devices are.
+// shortcut: the battery is unknown, XInput's coarse levels have no
+// capacities to give; API v0 documents its battery state as unimplemented.
+extern "system" fn battery_state(_: *const Device, out: *mut BatteryState) {
+    if !out.is_null() {
+        // SAFETY: checked non-null; the title passes room for the state.
+        unsafe {
+            out.write(BatteryState {
+                charge_rate: 0.0,
+                max_charge_rate: 0.0,
+                remaining_capacity: 0.0,
+                full_charge_capacity: 0.0,
+                status: BATTERY_UNKNOWN,
+            });
+        }
+    }
+}
+/// No such motor: force feedback effects and haptic states.
+extern "system" fn no_motor(
+    _: *const Device,
+    _motor: u32,
+    _params: *const c_void,
+    out: Out,
+) -> HRESULT {
+    fail(out, E_INVALIDARG)
+}
+extern "system" fn no_haptics(_: *const Device, _motor: u32, _params: *const c_void) -> HRESULT {
+    E_INVALIDARG
+}
+/// Power state of a force feedback motor; exclusive raw access: no.
+extern "system" fn no(_: *const Device, _: u64) -> bool {
+    false
+}
+/// Motor gain, input synchronization, power off, releasing raw access.
+// shortcut: PowerOff leaves the host pad on; that is the user's to do.
+extern "system" fn ignore(_: *const Device, _: u64, _: u32) {}
+/// Raw reports: creating one, reading a feature, sending with a response.
+extern "system" fn no_report(_: *const Device, _id: u32, _kind: u32, out: Out) -> HRESULT {
+    fail(out, E_NOTIMPL)
+}
+extern "system" fn no_feature(_: *const Device, _id: u32, out: Out) -> HRESULT {
+    fail(out, E_NOTIMPL)
+}
+extern "system" fn no_report_sent(_: *const Device, _report: *const c_void) -> HRESULT {
+    E_NOTIMPL
+}
+extern "system" fn no_report_response(
+    _: *const Device,
+    _report: *const c_void,
+    out: Out,
+) -> HRESULT {
+    fail(out, E_NOTIMPL)
+}
+extern "system" fn no_io_control(
+    _: *const Device,
+    _code: u32,
+    _in_size: usize,
+    _in: *const c_void,
+    _out_size: usize,
+    _out: *mut c_void,
+    out_written: *mut usize,
+) -> HRESULT {
+    if !out_written.is_null() {
+        // SAFETY: checked non-null; zero on failure, as documented.
+        unsafe { out_written.write(0) };
+    }
     E_NOTIMPL
 }
 
-static DEVICE: Table<21> = Table([
-    no_interface as *const (),        // 0x00
-    add_ref as *const (),             // 0x08 AddRef
-    add_ref as *const (),             // 0x10 Release
-    device_info as *const (),         // 0x18
-    device_status as *const (),       // 0x20
-    unsupported::<0x28> as *const (), // battery
-    unsupported::<0x30> as *const (), // force feedback
-    unsupported::<0x38> as *const (), //
-    unsupported::<0x40> as *const (), //
-    unsupported::<0x48> as *const (), // haptics
-    set_rumble as *const (),          // 0x50
-    unsupported::<0x58> as *const (), // input synchronization
-    unsupported::<0x60> as *const (), //
-    unsupported::<0x68> as *const (), // power off
-    unsupported::<0x70> as *const (), // raw device access
-    unsupported::<0x78> as *const (), //
-    unsupported::<0x80> as *const (), //
-    unsupported::<0x88> as *const (), //
-    unsupported::<0x90> as *const (), //
-    unsupported::<0x98> as *const (), //
-    unsupported::<0xa0> as *const (), //
+static DEVICE: Table<22> = Table([
+    query_device as *const (),       // 0x00
+    add_ref::<Device> as *const (),  // 0x08 AddRef
+    add_ref::<Device> as *const (),  // 0x10 Release
+    device_info as *const (),        // 0x18
+    device_status as *const (),      // 0x20
+    battery_state as *const (),      // 0x28
+    no_motor as *const (),           // 0x30 CreateForceFeedbackEffect
+    no as *const (),                 // 0x38 IsForceFeedbackMotorPoweredOn
+    ignore as *const (),             // 0x40 SetForceFeedbackMotorGain
+    no_haptics as *const (),         // 0x48 SetHapticMotorState
+    set_rumble as *const (),         // 0x50
+    ignore as *const (),             // 0x58 SetInputSynchronizationState
+    ignore as *const (),             // 0x60 SendInputSynchronizationHint
+    ignore as *const (),             // 0x68 PowerOff
+    no_report as *const (),          // 0x70 CreateRawDeviceReport
+    no_feature as *const (),         // 0x78 GetRawDeviceFeature
+    no_report_sent as *const (),     // 0x80 SetRawDeviceFeature
+    no_report_sent as *const (),     // 0x88 SendRawDeviceOutput
+    no_report_response as *const (), // 0x90 SendRawDeviceOutputWithResponse
+    no_io_control as *const (),      // 0x98 ExecuteRawDeviceIoControl
+    no as *const (),                 // 0xa0 AcquireExclusiveRawDeviceAccess
+    ignore as *const (),             // 0xa8 ReleaseExclusiveRawDeviceAccess
 ]);
 
 fn reading<'a>(this: *const Reading) -> &'a Reading {
@@ -1076,7 +1455,7 @@ extern "system" fn nothing(_: *const c_void) -> usize {
 }
 
 static READING: Table<25> = Table([
-    no_interface as *const (),      // 0x00
+    query_reading as *const (),     // 0x00
     reading_add_ref as *const (),   // 0x08
     reading_release as *const (),   // 0x10
     input_kind as *const (),        // 0x18
@@ -1175,9 +1554,70 @@ mod host {
         }
     }
 
-    #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Slots that had a pad when last read.
+        connected: [bool; PADS],
+        rumble: Router<XInput, GamingInput>,
+    }
+
+    impl Default for Host {
+        fn default() -> Self {
+            Host {
+                empty_until: Default::default(),
+                connected: Default::default(),
+                rumble: Router::new(XInput, GamingInput::default()),
+            }
+        }
+    }
+
+    struct XInput;
+
+    impl Motors for XInput {
+        fn set(&mut self, slot: usize, low: u16, high: u16) {
+            let speeds = XINPUT_VIBRATION {
+                wLeftMotorSpeed: low,
+                wRightMotorSpeed: high,
+            };
+            // SAFETY: a valid vibration; an empty slot just fails.
+            unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+    }
+
+    /// Windows.Gaming.Input's gamepads, the API with trigger motors. Without
+    /// it (no WinRT), triggers stay still and the motors work as before.
+    #[derive(Default)]
+    struct GamingInput {
+        unavailable: bool,
+    }
+
+    impl Triggers for GamingInput {
+        fn set(&mut self, pad: usize, rumble: Rumble) -> bool {
+            use windows::Gaming::Input::{Gamepad, GamepadVibration};
+            if self.unavailable {
+                return false;
+            }
+            let pads = match Gamepad::Gamepads() {
+                Ok(pads) => pads,
+                Err(error) => {
+                    tracing::warn!(%error, "no Windows.Gaming.Input: trigger rumble is off");
+                    self.unavailable = true;
+                    return false;
+                }
+            };
+            // The list fills in shortly after the first call; until then
+            // and for a pad it lacks, there is nothing to set.
+            let Ok(gamepad) = pads.GetAt(pad as u32) else {
+                return false;
+            };
+            let vibration = GamepadVibration {
+                LeftMotor: f64::from(rumble.low),
+                RightMotor: f64::from(rumble.high),
+                LeftTrigger: f64::from(rumble.left_trigger),
+                RightTrigger: f64::from(rumble.right_trigger),
+            };
+            gamepad.SetVibration(vibration).is_ok()
+        }
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1200,9 +1640,11 @@ mod host {
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                self.connected[slot] = false;
                 return None;
             }
             self.empty_until[slot] = None;
+            self.connected[slot] = true;
             Some(convert(&state.Gamepad))
         }
 
@@ -1236,13 +1678,8 @@ mod host {
             }
         }
 
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
-            };
-            // SAFETY: a valid vibration; an empty slot just fails.
-            unsafe { XInputSetState(slot as u32, &speeds) };
+        fn rumble(&mut self, slot: usize, rumble: Rumble) {
+            self.rumble.rumble(slot, self.connected, rumble);
         }
     }
 
@@ -1295,6 +1732,15 @@ mod host {
         }
     }
 
+    /// The real trigger API, with all motors off: whether or not WinRT and
+    /// pads are there, a pad it lacks is no pad.
+    #[test]
+    fn the_host_trigger_api_has_no_pad_it_lacks() {
+        let mut api = GamingInput::default();
+        assert!(!api.set(PADS * 4, Rumble::default()));
+        assert!(!api.set(PADS * 4, Rumble::default()));
+    }
+
     #[test]
     fn host_pads_convert_to_console_pads() {
         let pad = XINPUT_GAMEPAD {
@@ -1333,7 +1779,7 @@ mod tests {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         scripted: Vec<KeyState>,
-        rumble: Vec<(usize, u16, u16)>,
+        rumble: Vec<(usize, Rumble)>,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
@@ -1348,8 +1794,8 @@ mod tests {
         fn scripted_keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().scripted.clone()
         }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
+        fn rumble(&mut self, slot: usize, rumble: Rumble) {
+            self.0.lock().unwrap().rumble.push((slot, rumble));
         }
     }
 
@@ -1466,6 +1912,258 @@ mod tests {
 
     fn release(reading: *const Reading) {
         slot::<extern "system" fn(*const Reading) -> u32, _>(reading, 0x10)(reading);
+    }
+
+    /// QueryInterface through the object's table; a failure must clear `out`.
+    fn query_as<T>(object: *const T, iid: *const Iid) -> Result<*const c_void, HRESULT> {
+        type Query<T> = extern "system" fn(*const T, *const Iid, Out) -> HRESULT;
+        let mut out = std::ptr::dangling::<c_void>();
+        let hr = slot::<Query<T>, _>(object, 0)(object, iid, &mut out);
+        if hr == S_OK {
+            Ok(out)
+        } else {
+            assert!(out.is_null());
+            Err(hr)
+        }
+    }
+
+    const FOREIGN: Iid = guid(0x1234_5678, 1, 2, [3, 4, 5, 6, 7, 8, 9, 10]);
+
+    #[test]
+    fn query_interface_answers_by_interface_id() {
+        let (hub, _) = fake();
+        let object = &raw const hub.object;
+        for iid in [IID_UNKNOWN, IID_INPUT] {
+            assert_eq!(query_as(object, &iid), Ok(object.cast()));
+        }
+        for iid in [IID_DEVICE, IID_READING, FOREIGN] {
+            assert_eq!(query_as(object, &iid), Err(E_NOINTERFACE));
+        }
+
+        let device = &raw const hub.devices[FALLBACK];
+        for iid in [IID_UNKNOWN, IID_DEVICE] {
+            assert_eq!(query_as(device, &iid), Ok(device.cast()));
+        }
+        for iid in [IID_INPUT, IID_READING, FOREIGN] {
+            assert_eq!(query_as(device, &iid), Err(E_NOINTERFACE));
+        }
+
+        // Readings are counted: each answer is a reference, a refusal none.
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let refs = || reading(r).refs.load(Ordering::SeqCst);
+        assert_eq!(refs(), 2, "the history's and ours");
+        for iid in [IID_UNKNOWN, IID_READING] {
+            assert_eq!(query_as(r, &iid), Ok(r.cast()));
+        }
+        assert_eq!(refs(), 4);
+        for iid in [IID_INPUT, IID_DEVICE, FOREIGN] {
+            assert_eq!(query_as(r, &iid), Err(E_NOINTERFACE));
+        }
+        assert_eq!(refs(), 4);
+        assert_eq!(query_as(r, std::ptr::null()), Err(E_INVALIDARG));
+        type Query = extern "system" fn(*const Reading, *const Iid, Out) -> HRESULT;
+        let query = slot::<Query, _>(r, 0);
+        assert_eq!(query(r, &IID_READING, std::ptr::null_mut()), E_POINTER);
+        assert_eq!(refs(), 4);
+        for _ in 0..3 {
+            release(r);
+        }
+        assert_eq!(refs(), 1);
+    }
+
+    fn new_dispatcher(hub: &Hub) -> *const Dispatcher {
+        type Create = extern "system" fn(This, Out) -> HRESULT;
+        let mut out = std::ptr::null();
+        let create = slot::<Create, _>(&hub.object, 0x70);
+        assert_eq!(create(&hub.object, &mut out), S_OK);
+        assert!(!out.is_null());
+        assert_eq!(create(&hub.object, std::ptr::null_mut()), E_INVALIDARG);
+        out.cast()
+    }
+
+    fn release_dispatcher(d: *const Dispatcher) -> u32 {
+        slot::<extern "system" fn(*const Dispatcher) -> u32, _>(d, 0x10)(d)
+    }
+
+    #[test]
+    fn a_dispatcher_moves_input_work_to_the_title_thread() {
+        let (hub, host) = fake();
+        assert!(!hub.manual());
+        let d = new_dispatcher(hub);
+        assert!(hub.manual());
+        let refs = || dispatcher(d).refs.load(Ordering::SeqCst);
+        for iid in [IID_UNKNOWN, IID_DISPATCHER] {
+            assert_eq!(query_as(d, &iid), Ok(d.cast()));
+        }
+        for iid in [IID_INPUT, IID_DEVICE, IID_READING, FOREIGN] {
+            assert_eq!(query_as(d, &iid), Err(E_NOINTERFACE));
+        }
+        assert_eq!(refs(), 3);
+
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 0, &log);
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        // Our poll thread's period no longer polls...
+        hub.tick();
+        assert!(log.lock().unwrap().is_empty());
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+        // ...the title's Dispatch does, callbacks on its thread.
+        let dispatch = slot::<extern "system" fn(*const Dispatcher, u64) -> bool, _>(d, 0x18);
+        assert!(!dispatch(d, 0), "nothing left after one dispatch");
+        assert_eq!(
+            *log.lock().unwrap(),
+            [(0, STATUS_CONNECTED, 0), (FALLBACK, 0, STATUS_CONNECTED)]
+        );
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(r).buttons, A);
+        release(r);
+
+        // Releasing the last reference returns to automatic dispatch.
+        assert_eq!(release_dispatcher(d), 2);
+        assert_eq!(release_dispatcher(d), 1);
+        assert!(hub.manual());
+        assert_eq!(release_dispatcher(d), 0);
+        assert!(!hub.manual());
+        host.lock().unwrap().pads[0] = None;
+        hub.tick();
+        assert_eq!(log.lock().unwrap().len(), 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dispatcher_wait_handles_signal_while_dispatch_is_manual() {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        type Open = extern "system" fn(*const Dispatcher, *mut *mut c_void) -> HRESULT;
+        let (hub, _) = fake();
+        let d = new_dispatcher(hub);
+        let open = slot::<Open, _>(d, 0x20);
+        let (mut a, mut b) = (std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(open(d, &mut a), S_OK);
+        assert_eq!(open(d, &mut b), S_OK);
+        assert!(!a.is_null() && !b.is_null() && a != b, "a handle per call");
+        assert_eq!(open(d, std::ptr::null_mut()), E_INVALIDARG);
+        // SAFETY: handles we were just given; the title owns and closes them.
+        unsafe {
+            assert_eq!(WaitForSingleObject(a, 0), WAIT_TIMEOUT);
+            hub.tick();
+            assert_eq!(WaitForSingleObject(b, 0), WAIT_OBJECT_0);
+            assert_eq!(WaitForSingleObject(a, 0), WAIT_TIMEOUT, "auto-reset");
+            CloseHandle(a);
+            // Closing the title's handle leaves ours working.
+            hub.tick();
+            assert_eq!(WaitForSingleObject(b, 0), WAIT_OBJECT_0);
+            assert_eq!(release_dispatcher(d), 0);
+            // Automatic dispatch: the period polls instead of signalling.
+            hub.tick();
+            assert_eq!(WaitForSingleObject(b, 0), WAIT_TIMEOUT);
+            CloseHandle(b);
+        }
+    }
+
+    #[test]
+    fn devices_answer_as_devices_without_battery_motors_or_raw_reports() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        for device in [&raw const hub.devices[0], &raw const hub.devices[KEYBOARD]] {
+            let mut battery = BatteryState {
+                charge_rate: 9.0,
+                max_charge_rate: 9.0,
+                remaining_capacity: 9.0,
+                full_charge_capacity: 9.0,
+                status: 7,
+            };
+            slot::<extern "system" fn(*const Device, *mut BatteryState), _>(device, 0x28)(
+                device,
+                &mut battery,
+            );
+            let unknown = BatteryState {
+                charge_rate: 0.0,
+                max_charge_rate: 0.0,
+                remaining_capacity: 0.0,
+                full_charge_capacity: 0.0,
+                status: -1, // GameInputBatteryUnknown
+            };
+            assert_eq!(battery, unknown);
+
+            type Motor = extern "system" fn(*const Device, u32, *const c_void, Out) -> HRESULT;
+            let mut out = std::ptr::dangling::<c_void>();
+            let effect =
+                slot::<Motor, _>(device, 0x30)(device, 0, &1_u64 as *const u64 as _, &mut out);
+            assert_eq!((effect, out), (E_INVALIDARG, std::ptr::null()));
+            type Haptic = extern "system" fn(*const Device, u32, *const c_void) -> HRESULT;
+            let haptic = slot::<Haptic, _>(device, 0x48)(device, 0, std::ptr::null());
+            assert_eq!(haptic, E_INVALIDARG);
+            // Booleans are false: E_NOTIMPL's low byte would read as true.
+            for offset in [0x38, 0xa0] {
+                let ask = slot::<extern "system" fn(*const Device, u32) -> bool, _>(device, offset);
+                assert!(!ask(device, 0), "slot {offset:#x}");
+            }
+            // Gain, synchronization, power off, releasing access: no effect.
+            for offset in [0x40, 0x58, 0x60, 0x68, 0xa8] {
+                slot::<extern "system" fn(*const Device, u32, u32), _>(device, offset)(
+                    device, 0, 1,
+                );
+            }
+
+            type Create = extern "system" fn(*const Device, u32, u32, Out) -> HRESULT;
+            let mut out = std::ptr::dangling::<c_void>();
+            assert_eq!(
+                slot::<Create, _>(device, 0x70)(device, 1, 1, &mut out),
+                E_NOTIMPL
+            );
+            assert!(out.is_null());
+            type Feature = extern "system" fn(*const Device, u32, Out) -> HRESULT;
+            let mut out = std::ptr::dangling::<c_void>();
+            assert_eq!(
+                slot::<Feature, _>(device, 0x78)(device, 1, &mut out),
+                E_NOTIMPL
+            );
+            assert!(out.is_null());
+            type Send = extern "system" fn(*const Device, *const c_void) -> HRESULT;
+            for offset in [0x80, 0x88] {
+                assert_eq!(
+                    slot::<Send, _>(device, offset)(device, std::ptr::null()),
+                    E_NOTIMPL
+                );
+            }
+            type Response = extern "system" fn(*const Device, *const c_void, Out) -> HRESULT;
+            let mut out = std::ptr::dangling::<c_void>();
+            let hr = slot::<Response, _>(device, 0x90)(device, std::ptr::null(), &mut out);
+            assert_eq!((hr, out), (E_NOTIMPL, std::ptr::null()));
+            type Control = extern "system" fn(
+                *const Device,
+                u32,
+                usize,
+                *const c_void,
+                usize,
+                *mut c_void,
+                *mut usize,
+            ) -> HRESULT;
+            let mut written = 5;
+            let control = slot::<Control, _>(device, 0x98);
+            let hr = control(
+                device,
+                1,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut written,
+            );
+            assert_eq!((hr, written), (E_NOTIMPL, 0));
+        }
+        assert!(host.lock().unwrap().rumble.is_empty());
+
+        // Aggregate devices are not in API v0.
+        type Aggregate = extern "system" fn(This, u32, Out) -> HRESULT;
+        let mut out = std::ptr::dangling::<c_void>();
+        let hr = slot::<Aggregate, _>(&hub.object, 0x78)(&hub.object, GAMEPAD_KIND, &mut out);
+        assert_eq!((hr, out), (E_NOTIMPL, std::ptr::null()));
     }
 
     #[test]
@@ -1719,12 +2417,137 @@ mod tests {
         assert_eq!(find(&hub.object, &[1; 32], &mut out), DEVICE_NOT_FOUND);
         assert!(out.is_null());
 
-        type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
-        let rumble = slot::<Rumble, _>(device, 0x50);
-        rumble(device, &[0.5, 1.0, 1.0, 1.0]);
+        // A pad has all four motors, the keyboard and its stand-in none.
+        let motors = |d: *const Device| {
+            // SAFETY: the info has the motors at +0x6c (after the ids,
+            // family, capabilities and supported input).
+            unsafe { *(info(d).add(0x6c) as *const u32) }
+        };
+        assert_eq!(std::mem::offset_of!(DeviceInfo, rumble_motors), 0x6c);
+        assert_eq!(motors(device), RUMBLE_MOTORS);
+        assert_eq!(motors(&hub.devices[FALLBACK]), 0);
+        assert_eq!(motors(&hub.devices[KEYBOARD]), 0);
+
+        type SetRumble = extern "system" fn(*const Device, *const [f32; 4]);
+        let rumble = slot::<SetRumble, _>(device, 0x50);
+        rumble(device, &[0.5, 1.0, 0.25, 3.0]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        let all = Rumble {
+            low: 0.5,
+            high: 1.0,
+            left_trigger: 0.25,
+            right_trigger: 1.0,
+        };
+        assert_eq!(
+            host.lock().unwrap().rumble,
+            [(2, all), (2, Rumble::default())]
+        );
+    }
+
+    #[test]
+    fn rumble_levels_are_clamped_and_scaled() {
+        let r = Rumble::from_params(Some([0.5, 1.0, -0.5, 7.0]));
+        assert_eq!(
+            r,
+            Rumble {
+                low: 0.5,
+                high: 1.0,
+                left_trigger: 0.0,
+                right_trigger: 1.0
+            }
+        );
+        assert_eq!(r.motor_speeds(), (32767, 65535));
+        assert!(r.triggers_on());
+        let r = Rumble::from_params(Some([f32::NAN, f32::INFINITY, f32::NAN, 0.0]));
+        assert_eq!(r.motor_speeds(), (0, 65535));
+        assert!(!r.triggers_on());
+        assert_eq!(Rumble::from_params(None), Rumble::default());
+        assert_eq!(Rumble::default().motor_speeds(), (0, 0));
+    }
+
+    /// Host rumble calls seen by the fakes.
+    #[derive(Default)]
+    struct RumbleLog {
+        motors: Vec<(usize, u16, u16)>,
+        triggers: Vec<(usize, Rumble)>,
+    }
+
+    struct FakeMotors(Arc<Mutex<RumbleLog>>);
+    impl Motors for FakeMotors {
+        fn set(&mut self, slot: usize, low: u16, high: u16) {
+            self.0.lock().unwrap().motors.push((slot, low, high));
+        }
+    }
+
+    /// `pads` pads with trigger motors.
+    struct FakeTriggers(Arc<Mutex<RumbleLog>>, usize);
+    impl Triggers for FakeTriggers {
+        fn set(&mut self, pad: usize, rumble: Rumble) -> bool {
+            self.0.lock().unwrap().triggers.push((pad, rumble));
+            pad < self.1
+        }
+    }
+
+    fn router(trigger_pads: usize) -> (Router<FakeMotors, FakeTriggers>, Arc<Mutex<RumbleLog>>) {
+        let log = Arc::new(Mutex::new(RumbleLog::default()));
+        let router = Router::new(
+            FakeMotors(Arc::clone(&log)),
+            FakeTriggers(Arc::clone(&log), trigger_pads),
+        );
+        (router, log)
+    }
+
+    fn levels(low: f32, high: f32, left: f32, right: f32) -> Rumble {
+        Rumble::from_params(Some([low, high, left, right]))
+    }
+
+    #[test]
+    fn motors_go_to_xinput_and_triggers_to_the_trigger_api() {
+        let (mut router, log) = router(2);
+        let connected = [false, true, false, true];
+        // Motors only: XInput alone.
+        router.rumble(1, connected, levels(0.5, 0.25, 0.0, 0.0));
+        assert_eq!(log.lock().unwrap().motors, [(1, 32767, 16383)]);
+        assert!(log.lock().unwrap().triggers.is_empty());
+
+        // Triggers: the trigger API gets all four, for the pad of the same
+        // rank (slot 3 is the second connected slot); XInput the motors.
+        let both = levels(1.0, 0.0, 0.5, 0.75);
+        router.rumble(3, connected, both);
+        assert_eq!(log.lock().unwrap().motors[1], (3, 65535, 0));
+        assert_eq!(log.lock().unwrap().triggers, [(1, both)]);
+        router.rumble(1, connected, both);
+        assert_eq!(log.lock().unwrap().triggers[1], (0, both));
+
+        // Back to motors only: the triggers are stopped once, then left be.
+        let motors = levels(0.25, 0.25, 0.0, 0.0);
+        router.rumble(3, connected, motors);
+        router.rumble(3, connected, motors);
+        router.rumble(3, connected, Rumble::default());
+        let log = log.lock().unwrap();
+        assert_eq!(log.triggers[2..], [(1, motors)]);
+        assert_eq!(log.motors.len(), 6);
+        assert_eq!(log.motors[5], (3, 0, 0));
+    }
+
+    #[test]
+    fn rumble_without_a_trigger_pad_still_drives_the_motors() {
+        let (mut router, log) = router(0);
+        let connected = [true, false, false, false];
+        let both = levels(0.5, 0.5, 1.0, 1.0);
+        router.rumble(0, connected, both);
+        // No pad there: nothing to stop later.
+        router.rumble(0, connected, Rumble::default());
+        // An empty slot has no pad to rank: XInput is told (and fails), the
+        // trigger API is not asked.
+        router.rumble(2, connected, both);
+        let log = log.lock().unwrap();
+        assert_eq!(
+            log.motors,
+            [(0, 32767, 32767), (0, 0, 0), (2, 32767, 32767)]
+        );
+        assert_eq!(log.triggers, [(0, both)]);
     }
 
     #[test]
