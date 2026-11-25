@@ -43,6 +43,7 @@ impl Default for HostPolicy {
             "msvcp_win.dll",
             "ole32.dll",
             "advapi32.dll",
+            // Its own traffic (echo requests, ARP) is refused in `modules::net`.
             "iphlpapi.dll",
             // The title's crash handler writes minidumps with it (loaded by name).
             "dbghelp.dll",

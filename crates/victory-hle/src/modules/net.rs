@@ -15,6 +15,10 @@
 //!   downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
 //! * A bind to all interfaces is narrowed to loopback, so nothing on the
 //!   network can connect in.
+//! * The IP helper's own traffic, which never goes through Winsock (echo
+//!   requests, ARP and neighbor solicitations), reaches loopback only; to
+//!   anything else it fails as unreachable before a packet is sent. The
+//!   rest of `iphlpapi.dll` (adapters, routes, notifications) is the host's.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
@@ -535,6 +539,235 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
     }
 }
 
+// The IP helper's own traffic.
+
+/// What an echo request to an unreachable network reports.
+const IP_DEST_NET_UNREACHABLE: u32 = 11002;
+/// What an address resolution (ARP, neighbor solicitation) that no
+/// neighbor answers reports.
+const ERROR_BAD_NET_NAME: u32 = 67;
+
+type ApcRoutine = *const c_void;
+type EchoOptions = *const c_void;
+
+/// An `IPAddr`: an IPv4 address as its bytes lie in memory.
+fn ipv4(addr: u32) -> IpAddr {
+    std::net::Ipv4Addr::from(addr.to_le_bytes()).into()
+}
+
+/// A `SOCKADDR` of either family, read no further than its family's size.
+fn any_socket_addr(addr: *const u8) -> Option<SocketAddr> {
+    if addr.is_null() {
+        return None;
+    }
+    // SAFETY: a socket address starts with its family.
+    let family = unsafe { addr.cast::<u16>().read_unaligned() };
+    socket_addr(addr, if family == AF_INET6 { 28 } else { 16 })
+}
+
+/// Whether the IP helper may send to `to`: loopback only. Otherwise logs it
+/// and sets `error` as the last error.
+fn ip_helper_reaches(what: &'static str, to: Option<IpAddr>, error: u32) -> bool {
+    match to {
+        Some(ip) if loopback(ip) => true,
+        ip => {
+            once(what, shown(ip));
+            // SAFETY: plain call.
+            unsafe { SetLastError(error) };
+            false
+        }
+    }
+}
+
+pub extern "system" fn IcmpSendEcho(
+    icmp: Handle,
+    to: u32,
+    data: *const c_void,
+    size: u16,
+    options: EchoOptions,
+    reply: *mut c_void,
+    reply_size: u32,
+    timeout: u32,
+) -> u32 {
+    if !ip_helper_reaches(
+        "network echo request blocked",
+        Some(ipv4(to)),
+        IP_DEST_NET_UNREACHABLE,
+    ) {
+        return 0;
+    }
+    host!("iphlpapi.dll", "IcmpSendEcho": extern "system" fn(Handle, u32, *const c_void, u16, EchoOptions, *mut c_void, u32, u32) -> u32)(
+        icmp, to, data, size, options, reply, reply_size, timeout,
+    )
+}
+
+/// Refused at once, also when it would have completed through `event` or
+/// `apc`: the last error is not `ERROR_IO_PENDING`, so the caller waits for
+/// nothing.
+pub extern "system" fn IcmpSendEcho2(
+    icmp: Handle,
+    event: Handle,
+    apc: ApcRoutine,
+    apc_context: *mut c_void,
+    to: u32,
+    data: *const c_void,
+    size: u16,
+    options: EchoOptions,
+    reply: *mut c_void,
+    reply_size: u32,
+    timeout: u32,
+) -> u32 {
+    if !ip_helper_reaches(
+        "network echo request blocked",
+        Some(ipv4(to)),
+        IP_DEST_NET_UNREACHABLE,
+    ) {
+        return 0;
+    }
+    host!("iphlpapi.dll", "IcmpSendEcho2": extern "system" fn(Handle, Handle, ApcRoutine, *mut c_void, u32, *const c_void, u16, EchoOptions, *mut c_void, u32, u32) -> u32)(
+        icmp,
+        event,
+        apc,
+        apc_context,
+        to,
+        data,
+        size,
+        options,
+        reply,
+        reply_size,
+        timeout,
+    )
+}
+
+/// See [`IcmpSendEcho2`].
+pub extern "system" fn IcmpSendEcho2Ex(
+    icmp: Handle,
+    event: Handle,
+    apc: ApcRoutine,
+    apc_context: *mut c_void,
+    from: u32,
+    to: u32,
+    data: *const c_void,
+    size: u16,
+    options: EchoOptions,
+    reply: *mut c_void,
+    reply_size: u32,
+    timeout: u32,
+) -> u32 {
+    if !ip_helper_reaches(
+        "network echo request blocked",
+        Some(ipv4(to)),
+        IP_DEST_NET_UNREACHABLE,
+    ) {
+        return 0;
+    }
+    host!("iphlpapi.dll", "IcmpSendEcho2Ex": extern "system" fn(Handle, Handle, ApcRoutine, *mut c_void, u32, u32, *const c_void, u16, EchoOptions, *mut c_void, u32, u32) -> u32)(
+        icmp,
+        event,
+        apc,
+        apc_context,
+        from,
+        to,
+        data,
+        size,
+        options,
+        reply,
+        reply_size,
+        timeout,
+    )
+}
+
+/// See [`IcmpSendEcho2`]; the addresses are `sockaddr_in6`.
+pub extern "system" fn Icmp6SendEcho2(
+    icmp: Handle,
+    event: Handle,
+    apc: ApcRoutine,
+    apc_context: *mut c_void,
+    from: *const u8,
+    to: *const u8,
+    data: *const c_void,
+    size: u16,
+    options: EchoOptions,
+    reply: *mut c_void,
+    reply_size: u32,
+    timeout: u32,
+) -> u32 {
+    let to_ip = socket_addr(to, 28).map(|a| a.ip());
+    if !ip_helper_reaches(
+        "network echo request blocked",
+        to_ip,
+        IP_DEST_NET_UNREACHABLE,
+    ) {
+        return 0;
+    }
+    host!("iphlpapi.dll", "Icmp6SendEcho2": extern "system" fn(Handle, Handle, ApcRoutine, *mut c_void, *const u8, *const u8, *const c_void, u16, EchoOptions, *mut c_void, u32, u32) -> u32)(
+        icmp,
+        event,
+        apc,
+        apc_context,
+        from,
+        to,
+        data,
+        size,
+        options,
+        reply,
+        reply_size,
+        timeout,
+    )
+}
+
+/// An ARP request on the network: unanswered, as with no cable.
+pub extern "system" fn SendARP(to: u32, from: u32, mac: *mut c_void, mac_len: *mut u32) -> u32 {
+    if !ip_helper_reaches(
+        "network address resolution blocked",
+        Some(ipv4(to)),
+        ERROR_BAD_NET_NAME,
+    ) {
+        return ERROR_BAD_NET_NAME;
+    }
+    host!("iphlpapi.dll", "SendARP": extern "system" fn(u32, u32, *mut c_void, *mut u32) -> u32)(
+        to, from, mac, mac_len,
+    )
+}
+
+/// Resolves the row's address (its first field, a `SOCKADDR_INET`) with ARP
+/// or a neighbor solicitation: see [`SendARP`]. A null row is the host's to
+/// refuse.
+pub extern "system" fn ResolveIpNetEntry2(row: *mut u8, from: *const c_void) -> u32 {
+    if !row.is_null()
+        && !ip_helper_reaches(
+            "network address resolution blocked",
+            socket_addr(row, 28).map(|a| a.ip()),
+            ERROR_BAD_NET_NAME,
+        )
+    {
+        return ERROR_BAD_NET_NAME;
+    }
+    host!("iphlpapi.dll", "ResolveIpNetEntry2": extern "system" fn(*mut u8, *const c_void) -> u32)(
+        row, from,
+    )
+}
+
+/// See [`ResolveIpNetEntry2`].
+pub extern "system" fn ResolveNeighbor(
+    addr: *const u8,
+    mac: *mut c_void,
+    mac_len: *mut u32,
+) -> u32 {
+    if !addr.is_null()
+        && !ip_helper_reaches(
+            "network address resolution blocked",
+            any_socket_addr(addr).map(|a| a.ip()),
+            ERROR_BAD_NET_NAME,
+        )
+    {
+        return ERROR_BAD_NET_NAME;
+    }
+    host!("iphlpapi.dll", "ResolveNeighbor": extern "system" fn(*const u8, *mut c_void, *mut u32) -> u32)(
+        addr, mac, mac_len,
+    )
+}
+
 // Forward lookups.
 
 fn blocked_lookup(result: *mut *mut c_void) -> i32 {
@@ -842,7 +1075,7 @@ fn ordinal(name: &'static str, f: usize) -> HleExport {
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "net",
-        dlls: &["ws2_32.dll", "winhttp.dll"],
+        dlls: &["ws2_32.dll", "winhttp.dll", "iphlpapi.dll"],
         exports: vec![
             hle_export!(connect),
             hle_export!(WSAConnect),
@@ -875,6 +1108,13 @@ pub(crate) fn module() -> HleModule {
             hle_export!(WinHttpGetProxyForUrlEx),
             hle_export!(WinHttpGetProxyForUrlEx2),
             hle_export!(WinHttpGetProxySettingsEx),
+            hle_export!(IcmpSendEcho),
+            hle_export!(IcmpSendEcho2),
+            hle_export!(IcmpSendEcho2Ex),
+            hle_export!(Icmp6SendEcho2),
+            hle_export!(SendARP),
+            hle_export!(ResolveIpNetEntry2),
+            hle_export!(ResolveNeighbor),
             ordinal("#2", bind as *const () as usize),
             ordinal("#4", connect as *const () as usize),
             ordinal("#20", sendto as *const () as usize),
@@ -1107,8 +1347,11 @@ mod tests {
         // them only when the host really lacks them.
         const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
+            let ip_helper = ["Icmp", "SendARP", "Resolve"];
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
+            } else if ip_helper.iter().any(|p| e.name.starts_with(p)) {
+                "iphlpapi.dll"
             } else {
                 "ws2_32.dll"
             };
@@ -1118,5 +1361,220 @@ mod tests {
             }
             assert!(present, "{dll} lacks {}", e.name);
         }
+    }
+
+    fn import(name: &str) -> ImportSymbol {
+        ImportSymbol::Name {
+            hint: 0,
+            name: name.into(),
+        }
+    }
+
+    /// What a title's import of `name` from `dll` is bound to.
+    fn bound(dll: &str, name: &str) -> usize {
+        use victory_loader::{ImportResolver, Resolution};
+        match crate::HleResolver::default().resolve(dll, &import(name)) {
+            Resolution::Found { address, .. } => address,
+            Resolution::Missing => panic!("{dll}!{name} is not bound"),
+        }
+    }
+
+    /// The IP helper sends packets of its own (ICMP echo requests, ARP and
+    /// neighbor solicitations), which `connect` and `sendto` never see: those
+    /// calls are ours; the rest of the DLL stays the host's.
+    #[test]
+    fn ip_helper_traffic_is_vetted_here() {
+        use victory_loader::Provenance;
+        let r = crate::HleResolver::default();
+        for call in [
+            "IcmpSendEcho",
+            "IcmpSendEcho2",
+            "IcmpSendEcho2Ex",
+            "Icmp6SendEcho2",
+            "SendARP",
+            "ResolveIpNetEntry2",
+            "ResolveNeighbor",
+        ] {
+            assert_eq!(
+                r.classify("iphlpapi.dll", &import(call)),
+                Some(Provenance::Hle),
+                "{call}"
+            );
+        }
+        for call in ["GetAdaptersAddresses", "IcmpCreateFile", "IcmpCloseHandle"] {
+            assert_eq!(
+                r.classify("iphlpapi.dll", &import(call)),
+                Some(Provenance::Host),
+                "{call}"
+            );
+        }
+    }
+
+    /// The machine's own address on its default route of `family` (a
+    /// connected datagram socket sends nothing): answered by the host, so a
+    /// call that reaches it would succeed; none without a network.
+    fn own_address(v6: bool) -> Option<IpAddr> {
+        let (any, away) = if v6 {
+            ("[::]:0", "[2001:db8::1]:9")
+        } else {
+            ("0.0.0.0:0", "192.0.2.1:9")
+        };
+        let probe = std::net::UdpSocket::bind(any).ok()?;
+        probe.connect(away).ok()?;
+        let ip = probe.local_addr().ok()?.ip();
+        (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+    }
+
+    fn sockaddr_of(ip: IpAddr) -> [u8; 28] {
+        let mut a = [0u8; 28];
+        match ip {
+            IpAddr::V4(ip) => a[..16].copy_from_slice(&v4(ip.octets(), 0)),
+            IpAddr::V6(ip) => {
+                a[..2].copy_from_slice(&AF_INET6.to_le_bytes());
+                a[8..24].copy_from_slice(&ip.octets());
+            }
+        }
+        a
+    }
+
+    /// End to end: an echo request, bound as the title binds it, is answered
+    /// on loopback but never reaches the machine's network address.
+    #[test]
+    fn a_title_echo_request_reaches_loopback_only() {
+        let Some(IpAddr::V4(lan)) = own_address(false) else {
+            return; // no network here
+        };
+        type Echo = extern "system" fn(
+            Handle,
+            u32,
+            *const c_void,
+            u16,
+            *const c_void,
+            *mut c_void,
+            u32,
+            u32,
+        ) -> u32;
+        // SAFETY: the bound functions have these signatures.
+        let (create, close, echo) = unsafe {
+            (
+                std::mem::transmute::<usize, extern "system" fn() -> Handle>(bound(
+                    "iphlpapi.dll",
+                    "IcmpCreateFile",
+                )),
+                std::mem::transmute::<usize, extern "system" fn(Handle) -> i32>(bound(
+                    "iphlpapi.dll",
+                    "IcmpCloseHandle",
+                )),
+                std::mem::transmute::<usize, Echo>(bound("iphlpapi.dll", "IcmpSendEcho")),
+            )
+        };
+        let icmp = create();
+        assert_ne!(icmp as isize, -1);
+        let mut reply = [0u8; 64];
+        let mut ping = |ip: std::net::Ipv4Addr| {
+            let data = b"victory";
+            let to = u32::from_le_bytes(ip.octets());
+            let null = std::ptr::null();
+            echo(
+                icmp,
+                to,
+                data.as_ptr().cast(),
+                7,
+                null,
+                reply.as_mut_ptr().cast(),
+                64,
+                1000,
+            )
+        };
+        assert_eq!(ping(HOME.into()), 1, "loopback answers");
+        let answered = ping(lan);
+        // SAFETY: no arguments.
+        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        close(icmp);
+        assert_eq!(answered, 0, "an echo request reached {lan}");
+        assert_eq!(error, IP_DEST_NET_UNREACHABLE);
+    }
+
+    /// IPv6 echo requests: answered on [::1], never sent to the machine's own
+    /// network address (which would answer).
+    #[test]
+    fn ip_helper_ipv6_echo_reaches_loopback_only() {
+        let create = host!("iphlpapi.dll", "Icmp6CreateFile": extern "system" fn() -> Handle);
+        let close = host!("iphlpapi.dll", "IcmpCloseHandle": extern "system" fn(Handle) -> i32);
+        let icmp = create();
+        assert_ne!(icmp as isize, -1);
+        let (null, null_mut) = (std::ptr::null(), std::ptr::null_mut());
+        let from = sockaddr_of(std::net::Ipv6Addr::UNSPECIFIED.into());
+        let mut reply = [0u8; 64];
+        let mut ping = |to: IpAddr| {
+            let (to, data) = (sockaddr_of(to), b"victory".as_ptr().cast());
+            let out = reply.as_mut_ptr().cast();
+            Icmp6SendEcho2(
+                icmp,
+                null_mut,
+                null,
+                null_mut,
+                from.as_ptr(),
+                to.as_ptr(),
+                data,
+                7,
+                null,
+                out,
+                64,
+                1000,
+            )
+        };
+        assert_eq!(
+            ping(std::net::Ipv6Addr::LOCALHOST.into()),
+            1,
+            "[::1] answers"
+        );
+        if let Some(own) = own_address(true) {
+            let answered = ping(own);
+            // SAFETY: no arguments.
+            let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            assert_eq!(
+                (answered, error),
+                (0, IP_DEST_NET_UNREACHABLE),
+                "an echo request reached {own}"
+            );
+        }
+        close(icmp);
+    }
+
+    /// ARP for the machine's own network address, which the host resolves.
+    #[test]
+    fn ip_helper_arp_stays_on_the_machine() {
+        let Some(IpAddr::V4(lan)) = own_address(false) else {
+            return; // no network here
+        };
+        let (mut mac, mut len) = ([0u32; 2], 6u32);
+        let to = u32::from_le_bytes(lan.octets());
+        assert_eq!(
+            SendARP(to, 0, mac.as_mut_ptr().cast(), &mut len),
+            ERROR_BAD_NET_NAME
+        );
+    }
+
+    /// Neighbor resolution of the machine's own network address, which the
+    /// host resolves: by row and by address.
+    #[test]
+    fn ip_helper_neighbor_resolution_stays_on_the_machine() {
+        let Some(lan) = own_address(false) else {
+            return; // no network here
+        };
+        // A `MIB_IPNET_ROW2` (88 bytes) starts with the address to resolve.
+        let mut row = [0u8; 88];
+        row[..28].copy_from_slice(&sockaddr_of(lan));
+        assert_eq!(
+            ResolveIpNetEntry2(row.as_mut_ptr(), std::ptr::null()),
+            ERROR_BAD_NET_NAME
+        );
+        let (mut mac, mut len) = ([0u32; 8], 32u32);
+        let addr = sockaddr_of(lan);
+        assert_eq!(
+            ResolveNeighbor(addr.as_ptr(), mac.as_mut_ptr().cast(), &mut len),
+            ERROR_BAD_NET_NAME
+        );
     }
 }
