@@ -195,7 +195,12 @@ pub fn track(
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
+                // A load in an earlier block ran once before the loop and
+                // stays uniform; otherwise its first-lane read fails the
+                // waterfall proof for operands loaded inside block `b`.
                 if let Source::Loaded { load, .. } = source
+                    && load.0 == b
+                    && load.1 < i
                     && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
                     && let Some(Term::Value(v)) = a.dynamic.map(|d| t.origin(d))
                     && t.first_lane_source(v).is_some()
@@ -288,9 +293,11 @@ pub fn track(
     }
     // Unproven, an offset read stays the first lane's (one uniform entry),
     // which is what the hardware reads outside a waterfall loop.
-    for (block, (accesses, mut reads, loads)) in offset_at {
+    for (block, (accesses, mut reads, mut loads)) in offset_at {
         reads.sort_unstable();
         reads.dedup();
+        loads.sort_unstable();
+        loads.dedup();
         if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
             out.waterfall.compares.extend(proof.compares);
             out.waterfall.reads.extend(proof.reads);
@@ -2900,6 +2907,39 @@ pub(crate) mod tests {
         };
         let (_, address) = r.scalar.iter().find(|s| s.0 == load).unwrap();
         assert!(address.dynamic.is_some(), "{address:?}");
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [load]);
+    }
+
+    /// [`WATERFALL_INDEXED_WAVE32`] with the pre-loop sampler load taking its
+    /// offset from `v_readfirstlane_b32` in block 0.
+    pub(crate) fn pre_loop_first_lane_waterfall() -> Vec<u32> {
+        let mut words = WATERFALL_INDEXED_WAVE32.to_vec();
+        words.splice(
+            4..6,
+            [
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E2C_0501, // v_readfirstlane_b32 s22, v1
+                0xF408_0203,
+                0x2C00_0000, // s_load_dwordx4 s[8:11], s[6:7], s22
+            ],
+        );
+        words
+    }
+
+    #[test]
+    fn a_first_lane_load_before_a_waterfall_loop_stays_uniform() {
+        let r = waterfall(&pre_loop_first_lane_waterfall(), false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source)
+        };
+        assert_eq!(load.0, 1);
         assert_eq!(r.waterfall.compares.len(), 1);
         assert_eq!(r.waterfall.reads.len(), 1);
         assert_eq!(r.waterfall.loads, [load]);

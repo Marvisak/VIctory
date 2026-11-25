@@ -16,6 +16,10 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    build_with(words, buffers, false)
+}
+
+fn build_with(words: &[u32], buffers: bool, wave_ops: bool) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -72,9 +76,10 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         view_marks: false,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
+    // One access with each lane's own heap index, no wave operation unless
+    // another read stays uniform.
     assert_eq!(lowered.nonuniform_handles, 1);
-    assert!(!lowered.wave_ops);
+    assert_eq!(lowered.wave_ops, wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -237,12 +242,17 @@ fn lanes_load_from_the_buffer_their_nested_arms_chose() {
 
 #[test]
 fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
-    use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
-    let shader = build(WATERFALL_INDEXED_WAVE32, false);
-    for (label, red) in sampled(&shader) {
-        // Even lanes hold entry 0's offset, odd lanes entry 1's.
-        let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
-        assert_eq!(red, want, "{label}");
+    use crate::resource::tests::{WATERFALL_INDEXED_WAVE32, pre_loop_first_lane_waterfall};
+    // Even lanes hold entry 0's offset, odd lanes entry 1's.
+    let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
+    for (words, wave_ops) in [
+        (WATERFALL_INDEXED_WAVE32, false),
+        (&pre_loop_first_lane_waterfall()[..], true),
+    ] {
+        let shader = build_with(words, false, wave_ops);
+        for (label, red) in sampled(&shader) {
+            assert_eq!(red, want, "{label}");
+        }
     }
 }
 
