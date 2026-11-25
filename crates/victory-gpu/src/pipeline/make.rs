@@ -238,17 +238,37 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
+/// Bounds parallel shader/PSO worker threads on <= 16 GiB RAM hosts so
+/// concurrent `victory-shader` structurisation and DXIL compiles stay within
+/// Windows commit and physical memory limits.
+fn worker_count() -> usize {
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    // SAFETY: `dwLength` initialized to the struct size.
+    let total_phys = unsafe {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut mem: MEMORYSTATUSEX = std::mem::zeroed();
+        mem.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        (GlobalMemoryStatusEx(&mut mem) != 0).then_some(mem.ullTotalPhys)
+    };
+    match total_phys {
+        Some(bytes) if bytes <= 18 << 30 => 2,
+        Some(bytes) if bytes <= 26 << 30 => (cores / 2).clamp(2, 4),
+        Some(_) => (cores / 2).clamp(2, 8),
+        None => 2,
+    }
+}
+
 /// Pipelines for the workers: those draws wait for, then those started
 /// early.
 static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
     (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Hands `p` to the workers (bounded by physical RAM and logical cores),
+/// started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let n = worker_count();
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()

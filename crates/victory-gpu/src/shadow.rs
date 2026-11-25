@@ -71,22 +71,25 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool, which keeps the largest up to
-/// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
-/// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
+/// Maximum bytes held idle in the snapshot pool across all buffers.
+const MAX_POOLED_BYTES: usize = 64 << 20;
+
+/// Returns a snapshot buffer to the pool (at most 2 kept and at most
+/// [`MAX_POOLED_BYTES`] total, so large heaps do not pin ~1.4 GiB idle).
 fn give_back(v: Vec<u8>) {
+    if v.capacity() > MAX_POOLED_BYTES {
+        return;
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut total = 0;
-    pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
-    });
+    pool.truncate(2);
+    let mut total: usize = pool.iter().map(Vec::capacity).sum();
+    while total > MAX_POOLED_BYTES {
+        let Some(dropped) = pool.pop() else { break };
+        total -= dropped.capacity();
+    }
 }
-
-/// Snapshot memory kept for reuse.
-const POOL_BYTES: usize = 2 << 30;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.

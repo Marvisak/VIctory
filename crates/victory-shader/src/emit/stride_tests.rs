@@ -193,6 +193,7 @@ fn build(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        max_wave: 64,
         view_marks: false,
     })
     .expect("lower");

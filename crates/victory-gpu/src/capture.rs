@@ -4,6 +4,7 @@
 //! size. Only in builds with diagnostics.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -857,5 +858,15 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    #[test]
+    fn auto_capture_window_matches_three_frames() {
+        assert!(!super::auto_listed(1, 0));
+        assert!(!super::auto_listed(1899, 1900));
+        assert!(super::auto_listed(1900, 1900));
+        assert!(super::auto_listed(1901, 1900));
+        assert!(super::auto_listed(1902, 1900));
+        assert!(!super::auto_listed(1903, 1900));
     }
 }

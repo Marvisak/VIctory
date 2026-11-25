@@ -4,8 +4,9 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -59,6 +60,7 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    formats: Mutex<std::collections::HashMap<u32, (u32, u32)>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -186,7 +188,30 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let high_perf = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .ok()
+                .and_then(|f| {
+                    f.EnumAdapterByGpuPreference::<IDXGIAdapter>(
+                        0,
+                        DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                    )
+                    .ok()
+                });
+            match high_perf {
+                Some(adapter) => {
+                    if let Ok(desc) = adapter.GetDesc() {
+                        let end = desc
+                            .Description
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(desc.Description.len());
+                        let name = String::from_utf16_lossy(&desc.Description[..end]);
+                        tracing::info!(adapter = %name, "host GPU adapter");
+                    }
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            }
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -254,6 +279,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
+            formats: Mutex::default(),
         })
     }
 }
@@ -459,6 +485,42 @@ mod tests {
     }
 }
 
+type DynamicSlotList = Mutex<Vec<(usize, u32, u32)>>;
+type DynamicSlots = Arc<DynamicSlotList>;
+
+/// Dynamic descriptor slot ranges held by lists whose GPU submission has
+/// completed (`Host::execute`), reclaimed on demand when dynamic slots run out.
+static COMPLETED_DYNAMIC: Mutex<VecDeque<Weak<DynamicSlotList>>> = Mutex::new(VecDeque::new());
+
+fn release_dynamic_vec(slots: &DynamicSlotList) -> usize {
+    let entries = std::mem::take(&mut *slots.lock().unwrap_or_else(|e| e.into_inner()));
+    let count = entries.len();
+    for (heap, first, n) in entries {
+        crate::descriptor::release_dynamic(heap, first, n);
+    }
+    count
+}
+
+/// Releases the dynamic descriptor slots of the oldest completed list that still
+/// retains any, returning `true` if any slots were reclaimed.
+pub(crate) fn reclaim_one_completed_dynamic() -> bool {
+    loop {
+        let weak = COMPLETED_DYNAMIC
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        let Some(weak) = weak else {
+            return false;
+        };
+        let Some(slots) = weak.upgrade() else {
+            continue;
+        };
+        if release_dynamic_vec(&slots) > 0 {
+            return true;
+        }
+    }
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -468,6 +530,12 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Dynamic descriptor slot ranges (`heap`, `first`, `count`) allocated by
+    /// draws in this list, released on reset, drop, or on-demand reclamation
+    /// after execution finishes.
+    dynamic: DynamicSlots,
+    /// Whether `dynamic` is already queued in `COMPLETED_DYNAMIC`.
+    dynamic_queued: AtomicBool,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -607,9 +675,6 @@ struct Scratch {
     used: u64,
 }
 
-// SAFETY: the chunk pointers are persistent mappings of upload buffers.
-unsafe impl Send for Scratch {}
-
 const SCRATCH_CHUNK: u64 = 4 << 20;
 const FIRST_SCRATCH_CHUNK: u64 = 64 << 10;
 
@@ -682,6 +747,36 @@ struct Deferred {
 }
 
 impl Host {
+    /// Cached `(Support1, Support2)` flags for host DXGI format `format`.
+    pub(crate) fn format_support(&self, format: u32) -> (u32, u32) {
+        let mut formats = self.formats.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&pair) = formats.get(&format) {
+            return pair;
+        }
+        let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT(format as i32),
+            ..Default::default()
+        };
+        // SAFETY: `data` matches `D3D12_FEATURE_FORMAT_SUPPORT`.
+        let pair = unsafe {
+            if self
+                .device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut data).cast(),
+                    size_of_val(&data) as u32,
+                )
+                .is_ok()
+            {
+                (data.Support1.0 as u32, data.Support2.0 as u32)
+            } else {
+                (0, 0)
+            }
+        };
+        formats.insert(format, pair);
+        pair
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
@@ -714,6 +809,36 @@ impl Host {
                 && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
             tracing::info!(mesh, "host mesh shader support");
             mesh
+        })
+    }
+
+    /// Maximum wave lane count supported by the host GPU (`WaveLaneCountMax`,
+    /// or `0` when wave operations are unsupported); logged once.
+    pub(crate) fn max_wave_size(&self) -> u32 {
+        static MAX_WAVE: OnceLock<u32> = OnceLock::new();
+        *MAX_WAVE.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: plain query into our initialized struct.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let max_wave = if ok && options.WaveOps.as_bool() {
+                options.WaveLaneCountMax
+            } else {
+                0
+            };
+            tracing::info!(
+                max_wave,
+                min_wave = options.WaveLaneCountMin,
+                "host wave lane count"
+            );
+            max_wave
         })
     }
 
@@ -780,6 +905,8 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                dynamic: Arc::default(),
+                dynamic_queued: AtomicBool::new(false),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 rebind: false.into(),
@@ -927,7 +1054,6 @@ impl Host {
             }
             let _ = (i, started);
         }
-        let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -948,6 +1074,16 @@ impl Host {
                 last_notes(runs),
                 removed_during(runs, removed_in)
             ));
+        }
+        for run in runs {
+            if !run.dynamic.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                && !run.dynamic_queued.swap(true, Ordering::Relaxed)
+            {
+                COMPLETED_DYNAMIC
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(Arc::downgrade(&run.dynamic));
+            }
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -1245,7 +1381,28 @@ impl Host {
     }
 }
 
+impl Drop for HostList {
+    fn drop(&mut self) {
+        self.release_dynamic();
+    }
+}
+
 impl HostList {
+    /// Records dynamic descriptor slots `(heap, first, n)` held until reset,
+    /// drop, or post-execution reclamation.
+    pub(crate) fn keep_dynamic(&self, heap: usize, first: u32, n: u32) {
+        self.dynamic
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((heap, first, n));
+    }
+
+    /// Releases any dynamic descriptor slots currently retained by this list.
+    pub(crate) fn release_dynamic(&self) {
+        release_dynamic_vec(&self.dynamic);
+        self.dynamic_queued.store(false, Ordering::Relaxed);
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -1365,6 +1522,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.release_dynamic();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1881,15 +2039,46 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// Maximum gap between two shadow refresh ranges that are coalesced into one
+/// watch/copy span (64 KiB, matching one watch page).
+#[cfg(test)]
+const COALESCE_GAP: usize = 64 << 10;
+
+/// Inserts `[from, to)` into sorted disjoint intervals, merging any within [`COALESCE_GAP`].
+#[cfg(test)]
+fn coalesce_interval(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    let mut merged_from = from;
+    let mut merged_to = to;
+    let mut i = 0;
+    while i < ranges.len() {
+        let (a, b) = ranges[i];
+        if merged_from <= b.saturating_add(COALESCE_GAP)
+            && a <= merged_to.saturating_add(COALESCE_GAP)
+        {
+            merged_from = merged_from.min(a);
+            merged_to = merged_to.max(b);
+            ranges.remove(i);
+        } else if a > merged_to.saturating_add(COALESCE_GAP) {
+            break;
+        } else {
+            i += 1;
+        }
+    }
+    let pos = ranges.partition_point(|&(a, _)| a < merged_from);
+    ranges.insert(pos, (merged_from, merged_to));
+}
+
+/// A submission's refreshes not done yet, merged per buffer copy into sorted
+/// disjoint ranges within [`COALESCE_GAP`]: done before a step that writes
+/// title memory or gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
-///
 /// A copy's range brought up to date is not copied again in the submission
 /// until a step writes title memory: every list of a world submission using
 /// title memory asks for every copy whole. What the title's threads write
@@ -2013,14 +2202,51 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
+    // Something is unmapped: walk memory regions via VirtualQuery so large
+    // uncommitted/unmapped holes are zeroed in one shot instead of 4 KiB syscalls.
+    copy_mapped_fallback(src, dst, len);
+}
+
+fn copy_mapped_fallback(src: *const u8, dst: *mut u8, len: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let end = (src as usize).saturating_add(len);
+    let mut at = src as usize;
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            let chunk = ((at + 4096) & !4095).min(end) - at;
+            let to = dst.wrapping_add(at - src as usize);
+            if !read(at as *const u8, to, chunk) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::Unmapped, chunk as u64);
+                // SAFETY: inside the destination, which is mapped.
+                unsafe { to.write_bytes(0, chunk) };
+            }
+            at += chunk;
+            continue;
+        }
+        let region_end = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .min(end);
+        let chunk = region_end.saturating_sub(at).max(1).min(end - at);
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
+        let readable = info.State == MEM_COMMIT
+            && info.Protect != 0
+            && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+        if !readable {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, chunk as u64);
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { to.write_bytes(0, chunk) };
+        } else if !read(at as *const u8, to, chunk) {
+            for_pieces(at, chunk, 4 << 10, |piece_at, n| {
+                let to = dst.wrapping_add(piece_at - src as usize);
+                if !read(piece_at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     // SAFETY: inside the destination, which is mapped.
@@ -2028,7 +2254,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
                 }
             });
         }
-    });
+        at += chunk;
+    }
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -3013,5 +3240,80 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn completed_dynamic_slots_reclaim_on_demand() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        // Verify queueing a live completed list allows `reclaim_one_completed_dynamic`
+        // to drain and return `true` when it holds dynamic slots.
+        list.keep_dynamic(0, 100, 16);
+        super::COMPLETED_DYNAMIC
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(std::sync::Arc::downgrade(&list.dynamic));
+        assert!(super::reclaim_one_completed_dynamic());
+        assert!(list.dynamic.lock().unwrap().is_empty());
+        assert!(!super::reclaim_one_completed_dynamic());
+    }
+
+    #[test]
+    fn batch_intervals_keep_disjoint_ranges_and_coalesce_nearby() {
+        let mut ranges = Vec::new();
+        super::coalesce_interval(&mut ranges, 0x1000, 0x2000);
+        // Far away (> 64 KiB): stays separate.
+        super::coalesce_interval(&mut ranges, 0x10_0000, 0x10_2000);
+        assert_eq!(ranges, vec![(0x1000, 0x2000), (0x10_0000, 0x10_2000)]);
+
+        // Within 64 KiB of first range: coalesces with first without swallowing second.
+        super::coalesce_interval(&mut ranges, 0x1_0000, 0x1_1000);
+        assert_eq!(ranges, vec![(0x1000, 0x1_1000), (0x10_0000, 0x10_2000)]);
+
+        // Overlapping both: bridges into one interval.
+        super::coalesce_interval(&mut ranges, 0x1_0000, 0x10_0500);
+        assert_eq!(ranges, vec![(0x1000, 0x10_2000)]);
+    }
+
+    #[test]
+    fn copy_mapped_zeroes_uncommitted_holes_and_preserves_committed_ends() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const CHUNK: usize = 64 << 10;
+        const TOTAL: usize = 4 * CHUNK;
+        // SAFETY: reserving a fresh 256 KiB region and committing only the ends.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        // SAFETY: committing only the head and tail 64 KiB chunks inside our reserved region.
+        let head = unsafe { VirtualAlloc(base, CHUNK, MEM_COMMIT, PAGE_READWRITE) };
+        // SAFETY: tail offset is inside our 4-chunk reservation.
+        let tail = unsafe {
+            VirtualAlloc(
+                base.cast::<u8>().add(3 * CHUNK).cast(),
+                CHUNK,
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!head.is_null() && !tail.is_null());
+
+        // SAFETY: both end 64 KiB chunks were just committed read-write.
+        unsafe {
+            std::slice::from_raw_parts_mut(head.cast::<u8>(), CHUNK).fill(0x5A);
+            std::slice::from_raw_parts_mut(tail.cast::<u8>(), CHUNK).fill(0xC3);
+        }
+
+        let mut dst = vec![0xAAu8; TOTAL];
+        super::copy_mapped(dst.as_mut_ptr(), base.cast::<u8>(), TOTAL, false);
+
+        assert!(dst[..CHUNK].iter().all(|&b| b == 0x5A));
+        assert!(dst[CHUNK..3 * CHUNK].iter().all(|&b| b == 0));
+        assert!(dst[3 * CHUNK..].iter().all(|&b| b == 0xC3));
+
+        // SAFETY: freeing our own VirtualAlloc reservation.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }
 }
