@@ -670,7 +670,22 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&lists[0], &lists[1]]);
         assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
-        assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
+        // The copies' views sit in the pair range past the dynamic slots.
+        // SAFETY: a plain query of the live heap.
+        let total = unsafe { views.heap.GetDesc().NumDescriptors };
+        if total < victory_shader::emit::HEAP_VIEWS {
+            // A host that caps its shader-visible heaps (NVIDIA) has no
+            // pair range: [`HostHeap::pair`] hands the dynamic slots out
+            // instead, and only their being kept is checked below.
+            eprintln!(
+                "the device caps its shader-visible heap below the pair range ({pairs:?}); the pair-range assertion is skipped"
+            );
+        } else {
+            assert!(
+                pairs.0 >= views.pair_base() && pairs.1 >= views.pair_base(),
+                "past the dynamic slots: {pairs:?}"
+            );
+        }
         // A second submission, after a third copy came.
         let c = copy(memory[2], 1);
         for list in &lists {

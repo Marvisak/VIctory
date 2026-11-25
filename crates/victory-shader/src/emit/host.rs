@@ -129,6 +129,27 @@ impl Host {
         }
     }
 
+    /// Whether the device takes the whole shader-visible view heap: a heap
+    /// of [`super::HEAP_VIEWS`] slots, which a test's null buffer views at
+    /// [`super::NULL_BUFFER_VIEW`] have to sit at. NVIDIA's laptop drivers
+    /// cap shader-visible heaps at a million (`victory-gpu` caps them the
+    /// same way, `PORTABLE_VIEWS`), so there the slots past do not exist.
+    pub fn takes_the_whole_heap(&self) -> bool {
+        // SAFETY: a plain heap creation, given straight back.
+        unsafe {
+            self.device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(
+                    &D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: super::HEAP_VIEWS,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        ..Default::default()
+                    },
+                )
+                .is_ok()
+        }
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.

@@ -333,6 +333,14 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
             // The texture at heap index 1, the UAV's table at 0.
             ud[u.index as usize] = u32::from(u.root == RootType::Constants);
         }
+        // The null views sit at the end of a [`super::HEAP_VIEWS`]-slot
+        // heap; a device that caps its shader-visible heaps below that
+        // (NVIDIA, `Host::takes_the_whole_heap`) has no such slots, and the
+        // translated null index would read past every one it takes.
+        if !host.takes_the_whole_heap() {
+            eprintln!("{label}: the device caps its shader-visible heaps below the heap's end; skipped");
+            continue;
+        }
         let dispatch = Dispatch {
             // Heap index 1 holds no buffer view: stride 0.
             roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0] })],
