@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! End-to-end tests of waterfall loops over per-lane descriptors: the
 //! synthetic GFX10 programs of `resource::tests` lowered to DXIL, validated
 //! by `dxil.dll` when present, and run on the host GPU and WARP, each lane

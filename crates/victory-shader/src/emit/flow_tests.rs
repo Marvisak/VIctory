@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Control flow and lanes, differentially: HLSL shapes that exercise the
 //! structurisation (nested branches with early returns, loops with
 //! divergent exits and values read after them, `break`/`continue`, a

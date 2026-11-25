@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Synthetic GFX10 programs of what the 2020 compiler does not produce,
 //! lowered to DXIL, validated by `dxil.dll` when present, and run on the
 //! host GPU and WARP. Gathers at a level (`image_gather4_l`, `_l_o`), which

@@ -8,6 +8,16 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     let dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("set by cargo"));
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let version = std::process::Command::new(rustc).arg("-vV").output();
+    let hash = source_hash(&dir, &version.map(|o| o.stdout).unwrap_or_default());
+    for watched in ["src", "Cargo.toml", "build.rs", "../../Cargo.lock"] {
+        println!("cargo:rerun-if-changed={watched}");
+    }
+    println!("cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={hash:016x}");
+}
+
+pub(crate) fn source_hash(dir: &Path, rustc_version: &[u8]) -> u64 {
     let mut files = vec![
         dir.join("Cargo.toml"),
         dir.join("build.rs"),
@@ -18,25 +28,26 @@ fn main() {
     // SipHash with fixed keys: stable for one compiler, whose version is
     // hashed too.
     let mut h = DefaultHasher::new();
-    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-    let version = std::process::Command::new(rustc).arg("-vV").output();
-    h.write(&version.map(|o| o.stdout).unwrap_or_default());
+    h.write(rustc_version);
     for f in &files {
         let name = f
-            .strip_prefix(&dir)
+            .strip_prefix(dir)
             .unwrap_or(f)
             .to_string_lossy()
             .replace('\\', "/");
+        let contents = std::fs::read(f).unwrap_or_default();
+        // Test-only modules opt out by putting their inner cfg first. Rust
+        // enforces the guard even if the module declaration later changes.
+        if name.starts_with("src/")
+            && name.ends_with(".rs")
+            && contents.starts_with(b"#![cfg(test)]")
+        {
+            continue;
+        }
         h.write(name.as_bytes());
-        h.write(&std::fs::read(f).unwrap_or_default());
+        h.write(&contents);
     }
-    for watched in ["src", "Cargo.toml", "build.rs", "../../Cargo.lock"] {
-        println!("cargo:rerun-if-changed={watched}");
-    }
-    println!(
-        "cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={:016x}",
-        h.finish()
-    );
+    h.finish()
 }
 
 fn sources(dir: &Path, out: &mut Vec<PathBuf>) {

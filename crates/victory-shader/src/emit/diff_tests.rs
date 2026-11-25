@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Differential tests: HLSL compiled by the console's shader compiler and
 //! translated, against the same HLSL compiled for PC, both drawn (or
 //! dispatched) on the host GPU with the same inputs.

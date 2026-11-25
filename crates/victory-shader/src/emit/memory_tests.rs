@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Title memory at addresses the program computes (decision 0005, the
 //! unified-memory item), run on the host GPU and WARP with the test host
 //! serving the contract (`emit` "Title memory"): a synthetic GFX10 program

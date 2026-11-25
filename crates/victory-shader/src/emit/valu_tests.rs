@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! End-to-end tests of synthetic GFX10 VALU shaders lowered to DXIL, validated
 //! by `dxil.dll` when present, and executed on the host GPU and WARP.
 //!

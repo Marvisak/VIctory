@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! End-to-end tests of descriptors whose emission needs more than one
 //! binding: a buffer read by element through the resource heap (no
 //! used-resource entry, so no stride; the view-stride table gives it), and

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! The BVH intersection emulation (`lower::bvh`): a CPU reference of the
 //! box and triangle tests with their edge cases, and synthetic GFX10
 //! programs running `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`

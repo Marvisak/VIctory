@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Single console instructions as the lowering computes them, against what
 //! the console GPU computes.
 //!
