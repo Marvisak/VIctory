@@ -873,6 +873,10 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Publish staged HostHeap descriptor and side-table updates under the
+        // submission lock right before `ExecuteCommandLists` so this batch sees
+        // them while concurrent title rewrites stay staged until the next flush.
+        crate::descriptor::flush_heaps();
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1009,7 +1013,9 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
-        // The submission has run and the next waits for our lock.
+        // The submission has run and the next waits for our lock: publish any
+        // HostHeap writes staged during it before releasing retired resources.
+        crate::descriptor::flush_heaps();
         release_retired();
         self.log_messages();
         // A listed frame: what this submission's lists drew, as it is now
@@ -1191,8 +1197,15 @@ impl Host {
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
                     tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
-                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
-                        first_error = Some(text.to_owned());
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                        #[cfg(test)]
+                        {
+                            DEBUG_ERRORS.fetch_add(1, Ordering::Relaxed);
+                            *LAST_DEBUG_ERROR.lock().unwrap() = text.to_owned();
+                        }
+                        if first_error.is_none() {
+                            first_error = Some(text.to_owned());
+                        }
                     }
                 }
             }
@@ -2707,6 +2720,20 @@ pub(crate) fn retire(resource: ID3D12Resource) {
 pub(crate) fn release_retired() {
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
     drop(retired);
+}
+
+#[cfg(test)]
+static DEBUG_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+static LAST_DEBUG_ERROR: Mutex<String> = Mutex::new(String::new());
+
+#[cfg(test)]
+pub(crate) fn debug_errors() -> (u64, String) {
+    (
+        DEBUG_ERRORS.load(Ordering::Relaxed),
+        LAST_DEBUG_ERROR.lock().unwrap().clone(),
+    )
 }
 
 /// Diagnostics: a noted command running a shader `VICTORY_TRACE_SHADERS`

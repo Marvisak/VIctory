@@ -188,13 +188,22 @@ pub(crate) fn log_frame() {
     );
 }
 
+static HEAP: std::sync::OnceLock<Option<crate::descriptor::host::HostHeap>> =
+    std::sync::OnceLock::new();
+
 /// Our view heap for lists that bind none of the title's (dynamic slots
 /// only).
 pub(crate) fn heap() -> Option<&'static crate::descriptor::host::HostHeap> {
-    static HEAP: std::sync::OnceLock<Option<crate::descriptor::host::HostHeap>> =
-        std::sync::OnceLock::new();
     HEAP.get_or_init(|| crate::descriptor::host::HostHeap::new(false, 0))
         .as_ref()
+}
+
+/// Publishes staged updates on the internal view heap when
+/// `descriptor::flush_heaps` runs around each `Host::execute` submission.
+pub(crate) fn flush_heap() {
+    if let Some(Some(heap)) = HEAP.get() {
+        heap.flush();
+    }
 }
 
 /// The page table for host copies of title memory `copies` (start,

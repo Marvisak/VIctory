@@ -98,6 +98,7 @@ impl Heap {
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
+                h.flush();
                 Some(h)
             })
             .as_ref()
@@ -187,6 +188,25 @@ pub(crate) fn sync_heaps() {
             }
         }
     }
+}
+
+/// Publishes staged descriptor, stride, mark and view-address updates on
+/// every live host heap; called under `Host::execute`'s submission lock
+/// right before `ExecuteCommandLists` and again after the submission has
+/// waited for completion, before `release_retired`.
+#[cfg(windows)]
+pub(crate) fn flush_heaps() {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped, which
+        // waits for `SHADER_HEAPS`).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            host.flush();
+        }
+    }
+    drop(heaps);
+    crate::memory::flush_heap();
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at

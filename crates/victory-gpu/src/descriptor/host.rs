@@ -55,8 +55,46 @@ pub(crate) struct HostHeap {
     /// address as data, `crate::memory`): the buffer, its mapping and host
     /// address, made on first use.
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
+    /// CPU-staged descriptor, stride, mark and view-address writes published
+    /// onto the shader-visible heap and tables by [`HostHeap::flush`] (called
+    /// under `Host::execute`'s submission lock before `ExecuteCommandLists` and
+    /// again after waiting for completion, before `release_retired`).
+    staged: Mutex<Staged>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
+}
+
+const STAGED_CHUNK: u32 = 4096;
+
+struct StagedChunk {
+    _heap: ID3D12DescriptorHeap,
+    cpu: usize,
+}
+
+#[derive(Clone, Copy)]
+struct StagedSlot {
+    index: u32,
+    descriptor: D3D12_CPU_DESCRIPTOR_HANDLE,
+    stride: u32,
+    mark: Option<(u32, u32)>,
+    address: Option<[u32; 2]>,
+}
+
+#[derive(Default)]
+struct Staged {
+    chunks: Vec<StagedChunk>,
+    current: usize,
+    used: u32,
+    inflight: usize,
+    slots: Vec<StagedSlot>,
+    /// View-address entries already published to the shader-visible heap;
+    /// `view_addresses` initializes from here rather than `made` so unflushed
+    /// slot updates never leak ahead of `flush`.
+    published_addresses: Vec<[u32; 2]>,
+    /// Mapped pointer of the `addresses` upload buffer once created.
+    addresses_data: Option<usize>,
+    #[cfg(test)]
+    fail_alloc: bool,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -96,6 +134,14 @@ const DYNAMIC: u32 = 1 << 18;
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+/// Logs `what` the first time it happens.
+macro_rules! once {
+    ($($arg:tt)*) => {{
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!($($arg)*));
+    }};
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -203,6 +249,14 @@ impl HostHeap {
             strides,
             marks,
             addresses: std::sync::OnceLock::new(),
+            staged: Mutex::new(Staged {
+                published_addresses: if sampler {
+                    Vec::new()
+                } else {
+                    vec![[0, 0]; count as usize]
+                },
+                ..Default::default()
+            }),
             viewed: Default::default(),
         };
         if !sampler {
@@ -222,8 +276,9 @@ impl HostHeap {
         // views at computed heap indices"): a null raw SRV, and UAV below it.
         let null = victory_shader::emit::NULL_BUFFER_VIEW;
         if !sampler && null > count + extra && null < total {
-            h.raw_view_at(null, None, 0, 0, false);
-            h.raw_view_at(null - 1, None, 0, 0, true);
+            h.raw_view_at(null, None, 0, 0, false, None);
+            h.raw_view_at(null - 1, None, 0, 0, true, None);
+            h.flush();
         } else if !sampler {
             tracing::warn!(count, total, "no room for the null buffer views: computed indices of slots without a buffer view read what is there");
         }
@@ -266,12 +321,6 @@ impl HostHeap {
             }
         }
         Ok(())
-    }
-
-    /// A plain point sampler at slot `index`, for sampler slots without a
-    /// view.
-    fn null_sampler(&self, index: u32) {
-        null_sampler(self.cpu(index));
     }
 }
 
@@ -383,24 +432,203 @@ impl HostHeap {
         }
     }
 
+    /// Allocates `N` CPU-only staging descriptor handles (`N <= STAGED_CHUNK`)
+    /// paired with [`HostHeap::finish_slots`].
+    fn alloc_staged<const N: usize>(&self) -> Option<[D3D12_CPU_DESCRIPTOR_HANDLE; N]> {
+        let host = host()?;
+        let kind = if self.sampler {
+            D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
+        } else {
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+        };
+        let need = N as u32;
+        let mut s = self.staged.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        if s.fail_alloc {
+            return None;
+        }
+        while s.current < s.chunks.len() {
+            if s.used + need <= STAGED_CHUNK {
+                break;
+            }
+            (s.current, s.used) = (s.current + 1, 0);
+        }
+        if s.current == s.chunks.len() {
+            // SAFETY: plain CPU-only descriptor heap creation.
+            let heap: ID3D12DescriptorHeap = match unsafe {
+                host.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: kind,
+                        NumDescriptors: STAGED_CHUNK,
+                        ..Default::default()
+                    })
+            } {
+                Ok(heap) => heap,
+                Err(e) => {
+                    once!(
+                        error = %e,
+                        code = e.code().0,
+                        "failed to allocate descriptor staging chunk; writing host descriptors directly"
+                    );
+                    return None;
+                }
+            };
+            // SAFETY: a live CPU descriptor heap.
+            let cpu = unsafe { heap.GetCPUDescriptorHandleForHeapStart().ptr };
+            s.chunks.push(StagedChunk { _heap: heap, cpu });
+            s.used = 0;
+        }
+        let base = s.chunks[s.current].cpu + (s.used * self.step) as usize;
+        s.used += need;
+        s.inflight += N;
+        Some(std::array::from_fn(|i| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: base + i * self.step as usize,
+        }))
+    }
+
+    /// Allocates `N` CPU staging handles, or falls back to the host heap's
+    /// direct handles at `indices` when staging allocation fails. Returns
+    /// `(handles, true)` when staged and `(handles, false)` for direct writes.
+    fn target_handles<const N: usize>(
+        &self,
+        indices: [u32; N],
+    ) -> ([D3D12_CPU_DESCRIPTOR_HANDLE; N], bool) {
+        if let Some(handles) = self.alloc_staged() {
+            (handles, true)
+        } else {
+            let mut s = self.staged.lock().unwrap_or_else(|e| e.into_inner());
+            s.slots.retain(|queued| !indices.contains(&queued.index));
+            (indices.map(|i| self.cpu(i)), false)
+        }
+    }
+
+    /// Writes stride, mark and view-address side tables for `slot`, updating
+    /// `published_addresses` when `slot` carries a title-slot address.
+    fn write_side_tables(&self, slot: &StagedSlot, staged: &mut Staged) {
+        let limit = self.count.max(victory_shader::emit::HEAP_VIEWS);
+        if let Some(&(_, data)) = self.strides.as_ref()
+            && slot.index < limit
+        {
+            // SAFETY: a dword inside the mapped stride table.
+            unsafe {
+                (data as *mut u32)
+                    .add(slot.index as usize)
+                    .write_volatile(slot.stride);
+            }
+        }
+        if let Some(&(_, data)) = self.marks.as_ref()
+            && slot.index < limit
+        {
+            let entry = slot
+                .mark
+                .unwrap_or((victory_shader::emit::VIEW_MARK_NONE, 0));
+            // SAFETY: two dwords inside the mapped mark table.
+            unsafe {
+                let at = (data as *mut u32).add(2 * slot.index as usize);
+                at.write_volatile(entry.0);
+                at.add(1).write_volatile(entry.1);
+            }
+        }
+        if let Some(words) = slot.address
+            && let Some(entry) = staged.published_addresses.get_mut(slot.index as usize)
+        {
+            *entry = words;
+            if let Some(data) = staged.addresses_data {
+                // SAFETY: 8 bytes inside the mapped view-address table (`slot.index < self.count`).
+                unsafe {
+                    ((data + 8 * slot.index as usize) as *mut [u32; 2]).write_unaligned(words);
+                }
+            }
+        }
+    }
+
+    fn finish_slots(&self, slots: &[StagedSlot], staged: bool) {
+        let mut s = self.staged.lock().unwrap_or_else(|e| e.into_inner());
+        if staged {
+            s.slots.extend_from_slice(slots);
+            s.inflight -= slots.len();
+        } else {
+            // Drop any older queued updates for these slots so the next
+            // `flush` cannot overwrite this direct write.
+            s.slots
+                .retain(|queued| !slots.iter().any(|slot| slot.index == queued.index));
+            for slot in slots {
+                self.write_side_tables(slot, &mut s);
+            }
+        }
+    }
+
+    /// Publishes staged slot updates (descriptor, stride, mark and view address)
+    /// to the shader-visible heap and tables; called under `Host::execute`'s
+    /// submission lock before `ExecuteCommandLists` and again after waiting for
+    /// completion, before `release_retired`.
+    pub(crate) fn flush(&self) {
+        let Some(host) = host() else { return };
+        let kind = if self.sampler {
+            D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
+        } else {
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+        };
+        let mut s = self.staged.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slots = std::mem::take(&mut s.slots);
+        for &slot in &slots {
+            // SAFETY: `slot.descriptor` is a populated CPU staging slot and
+            // `flush` runs under `Host::execute`'s submission lock while no GPU
+            // submission is executing on `self.heap`.
+            unsafe {
+                host.device
+                    .CopyDescriptorsSimple(1, self.cpu(slot.index), slot.descriptor, kind);
+            }
+            self.write_side_tables(&slot, &mut s);
+        }
+        slots.clear();
+        s.slots = slots;
+        if s.inflight == 0 {
+            (s.current, s.used) = (0, 0);
+        }
+    }
+
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let (kept, mark) = make_marked(view, self.cpu(index));
+        let ([at], staged) = self.target_handles([index]);
+        let (kept, mark) = make_marked(view, at);
         if kept.is_none() {
-            null_for(view, self.cpu(index));
+            if self.sampler {
+                null_sampler(at);
+            } else {
+                null_for(view, at);
+            }
         }
+        let stride = if self.sampler { 0 } else { view_stride(view) };
+        self.finish_slots(
+            &[StagedSlot {
+                index,
+                descriptor: at,
+                stride,
+                mark,
+                address: None,
+            }],
+            staged,
+        );
         self.keep(index, kept.flatten());
-        self.set_stride(index, Some(view));
-        self.set_mark(index, mark);
     }
 
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
     /// unordered access (`uav`), of `bytes` of `buffer` from byte `first`
     /// (both multiples of 4), which it holds; a null one for no buffer, or
     /// for unordered access to a buffer shaders cannot write.
-    pub(crate) fn raw_view_at(&self, index: u32, buffer: Option<&ID3D12Resource>, first: u64, bytes: u64, uav: bool) {
+    pub(crate) fn raw_view_at(
+        &self,
+        index: u32,
+        buffer: Option<&ID3D12Resource>,
+        first: u64,
+        bytes: u64,
+        uav: bool,
+        mark: Option<(u32, u32)>,
+    ) {
         let Some(host) = host() else { return };
+        let ([at], staged) = self.target_handles([index]);
         let writable = |b: &ID3D12Resource| {
             // SAFETY: a live buffer.
             unsafe { b.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
@@ -412,7 +640,7 @@ impl HostHeap {
             // A null view still names its size.
             None => (0, 1),
         };
-        // SAFETY: a slot of our heap; the buffer is live (or none: a null view).
+        // SAFETY: a CPU staging or host slot of ours; the buffer is live (or none).
         unsafe {
             if uav {
                 let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -428,7 +656,7 @@ impl HostHeap {
                     },
                 };
                 host.device
-                    .CreateUnorderedAccessView(buffer, None, Some(&desc), self.cpu(index));
+                    .CreateUnorderedAccessView(buffer, None, Some(&desc), at);
             } else {
                 let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                     Format: DXGI_FORMAT_R32_TYPELESS,
@@ -444,66 +672,50 @@ impl HostHeap {
                     },
                 };
                 host.device
-                    .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index));
+                    .CreateShaderResourceView(buffer, Some(&desc), at);
             }
         }
+        self.finish_slots(
+            &[StagedSlot {
+                index,
+                descriptor: at,
+                stride: 4,
+                mark: buffer.and(mark),
+                address: None,
+            }],
+            staged,
+        );
         self.keep(index, buffer.map(|b| (b.clone(), None)));
-        self.write_stride(index, 4);
-        self.set_mark(index, None);
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        let ([at], staged) = self.target_handles([index]);
         if self.sampler {
-            self.null_sampler(index);
+            null_sampler(at);
         } else {
-            null_view(self.cpu(index));
+            null_view(at);
         }
-        self.keep(index, None);
-        self.set_stride(index, None);
-        self.set_mark(index, None);
+        let address = (!self.sampler && index < self.count).then_some([0, 0]);
+        self.finish_slots(
+            &[StagedSlot {
+                index,
+                descriptor: at,
+                stride: 0,
+                mark: None,
+                address,
+            }],
+            staged,
+        );
         if index < self.count {
             self.viewed.set(index, None, false);
         }
-    }
-
-    /// Enters the byte stride of `view` (0 for none or not a buffer view)
-    /// for slot `index` in the view-stride table.
-    fn set_stride(&self, index: u32, view: Option<&View>) {
-        self.write_stride(index, view.map_or(0, view_stride));
-    }
-
-    fn write_stride(&self, index: u32, stride: u32) {
-        let Some((_, data)) = &self.strides else { return };
-        if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
-            return;
-        }
-        // SAFETY: a dword of the mapped table, which has one per slot below
-        // the larger of the title's count and `HEAP_VIEWS`.
-        unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
+        self.keep(index, None);
     }
 
     /// The view-stride table, for root SRV `VIEW_STRIDES`.
     pub(crate) fn strides(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|(buffer, _)| buffer)
-    }
-
-    /// Enters slot `index`'s view-mark entry: the mark bit and phase of the
-    /// unordered buffer view there ([`crate::shadow::Shadow::mark_entry`]),
-    /// none for anything else.
-    pub(crate) fn set_mark(&self, index: u32, entry: Option<(u32, u32)>) {
-        let Some((_, data)) = &self.marks else { return };
-        if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
-            return;
-        }
-        let entry = entry.unwrap_or((victory_shader::emit::VIEW_MARK_NONE, 0));
-        // SAFETY: two dwords of the mapped table, which has two per slot
-        // below the larger of the title's count and `HEAP_VIEWS`.
-        unsafe {
-            let at = (*data as *mut u32).add(2 * index as usize);
-            at.write_volatile(entry.0);
-            at.add(1).write_volatile(entry.1);
-        }
     }
 
     /// The view-mark table, for the root SRV of shaders marking their writes.
@@ -538,29 +750,34 @@ impl HostHeap {
     }
 
     /// The host address of the slots' view addresses (see the field), made
-    /// on first use from the slots made so far.
+    /// on first use from the slots already published to the host heap (and
+    /// updated alongside descriptors when staged slots flush).
     pub(crate) fn view_addresses(&self) -> Option<u64> {
+        if self.sampler {
+            return None;
+        }
         let made = self.addresses.get_or_init(|| {
             let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 8)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            for (i, &key) in made.iter().enumerate() {
-                let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
-                write_address(data, i, view.as_ref());
-            }
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let mut s = self.staged.lock().unwrap_or_else(|e| e.into_inner());
+            if !s.published_addresses.is_empty() {
+                // SAFETY: `data` is mapped for `self.count * 8` bytes and
+                // `s.published_addresses` holds `self.count` entries of `[u32; 2]`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        s.published_addresses.as_ptr(),
+                        data as *mut [u32; 2],
+                        s.published_addresses.len(),
+                    );
+                }
+            }
+            s.addresses_data = Some(data);
             Some((buffer, data, gpu))
         });
         made.as_ref().map(|m| m.2)
-    }
-
-    /// Slot `index` now holds `view` (or no view): its view address.
-    fn note_address(&self, index: u32, view: Option<&View>) {
-        if let Some(Some((_, data, _))) = self.addresses.get() {
-            write_address(*data, index as usize, view);
-        }
     }
 
     /// Makes slots `index` and `index + 1` (dynamic ones) a raw shader
@@ -569,6 +786,7 @@ impl HostHeap {
     /// buffer.
     pub(crate) fn raw_pair_at(&self, index: u32, buffer: Option<&ID3D12Resource>, bytes: u64) {
         let Some(host) = host() else { return };
+        let ([at0, at1], staged) = self.target_handles([index, index + 1]);
         // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw);
         // a longer copy's rest reads 0 through it.
         let elements = (bytes / 4).min(1 << 27) as u32;
@@ -596,20 +814,35 @@ impl HostHeap {
                 },
             },
         };
-        // SAFETY: slots of our heap; the buffer is live (or none: null views).
+        // SAFETY: CPU staging or host slots of ours; the buffer is live (or none).
         unsafe {
             host.device
-                .CreateShaderResourceView(buffer, Some(&srv), self.cpu(index));
+                .CreateShaderResourceView(buffer, Some(&srv), at0);
             host.device
-                .CreateUnorderedAccessView(buffer, None, Some(&uav), self.cpu(index + 1));
+                .CreateUnorderedAccessView(buffer, None, Some(&uav), at1);
         }
+        // Writes through these are title memory's, marked in its page table.
+        self.finish_slots(
+            &[
+                StagedSlot {
+                    index,
+                    descriptor: at0,
+                    stride: 4,
+                    mark: None,
+                    address: None,
+                },
+                StagedSlot {
+                    index: index + 1,
+                    descriptor: at1,
+                    stride: 4,
+                    mark: None,
+                    address: None,
+                },
+            ],
+            staged,
+        );
         self.keep(index, buffer.map(|b| (b.clone(), None)));
         self.keep(index + 1, buffer.map(|b| (b.clone(), None)));
-        self.write_stride(index, 4);
-        self.write_stride(index + 1, 4);
-        // Writes through these are title memory's, marked in its page table.
-        self.set_mark(index, None);
-        self.set_mark(index + 1, None);
     }
 
     /// The shader-visible handle of slot `index`.
@@ -658,13 +891,11 @@ impl HostHeap {
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);
-                self.note_address(index, None);
             }
             return None;
         };
         if made[index as usize] != key {
-            self.set_stride(index, Some(&view));
-            self.note_address(index, Some(&view));
+            let ([at], staged) = self.target_handles([index]);
             // Shaders index the heap itself (`crate::bindless`): buffer views
             // are made when written.
             // shortcut: views of textures the title placed itself are made
@@ -672,16 +903,34 @@ impl HostHeap {
             // staging copy) for each of the ~20,000 the title has views of
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
-            made[index as usize] = if later { 0 } else { key };
             let (kept, mark) = if later {
                 (None, None)
             } else {
-                make_marked(&view, self.cpu(index))
+                make_marked(&view, at)
             };
-            self.set_mark(index, mark);
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+            if kept.is_none() {
+                if self.sampler {
+                    null_sampler(at);
+                } else {
+                    null_for(&view, at);
+                }
             }
+            let (stride, address) = if self.sampler {
+                (0, None)
+            } else {
+                (view_stride(&view), Some(address_words(Some(&view))))
+            };
+            made[index as usize] = if later { 0 } else { key };
+            self.finish_slots(
+                &[StagedSlot {
+                    index,
+                    descriptor: at,
+                    stride,
+                    mark,
+                    address,
+                }],
+                staged,
+            );
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
@@ -716,14 +965,6 @@ impl HostHeap {
     pub(crate) fn made(&self, index: u32) -> bool {
         self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
     }
-}
-
-/// Logs `what` the first time it happens.
-macro_rules! once {
-    ($($arg:tt)*) => {{
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!($($arg)*));
-    }};
 }
 
 /// A view description from its words, with the format as the host has it.
@@ -803,14 +1044,9 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// Writes slot `index`'s view address into the view addresses at `data`:
-/// a buffer view's title address (dword 0 low, dword 1 bits 0-15 high);
-/// zeros for anything else.
-fn write_address(data: usize, index: usize, view: Option<&View>) {
+fn address_words(view: Option<&View>) -> [u32; 2] {
     let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-    let words = [address as u32, (address >> 32) as u32 & 0xFFFF];
-    // SAFETY: the mapped view addresses hold 8 bytes per title slot.
-    unsafe { ((data + 8 * index) as *mut [u32; 2]).write_unaligned(words) };
+    [address as u32, (address >> 32) as u32 & 0xFFFF]
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
@@ -1520,7 +1756,7 @@ mod tests {
                 ((**unknown).Release)(raw)
             };
             let slot = heap.count + 2;
-            heap.raw_view_at(slot, Some(&buffer), 0, 256, false);
+            heap.raw_view_at(slot, Some(&buffer), 0, 256, false, None);
             assert_eq!(references(&buffer), 2, "ours and the slot's");
             heap.make_null(slot);
             assert!(references(&buffer) >= 2, "the slot's, retired");
@@ -1562,5 +1798,993 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    #[test]
+    fn concurrent_slot_rewrites_do_not_corrupt_in_flight_32_list_submission() {
+        use crate::object::{S_OK, This, guid};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+
+        const CS: &str = r#"
+#define RS "DescriptorTable(SRV(t0, flags = DESCRIPTORS_VOLATILE), UAV(u0, numDescriptors = 2, flags = DESCRIPTORS_VOLATILE)), RootConstants(num32BitConstants=1, b0), UAV(u2)"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+RWTexture3D<uint> vol : register(u1);
+RWStructuredBuffer<uint> started : register(u2);
+cbuffer StepBuf : register(b0) { uint step_idx; };
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x == 0 && (step_idx % 32u) == 0u) {
+        started[0] = 1u;
+    }
+    uint acc = src.Load((id.x & 63) * 4);
+    for (uint k = 0; k < 128; ++k) {
+        acc = (acc ^ (k + step_idx)) + 1u;
+    }
+    if (id.x < 64) {
+        dst.Store(id.x * 4, acc);
+    }
+    vol[uint3(id.x & 3, (id.x >> 2) & 3, step_idx & 3)] = acc;
+}
+"#;
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = host() else { return };
+
+        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+        // SAFETY: static source and entry point strings.
+        unsafe {
+            if let Err(e) = D3DCompile(
+                CS.as_ptr().cast(),
+                CS.len(),
+                s!("multilist_sync"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            ) {
+                let msg = errors.map(|b| {
+                    String::from_utf8_lossy(std::slice::from_raw_parts(
+                        b.GetBufferPointer().cast::<u8>(),
+                        b.GetBufferSize(),
+                    ))
+                    .into_owned()
+                });
+                panic!("D3DCompile failed: {e}: {msg:?}");
+            }
+        }
+        let blob = code.unwrap();
+        // SAFETY: valid compiled DXBC blob.
+        let (root, pso) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                blob.GetBufferPointer().cast::<u8>(),
+                blob.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+
+        let make_res = |dim: u32, w: u64, h: u32, d: u16, fmt: u32, flags: u32| -> This {
+            let desc: [u32; 14] = [
+                dim,
+                0,
+                0,
+                0,
+                w as u32,
+                (w >> 32) as u32,
+                h,
+                u32::from(d) | 1 << 16,
+                fmt,
+                1,
+                0,
+                0x100,
+                flags,
+                0,
+            ];
+            let props = [1u32, 0, 0, 0, 0];
+            let iid = guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let mut out = std::ptr::null();
+            assert_eq!(
+                crate::resource::create_committed(
+                    std::ptr::null(),
+                    props.as_ptr().cast(),
+                    0,
+                    desc.as_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    &iid,
+                    &mut out,
+                ),
+                S_OK
+            );
+            out
+        };
+
+        let null = std::ptr::null();
+        let heap_iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let heap_desc: [u32; 8] = [0, 16, 1, 0, 0, 0, 0, 0];
+        let mut heap_obj = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                heap_desc.as_ptr().cast(),
+                &heap_iid,
+                &mut heap_obj
+            ),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap_obj);
+        let slot_addr = |i: u64| title_heap.start + 32 * i;
+
+        let src_buf = make_res(1, 256, 1, 1, 0, 0);
+        let dst_buf = make_res(1, 256, 1, 1, 0, 0);
+        let alt_buf = make_res(1, 256, 1, 1, 0, 0);
+        let vol_a = make_res(4, 4, 4, 4, 42, 0x4); // TEXTURE_3D, R32_UINT, ALLOW_UNORDERED_ACCESS
+        let tex_2d = make_res(3, 4, 4, 1, 28, 0); // TEXTURE_2D, R8G8B8A8_UNORM
+
+        let (src_ptr, _) = crate::resource::buffer_bytes(src_buf).unwrap();
+        let (dst_ptr, _) = crate::resource::buffer_bytes(dst_buf).unwrap();
+        // SAFETY: 256-byte buffer owned by `src_buf`.
+        unsafe {
+            let words = std::slice::from_raw_parts_mut(src_ptr.cast::<u32>(), 64);
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = 0x1000 + i as u32;
+            }
+        }
+
+        let raw_srv: [u32; 10] = [39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0];
+        let raw_uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let vol_uav: [u32; 10] = [42, 8, 0, 0, 4, 0, 0, 0, 0, 0];
+
+        let host_heap = title_heap.host().expect("host view heap");
+        let _ = host.log_messages();
+        let (errors_before, _) = crate::host::debug_errors();
+        let src_shadow = crate::shadow::find(src_ptr as u64, 256).unwrap();
+        let dst_shadow = crate::shadow::find(dst_ptr as u64, 256).unwrap();
+        let (started_buf, started_ptr) = host.shared_buffer(256).unwrap();
+        // SAFETY: live shared buffer.
+        let started_gpu = unsafe { started_buf.GetGPUVirtualAddress() };
+        let started_addr = started_ptr as usize;
+
+        let lists: Vec<_> = (0..32).map(|_| host.new_list().unwrap()).collect();
+
+        for round in 0..4u32 {
+            // SAFETY: CPU-visible shared buffer, idle between rounds.
+            unsafe { (started_addr as *mut u32).write_volatile(0) };
+            // Restore slots 0..3 for this submission's 32 lists.
+            crate::descriptor::create_srv(null, src_buf, &raw_srv, slot_addr(0));
+            crate::descriptor::create_uav(null, dst_buf, null, &raw_uav, slot_addr(1));
+            crate::descriptor::create_uav(null, vol_a, null, &vol_uav, slot_addr(2));
+
+            for (idx, list) in lists.iter().enumerate() {
+                if round > 0 {
+                    list.reset();
+                }
+                src_shadow.refresh(list, src_ptr as u64, 256);
+                dst_shadow.refresh(list, dst_ptr as u64, 256);
+                dst_shadow.gpu_writes(list, dst_ptr as u64, 256, false);
+                crate::list::ensure_state(list, vol_a, 0x8);
+                let step_val = round * 32 + idx as u32;
+                // SAFETY: recording into open command lists with live objects.
+                unsafe {
+                    list.list
+                        .SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+                    list.list.SetComputeRootSignature(&root);
+                    list.list.SetComputeRootDescriptorTable(0, host_heap.gpu(0));
+                    list.list
+                        .SetComputeRoot32BitConstants(1, 1, (&raw const step_val).cast(), 0);
+                    list.list.SetComputeRootUnorderedAccessView(2, started_gpu);
+                    list.list.SetPipelineState(&pso);
+                    for _ in 0..16 {
+                        list.list.Dispatch(64, 1, 1);
+                    }
+                }
+                list.close();
+            }
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_worker = stop.clone();
+            let heap_raw = heap_obj as usize;
+            let alt_raw = alt_buf as usize;
+            let tex_raw = tex_2d as usize;
+            let worker = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !stop_worker.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                    // SAFETY: `started_addr` points to the mapped shared buffer.
+                    if unsafe { (started_addr as *const u32).read_volatile() } != 0 {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                let h = crate::descriptor::heap(heap_raw as This);
+                let hh = h.host().unwrap();
+                let dyn_slot = hh.dynamic(2).unwrap();
+                let mut iter = 0u32;
+                while !stop_worker.load(Ordering::Relaxed) {
+                    // Rewrite title slots and dynamic slots while the 32-list
+                    // submission is executing on the GPU.
+                    if iter.is_multiple_of(2) {
+                        crate::descriptor::create_srv(
+                            std::ptr::null(),
+                            tex_raw as This,
+                            std::ptr::null(),
+                            h.start + 32 * 2,
+                        );
+                        hh.make_null(0);
+                    } else {
+                        crate::descriptor::create_srv(
+                            std::ptr::null(),
+                            alt_raw as This,
+                            &raw_srv,
+                            h.start,
+                        );
+                        hh.make_null(dyn_slot);
+                    }
+                    iter = iter.wrapping_add(1);
+                    std::thread::yield_now();
+                }
+                hh.release(dyn_slot, 2);
+            });
+
+            let refs: Vec<&_> = lists.iter().collect();
+            host.execute(&refs);
+            stop.store(true, Ordering::Relaxed);
+            worker.join().unwrap();
+
+            let (errors_after, last_err) = crate::host::debug_errors();
+            assert_eq!(
+                errors_after, errors_before,
+                "D3D12 debug layer error: {last_err}"
+            );
+            // SAFETY: plain device health query.
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+            let step_val = round * 32 + 31;
+            let mut expected = 0x1000u32;
+            for k in 0..128u32 {
+                expected = (expected ^ (k + step_val)).wrapping_add(1);
+            }
+            let got = dst_shadow.read_host(dst_ptr as u64, 1)[0];
+            assert_eq!(
+                got, expected,
+                "round {round} output corrupted by concurrent slot rewrite"
+            );
+        }
+    }
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct SideTableProbe {
+        root: ID3D12RootSignature,
+        pso: ID3D12PipelineState,
+        _out_buf: ID3D12Resource,
+        out_gpu: u64,
+        out_addr: usize,
+    }
+
+    impl SideTableProbe {
+        fn new(host: &crate::host::Host) -> Self {
+            use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+            use windows::Win32::Graphics::Direct3D::ID3DBlob;
+            use windows::core::s;
+
+            const CS: &str = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors = 2, flags = DESCRIPTORS_VOLATILE)), " \
+           "DescriptorTable(UAV(u0, space = 1, numDescriptors = 2, flags = DESCRIPTORS_VOLATILE)), " \
+           "RootConstants(num32BitConstants = 1, b0), " \
+           "SRV(t0), SRV(t1), SRV(t2), UAV(u1, space = 2)"
+RWByteAddressBuffer raw_uav[2] : register(u0, space0);
+RWStructuredBuffer<uint4> struct_uav[2] : register(u0, space1);
+cbuffer SlotBuf : register(b0) { uint slot_idx; };
+ByteAddressBuffer strides_buf : register(t0);
+ByteAddressBuffer marks_buf : register(t1);
+ByteAddressBuffer addrs_buf : register(t2);
+RWStructuredBuffer<uint> out_words : register(u1, space2);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint idx = NonUniformResourceIndex(slot_idx);
+    uint stride = strides_buf.Load(idx * 4u);
+    uint val = 0u;
+    if (stride == 4u) {
+        val = raw_uav[idx].Load(0u);
+    } else if (stride == 16u) {
+        val = struct_uav[idx][0].x;
+    }
+    uint2 mark = marks_buf.Load2(idx * 8u);
+    uint2 addr = addrs_buf.Load2(idx * 8u);
+    out_words[0] = stride;
+    out_words[1] = val;
+    out_words[2] = mark.x;
+    out_words[3] = mark.y;
+    out_words[4] = addr.x;
+    out_words[5] = addr.y;
+}
+"#;
+
+            let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+            // SAFETY: static source and entry point strings.
+            unsafe {
+                if let Err(e) = D3DCompile(
+                    CS.as_ptr().cast(),
+                    CS.len(),
+                    s!("atomic_staged_slot"),
+                    None,
+                    None,
+                    s!("main"),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    Some(&mut errors),
+                ) {
+                    let msg = errors.map(|b| {
+                        String::from_utf8_lossy(std::slice::from_raw_parts(
+                            b.GetBufferPointer().cast::<u8>(),
+                            b.GetBufferSize(),
+                        ))
+                        .into_owned()
+                    });
+                    panic!("D3DCompile failed: {e}: {msg:?}");
+                }
+            }
+            let blob = code.unwrap();
+            // SAFETY: valid compiled DXBC blob.
+            let (root, pso) = unsafe {
+                let bytes = std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                );
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+                let pso: ID3D12PipelineState = host
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bytes.as_ptr().cast(),
+                            BytecodeLength: bytes.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (root, pso)
+            };
+            let (out_buf, out_ptr) = host.shared_buffer(256).unwrap();
+            // SAFETY: live shared buffer.
+            let out_gpu = unsafe { out_buf.GetGPUVirtualAddress() };
+            Self {
+                root,
+                pso,
+                _out_buf: out_buf,
+                out_gpu,
+                out_addr: out_ptr as usize,
+            }
+        }
+
+        fn read(
+            &self,
+            host: &crate::host::Host,
+            list: &crate::host::HostList,
+            host_heap: &HostHeap,
+            addrs_gpu: u64,
+            slot: u32,
+        ) -> [u32; 6] {
+            // SAFETY: live side-table resources and open command list.
+            unsafe {
+                let strides_gpu = host_heap.strides().unwrap().GetGPUVirtualAddress();
+                let marks_gpu = host_heap.marks().unwrap().GetGPUVirtualAddress();
+                list.list
+                    .SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+                list.list.SetComputeRootSignature(&self.root);
+                list.list.SetComputeRootDescriptorTable(0, host_heap.gpu(0));
+                list.list.SetComputeRootDescriptorTable(1, host_heap.gpu(0));
+                list.list
+                    .SetComputeRoot32BitConstants(2, 1, (&raw const slot).cast(), 0);
+                list.list.SetComputeRootShaderResourceView(3, strides_gpu);
+                list.list.SetComputeRootShaderResourceView(4, marks_gpu);
+                list.list.SetComputeRootShaderResourceView(5, addrs_gpu);
+                list.list.SetComputeRootUnorderedAccessView(6, self.out_gpu);
+                list.list.SetPipelineState(&self.pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[list]);
+            // SAFETY: CPU-visible shared buffer idle after `host.execute`.
+            unsafe { std::array::from_fn(|i| (self.out_addr as *const u32).add(i).read_volatile()) }
+        }
+    }
+
+    fn create_test_title_heap(count: u32) -> crate::object::This {
+        use crate::object::{S_OK, guid};
+        let heap_iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let heap_desc: [u32; 8] = [0, count, 1, 0, 0, 0, 0, 0];
+        let mut heap_obj = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                heap_desc.as_ptr().cast(),
+                &heap_iid,
+                &mut heap_obj,
+            ),
+            S_OK
+        );
+        heap_obj
+    }
+
+    fn read_side_tables(host_heap: &HostHeap, slot: u32) -> (u32, (u32, u32), [u32; 2]) {
+        let i = slot as usize;
+        let strides_ptr = host_heap.strides.as_ref().unwrap().1 as *const u32;
+        let marks_ptr = host_heap.marks.as_ref().unwrap().1 as *const u32;
+        let addrs_ptr = host_heap
+            .addresses
+            .get()
+            .and_then(Option::as_ref)
+            .map(|m| m.1 as *const u32);
+        // SAFETY: mapped side-table words within `slot < count / limit`.
+        unsafe {
+            let stride = strides_ptr.add(i).read_volatile();
+            let m0 = marks_ptr.add(2 * i).read_volatile();
+            let m1 = marks_ptr.add(2 * i + 1).read_volatile();
+            let addr = match addrs_ptr {
+                Some(p) if slot < host_heap.count => [
+                    p.add(2 * i).read_volatile(),
+                    p.add(2 * i + 1).read_volatile(),
+                ],
+                _ => [0, 0],
+            };
+            (stride, (m0, m1), addr)
+        }
+    }
+
+    fn placed_uav_words(ptr: u64, struct_stride: u32) -> [u32; 16] {
+        if struct_stride == 0 {
+            [
+                39,
+                1,
+                0,
+                0,
+                64,
+                0,
+                0,
+                0,
+                1,
+                0,
+                ptr as u32,
+                (ptr >> 32) as u32,
+                0,
+                0,
+                0,
+                0,
+            ]
+        } else {
+            [
+                0,
+                1,
+                0,
+                0,
+                16,
+                struct_stride,
+                0,
+                0,
+                0,
+                0,
+                ptr as u32,
+                (ptr >> 32) as u32,
+                0,
+                0,
+                0,
+                0,
+            ]
+        }
+    }
+
+    #[test]
+    fn staged_slots_publish_descriptors_and_side_tables_atomically() {
+        use crate::object::This;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use victory_shader::emit::VIEW_MARK_NONE;
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = host() else { return };
+        let probe = SideTableProbe::new(host);
+
+        let res_desc: [u32; 14] = [1, 0, 0, 0, 256, 0, 1, 1 | 1 << 16, 0, 1, 0, 0x100, 0x4, 0];
+
+        let null = std::ptr::null();
+        let heap_obj = create_test_title_heap(8);
+        let title_heap = crate::descriptor::heap(heap_obj);
+        let host_heap = title_heap.host().expect("host view heap");
+        let addrs_gpu = host_heap.view_addresses().expect("view addresses");
+        let _ = host.log_messages();
+        let (errors_before, _) = crate::host::debug_errors();
+
+        let page_bytes = crate::watch::PAGE;
+        let pool = crate::watch::tests::pool(2);
+        let pool_len = (2 * page_bytes) as u64;
+        crate::shadow::register(pool, pool as u64, pool_len);
+        let ptr_a = (pool + 16) as u64;
+        let ptr_b = (pool + page_bytes + 32) as u64;
+        // SAFETY: 256-byte slices inside our two-page tracked pool.
+        unsafe {
+            std::slice::from_raw_parts_mut(ptr_a as *mut u32, 64).fill(0x1111_1111);
+            std::slice::from_raw_parts_mut(ptr_b as *mut u32, 64).fill(0x2222_2222);
+        }
+        let shadow = crate::shadow::find(pool as u64, pool_len).unwrap();
+        let mark_a = shadow.mark_entry(ptr_a).unwrap();
+        let mark_b = shadow.mark_entry(ptr_b).unwrap();
+        assert_ne!(mark_a.0, mark_b.0);
+        assert_ne!(mark_a.1, mark_b.1);
+        let addr_a = [ptr_a as u32, (ptr_a >> 32) as u32 & 0xFFFF];
+        let addr_b = [ptr_b as u32, (ptr_b >> 32) as u32 & 0xFFFF];
+        let state_a = [4, 0x1111_1111, mark_a.0, mark_a.1, addr_a[0], addr_a[1]];
+        let state_b = [16, 0x2222_2222, mark_b.0, mark_b.1, addr_b[0], addr_b[1]];
+
+        let raw_uav = placed_uav_words(ptr_a, 0);
+        let struct_uav = placed_uav_words(ptr_b, 16);
+
+        let list = host.new_list().unwrap();
+        shadow.refresh(&list, pool as u64, pool_len);
+        list.close();
+        host.execute(&[&list]);
+
+        // Deterministic staging isolation: updates stay staged until `flush`,
+        // then publish descriptor, stride, mark and view address together.
+        let uninit_mark = (VIEW_MARK_NONE, VIEW_MARK_NONE);
+        crate::descriptor::create_placed_uav(null, &res_desc, &raw_uav, title_heap.start);
+        assert_eq!(read_side_tables(host_heap, 0), (0, uninit_mark, [0, 0]));
+        host_heap.flush();
+        assert_eq!(read_side_tables(host_heap, 0), (4, mark_a, addr_a));
+
+        crate::descriptor::create_placed_uav(null, &res_desc, &struct_uav, title_heap.start);
+        assert_eq!(read_side_tables(host_heap, 0), (4, mark_a, addr_a));
+        host_heap.flush();
+        assert_eq!(read_side_tables(host_heap, 0), (16, mark_b, addr_b));
+
+        host_heap.make_null(0);
+        assert_eq!(read_side_tables(host_heap, 0), (16, mark_b, addr_b));
+        host_heap.flush();
+        assert_eq!(
+            read_side_tables(host_heap, 0),
+            (0, (VIEW_MARK_NONE, 0), [0, 0])
+        );
+
+        let dyn_slot = host_heap.dynamic(1).unwrap();
+        let pair_slot = host_heap.pair().unwrap();
+        host_heap.raw_view_at(dyn_slot, Some(&shadow.buffer), 0, 256, true, Some(mark_a));
+        host_heap.raw_pair_at(pair_slot, Some(&shadow.buffer), 256);
+        assert_eq!(
+            read_side_tables(host_heap, dyn_slot),
+            (0, uninit_mark, [0, 0])
+        );
+        assert_eq!(
+            read_side_tables(host_heap, pair_slot),
+            (0, uninit_mark, [0, 0])
+        );
+        assert_eq!(
+            read_side_tables(host_heap, pair_slot + 1),
+            (0, uninit_mark, [0, 0])
+        );
+        host_heap.flush();
+        assert_eq!(read_side_tables(host_heap, dyn_slot), (4, mark_a, [0, 0]));
+        assert_eq!(
+            read_side_tables(host_heap, pair_slot),
+            (4, (VIEW_MARK_NONE, 0), [0, 0])
+        );
+        assert_eq!(
+            read_side_tables(host_heap, pair_slot + 1),
+            (4, (VIEW_MARK_NONE, 0), [0, 0])
+        );
+        host_heap.free_pair(pair_slot);
+
+        // Concurrent `mirror` + `raw_view_at`/`make_null` vs `flush` and GPU reads.
+        crate::descriptor::create_placed_uav(null, &res_desc, &raw_uav, title_heap.start);
+        host_heap.flush();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_worker = stop.clone();
+        let heap_raw = heap_obj as usize;
+        let shadow_worker = shadow.clone();
+        let worker = std::thread::spawn(move || {
+            let h = crate::descriptor::heap(heap_raw as This);
+            let hh = h.host().unwrap();
+            let mut iter = 0u32;
+            while !stop_worker.load(Ordering::Relaxed) {
+                if iter.is_multiple_of(2) {
+                    crate::descriptor::create_placed_uav(
+                        std::ptr::null(),
+                        &res_desc,
+                        &struct_uav,
+                        h.start,
+                    );
+                    hh.make_null(dyn_slot);
+                } else {
+                    crate::descriptor::create_placed_uav(
+                        std::ptr::null(),
+                        &res_desc,
+                        &raw_uav,
+                        h.start,
+                    );
+                    hh.raw_view_at(
+                        dyn_slot,
+                        Some(&shadow_worker.buffer),
+                        0,
+                        256,
+                        true,
+                        Some(mark_a),
+                    );
+                }
+                iter = iter.wrapping_add(1);
+            }
+        });
+
+        for step in 0..4000u32 {
+            host_heap.flush();
+            let s0 = read_side_tables(host_heap, 0);
+            assert!(
+                s0 == (4, mark_a, addr_a) || s0 == (16, mark_b, addr_b),
+                "torn title slot side-tables at flush {step}: {s0:?}"
+            );
+            let sd = read_side_tables(host_heap, dyn_slot);
+            assert!(
+                sd == (4, mark_a, [0, 0]) || sd == (0, (VIEW_MARK_NONE, 0), [0, 0]),
+                "torn dynamic slot side-tables at flush {step}: {sd:?}"
+            );
+        }
+
+        for round in 0..16u32 {
+            list.reset();
+            let got = probe.read(host, &list, host_heap, addrs_gpu, 0);
+            assert!(
+                got == state_a || got == state_b,
+                "round {round} observed torn descriptor/side-table state on GPU: {got:?}"
+            );
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        host_heap.release(dyn_slot, 1);
+        crate::shadow::unregister(pool, pool as u64);
+
+        let (errors_after, last_err) = crate::host::debug_errors();
+        assert_eq!(
+            errors_after, errors_before,
+            "D3D12 debug layer error: {last_err}"
+        );
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn view_addresses_stays_synchronized_with_staged_flushes() {
+        use victory_shader::emit::VIEW_MARK_NONE;
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = host() else { return };
+        let probe = SideTableProbe::new(host);
+        let res_desc: [u32; 14] = [1, 0, 0, 0, 256, 0, 1, 1 | 1 << 16, 0, 1, 0, 0x100, 0x4, 0];
+        let null = std::ptr::null();
+
+        let page_bytes = crate::watch::PAGE;
+        let pool = crate::watch::tests::pool(2);
+        let pool_len = (2 * page_bytes) as u64;
+        crate::shadow::register(pool, pool as u64, pool_len);
+        let ptr_a = (pool + 16) as u64;
+        let ptr_b = (pool + page_bytes + 32) as u64;
+        // SAFETY: 256-byte slices inside our two-page tracked pool.
+        unsafe {
+            std::slice::from_raw_parts_mut(ptr_a as *mut u32, 64).fill(0x1111_1111);
+            std::slice::from_raw_parts_mut(ptr_b as *mut u32, 64).fill(0x2222_2222);
+        }
+        let shadow = crate::shadow::find(pool as u64, pool_len).unwrap();
+        let mark_a = shadow.mark_entry(ptr_a).unwrap();
+        let mark_b = shadow.mark_entry(ptr_b).unwrap();
+        let addr_a = [ptr_a as u32, (ptr_a >> 32) as u32 & 0xFFFF];
+        let addr_b = [ptr_b as u32, (ptr_b >> 32) as u32 & 0xFFFF];
+        let state_a = [4, 0x1111_1111, mark_a.0, mark_a.1, addr_a[0], addr_a[1]];
+        let state_b = [16, 0x2222_2222, mark_b.0, mark_b.1, addr_b[0], addr_b[1]];
+        let raw_uav = placed_uav_words(ptr_a, 0);
+        let struct_uav = placed_uav_words(ptr_b, 16);
+
+        let list = host.new_list().unwrap();
+        shadow.refresh(&list, pool as u64, pool_len);
+        list.close();
+        host.execute(&[&list]);
+
+        let _ = host.log_messages();
+        let (errors_before, _) = crate::host::debug_errors();
+
+        // Part 1: Calling `view_addresses` mid-recording after `made` is updated,
+        // before `flush_heaps` runs, must initialize from already-published
+        // state (`[0, 0]`) rather than leaking the unflushed `made` entry.
+        let heap_a_obj = create_test_title_heap(8);
+        let title_heap_a = crate::descriptor::heap(heap_a_obj);
+        let host_heap_a = title_heap_a.host().expect("host view heap A");
+
+        crate::descriptor::create_placed_uav(null, &res_desc, &raw_uav, title_heap_a.start);
+        assert!(host_heap_a.made(0));
+        let addrs_gpu_a = host_heap_a.view_addresses().expect("view addresses A");
+        assert_eq!(
+            read_side_tables(host_heap_a, 0),
+            (0, (VIEW_MARK_NONE, VIEW_MARK_NONE), [0, 0]),
+            "lazy view_addresses must not read unflushed `made`"
+        );
+
+        crate::descriptor::flush_heaps();
+        assert_eq!(read_side_tables(host_heap_a, 0), (4, mark_a, addr_a));
+        list.reset();
+        assert_eq!(
+            probe.read(host, &list, host_heap_a, addrs_gpu_a, 0),
+            state_a
+        );
+
+        // Part 2: Rewriting slot 0 into `made` (before `flush_heaps`) must NOT
+        // overwrite the live `view_addresses` entry until `flush_heaps` runs.
+        crate::descriptor::create_placed_uav(null, &res_desc, &struct_uav, title_heap_a.start);
+        assert_eq!(read_side_tables(host_heap_a, 0), (4, mark_a, addr_a));
+        crate::descriptor::flush_heaps();
+        assert_eq!(read_side_tables(host_heap_a, 0), (16, mark_b, addr_b));
+        list.reset();
+        assert_eq!(
+            probe.read(host, &list, host_heap_a, addrs_gpu_a, 0),
+            state_b
+        );
+
+        // Part 3: A heap with a published slot (`state_a`) whose `made` is
+        // rewritten (`state_b`) before `view_addresses` is first called must
+        // initialize `view_addresses` to `addr_a`, then update to `addr_b` on
+        // `flush_heaps`.
+        let heap_b_obj = create_test_title_heap(8);
+        let title_heap_b = crate::descriptor::heap(heap_b_obj);
+        let host_heap_b = title_heap_b.host().expect("host view heap B");
+        crate::descriptor::create_placed_uav(null, &res_desc, &raw_uav, title_heap_b.start);
+        crate::descriptor::flush_heaps();
+
+        crate::descriptor::create_placed_uav(null, &res_desc, &struct_uav, title_heap_b.start);
+        let addrs_gpu_b = host_heap_b.view_addresses().expect("view addresses B");
+        assert_eq!(
+            read_side_tables(host_heap_b, 0),
+            (4, mark_a, addr_a),
+            "lazy view_addresses must keep published address until flush_heaps"
+        );
+        crate::descriptor::flush_heaps();
+        assert_eq!(read_side_tables(host_heap_b, 0), (16, mark_b, addr_b));
+        list.reset();
+        assert_eq!(
+            probe.read(host, &list, host_heap_b, addrs_gpu_b, 0),
+            state_b
+        );
+
+        crate::shadow::unregister(pool, pool as u64);
+        let (errors_after, last_err) = crate::host::debug_errors();
+        assert_eq!(
+            errors_after, errors_before,
+            "D3D12 debug layer error: {last_err}"
+        );
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn alloc_staged_failure_falls_back_to_direct_writes() {
+        use victory_shader::emit::VIEW_MARK_NONE;
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = host() else { return };
+        let probe = SideTableProbe::new(host);
+        let res_desc: [u32; 14] = [1, 0, 0, 0, 256, 0, 1, 1 | 1 << 16, 0, 1, 0, 0x100, 0x4, 0];
+        let null = std::ptr::null();
+
+        let page_bytes = crate::watch::PAGE;
+        let pool = crate::watch::tests::pool(2);
+        let pool_len = (2 * page_bytes) as u64;
+        crate::shadow::register(pool, pool as u64, pool_len);
+        let ptr_a = (pool + 16) as u64;
+        let ptr_b = (pool + page_bytes + 32) as u64;
+        // SAFETY: 256-byte slices inside our two-page tracked pool.
+        unsafe {
+            std::slice::from_raw_parts_mut(ptr_a as *mut u32, 64).fill(0x3333_3333);
+            std::slice::from_raw_parts_mut(ptr_b as *mut u32, 64).fill(0x4444_4444);
+        }
+        let shadow = crate::shadow::find(pool as u64, pool_len).unwrap();
+        let mark_a = shadow.mark_entry(ptr_a).unwrap();
+        let mark_b = shadow.mark_entry(ptr_b).unwrap();
+        let addr_a = [ptr_a as u32, (ptr_a >> 32) as u32 & 0xFFFF];
+        let state_a = [4, 0x3333_3333, mark_a.0, mark_a.1, addr_a[0], addr_a[1]];
+        let raw_uav = placed_uav_words(ptr_a, 0);
+        let struct_uav = placed_uav_words(ptr_b, 16);
+
+        let list = host.new_list().unwrap();
+        shadow.refresh(&list, pool as u64, pool_len);
+        list.close();
+        host.execute(&[&list]);
+
+        let _ = host.log_messages();
+        let (errors_before, _) = crate::host::debug_errors();
+
+        let heap_obj = create_test_title_heap(8);
+        let title_heap = crate::descriptor::heap(heap_obj);
+        let host_heap = title_heap.host().expect("host view heap");
+        host_heap
+            .staged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fail_alloc = true;
+
+        // `mirror` writes directly when staging allocation fails (even before
+        // `view_addresses` is initialized).
+        crate::descriptor::create_placed_uav(null, &res_desc, &raw_uav, title_heap.start);
+        assert!(host_heap.made(0));
+        let addrs_gpu = host_heap.view_addresses().expect("view addresses");
+        assert_eq!(read_side_tables(host_heap, 0), (4, mark_a, addr_a));
+        list.reset();
+        assert_eq!(probe.read(host, &list, host_heap, addrs_gpu, 0), state_a);
+
+        // `make_at`, `raw_view_at`, `raw_pair_at` and `make_null` also fall
+        // back to direct writes without needing `flush`.
+        let dyn_slot = host_heap.dynamic(1).unwrap();
+        let pair_slot = host_heap.pair().unwrap();
+        let view_b = View::Placed(true, res_desc, struct_uav);
+        host_heap.make_at(dyn_slot, &view_b);
+        assert_eq!(read_side_tables(host_heap, dyn_slot), (16, mark_b, [0, 0]));
+        host_heap.raw_view_at(dyn_slot, Some(&shadow.buffer), 0, 256, true, Some(mark_b));
+        assert_eq!(read_side_tables(host_heap, dyn_slot), (4, mark_b, [0, 0]));
+        host_heap.raw_pair_at(pair_slot, Some(&shadow.buffer), 256);
+        assert_eq!(
+            read_side_tables(host_heap, pair_slot),
+            (4, (VIEW_MARK_NONE, 0), [0, 0])
+        );
+        assert_eq!(
+            read_side_tables(host_heap, pair_slot + 1),
+            (4, (VIEW_MARK_NONE, 0), [0, 0])
+        );
+        host_heap.make_null(0);
+        assert_eq!(
+            read_side_tables(host_heap, 0),
+            (0, (VIEW_MARK_NONE, 0), [0, 0])
+        );
+
+        host_heap.free_pair(pair_slot);
+        host_heap.release(dyn_slot, 1);
+        crate::shadow::unregister(pool, pool as u64);
+
+        let (errors_after, last_err) = crate::host::debug_errors();
+        assert_eq!(
+            errors_after, errors_before,
+            "D3D12 debug layer error: {last_err}"
+        );
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn direct_fallback_drops_older_queued_updates_for_the_same_slot() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = host() else { return };
+        let probe = SideTableProbe::new(host);
+        let res_desc: [u32; 14] = [1, 0, 0, 0, 256, 0, 1, 1 | 1 << 16, 0, 1, 0, 0x100, 0x4, 0];
+        let null = std::ptr::null();
+
+        let page_bytes = crate::watch::PAGE;
+        let pool = crate::watch::tests::pool(2);
+        let pool_len = (2 * page_bytes) as u64;
+        crate::shadow::register(pool, pool as u64, pool_len);
+        let ptr_a = (pool + 16) as u64;
+        let ptr_b = (pool + page_bytes + 32) as u64;
+        // SAFETY: 256-byte slices inside our two-page tracked pool.
+        unsafe {
+            std::slice::from_raw_parts_mut(ptr_a as *mut u32, 64).fill(0x3333_3333);
+            std::slice::from_raw_parts_mut(ptr_b as *mut u32, 64).fill(0x4444_4444);
+        }
+        let shadow = crate::shadow::find(pool as u64, pool_len).unwrap();
+        let mark_a = shadow.mark_entry(ptr_a).unwrap();
+        let mark_b = shadow.mark_entry(ptr_b).unwrap();
+        let addr_a = [ptr_a as u32, (ptr_a >> 32) as u32 & 0xFFFF];
+        let addr_b = [ptr_b as u32, (ptr_b >> 32) as u32 & 0xFFFF];
+        let state_a = [4, 0x3333_3333, mark_a.0, mark_a.1, addr_a[0], addr_a[1]];
+        let state_b = [16, 0x4444_4444, mark_b.0, mark_b.1, addr_b[0], addr_b[1]];
+        let raw_uav = placed_uav_words(ptr_a, 0);
+        let struct_uav = placed_uav_words(ptr_b, 16);
+
+        let list = host.new_list().unwrap();
+        shadow.refresh(&list, pool as u64, pool_len);
+        list.close();
+        host.execute(&[&list]);
+
+        let _ = host.log_messages();
+        let (errors_before, _) = crate::host::debug_errors();
+
+        let heap_obj = create_test_title_heap(8);
+        let title_heap = crate::descriptor::heap(heap_obj);
+        let host_heap = title_heap.host().expect("host view heap");
+        let addrs_gpu = host_heap.view_addresses().expect("view addresses");
+        let dyn_slot = host_heap.dynamic(1).unwrap();
+
+        // Queue older staged updates on slot 0, slot 1, and a dynamic slot
+        // without flushing yet.
+        crate::descriptor::create_placed_uav(null, &res_desc, &raw_uav, title_heap.start);
+        assert!(host_heap.made(0));
+        let title_step = u64::from(crate::descriptor::increment(title_heap.desc.kind).unwrap());
+        crate::descriptor::create_placed_uav(
+            null,
+            &res_desc,
+            &raw_uav,
+            title_heap.start + title_step,
+        );
+        assert!(host_heap.made(1));
+        host_heap.make_at(dyn_slot, &View::Placed(true, res_desc, raw_uav));
+
+        // Force direct fallback writes for slot 0 and `dyn_slot`.
+        host_heap
+            .staged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fail_alloc = true;
+
+        crate::descriptor::create_placed_uav(null, &res_desc, &struct_uav, title_heap.start);
+        assert!(host_heap.made(0));
+        host_heap.make_at(dyn_slot, &View::Placed(true, res_desc, struct_uav));
+
+        assert_eq!(read_side_tables(host_heap, 0), (16, mark_b, addr_b));
+        assert_eq!(read_side_tables(host_heap, dyn_slot), (16, mark_b, [0, 0]));
+        list.reset();
+        assert_eq!(probe.read(host, &list, host_heap, addrs_gpu, 0), state_b);
+
+        // Flushing must publish unrelated slot 1, without letting the stale
+        // queued updates overwrite the newer direct writes on slot 0 / dyn_slot.
+        host_heap.flush();
+        assert_eq!(read_side_tables(host_heap, 0), (16, mark_b, addr_b));
+        assert_eq!(read_side_tables(host_heap, 1), (4, mark_a, addr_a));
+        assert_eq!(read_side_tables(host_heap, dyn_slot), (16, mark_b, [0, 0]));
+        list.reset();
+        assert_eq!(probe.read(host, &list, host_heap, addrs_gpu, 0), state_b);
+        list.reset();
+        assert_eq!(probe.read(host, &list, host_heap, addrs_gpu, 1), state_a);
+
+        host_heap.release(dyn_slot, 1);
+        crate::shadow::unregister(pool, pool as u64);
+
+        let (errors_after, last_err) = crate::host::debug_errors();
+        assert_eq!(
+            errors_after, errors_before,
+            "D3D12 debug layer error: {last_err}"
+        );
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
