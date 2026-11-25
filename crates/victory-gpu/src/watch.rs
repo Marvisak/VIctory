@@ -584,20 +584,11 @@ impl Tracked {
 
     /// Shaders may write the copy's bytes `[from, to)` until [`Tracked::disarm`]:
     /// pages there written next after they were taken have their bytes kept
-    /// first ([`Tracked::saved`]).
+    /// first ([`Tracked::finish`]).
     pub(crate) fn arm(&self, from: usize, to: usize) {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from < to {
             self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).arm(from / PAGE, to.div_ceil(PAGE));
-        }
-    }
-
-    /// Page `page` (a page number) needs no saving any more: its copy-back
-    /// is under way.
-    pub(crate) fn unarm(&self, page: usize) {
-        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
-        if saved.armed(page) {
-            saved.unarmed.insert(page);
         }
     }
 
@@ -609,11 +600,23 @@ impl Tracked {
         saved.bytes.clear();
     }
 
-    /// The bytes page `page` (a page number) held when it was first written
-    /// since it was taken, if it was armed then (and so changed), with what
-    /// the copy took of it since: the copy's bytes before the submission.
-    pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
-        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
+    /// The copy-back of page `page` (a page number) has read it: it needs
+    /// no saving any more, and what the title did to it until now. Under the
+    /// guard lock, which the write handler takes before it marks or saves a
+    /// page: a title write lands wholly before this (changed, saved if
+    /// armed) or after it.
+    pub(crate) fn finish(&self, page: usize) -> Finished {
+        let _g = guards();
+        let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner()).contains(&page);
+        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        if saved.armed(page) {
+            saved.unarmed.insert(page);
+        }
+        match saved.bytes.remove(&page) {
+            Some(bytes) => Finished::Saved(bytes),
+            None if changed => Finished::Unsaved,
+            None => Finished::Untouched,
+        }
     }
 
     /// The copy took `bytes` at title address `from`: any saved bytes of pages
@@ -636,6 +639,19 @@ impl Tracked {
             }
         }
     }
+}
+
+/// What the title did to a page a copy-back read ([`Tracked::finish`]).
+pub(crate) enum Finished {
+    /// Not written since the copy took it: the bytes read are the copy's
+    /// from before.
+    Untouched,
+    /// Written while armed: the bytes it held before the first write, with
+    /// what the copy took of it since ([`Tracked::refreshed`]): the copy's
+    /// bytes before the submission.
+    Saved(Box<[u8]>),
+    /// Written while not armed: what it held before is not known.
+    Unsaved,
 }
 
 /// Makes `pages` read-only where not already (in runs), and returns those
@@ -895,6 +911,16 @@ fn install() {
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
+        // A page that cannot be read in, or a title's own guard page, ends
+        // `store_runs`'s copy as the kernel's copy ends (it fails).
+        const IN_PAGE_ERROR: NTSTATUS = 0xC000_0006_u32 as NTSTATUS;
+        const GUARD_PAGE_VIOLATION: NTSTATUS = 0x8000_0001_u32 as NTSTATUS;
+        if (r.ExceptionCode == IN_PAGE_ERROR || r.ExceptionCode == GUARD_PAGE_VIOLATION)
+            // SAFETY: the system passes the faulting thread's context.
+            && unsafe { store_failed(&mut *(*info).ContextRecord) }
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         const WRITE: usize = 1;
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
@@ -915,16 +941,136 @@ fn install() {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
+        drop(g);
+        // SAFETY: the system passes the faulting thread's context.
+        if unsafe { store_failed(&mut *(*info).ContextRecord) } {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        EXCEPTION_CONTINUE_SEARCH
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+// `victory_gpu_store_runs(dst, src, runs, count)`: for each of `count` runs
+// `(a, b)` (16 bytes each at `runs`), copies bytes `[a, b)` from `src + a` to
+// `dst + a`, and returns `count`; or, where a destination page faulted
+// ([`store_failed`] resumes at `_failed`), the index of the run it was
+// copying. Runs of up to 16 bytes are copied a byte at a time, longer ones
+// with `rep movsb` (whose start costs as much as a short run). Every store
+// to the destination lies in `[_first, _last)`. It keeps `rdi`, `rsi` and
+// `rbx` (the callee's) on the stack, with unwind data saying so. Its labels
+// are data symbols, compared with the faulting `rip` as they are (no import
+// or incremental-link thunk).
+std::arch::global_asm!(
+    ".globl victory_gpu_store_runs",
+    ".globl victory_gpu_store_runs_first",
+    ".globl victory_gpu_store_runs_last",
+    ".globl victory_gpu_store_runs_failed",
+    ".def victory_gpu_store_runs",
+    ".scl 2",
+    ".type 32",
+    ".endef",
+    "victory_gpu_store_runs:",
+    ".seh_proc victory_gpu_store_runs",
+    "push rdi",
+    ".seh_pushreg rdi",
+    "push rsi",
+    ".seh_pushreg rsi",
+    "push rbx",
+    ".seh_pushreg rbx",
+    ".seh_endprologue",
+    // r10: the run; r11: the destination's base; rdx: the source's base.
+    "xor r10d, r10d",
+    "mov r11, rcx",
+    "cld",
+    "victory_gpu_store_runs_next:",
+    "cmp r10, r9",
+    "jae victory_gpu_store_runs_done",
+    "mov rax, r10",
+    "shl rax, 4",
+    "mov rbx, qword ptr [r8 + rax]",
+    "mov rcx, qword ptr [r8 + rax + 8]",
+    "sub rcx, rbx",
+    "jbe victory_gpu_store_runs_done_one",
+    "lea rdi, [r11 + rbx]",
+    "lea rsi, [rdx + rbx]",
+    "cmp rcx, 16",
+    "ja victory_gpu_store_runs_long",
+    "victory_gpu_store_runs_first:",
+    "victory_gpu_store_runs_byte:",
+    "mov al, byte ptr [rsi]",
+    "mov byte ptr [rdi], al",
+    "inc rsi",
+    "inc rdi",
+    "dec rcx",
+    "jnz victory_gpu_store_runs_byte",
+    "jmp victory_gpu_store_runs_done_one",
+    "victory_gpu_store_runs_long:",
+    "rep movsb",
+    "victory_gpu_store_runs_last:",
+    "victory_gpu_store_runs_done_one:",
+    "inc r10",
+    "jmp victory_gpu_store_runs_next",
+    "victory_gpu_store_runs_done:",
+    "victory_gpu_store_runs_failed:",
+    "mov rax, r10",
+    "pop rbx",
+    "pop rsi",
+    "pop rdi",
+    "ret",
+    ".seh_endproc",
+);
+
+unsafe extern "C" {
+    fn victory_gpu_store_runs(dst: *mut u8, src: *const u8, runs: *const [usize; 2], count: usize) -> usize;
+    static victory_gpu_store_runs_first: u8;
+    static victory_gpu_store_runs_last: u8;
+    static victory_gpu_store_runs_failed: u8;
+}
+
+/// Copies the runs `[a, b]` (bytes `a..b`) from host memory at `src + a` into
+/// title memory at `dst + a`, in one call with plain stores: a system call
+/// per run (as [`crate::host::write_mapped`]) cost ~1 µs, a call per run
+/// ~35 ns, and the copy-back of marked pages writes millions of runs of a
+/// few bytes a frame. Stops at a destination page that is not writable
+/// (nothing mapped, or read-only, not by our guards, or that cannot be read
+/// in), as the kernel's copy does instead of faulting, and returns the
+/// index of the run it was copying (`runs.len()` when all went): that run
+/// may be written in part, and is written again whole by whoever goes on.
+/// Guarded pages fault into the write handler as the title's writes do. A
+/// title's own guard page stops it as well (spent, as a kernel copy's
+/// probe spends it).
+///
+/// # Safety
+/// `src + a .. src + b` are readable bytes of host memory for every run;
+/// `dst` is title memory, which may be unmapped meanwhile. The caller holds
+/// none of this module's locks: a fault in the copy takes them.
+pub(crate) unsafe fn store_runs(dst: *mut u8, src: *const u8, runs: &[[usize; 2]]) -> usize {
+    install();
+    // SAFETY: the routine copies the runs; a fault at the destination ends
+    // it (see `store_failed`), the source is the caller's.
+    unsafe { victory_gpu_store_runs(dst, src, runs.as_ptr(), runs.len()) }
+}
+
+/// For the write handler: a fault at a store of [`store_runs`], which does
+/// not retry it but returns (with `r10` the run it was copying).
+///
+/// # Safety
+/// `context` is a faulting thread's.
+unsafe fn store_failed(context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> bool {
+    let first = &raw const victory_gpu_store_runs_first as u64;
+    let last = &raw const victory_gpu_store_runs_last as u64;
+    if !(first..last).contains(&context.Rip) {
+        return false;
+    }
+    context.Rip = &raw const victory_gpu_store_runs_failed as u64;
+    true
 }
 
 /// Whether `at` is committed read-write memory now.
@@ -1100,6 +1246,92 @@ pub(crate) mod tests {
         free(p);
     }
 
+    /// `store_runs` writes its runs (short ones and long ones), writes
+    /// guarded pages as a title write does (they change), and stops instead
+    /// of faulting at a page with nothing mapped, one read-only not by our
+    /// guards, or a title's own guard page, returning the run it was at.
+    #[test]
+    fn stores_mark_guarded_pages_and_stop_at_unwritable_ones() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_DECOMMIT, PAGE_GUARD, PAGE_READONLY, VirtualProtect,
+        };
+        let from: Vec<u8> = (0..3 * PAGE).map(|i| (i % 251) as u8 + 1).collect();
+        let p = pool(3);
+        let t = track(p, 3 * PAGE, true).expect("tracked");
+        assert_eq!(t.take(p, p + 3 * PAGE), [(p, p + 3 * PAGE)]);
+        // Runs of 1, 3, 16 (the last a byte at a time) and 17, 100 bytes.
+        let runs = [[10, 11], [20, 23], [40, 56], [60, 77], [200, 300]];
+        // SAFETY: our pool; the source is `from`.
+        let at = unsafe { store_runs(p as *mut u8, from.as_ptr(), &runs) };
+        assert_eq!(at, runs.len());
+        // SAFETY: committed and readable.
+        let got = unsafe { std::slice::from_raw_parts(p as *const u8, 400) };
+        for (i, (&g, &f)) in got.iter().zip(&from).enumerate() {
+            let inside = runs.iter().any(|&[a, b]| (a..b).contains(&i));
+            assert_eq!(g, if inside { f } else { 0 }, "byte {i}");
+        }
+        assert!(t.changed(p / PAGE) && !t.changed(p / PAGE + 1));
+        // A long run alone on a guarded page: the fault in `rep movsb` opens
+        // it, and the copy goes on.
+        // SAFETY: as above.
+        let at = unsafe { store_runs(p as *mut u8, from.as_ptr(), &[[PAGE + 8, PAGE + 40]]) };
+        assert_eq!(at, 1);
+        // SAFETY: committed and readable.
+        let got = unsafe { std::slice::from_raw_parts((p + PAGE + 8) as *const u8, 32) };
+        assert_eq!(got, &from[PAGE + 8..PAGE + 40]);
+        assert!(t.changed(p / PAGE + 1));
+        // No runs, an empty one or one ending before it starts: nothing to do.
+        // SAFETY: as above.
+        assert_eq!(unsafe { store_runs(p as *mut u8, from.as_ptr(), &[]) }, 0);
+        // SAFETY: as above.
+        assert_eq!(unsafe { store_runs(p as *mut u8, from.as_ptr(), &[[500, 500], [0, 0], [9, 3]]) }, 3);
+        // SAFETY: as above.
+        let untouched = unsafe { std::slice::from_raw_parts(p as *const u8, 10) };
+        assert!(untouched.iter().all(|&b| b == 0));
+        drop(t);
+        // The middle page read-only (not ours), the last decommitted: the
+        // copy stops at the first run reaching either.
+        let mut old = 0;
+        // SAFETY: pages of our pool.
+        unsafe {
+            assert_ne!(VirtualProtect((p + PAGE) as *const _, PAGE, PAGE_READONLY, &mut old), 0);
+            assert_ne!(VirtualFree((p + 2 * PAGE) as *mut _, PAGE, MEM_DECOMMIT), 0);
+        }
+        let runs = [[0, 8], [100, PAGE], [PAGE - 2, PAGE + 2], [PAGE + 50, PAGE + 52]];
+        // SAFETY: as above.
+        let at = unsafe { store_runs(p as *mut u8, from.as_ptr(), &runs) };
+        assert_eq!(at, 2, "the short run crossing into the read-only page");
+        // SAFETY: the first page is committed.
+        let first = unsafe { std::slice::from_raw_parts(p as *const u8, PAGE - 2) };
+        assert_eq!(&first[..8], &from[..8]);
+        assert_eq!(&first[100..], &from[100..PAGE - 2]);
+        let runs = [[PAGE - 64, PAGE + 64]];
+        // SAFETY: as above.
+        let at = unsafe { store_runs(p as *mut u8, from.as_ptr(), &runs) };
+        assert_eq!(at, 0, "a long run crossing into it");
+        // SAFETY: as above.
+        unsafe {
+            assert_ne!(VirtualProtect((p + PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old), 0);
+        }
+        let runs = [[PAGE + 4, PAGE + 8], [2 * PAGE - 8, 2 * PAGE + 8]];
+        // SAFETY: as above.
+        let at = unsafe { store_runs(p as *mut u8, from.as_ptr(), &runs) };
+        assert_eq!(at, 1, "the run crossing into the decommitted page");
+        // A title's own guard page stops it too (and is spent, as a kernel
+        // copy's probe spends it).
+        // SAFETY: as above.
+        unsafe {
+            assert_ne!(
+                VirtualProtect((p + PAGE) as *const _, PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old),
+                0
+            );
+        }
+        // SAFETY: as above.
+        let at = unsafe { store_runs(p as *mut u8, from.as_ptr(), &[[PAGE, PAGE + 16]]) };
+        assert_eq!(at, 0);
+        free(p);
+    }
+
     /// A page only partly in the range asked is copied in part and stays
     /// changed; edge pages count whole when the tracked part is covered.
     #[test]
@@ -1116,6 +1348,15 @@ pub(crate) mod tests {
         free(p);
     }
 
+    /// The bytes [`Tracked::finish`] hands out for page `page`, if it saved
+    /// them.
+    fn saved(t: &Tracked, page: usize) -> Option<Box<[u8]>> {
+        match t.finish(page) {
+            Finished::Saved(bytes) => Some(bytes),
+            Finished::Unsaved | Finished::Untouched => None,
+        }
+    }
+
     /// Pages of the ranges armed keep their bytes from before the first
     /// write after they were taken, whichever overlapping ranges armed
     /// them; a page unarmed keeps none until it is armed again, and none
@@ -1128,7 +1369,7 @@ pub(crate) mod tests {
         // SAFETY: (every write below) a byte of our pool; a guarded page
         // faults into the handler, which saves it first where it is armed.
         let write = |page: usize, value: u8| unsafe { ((p + page * PAGE + 8) as *mut u8).write_volatile(value) };
-        let saved = |page: usize| t.saved(p / PAGE + page).map(|bytes| bytes[8]);
+        let saved = |page: usize| saved(&t, p / PAGE + page).map(|bytes| bytes[8]);
         all();
         write(0, 1);
         assert_eq!(saved(0), None, "nothing armed yet");
@@ -1137,7 +1378,7 @@ pub(crate) mod tests {
         t.arm(p + 100, p + 2 * PAGE + 1);
         t.arm(p + PAGE, p + 2 * PAGE);
         t.arm(p + PAGE + 5, p + 2 * PAGE + 1);
-        t.unarm(p / PAGE + 1);
+        t.finish(p / PAGE + 1);
         for page in 0..4 {
             write(page, 2);
         }
@@ -1149,6 +1390,8 @@ pub(crate) mod tests {
         write(1, 3);
         write(1, 4);
         assert_eq!(saved(1), Some(2), "from before the first write");
+        // Handing bytes out unarmed those pages: all armed again, then none.
+        t.arm(p, p + 4 * PAGE);
         t.disarm();
         all();
         write(2, 5);
@@ -1423,7 +1666,7 @@ pub(crate) mod tests {
         unsafe { (b as *mut u32).write_volatile(0x1234) };
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         drop(write);
-        let saved = t.saved(a / PAGE).expect("saved bytes survive");
+        let saved = saved(&t, a / PAGE).expect("saved bytes survive");
         assert_eq!(&saved[..4], &[0, 0, 0, 0]);
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert!(t.take(a, a + PAGE).is_empty(), "taken once the write ended");
