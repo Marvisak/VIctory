@@ -14,11 +14,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_COMMITMENT_LIMIT, ERROR_INVALID_ADDRESS, ERROR_INVALID_PARAMETER, HANDLE,
+    INVALID_HANDLE_VALUE, SetLastError,
 };
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
-    MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+    CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_FREE,
+    MEM_PRESERVE_PLACEHOLDER, MEM_PRIVATE, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
     SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
@@ -106,10 +107,9 @@ pub extern "system" fn XMemVirtualAlloc(
         p => p,
     };
     // A reservation of 64 KiB pages takes physical pages later
-    // (`XMemMapPhysicalPages`); on the host only a placeholder can.
-    // shortcut: committing part of such a reservation later would fail
-    // (Grand Theft Auto VI's 23 calls never do); replace that part of the
-    // placeholder then.
+    // (`XMemMapPhysicalPages`); on the host only a placeholder can. If the
+    // title later commits virtual memory inside it instead of mapping physical
+    // pages, the commit path splits and replaces that range below.
     let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
     if placeholder {
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
@@ -138,7 +138,7 @@ pub extern "system" fn XMemVirtualAlloc(
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
+    let mut at = unsafe {
         VirtualAlloc2(
             GetCurrentProcess(),
             base,
@@ -154,17 +154,35 @@ pub extern "system" fn XMemVirtualAlloc(
         )
     };
     if at.is_null() {
-        let error = std::io::Error::last_os_error();
-        if kind & MEM_COMMIT != 0 {
-            commit_refused(size, "virtual memory", error);
-        } else {
-            tracing::warn!(
-                size,
-                kind = format_args!("{kind:#x}"),
-                flags = format_args!("{flags:#x}"),
-                %error,
-                "XMemVirtualAlloc refused"
-            );
+        let mut error = std::io::Error::last_os_error();
+        if !base.is_null()
+            && size > 0
+            && kind & (MEM_RESERVE | MEM_COMMIT) == MEM_COMMIT
+            && is_placeholder_commit_error(&error)
+        {
+            match commit_in_placeholder(base, size, kind, protect) {
+                Ok(committed) => at = committed,
+                Err(commit_error) => {
+                    error = commit_error;
+                    if let Some(code) = error.raw_os_error() {
+                        // SAFETY: restores this thread's last Win32 error after cleanup queries.
+                        unsafe { SetLastError(code as u32) };
+                    }
+                }
+            }
+        }
+        if at.is_null() {
+            if kind & MEM_COMMIT != 0 {
+                commit_refused(size, "virtual memory", error);
+            } else {
+                tracing::warn!(
+                    size,
+                    kind = format_args!("{kind:#x}"),
+                    flags = format_args!("{flags:#x}"),
+                    %error,
+                    "XMemVirtualAlloc refused"
+                );
+            }
         }
     }
     if base.is_null() {
@@ -177,6 +195,171 @@ pub extern "system" fn XMemVirtualAlloc(
         );
     }
     at
+}
+
+/// Wine and different Windows builds may report attempting `MEM_COMMIT` on a
+/// placeholder as `ERROR_INVALID_ADDRESS` or `ERROR_INVALID_PARAMETER`.
+fn is_placeholder_commit_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(e) if e == ERROR_INVALID_ADDRESS as i32 || e == ERROR_INVALID_PARAMETER as i32
+    )
+}
+
+/// Queries the virtual memory region containing `address`.
+fn query_region(address: usize) -> Option<MEMORY_BASIC_INFORMATION> {
+    // SAFETY: zero-initialized output buffer for `VirtualQueryEx`.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: queries virtual memory metadata in our own process without dereferencing `address`.
+    let read = unsafe {
+        VirtualQueryEx(
+            GetCurrentProcess(),
+            address as *const c_void,
+            &mut info,
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    (read == size_of::<MEMORY_BASIC_INFORMATION>()).then_some(info)
+}
+
+/// Replaces any `MEM_RESERVE_PLACEHOLDER` sub-ranges intersecting `[base, base + size)`
+/// with private reservations before committing `[base, base + size)` with `kind` and `protect`.
+fn commit_in_placeholder(
+    base: *mut c_void,
+    size: usize,
+    kind: u32,
+    protect: u32,
+) -> Result<*mut c_void, std::io::Error> {
+    let invalid = || std::io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32);
+    let req_start = base as usize;
+    let req_end = req_start.checked_add(size).ok_or_else(invalid)?;
+
+    // Pre-scan the entire requested range so invalid mixed/free ranges never mutate
+    // earlier placeholders before failing.
+    let mut scan = req_start;
+    while scan < req_end {
+        let info = query_region(scan).ok_or_else(invalid)?;
+        let region_end = (info.BaseAddress as usize)
+            .checked_add(info.RegionSize)
+            .ok_or_else(invalid)?;
+        if region_end <= scan || info.State == MEM_FREE || info.Type != MEM_PRIVATE {
+            return Err(invalid());
+        }
+        scan = region_end.min(req_end);
+    }
+
+    let mut first = None;
+    let mut cursor = req_start;
+    while cursor < req_end {
+        let info = query_region(cursor).ok_or_else(invalid)?;
+        let region_base = info.BaseAddress as usize;
+        let region_end = region_base
+            .checked_add(info.RegionSize)
+            .ok_or_else(invalid)?;
+        if region_end <= cursor || info.State == MEM_FREE || info.Type != MEM_PRIVATE {
+            return Err(invalid());
+        }
+        let chunk_end = req_end.min(region_end);
+        let chunk_len = chunk_end - cursor;
+
+        // Fast path for sub-ranges that belong to an already-private reservation or commit.
+        // SAFETY: `cursor..chunk_end` is validated as private reserved/committed memory.
+        let committed = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                cursor as *const c_void,
+                chunk_len,
+                kind,
+                protect,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if !committed.is_null() {
+            first.get_or_insert(committed);
+            cursor = chunk_end;
+            continue;
+        }
+
+        let err = std::io::Error::last_os_error();
+        if !is_placeholder_commit_error(&err)
+            || info.State != MEM_RESERVE
+            || !region_base.is_multiple_of(PAGE)
+            || !info.RegionSize.is_multiple_of(PAGE)
+        {
+            return Err(err);
+        }
+
+        // Placeholders can only be split and replaced on 64 KiB allocation granularity.
+        let p_start = cursor & !(PAGE - 1);
+        let p_end = chunk_end
+            .checked_next_multiple_of(PAGE)
+            .ok_or_else(invalid)?;
+        if p_start > region_base || p_end < region_end {
+            // SAFETY: `[p_start, p_end)` lies strictly within the queried 64 KiB-aligned region.
+            let split = unsafe {
+                VirtualFree(
+                    p_start as *mut c_void,
+                    p_end - p_start,
+                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+                )
+            };
+            if split == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
+        // Replace the isolated placeholder with a write-watched private reservation, falling
+        // back without `MEM_WRITE_WATCH` if the host rejects watch flags on replacement.
+        // SAFETY: `[p_start, p_end)` is an isolated placeholder of `PAGE`-aligned extent.
+        let mut replaced = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                p_start as *const c_void,
+                p_end - p_start,
+                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | MEM_WRITE_WATCH,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if replaced.is_null() {
+            // SAFETY: same placeholder range without `MEM_WRITE_WATCH`.
+            replaced = unsafe {
+                VirtualAlloc2(
+                    GetCurrentProcess(),
+                    p_start as *const c_void,
+                    p_end - p_start,
+                    MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
+                    PAGE_NOACCESS,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+        }
+        if replaced.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // SAFETY: `[cursor, chunk_end)` now lies inside a private `MEM_RESERVE` block.
+        let committed = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                cursor as *const c_void,
+                chunk_len,
+                kind,
+                protect,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if committed.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        first.get_or_insert(committed);
+        cursor = chunk_end;
+    }
+    Ok(first.unwrap_or(base))
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
@@ -1412,5 +1595,191 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    fn release_range(base: *mut c_void, len: usize) {
+        let mut cursor = base as usize;
+        let end = cursor + len;
+        while cursor < end {
+            let Some(info) = query_region(cursor) else {
+                break;
+            };
+            let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+            if info.State != MEM_FREE {
+                // SAFETY: releases our test reservation/split region.
+                unsafe { VirtualFree(info.AllocationBase, 0, MEM_RELEASE) };
+            }
+            if region_end <= cursor {
+                break;
+            }
+            cursor = region_end;
+        }
+    }
+
+    #[test]
+    fn committing_all_or_part_of_a_64k_placeholder_succeeds() {
+        // 1. Partial and whole placeholder commits with PAGES_64K / plain MEM_COMMIT.
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            GRAPHICS,
+            PAGE_NOACCESS,
+        );
+        assert!(!base.is_null());
+        let at = |page: usize| base.wrapping_byte_add(page * PAGE);
+
+        // Commit page 1 inside the placeholder while keeping pages 0 and 2..4 placeholders.
+        assert_eq!(
+            XMemVirtualAlloc(
+                at(1),
+                PAGE,
+                MEM_COMMIT | PAGES_64K,
+                GRAPHICS,
+                PAGE_READWRITE
+            ),
+            at(1)
+        );
+        assert_eq!(query(at(1)).host.State, MEM_COMMIT);
+        assert_eq!(query(at(1)).host.Protect, PAGE_READWRITE);
+        // SAFETY: page 1 was just committed read-write.
+        unsafe { at(1).cast::<u8>().write_bytes(0x5c, PAGE) };
+        let (mut found, mut count, mut granularity) = ([0usize; 4], 4, 0);
+        // SAFETY: queries write-watch addresses into our stack buffer.
+        let watched = unsafe {
+            windows_sys::Win32::System::Memory::GetWriteWatch(
+                0,
+                at(1),
+                PAGE,
+                found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        assert_eq!(watched, 0);
+        assert!(count > 0);
+
+        // Sibling placeholder page 0 still maps physical pages cleanly.
+        let pages = allocate(1);
+        assert_eq!(XMemMapPhysicalPages(at(0), 1, pages.as_ptr()), at(0));
+        // SAFETY: page 0 is mapped read-write.
+        unsafe {
+            at(0).cast::<u8>().write(0x33);
+            assert_eq!(at(0).cast::<u8>().read(), 0x33);
+        }
+
+        // Commit a single 4 KiB sub-page inside placeholder page 2 (with an unaligned
+        // interior address); Win32 rounds down to the 4 KiB page base and leaves the rest reserved.
+        assert_eq!(
+            XMemVirtualAlloc(
+                at(2).wrapping_byte_add(128),
+                1024,
+                MEM_COMMIT,
+                GRAPHICS,
+                PAGE_READWRITE,
+            ),
+            at(2)
+        );
+        assert_eq!(query(at(2)).host.State, MEM_COMMIT);
+        assert_eq!(query(at(2).wrapping_byte_add(4096)).host.State, MEM_RESERVE);
+
+        // Committing the next 4 KiB page inside already-replaced page 2 takes the fast path.
+        assert_eq!(
+            XMemVirtualAlloc(
+                at(2).wrapping_byte_add(4096),
+                4096,
+                MEM_COMMIT,
+                GRAPHICS,
+                PAGE_READWRITE,
+            ),
+            at(2).wrapping_byte_add(4096)
+        );
+
+        // A single commit spanning the end of page 2 (private reserve) into page 3 (placeholder).
+        let bridge = at(2).wrapping_byte_add(PAGE - 4096);
+        assert_eq!(
+            XMemVirtualAlloc(bridge, 8192, MEM_COMMIT, GRAPHICS, PAGE_READWRITE),
+            bridge
+        );
+        assert_eq!(query(bridge).host.State, MEM_COMMIT);
+        assert_eq!(query(at(3)).host.State, MEM_COMMIT);
+
+        // A commit extending past the reservation fails cleanly without touching untouched pages.
+        assert!(
+            XMemVirtualAlloc(
+                base.wrapping_byte_add(4 * PAGE - 4096),
+                8192,
+                MEM_COMMIT,
+                GRAPHICS,
+                PAGE_READWRITE,
+            )
+            .is_null()
+        );
+        assert_eq!(
+            query(base.wrapping_byte_add(4 * PAGE - 4096)).host.State,
+            MEM_RESERVE
+        );
+
+        // Unmap page 0 so [page 0] becomes a placeholder again, verify a commit covering
+        // a still-mapped physical view fails before mutating adjacent regions, then unmap and commit.
+        let mapped = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            GRAPHICS,
+            PAGE_NOACCESS,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(XMemMapPhysicalPages(mapped, 1, pages.as_ptr()), mapped);
+        assert!(XMemVirtualAlloc(mapped, 2 * PAGE, MEM_COMMIT, GRAPHICS, PAGE_READWRITE).is_null());
+        // Sibling page 1 of `mapped` must still be usable as an untouched placeholder.
+        assert_eq!(
+            XMemMapPhysicalPages(mapped.wrapping_byte_add(PAGE), 1, pages.as_ptr()),
+            mapped.wrapping_byte_add(PAGE)
+        );
+        assert_eq!(XMemMapPhysicalPages(mapped, 2, std::ptr::null()), mapped);
+        // Committing all 2 * PAGE across two uncoalesced placeholders succeeds too.
+        assert_eq!(
+            XMemVirtualAlloc(
+                mapped,
+                2 * PAGE,
+                MEM_COMMIT | PAGES_64K,
+                GRAPHICS,
+                PAGE_READWRITE
+            ),
+            mapped
+        );
+        assert_eq!(query(mapped).host.State, MEM_COMMIT);
+        assert_eq!(query(mapped.wrapping_byte_add(PAGE)).host.State, MEM_COMMIT);
+
+        assert_eq!(XMemMapPhysicalPages(at(0), 1, std::ptr::null()), at(0));
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        release_range(base, 4 * PAGE);
+        release_range(mapped, 2 * PAGE);
+
+        // 2. Whole-placeholder commit in a single call.
+        let whole = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            GRAPHICS,
+            PAGE_NOACCESS,
+        );
+        assert!(!whole.is_null());
+        assert_eq!(
+            XMemVirtualAlloc(
+                whole,
+                2 * PAGE,
+                MEM_COMMIT | PAGES_64K,
+                GRAPHICS,
+                PAGE_READWRITE
+            ),
+            whole
+        );
+        assert_eq!(query(whole).host.State, MEM_COMMIT);
+        assert_eq!(query(whole.wrapping_byte_add(PAGE)).host.State, MEM_COMMIT);
+        // SAFETY: whole range is committed read-write.
+        unsafe { whole.cast::<u8>().write_bytes(0x7a, 2 * PAGE) };
+        release_range(whole, 2 * PAGE);
     }
 }
