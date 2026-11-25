@@ -64,7 +64,7 @@ extern "system" fn text_entry_async(
     let max_length = max_length_for(scope, max_length);
     tracing::info!(title, description, max_length, "text entry");
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {
-        match ask(&title, &description, &default, max_length) {
+        match ask(&title, &description, &default, max_length, scope) {
             Some(typed) => {
                 tracing::info!(length = typed.chars().count(), "text entry: done");
                 let mut bytes = limit(&typed, max_length).into_bytes();
@@ -125,14 +125,14 @@ fn limit(typed: &str, max: u32) -> String {
 
 /// Asks the user in a modal host dialog; `None` if dismissed.
 #[cfg(not(test))]
-fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
-    dialog::ask(title, description, default, max)
+fn ask(title: &str, description: &str, default: &str, max: u32, scope: u32) -> Option<String> {
+    dialog::ask(title, description, default, max, scope)
 }
 
 /// Tests answer for the user: "typed" for a title starting with "Type",
 /// cancelled otherwise.
 #[cfg(test)]
-fn ask(title: &str, _: &str, default: &str, _: u32) -> Option<String> {
+fn ask(title: &str, _: &str, default: &str, _: u32, _: u32) -> Option<String> {
     title.starts_with("Type").then(|| format!("{default}typed"))
 }
 
@@ -149,15 +149,29 @@ mod dialog {
 
     /// The dialog's state, behind its user data while it runs.
     struct Entry {
+        scope: i32,
         max: u32,
         typed: Option<String>,
     }
 
+    // The documented GDK scope values are the corresponding Win32 InputScope
+    // values. Unknown title values use the ordinary keyboard.
+    fn windows_scope(scope: u32) -> i32 {
+        match scope {
+            1 | 5 | 29 | 31 | 32 | 40 | 50 | 68 => scope as i32,
+            _ => 0,
+        }
+    }
+
+    #[link(name = "msctf", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn SetInputScope(hwnd: HWND, scope: i32) -> i32;
+    }
     /// The description, an edit box with the default text, OK and Cancel,
     /// from an in-memory template (dialog units, the system font); Enter
     /// accepts, Esc cancels.
     #[allow(dead_code)] // unused in test builds
-    pub(super) fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
+    pub(super) fn ask(title: &str, description: &str, default: &str, max: u32, scope: u32) -> Option<String> {
         let mut t: Vec<u16> = Vec::new();
         fn dword(t: &mut Vec<u16>, v: u32) {
             t.extend([v as u16, (v >> 16) as u16]);
@@ -197,7 +211,7 @@ mod dialog {
             .chunks(2)
             .map(|c| u32::from(c[0]) | u32::from(c.get(1).copied().unwrap_or(0)) << 16)
             .collect();
-        let mut entry = Entry { max, typed: None };
+        let mut entry = Entry { max, scope: windows_scope(scope), typed: None };
         // SAFETY: a complete template and our dialog procedure; `entry`
         // outlives the modal dialog.
         unsafe {
@@ -221,10 +235,20 @@ mod dialog {
                 wm::WM_INITDIALOG => {
                     wm::SetWindowLongPtrW(dialog, wm::GWLP_USERDATA, lparam);
                     let entry = &*(lparam as *const Entry);
+                    if entry.scope != 0 {
+                        SetInputScope(edit, entry.scope);
+                    }
                     wm::SendMessageW(edit, EM_LIMITTEXT, entry.max as WPARAM, 0);
                     wm::SendMessageW(edit, EM_SETSEL, 0, -1);
                     SetFocus(edit);
                     0 // focus set here
+                }
+                wm::WM_DESTROY => {
+                    let entry = wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA) as *const Entry;
+                    if !entry.is_null() && (*entry).scope != 0 && !edit.is_null() {
+                        SetInputScope(edit, 0);
+                    }
+                    0
                 }
                 wm::WM_COMMAND => {
                     let user_data = wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA);
@@ -254,6 +278,25 @@ mod dialog {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn host_edit_accepts_title_input_scopes() {
+            // SAFETY: this thread creates and destroys the hidden edit control.
+            unsafe {
+                let edit = wm::CreateWindowExW(
+                    0, windows_sys::w!("EDIT"), std::ptr::null(), wm::WS_POPUP,
+                    0, 0, 1, 1, std::ptr::null_mut(), std::ptr::null_mut(),
+                    GetModuleHandleW(std::ptr::null()), std::ptr::null(),
+                );
+                assert!(!edit.is_null());
+                for scope in [1, 5, 29, 31, 32, 40, 50, 68, 0] {
+                    assert_eq!(windows_scope(scope), scope as i32);
+                    assert!(SetInputScope(edit, windows_scope(scope)) >= 0);
+                }
+                assert_eq!(windows_scope(u32::MAX), 0);
+                wm::DestroyWindow(edit);
+            }
+        }
 
         #[test]
         fn command_before_init_is_ignored() {
