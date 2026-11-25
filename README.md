@@ -129,10 +129,16 @@ victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm] [--effects]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 victory translate [paths...] --cache [--pipelines] [--jobs N]
+victory list-diff <before> <after> [--top N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
 ```
+
+To measure a shader change, run `translate --validate --list` before and
+after it, each into a file, and compare them with `list-diff`. Its report has
+only counts and failure reasons, no program names, so it can be posted as it
+is.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
