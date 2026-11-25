@@ -24,6 +24,9 @@ struct Tally {
     programs: usize,
     translated: usize,
     instructions: usize,
+    /// Instructions on 16-bit floats ([`f16_kind`]), and the packed ones.
+    f16: usize,
+    packed_f16: usize,
     structured: usize,
     vector: usize,
     guarded: usize,
@@ -96,6 +99,8 @@ impl Tally {
         self.programs += other.programs;
         self.translated += other.translated;
         self.instructions += other.instructions;
+        self.f16 += other.f16;
+        self.packed_f16 += other.packed_f16;
         self.structured += other.structured;
         self.vector += other.vector;
         self.guarded += other.guarded;
@@ -245,6 +250,14 @@ pub fn run(
     println!(
         "programs     {} translated of {} ({} IR instructions)",
         t.translated, t.programs, t.instructions
+    );
+    println!(
+        "f16          {} of {} instructions on 16-bit floats ({:.1}%), {} packed (v_pk_*); \
+         counted in the code, not as run",
+        t.f16,
+        t.instructions,
+        100.0 * t.f16 as f64 / t.instructions.max(1) as f64,
+        t.packed_f16
     );
     println!(
         "structured   {} of {} ({} vector instructions, {} guarded, {} on opaque masks; \
@@ -512,6 +525,12 @@ fn translate(
             Ok((program, structured)) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
+                for i in program.blocks.iter().flat_map(|b| &b.insts) {
+                    if let Some(packed) = f16_kind(i.name()) {
+                        t.f16 += 1;
+                        t.packed_f16 += usize::from(packed);
+                    }
+                }
                 // Per-lane descriptors are traced on the per-lane form; its
                 // failure is listed after the resources' and I/O's.
                 let lanes = structured.as_ref().ok();
@@ -848,12 +867,32 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
     }
 }
 
+/// Whether `name` is an instruction on 16-bit floats (an `_f16` operand or
+/// result: arithmetic, compares and conversions), and if so whether it is
+/// packed (`v_pk_*`). Their share is what native 16-bit math can speed up.
+fn f16_kind(name: &str) -> Option<bool> {
+    (name.ends_with("_f16") || name.contains("_f16_")).then(|| name.starts_with("v_pk_"))
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn f16_instructions_are_counted_and_packed_ones_told_apart() {
+        use super::f16_kind;
+        assert_eq!(f16_kind("v_pk_fma_f16"), Some(true));
+        assert_eq!(f16_kind("v_fma_f16"), Some(false));
+        assert_eq!(f16_kind("v_cvt_f16_f32"), Some(false));
+        assert_eq!(f16_kind("v_cmp_lt_f16"), Some(false));
+        assert_eq!(f16_kind("v_fma_f32"), None);
+        assert_eq!(f16_kind("v_pk_add_u16"), None);
+        assert_eq!(f16_kind("s_mov_b32"), None);
+        assert_eq!(f16_kind(""), None);
+    }
+
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
     fn emit_dump_inside_repo_is_refused() {
