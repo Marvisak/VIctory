@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::UserData;
-use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Rmw, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
 use crate::ShaderError;
@@ -258,6 +258,9 @@ struct Lower<'a> {
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
     mask_ok: bool,
+    /// Group-uniform DXIL block during lowering of the mesh entry block.
+    /// An internally guarded operation can move `cur` away from it.
+    mesh_mask_point: Option<usize>,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
@@ -383,6 +386,8 @@ enum MaskData {
     /// operations the console compiler expands). Lane numbers stay host
     /// lanes throughout (`v_mbcnt`, `v_readlane` at a computed lane).
     Host,
+    /// Wave32 mesh numerical ballots over logical group thread IDs.
+    Mesh32,
     /// Mesh programs: their lanes and waves (LDS per console wave) are the
     /// console's but no host wave size can be declared. Only a mask's bit
     /// count is taken, over the host's wave (the console compiler's test of
@@ -700,9 +705,11 @@ impl<'a> Lower<'a> {
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
+                HwStage::Ms if !x.native.wave64 => MaskData::Mesh32,
                 _ => MaskData::None,
             },
             mask_ok: false,
+            mesh_mask_point: None,
             ballots: HashMap::new(),
             balloting: HashSet::new(),
             def_block: p
@@ -1216,7 +1223,7 @@ impl<'a> Lower<'a> {
         // A mesh program's lanes are numbered as the console's, its host
         // waves are not the console's: only a minimum or maximum (the loop
         // that serves each distinct value once) means the same on any wave.
-        if self.mask_data == MaskData::None
+        if matches!(self.mask_data, MaskData::None | MaskData::Mesh32)
             && (prefix.is_some()
                 || !matches!(
                     op,
@@ -1323,6 +1330,9 @@ impl<'a> Lower<'a> {
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
+            if self.mask_data == MaskData::Mesh32 {
+                self.mesh_mask_point = Some(self.cur);
+            }
         }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
@@ -1375,7 +1385,7 @@ impl<'a> Lower<'a> {
                 }
                 i += 1;
             }
-            self.mask_ok = self.mask_data == MaskData::Console;
+            self.mask_ok = matches!(self.mask_data, MaskData::Console | MaskData::Mesh32);
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
@@ -1824,11 +1834,20 @@ impl<'a> Lower<'a> {
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
             None => {
-                let at = match self.def_block.get(&lo) {
+                let definition = self.def_block.get(&lo).copied();
+                if self.mask_data == MaskData::Mesh32
+                    && (self.cur_ir != 0
+                        || self.mesh_mask_point != Some(self.cur)
+                        || definition.is_some_and(|b| b != 0)
+                        || !self.x.p.blocks[0].preds.is_empty())
+                {
+                    return Err("a numerical mesh mask outside the uniform entry block");
+                }
+                let at = match definition {
                     // Program inputs (EXEC on entry).
                     None => self.s.entry,
-                    Some(&b) if b == self.cur_ir => self.cur,
-                    Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+                    Some(b) if b == self.cur_ir => self.cur,
+                    Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
@@ -1836,18 +1855,59 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let xy = if self.mask_data == MaskData::Mesh32 {
+                    (self.mesh_ballot(at, bit)?, self.s.m.i32(0))
+                } else {
+                    let i32t = self.s.t.i32;
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let r = self
+                        .s
+                        .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+                    self.s.flags |= flags::WAVE_OPS;
+                    (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1))
+                };
                 self.ballots.insert(lo, xy);
                 xy
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// Exact ballot for one or more logical Wave32s in a mesh group. The
+    /// caller proves all threads reach this point once and in the same order.
+    fn mesh_ballot(&mut self, at: usize, bit: V) -> Result<V, Why> {
+        let threads = self.s.threads.expect("mesh thread count")[0];
+        let scratch = self
+            .s
+            .mesh_mask_scratch(threads)
+            .ok_or("a numerical mesh mask beyond the groupshared memory limit")?;
+        let flat = self.mesh_thread();
+        let (zero, one, low_bits, wave_bits, sync_mode) = (
+            self.s.m.i32(0),
+            self.s.m.i32(1),
+            self.s.m.i32(31),
+            self.s.m.i32(!31),
+            self.s.m.i32(1 | 8),
+        );
+        let lane = self.s.m.bin(at, Bin::And, flat, low_bits);
+        let base = self.s.m.bin(at, Bin::And, flat, wave_bits);
+        let lane_cell = self.s.m.element(at, scratch, flat);
+        let wave_cell = self.s.m.element(at, scratch, base);
+        let mask = self.s.m.bin(at, Bin::Shl, one, lane);
+        let contribution = self.s.m.select(at, bit, mask, zero);
+        let sync = |s: &mut Shader| {
+            s.op(at, "barrier", Attr::NoDuplicate, s.t.void, 80, &[sync_mode]);
+        };
+        // Each thread initializes a different cell. A logical wave
+        // accumulates into its first thread's cell even on narrow hosts.
+        self.s.m.store(at, lane_cell, zero);
+        sync(&mut self.s);
+        self.s.m.atomic(at, Rmw::Or, wave_cell, contribution);
+        sync(&mut self.s);
+        let result = self.s.m.load(at, wave_cell);
+        // All readers finish before a later ballot reuses these cells.
+        sync(&mut self.s);
+        Ok(result)
     }
 
     /// Both dwords of a mask holding lanes that do not reach the block
@@ -2877,6 +2937,9 @@ impl<'a> Lower<'a> {
         let then = self.cur;
         self.s.m.terminate(then, Term::Br(join));
         self.cur = join;
+        if self.mesh_mask_point == Some(head) {
+            self.mesh_mask_point = Some(join);
+        }
         values
             .iter()
             .map(|&(inside, outside)| {
@@ -3504,7 +3567,7 @@ impl<'a> Lower<'a> {
         let offset = inst.machine.offset;
         let name = inst.name();
         self.mask_ok = match self.mask_data {
-            MaskData::Console => true,
+            MaskData::Console | MaskData::Mesh32 => true,
             MaskData::Host => {
                 name.starts_with("s_bcnt1_i32_")
                     || name.starts_with("s_ff1_i32_")

@@ -210,6 +210,8 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(test)]
+mod mesh_mask_tests;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
