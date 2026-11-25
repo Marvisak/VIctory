@@ -122,6 +122,35 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
+Set `VICTORY_IN_PLACE=1` (experimental) to let the host GPU read title
+memory in place instead of from host copies (title buffers and memory
+outside them), which saves the copies' host memory and their refreshes.
+Where the host opens part of an allocation as a heap
+(`OpenExistingHeapFromAddress1`), only a buffer's own pages are opened.
+Elsewhere (vkd3d-proton) the whole allocation is opened, which makes all of
+it resident, so only allocations already mostly in memory go in place: 90%
+by default, `VICTORY_IN_PLACE_DENSITY` sets the percentage. Title buffers
+under 1 MiB keep their copies (`VICTORY_IN_PLACE_MIN_KB`): shaders reach
+host memory over the bus, which costs most for small, often-touched
+buffers. Sparse
+allocations, and memory that is not one committed allocation (a buffer over
+many separately mapped pages, say), are still copied. Unset, nothing
+changes.
+
+With `VICTORY_IN_PLACE=1`, also set `VICTORY_IN_PLACE_VRAM=1`
+(experimental) to keep title buffers in place in video memory: each gets a
+buffer on the card that its shaders use, kept in step with title memory by
+the card. Before a submission's lists the pages the title wrote go up from
+the memory in place by GPU copies; after them a compute pass of ours writes
+back only the dwords the shaders changed (partial dwords by atomics, so the
+title's bytes beside them stay), before the submission is done. Nothing is
+copied, compared or hashed by the processor for these buffers, and shaders
+no longer read and write them across the bus. Buffers from 1 MiB
+(`VICTORY_IN_PLACE_VRAM_MIN_MB`) get one while the card's budget allows: 60%
+of it at most by default (`VICTORY_IN_PLACE_VRAM_MB`), and none past 80% of
+the budget in use. The log says every 5 seconds how many there are and what
+went up and back. Unset, nothing changes.
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 

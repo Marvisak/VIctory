@@ -56,6 +56,8 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod resident;
 pub mod signature;
 mod switch;
 #[cfg(windows)]
