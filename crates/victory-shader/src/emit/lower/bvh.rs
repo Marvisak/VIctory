@@ -442,11 +442,32 @@ impl Lower<'_> {
         let sz = self.s.m.bin(c, Bin::SDiv, one, d[2]);
         let sx = self.s.m.bin(c, Bin::Mul, d[0], sz);
         let sy = self.s.m.bin(c, Bin::Mul, d[1], sz);
+        // A multiply kept apart from the add or sub that follows it. The
+        // driver folds a `fmul` feeding a `fadd`/`fsub` into an FMA even
+        // though the stores carry no fast-math flags (precise), and one
+        // rounding instead of two perturbs t's bits. An FMad over a zero
+        // hides the multiply from the fusion pass behind a call, and the
+        // zero carries the product's own sign (sign(a) ^ sign(b)): a sum
+        // the driver fuses rounds its exact product-add once, which is the
+        // plain product's rounding, -0 included — on every backend, AMD's
+        // fused FMad included. (Nothing an emitter can mark makes the
+        // drivers keep the two apart: DXC itself drops `precise` before it
+        // writes DXIL.)
+        let smul = |l: &mut Self, a: V, b: V| -> V {
+            let c = l.cur;
+            let ia = l.as_int(a);
+            let ib = l.as_int(b);
+            let sign = l.s.m.bin(c, Bin::Xor, ia, ib);
+            let mask = l.s.m.i32(0x8000_0000);
+            let zeros = l.s.m.bin(c, Bin::And, sign, mask);
+            let zero = l.as_float(zeros);
+            l.s.op(c, "tertiary.f32", Attr::ReadNone, l.s.t.f32, 46, &[a, b, zero])
+        };
         let sheared = |l: &mut Self, v: [V; 3]| -> [V; 3] {
             let rel: [V; 3] = std::array::from_fn(|k| l.s.m.bin(c, Bin::Sub, v[k], ray.origin[k]));
             let r = perm(l, rel);
-            let tx = l.s.m.bin(c, Bin::Mul, sx, r[2]);
-            let ty = l.s.m.bin(c, Bin::Mul, sy, r[2]);
+            let tx = smul(l, sx, r[2]);
+            let ty = smul(l, sy, r[2]);
             [
                 l.s.m.bin(c, Bin::Sub, r[0], tx),
                 l.s.m.bin(c, Bin::Sub, r[1], ty),
@@ -455,8 +476,8 @@ impl Lower<'_> {
         };
         let [a, b, cc] = p.map(|v| sheared(self, v));
         let edge = |l: &mut Self, p: [V; 3], q: [V; 3]| {
-            let m = l.s.m.bin(c, Bin::Mul, p[0], q[1]);
-            let n = l.s.m.bin(c, Bin::Mul, p[1], q[0]);
+            let m = smul(l, p[0], q[1]);
+            let n = smul(l, p[1], q[0]);
             l.s.m.bin(c, Bin::Sub, m, n)
         };
         let u = edge(self, cc, b);
@@ -473,9 +494,9 @@ impl Lower<'_> {
         let inside = self.s.m.bin(c, Bin::Or, ge, le);
         let vw = self.s.m.bin(c, Bin::Add, v, ww);
         let det = self.s.m.bin(c, Bin::Add, u, vw);
-        let ua = self.s.m.bin(c, Bin::Mul, u, a[2]);
-        let vb = self.s.m.bin(c, Bin::Mul, v, b[2]);
-        let wc = self.s.m.bin(c, Bin::Mul, ww, cc[2]);
+        let ua = smul(self, u, a[2]);
+        let vb = smul(self, v, b[2]);
+        let wc = smul(self, ww, cc[2]);
         let uv = self.s.m.bin(c, Bin::Add, ua, vb);
         let tnum = self.s.m.bin(c, Bin::Add, uv, wc);
         // t >= 0: the numerator has the denominator's sign (0 misses).
