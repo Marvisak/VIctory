@@ -70,12 +70,28 @@ uint clamped(uint at) {
 }
 // A record past the budget (no cost reaches it).
 static const uint PAST = 0xffffffffu;
+#ifndef SINGLE_RECORD
 groupshared uint costs[64];
+#endif
 // One group walks the records in tiles of 64: every lane clamps its own
 // record, then the first lane charges the tile's records in order. No
 // other group shares the budget: a shared add wraps once enough records
 // are rejected, and a compare-exchange retries more the more records fit.
 [RootSignature(RS)]
+#ifdef SINGLE_RECORD
+[numthreads(1, 1, 1)]
+void main() {
+    uint left = BUDGET - min(budget.Load(0), BUDGET);
+    uint cost = clamped(0);
+    if (cost > left) {
+        dest.Store(0, 0);
+        left = 0;
+    } else {
+        left -= cost;
+    }
+    budget.Store(0, BUDGET - left);
+}
+#else
 [numthreads(64, 1, 1)]
 void main(uint lane : SV_GroupIndex) {
     uint left = 0;
@@ -113,6 +129,7 @@ void main(uint lane : SV_GroupIndex) {
         budget.Store(0, BUDGET - left);
     }
 }
+#endif
 "#;
 
 struct Clamp {
@@ -138,15 +155,34 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
+fn clamp_for(records: u32) -> Option<&'static Clamp> {
+    static SINGLE: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    if records == 1
+        && let Some(single) = SINGLE.get_or_init(|| {
+            if std::env::var_os("VICTORY_INDIRECT_SINGLE").is_none_or(|value| value != "1") {
+                return None;
+            }
+            make_from(&format!("#define SINGLE_RECORD\n{SOURCE}")).ok()
+        })
+    {
+        return Some(single);
+    }
+    clamp()
+}
+
 fn make() -> windows::core::Result<Clamp> {
+    make_from(SOURCE)
+}
+
+fn make_from(source: &str) -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -204,7 +240,7 @@ fn make() -> windows::core::Result<Clamp> {
 // layer cannot see view accesses; GPU-based validation might); upgrade to
 // per-list tracked buffer states if a driver or that validation minds.
 pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
+    let (Some(c), Some(budget)) = (clamp_for(records), list.budget()) else {
         return None;
     };
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {

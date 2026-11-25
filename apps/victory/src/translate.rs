@@ -476,10 +476,17 @@ pub(crate) fn report<T>(
     eprintln!("{}{}", if terminal { "\r" } else { "" }, line());
 }
 
+#[derive(PartialEq, Eq, Hash)]
+struct ShaderKey {
+    dxil: blake3::Hash,
+    /// Input, output and primitive signatures, followed by pipeline validation info.
+    interface: [Option<blake3::Hash>; 5],
+}
+
 fn translate(
     source: &Source,
     path: &Path,
-    seen: &Mutex<HashSet<blake3::Hash>>,
+    seen: &Mutex<HashSet<ShaderKey>>,
     t: &mut Tally,
     checks: &mut Checks,
 ) {
@@ -498,7 +505,12 @@ fn translate(
     else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    let interface = [FourCC::ISG1, FourCC::OSG1, FourCC::PSG1, FourCC::PSV0, FourCC::RTS0]
+        .map(|kind| container.part(kind).map(|part| blake3::hash(part.data)));
+    if !lock(seen).insert(ShaderKey {
+        dxil: blake3::hash(dxil),
+        interface,
+    }) {
         t.duplicates += 1;
         return;
     }
@@ -854,6 +866,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
     fn emit_dump_inside_repo_is_refused() {
@@ -870,5 +884,41 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn shared_dxil_with_distinct_signatures_is_not_a_duplicate() {
+        let make = |signature: u32| {
+            let fourcc = u32::from_le_bytes;
+            let words = [
+                fourcc(*b"DXBC"), 0, 0, 0, 0, // Magic and digest.
+                1, 64, 2, 40, 52, // Version, size, and the two part offsets.
+                fourcc(*b"DXIL"), 4, 0,
+                fourcc(*b"OSG1"), 4, signature,
+            ];
+            words
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        let first = make(1);
+        let second = make(2);
+        let seen = Mutex::new(HashSet::new());
+        let mut tally = Tally::default();
+        let mut checks = Checks {
+            keep: None,
+            validator: None,
+            host: None,
+        };
+
+        // The shared synthetic DXIL body is intentionally invalid. Deduplication
+        // happens before decoding it, so only the repeat should be skipped.
+        for data in [&first[..], &second, &first] {
+            let source = Source::Raw { offset: 0, data };
+            translate(&source, Path::new("test.dxbc"), &seen, &mut tally, &mut checks);
+        }
+
+        assert_eq!(tally.containers, 3);
+        assert_eq!(tally.duplicates, 1);
     }
 }
