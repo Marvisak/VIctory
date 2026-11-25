@@ -76,6 +76,29 @@ pub(crate) fn layout<'a>(this: This) -> Option<(u32, &'a [[u32; 4]])> {
     Some((s.stride, &s.arguments))
 }
 
+#[cfg(test)]
+pub(crate) fn test_dispatch() -> This {
+    let arguments = [[2u32, 0, 0, 0]];
+    let desc = Desc {
+        stride: 12,
+        count: 1,
+        arguments: arguments.as_ptr(),
+        nodes: 0,
+    };
+    let mut out = std::ptr::null();
+    assert_eq!(
+        create(
+            std::ptr::null(),
+            &desc,
+            std::ptr::null(),
+            &SIGNATURE_IIDS[0],
+            &mut out
+        ),
+        crate::object::S_OK
+    );
+    out
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &SIGNATURE_IIDS).then_some(this);
     object::answer(COMMAND_SIGNATURE, iid, found, out)

@@ -1277,6 +1277,17 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+/// Checked byte address inside `buffer` at `offset` with at least `min_bytes`
+/// remaining, preventing `u64` address wrap and out-of-bounds aliasing.
+fn buffer_at(buffer: This, offset: u64, min_bytes: u64) -> Option<u64> {
+    let (p, size) = crate::resource::buffer_bytes(buffer)?;
+    let end = offset.checked_add(min_bytes)?;
+    if end > size {
+        return None;
+    }
+    (p as u64).checked_add(offset)
+}
+
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
@@ -1299,8 +1310,15 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
-    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let min_bytes = if count.is_null() {
+        (max as u64).saturating_mul(stride as u64)
+    } else if max > 0 {
+        stride as u64
+    } else {
+        0
+    };
+    let address = buffer_at(arguments, offset, min_bytes);
+    let counter = buffer_at(count, count_offset, 4);
     let mut ran = false;
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
@@ -1720,6 +1738,42 @@ mod tests {
         resolve_queries(list, null, 0, 0, 2, buffer, u64::MAX - 8);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [buffer, list, allocator] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// Offsets near `u64::MAX` or past the buffer end must not overflow `p + offset`
+    /// or alias memory outside the argument / count buffers.
+    #[test]
+    fn execute_indirect_rejects_overflowing_or_oob_offsets() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let sig = crate::signature::test_dispatch();
+        let args = crate::resource::test_buffer(64);
+        let count = crate::resource::test_buffer(64);
+
+        assert!(buffer_at(args, 0, 12).is_some());
+        assert_eq!(buffer_at(args, u64::MAX, 12), None);
+        assert_eq!(buffer_at(args, 65, 0), None);
+        assert_eq!(buffer_at(args, 53, 12), None);
+        assert_eq!(buffer_at(count, 61, 4), None);
+        assert_eq!(buffer_at(count, u64::MAX - 2, 4), None);
+
+        execute_indirect(list, sig, 1, args, u64::MAX, null, 0);
+        execute_indirect(list, sig, 1, args, 0, count, u64::MAX - 2);
+        execute_indirect(list, sig, 1, args, 128, count, 62);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [count, args, sig, list, allocator] {
             assert_eq!(release(object), 0);
         }
     }
