@@ -750,9 +750,12 @@ mod tests {
         assert_eq!(increment_size(null, 0), 32);
         // SAFETY: the heap holds 1000 descriptors of 32 bytes.
         unsafe { (cpu as *mut u8).add(999 * 32 + 31).write(1) };
+        assert_eq!(release(h), 0);
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
-        assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+        let mut invalid = null;
+        assert_eq!(create(bad, none, &mut invalid), E_INVALIDARG);
+        assert!(invalid.is_null());
     }
 
     #[test]
