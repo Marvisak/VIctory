@@ -9,7 +9,7 @@ use victory_hle::{HleResolver, HostPolicy};
 use victory_loader::Provenance;
 use victory_pe::{ImageInfo, ImportSymbol};
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum FunctionKey {
     Name(String),
     Ordinal(u16),
@@ -20,6 +20,16 @@ impl From<&ImportSymbol> for FunctionKey {
         match symbol {
             ImportSymbol::Name { name, .. } => Self::Name(name.clone()),
             ImportSymbol::Ordinal(ordinal) => Self::Ordinal(*ordinal),
+        }
+    }
+}
+
+impl std::fmt::Display for FunctionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Name(name) if name.starts_with('#') => write!(f, "{name:?}"),
+            Self::Name(name) => f.write_str(name),
+            Self::Ordinal(ordinal) => write!(f, "#{ordinal}"),
         }
     }
 }
@@ -45,7 +55,7 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
     let mut seen = BTreeSet::new();
     let mut failed = Vec::new();
     let mut dlls: BTreeMap<String, DllStats> = BTreeMap::new();
-    let mut missing: BTreeMap<(String, String), BTreeSet<PathBuf>> = BTreeMap::new();
+    let mut missing: BTreeMap<(String, FunctionKey), BTreeSet<PathBuf>> = BTreeMap::new();
 
     for root in &paths {
         for entry in walkdir::WalkDir::new(root) {
@@ -134,7 +144,7 @@ fn tally_image(
     info: &ImageInfo,
     resolver: &HleResolver,
     dlls: &mut BTreeMap<String, DllStats>,
-    missing: &mut BTreeMap<(String, String), BTreeSet<PathBuf>>,
+    missing: &mut BTreeMap<(String, FunctionKey), BTreeSet<PathBuf>>,
 ) {
     for module in info.imports.iter().chain(&info.delay_imports) {
         let key = module.dll.to_ascii_lowercase();
@@ -142,14 +152,15 @@ fn tally_image(
         stats.images.insert(path.to_path_buf());
         for e in &module.entries {
             let class = resolver.classify(&module.dll, &e.symbol);
+            let function = FunctionKey::from(&e.symbol);
             if class.is_none() {
                 missing
-                    .entry((key.clone(), e.symbol.to_string()))
+                    .entry((key.clone(), function.clone()))
                     .or_default()
                     .insert(path.to_path_buf());
             }
             // Count each dll!function once across all images.
-            if stats.functions.insert(FunctionKey::from(&e.symbol)) {
+            if stats.functions.insert(function) {
                 match class {
                     Some(Provenance::Hle) => stats.hle += 1,
                     Some(Provenance::Host) => stats.host += 1,
@@ -212,7 +223,7 @@ mod tests {
     fn deduplicates_imports_ignoring_hint_across_images_and_delay_imports() {
         let resolver = HleResolver::new(HostPolicy::none());
         let mut dlls: BTreeMap<String, DllStats> = BTreeMap::new();
-        let mut missing: BTreeMap<(String, String), BTreeSet<PathBuf>> = BTreeMap::new();
+        let mut missing: BTreeMap<(String, FunctionKey), BTreeSet<PathBuf>> = BTreeMap::new();
 
         let image_a = synthetic_image(
             vec![ImportModule {
@@ -273,17 +284,47 @@ mod tests {
             missing.len()
         );
         assert_eq!(
-            missing[&("xgameruntime.dll".into(), "SyntheticMissingApi".into())].len(),
+            missing[&(
+                "xgameruntime.dll".into(),
+                FunctionKey::Name("SyntheticMissingApi".into())
+            )]
+                .len(),
             2
         );
-        assert_eq!(missing[&("xgameruntime.dll".into(), "#42".into())].len(), 2);
+        assert_eq!(missing[&("xgameruntime.dll".into(), FunctionKey::Ordinal(42))].len(), 2);
+    }
+
+    #[test]
+    fn missing_names_and_ordinals_with_the_same_spelling_stay_distinct() {
+        let resolver = HleResolver::new(HostPolicy::none());
+        let mut dlls = BTreeMap::new();
+        let mut missing = BTreeMap::new();
+        let dll = "synthetic.dll";
+        let image = synthetic_image(
+            vec![ImportModule {
+                dll: dll.into(),
+                entries: vec![named(0, "#42"), ordinal(42)],
+            }],
+            Vec::new(),
+        );
+
+        let image_path = Path::new("synthetic.exe");
+        tally_image(image_path, &image, &resolver, &mut dlls, &mut missing);
+
+        let name = FunctionKey::Name("#42".into());
+        let ordinal = FunctionKey::Ordinal(42);
+        assert_eq!(dlls[dll].missing, 2);
+        assert_eq!(missing.len(), 2);
+        assert_ne!(name.to_string(), ordinal.to_string());
+        assert!(missing[&(dll.into(), name)].contains(image_path));
+        assert!(missing[&(dll.into(), ordinal)].contains(image_path));
     }
 
     #[test]
     fn counts_distinct_symbols_and_dlls_separately() {
         let resolver = HleResolver::new(HostPolicy::none());
         let mut dlls: BTreeMap<String, DllStats> = BTreeMap::new();
-        let mut missing: BTreeMap<(String, String), BTreeSet<PathBuf>> = BTreeMap::new();
+        let mut missing: BTreeMap<(String, FunctionKey), BTreeSet<PathBuf>> = BTreeMap::new();
 
         let image = synthetic_image(
             vec![
