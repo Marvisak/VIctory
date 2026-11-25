@@ -3115,8 +3115,10 @@ impl Meter {
                     );
                 }
                 for (why, n) in drops.iter().take(40) {
+                    // The count as well as the rate: a few drops over many
+                    // frames are a rate of 0.0, which reads as none at all.
                     tracing::info!(
-                        "dropped {:.1}/frame without a host pipeline: {why}",
+                        "dropped {n} ({:.1}/frame) without a host pipeline: {why}",
                         *n as f64 / report_frames
                     );
                 }

@@ -288,12 +288,33 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `what` has not been reported before (diagnostics): a skip is
+/// worth one line the first time it happens, since the frame report shows
+/// per-frame averages, which round a handful of drops to zero.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn first_time(what: &str) -> bool {
+    static SAID: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    SAID.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(what.to_owned())
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        let hashes = parse_skip_hashes(&value);
+        // Which hashes the switch took, so a list it refused in full (a
+        // typo, a short hash) is not mistaken for one that skipped nothing.
+        if !hashes.is_empty() {
+            tracing::info!(
+                ?hashes,
+                "VICTORY_SKIP_PIPELINES: skipping their draws and dispatches"
+            );
+        }
+        hashes
     })
 }
 
@@ -333,7 +354,14 @@ pub(crate) fn note_drop(this: This) {
         p.host
             .skipped_shader
             .as_deref()
-            .map(|hash| format!("skipped shader {hash}"))
+            .map(|hash| {
+                // The first skip of each hash is said outright: a run with
+                // nothing in the log here skipped nothing at all.
+                if first_time(hash) {
+                    tracing::info!(hash, "VICTORY_SKIP_PIPELINES: skipped a draw or dispatch");
+                }
+                format!("skipped shader {hash}")
+            })
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
@@ -715,6 +743,20 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    /// Each skipped hash is reported once, however many draws it drops, so
+    /// the line says a skip happened without one per dropped draw.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_skip_is_reported_once_per_hash() {
+        // Keys of this test alone: the set behind `first_time` is global.
+        let (one, two) = ("a_skip_is_reported_once:1", "a_skip_is_reported_once:2");
+        assert!(super::first_time(one));
+        assert!(!super::first_time(one));
+        assert!(!super::first_time(one));
+        assert!(super::first_time(two));
+        assert!(!super::first_time(two));
     }
 
     use super::*;
