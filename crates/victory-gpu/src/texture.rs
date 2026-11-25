@@ -43,8 +43,10 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Mips per array slice on the host copy.
     mips: u32,
+    /// Top console mips omitted from the host copy.
+    mip_drop: u32,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
@@ -66,17 +68,40 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-/// A host copy or resolve writes `resource`: its host texture's contents
-/// are the host's, not title memory's, which stays as it was.
+/// A host copy or resolve writes the entire `resource`: its host texture's
+/// contents are the host's, not title memory's, which stays as it was.
 pub(crate) fn host_written(resource: This) {
     if let Some(copy) = crate::resource::host_copy(resource) {
-        copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed);
+        copy.host_written
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A partial host copy writes a single host subresource of `resource`,
+/// leaving untouched subresources eligible for title-memory upload.
+pub(crate) fn host_written_subresource(resource: This, host_subresource: u32) {
+    if let Some(copy) = crate::resource::host_copy(resource) {
+        let mut subs = copy
+            .host_written_subs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        subs.get_or_insert_with(Default::default)
+            .insert(host_subresource);
     }
 }
 
 fn is_host_written(resource: This) -> bool {
     crate::resource::host_copy(resource)
         .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn host_written_subresources(resource: This) -> Option<std::collections::HashSet<u32>> {
+    let copy = crate::resource::host_copy(resource)?;
+    let subs = copy
+        .host_written_subs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    subs.clone()
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -192,8 +217,8 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
+    // shortcut: a texture (or subresource) the host copied into keeps the
+    // host's contents even if the title later writes its memory too.
     // Once per list for each host texture, however many title textures of
     // its memory the list samples.
     if is_host_written(resource) || !list.first_use(texture.as_raw() as usize) {
@@ -202,9 +227,15 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let Some(staging) = staging(resource, texture) else {
         return;
     };
+    let written_subs = host_written_subresources(resource);
+    if let Some(ref written) = written_subs
+        && (0..staging.footprints.len() as u32).all(|sub| written.contains(&sub))
+    {
+        return;
+    }
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
-    record(list, resource, texture, &staging);
+    record(list, resource, texture, &staging, written_subs.as_ref());
     // Once per submission however many of its lists sample the texture.
     list.defer_texture(staging);
 }
@@ -221,20 +252,35 @@ pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Re
     let Some(staging) = staging(resource, texture) else {
         return false;
     };
+    let written_subs = host_written_subresources(resource);
+    if let Some(ref written) = written_subs
+        && (0..staging.footprints.len() as u32).all(|sub| written.contains(&sub))
+    {
+        return false;
+    }
     if !staging.refresh() {
         return false;
     }
-    record(list, resource, texture, &staging);
+    record(list, resource, texture, &staging, written_subs.as_ref());
     list.keep(&staging.buffer);
     true
 }
 
-/// Records the copy of every subresource of `staging` into `texture`,
-/// moving it to the copy destination state first.
-fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &Staging) {
+/// Records the copy of every non-host-written subresource of `staging` into
+/// `texture`, moving it to the copy destination state first.
+fn record(
+    list: &HostList,
+    resource: This,
+    texture: &ID3D12Resource,
+    staging: &Staging,
+    written_subs: Option<&std::collections::HashSet<u32>>,
+) {
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        if written_subs.is_some_and(|written| written.contains(&(i as u32))) {
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -351,7 +397,8 @@ impl Staging {
             );
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let (host_mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            let mip = host_mip + self.mip_drop;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
@@ -475,6 +522,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        mip_drop: crate::resource::host_mip_drop(resource),
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         last: Mutex::default(),
