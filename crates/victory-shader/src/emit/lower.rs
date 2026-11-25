@@ -531,8 +531,10 @@ impl<'a> Lower<'a> {
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
-            matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
-                && (i.name().contains("store") || i.name().contains("atomic"))
+            matches!(
+                i.fields,
+                Fields::Image { .. } | Fields::Buffer { .. } | Fields::Flat { .. }
+            ) && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
@@ -903,6 +905,21 @@ impl<'a> Lower<'a> {
     /// through a root view at the address the title sets, or into title
     /// memory at an address the program computes.
     fn flat_write(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        #[derive(Clone, Copy)]
+        enum GlobalAtomic {
+            /// Direct DXIL `atomicBinOp` (op 78): `(op_code, negate_value, wide_64)`.
+            BinOp { code: u32, negate: bool, wide: bool },
+            /// Direct DXIL `atomicCompareExchange` (op 79): `vdata` is `(new, compare)`.
+            CmpSwap { wide: bool },
+            /// Unsigned clamping sub via CAS loop: `(old >= val) ? old - val : 0`.
+            CSub,
+            /// Unsigned wrapping inc via CAS loop: `(old >= val) ? 0 : old + 1`.
+            Inc { wide: bool },
+            /// Unsigned wrapping dec via CAS loop: `(old == 0 || old > val) ? val : old - 1`.
+            Dec { wide: bool },
+            /// Existing two-pass signed/unsigned integer atomic lowering for `fmin`/`fmax` (`!glc`).
+            FloatTwoPass(&'static [(u32, u32)]),
+        }
         let Fields::Flat {
             dst, data, cache, ..
         } = &inst.fields
@@ -917,41 +934,158 @@ impl<'a> Lower<'a> {
         if a.param == CODE {
             return Err("a global store into the code");
         }
-        let n = match name.strip_prefix("global_store_") {
-            None => 1,
-            Some("dword") => 1,
-            Some("dwordx2") => 2,
-            Some("dwordx3") => 3,
-            Some("dwordx4") => 4,
-            Some(_) => return Err(name),
-        };
-        // DXIL atomic operations: add, and, or, xor, signed and unsigned min
-        // and max, exchange; subtraction adds the negation. A float minimum
-        // or maximum is the signed integer one where the value is positive
-        // and the reversed unsigned one where negative (IEEE order of the
-        // bits), as two atomics, each a no-op in the lanes the other serves.
-        let ops: Option<&[(u32, u32)]> = match name.strip_prefix("global_atomic_") {
-            None => None,
-            Some("add" | "sub") => Some(&[(0, 0)]),
-            Some("and") => Some(&[(1, 0)]),
-            Some("or") => Some(&[(2, 0)]),
-            Some("xor") => Some(&[(3, 0)]),
-            Some("smin") => Some(&[(4, 0)]),
-            Some("smax") => Some(&[(5, 0)]),
-            Some("umin") => Some(&[(6, 0)]),
-            Some("umax") => Some(&[(7, 0)]),
-            Some("swap") => Some(&[(8, 0)]),
-            Some("fmin") if !cache.glc => Some(&[(4, i32::MAX as u32), (7, 0)]),
-            Some("fmax") if !cache.glc => Some(&[(5, i32::MIN as u32), (6, u32::MAX)]),
-            Some(_) => return Err(name),
-        };
-        if ops.is_none() && !name.starts_with("global_store_") {
+        let (store_n, atomic) = if let Some(rest) = name.strip_prefix("global_store_") {
+            let n = match rest {
+                "dword" => 1,
+                "dwordx2" => 2,
+                "dwordx3" => 3,
+                "dwordx4" => 4,
+                _ => return Err(name),
+            };
+            (Some(n), None)
+        } else if let Some(op) = name.strip_prefix("global_atomic_") {
+            let kind = match op {
+                "swap" => GlobalAtomic::BinOp {
+                    code: 8,
+                    negate: false,
+                    wide: false,
+                },
+                "cmpswap" => GlobalAtomic::CmpSwap { wide: false },
+                "add" => GlobalAtomic::BinOp {
+                    code: 0,
+                    negate: false,
+                    wide: false,
+                },
+                "sub" => GlobalAtomic::BinOp {
+                    code: 0,
+                    negate: true,
+                    wide: false,
+                },
+                "csub" => GlobalAtomic::CSub,
+                "smin" => GlobalAtomic::BinOp {
+                    code: 4,
+                    negate: false,
+                    wide: false,
+                },
+                "umin" => GlobalAtomic::BinOp {
+                    code: 6,
+                    negate: false,
+                    wide: false,
+                },
+                "smax" => GlobalAtomic::BinOp {
+                    code: 5,
+                    negate: false,
+                    wide: false,
+                },
+                "umax" => GlobalAtomic::BinOp {
+                    code: 7,
+                    negate: false,
+                    wide: false,
+                },
+                "and" => GlobalAtomic::BinOp {
+                    code: 1,
+                    negate: false,
+                    wide: false,
+                },
+                "or" => GlobalAtomic::BinOp {
+                    code: 2,
+                    negate: false,
+                    wide: false,
+                },
+                "xor" => GlobalAtomic::BinOp {
+                    code: 3,
+                    negate: false,
+                    wide: false,
+                },
+                "inc" => GlobalAtomic::Inc { wide: false },
+                "dec" => GlobalAtomic::Dec { wide: false },
+                "fmin" if !cache.glc => GlobalAtomic::FloatTwoPass(&[(4, i32::MAX as u32), (7, 0)]),
+                "fmax" if !cache.glc => {
+                    GlobalAtomic::FloatTwoPass(&[(5, i32::MIN as u32), (6, u32::MAX)])
+                }
+                "swap_x2" => GlobalAtomic::BinOp {
+                    code: 8,
+                    negate: false,
+                    wide: true,
+                },
+                "cmpswap_x2" => GlobalAtomic::CmpSwap { wide: true },
+                "add_x2" => GlobalAtomic::BinOp {
+                    code: 0,
+                    negate: false,
+                    wide: true,
+                },
+                "sub_x2" => GlobalAtomic::BinOp {
+                    code: 0,
+                    negate: true,
+                    wide: true,
+                },
+                "smin_x2" => GlobalAtomic::BinOp {
+                    code: 4,
+                    negate: false,
+                    wide: true,
+                },
+                "umin_x2" => GlobalAtomic::BinOp {
+                    code: 6,
+                    negate: false,
+                    wide: true,
+                },
+                "smax_x2" => GlobalAtomic::BinOp {
+                    code: 5,
+                    negate: false,
+                    wide: true,
+                },
+                "umax_x2" => GlobalAtomic::BinOp {
+                    code: 7,
+                    negate: false,
+                    wide: true,
+                },
+                "and_x2" => GlobalAtomic::BinOp {
+                    code: 1,
+                    negate: false,
+                    wide: true,
+                },
+                "or_x2" => GlobalAtomic::BinOp {
+                    code: 2,
+                    negate: false,
+                    wide: true,
+                },
+                "xor_x2" => GlobalAtomic::BinOp {
+                    code: 3,
+                    negate: false,
+                    wide: true,
+                },
+                "inc_x2" => GlobalAtomic::Inc { wide: true },
+                "dec_x2" => GlobalAtomic::Dec { wide: true },
+                _ => return Err(name),
+            };
+            (None, Some(kind))
+        } else {
             return Err(name);
-        }
+        };
+        let wide = matches!(
+            atomic,
+            Some(
+                GlobalAtomic::BinOp { wide: true, .. }
+                    | GlobalAtomic::CmpSwap { wide: true }
+                    | GlobalAtomic::Inc { wide: true }
+                    | GlobalAtomic::Dec { wide: true }
+            )
+        );
+        let (data_dwords, access_bytes) = match (store_n, atomic) {
+            (Some(n), _) => (n, 4 * u32::from(n)),
+            (_, Some(GlobalAtomic::CmpSwap { wide: false })) => (2, 4),
+            (_, Some(GlobalAtomic::CmpSwap { wide: true })) => (4, 8),
+            (_, Some(_)) if wide => (2, 8),
+            (_, Some(_)) => (1, 4),
+            (None, None) => unreachable!(),
+        };
         let guard = self.guard(b, i)?;
         let c = self.cur;
         let d = data.as_ref().ok_or("global store data")?;
-        let vals = self.vgprs(inst, d, n)?;
+        let vals = self.vgprs(inst, d, data_dwords)?;
+        if wide {
+            self.s.flags |= flags::INT64 | flags::ATOMIC64_HEAP;
+        }
         let (memory, root) = if a.param == MEMORY {
             (Some(self.global_address(inst)?), None)
         } else {
@@ -987,11 +1121,11 @@ impl<'a> Lower<'a> {
         // the lanes that write.
         let at = self.begin_guarded(guard);
         let (h, off) = match (memory, root) {
-            (Some((lo, hi)), _) => self.memory(lo, hi, 4 * u32::from(n), true, None),
+            (Some((lo, hi)), _) => self.memory(lo, hi, access_bytes, true, None),
             (_, Some(r)) => r,
             _ => unreachable!(),
         };
-        if name.starts_with("global_store_") {
+        if let Some(n) = store_n {
             let mut args = vec![h, off, iu];
             args.extend(&vals);
             args.resize(3 + 4, iu);
@@ -1003,52 +1137,209 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        let ops = ops.expect("an atomic");
-        let mut x = vals[0];
-        let c = self.cur;
-        if name == "global_atomic_sub" {
-            let zero = self.s.m.i32(0);
-            x = self.s.m.bin(c, Bin::Sub, zero, x);
-        }
-        let negative = {
-            let zero = self.s.m.i32(0);
-            self.s.m.cmp(c, pred::SLT, x, zero)
+        let atomic = atomic.expect("an atomic");
+        let r = match atomic {
+            GlobalAtomic::BinOp { code, negate, wide } => {
+                let (ty, suffix) = if wide {
+                    (self.s.m.int(64), "i64")
+                } else {
+                    (i32t, "i32")
+                };
+                let mut val = if wide {
+                    self.pack64(vals[0], vals[1])
+                } else {
+                    vals[0]
+                };
+                if negate {
+                    let zero = if wide {
+                        self.s.m.int_const(ty, 0)
+                    } else {
+                        self.s.m.i32(0)
+                    };
+                    val = self.s.m.bin(self.cur, Bin::Sub, zero, val);
+                }
+                let op = self.s.m.i32(code);
+                self.s.op(
+                    self.cur,
+                    &format!("atomicBinOp.{suffix}"),
+                    Attr::NoUnwind,
+                    ty,
+                    78,
+                    &[h, op, off, iu, iu, val],
+                )
+            }
+            GlobalAtomic::CmpSwap { wide } => {
+                let (new_val, cmp_val) = if wide {
+                    (
+                        self.pack64(vals[0], vals[1]),
+                        self.pack64(vals[2], vals[3]),
+                    )
+                } else {
+                    (vals[0], vals[1])
+                };
+                self.raw_cmpxchg(h, off, wide, cmp_val, new_val)
+            }
+            GlobalAtomic::CSub => {
+                let val = vals[0];
+                self.raw_atomic_cas_loop(h, off, false, |l, old| {
+                    let c = l.cur;
+                    let zero = l.s.m.i32(0);
+                    let ge = l.s.m.cmp(c, pred::IUGE, old, val);
+                    let diff = l.s.m.bin(c, Bin::Sub, old, val);
+                    l.s.m.select(c, ge, diff, zero)
+                })
+            }
+            GlobalAtomic::Inc { wide } => {
+                let val = if wide {
+                    self.pack64(vals[0], vals[1])
+                } else {
+                    vals[0]
+                };
+                self.raw_atomic_cas_loop(h, off, wide, |l, old| {
+                    let c = l.cur;
+                    let (zero, one) = if wide {
+                        let t = l.s.m.int(64);
+                        (l.s.m.int_const(t, 0), l.s.m.int_const(t, 1))
+                    } else {
+                        (l.s.m.i32(0), l.s.m.i32(1))
+                    };
+                    let ge = l.s.m.cmp(c, pred::IUGE, old, val);
+                    let plus1 = l.s.m.bin(c, Bin::Add, old, one);
+                    l.s.m.select(c, ge, zero, plus1)
+                })
+            }
+            GlobalAtomic::Dec { wide } => {
+                let val = if wide {
+                    self.pack64(vals[0], vals[1])
+                } else {
+                    vals[0]
+                };
+                self.raw_atomic_cas_loop(h, off, wide, |l, old| {
+                    let c = l.cur;
+                    let (zero, one) = if wide {
+                        let t = l.s.m.int(64);
+                        (l.s.m.int_const(t, 0), l.s.m.int_const(t, 1))
+                    } else {
+                        (l.s.m.i32(0), l.s.m.i32(1))
+                    };
+                    let is_zero = l.s.m.cmp(c, pred::EQ, old, zero);
+                    let gt = l.s.m.cmp(c, pred::IUGT, old, val);
+                    let wrap = l.s.m.bin(c, Bin::Or, is_zero, gt);
+                    let minus1 = l.s.m.bin(c, Bin::Sub, old, one);
+                    l.s.m.select(c, wrap, val, minus1)
+                })
+            }
+            GlobalAtomic::FloatTwoPass(ops) => {
+                // A float minimum or maximum is the signed integer one where
+                // the value is positive and the reversed unsigned one where
+                // negative (IEEE order of the bits), as two atomics, each a
+                // no-op in the lanes the other serves.
+                let x = vals[0];
+                let zero = self.s.m.i32(0);
+                let negative = self.s.m.cmp(self.cur, pred::SLT, x, zero);
+                let mut first = None;
+                for (k, &(op, neutral)) in ops.iter().enumerate() {
+                    let n = self.s.m.i32(neutral);
+                    // The first serves positive values, the second negative ones.
+                    let value = if k == 0 {
+                        self.s.m.select(self.cur, negative, n, x)
+                    } else {
+                        self.s.m.select(self.cur, negative, x, n)
+                    };
+                    let op = self.s.m.i32(op);
+                    let r = self.s.op(
+                        self.cur,
+                        "atomicBinOp.i32",
+                        Attr::NoUnwind,
+                        i32t,
+                        78,
+                        &[h, op, off, iu, iu, value],
+                    );
+                    first.get_or_insert(r);
+                }
+                first.expect("an atomic")
+            }
         };
         let returned = match *dst {
             Some(Operand::Vector { reg, .. }) if cache.glc => Some(reg),
             _ => None,
         };
-        let mut first = None;
-        for (k, &(op, neutral)) in ops.iter().enumerate() {
-            let value = if ops.len() == 1 {
-                x
-            } else {
-                let n = self.s.m.i32(neutral);
-                // The first serves positive values, the second negative ones.
-                if k == 0 {
-                    self.s.m.select(self.cur, negative, n, x)
-                } else {
-                    self.s.m.select(self.cur, negative, x, n)
-                }
-            };
-            let op = self.s.m.i32(op);
-            let r = self.s.op(
-                self.cur,
-                "atomicBinOp.i32",
-                Attr::NoUnwind,
-                i32t,
-                78,
-                &[h, op, off, iu, iu, value],
-            );
-            first.get_or_insert(r);
-        }
-        self.mark_view_write(h, off, 4, None);
+        self.mark_view_write(h, off, access_bytes, None);
         let zero = self.s.m.i32(0);
-        let r = self.end_guarded(at, &[(first.expect("an atomic"), zero)])[0];
+        let pairs: Vec<(V, V)> = match (returned, wide) {
+            (None, _) => Vec::new(),
+            (Some(_), true) => {
+                let (lo, hi) = self.split64(r);
+                vec![(lo, zero), (hi, zero)]
+            }
+            (Some(_), false) => vec![(r, zero)],
+        };
+        let results = self.end_guarded(at, &pairs);
         if let Some(reg) = returned {
-            self.write(inst, Reg::V(reg), r, guard);
+            for (k, x) in results.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
         }
         Ok(())
+    }
+
+    /// DXIL `atomicCompareExchange.{i32,i64}` (op 79) on a raw buffer UAV.
+    fn raw_cmpxchg(&mut self, h: V, off: V, wide: bool, cmp: V, new: V) -> V {
+        let (ty, suffix) = if wide {
+            (self.s.m.int(64), "i64")
+        } else {
+            (self.s.t.i32, "i32")
+        };
+        let iu = self.s.m.undef(self.s.t.i32);
+        self.s.op(
+            self.cur,
+            &format!("atomicCompareExchange.{suffix}"),
+            Attr::NoUnwind,
+            ty,
+            79,
+            &[h, off, iu, iu, cmp, new],
+        )
+    }
+
+    /// Compare-and-swap loop over a raw buffer UAV (`i32` or `i64`): reads the
+    /// current word atomically with `cmpxchg(0, 0)` (returning 0 on null/OOB
+    /// views so the first CAS exits immediately), computes `step(old)` as the
+    /// replacement value, and retries until the CAS succeeds. Returns the
+    /// pre-operation memory value.
+    fn raw_atomic_cas_loop(
+        &mut self,
+        h: V,
+        off: V,
+        wide: bool,
+        step: impl FnOnce(&mut Self, V) -> V,
+    ) -> V {
+        let ty = if wide {
+            self.s.m.int(64)
+        } else {
+            self.s.t.i32
+        };
+        let zero = if wide {
+            self.s.m.int_const(ty, 0)
+        } else {
+            self.s.m.i32(0)
+        };
+        let init = self.raw_cmpxchg(h, off, wide, zero, zero);
+        let pre = self.cur;
+        let loop_blk = self.s.m.new_block();
+        let exit_blk = self.s.m.new_block();
+        self.s.m.terminate(pre, Term::Br(loop_blk));
+        self.cur = loop_blk;
+        let cur_old = self.s.m.phi(loop_blk, ty);
+        let next_val = step(self, cur_old);
+        let prev = self.raw_cmpxchg(h, off, wide, cur_old, next_val);
+        let done = self.s.m.cmp(self.cur, pred::EQ, prev, cur_old);
+        let back = self.cur;
+        self.s
+            .m
+            .terminate(back, Term::CondBr(done, exit_blk, loop_blk));
+        self.s.m.set_phi(cur_old, vec![(init, pre), (prev, back)]);
+        self.cur = exit_blk;
+        cur_old
     }
 
     /// Finds the whole-wave sections and the values they leave.
@@ -6494,6 +6785,17 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// Combines low and high dwords into an i64.
+    fn pack64(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, i64t);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, i64t);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+        self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
     /// The low and high dwords of an i64.

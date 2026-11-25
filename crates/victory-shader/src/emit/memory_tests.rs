@@ -752,3 +752,583 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// GLOBAL `op` with `glc = 1` (returns pre-op value in `vdst`).
+const fn global_glc(op: u32, vdst: u8, vaddr: u8, data: u8, saddr: u8, offset: u32) -> [u32; 2] {
+    [
+        0x37 << 26 | op << 18 | 1 << 16 | 2 << 14 | (offset & 0xFFF),
+        vaddr as u32 | (data as u32) << 8 | (saddr as u32) << 16 | (vdst as u32) << 24,
+    ]
+}
+
+/// VOP1 `v_mov_b32 vdst, literal32`.
+const fn v_mov_lit(vdst: u8, literal: u32) -> [u32; 2] {
+    [0x7E00_02FF | (vdst as u32) << 17, literal]
+}
+
+fn compile_cs_program(
+    words: &[u32],
+    vgprs: u16,
+    threads: [u32; 3],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+) -> Result<HostShader, crate::ShaderError> {
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 8 << 1,
+            threads,
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })?;
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    Ok(shader)
+}
+
+fn title_memory_layout() -> (Vec<RootParam>, Vec<UsedResource>) {
+    (
+        vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+    )
+}
+
+fn supports_heap_atomics64(host: &Host) -> bool {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS11, D3D12_FEATURE_DATA_D3D12_OPTIONS11,
+    };
+    let mut opt = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+    // SAFETY: valid D3D12 feature query writing into `opt`.
+    let ok = unsafe {
+        host.device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS11,
+                (&raw mut opt).cast(),
+                size_of_val(&opt) as u32,
+            )
+            .is_ok()
+    };
+    ok && opt.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+}
+
+/// All newly lowered 32-bit integer global atomics (`cmpswap`, `csub`, `inc`,
+/// `dec`) with `glc = 1`: verifies both updated title memory and returned
+/// pre-op values across wrap, clamp, unsigned high-bit, and unmapped-memory
+/// termination cases.
+#[test]
+fn global_atomics_32bit_cmpswap_csub_inc_dec_match_rdna2() {
+    const CMPSWAP: u32 = 0x31;
+    const CSUB: u32 = 0x34;
+    const INC: u32 = 0x3C;
+    const DEC: u32 = 0x3D;
+
+    // (op, initial_mem, vdata0 [new/val], optional vdata1 [cmp], want_mem, want_ret)
+    type Case32 = (u32, u32, u32, Option<u32>, u32, u32);
+    let cases: &[Case32] = &[
+        (CMPSWAP, 0x1111_2222, 0xAAAA_BBBB, Some(0x1111_2222), 0xAAAA_BBBB, 0x1111_2222),
+        (CMPSWAP, 0x1111_2222, 0xAAAA_BBBB, Some(0xDEAD_BEEF), 0x1111_2222, 0x1111_2222),
+        (CSUB, 100, 30, None, 70, 100),
+        (CSUB, 42, 42, None, 0, 42),
+        (CSUB, 10, 50, None, 0, 10),
+        (CSUB, 0x8000_0005, 5, None, 0x8000_0000, 0x8000_0005),
+        (INC, 3, 5, None, 4, 3),
+        (INC, 5, 5, None, 0, 5),
+        (INC, 9, 5, None, 0, 9),
+        (INC, 0, 0, None, 0, 0),
+        (INC, u32::MAX, u32::MAX, None, 0, u32::MAX),
+        (DEC, 3, 5, None, 2, 3),
+        (DEC, 0, 5, None, 5, 0),
+        (DEC, 9, 5, None, 5, 9),
+        (DEC, 7, 0, None, 0, 7),
+    ];
+
+    let mut w = vec![s_mov_b32(5, ZERO as u8)];
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: result UAV
+    w.push(v_mov_b32(1, ZERO)); // v1 = 0
+    for (idx, &(op, _, d0, d1, _, _)) in cases.iter().enumerate() {
+        w.extend(v_mov_lit(2, d0));
+        if let Some(cmp) = d1 {
+            w.extend(v_mov_lit(3, cmp));
+        }
+        w.extend(global_glc(op, 6, 1, 2, 0, (idx * 4) as u32));
+        w.push(S_WAITCNT_ALL);
+        w.extend(buffer_store_dword(6, 8, (idx * 4) as u16));
+    }
+    // Unmapped title address (next 64 KiB page): CAS loop must exit cleanly and return 0.
+    let unmapped = TITLE + 0x1_0000;
+    w.extend(v_mov_lit(4, unmapped as u32));
+    w.extend(v_mov_lit(5, (unmapped >> 32) as u32));
+    w.extend(v_mov_lit(2, 5));
+    w.extend(global_glc(INC, 6, 4, 2, 0x7D, 0));
+    w.push(S_WAITCNT_ALL);
+    w.extend(buffer_store_dword(6, 8, (cases.len() * 4) as u16));
+    w.push(S_ENDPGM);
+
+    let (layout, used) = title_memory_layout();
+    let shader = compile_cs_program(&w, 8, [1, 1, 1], layout, used).expect("compile");
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut memory = vec![0u32; 64];
+    for (idx, &(_, init, _, _, _, _)) in cases.iter().enumerate() {
+        memory[idx] = init;
+    }
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        let constants = [TITLE as u32, (TITLE >> 32) as u32];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => constants[u.dword as usize],
+                _ => 0,
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: page_table(1, 3) }),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[
+                        View::RawUav((cases.len() + 1) as u32),
+                        View::Memory(&memory),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        for (idx, &(op, _, _, _, want_mem, want_ret)) in cases.iter().enumerate() {
+            assert_eq!(
+                out[1][idx], want_mem,
+                "{label}: case {idx} (op {op:#x}) memory mismatch: got {:#x}, want {want_mem:#x}",
+                out[1][idx]
+            );
+            assert_eq!(
+                out[0][idx], want_ret,
+                "{label}: case {idx} (op {op:#x}) return mismatch: got {:#x}, want {want_ret:#x}",
+                out[0][idx]
+            );
+        }
+        assert_eq!(out[0][cases.len()], 0, "{label}: unmapped inc return");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Contended CAS loop under divergent `EXEC`: 16 active lanes increment the
+/// same global word while 16 disabled lanes must preserve their destination
+/// VGPR untouched.
+#[test]
+fn global_atomics_cas_loop_handles_contention_and_exec_mask() {
+    const INC: u32 = 0x3C;
+    const SENTINEL: u32 = 0xDEAD_C0DE;
+    const V_LSHLREV_B32: u32 = 0x1A;
+    let mut w = vec![s_mov_b32(5, ZERO as u8)];
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: result UAV
+    w.push(v_mov_b32(1, ZERO)); // v1 = 0
+    w.extend(v_mov_lit(2, 100)); // v2 = limit 100
+    w.extend(v_mov_lit(6, SENTINEL)); // pre-initialized vdst
+    // v_cmp_gt_u32 vcc_lo, 16, v0 (true for lanes 0..16)
+    w.push(0x7C00_0000 | 0xC4 << 17 | (128 + 16));
+    // s_and_saveexec_b32 s20, vcc_lo
+    w.push(0xBE80_0000 | 20 << 16 | 0x3C << 8 | 106);
+    w.extend(global_glc(INC, 6, 1, 2, 0, 0));
+    // s_mov_b32 exec_lo, s20
+    w.push(s_mov_b32(126, 20));
+    w.push(S_WAITCNT_ALL);
+    // v3 = lane << 2
+    w.push(V_LSHLREV_B32 << 25 | 3 << 17 | (128 + 2));
+    // buffer_store_dword v6, v3, s[8:11], 0 offen
+    w.extend([0x38 << 26 | 0x1C << 18 | 1 << 12, 0x80 << 24 | (8 >> 2) << 16 | 6 << 8 | 3]);
+    w.push(S_ENDPGM);
+
+    let (layout, used) = title_memory_layout();
+    let shader = compile_cs_program(&w, 8, [32, 1, 1], layout, used).expect("compile");
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let memory = vec![0u32; 16];
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        let constants = [TITLE as u32, (TITLE >> 32) as u32];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => constants[u.dword as usize],
+                _ => 0,
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: page_table(1, 3) }),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[
+                        View::RawUav(32),
+                        View::Memory(&memory),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(out[1][0], 16, "{label}: final counter after 16 contended increments");
+        let mut active = out[0][..16].to_vec();
+        active.sort_unstable();
+        assert_eq!(active, (0..16).collect::<Vec<u32>>(), "{label}: active returns");
+        assert_eq!(out[0][16..32], [SENTINEL; 16], "{label}: disabled lanes preserved");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// All 13 64-bit integer global atomics (`global_atomic_*_x2`) with `glc = 1`,
+/// through both title memory and a root UAV: validates DXIL and `SFI0` flags
+/// (`INT64 | ATOMIC64_HEAP` without `ATOMIC64_TYPED`), and executes on every
+/// SM 6.6 adapter supporting `OPTIONS11` 64-bit heap atomics.
+#[test]
+fn global_atomics_64bit_x2_match_rdna2() {
+    const SWAP_X2: u32 = 0x50;
+    const CMPSWAP_X2: u32 = 0x51;
+    const ADD_X2: u32 = 0x52;
+    const SUB_X2: u32 = 0x53;
+    const SMIN_X2: u32 = 0x55;
+    const UMIN_X2: u32 = 0x56;
+    const SMAX_X2: u32 = 0x57;
+    const UMAX_X2: u32 = 0x58;
+    const AND_X2: u32 = 0x59;
+    const OR_X2: u32 = 0x5A;
+    const XOR_X2: u32 = 0x5B;
+    const INC_X2: u32 = 0x5C;
+    const DEC_X2: u32 = 0x5D;
+
+    // (op, initial_mem, val0 [new/op], optional val1 [cmp], want_mem, want_ret)
+    type Case64 = (u32, u64, u64, Option<u64>, u64, u64);
+    let cases: &[Case64] = &[
+        (SWAP_X2, 0x1122_3344_5566_7788, 0xAABB_CCDD_EEFF_0011, None, 0xAABB_CCDD_EEFF_0011, 0x1122_3344_5566_7788),
+        (CMPSWAP_X2, 0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210, Some(0x0123_4567_89AB_CDEF), 0xFEDC_BA98_7654_3210, 0x0123_4567_89AB_CDEF),
+        (CMPSWAP_X2, 0x0123_4567_89AB_CDEF, 0xDEAD_BEEF_CAFE_BABE, Some(0x0123_4568_89AB_CDEF), 0x0123_4567_89AB_CDEF, 0x0123_4567_89AB_CDEF),
+        (ADD_X2, 0x0000_0001_FFFF_FFF0, 0x20, None, 0x0000_0002_0000_0010, 0x0000_0001_FFFF_FFF0),
+        (SUB_X2, 0x0000_0002_0000_0005, 0x10, None, 0x0000_0001_FFFF_FFF5, 0x0000_0002_0000_0005),
+        (SMIN_X2, 3, (-5i64) as u64, None, (-5i64) as u64, 3),
+        (UMIN_X2, (-5i64) as u64, 3, None, 3, (-5i64) as u64),
+        (SMAX_X2, (-10i64) as u64, (-2i64) as u64, None, (-2i64) as u64, (-10i64) as u64),
+        (UMAX_X2, 0x0000_0000_FFFF_FFFF, 0x0000_0001_0000_0000, None, 0x0000_0001_0000_0000, 0x0000_0000_FFFF_FFFF),
+        (AND_X2, 0xF0F0_F0F0_AAAA_AAAA, 0x0FF0_00FF_55FF_00FF, None, 0x00F0_00F0_00AA_00AA, 0xF0F0_F0F0_AAAA_AAAA),
+        (OR_X2, 0x1000_0000_0000_0001, 0x0200_0000_0000_0020, None, 0x1200_0000_0000_0021, 0x1000_0000_0000_0001),
+        (XOR_X2, 0xFFFF_0000_1234_5678, 0x0F0F_0F0F_FFFF_0000, None, 0xF0F0_0F0F_EDCB_5678, 0xFFFF_0000_1234_5678),
+        (INC_X2, 0x0000_0000_FFFF_FFFF, 0x0000_0002_0000_0000, None, 0x0000_0001_0000_0000, 0x0000_0000_FFFF_FFFF),
+        (INC_X2, 0x0000_0002_0000_0000, 0x0000_0002_0000_0000, None, 0, 0x0000_0002_0000_0000),
+        (INC_X2, u64::MAX, u64::MAX, None, 0, u64::MAX),
+        (DEC_X2, 0x0000_0001_0000_0000, 0x0000_0005_0000_0000, None, 0x0000_0000_FFFF_FFFF, 0x0000_0001_0000_0000),
+        (DEC_X2, 0, 0x0000_0005_0000_0001, None, 0x0000_0005_0000_0001, 0),
+        (DEC_X2, 0x0000_0009_0000_0000, 0x0000_0005_0000_0001, None, 0x0000_0005_0000_0001, 0x0000_0009_0000_0000),
+        (DEC_X2, 0x0000_0001_0000_0000, 0, None, 0, 0x0000_0001_0000_0000),
+    ];
+
+    let mut w = vec![s_mov_b32(5, ZERO as u8)];
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: result UAV
+    w.push(v_mov_b32(1, ZERO));
+    for (idx, &(op, _, v0, v1, _, _)) in cases.iter().enumerate() {
+        w.extend(v_mov_lit(2, v0 as u32));
+        w.extend(v_mov_lit(3, (v0 >> 32) as u32));
+        if let Some(cmp) = v1 {
+            w.extend(v_mov_lit(4, cmp as u32));
+            w.extend(v_mov_lit(5, (cmp >> 32) as u32));
+        }
+        w.extend(global_glc(op, 6, 1, 2, 0, (idx * 8) as u32));
+        w.push(S_WAITCNT_ALL);
+        w.extend(buffer_store_dword(6, 8, (idx * 8) as u16));
+        w.extend(buffer_store_dword(7, 8, (idx * 8 + 4) as u16));
+    }
+    // Also exercise the `glc = 0` (no return value) path on a 64-bit atomic.
+    let no_glc_idx = cases.len();
+    w.extend(v_mov_lit(2, 0x10));
+    w.extend(v_mov_lit(3, 0));
+    w.extend(global(ADD_X2, 0, 1, 2, 0, (no_glc_idx * 8) as u32));
+    w.push(S_ENDPGM);
+
+    let (layout, used) = title_memory_layout();
+    let shader = compile_cs_program(&w, 10, [1, 1, 1], layout, used).expect("compile");
+    let sfi0 = crate::Container::parse(&shader.dxil)
+        .unwrap()
+        .part(crate::FourCC::SFI0)
+        .unwrap()
+        .data;
+    let features = u64::from_le_bytes(sfi0[..8].try_into().unwrap());
+    assert_ne!(features & 0x8000, 0, "INT64 feature bit");
+    assert_ne!(features & 0x1000_0000, 0, "ATOMIC64_HEAP feature bit");
+    assert_eq!(features & 0x0040_0000, 0, "raw buffer must not set ATOMIC64_TYPED");
+
+    // Non-title-memory root UAV shader using global_atomic_add_x2.
+    let mut rw = vec![s_mov_b32(5, ZERO as u8)];
+    rw.extend(s_load(2, 8, 4, 0));
+    rw.push(v_mov_b32(1, ZERO));
+    rw.extend(v_mov_lit(2, 0x0000_0020));
+    rw.extend(v_mov_lit(3, 0x0000_0001));
+    rw.extend(global_glc(ADD_X2, 6, 1, 2, 6, 0));
+    rw.push(S_WAITCNT_ALL);
+    rw.extend(buffer_store_dword(6, 8, 0));
+    rw.extend(buffer_store_dword(7, 8, 4));
+    rw.push(S_ENDPGM);
+    let root_shader = compile_cs_program(
+        &rw,
+        10,
+        [1, 1, 1],
+        vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 2,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+    )
+    .expect("root uav compile");
+    assert!(!root_shader.memory, "root UAV shader uses direct view, not title memory");
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut memory = vec![0u32; cases.len() * 2 + 8];
+    for (idx, &(_, init, _, _, _, _)) in cases.iter().enumerate() {
+        memory[idx * 2] = init as u32;
+        memory[idx * 2 + 1] = (init >> 32) as u32;
+    }
+    memory[no_glc_idx * 2] = 0xFFFF_FFF8;
+    memory[no_glc_idx * 2 + 1] = 0x0000_0005;
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        if !supports_heap_atomics64(&host) {
+            eprintln!("{label} device has no OPTIONS11 64-bit heap atomics; skipped");
+            continue;
+        }
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        let constants = [TITLE as u32, (TITLE >> 32) as u32];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => constants[u.dword as usize],
+                _ => 0,
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: page_table(1, 3) }),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[
+                        View::RawUav((cases.len() * 2) as u32),
+                        View::Memory(&memory),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let read64 = |words: &[u32], idx: usize| {
+            u64::from(words[idx * 2]) | (u64::from(words[idx * 2 + 1]) << 32)
+        };
+        for (idx, &(op, _, _, _, want_mem, want_ret)) in cases.iter().enumerate() {
+            assert_eq!(
+                read64(&out[1], idx),
+                want_mem,
+                "{label}: case {idx} (op {op:#x}) 64-bit memory mismatch"
+            );
+            assert_eq!(
+                read64(&out[0], idx),
+                want_ret,
+                "{label}: case {idx} (op {op:#x}) 64-bit return mismatch"
+            );
+        }
+        assert_eq!(
+            read64(&out[1], no_glc_idx),
+            0x0000_0006_0000_0008,
+            "{label}: glc=0 add_x2 memory mismatch"
+        );
+
+        // Also run the non-title-memory root UAV 64-bit atomic path:
+        // View::Memory puts its raw SRV at heap index 1 and raw UAV at heap index 2.
+        let (rroot, rpso) = host.compute_pipeline(&root_shader).expect("root pipeline");
+        let mut rud = vec![0u32; root_shader.user_data_dwords() as usize];
+        // Table at heap index 0, root UAV view at heap index 2, offset 8 bytes.
+        (rud[4], rud[6], rud[7]) = (0, 2, 8);
+        let root_init = [0u32, 0, 0xFFFF_FFF0, 0x0000_0002];
+        let rout = host
+            .dispatch(
+                &rroot,
+                &rpso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(rud))],
+                    views: &[View::RawUav(2), View::Memory(&root_init), View::Pair],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label} root UAV: {e}"));
+        assert_eq!(read64(&rout[0], 0), 0x0000_0002_FFFF_FFF0, "{label}: root UAV return");
+        assert_eq!(read64(&rout[1], 1), 0x0000_0004_0000_0010, "{label}: root UAV memory");
+        ran += 1;
+    }
+    eprintln!("64-bit global atomics ran on {ran} adapter(s)");
+}
+
+/// 64-bit floating-point global atomics (`fcmpswap_x2`, `fmin_x2`, `fmax_x2`)
+/// are still cleanly rejected until DXIL `double` is modelled.
+#[test]
+fn global_atomic_refuses_unsupported_f64_forms() {
+    for (op, expected) in [
+        (0x5E, "global_atomic_fcmpswap_x2"),
+        (0x5F, "global_atomic_fmin_x2"),
+        (0x60, "global_atomic_fmax_x2"),
+    ] {
+        let mut w = vec![v_mov_b32(1, ZERO)];
+        w.extend(v_mov_lit(2, 0));
+        w.extend(v_mov_lit(3, 0));
+        w.extend(v_mov_lit(4, 0));
+        w.extend(v_mov_lit(5, 0));
+        w.extend(global(op, 0, 1, 2, 0, 0));
+        w.push(S_ENDPGM);
+        let (layout, used) = title_memory_layout();
+        let err = compile_cs_program(&w, 8, [1, 1, 1], layout, used)
+            .expect_err("unsupported f64 atomic should fail");
+        match err {
+            crate::ShaderError::Unsupported { what, .. } => assert_eq!(what, expected),
+            other => panic!("expected Unsupported({expected}), got {other:?}"),
+        }
+    }
+}
