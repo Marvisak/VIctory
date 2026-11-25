@@ -320,11 +320,21 @@ const INPUT_INVALID: u32 = 4;
 
 struct Voice {
     decoder: Option<xma::Decoder>,
+    /// Decoded samples not yet in the ring: up to a reserve ahead of it, so
+    /// a block the title frees is refilled at once, on its own thread.
     pcm: VecDeque<i16>,
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
-    ended: bool,
+    /// Both inputs ran out and the decoder's tail was flushed. New input
+    /// resumes the voice from a cold decoder.
+    drained: bool,
     trace: Trace,
+}
+
+/// Decoded samples (all channels) kept ahead of the ring: two frames,
+/// 21 ms, so the decoding thread may be that late without a gap.
+fn reserve(channels: usize) -> usize {
+    2 * xma::FRAME_SAMPLES * channels
 }
 
 /// What a voice did, for the debug log when it is disabled.
@@ -421,7 +431,7 @@ impl Xma {
             decoder: None,
             pcm: VecDeque::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
-            ended: false,
+            drained: false,
             trace: Trace {
                 since: Instant::now(),
                 produced: 0,
@@ -482,6 +492,9 @@ impl Xma {
             t.taken += blocks as usize;
             t.takes += 1;
             t.partial_takes += u32::from(blocks < size);
+            // Refill from the reserve now: a copy, no decoding, so the title's
+            // mixer never waits for the decoding thread to be scheduled.
+            fill(context, voice);
         }
         drop(slot);
         wake_decoder();
@@ -506,15 +519,33 @@ impl Xma {
     }
 }
 
+/// Fills the ring as far as it has room and then decodes the reserve
+/// ahead of it.
 fn pump(context: Context, voice: &mut Voice) {
+    if context.field(0, 22, 5) == 0 {
+        return;
+    }
+    let reserve = reserve(context.channels());
+    loop {
+        fill(context, voice);
+        let wanted = context.field(1, 31, 1) == 1 || voice.pcm.len() < reserve;
+        if !wanted || !decode(context, voice) {
+            return;
+        }
+    }
+}
+
+/// Copies decoded samples into the ring while it has room. A partial block
+/// waits for more input, unless the input has run out: then it is padded
+/// with silence.
+fn fill(context: Context, voice: &mut Voice) {
     let size = context.field(0, 22, 5);
     if size == 0 {
         return;
     }
-    while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
-            return;
-        }
+    while context.field(1, 31, 1) == 1
+        && (voice.pcm.len() >= SAMPLES_PER_BLOCK || (voice.drained && !voice.pcm.is_empty()))
+    {
         // The write block is the title's too: taken modulo the ring before
         // the first write, which would otherwise land past the ring's end.
         let write = context.field(0, 27, 5) % size;
@@ -542,28 +573,38 @@ fn pump(context: Context, voice: &mut Voice) {
 }
 
 /// Decodes the next frame of the current input into `voice.pcm`; false
-/// when there is nothing left to decode.
+/// when there is nothing to decode until the title gives more input.
 fn decode(context: Context, voice: &mut Voice) -> bool {
-    if voice.ended {
-        return false;
-    }
     let channels = context.channels();
     let mut current = context.field(4, 31, 1);
     let valid = context.field(0, 20, 2);
-    if valid & (1 << current) == 0 {
-        if valid & (1 << (1 - current)) == 0 {
-            // Out of input: the overlap tail, then nothing.
-            if let Some(decoder) = &mut voice.decoder {
-                let mut tail = Vec::new();
-                decoder.flush(&mut tail);
-                voice.pcm.extend(tail);
-            }
-            voice.ended = true;
-            voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
-            context.set_field(2, 26, 5, INPUT_INVALID);
-            context.set_field(2, 31, 1, 1);
-            return !voice.pcm.is_empty();
+    if valid == 0 {
+        if voice.drained {
+            return false;
         }
+        // Out of input: the overlap tail, then nothing until the title
+        // gives more (a streaming title that refilled late, or a sound
+        // that ended).
+        if let Some(decoder) = &mut voice.decoder {
+            let mut tail = Vec::new();
+            decoder.flush(&mut tail);
+            voice.pcm.extend(tail);
+        }
+        voice.drained = true;
+        voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
+        context.set_field(2, 26, 5, INPUT_INVALID);
+        context.set_field(2, 31, 1, 1);
+        return true;
+    }
+    if voice.drained {
+        // New input after running out: the tail was played, so start over
+        // from a cold decoder at the start of the input, with the error
+        // cleared as enabling does.
+        voice.drained = false;
+        voice.decoder = None;
+        context.set(2, 0);
+    }
+    if valid & (1 << current) == 0 {
         current = 1 - current;
         context.set_field(4, 31, 1, current);
         context.set_field(2, 0, 26, 0);
@@ -668,6 +709,18 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    // The title's mixer, which takes what this decodes, runs
+                    // time-critical; at normal priority this thread lost the
+                    // CPU to the title's workers and the rings ran dry. It
+                    // only works while a ring has room, so it cannot hog.
+                    #[cfg(windows)]
+                    // SAFETY: changes only this thread's priority.
+                    unsafe {
+                        use windows_sys::Win32::System::Threading::{
+                            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+                        };
+                        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+                    }
                     loop {
                         xma().pump();
                         // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
@@ -1240,6 +1293,28 @@ mod tests {
         assert_eq!(context.field(0, 20, 2), 0, "input used up");
         assert_eq!(context.field(2, 26, 5), INPUT_INVALID);
 
+        // New input after running out resumes the voice from its start,
+        // with the error cleared until it runs out again.
+        let before = produced(&xma()).unwrap();
+        context.set_field(0, 20, 2, 1);
+        xma().pump();
+        assert_eq!(context.field(2, 31, 1), 0, "resumed");
+        assert_eq!(context.field(1, 31, 1), 0, "ring full again");
+        // Freed blocks are refilled from the reserve by the command itself.
+        submit(ADVANCE_XMA_READ, &[1, 4]);
+        assert_eq!(context.field(1, 31, 1), 0, "refilled without a pass");
+        for _ in 0..20 {
+            submit(ADVANCE_XMA_READ, &[1, 4]);
+            xma().pump();
+            if context.field(2, 31, 1) == 1 && context.field(1, 31, 1) == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            produced(&xma()).unwrap() - before,
+            26 * SAMPLES_PER_BLOCK
+        );
+
         // A count near `u32::MAX` wraps the read block like any other
         // (3 + 0xffff_ffff blocks on a ring of four is block 2); the sum
         // used to overflow.
@@ -1286,7 +1361,7 @@ mod tests {
             decoder: None,
             pcm: VecDeque::new(),
             skip: 0,
-            ended: false,
+            drained: false,
             trace: Trace {
                 since: Instant::now(),
                 produced: 0,
