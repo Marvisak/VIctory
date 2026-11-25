@@ -375,6 +375,10 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// Whether the host runs compute waves of 32 lanes only (no `WaveSize(64)`,
+    /// e.g. NVIDIA GPUs). Wave64 compute programs without cross-half or
+    /// single-wave LDS sharing are translated to run as two 32-lane waves.
+    pub host_wave32: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -499,6 +503,7 @@ pub fn emit_with(
         prims: prims.clone(),
         mesh_stride,
         view_marks: options.view_marks,
+        host_wave32: options.host_wave32,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
@@ -1791,5 +1796,82 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    #[test]
+    fn wave64_cross_half_readlane_is_refused_on_wave32_host() {
+        // v_readlane_b32 s12, v5, 1; v_mov_b32 v3, s12; ds_write_b32 v0, v3; s_endpgm
+        let words = [
+            0xD760_000Cu32,
+            0x0001_0305,
+            0x7E06_020C,
+            0xD834_0000,
+            0x0000_0300,
+            0xBF81_0000,
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: true,
+            vgprs: 6,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 1 << 15, // 64 LDS dwords
+                threads: [128, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let bytes = crate::dxbc::build(&[]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+
+        let opts = super::Options {
+            host_wave32: true,
+            ..Default::default()
+        };
+        let err = super::emit_with(&c, &native, &p, &st, &io, &res, opts)
+            .expect_err("cross-half v_readlane_b32 must be refused on a 32-lane host");
+        assert!(
+            err.to_string().contains("cross-half"),
+            "unexpected refusal reason: {err}"
+        );
+    }
+
+    #[test]
+    fn wave64_one_wave_lds_is_refused_on_wave32_host() {
+        // ds_write_b32 v0, v1; s_endpgm (no barrier, one-wave LDS sharing)
+        let words = [0xD834_0000u32, 0x0000_0100, 0xBF81_0000];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: true,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 1 << 15, // 64 LDS dwords
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let bytes = crate::dxbc::build(&[]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+
+        let opts = super::Options {
+            host_wave32: true,
+            ..Default::default()
+        };
+        let err = super::emit_with(&c, &native, &p, &st, &io, &res, opts)
+            .expect_err("one-wave LDS sharing must be refused on a 32-lane host");
+        assert!(
+            err.to_string().contains("sharing LDS within one wave"),
+            "unexpected refusal reason: {err}"
+        );
     }
 }
