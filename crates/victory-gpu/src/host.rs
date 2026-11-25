@@ -1009,6 +1009,9 @@ struct Deferred {
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
+    /// Work done once the list has run, before anything goes back into
+    /// title memory.
+    before: Vec<Box<dyn Fn() + Send>>,
     /// Asked once the list has run, before anything goes back: whether its
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
@@ -1367,6 +1370,13 @@ impl Host {
         for b in back.iter_mut().filter(|b| b.3) {
             let copy = std::sync::Arc::as_ptr(&b.0) as usize;
             b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
+        }
+        // Before anything goes back: a write-back marks its pages changed in
+        // the other copies holding them, and makes these differ there.
+        for list in runs {
+            for work in &list.deferred().before {
+                work();
+            }
         }
         // Pages shaders marked first: the copy-backs below end what the
         // copies keep for them.
@@ -2109,6 +2119,12 @@ impl HostList {
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
         self.deferred().after.push(Box::new(work));
+    }
+
+    /// Runs `work` once the list has run (each submission), before anything
+    /// its submission's shaders wrote goes back into title memory.
+    pub(crate) fn defer_before(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().before.push(Box::new(work));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -3959,6 +3975,7 @@ mod withholding {
     #[test]
     fn only_programs_using_title_memory_are_withheld() {
         use crate::watch::PAGE;
+        let _misses = crate::memory::tests::misses();
         let Some(host) = super::host() else {
             return; // no host GPU here
         };

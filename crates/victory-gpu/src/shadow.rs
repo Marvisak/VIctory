@@ -190,22 +190,37 @@ impl Shadow {
         (self.start, self.len)
     }
 
+    /// The 64 KiB page at `page` cut to the copy: where it starts and ends.
+    fn page(&self, page: usize) -> (usize, usize) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        (page.max(start), (page + PAGE).min(end))
+    }
+
     /// After a submission whose shaders wrote title memory at addresses they
-    /// computed (`crate::memory`), somewhere in the 64 KiB page at `page`:
-    /// the bytes of the page (cut to the copy) that differ from title memory
-    /// go back into it, when the title has not written the page since the
-    /// copy took it (then title memory is the copy as it was before the
-    /// submission, and what differs is what the GPU wrote). Returns the
-    /// bytes written; a page the title wrote meanwhile keeps the title's
-    /// bytes (logged once).
+    /// computed (`crate::memory`), somewhere in the 64 KiB page at `page`,
+    /// and before anything of it goes back: the page's bytes (cut to the
+    /// copy) in title memory, for [`Shadow::copy_back_page`]. When the title
+    /// has not written the page since the copy took it, they are the copy's
+    /// as it was before the submission, and what differs is what the GPU
+    /// wrote. None if nothing differs, or if the title wrote the page: it
+    /// keeps the title's bytes (logged once).
     // shortcut: a page the copy holds only in part (at its ends) has no
     // "copied" mark and is compared without the title-write check.
-    pub(crate) fn copy_back_page(&self, page: usize) -> usize {
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (page.max(start), (page + PAGE).min(end));
+    pub(crate) fn page_before(&self, page: usize) -> Option<Vec<u8>> {
+        let (from, to) = self.page(page);
         if from >= to {
-            return 0;
+            return None;
         }
+        let n = to - from;
+        let mut title = pooled(n);
+        title.resize(n, 0);
+        // SAFETY: inside the mapping; only the submitting thread writes it.
+        let host = unsafe { std::slice::from_raw_parts(self.data.add(from - self.start as usize), n) };
+        if !crate::host::read_into(from as *const u8, &mut title) || title == host {
+            give_back(title);
+            return None;
+        }
+        // Once read: no title write is taken for the shaders'.
         if let Some(t) = &self.tracked
             && t.changed(page / PAGE)
         {
@@ -216,24 +231,41 @@ impl Shadow {
                     "the title and translated shaders both wrote a page of title memory in one submission: the title's bytes kept (logged once)"
                 )
             });
-            return 0;
+            give_back(title);
+            return None;
         }
+        Some(title)
+    }
+
+    /// After the submission's other write-backs, which may have written the
+    /// page at `page` from other copies: the copy's bytes that differ from
+    /// `before` ([`Shadow::page_before`]) go into title memory, and the copy
+    /// takes title memory's others. Returns the bytes written.
+    pub(crate) fn copy_back_page(&self, page: usize, before: Vec<u8>) -> usize {
+        let (from, to) = self.page(page);
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) || title == host {
-            return 0;
+        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - self.start as usize), n) };
+        let mut title = pooled(n);
+        title.resize(n, 0);
+        let mut changed = false;
+        if crate::host::read_into(from as *const u8, &mut title) && title != host {
+            changed = merge_writeback(&mut title, host, &before);
+            if changed {
+                let _writing = crate::watch::writing(from, n);
+                crate::host::write_mapped(from as *mut u8, title.as_ptr(), n);
+            }
+            // Our write is not the title's: the copy holds the page as it is,
+            // unless it holds it in part.
+            if let Some(t) = &self.tracked
+                && n == PAGE
+            {
+                t.taken(&[page / PAGE]);
+            }
         }
-        {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
-        }
-        // Our write is not the title's: the copy holds the page as it is.
-        if let Some(t) = &self.tracked {
-            t.taken(&[page / PAGE]);
-        }
-        n
+        give_back(title);
+        give_back(before);
+        if changed { n } else { 0 }
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -1656,5 +1688,34 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// What shaders wrote at addresses they computed goes back by its bytes:
+    /// what reached the page meanwhile (other write-backs, the title) stays
+    /// and comes into the copy, in tracked memory and not.
+    #[test]
+    fn page_writes_go_back_beside_what_reached_the_page_meanwhile() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        // SAFETY: a fresh allocation.
+        let untracked = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        for p in [crate::watch::tests::pool(1), untracked] {
+            register(p, p as u64, PAGE as u64);
+            let Some(copy) = find(p as u64, PAGE as u64) else {
+                unregister(p, p as u64);
+                return; // no host GPU here
+            };
+            copy.update(p, PAGE);
+            assert!(copy.page_before(p).is_none(), "nothing written");
+            copy.write_host((p + 8) as u64, &[0xaa]);
+            let before = copy.page_before(p).expect("the shader's byte");
+            // SAFETY: a byte of our pool.
+            unsafe { ((p + 16) as *mut u8).write_volatile(0xbb) };
+            assert_eq!(copy.copy_back_page(p, before), PAGE);
+            // SAFETY: bytes of our pool.
+            let title = [p + 8, p + 16].map(|a| unsafe { (a as *const u8).read_volatile() });
+            assert_eq!(title, [0xaa, 0xbb], "both writers' bytes");
+            assert_eq!(copy.read_host((p + 16) as u64, 1), [0xbb], "in the copy");
+            unregister(p, p as u64);
+        }
     }
 }
