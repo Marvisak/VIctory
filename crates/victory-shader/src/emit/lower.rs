@@ -2521,6 +2521,34 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Shl, byte, three)
     }
 
+    /// For a halfword at byte LDS address `a` + `offset`: whether it sits at
+    /// byte 3 of its dword with a next dword in the program's LDS, and that
+    /// dword (else the halfword's own dword). The hardware takes such a
+    /// halfword's high byte from byte 0 of the next dword, reading and
+    /// writing (measured on RDNA2); past the end of LDS the high byte reads
+    /// 0 and its write is dropped, as for any out-of-bounds access.
+    fn lds_straddle(&mut self, a: V, offset: u32) -> (V, V) {
+        let c = self.cur;
+        let (o, two, three, one) = (
+            self.s.m.i32(offset),
+            self.s.m.i32(2),
+            self.s.m.i32(3),
+            self.s.m.i32(1),
+        );
+        let end = self.s.m.i32(self.s.lds_dwords);
+        let at = self.s.m.bin(c, Bin::Add, a, o);
+        let byte = self.s.m.bin(c, Bin::And, at, three);
+        let at_byte3 = self.s.m.cmp(c, pred::EQ, byte, three);
+        let index = self.s.m.bin(c, Bin::LShr, at, two);
+        let after = self.s.m.bin(c, Bin::Add, index, one);
+        // `end` (out of range) where the halfword does not sit at byte 3.
+        let next = self.s.m.select(c, at_byte3, after, end);
+        let straddle = self.s.m.cmp(c, pred::IULT, next, end);
+        let index = self.s.m.select(c, straddle, after, index);
+        let lds = self.s.lds();
+        (straddle, self.s.m.element(c, lds, index))
+    }
+
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
         self.s.flags |= flags::WAVE_OPS;
@@ -3150,6 +3178,16 @@ impl<'a> Lower<'a> {
                 let x = self.s.m.load(c, p);
                 let sh = self.lds_shift(a, offset);
                 let x = self.s.m.bin(c, Bin::LShr, x, sh);
+                let x = if bits == 16 {
+                    let (straddle, p2) = self.lds_straddle(a, offset);
+                    let y = self.s.m.load(c, p2);
+                    let (eight, zero) = (self.s.m.i32(8), self.s.m.i32(0));
+                    let y = self.s.m.bin(c, Bin::Shl, y, eight);
+                    let y = self.s.m.select(c, straddle, y, zero);
+                    self.s.m.bin(c, Bin::Or, x, y)
+                } else {
+                    x
+                };
                 let left = self.s.m.i32(32 - bits);
                 let x = self.s.m.bin(c, Bin::Shl, x, left);
                 let x = self
@@ -3200,7 +3238,8 @@ impl<'a> Lower<'a> {
                 // its dword through atomics, so lanes writing the other parts
                 // of the dword keep theirs.
                 // shortcut: lanes writing the same part in one instruction
-                // leave the OR of theirs (the console keeps one).
+                // leave the OR of theirs (the hardware keeps the highest
+                // lane's, measured on RDNA2).
                 let bits = match rest.trim_end_matches("_d16_hi") {
                     "_b8" => 8,
                     "_b16" => 16,
@@ -3221,10 +3260,27 @@ impl<'a> Lower<'a> {
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, part, ones);
                 let p = dword(self, offset);
+                // A halfword at byte 3: its high byte into the next dword.
+                let next = if bits == 16 {
+                    let (straddle, p2) = self.lds_straddle(a, offset);
+                    let (eight, zero, byte) =
+                        (self.s.m.i32(8), self.s.m.i32(0), self.s.m.i32(0xFF));
+                    let part2 = self.s.m.select(c, straddle, byte, zero);
+                    let keep2 = self.s.m.bin(c, Bin::Xor, part2, ones);
+                    let set2 = self.s.m.bin(c, Bin::LShr, x, eight);
+                    let set2 = self.s.m.select(c, straddle, set2, zero);
+                    Some((p2, keep2, set2))
+                } else {
+                    None
+                };
                 let at = self.begin_guarded(guard);
                 use super::bitcode::Rmw;
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, set);
+                if let Some((p2, keep2, set2)) = next {
+                    self.s.m.atomic(self.cur, Rmw::And, p2, keep2);
+                    self.s.m.atomic(self.cur, Rmw::Or, p2, set2);
+                }
                 self.end_guarded(at, &[]);
                 return Ok(());
             };
