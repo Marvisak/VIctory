@@ -797,7 +797,9 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
         eprintln!("{label}: equal ({hits} boxes and {tris} triangles hit)");
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    if ran == 0 {
+        crate::emit::host::no_device("no SM 6.6 device", &[]);
+    }
 }
 
 #[test]
