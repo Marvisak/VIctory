@@ -35,8 +35,9 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_Input_XboxController",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# The host's D3D12 objects handed to a host library (`modules::fidelityfx`);
-# diagnostics: recording our own audio (`modules::audio::capture`).
+# The host's D3D12 objects handed to a host library (`modules::fidelityfx`),
+# COM objects: the silent audio endpoint (`modules::audio::silent`) and, in
+# diagnostics builds, recording our own audio (`modules::audio::capture`).
 windows = { workspace = true, features = [
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Dxgi_Common",
@@ -45,16 +46,17 @@ windows = { workspace = true, features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Threading",
     "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
 ] }
 # `#[implement]` names it.
-windows-core = { workspace = true, optional = true }
+windows-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 
 [features]
 # Debugging switches (scripted keys and the like).
-diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows-core"]
+diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics"]
 
 [lints]
 workspace = true
