@@ -15,7 +15,7 @@ use victory_shader::{
 };
 use victory_shader::{io, resource};
 
-use crate::shader::{MAX_FILE, Source, sources};
+use crate::shader::source::{Source, sources};
 
 #[derive(Default)]
 struct Tally {
@@ -193,48 +193,57 @@ pub fn run(
             .into_iter()
             .filter_map(Result::ok)
         {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+            if !entry.file_type().is_file() {
                 continue;
             }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
-            };
-            let jobs = sources(&data);
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                let workers: Vec<_> = (0..threads.min(jobs.len()))
-                    .map(|_| {
-                        s.spawn(|| {
-                            let mut t = Tally {
-                                list,
-                                ..Tally::default()
-                            };
-                            let mut checks = Checks {
-                                keep: (!pairs.is_empty()).then(|| kept.clone()),
-                                validator: validate
-                                    .then(|| Validator::load(dll.as_deref()).ok())
-                                    .flatten(),
-                                host: pipelines
-                                    .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                    .flatten(),
-                            };
-                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                                translate(job, entry.path(), &seen, &mut t, &mut checks);
-                            }
-                            lock(&total).merge(t);
+            let mut checks = Vec::new();
+            if let Err(error) = sources(entry.path(), |jobs| {
+                let count = threads.min(jobs.len());
+                if checks.len() < count {
+                    checks.resize_with(count, || None);
+                }
+                let next = AtomicUsize::new(0);
+                std::thread::scope(|s| {
+                    let workers: Vec<_> = checks[..count]
+                        .iter_mut()
+                        .map(|worker| {
+                            s.spawn(|| {
+                                let mut t = Tally {
+                                    list,
+                                    ..Tally::default()
+                                };
+                                let checks = worker.get_or_insert_with(|| Checks {
+                                    keep: (!pairs.is_empty()).then(|| kept.clone()),
+                                    validator: validate
+                                        .then(|| Validator::load(dll.as_deref()).ok())
+                                        .flatten(),
+                                    host: pipelines
+                                        .then(|| {
+                                            Host::new(false).ok().map(|h| (h, host::stub_ps()))
+                                        })
+                                        .flatten(),
+                                });
+                                while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed))
+                                {
+                                    translate(job, entry.path(), &seen, &mut t, checks);
+                                }
+                                lock(&total).merge(t);
+                            })
                         })
-                    })
-                    .collect();
-                report(
-                    entry.path(),
-                    jobs.len(),
-                    "containers",
-                    &next,
-                    started,
-                    &workers,
-                    String::new,
-                );
-            });
+                        .collect();
+                    report(
+                        entry.path(),
+                        jobs.len(),
+                        "containers",
+                        &next,
+                        started,
+                        &workers,
+                        String::new,
+                    );
+                });
+            }) {
+                eprintln!("could not scan {}: {error}", entry.path().display());
+            }
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -343,71 +352,72 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
             .into_iter()
             .filter_map(Result::ok)
         {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+            if !entry.file_type().is_file() {
                 continue;
             }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
-            };
-            let jobs = sources(&data);
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                let workers: Vec<_> = (0..threads.min(jobs.len()))
-                    .map(|_| {
-                        s.spawn(|| {
-                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                                let Some(bytes) = job.bytes() else { continue };
-                                // As the title passes it: the container's own size
-                                // (a raw source runs on to the end of the file).
-                                let size = bytes.get(0x18..0x1c).map_or(0, |b| {
-                                    u32::from_le_bytes(b.try_into().expect("4")) as usize
-                                });
-                                let container = &bytes[..size.min(bytes.len())];
-                                let hash = blake3::hash(container);
-                                if !lock(&seen).insert(hash) {
-                                    continue;
+            if let Err(error) = sources(entry.path(), |jobs| {
+                let next = AtomicUsize::new(0);
+                std::thread::scope(|s| {
+                    let workers: Vec<_> = (0..threads.min(jobs.len()))
+                        .map(|_| {
+                            s.spawn(|| {
+                                while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed))
+                                {
+                                    let Some(bytes) = job.bytes() else { continue };
+                                    // As the title passes it: the container's own size
+                                    // (the source may be a packed record).
+                                    let size = bytes.get(0x18..0x1c).map_or(0, |b| {
+                                        u32::from_le_bytes(b.try_into().expect("4")) as usize
+                                    });
+                                    let container = &bytes[..size.min(bytes.len())];
+                                    let hash = blake3::hash(container);
+                                    if !lock(&seen).insert(hash) {
+                                        continue;
+                                    }
+                                    let one = std::time::Instant::now();
+                                    let (done, cached) =
+                                        victory_gpu::shader_cache::host_shader(container);
+                                    let k = if cached {
+                                        0
+                                    } else if done.is_ok() {
+                                        1
+                                    } else {
+                                        2
+                                    };
+                                    counts[k].fetch_add(1, Ordering::Relaxed);
+                                    tracing::debug!(
+                                        hash = %&hash.to_hex()[..16],
+                                        ms = one.elapsed().as_millis() as u64,
+                                        cached,
+                                        ok = done.is_ok(),
+                                        "warm-up"
+                                    );
                                 }
-                                let one = std::time::Instant::now();
-                                let (done, cached) =
-                                    victory_gpu::shader_cache::host_shader(container);
-                                let k = if cached {
-                                    0
-                                } else if done.is_ok() {
-                                    1
-                                } else {
-                                    2
-                                };
-                                counts[k].fetch_add(1, Ordering::Relaxed);
-                                tracing::debug!(
-                                    hash = %&hash.to_hex()[..16],
-                                    ms = one.elapsed().as_millis() as u64,
-                                    cached,
-                                    ok = done.is_ok(),
-                                    "warm-up"
-                                );
-                            }
+                            })
                         })
-                    })
-                    .collect();
-                let [c, t, r] = &counts;
-                report(
-                    entry.path(),
-                    jobs.len(),
-                    "containers",
-                    &next,
-                    started,
-                    &workers,
-                    || {
-                        let n = |a: &AtomicUsize| a.load(Ordering::Relaxed);
-                        format!(
-                            "; all files so far: {} cached, {} translated, {} refused",
-                            n(c),
-                            n(t),
-                            n(r)
-                        )
-                    },
-                );
-            });
+                        .collect();
+                    let [c, t, r] = &counts;
+                    report(
+                        entry.path(),
+                        jobs.len(),
+                        "containers",
+                        &next,
+                        started,
+                        &workers,
+                        || {
+                            let n = |a: &AtomicUsize| a.load(Ordering::Relaxed);
+                            format!(
+                                "; all files so far: {} cached, {} translated, {} refused",
+                                n(c),
+                                n(t),
+                                n(r)
+                            )
+                        },
+                    );
+                });
+            }) {
+                eprintln!("could not scan {}: {error}", entry.path().display());
+            }
         }
     }
     let [cached, translated, refused] = counts.map(AtomicUsize::into_inner);

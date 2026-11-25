@@ -28,7 +28,7 @@
 //! Files whose table does not parse fall back to finding records by marker.
 
 pub const MAGIC: &[u8; 4] = b"SGD5";
-const MARKER: [u8; 4] = 0x000D_DCE7_u32.to_le_bytes();
+pub const MARKER: [u8; 4] = 0x000D_DCE7_u32.to_le_bytes();
 /// Containers are at most a few MiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: usize = 64 << 20;
 const SHARED: u32 = 0x8000_0000;
@@ -144,22 +144,30 @@ pub fn records(file: &[u8]) -> Vec<Record<'_>> {
         .collect()
 }
 
-fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
-    let u32_at = |o: usize| {
-        file.get(o..o + 4)
-            .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
-    };
-    let n = u32_at(at.checked_sub(4)?)?;
-    let unpacked_size = u32_at(at + 8)?;
-    if u32_at(at + 4)? != n || n < 12 || unpacked_size > MAX_UNPACKED {
-        return None;
-    }
+/// Record size from the marker onwards. The header starts four bytes
+/// before the marker and includes the unpacked size.
+pub fn encoded_len(header: &[u8; 16]) -> Option<usize> {
+    let n = u32::from_le_bytes(header[..4].try_into().expect("four bytes"));
+    let again = u32::from_le_bytes(header[8..12].try_into().expect("four bytes"));
+    let unpacked = u32::from_le_bytes(header[12..].try_into().expect("four bytes")) as usize;
+    (header[4..8] == MARKER && n == again && n >= 12 && unpacked <= MAX_UNPACKED)
+        .then_some(n as usize)
+}
+
+/// Reads a record at a known marker offset in the supplied slice.
+pub fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
+    let header: &[u8; 16] = file
+        .get(at.checked_sub(4)?..at.checked_add(12)?)?
+        .try_into()
+        .ok()?;
+    let n = encoded_len(header)?;
+    let unpacked_size = u32::from_le_bytes(header[12..].try_into().expect("four bytes")) as usize;
     let nul = at.checked_sub(6)?;
     Some(Record {
         offset: at,
         name: (file[nul] == 0).then(|| name_before(file, nul)).flatten(),
         kind: file[at - 5],
-        packed: file.get(at + 12..at + n)?,
+        packed: file.get(at + 12..at.checked_add(n)?)?,
         unpacked_size,
     })
 }
@@ -235,9 +243,10 @@ fn parse(file: &[u8], start: usize) -> Option<Database<'_>> {
             list.push(shader(&mut c)?);
         }
     }
+    let counts = shaders.each_ref().map(Vec::len);
     let mut effects = Vec::new();
     for _ in 0..c.u32()? {
-        effects.push(effect(&mut c, &shaders)?);
+        effects.push(effect(&mut c, counts)?);
     }
     Some(Database {
         shaders,
@@ -275,15 +284,13 @@ fn shader<'a>(c: &mut Cursor<'a>) -> Option<Shader<'a>> {
     })
 }
 
-fn effect<'a>(c: &mut Cursor<'a>, shaders: &[Vec<Shader<'a>>; 6]) -> Option<Effect<'a>> {
+fn effect<'a>(c: &mut Cursor<'a>, counts: [usize; 6]) -> Option<Effect<'a>> {
     let name = c.str()?;
     let size = c.u32()? as usize;
     let mut stages: [Vec<u32>; 6] = Default::default();
-    for (list, all) in stages.iter_mut().zip(shaders) {
+    for (list, all) in stages.iter_mut().zip(counts) {
         *list = c.u32s()?;
-        list.iter()
-            .all(|&i| (i as usize) < all.len())
-            .then_some(())?;
+        list.iter().all(|&i| (i as usize) < all).then_some(())?;
     }
     c.bytes(0x50)?;
     let rasterizers = c.items(16)?;
@@ -376,6 +383,156 @@ fn effect<'a>(c: &mut Cursor<'a>, shaders: &[Vec<Shader<'a>>; 6]) -> Option<Effe
         depth_stencils,
         blends,
     })
+}
+
+/// Only the metadata needed to find and identify a shader in a database.
+pub struct IndexedRecord {
+    pub offset: u64,
+    pub name: String,
+    pub hash: u64,
+}
+
+/// Reads one database's index while seeking past the compressed shaders.
+/// A database with malformed effects is rejected, as in the slice parser.
+pub fn read_index(
+    file: &mut (impl std::io::Read + std::io::Seek),
+    start: u64,
+    len: u64,
+) -> std::io::Result<Option<(u64, Vec<IndexedRecord>)>> {
+    use std::io::SeekFrom;
+
+    file.seek(SeekFrom::Start(start))?;
+    let mut c = IndexCursor {
+        file,
+        at: start,
+        len,
+        error: None,
+    };
+    let index = (|| {
+        (c.read::<4>()? == *MAGIC).then_some(())?;
+        c.skip(8)?;
+        for _ in 0..c.u32()? {
+            c.block(1)?;
+        }
+        c.block(1)?;
+        let mut counts = [0; 6];
+        let mut records = Vec::new();
+        for count in &mut counts {
+            *count = c.u32()? as usize;
+            for _ in 0..*count {
+                let n = c.read::<1>()?[0] as usize;
+                let mut name = [0; 255];
+                c.read_exact(&mut name[..n])?;
+                let (&nul, text) = name[..n].split_last()?;
+                (nul == 0).then_some(())?;
+                let name = std::str::from_utf8(text).ok()?.to_owned();
+                c.skip(1)?; // record kind
+                let size = u64::from(c.u32()?);
+                let offset = c.at;
+                (size >= 12 && c.read::<4>()? == MARKER).then_some(())?;
+                (u64::from(c.u32()?) == size).then_some(())?;
+                (c.u32()? as usize <= MAX_UNPACKED).then_some(())?;
+                c.skip(size - 12)?;
+                let hash = u64::from_le_bytes(c.read::<8>()?);
+                c.skip(0x90)?;
+                c.block(1)?;
+                records.push(IndexedRecord { offset, name, hash });
+            }
+        }
+        for _ in 0..c.u32()? {
+            let start = c.at;
+            c.skip_effect()?;
+            let size = usize::try_from(c.at - start).ok()?;
+            c.seek(start)?;
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(size).ok()?;
+            bytes.resize(size, 0);
+            c.read_exact(&mut bytes)?;
+            let mut effect_cursor = Cursor {
+                file: &bytes,
+                at: 0,
+            };
+            effect(&mut effect_cursor, counts)?;
+            (effect_cursor.at == size).then_some(())?;
+        }
+        Some((c.at, records))
+    })();
+    c.error.map_or(Ok(index), Err)
+}
+
+struct IndexCursor<'a, F> {
+    file: &'a mut F,
+    at: u64,
+    len: u64,
+    error: Option<std::io::Error>,
+}
+
+impl<F: std::io::Read + std::io::Seek> IndexCursor<'_, F> {
+    fn read_exact(&mut self, buf: &mut [u8]) -> Option<()> {
+        let end = self.at.checked_add(buf.len() as u64)?;
+        (end <= self.len).then_some(())?;
+        if let Err(error) = self.file.read_exact(buf) {
+            self.error = Some(error);
+            return None;
+        }
+        self.at = end;
+        Some(())
+    }
+
+    fn read<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let mut buf = [0; N];
+        self.read_exact(&mut buf)?;
+        Some(buf)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        self.read().map(u32::from_le_bytes)
+    }
+
+    fn seek(&mut self, at: u64) -> Option<()> {
+        (at <= self.len).then_some(())?;
+        if let Err(error) = self.file.seek(std::io::SeekFrom::Start(at)) {
+            self.error = Some(error);
+            return None;
+        }
+        self.at = at;
+        Some(())
+    }
+
+    fn skip(&mut self, len: u64) -> Option<()> {
+        self.seek(self.at.checked_add(len)?)
+    }
+
+    fn block(&mut self, width: u64) -> Option<()> {
+        let len = u64::from(self.u32()?).checked_mul(width)?;
+        self.skip(len)
+    }
+
+    /// Locates the end of an effect. The slice parser validates its contents.
+    fn skip_effect(&mut self) -> Option<()> {
+        let name = self.read::<1>()?[0];
+        self.skip(u64::from(name) + 4)?;
+        for _ in 0..6 {
+            self.block(4)?;
+        }
+        self.skip(0x50)?;
+        for width in [16, 24, 68, 36, 4, 24, 4] {
+            self.block(width)?;
+        }
+        let strings = self.u32()?;
+        if strings != SHARED {
+            self.skip(u64::from(strings))?;
+        }
+        self.block(1)?;
+        self.block(1)?;
+        for _ in 0..(self.u32()? & 0x00FF_FFFF) {
+            match self.u32()? {
+                SHARED => self.skip(4)?,
+                n => self.skip(u64::from(n))?,
+            }
+        }
+        self.block(1)
+    }
 }
 
 #[cfg(test)]
@@ -556,6 +713,18 @@ mod tests {
         assert_eq!(found.len(), 4);
         assert_eq!(found[3].name, Some("x:CS_c"));
         assert_eq!(found[3].offset, db.shaders[5][0].record.offset);
+
+        let mut reader = std::io::Cursor::new(&file);
+        let (end, index) = read_index(&mut reader, 0, file.len() as u64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(end, db.end as u64);
+        assert_eq!(index.len(), found.len());
+        for (record, expected) in index.iter().zip(db.shaders.iter().flatten()) {
+            assert_eq!(record.offset, expected.record.offset as u64);
+            assert_eq!(Some(record.name.as_str()), expected.record.name);
+            assert_eq!(record.hash, expected.hash);
+        }
     }
 
     #[test]
@@ -565,6 +734,12 @@ mod tests {
         let at = memchr::memmem::find(&file, b"\x03fx\0").unwrap() + 4;
         file[at] ^= 1;
         assert!(databases(&file).is_empty());
+        let mut reader = std::io::Cursor::new(&file);
+        assert!(
+            read_index(&mut reader, 0, file.len() as u64)
+                .unwrap()
+                .is_none()
+        );
         let found = records(&file);
         assert_eq!(found.len(), 4);
         assert_eq!(found[1].name, Some("PS_a"));
