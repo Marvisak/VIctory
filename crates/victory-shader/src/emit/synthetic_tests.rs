@@ -126,7 +126,7 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
     })
 }
 
-fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
+pub(super) fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
