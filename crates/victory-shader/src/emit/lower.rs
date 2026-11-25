@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod frexp;
 
 type Why = &'static str;
 
@@ -6306,6 +6307,7 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            "v_frexp_exp_i32_f64" | "v_frexp_mant_f64" => self.frexp64(inst, guard),
             "v_rcp_f32" | "v_rcp_iflag_f32" => {
                 // shortcut: the hardware reciprocal is approximate (1 ULP); this divides.
                 let a = f(self, 0)?;
