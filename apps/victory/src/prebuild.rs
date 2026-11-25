@@ -223,6 +223,7 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     let todo: Vec<Job> = todo.into_iter().map(|(_, job)| job).collect();
 
     let next = AtomicUsize::new(0);
+    let completed = AtomicUsize::new(0);
     let (made0, loaded0) = pipeline::pipeline_counts();
     let counts = || {
         let (made, loaded) = pipeline::pipeline_counts();
@@ -236,12 +237,13 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
                         if let Err(why) = prepare(job).and_then(|p| p.make()) {
                             skip(why);
                         }
+                        completed.fetch_add(1, Ordering::Relaxed);
                     }
                 })
             })
             .collect();
         let (n, what) = (todo.len(), "pipelines to make");
-        crate::translate::report(pack_path, n, what, &next, started, &workers, || {
+        crate::translate::report(pack_path, n, what, &completed, started, &workers, || {
             let (made, loaded) = counts();
             format!("; {made} made, {loaded} found in the library")
         });

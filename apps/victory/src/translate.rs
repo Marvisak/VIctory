@@ -201,6 +201,7 @@ pub fn run(
             };
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
+            let completed = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 let workers: Vec<_> = (0..threads.min(jobs.len()))
                     .map(|_| {
@@ -220,6 +221,7 @@ pub fn run(
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
+                                completed.fetch_add(1, Ordering::Relaxed);
                             }
                             lock(&total).merge(t);
                         })
@@ -229,7 +231,7 @@ pub fn run(
                     entry.path(),
                     jobs.len(),
                     "containers",
-                    &next,
+                    &completed,
                     started,
                     &workers,
                     String::new,
@@ -351,12 +353,16 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
             };
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
+            let completed = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 let workers: Vec<_> = (0..threads.min(jobs.len()))
                     .map(|_| {
                         s.spawn(|| {
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                                let Some(bytes) = job.bytes() else { continue };
+                                let Some(bytes) = job.bytes() else {
+                                    completed.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                };
                                 // As the title passes it: the container's own size
                                 // (a raw source runs on to the end of the file).
                                 let size = bytes.get(0x18..0x1c).map_or(0, |b| {
@@ -365,6 +371,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 let container = &bytes[..size.min(bytes.len())];
                                 let hash = blake3::hash(container);
                                 if !lock(&seen).insert(hash) {
+                                    completed.fetch_add(1, Ordering::Relaxed);
                                     continue;
                                 }
                                 let one = std::time::Instant::now();
@@ -385,6 +392,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                     ok = done.is_ok(),
                                     "warm-up"
                                 );
+                                completed.fetch_add(1, Ordering::Relaxed);
                             }
                         })
                     })
@@ -394,7 +402,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                     entry.path(),
                     jobs.len(),
                     "containers",
-                    &next,
+                    &completed,
                     started,
                     &workers,
                     || {
@@ -437,7 +445,7 @@ pub(crate) fn report<T>(
     file: &Path,
     jobs: usize,
     what: &str,
-    next: &AtomicUsize,
+    completed: &AtomicUsize,
     started: std::time::Instant,
     workers: &[std::thread::ScopedJoinHandle<'_, T>],
     extra: impl Fn() -> String,
@@ -449,10 +457,7 @@ pub(crate) fn report<T>(
     let terminal = std::io::stderr().is_terminal();
     let every = std::time::Duration::from_secs(if terminal { 1 } else { 10 });
     let line = || {
-        // `next` counts jobs handed out; a worker still running holds one.
-        let busy = workers.iter().filter(|w| !w.is_finished()).count();
-        let taken = next.load(Ordering::Relaxed).min(jobs);
-        let done = taken.saturating_sub(busy);
+        let done = completed.load(Ordering::Relaxed);
         format!(
             "{}: {done} of {jobs} {what} ({}%), {:.0} s{}",
             file.display(),
