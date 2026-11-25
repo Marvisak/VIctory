@@ -2790,6 +2790,8 @@ struct Presenter {
 /// every few seconds.
 struct Meter {
     since: std::time::Instant,
+    previous_present: Option<std::time::Instant>,
+    present_intervals_us: Vec<u64>,
     frames: u32,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
@@ -2799,11 +2801,24 @@ struct Meter {
     caption: Option<Vec<u16>>,
 }
 
+/// Nearest-rank median, 95th percentile and maximum between host Present
+/// returns. The first return establishes a baseline and supplies no sample.
+fn present_percentiles(samples: &mut [u64]) -> Option<[u64; 3]> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    let n = samples.len();
+    Some([samples[(n - 1) / 2], samples[n - 1 - n / 20], samples[n - 1]])
+}
+
 impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
             since: now,
+            previous_present: None,
+            present_intervals_us: Vec::new(),
             frames: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
@@ -2815,6 +2830,10 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        let now = std::time::Instant::now();
+        if let Some(previous) = self.previous_present.replace(now) {
+            self.present_intervals_us.push((now - previous).as_micros() as u64);
+        }
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
@@ -2825,7 +2844,7 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
-        let elapsed = self.since.elapsed();
+        let elapsed = now - self.since;
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
@@ -2834,7 +2853,7 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
-        (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
+        (self.since, self.frames, self.drawn) = (now, 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
             SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
@@ -2852,8 +2871,16 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
-            self.logged = std::time::Instant::now();
+        if now - self.logged >= std::time::Duration::from_secs(5) {
+            self.logged = now;
+            if let Some(intervals) = present_percentiles(&mut self.present_intervals_us) {
+                let [median, p95, longest] = intervals.map(|us| us as f64 / 1000.0);
+                tracing::info!(
+                    "host present intervals ({} samples): median {median:.2} ms, p95 {p95:.2} ms, longest {longest:.2} ms",
+                    self.present_intervals_us.len()
+                );
+                self.present_intervals_us.clear();
+            }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -3578,5 +3605,20 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod present_interval_tests {
+    use super::present_percentiles;
+
+    #[test]
+    fn summarizes_sparse_and_uneven_frames() {
+        assert_eq!(present_percentiles(&mut []), None);
+        assert_eq!(present_percentiles(&mut [700]), Some([700; 3]));
+        let mut intervals = [33_333; 20];
+        intervals[0] = 80_000;
+        intervals[1] = 50_000;
+        assert_eq!(present_percentiles(&mut intervals), Some([33_333, 50_000, 80_000]));
     }
 }
