@@ -521,55 +521,111 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
 /// its entries. Loops nested in a single-entry loop are searched with its
 /// header removed, so one is found whenever the control flow is irreducible.
 fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec<usize>)> {
-    let reach = |from: usize, forward: bool| {
-        let mut seen = vec![false; blocks.len()];
-        let mut stack = vec![from];
-        while let Some(b) = stack.pop() {
-            let next = if forward {
-                blocks[b].exit.successors()
-            } else {
-                blocks[b].preds.clone()
-            };
-            for n in next {
-                if inside[n] && !seen[n] {
-                    seen[n] = true;
-                    stack.push(n);
-                }
-            }
-        }
-        seen
-    };
-    let mut done = vec![false; blocks.len()];
-    for v in (0..blocks.len()).filter(|&v| inside[v]) {
-        if done[v] {
-            continue;
-        }
-        // Blocks on a cycle through `v`; `v` itself only if there is one.
-        let (ahead, behind) = (reach(v, true), reach(v, false));
-        let region: Vec<bool> = ahead.iter().zip(&behind).map(|(a, b)| a & b).collect();
-        if !region[v] {
-            continue;
-        }
-        let members = (0..blocks.len()).filter(|&b| region[b]);
-        for b in members.clone() {
-            done[b] = true;
+    // Search components in ascending order of their first block, as before.
+    // Nested components are examined before the next sibling.
+    let mut pending = cyclic_components(blocks, inside);
+    pending.reverse();
+    let mut region = vec![false; blocks.len()];
+    while let Some(members) = pending.pop() {
+        for &b in &members {
+            region[b] = true;
         }
         let entries: Vec<usize> = members
+            .iter()
+            .copied()
             .filter(|&b| blocks[b].preds.iter().any(|&p| !region[p]))
             .collect();
         match entries[..] {
             [] => {}
             [header] => {
-                let mut nested = region;
-                nested[header] = false;
-                if let Some(found) = multi_entry_loop(blocks, &nested) {
-                    return Some(found);
-                }
+                // Removing the unique entry exposes any nested irreducible loop.
+                region[header] = false;
+                pending.extend(cyclic_components(blocks, &region).into_iter().rev());
             }
             _ => return Some((region, entries)),
         }
+        for b in members {
+            region[b] = false;
+        }
     }
     None
+}
+
+/// Cyclic strongly connected components of the induced subgraph, ordered
+/// by their smallest block index; members are in ascending block order.
+/// Iterative Kosaraju: one forward and one reverse traversal, O(V + E)
+/// work per decomposition (including the scan of the block array).
+fn cyclic_components(blocks: &[Block], inside: &[bool]) -> Vec<Vec<usize>> {
+    let n = blocks.len();
+    let mut seen = vec![false; n];
+    let mut post = Vec::new();
+    let mut stack = Vec::new();
+
+    // Number the vertices by finishing time without recursion or temporary
+    // successor vectors. Each exit has at most two outgoing edges.
+    for v in 0..n {
+        if !inside[v] || seen[v] {
+            continue;
+        }
+        seen[v] = true;
+        stack.push((v, 0usize));
+        while let Some(&(b, i)) = stack.last() {
+            let next = match (&blocks[b].exit, i) {
+                (Exit::Jump(s), 0) | (Exit::Branch { taken: s, .. }, 0) => Some(*s),
+                (Exit::Branch { not_taken: s, .. }, 1) => Some(*s),
+                _ => None,
+            };
+            if let Some(s) = next {
+                stack.last_mut().expect("active block").1 += 1;
+                if inside[s] && !seen[s] {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+            } else {
+                post.push(b);
+                stack.pop();
+            }
+        }
+    }
+
+    // Visit the transpose in reverse finishing order. Predecessors are
+    // already linked, so no additional graph or cloned edges are needed.
+    let mut ids = vec![usize::MAX; n];
+    let mut count = 0;
+    let mut stack = Vec::new();
+    for v in post.into_iter().rev() {
+        if ids[v] != usize::MAX {
+            continue;
+        }
+        ids[v] = count;
+        stack.push(v);
+        while let Some(b) = stack.pop() {
+            for &p in &blocks[b].preds {
+                if inside[p] && ids[p] == usize::MAX {
+                    ids[p] = count;
+                    stack.push(p);
+                }
+            }
+        }
+        count += 1;
+    }
+
+    // Restore the original deterministic selection order in linear time,
+    // independent of the DFS order. Singleton SCCs need a self-edge.
+    let mut order = vec![usize::MAX; count];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (b, id) in ids.into_iter().enumerate() {
+        if id == usize::MAX {
+            continue;
+        }
+        if order[id] == usize::MAX {
+            order[id] = groups.len();
+            groups.push(Vec::new());
+        }
+        groups[order[id]].push(b);
+    }
+    groups.retain(|g| g.len() > 1 || blocks[g[0]].preds.contains(&g[0]));
+    groups
 }
 
 /// Registers live into and out of each block.
@@ -1085,6 +1141,146 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    // The old reachability-intersection search is retained as a small-graph
+    // oracle only. Production code never calls it.
+    fn reference_multi_entry_loop(
+        blocks: &[Block],
+        inside: &[bool],
+    ) -> Option<(Vec<bool>, Vec<usize>)> {
+        let reach = |from: usize, forward: bool| {
+            let mut seen = vec![false; blocks.len()];
+            let mut stack = vec![from];
+            while let Some(b) = stack.pop() {
+                let next = if forward {
+                    blocks[b].exit.successors()
+                } else {
+                    blocks[b].preds.clone()
+                };
+                for n in next {
+                    if inside[n] && !seen[n] {
+                        seen[n] = true;
+                        stack.push(n);
+                    }
+                }
+            }
+            seen
+        };
+        let mut done = vec![false; blocks.len()];
+        for v in (0..blocks.len()).filter(|&v| inside[v]) {
+            if done[v] {
+                continue;
+            }
+            // Blocks on a cycle through `v`; `v` itself only if there is one.
+            let (ahead, behind) = (reach(v, true), reach(v, false));
+            let region: Vec<bool> = ahead.iter().zip(&behind).map(|(a, b)| a & b).collect();
+            if !region[v] {
+                continue;
+            }
+            let members = (0..blocks.len()).filter(|&b| region[b]);
+            for b in members.clone() {
+                done[b] = true;
+            }
+            let entries: Vec<usize> = members
+                .filter(|&b| blocks[b].preds.iter().any(|&p| !region[p]))
+                .collect();
+            match entries[..] {
+                [] => {}
+                [header] => {
+                    let mut nested = region;
+                    nested[header] = false;
+                    if let Some(found) = reference_multi_entry_loop(blocks, &nested) {
+                        return Some(found);
+                    }
+                }
+                _ => return Some((region, entries)),
+            }
+        }
+        None
+    }
+
+    fn graph(exits: Vec<Exit>) -> Vec<Block> {
+        let mut blocks: Vec<Block> = exits
+            .into_iter()
+            .enumerate()
+            .map(|(offset, exit)| Block {
+                offset,
+                preds: Vec::new(),
+                phis: Vec::new(),
+                insts: Vec::new(),
+                exit,
+            })
+            .collect();
+        link(&mut blocks);
+        blocks
+    }
+
+    #[test]
+    fn scc_loop_discovery_matches_the_reference() {
+        // All three-block directed graphs representable by the IR's
+        // zero/one/two successor exits, including every induced subgraph.
+        for mask in 0u32..512 {
+            let mut exits = Vec::new();
+            for b in 0..3 {
+                let next: Vec<usize> = (0..3)
+                    .filter(|&s| mask & (1 << (3 * b + s)) != 0)
+                    .collect();
+                exits.push(match next[..] {
+                    [] => Exit::End,
+                    [s] => Exit::Jump(s),
+                    [taken, not_taken] => Exit::Branch { taken, not_taken },
+                    _ => break,
+                });
+            }
+            if exits.len() != 3 {
+                continue;
+            }
+            let blocks = graph(exits);
+            for subset in 0u32..8 {
+                let inside: Vec<bool> = (0..3).map(|b| subset & (1 << b) != 0).collect();
+                assert_eq!(
+                    multi_entry_loop(&blocks, &inside),
+                    reference_multi_entry_loop(&blocks, &inside),
+                    "graph {mask}, subset {subset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scc_loop_after_long_acyclic_prefix() {
+        let n = 2048;
+        let mut exits: Vec<Exit> = (1..n).map(Exit::Jump).collect();
+        exits.push(Exit::Jump(n - 2));
+        exits[n - 3] = Exit::Branch {
+            taken: n - 2,
+            not_taken: n - 1,
+        };
+        let blocks = graph(exits);
+        let (region, entries) = multi_entry_loop(&blocks, &vec![true; n]).unwrap();
+        assert_eq!(entries, [n - 2, n - 1]);
+        assert_eq!(
+            region
+                .iter()
+                .enumerate()
+                .filter_map(|(b, &in_loop)| in_loop.then_some(b))
+                .collect::<Vec<_>>(),
+            [n - 2, n - 1]
+        );
+    }
+
+    #[test]
+    fn scc_search_descends_through_single_entry_outer_loop() {
+        let blocks = graph(vec![
+            Exit::Jump(1),
+            Exit::Branch { taken: 2, not_taken: 3 },
+            Exit::Jump(3),
+            Exit::Branch { taken: 2, not_taken: 1 },
+        ]);
+        let (region, entries) = multi_entry_loop(&blocks, &[true; 4]).unwrap();
+        assert_eq!(region, [false, false, true, true]);
+        assert_eq!(entries, [2, 3]);
     }
 
     #[test]
