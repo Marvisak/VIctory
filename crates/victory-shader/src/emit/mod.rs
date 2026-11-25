@@ -1138,7 +1138,7 @@ mod tests {
     /// primitive `prim` and, as vertex `lane`, the position
     /// (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1, 0.5, 1): triangle (0, 1, 2)
     /// covers the whole target.
-    fn triangle_mesh(prim: u32) -> Result<HostShader, ShaderError> {
+    fn triangle_mesh(prim: u32, lds_bytes: u32) -> Result<HostShader, ShaderError> {
         let words = [
             0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
@@ -1173,7 +1173,7 @@ mod tests {
                 max_vertices: 32,
                 max_primitives: 32,
                 topology: 2,
-                lds_bytes: 0,
+                lds_bytes,
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
@@ -1217,11 +1217,44 @@ mod tests {
             TRIANGLE | EDGE_FLAGS,
             TRIANGLE | EDGE_FLAGS | CULL,
         ] {
-            let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            let ms = triangle_mesh(prim, 0).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
             #[cfg(windows)]
             if let Some(v) = validator.as_mut() {
                 v.validate(&mut ms.dxil.clone())
                     .unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            }
+        }
+    }
+
+    /// A mesh program whose state declares group-shared memory its code
+    /// never touches counts none of it in its PSV0: DXC fills the runtime
+    /// info from the module's group-shared globals (the global is made
+    /// lazily, by `lds`, when the code lowers one), and the validator's
+    /// rebuilt part is compared byte for byte -- a declared size without
+    /// the global nothing reads is a mismatch that refuses the whole
+    /// container (#2798). The control: a program that declares none.
+    #[test]
+    fn unused_mesh_lds_is_not_counted_in_psv0() {
+        #[cfg(windows)]
+        let mut validator = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        for lds_bytes in [0, 16] {
+            let ms = triangle_mesh(TRIANGLE, lds_bytes).unwrap_or_else(|e| panic!("{lds_bytes}: {e}"));
+            let container = super::Container::parse(&ms.dxil).expect("a container");
+            let psv = container
+                .part(FourCC::PSV0)
+                .unwrap_or_else(|| panic!("{lds_bytes}: no PSV0"));
+            let shared = u32::from_le_bytes(psv.data[4..8].try_into().expect("4"));
+            assert_eq!(
+                shared, 0,
+                "{lds_bytes}: a program with no LDS instruction counts none"
+            );
+            #[cfg(windows)]
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut ms.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{lds_bytes}: {e}"));
             }
         }
     }
@@ -1265,7 +1298,7 @@ mod tests {
                 (TRIANGLE | EDGE_FLAGS, false),
                 (TRIANGLE | EDGE_FLAGS | CULL, true),
             ] {
-                let ms = triangle_mesh(prim).unwrap();
+                let ms = triangle_mesh(prim, 0).unwrap();
                 let root = host
                     .root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])
                     .unwrap();

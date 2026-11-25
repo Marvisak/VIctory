@@ -971,7 +971,14 @@ impl Shader {
             inputs: &self.inputs,
             outputs: &self.outputs,
             prims: &self.prims,
-            mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            // A mesh program's group-shared global is made lazily, by
+            // `lds`, when its code lowers one: DXC counts the module's
+            // group-shared globals (the validator's rebuilt runtime info
+            // does too), so the declared size is counted only where the
+            // global is -- a program that declares LDS and never touches
+            // it counts none of it (the container mismatch refused a
+            // whole program, #2798).
+            mesh: self.mesh.map(|m| (m, self.lds.is_some() as u32 * (self.lds_dwords * 4))),
             gs: self.gs,
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
