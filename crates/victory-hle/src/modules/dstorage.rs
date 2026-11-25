@@ -117,27 +117,36 @@ type Factory = *const Object;
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const FILE_SHARE_DELETE: u32 = 4;
     const OPEN_EXISTING: u32 = 3;
     if path.is_null() {
         return E_INVALIDARG;
     }
     // Goes through `files`, so paths on our virtual drives work too.
+    // Share write and delete so a title (or host tool) that already holds
+    // the file open for write still lets DirectStorage read it.
     let handle = super::files::CreateFileW(
         path,
         GENERIC_READ,
-        FILE_SHARE_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         std::ptr::null(),
         OPEN_EXISTING,
         0,
         std::ptr::null_mut(),
     );
+    // Capture LastError before any heap work that might overwrite it.
+    let open_error = if handle as isize == -1 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
     // SAFETY: the title passes a NUL-terminated path.
     let name = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
     };
-    if handle as isize == -1 {
-        let error = std::io::Error::last_os_error();
+    if let Some(error) = open_error {
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
@@ -1183,6 +1192,52 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
         assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+    }
+
+    /// A path already open for write must still open for DirectStorage
+    /// (share write|delete), and a missing path must keep CreateFileW's
+    /// LastError through the failure path (HRESULT_FROM_WIN32).
+    #[test]
+    fn opens_alongside_a_writer_and_keeps_not_found() {
+        use std::os::windows::io::FromRawHandle;
+
+        use crate::modules::files::CreateFileW;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
+        const OPEN_EXISTING: u32 = 3;
+        const ERROR_FILE_NOT_FOUND: HRESULT = 0x8007_0002_u32 as i32;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.bin");
+        std::fs::write(&path, b"data").unwrap();
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let held = CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        assert_ne!(held as isize, -1, "host open for write");
+        // SAFETY: CreateFileW just returned this handle; File owns it.
+        let _writer = unsafe { std::fs::File::from_raw_handle(held) };
+        let file = open(&path);
+        void(file, 0x10);
+
+        let gone = dir.path().join("gone.bin");
+        let gone_wide: Vec<u16> = gone.as_os_str().encode_wide().chain([0]).collect();
+        let open_slot: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x20);
+        let mut out = std::ptr::null_mut();
+        assert_eq!(
+            open_slot(factory(), gone_wide.as_ptr(), std::ptr::null(), &mut out),
+            ERROR_FILE_NOT_FOUND
+        );
+        assert!(out.is_null());
     }
 
     #[test]
