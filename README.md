@@ -58,6 +58,10 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+A CPU without AVX2 is refused when the title is run (`run --execute`);
+set `VICTORY_SKIP_CPU_CHECK=1` to bypass that check, for example under
+CPU emulation such as Intel SDE.
+
 To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
 the installer from https://rustup.rs). The first `cargo` command in this
 repository then fetches the pinned toolchain. Building needs the MSVC C++
