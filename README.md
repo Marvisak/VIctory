@@ -77,6 +77,10 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
+The shader tests' GPU checks run on the first hardware adapter and WARP. On a
+machine with two GPUs, `$env:VICTORY_ADAPTER=1` runs them on DXGI's adapter 1
+instead (counting from 0); the first test to make a device names it.
+
 Run the title:
 
 ```powershell
