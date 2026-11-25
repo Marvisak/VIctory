@@ -520,7 +520,13 @@ extern "system" fn present(
         #[cfg(windows)]
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
-            tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            let rejected = crate::shader_cache::rejected();
+            tracing::info!(
+                hits,
+                misses,
+                rejected,
+                "shaders from the cache and translated so far; rejected: refused by the DXIL validator"
+            );
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]

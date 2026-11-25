@@ -2,6 +2,11 @@
 //! offline batch. Translated shaders do not need it: they carry the
 //! container hash we compute (`container::hash`).
 //!
+//! It is also an opt-in run-time gate: with `VICTORY_VALIDATE=1` the GPU
+//! layer validates each translation and refuses what the validator rejects
+//! (`victory_gpu::shader_cache`). That loads external code into the game
+//! process, so it is off by default.
+//!
 //! The DLL is found at `VICTORY_DXIL` if set, else the newest Windows SDK's
 //! `bin\<version>\x64\dxil.dll`, else wherever `LoadLibrary` finds it.
 
@@ -217,5 +222,50 @@ impl Drop for Validator {
     fn drop(&mut self) {
         // SAFETY: we own one reference.
         unsafe { release(self.object) };
+    }
+}
+
+/// The first specific line of the validator's `text`, trimmed.
+///
+/// The validator ends with a generic summary ("... See other errors") that
+/// hides the rule that was broken, so the first line that names an error
+/// without being that summary wins; failing that, the first line naming an
+/// error; failing that, the first line; `""` for empty text.
+pub fn first_specific_line(text: &str) -> &str {
+    text.lines()
+        .find(|l| l.contains("error") && !l.contains("See other errors"))
+        .or_else(|| text.lines().find(|l| l.contains("error")))
+        .or_else(|| text.lines().next())
+        .unwrap_or("")
+        .trim()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_specific_line;
+
+    #[test]
+    fn the_specific_line_beats_the_summary() {
+        let text = "error: Entry function performs some operation. See other errors.\n  error: 'x' is bad \nnote";
+        assert_eq!(first_specific_line(text), "error: 'x' is bad");
+    }
+
+    #[test]
+    fn only_the_summary_is_used_when_nothing_else_names_an_error() {
+        let text = "note\nerror: incompatible. See other errors.\n";
+        assert_eq!(
+            first_specific_line(text),
+            "error: incompatible. See other errors."
+        );
+    }
+
+    #[test]
+    fn no_error_falls_back_to_the_first_line() {
+        assert_eq!(first_specific_line("  just a line \nmore"), "just a line");
+    }
+
+    #[test]
+    fn empty_text_is_empty() {
+        assert_eq!(first_specific_line(""), "");
     }
 }

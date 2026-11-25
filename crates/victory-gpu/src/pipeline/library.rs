@@ -184,10 +184,14 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
 fn tag(blob: &[u8]) -> String {
     let limit = victory_shader::emit::loop_limit().to_le_bytes();
     let translator = victory_shader::SOURCE_HASH.as_bytes();
+    // A pipeline built from a shader the validator would now refuse (or
+    // the other way round) is not the one this process would build.
+    let validator = crate::shader_cache::validator_id().unwrap_or_default();
     let mut h = blake3::Hasher::new();
     for part in [
         blob,
         translator,
+        &validator,
         include_bytes!("../shader_cache.rs"),
         &limit,
         include_bytes!("host.rs"),
@@ -348,6 +352,7 @@ pub(crate) fn save(now: bool) {
             distinct,
             shaders_cached,
             shaders_translated,
+            shaders_rejected = crate::shader_cache::rejected(),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),

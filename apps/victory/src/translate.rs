@@ -647,11 +647,10 @@ fn check(
             }
         }
         Err(text) => {
-            let first = text
-                .lines()
-                .find(|l| l.contains("error"))
-                .unwrap_or(text.lines().next().unwrap_or(""))
-                .to_owned();
+            // The summary ("Entry function performs some operation that is
+            // incompatible... See other errors") hides the rule that was
+            // broken: bucket by the first specific error after it.
+            let first = emit::validator::first_specific_line(&text).to_owned();
             if let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP") {
                 let n = t
                     .failed

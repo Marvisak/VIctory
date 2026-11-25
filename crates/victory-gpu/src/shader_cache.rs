@@ -15,17 +15,20 @@
 //! The entry is our own encoding of [`HostShader`]; this file's text is part
 //! of the key, so changing the encoding invalidates every entry.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
+use victory_shader::emit::validator::{Validator, first_specific_line};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+static REJECTED: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in a folder of `dir` from now on: the folder
 /// of this translator, `None` if it cannot be opened.
@@ -49,11 +52,17 @@ pub fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+/// Shaders refused because the DXIL validator rejects them, cached
+/// refusals included.
+pub fn rejected() -> u64 {
+    REJECTED.load(Ordering::Relaxed)
+}
+
 /// What a translation depends on besides its container: the translator
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
-/// the compiler), the entry's encoding (this file's text) and the
-/// translation settings (the loop limit, which a diagnostics build can
-/// change at run time).
+/// the compiler), the entry's encoding (this file's text), the translation
+/// settings (the loop limit, which a diagnostics build can change at run
+/// time) and the validator that gates it ([`validator_id`]).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -64,32 +73,164 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        key(
+            victory_shader::SOURCE_HASH,
+            ENCODING,
+            limit,
+            validator_id().as_ref(),
+        )
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+/// `validator` is [`validator_id`]: `None` when no validator gates the
+/// translation, so a cache filled without one is not served to a process
+/// that has one (it would hold shaders the validator refuses), nor the
+/// other way round (it would hold refusals this process does not make).
+fn key(translator: &str, encoding: &[u8], limit: u32, validator: Option<&[u8; 32]>) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    match validator {
+        Some(id) => h.update(&[1]).update(id),
+        None => h.update(&[0]),
+    };
     *h.finalize().as_bytes()
+}
+
+/// Why a translated shader was refused: the validator's first error follows.
+const REJECTED_PREFIX: &str = "the DXIL validator rejects it: ";
+
+/// The longest reason kept from the validator's text.
+const REASON_CHARS: usize = 200;
+
+/// What identifies the validator that gates translations: its `dxil.dll`'s
+/// path, size and last write, `None` when the gate is off (the default) or
+/// the DLL is not there.
+///
+/// This is part of the cache key and of the pipeline library tag, so
+/// swapping `dxil.dll` (a different path, size or modification time)
+/// invalidates the whole shader cache and the library. That is intended: a
+/// different validator may refuse different shaders.
+pub(crate) fn validator_id() -> Option<[u8; 32]> {
+    static ID: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+    *ID.get_or_init(|| {
+        let path = validator_path()?;
+        let meta = std::fs::metadata(&path).ok()?;
+        let written = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        let mut h = blake3::Hasher::new();
+        h.update(path.as_os_str().to_string_lossy().as_bytes());
+        h.update(&meta.len().to_le_bytes());
+        h.update(&written.to_le_bytes());
+        Some(*h.finalize().as_bytes())
+    })
+}
+
+/// The validator's DLL. The gate is opt-in: `None` unless `VICTORY_VALIDATE`
+/// is set to anything but `0` (`crate::switch`; `1` is the documented value),
+/// because it loads `dxil.dll` into the game process. With the gate on and no
+/// DLL to find, also `None`: the translation goes ungated, once warned.
+fn validator_path() -> Option<PathBuf> {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        if !crate::switch::on("VICTORY_VALIDATE") {
+            return None;
+        }
+        // Without a path `LoadLibrary` searches, which cannot be keyed;
+        // the first load tells whether it is there.
+        let path = Validator::default_path();
+        if path.is_none() {
+            warn_ungated("no dxil.dll found (set VICTORY_DXIL)");
+        }
+        path
+    })
+    .clone()
+}
+
+fn warn_ungated(why: &str) {
+    static WARNED: OnceLock<()> = OnceLock::new();
+    WARNED.get_or_init(|| {
+        tracing::warn!(
+            why,
+            "VICTORY_VALIDATE is on but translated shaders are not validated"
+        );
+    });
+}
+
+thread_local! {
+    /// One validator per worker: it is `Send` but not `Sync`, and a shared
+    /// one would serialise every pipeline worker.
+    static VALIDATOR: RefCell<Option<Validator>> = const { RefCell::new(None) };
+}
+
+/// `Err` with the validator's first error line if it rejects `dxil`.
+/// Validation signs in place, so it runs on a copy; no validator, no check.
+fn validate(dxil: &[u8]) -> Result<(), String> {
+    match validator_path() {
+        Some(path) => validate_with(&path, dxil),
+        None => Ok(()),
+    }
+}
+
+/// [`validate`] with the DLL at `path`, whatever the switch says.
+fn validate_with(path: &std::path::Path, dxil: &[u8]) -> Result<(), String> {
+    VALIDATOR.with_borrow_mut(|slot| {
+        if slot.is_none() {
+            match Validator::load(Some(path)) {
+                Ok(v) => *slot = Some(v),
+                Err(e) => {
+                    warn_ungated(&e);
+                    return Ok(());
+                }
+            }
+        }
+        let Some(v) = slot.as_mut() else {
+            return Ok(());
+        };
+        v.validate(&mut dxil.to_vec())
+            .map_err(|text| format!("{REJECTED_PREFIX}{}", first_error(&text)))
+    })
+}
+
+/// The validator's first specific line (not its "See other errors"
+/// summary), on one line and short.
+fn first_error(text: &str) -> String {
+    first_specific_line(text)
+        .chars()
+        .take(REASON_CHARS)
+        .collect()
+}
+
+fn translate_validated(container: &[u8]) -> Result<HostShader, String> {
+    // Writes through views mark their pages: copy-backs compare only those
+    // (crate::shadow::copy_back_marks).
+    let options = victory_shader::emit::Options { view_marks: true };
+    let shader =
+        victory_shader::emit::translate_with(container, options).map_err(|e| e.to_string())?;
+    validate(&shader.dxil)?;
+    Ok(shader)
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    // Writes through views mark their pages: copy-backs compare only those
-    // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
-        None => (translate(container), false),
+    let (shader, hit) = match CACHE.get() {
+        Some(cache) => cached(cache, build(), container, translate_validated),
+        None => (translate_validated(container), false),
+    };
+    if let Err(reason) = &shader
+        && reason.starts_with(REJECTED_PREFIX)
+    {
+        REJECTED.fetch_add(1, Ordering::Relaxed);
     }
+    (shader, hit)
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -435,17 +576,18 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, None);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, None));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, None));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, None));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, None));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                validator_id().as_ref()
             )
         );
         // The encoding part is this file as built.
@@ -454,6 +596,81 @@ mod tests {
                 .unwrap()
                 .contains("fn encode(translation: &Result<HostShader, String>)")
         );
+    }
+
+    /// A cache filled with no validator is not served to a process that has
+    /// one, nor the other way round, and the same validator keys the same.
+    #[test]
+    fn the_key_covers_the_validator() {
+        let key = |v: Option<&[u8; 32]>| key("0123456789abcdef", b"encoding", 1 << 20, v);
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        assert_eq!(key(None), key(None));
+        assert_eq!(key(Some(&a)), key(Some(&a)));
+        assert_ne!(key(None), key(Some(&a)));
+        assert_ne!(key(Some(&a)), key(Some(&b)));
+        // Not the id's bytes zeroed: "no validator" is not "validator 0".
+        assert_ne!(key(None), key(Some(&[0; 32])));
+    }
+
+    #[test]
+    fn the_reason_is_one_short_line() {
+        let text = "error: the entry is incompatible\n  note: see other\n";
+        assert_eq!(first_error(text), "error: the entry is incompatible");
+        let summary = "error: bad. See other errors.\nerror: the real rule\n";
+        assert_eq!(first_error(summary), "error: the real rule");
+        assert_eq!(first_error(""), "");
+        let long = format!("error: {}", "x".repeat(500));
+        assert_eq!(first_error(&long).chars().count(), REASON_CHARS);
+    }
+
+    #[test]
+    fn a_validator_refusal_round_trips_as_a_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let reason = format!("{REJECTED_PREFIX}error: bad");
+        let refusal = Err(reason.clone());
+        assert_eq!(decode(&encode(&refusal)), Some(refusal.clone()));
+        let fail = |_: &[u8]| Err::<HostShader, _>(reason.clone());
+        assert_eq!(
+            cached(&cache, &[1; 32], b"c", fail),
+            (refusal.clone(), false)
+        );
+        assert_eq!(cached(&cache, &[1; 32], b"c", fail), (refusal, true));
+    }
+
+    /// A well-formed container with no parts: the validator refuses it for
+    /// lacking a program. (Bytes that are not a container at all crash it.)
+    fn empty_container() -> Vec<u8> {
+        let mut c = b"DXBC".to_vec();
+        c.extend([0; 16]); // hash
+        c.extend(1u16.to_le_bytes()); // major
+        c.extend(0u16.to_le_bytes()); // minor
+        c.extend(32u32.to_le_bytes()); // size
+        c.extend(0u32.to_le_bytes()); // parts
+        c
+    }
+
+    /// Needs `dxil.dll` (`VICTORY_DXIL`, or a Windows SDK); skipped without.
+    /// Calls the validator directly: it does not depend on `VICTORY_VALIDATE`.
+    #[test]
+    fn garbage_dxil_is_refused_and_then_served_from_the_cache() {
+        let Some(path) = Validator::default_path() else {
+            eprintln!("skipped: no dxil.dll");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let ours = |_: &[u8]| {
+            let mut shader = shader();
+            shader.dxil = empty_container();
+            validate_with(&path, &shader.dxil).map(|()| shader)
+        };
+        let (first, hit) = cached(&cache, &[3; 32], b"c", ours);
+        assert!(!hit);
+        let reason = first.expect_err("garbage must not validate");
+        assert!(reason.starts_with(REJECTED_PREFIX), "{reason}");
+        assert!(!reason.contains('\n') && reason.chars().count() <= 300);
+        assert_eq!(cached(&cache, &[3; 32], b"c", ours), (Err(reason), true));
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
