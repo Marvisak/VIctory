@@ -559,6 +559,7 @@ impl State {
                 return false;
             };
             list.keep(table);
+            list.marks_views();
             // SAFETY: an open list; the table lives while the list holds it,
             // the bitmap for good.
             unsafe {

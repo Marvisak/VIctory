@@ -673,15 +673,28 @@ impl Marks {
     }
 }
 
-/// The buffer views' written-pages bitmap: the buffer, its mapping (bits
-/// as dwords) and host GPU address.
+/// The buffer views' written-pages bitmap (`victory_shader::emit`, "Write
+/// marks"): in video memory, with the read-back buffer it is copied into
+/// after each submission whose lists mark (mapped, as dwords) and the
+/// closed list that copies and clears it.
+///
+/// Every marked write is an atomic OR, and the lanes of a pass writing one
+/// region OR the same few dwords. In system memory, where the bitmap was,
+/// those atomics are ~600 times slower than in video memory on an NVIDIA
+/// host (1M ORs of one dword: 18 ms against 0.03 ms).
 struct Bitmap {
     _buffer: ID3D12Resource,
-    data: usize,
     gpu: u64,
+    back: usize,
+    /// Copies the bitmap into the read-back buffer, then clears it (from
+    /// zeros in upload memory). Recorded once, closed, and run after the
+    /// lists of every submission whose shaders mark (one runs at a time).
+    tail: HostList,
+    _back: ID3D12Resource,
+    _zeros: ID3D12Resource,
 }
 
-// SAFETY: D3D12 resources are free-threaded; the mapping is read and cleared
+// SAFETY: D3D12 resources are free-threaded; the read-back mapping is read
 // only between submissions, which run one at a time.
 unsafe impl Send for Bitmap {}
 // SAFETY: as above.
@@ -691,17 +704,53 @@ fn bitmap() -> Option<&'static Bitmap> {
     static BITMAP: std::sync::OnceLock<Option<Bitmap>> = std::sync::OnceLock::new();
     BITMAP
         .get_or_init(|| {
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_UAV_BARRIER,
+            };
             let bytes = u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8);
-            let (buffer, data) = host()?.shared_buffer(bytes)?;
+            let host = host()?;
+            // Committed, so zeroed; a stray bit would only compare a page.
+            let buffer = host.uav_buffer(bytes)?;
             crate::host::name(&buffer, || "views' written pages".into());
+            let (back, data) = host.readback_buffer(bytes)?;
+            let (zeros, z) = host.upload_buffer(bytes)?;
             // SAFETY: our mapped buffer of `bytes` bytes.
-            unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+            unsafe { std::ptr::write_bytes(z, 0, bytes as usize) };
+            let tail = host.new_list().ok()?;
+            // The lists before it wrote the bitmap as unordered access (from
+            // the common state); a copy promotes it to copy source.
+            let done = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            };
+            // SAFETY: an open list; buffers of ours the bitmap keeps.
+            unsafe {
+                tail.list.ResourceBarrier(&[done]);
+                tail.list.CopyBufferRegion(&back, 0, &buffer, 0, bytes);
+                tail.list.ResourceBarrier(&[crate::host::transition(
+                    &buffer,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                tail.list.CopyBufferRegion(&buffer, 0, &zeros, 0, bytes);
+            }
+            tail.close();
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             Some(Bitmap {
                 _buffer: buffer,
-                data: data as usize,
                 gpu,
+                back: data as usize,
+                tail,
+                _back: back,
+                _zeros: zeros,
             })
         })
         .as_ref()
@@ -713,11 +762,17 @@ pub(crate) fn view_writes() -> Option<u64> {
     bitmap().map(|b| b.gpu)
 }
 
-/// After a submission: every page its shaders marked as written through
-/// views goes back ([`Shadow::copy_back_marked`]), but for pages in
-/// `withheld` (ranges of copies that lists whose writes stay out of title
-/// memory declared); the bitmap is cleared. Before the copy-backs of
-/// declared ranges, which disarm the copies.
+/// The list that reads the bitmap back and clears it, to run after the
+/// lists of a submission whose shaders mark ([`copy_back_marks`]).
+pub(crate) fn marks_tail() -> Option<&'static HostList> {
+    bitmap().map(|b| &b.tail)
+}
+
+/// After a submission whose last list was [`marks_tail`]: every page its
+/// shaders marked as written through views goes back
+/// ([`Shadow::copy_back_marked`]), but for pages in `withheld` (ranges of
+/// copies that lists whose writes stay out of title memory declared).
+/// Before the copy-backs of declared ranges, which disarm the copies.
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
@@ -725,18 +780,30 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
     let Some(b) = bitmap() else {
         return;
     };
+    let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
+    // SAFETY: the mapped read-back buffer; the submission that copied the
+    // bitmap there is over (one runs at a time).
+    let bits = unsafe { std::slice::from_raw_parts(b.back as *const u32, words) };
+    copy_back_marks_in(bits, withheld);
+}
+
+/// [`copy_back_marks`] of the marks in `bits`.
+fn copy_back_marks_in(bits: &[u32], withheld: &[(Arc<Shadow>, usize, usize)]) {
     #[cfg(feature = "diagnostics")]
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
     let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
-    // SAFETY: the mapped bitmap; the GPU is done with it (one submission
-    // runs at a time).
-    let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
-    // Marks of offsets past the bitmap land in its last bit, no copy's.
-    bits[words - 1] = 0;
     let mut marked = Vec::new();
-    let used = (marks().end as usize).div_ceil(32).min(words);
-    for (w, word) in bits[..used].iter_mut().enumerate() {
-        let mut x = std::mem::take(word);
+    let used = (marks().end as usize)
+        .div_ceil(32)
+        .min(words)
+        .min(bits.len());
+    for (w, &word) in bits[..used].iter().enumerate() {
+        // Marks of offsets past the bitmap land in its last bit, no copy's.
+        let mut x = if w == words - 1 {
+            word & !(1 << 31)
+        } else {
+            word
+        };
         while x != 0 {
             marked.push((w * 32) as u32 + x.trailing_zeros());
             x &= x - 1;
@@ -1093,18 +1160,75 @@ mod tests {
         unregister(p, p as u64);
     }
 
+    /// The views' written-pages bitmap (in video memory) is read back after
+    /// a submission whose lists mark and cleared for the next one; two lists
+    /// of one submission mark in it both. (The bits marked are none of a
+    /// copy's.)
+    #[test]
+    fn view_marks_are_read_back_and_cleared_each_submission() {
+        const MARK: &str = r#"
+#define RS "UAV(u0), RootConstants(num32BitConstants=1, b0)"
+RWByteAddressBuffer marks : register(u0);
+cbuffer c : register(b0) { uint bit; }
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint was;
+    marks.InterlockedOr((bit >> 5) * 4, 1u << (bit & 31), was);
+}
+"#;
+        let (Some(host), Some(b)) = (host(), bitmap()) else {
+            return; // no host GPU here
+        };
+        let (root, pso) = crate::memory::tests::pipeline_of(MARK);
+        let last = victory_shader::emit::VIEW_WRITE_BITS - 1;
+        let lists = [host.new_list().unwrap(), host.new_list().unwrap()];
+        let record = |list: &HostList, bit: u32| {
+            list.marks_views();
+            // SAFETY: an open list; objects of ours.
+            unsafe {
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootUnorderedAccessView(0, b.gpu);
+                list.list
+                    .SetComputeRoot32BitConstants(1, 1, (&raw const bit).cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(4, 1, 1);
+            }
+            list.close();
+        };
+        let marked = || -> Vec<u32> {
+            let words = victory_shader::emit::VIEW_WRITE_BITS as usize / 32;
+            // SAFETY: the mapped read-back buffer; no submission of ours runs.
+            let bits = unsafe { std::slice::from_raw_parts(b.back as *const u32, words) };
+            (0..words as u32 * 32)
+                .filter(|&n| bits[n as usize / 32] >> (n % 32) & 1 != 0)
+                .collect()
+        };
+        record(&lists[0], last);
+        record(&lists[1], last - 1);
+        host.execute(&[&lists[0], &lists[1]]);
+        assert_eq!(marked(), [last - 1, last], "both lists' marks");
+        for list in &lists {
+            list.reset();
+        }
+        record(&lists[0], last - 2);
+        host.execute(&[&lists[0]]);
+        assert_eq!(marked(), [last - 2], "this submission's marks only");
+        lists[0].reset();
+    }
+
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
     /// "Write marks") go back by the bytes the GPU changed. The title writes
     /// a marked page after the copy took it (the guard saves its bytes from
     /// before) and a page nobody marked: the shader's byte and the title's
     /// both stay in the first; the second keeps the title's, and the copy's
-    /// byte there (no mark) is not put back. The bits are cleared.
+    /// byte there (no mark) is not put back.
     #[test]
     fn marked_pages_go_back_by_the_bytes_the_gpu_changed() {
         let p = crate::watch::tests::pool(3);
         let len = 3 * PAGE;
         register(p, p as u64, len as u64);
-        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap()) else {
+        let Some(copy) = find(p as u64, len as u64) else {
             unregister(p, p as u64);
             return; // no host GPU here
         };
@@ -1124,21 +1248,17 @@ mod tests {
             title(PAGE + 40).write_volatile(0x11);
             title(2 * PAGE + 50).write_volatile(0x22);
         }
-        // The shaders marked pages 0 and 1.
-        let bits = b.data as *mut u32;
+        // The shaders marked pages 0 and 1 (the bitmap as read back).
+        let mut bits = vec![0u32; (base + 2).div_ceil(32)];
         for n in [base, base + 1] {
-            // SAFETY: a dword of the mapped bitmap.
-            unsafe { *bits.add(n / 32) |= 1 << (n % 32) };
+            bits[n / 32] |= 1 << (n % 32);
         }
-        copy_back_marks(&[]);
+        copy_back_marks_in(&bits, &[]);
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { title(at).read_volatile() };
         assert_eq!(read(10), 0xaa, "the shader's byte, page 0");
         assert_eq!((read(PAGE + 20), read(PAGE + 40)), (0xbb, 0x11), "both writers' bytes, page 1");
         assert_eq!((read(2 * PAGE + 30), read(2 * PAGE + 50)), (0, 0x22), "page 2 not marked");
-        // SAFETY: dwords of the mapped bitmap.
-        let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
-        assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
         unregister(p, p as u64);
     }
