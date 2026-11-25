@@ -177,8 +177,10 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) || title == host {
+        let differs = with_scratch(n, |title| {
+            crate::host::read_into(from as *const u8, title) && title != host
+        });
+        if !differs {
             return 0;
         }
         {
@@ -233,6 +235,11 @@ impl Shadow {
     /// Whether writes through views of this copy are marked.
     pub(crate) fn marked(&self) -> bool {
         self.marks.is_some()
+    }
+
+    /// Whether this copy tracks dirty 64 KiB pages via [`crate::watch`].
+    pub(crate) fn is_tracked(&self) -> bool {
+        self.tracked.is_some()
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -352,45 +359,38 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
-            let mut at = from;
-            while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
-                // A whole piece is compared once per submission, whichever
-                // declared ranges overlap it: then what the GPU wrote there
-                // went back.
-                if n == PIECE && !compared.insert(start + at) {
-                    at += n;
-                    continue;
-                }
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
+            with_scratch(PIECE, |scratch| {
+                let mut at = from;
+                while at < to {
+                    let n = (PIECE - (start + at) % PIECE).min(to - at);
+                    // SAFETY: inside the mapping; only the submitting thread
+                    // writes it.
+                    let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    let old = &before[at - from..at - from + n];
+                    let title = &mut scratch[..n];
+                    // A whole piece is compared once per submission, whichever
+                    // declared ranges overlap it: then what the GPU wrote there
+                    // went back.
+                    if n == PIECE && !compared.insert(start + at) {
+                        at += n;
+                        continue;
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
+                    if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                        // Title memory with the GPU's bytes put in; the copy
+                        // takes the title's bytes in turn.
+                        if merge_host_into_title(title, host, old) {
+                            let _writing = crate::watch::writing(start + at, n);
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                            written += n;
                         }
-                        *h = *t;
+                        synced.push((start + at) / PAGE);
                     }
-                    if changed {
-                        let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
+                    at += n;
                 }
-                at += n;
-            }
+            });
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
@@ -447,36 +447,33 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) {
-            return 0;
-        }
-        let written = match &saved {
-            // The title's bytes are the copy's from before: what differs is
-            // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
-            Some(before) => {
-                let before = &before[from - page..to - page];
-                let mut changed = false;
-                for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(before) {
-                    if *h != *b && *t != *h {
-                        *t = *h;
-                        changed = true;
-                    }
-                    *h = *t;
-                }
-                changed.then_some(title.as_ptr())
+        let wrote = with_scratch(n, |title| {
+            if !crate::host::read_into(from as *const u8, title) {
+                return None;
             }
+            let written = match &saved {
+                // The title's bytes are the copy's from before: what differs is
+                // the shaders'.
+                None => (*host != title[..]).then_some(host.as_ptr()),
+                Some(before) => {
+                    let before = &before[from - page..to - page];
+                    merge_host_into_title(title, host, before).then_some(title.as_ptr())
+                }
+            };
+            if let Some(bytes) = written {
+                let _writing = crate::watch::writing(from, n);
+                crate::host::write_mapped(from as *mut u8, bytes, n);
+            }
+            Some(written.is_some())
+        });
+        let Some(did_write) = wrote else {
+            return 0;
         };
-        if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
-        }
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
             t.taken(&[page / PAGE]);
         }
-        written.map_or(0, |_| n)
+        if did_write { n } else { 0 }
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -613,6 +610,57 @@ impl Drop for Shadow {
 /// The 64 KiB title pages `[start, start + len)` touches.
 fn pages(start: u64, len: u64) -> u32 {
     ((start + len.max(1) - 1) >> 16).saturating_sub(start >> 16) as u32 + 1
+}
+
+/// Runs `f` with a reusable thread-local scratch buffer of `len` bytes
+/// (`len <= PAGE`), avoiding per-page 64 KiB heap allocations and zero-fills
+/// during copy-back.
+fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Box<[u8]>> =
+            std::cell::RefCell::new(vec![0u8; PAGE].into_boxed_slice());
+    }
+    SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        f(&mut buf[..len])
+    })
+}
+
+/// Applies GPU changes (`host != before`) onto `title` and syncs `host` to
+/// match `title`, processing 8 bytes at a time to skip unmodified words and
+/// avoid redundant writes to write-combined GPU shadow memory.
+fn merge_host_into_title(title: &mut [u8], host: &mut [u8], before: &[u8]) -> bool {
+    let mut changed = false;
+    let (t_words, t_rest) = title.as_chunks_mut::<8>();
+    let (h_words, h_rest) = host.as_chunks_mut::<8>();
+    let (b_words, b_rest) = before.as_chunks::<8>();
+    for ((t, h), b) in t_words.iter_mut().zip(h_words.iter_mut()).zip(b_words) {
+        let hw = u64::from_ne_bytes(*h);
+        let bw = u64::from_ne_bytes(*b);
+        if hw == bw {
+            let tw = u64::from_ne_bytes(*t);
+            if tw != hw {
+                *h = *t;
+            }
+            continue;
+        }
+        for i in 0..8 {
+            let hb = h[i];
+            if hb != b[i] && t[i] != hb {
+                t[i] = hb;
+                changed = true;
+            }
+            h[i] = t[i];
+        }
+    }
+    for ((t, h), b) in t_rest.iter_mut().zip(h_rest.iter_mut()).zip(b_rest) {
+        if *h != *b && *t != *h {
+            *t = *h;
+            changed = true;
+        }
+        *h = *t;
+    }
+    changed
 }
 
 /// The bits of the buffer views' written-pages bitmap (`victory_shader::
@@ -1157,5 +1205,37 @@ mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    #[test]
+    fn word_merge_matches_bytewise_merge() {
+        let len = 4099; // non-multiple of 8 to cover remainder path
+        let before: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut host = before.clone();
+        let mut title = before.clone();
+        // GPU writes scattered single bytes and full words (including remainder).
+        for i in [0, 3, 7, 16, 17, 18, 19, 1024, 4095, 4097, 4098] {
+            host[i] ^= 0x55;
+        }
+        // Title writes overlapping and non-overlapping bytes.
+        for i in [5, 16, 200, 201, 202, 203, 204, 205, 206, 207, 4096] {
+            title[i] ^= 0xAA;
+        }
+        let (mut ref_title, mut ref_host) = (title.clone(), host.clone());
+        let mut ref_changed = false;
+        for ((t, h), b) in ref_title.iter_mut().zip(ref_host.iter_mut()).zip(&before) {
+            if *h != *b && *t != *h {
+                *t = *h;
+                ref_changed = true;
+            }
+            *h = *t;
+        }
+        let changed = merge_host_into_title(&mut title, &mut host, &before);
+        assert_eq!(changed, ref_changed);
+        assert_eq!(title, ref_title);
+        assert_eq!(host, ref_host);
+        // Second merge where host == before and title == host reports unchanged.
+        let before2 = host.clone();
+        assert!(!merge_host_into_title(&mut title, &mut host, &before2));
     }
 }
