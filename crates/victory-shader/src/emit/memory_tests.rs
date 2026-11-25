@@ -752,3 +752,88 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// A texture the program reads through a table at a fixed offset makes its
+/// slot on the host (the draw's table ranges) and marks nothing. Through a
+/// table at an offset the program computes — a term no root parameter or
+/// constant explains in the address — the host cannot name the slot, so the
+/// read marks its heap index instead (`emit`, "Read marks"): placed
+/// textures at such a slot would otherwise stay null forever.
+#[test]
+fn table_texture_reads_at_an_offset_the_code_computes_mark_their_slot() {
+    let lower_with = |computed: bool| {
+        let mut w = vec![s_mov_b32(5, ZERO as u8)]; // the table base's high half
+        if computed {
+            w.push(0x8814_8004); // s_or_b32 s20, s4, 0: a term the code computes
+            w.push(0x8006_1404); // s6 = s4 + s20: the computed table offset
+            w.push(0xBE87_0380); // s7 = 0
+            w.extend(s_load(3, 12, 6, 0)); // s[12:19] = descriptor at s[6:7]
+        } else {
+            w.extend(s_load(3, 12, 4, 0)); // s[12:19]: descriptor at s[4:5]
+        }
+        w.push(S_WAITCNT_ALL);
+        w.extend((0..2).map(|v| v_mov_b32(v, ZERO)));
+        // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
+        w.extend([0xF000_1F08, 0x0003_0200]);
+        w.push(S_WAITCNT_ALL);
+        w.push(S_ENDPGM);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 4,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: true,
+        })
+        .expect("lower")
+    };
+    let fixed = lower_with(false);
+    assert!(
+        !fixed.view_marks,
+        "a table read at a fixed offset marks nothing"
+    );
+    let computed = lower_with(true);
+    assert!(
+        computed.view_marks,
+        "a table read at an offset the code computes marks its slot"
+    );
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut computed.dxil.clone()).expect("DXIL validation failed");
+    }
+}

@@ -5090,12 +5090,15 @@ impl<'a> Lower<'a> {
     /// A handle for the descriptor `src` read at `site`; the heap index of
     /// a texture shader view the program takes from the heap itself is noted
     /// for the instruction's read mark (handles are made once per block,
-    /// often before the instruction). A view read through a table needs
-    /// none: the host makes the slot for the draw.
+    /// often before the instruction). A view read through a table at a fixed
+    /// offset needs none: the host makes that slot for the draw. A table
+    /// read the program computes (a dynamic offset, or a waterfall loop)
+    /// marks its slot: nothing on the host names it otherwise (`issue`:
+    /// placed textures at such a slot stay null forever).
     fn handle(&mut self, site: Site, src: &Source, sampler: bool, props: (u32, u32)) -> Result<V, Why> {
         let h = self.handle_made(site, src, sampler, props)?;
         if let Some(&index) = self.s.texture_index.get(&h)
-            && self.is_heap_direct(src)
+            && self.marks_its_reads(src)
         {
             self.s.texture_reads.push(index);
         }
@@ -5339,6 +5342,30 @@ impl<'a> Lower<'a> {
                 .is_some_and(|p| p.root == RootType::ResourceHeap),
             _ => false,
         })
+    }
+
+    /// Whether a use of `src` marks the slots it reads (`emit`, "Read
+    /// marks"): every descriptor the program takes from the heap itself
+    /// does, and so does one read through a table the program computes — a
+    /// dynamic offset, or a waterfall loop's per-lane entry. A table read
+    /// at a fixed offset names its slot for the draw, which makes it;
+    /// marking it again would cost without saying anything new.
+    fn marks_its_reads(&self, src: &Source) -> bool {
+        self.is_heap_direct(src)
+            || src.leaves().iter().any(|l| match l {
+                Source::Loaded { load, .. } | Source::Fetched { load, .. } => {
+                    let Some(a) = self.scalar.get(load) else {
+                        return false;
+                    };
+                    let Some(p) = self.x.native.layout.get(a.param) else {
+                        return false;
+                    };
+                    p.root == RootType::Table
+                        && (a.dynamic.is_some()
+                            || self.x.res.waterfall.loads.contains(load))
+                }
+                _ => false,
+            })
     }
 
     /// The address of the descriptor load at `load` when root parameters
