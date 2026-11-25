@@ -74,8 +74,16 @@ other applications or increase the Windows paging file size, then retry.
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
 cargo test --workspace                   # needs no game data
+cargo xtask verify-cpu --list            # review the CPU-only source checks
+cargo xtask verify-cpu --report target/cpu-verification.md
 cargo run -p victory -- config           # check your paths
 ```
+
+`cargo xtask verify-cpu` runs a reviewed subset of synthetic component tests
+and prints a Markdown results report (or writes one with `--report`). It does
+not launch the title or use game files; GPU tests are excluded. See
+[CPU-only source verification](docs/cpu-verification.md) for coverage and
+limitations.
 
 Run the title:
 

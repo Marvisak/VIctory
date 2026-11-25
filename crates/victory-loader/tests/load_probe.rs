@@ -26,15 +26,31 @@ fn workspace_root() -> PathBuf {
 fn build_probe() -> PathBuf {
     let manifest = workspace_root().join("tests/fixtures/hle-probe/Cargo.toml");
     let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hle-probe");
+    let target_triple = format!(
+        "{}-pc-windows-{}",
+        std::env::consts::ARCH,
+        if cfg!(target_env = "msvc") {
+            "msvc"
+        } else if cfg!(target_env = "gnu") {
+            "gnu"
+        } else {
+            panic!("unsupported Windows target environment")
+        }
+    );
     let status = Command::new(env!("CARGO"))
         .args(["build", "--quiet", "--manifest-path"])
         .arg(&manifest)
         .arg("--target-dir")
         .arg(&target)
+        .arg("--target")
+        .arg(&target_triple)
         .status()
         .expect("running cargo");
     assert!(status.success(), "building hle-probe failed");
-    target.join("debug").join("hle_probe.dll")
+    target
+        .join(target_triple)
+        .join("debug")
+        .join("hle_probe.dll")
 }
 
 extern "system" fn fake_xgameruntime_initialize() -> i32 {
