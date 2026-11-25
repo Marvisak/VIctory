@@ -13,6 +13,22 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at, views_current};
 use crate::host::host;
 
+struct DynamicSlots {
+    next: u32,
+    taken: Vec<bool>,
+    no_run: usize,
+}
+
+impl DynamicSlots {
+    fn new(extra: usize) -> Self {
+        Self {
+            next: 0,
+            taken: vec![false; extra],
+            no_run: usize::MAX,
+        }
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -31,9 +47,10 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     /// With it the view's own copy of title memory, if it has one.
     kept: Mutex<Vec<Kept>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// Where the search for free dynamic slots starts, which are taken (by
+    /// lists not yet reset), and the smallest run known not to be free since
+    /// the last release (`usize::MAX`: none).
+    next: Mutex<DynamicSlots>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -194,7 +211,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new(DynamicSlots::new(extra as usize)),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
                 null if !sampler && null > count + extra && null < total => null - 1,
@@ -299,11 +316,16 @@ impl HostHeap {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
         let n = n as usize;
+        // A search that found no run of this size (or of a smaller one) since
+        // the last release finds none now: without this, each table of a frame
+        // that does not fit walks all the slots again.
+        if n >= guard.no_run {
+            return None;
+        }
         // Search from `next` on, then from the start (extending past cursor by
         // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
+        let cursor = guard.next as usize;
         let end = self.dynamic as usize;
         let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
         let starts = (cursor..end).chain(0..second_end);
@@ -316,7 +338,7 @@ impl HostHeap {
                 run = 0;
             }
             last = at;
-            run = if taken[at] { 0 } else { run + 1 };
+            run = if guard.taken[at] { 0 } else { run + 1 };
             if run == n {
                 found = Some(at + 1 - n);
                 break;
@@ -325,10 +347,11 @@ impl HostHeap {
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            guard.no_run = n;
             return None;
         };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
+        guard.taken[first..first + n].fill(true);
+        guard.next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 
@@ -377,9 +400,15 @@ impl HostHeap {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
+        let (at, end) = (at as usize, (at + n).min(self.dynamic) as usize);
+        if at >= end {
+            return;
+        }
+        guard.taken[at..end].fill(false);
+        if guard.no_run != usize::MAX {
+            let left = guard.taken[..at].iter().rev().take_while(|t| !**t).count();
+            let right = guard.taken[end..].iter().take_while(|t| !**t).count();
+            guard.no_run = guard.no_run.max(left + (end - at) + right + 1);
         }
     }
 
@@ -2137,5 +2166,43 @@ mod tests {
         // The array's own view: a 2D array, levels 0-10.
         let words = image_words(&array, None, false);
         assert_eq!(words[1..], [3 << 30, 255 | 599 << 14, 0xFAC | 10 << 16 | 13 << 28]);
+    }
+
+    #[test]
+    fn dynamic_failed_search_is_cached_until_release() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        let bulk = heap.dynamic(heap.dynamic - 1).unwrap();
+        assert_eq!(heap.dynamic(2), None);
+        assert_eq!(heap.next.lock().unwrap().no_run, 2);
+        assert_eq!(heap.dynamic(3), None);
+        // Smaller runs still succeed.
+        let one = heap.dynamic(1).unwrap();
+        assert_eq!(one, bulk + heap.dynamic - 1);
+        // Releasing slots lifts `no_run` to cover the newly freed run.
+        heap.release(bulk, 2);
+        assert_eq!(heap.dynamic(2), Some(bulk));
+    }
+
+    /// Releases that free only single slots keep runs of two known missing
+    /// (no walk), and once the heap is free again a table gets its slots in
+    /// the same frame, however many searches failed before.
+    #[test]
+    fn a_frame_of_failed_searches_still_gets_slots_after_a_release() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        let all = heap.dynamic(heap.dynamic).unwrap();
+        for k in 0..16 {
+            // Every other slot: no two free slots are next to each other.
+            heap.release(all + 2 * k, 1);
+            assert_eq!(heap.dynamic(2), None);
+        }
+        assert_eq!(heap.next.lock().unwrap().no_run, 2);
+        heap.release(all, heap.dynamic);
+        assert_eq!(heap.dynamic(2), Some(all));
     }
 }
