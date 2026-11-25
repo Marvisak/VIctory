@@ -1442,6 +1442,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
+            // The host refuses (and removes the device for) a typed unordered
+            // view in a format it cannot store to: the packed 16-bit ones
+            // (B5G5R5A1, B4G4R4A4), 2026-11-24. Such a view is null.
+            // SAFETY: a live resource.
+            let final_format = desc
+                .as_ref()
+                .map(|d| d.Format.0 as u32)
+                .filter(|&f| f != 0)
+                .unwrap_or_else(|| unsafe { texture.GetDesc() }.Format.0 as u32);
+            if !typed_store(final_format) {
+                once!(format = final_format, "an unordered view in a format the host cannot store");
+                return None;
+            }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
                 device.CreateUnorderedAccessView(
