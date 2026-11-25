@@ -612,5 +612,9 @@ void main(uint3 id : SV_DispatchThreadID) {
                 assert_eq!(v, base + i as u32 + u32::from(texel), "round {round}, dword {i}");
             }
         }
+
+        drop(list);
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10);
+        assert_eq!(release(heap), 0);
     }
 }
