@@ -1807,3 +1807,39 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+/// `victory_formats::bcpack::zz`, the function the test below runs as console code.
+fn zz_reference(v: u8, bits: u32) -> u8 {
+    let mask = ((1u32 << bits) - 1) as u8;
+    ((v >> 1) ^ if v & 1 != 0 { mask } else { 0 }) & mask
+}
+
+/// BCPack's zigzag decode written as console code matches the formats crate's function on
+/// the GPU: every symbol at every width, widths past a byte included.
+#[test]
+fn bcpack_zigzag_decode_matches_the_formats_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the symbol, v2 = its width in bits; v5 = the width's mask, as a byte.
+    body.extend(vop3(0x11A, 5, vgpr(2), 129, 128)); // v_lshlrev_b32 v5, v2, 1
+    body.extend(vop3(0x125, 5, 193, vgpr(5), 128)); // v_add_nc_u32 v5, -1, v5
+    body.extend(vop3(0x148, 5, vgpr(5), 128, 128 + 8)); // v_bfe_u32 v5, v5, 0, 8
+    body.extend(vop3(0x116, 6, 129, vgpr(1), 128)); // v_lshrrev_b32 v6, 1, v1
+    body.extend(vop3(0x148, 7, vgpr(1), 128, 129)); // v_bfe_u32 v7, v1, 0, 1
+    body.extend(vop3(0x0C5, 106, 128, vgpr(7), 128)); // v_cmp_ne_u32 vcc, 0, v7
+    body.extend(vop3(0x101, 8, 128, vgpr(5), vcc)); // v_cndmask_b32 v8, 0, v5, vcc
+    body.extend(vop3(0x11D, 9, vgpr(6), vgpr(8), 128)); // v_xor_b32 v9, v6, v8
+    body.extend(vop3(0x11B, 0, vgpr(9), vgpr(5), 128)); // v_and_b32 v0, v9, v5
+    let shader = build_valu_cs(&body);
+    let mut cases = Vec::new();
+    let mut want = Vec::new();
+    for bits in (0u32..=9).chain([16, 31]) {
+        for v in 0u32..256 {
+            cases.push([v, bits, 0, 0]);
+            want.push(u32::from(zz_reference(v as u8, bits)));
+        }
+    }
+    run_cases(&shader, &cases, |backend, i, inputs, got| {
+        assert_eq!(got, want[i], "{backend}: zz{inputs:?}");
+    });
+}
