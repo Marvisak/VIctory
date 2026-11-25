@@ -651,6 +651,7 @@ impl Drop for Timed {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
@@ -761,7 +762,10 @@ pub(crate) mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
-            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE).Value as usize
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE).Value as usize;
+            // The mapped view keeps its own reference to the section.
+            assert_ne!(CloseHandle(section), 0);
+            view
         };
         assert_ne!(view, 0);
         assert!(track(view, 2 * PAGE, false).is_none(), "views only where asked");
@@ -808,12 +812,22 @@ pub(crate) mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
-            (
-                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize,
-                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize,
-            )
+            let a = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+            let b = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+            // Both views keep their references after the handle closes.
+            assert_ne!(CloseHandle(section), 0);
+            (a, b)
         };
-        assert!(a != 0 && b != 0);
+        if a == 0 || b == 0 {
+            use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+            for view in [a, b].into_iter().filter(|&view| view != 0) {
+                // SAFETY: a successful mapping from the section above.
+                unsafe {
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+                }
+            }
+            panic!("could not map both section views");
+        }
         for k in (0..len).step_by(PAGE) {
             title_memory_aliased(b + k, &[a + k]);
         }
