@@ -211,19 +211,16 @@ pub(crate) fn page_faults() -> u64 {
     u64::from(c.PageFaultCount)
 }
 
-/// Logs the counters per frame over `frames` frames, and the ranges that
-/// took most bytes.
-pub(crate) fn log(frames: f64) {
-    static FAULTS: AtomicU64 = AtomicU64::new(0);
-    let faults = page_faults();
-    let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
-    let c: Vec<f64> = COUNT
-        .iter()
-        .map(|a| a.swap(0, Relaxed) as f64 / frames)
-        .collect();
+/// Format a reporting window without touching live counters or the GPU.
+fn summary(
+    c: &[f64],
+    faults_per_frame: f64,
+    working_set_mb: f64,
+    hard_faults_per_frame: f64,
+) -> String {
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
-    tracing::info!(
+    format!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
@@ -249,7 +246,7 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::QueryUs as usize]),
         ms(c[C::MoveUs as usize]),
         mb(c[C::Unmapped as usize]),
-        faults as f64 / frames,
+        faults_per_frame,
         c[C::Watches as usize],
         ms(c[C::WatchUs as usize]),
         mb(c[C::Checked as usize]),
@@ -298,12 +295,28 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::MarkedUs as usize]),
         c[C::MarkedKept as usize],
         c[C::SavedPages as usize],
-        working_set() as f64 / 1e6,
-        {
+        working_set_mb,
+        hard_faults_per_frame,
+    )
+}
+
+/// Logs the counters per frame over `frames` frames, and the ranges that
+/// took most bytes.
+pub(crate) fn log(frames: f64) {
+    static FAULTS: AtomicU64 = AtomicU64::new(0);
+    let faults = page_faults();
+    let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
+    let c: Vec<f64> = COUNT
+        .iter()
+        .map(|a| a.swap(0, Relaxed) as f64 / frames)
+        .collect();
+    tracing::info!(
+        "{}",
+        summary(&c, faults as f64 / frames, working_set() as f64 / 1e6, {
             static HARD: AtomicU64 = AtomicU64::new(0);
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
-        },
+        })
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()
@@ -415,5 +428,25 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
             }
         }
         q
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_matches_report_fixture() {
+        let mut counters = [0.0; COUNTERS];
+        counters[C::Submissions as usize] = 2.5;
+        counters[C::Copies as usize] = 12.0;
+        counters[C::CopyBytes as usize] = 20_000_000.0;
+        counters[C::Refreshes as usize] = 8.0;
+        counters[C::RefreshBytes as usize] = 10_000_000.0;
+        counters[C::SnapshotBytes as usize] = 4_000_000.0;
+        assert_eq!(
+            summary(&counters, 3.0, 500.0, 2.0),
+            include_str!("../tests/copystat-summary.txt").trim_end()
+        );
     }
 }

@@ -274,18 +274,13 @@ pub fn run(
          {} vertex values; exports {:?}, {} still f16 pairs)",
         t.io_raised, t.io_programs, t.interpolated, t.vertex_values, t.exports, t.compressed
     );
-    println!(
-        "DXIL         {} emitted of {} vertex and pixel programs; {} validated, {} pipelines",
-        t.emitted, t.emit_programs, t.validated, t.pipelines
-    );
-    println!(
-        "             {} emitted of {} compute programs; {} validated, {} pipelines",
-        t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
-    );
-    println!(
-        "             {} emitted of {} mesh programs; {} validated, {} pipelines",
-        t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
-    );
+    for line in dxil_summary([
+        [t.emitted, t.emit_programs, t.validated, t.pipelines],
+        [t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines],
+        [t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines],
+    ]) {
+        println!("{line}");
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -315,6 +310,21 @@ pub fn run(
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
     Ok(())
+}
+
+/// The emitted, eligible, validated and pipeline counts for each stage.
+pub(crate) fn dxil_summary(rows: [[usize; 4]; 3]) -> [String; 3] {
+    let [graphics, compute, mesh] = rows;
+    let row = |prefix: &str, stage: &str, [emitted, total, validated, pipelines]: [usize; 4]| {
+        format!(
+            "{prefix}{emitted} emitted of {total} {stage} programs; {validated} validated, {pipelines} pipelines"
+        )
+    };
+    [
+        row("DXIL         ", "vertex and pixel", graphics),
+        row("             ", "compute", compute),
+        row("             ", "mesh", mesh),
+    ]
 }
 
 /// The warm-up (`--cache`): every distinct container found goes through

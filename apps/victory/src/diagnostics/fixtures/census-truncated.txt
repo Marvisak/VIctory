@@ -1,0 +1,3 @@
+containers   140 (0 duplicates skipped)
+DXIL         90 emitted of 100 vertex and pixel programs; 0 validated, 0 pipelines
+             15 emitted of 20 compute programs; 0 validated, 0 pipelines

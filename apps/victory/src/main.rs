@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod diagnostics;
 mod inspect;
 mod prebuild;
 mod run;
@@ -120,6 +121,24 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Compare offline translation censuses and optional GPU copy logs.
+    /// Use identical inputs, translate flags, hardware and workload phase.
+    /// Accepts UTF-8 or BOM-marked UTF-16 logs, up to 64 MiB each.
+    Report {
+        /// Baseline translation output.
+        baseline: PathBuf,
+        /// Candidate translation output.
+        candidate: PathBuf,
+        /// Baseline GPU copy-statistics log.
+        #[arg(long, requires = "candidate_gpu")]
+        baseline_gpu: Option<PathBuf>,
+        /// Candidate GPU copy-statistics log.
+        #[arg(long, requires = "baseline_gpu")]
+        candidate_gpu: Option<PathBuf>,
+        /// Fail if median title copy traffic grows by more than this percent.
+        #[arg(long, requires_all = ["baseline_gpu", "candidate_gpu"])]
+        max_copy_regression_percent: Option<f64>,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -197,6 +216,19 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Report {
+            baseline,
+            candidate,
+            baseline_gpu,
+            candidate_gpu,
+            max_copy_regression_percent,
+        } => diagnostics::run(
+            &baseline,
+            &candidate,
+            baseline_gpu.as_deref(),
+            candidate_gpu.as_deref(),
+            max_copy_regression_percent,
+        ),
         Command::Config => show_config(),
     }
 }
