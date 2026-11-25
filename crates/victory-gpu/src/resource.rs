@@ -1131,6 +1131,26 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // A texture made with the unordered flag needs a format the host can
+    // make a typed unordered view of. One without a family that could stand
+    // in (some console formats the title names, e.g. B5G5R5A1) removes the
+    // device at `GetResourceAllocationInfo`; make it without the flag
+    // instead, and its unordered views are refused later
+    // (`descriptor::host::fits`).
+    if d.flags & UNORDERED != 0
+        && family(d.format) == d.format
+        && family(d.format + 1) != d.format
+        && !crate::descriptor::host::typed_store(d.format)
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                format = d.format,
+                "no unordered access for this format: textures are made without it, their unordered views are refused"
+            );
+        });
+        d.flags &= !UNORDERED;
+    }
     Some(d)
 }
 
@@ -3166,4 +3186,46 @@ mod tests {
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
+
+    /// A texture asked for with the unordered flag in a format the host has no
+    /// typed UAV for and no family to stand in (the console's B5G5R5A1) is made
+    /// without the flag instead of removing the device; a UAV-capable format
+    /// and an sRGB one with a typeless family keep it.
+    #[test]
+    fn a_format_without_unordered_access_loses_the_flag() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let texture = |format| ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 1 | UNORDERED,
+        };
+        // An sRGB texture, turned typeless for unordered access, keeps the
+        // flag: its typeless family (27) can stand in.
+        let host = host_desc(&texture(29)).unwrap();
+        assert_eq!(host.flags & UNORDERED, UNORDERED, "29 (sRGB) keeps the flag");
+        assert_eq!(host.format, 27, "as its typeless family");
+        if crate::descriptor::host::typed_store(86) {
+            eprintln!("this device stores to 86 as a typed UAV; skipped");
+            return;
+        }
+        let host = host_desc(&texture(86)).unwrap();
+        assert_eq!(host.flags & UNORDERED, 0, "86 has no typed UAV");
+        assert_eq!(host.format, 86, "and no family to stand in");
+        // A format whose type can be stored to keeps the flag.
+        if crate::descriptor::host::typed_store(28) {
+            let host = host_desc(&texture(28)).unwrap();
+            assert_eq!(host.flags & UNORDERED, UNORDERED, "28 keeps the flag");
+        }
+    }
 }
+
