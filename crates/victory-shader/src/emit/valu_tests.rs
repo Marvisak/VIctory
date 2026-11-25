@@ -16,7 +16,17 @@ const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// SOP1 `s_mov_b32 sdst, src0`.
 const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
-    0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
+    sop1(0x03, sdst, src0)
+}
+
+/// SOP1 `op sdst, src0`.
+const fn sop1(op: u8, sdst: u8, src0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32 & 0x7F) << 16 | (op as u32) << 8 | src0 as u32
+}
+
+/// SOPK `op sdst, simm16`.
+const fn sopk(op: u8, sdst: u8, imm: u16) -> u32 {
+    0xB000_0000 | (op as u32 & 0x1F) << 23 | (sdst as u32 & 0x7F) << 16 | imm as u32
 }
 
 /// SOP2 `op sdst, src0, src1`.
@@ -1805,5 +1815,125 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         ),
         "{:?}",
         refused.err()
+    );
+}
+
+#[test]
+fn scalar_cmov_updates_only_when_scc_is_set() {
+    // s_cmov_b32 s6, s2 (SOP1 0x05): preserves s6 when SCC=0, overwrites with s2 when SCC=1,
+    // and leaves SCC unmodified even when the moved value is 0.
+    let cmov_b32 = build_valu_cs(&[
+        s_mov_b32(6, 1),          // s6 = s1 (old)
+        s_mov_b32(7, 1),          // s7 = s1 (initialized old dst)
+        sopk(0x0a, 0, 0),         // s_cmpk_lg_u32 s0, 0 -> SCC = (s0 != 0)
+        sop1(0x05, 6, 2),         // s_cmov_b32 s6, s2
+        sop1(0x05, 7, 0x80),      // s_cmov_b32 s7, 0 (must not clobber SCC)
+        sop2(0x0a, 12, 6, 3),     // s_cselect_b32 s12, s6, s3 (uses preserved SCC)
+        vop1(0x001, 0, sgpr(12)), // v0 = s12
+    ]);
+    let b32_cases: &[([u32; 4], u32)] = &[
+        ([1, 0x1122_3344, 0xdead_beef, 0xaaaa_bbbb], 0xdead_beef),
+        ([1, 0x1122_3344, 0x0000_0000, 0xaaaa_bbbb], 0x0000_0000),
+        ([0, 0x1122_3344, 0xdead_beef, 0xaaaa_bbbb], 0xaaaa_bbbb),
+    ];
+    let b32_in: Vec<[u32; 4]> = b32_cases.iter().map(|c| c.0).collect();
+    run_cases(&cmov_b32, &b32_in, |backend, i, inp, got| {
+        let want = b32_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: s_cmov_b32(cond={}, old={:#010x}, new={:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+
+    // Also verify s_cmov_b32 directly keeps old s6 on SCC=0.
+    let cmov_b32_keep = build_valu_cs(&[
+        s_mov_b32(6, 1),
+        sopk(0x0a, 0, 0),
+        sop1(0x05, 6, 2),
+        vop1(0x001, 0, sgpr(6)),
+    ]);
+    run_cases(
+        &cmov_b32_keep,
+        &[
+            [0, 0x1234_5678, 0x9abc_def0, 0],
+            [1, 0x1234_5678, 0x9abc_def0, 0],
+        ],
+        |backend, i, _, got| {
+            let want = if i == 0 { 0x1234_5678 } else { 0x9abc_def0 };
+            assert_eq!(got, want, "{backend}: s_cmov_b32 case {i}");
+        },
+    );
+
+    // s_cmovk_i32 s6, simm16 (SOPK 0x02): sign-extends negative and positive simm16.
+    for (imm, want_set) in [(0x8000u16, 0xffff_8000u32), (0x7fffu16, 0x0000_7fffu32)] {
+        let cmovk = build_valu_cs(&[
+            s_mov_b32(6, 1),
+            sopk(0x0a, 0, 0),
+            sopk(0x02, 6, imm),
+            vop1(0x001, 0, sgpr(6)),
+        ]);
+        run_cases(
+            &cmovk,
+            &[[0, 0x55aa_1234, 0, 0], [1, 0x55aa_1234, 0, 0]],
+            |backend, i, _, got| {
+                let want = if i == 0 { 0x55aa_1234 } else { want_set };
+                assert_eq!(
+                    got, want,
+                    "{backend}: s_cmovk_i32 imm={imm:#06x} case {i} = {got:#010x}, want {want:#010x}",
+                );
+            },
+        );
+    }
+
+    // s_cmov_b64 s[6:7], s[2:3] (SOP1 0x06): updates both dwords on SCC=1, preserves both on SCC=0,
+    // without requiring INT64.
+    for (read_reg, label) in [(6u8, "lo"), (7u8, "hi")] {
+        let cmov_b64 = build_valu_cs(&[
+            s_mov_b32(6, 1),                // s6 = s1 (old lo)
+            s_mov_b32(7, 2),                // s7 = s2 (old hi)
+            sopk(0x0a, 0, 0),               // SCC = (s0 != 0)
+            sop1(0x06, 6, 2),               // s_cmov_b64 s[6:7], s[2:3]
+            vop1(0x001, 0, sgpr(read_reg)), // v0 = s6 or s7
+        ]);
+        let container = crate::Container::parse(&cmov_b64.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        let flags = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_eq!(flags & 0x8000, 0, "s_cmov_b64 ({label}) must not require INT64");
+
+        let cases = [
+            [0, 0x1111_2222, 0x3333_4444, 0x5555_6666],
+            [1, 0x1111_2222, 0x3333_4444, 0x5555_6666],
+        ];
+        run_cases(&cmov_b64, &cases, |backend, i, _, got| {
+            let want = match (i, read_reg) {
+                (0, 6) => 0x1111_2222,
+                (0, 7) => 0x3333_4444,
+                (1, 6) => 0x3333_4444,
+                (1, 7) => 0x5555_6666,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                got, want,
+                "{backend}: s_cmov_b64 {label} case {i} = {got:#010x}, want {want:#010x}",
+            );
+        });
+    }
+
+    // s_cmov_b64 with inline negative constant -1 (0xC1) sign-extends into high dword.
+    let cmov_b64_inline = build_valu_cs(&[
+        s_mov_b32(6, 1),
+        s_mov_b32(7, 2),
+        sopk(0x0a, 0, 0),
+        sop1(0x06, 6, 0xC1), // s_cmov_b64 s[6:7], -1
+        vop1(0x001, 0, sgpr(7)),
+    ]);
+    run_cases(
+        &cmov_b64_inline,
+        &[[0, 0x0000_0001, 0x2222_3333, 0], [1, 0x0000_0001, 0x2222_3333, 0]],
+        |backend, i, _, got| {
+            let want = if i == 0 { 0x2222_3333 } else { 0xffff_ffff };
+            assert_eq!(got, want, "{backend}: s_cmov_b64 inline -1 hi case {i}");
+        },
     );
 }
