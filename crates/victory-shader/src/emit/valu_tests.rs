@@ -1328,6 +1328,100 @@ fn user_data_cs32(shader: &HostShader, k: u32) -> Vec<u32> {
     ud
 }
 
+/// Run explicitly on a Windows host with DXC, a hardware adapter and WARP.
+#[test]
+#[ignore = "requires dxc.exe on PATH and SM 6.6 hardware and WARP"]
+fn bc5_record_shader() {
+    use super::host::Stride;
+    use std::{fs, path::Path, process::Command};
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../victory-formats/examples/bc5/bc5-records.hlsl");
+    let tmp = std::env::temp_dir().join(format!("victory-bc5-{}", std::process::id()));
+    fs::create_dir(&tmp).unwrap();
+    let binary = tmp.join("bc5.dxil");
+    let compiled = Command::new("dxc.exe")
+        .args(["-T", "cs_6_6", "-E", "main", "-O3", "-Fo"])
+        .arg(&binary)
+        .arg(source)
+        .output();
+    let dxil = fs::read(&binary);
+    if dxil.is_ok() {
+        fs::remove_file(&binary).unwrap();
+    }
+    fs::remove_dir(&tmp).unwrap();
+    let compiled = compiled.expect("start dxc.exe from the Windows SDK");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let mut shader = build_valu_cs(&[vop1(1, 0, 128)]);
+    shader.dxil = dxil.unwrap();
+
+    // Dictionary entry 254 uses different endpoints and index bits per channel.
+    let entry = [0x1234_5678, 0x9abc_def0, 0xcafe_3412, 0x89ab_cdef];
+    let mut data = vec![0u32; 1 + 16 + 255 * 4];
+    data[0] = 4;
+    data[1] = 0x0025_1100; // Symbols 1 and 2 carry different pixel deltas.
+    data[17 + 254 * 4..].copy_from_slice(&entry);
+    // Block 0 takes both predictors from the last dictionary entry.
+    data.extend([0x0f0f_0000, 0, 0, 0, 0, 0]);
+    // Block 1 uses zero endpoints and index bits from block 0.
+    data.extend([0x0001_0001, 0, 0, 0, 0, 0]);
+    // Block 2 uses zero predictors and rank symbol 1 on the first channel.
+    data.extend([0, 0, 0x0101_0101, 0x0101_0101, 0, 0]);
+    // Block 3 predicts both channels from block 2 and applies distinct residuals.
+    data.extend([0x0001_0000, 0x0403_0201, 0x0201_0002, 0, 0x0102_0100, 0]);
+    // Checked against victory_formats::bcpack::decode on the same synthetic records.
+    let expected = [
+        entry[0],
+        entry[1],
+        entry[2],
+        entry[3],
+        0x1234_8080,
+        entry[1],
+        0xcafe_8080,
+        entry[3],
+        0x2492_8080,
+        0x4924_9249,
+        0x0000_8080,
+        0,
+        0xb4a7_817f,
+        0x4924_929d,
+        0xe480_827e,
+        0x0000_0049,
+    ];
+    for (name, warp) in [("hardware", false), ("WARP", true)] {
+        let host = Host::new(warp).unwrap();
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        let result = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(
+                        0,
+                        Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]),
+                    )],
+                    views: &[
+                        View::Buffer {
+                            data: &data,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(16),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        assert_eq!(result.last().unwrap().as_slice(), &expected, "{name}");
+        eprintln!("BC5 reference blocks matched on {name}");
+    }
+}
+
 /// Image addresses with `a16` after a whole-VGPR operand (the offset or
 /// bias keeps a VGPR; the coordinates share the next) and the clamp of
 /// `image_sample_d_cl` (after the coordinates). Program 1: a biased sample
