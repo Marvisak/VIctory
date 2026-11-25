@@ -8026,23 +8026,24 @@ impl<'a> Lower<'a> {
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         self.s.texture_reads.clear();
         let lowered = self.image_op(inst, b, i);
-        for index in std::mem::take(&mut self.s.texture_reads) {
-            if lowered.is_ok() {
-                self.mark_view_read(index);
-            }
+        let reads = std::mem::take(&mut self.s.texture_reads);
+        let guard = lowered?;
+        for index in reads {
+            self.mark_view_read(index, guard);
         }
-        lowered
+        Ok(())
     }
 
     /// Sets the read mark of resource-heap index `index` (module notes,
-    /// "Read marks") where it is still clear. Nothing without
-    /// [`Parts::view_marks`].
-    fn mark_view_read(&mut self, index: V) {
+    /// "Read marks") where `guard` holds and the mark is still clear.
+    /// Nothing without [`Parts::view_marks`].
+    fn mark_view_read(&mut self, index: V, guard: Option<V>) {
         if !self.x.view_marks {
             return;
         }
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let bitmap = self.s.view_writes_handle();
+        let outer = self.begin_guarded(guard);
         let c = self.cur;
         let (base, k5, k2, k31, one, zero) =
             (k(self, super::VIEW_READS), k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
@@ -8060,9 +8061,10 @@ impl<'a> Lower<'a> {
         // Operation 2 is OR.
         self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
         self.end_guarded(at, &[]);
+        self.end_guarded(outer, &[]);
     }
 
-    fn image_op(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+    fn image_op(&mut self, inst: &Inst, b: usize, i: usize) -> Result<Option<V>, Why> {
         let Fields::Image {
             data,
             addr,
@@ -8083,7 +8085,8 @@ impl<'a> Lower<'a> {
         }
         let name = inst.name();
         if name.starts_with("image_bvh") {
-            return self.bvh(inst, b, i);
+            // BVH lowering applies its own guard and uses no texture views.
+            return self.bvh(inst, b, i).map(|()| None);
         }
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
@@ -8272,7 +8275,7 @@ impl<'a> Lower<'a> {
                     self.write(inst, Reg::V(reg + k), x, None);
                 }
             }
-            return Ok(());
+            return Ok(guard);
         }
         if store {
             if name != "image_store" {
@@ -8325,7 +8328,7 @@ impl<'a> Lower<'a> {
                 &args,
             );
             self.end_guarded(at, &[]);
-            return Ok(());
+            return Ok(guard);
         }
         let (op, sample) = match name {
             "image_sample" | "image_sample_o" => (60, true),
@@ -8374,7 +8377,7 @@ impl<'a> Lower<'a> {
                 };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
-            return Ok(());
+            return Ok(guard);
         }
         if uav && op != 66 {
             return Err("sampling a UAV");
@@ -8399,7 +8402,8 @@ impl<'a> Lower<'a> {
                     .map(|k| addr_val(self, k))
                     .collect::<Result<Vec<_>, _>>()?;
                 let lod = inst.read(Reg::V(regs[n - 1])).ok_or("an image address")?;
-                return self.gather_at_level(inst, h, ss, &a, lod, guard);
+                self.gather_at_level(inst, h, ss, &a, lod, guard)?;
+                return Ok(guard);
             }
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
@@ -8479,7 +8483,7 @@ impl<'a> Lower<'a> {
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
                 }
-                return Ok(());
+                return Ok(guard);
             }
             let offsets = if kind == 5 {
                 0
@@ -8741,7 +8745,7 @@ impl<'a> Lower<'a> {
         for (k, x) in xs.into_iter().enumerate() {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
-        Ok(())
+        Ok(guard)
     }
 
     /// The direction a cube sample's face coordinates stand for: the
