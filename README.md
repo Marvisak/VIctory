@@ -122,7 +122,7 @@ upscaler for your GPU (the log says so), the title's own DLLs run.
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
+data under the cache folder. Set `VICTORY_DATA_DIR` or `VICTORY_CACHE_DIR` to override those folders. `VICTORY_GAME_DIR` sets the game folder when it is not configured in `victory.toml`.
 
 Set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit the title's
 top-level window to that bounding box. Smaller windows keep their size,
