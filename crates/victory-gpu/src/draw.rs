@@ -1979,7 +1979,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         compile_cs(SOURCE)
     }
 
-    /// A compute shader with its root signature inside (`RS`).
+    /// A compute shader and the root signature its source defines (`RS`).
     fn compile_cs(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
         let host = crate::host::host().unwrap();
         let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
@@ -2005,9 +2005,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         let bytes = unsafe {
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
         };
-        // SAFETY: a compiled shader with its root signature inside.
+        // Made apart: not every compiler keeps the shader's own.
+        let root = crate::test_root::from_source(&host.device, source);
+        // SAFETY: a compiled shader and its root signature.
         unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {

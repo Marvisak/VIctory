@@ -468,9 +468,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         let bytes = unsafe {
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
         };
-        // SAFETY: a compiled shader with its root signature inside.
+        // Made apart: not every compiler keeps the shader's own.
+        let root = crate::test_root::from_source(&host.device, SOURCE);
+        // SAFETY: a compiled shader and its root signature.
         unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
