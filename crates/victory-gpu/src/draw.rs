@@ -1695,7 +1695,7 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
+        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max), counter.is_none()) else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         };
@@ -1716,7 +1716,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &clamped);
+            crate::indirect::done(list, &clamped.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1736,16 +1736,23 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        let (count_buffer, count_offset) = match clamped.count_offset {
+            Some(at) => (Some(&clamped.buffer), at),
+            None => (
+                counter.as_ref().map(|(s, _)| &s.buffer),
+                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+            ),
+        };
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &clamped,
-                0,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                &clamped.buffer,
+                clamped.args_offset,
+                count_buffer,
+                count_offset,
             )
         };
         // A listed frame, or any frame for a traced shader: what the records
@@ -1755,12 +1762,19 @@ impl State {
             let always = !crate::host::traced_shaders().is_empty()
                 && crate::host::is_traced(&crate::pipeline::shaders_of(pipeline));
             if always || crate::capture::dump_on() {
-                let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                let count = count_buffer.map(|b| (b, count_offset));
                 let name = crate::pipeline::shaders_of(pipeline);
-                crate::capture::read_indirect(list, (&clamped, 0), count, (kind, stride, max), name, always);
+                crate::capture::read_indirect(
+                    list,
+                    (&clamped.buffer, clamped.args_offset),
+                    count,
+                    (kind, stride, max),
+                    name,
+                    always,
+                );
             }
         }
-        crate::indirect::done(list, &clamped);
+        crate::indirect::done(list, &clamped.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

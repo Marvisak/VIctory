@@ -23,9 +23,14 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
+/// Minimum record count before stream compaction is enabled; below this,
+/// the count-buffer indirection and compaction pass cost more on Arc A770
+/// than skipping empty records saves.
+const COMPACT_MIN_RECORDS: u32 = 16;
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint do_compact; };
 // The title's records, read only; the clamped ones go to the list's own.
 ByteAddressBuffer args : register(t0);
 RWByteAddressBuffer dest : register(u0);
@@ -35,21 +40,20 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-// Clamps the record at `at` into `dest`; its cost.
-uint clamped(uint at) {
+// Loads and clamps the record at `at` into `w` (plus `w4` for indexed draws); its cost.
+uint load_clamped(uint at, out uint4 w, out uint w4) {
+    w = uint4(0, 0, 0, 0);
+    w4 = 0;
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        uint4 raw = args.Load4(at);
+        uint count = min(raw.x, 1u << 24);
+        uint instances = min(raw.y, (1u << 26) / max(count, 1u));
         cost = count * instances;
-        dest.Store2(at, uint2(count, instances));
-        // The rest of the record as it is: first vertex and instance (4 words
-        // in all), or first index, base vertex and first instance (5).
+        w = uint4(count, instances, raw.z, raw.w);
         if (kind == 1) {
-            dest.Store3(at + 8, args.Load3(at + 8));
-        } else {
-            dest.Store2(at + 8, args.Load2(at + 8));
+            w4 = args.Load(at + 16);
         }
     } else if (kind == 2) {
         uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
@@ -58,59 +62,102 @@ uint clamped(uint at) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
-        dest.Store3(at, g);
+        w.xyz = g;
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = args.Load3(at);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
-        dest.Store3(at, g);
+        w.xyz = g;
     }
     return cost;
+}
+void store_record(uint at, uint4 w, uint w4) {
+    if (kind == 0) {
+        dest.Store4(at, w);
+    } else if (kind == 1) {
+        dest.Store4(at, w);
+        dest.Store(at + 16, w4);
+    } else {
+        dest.Store3(at, w.xyz);
+    }
 }
 // A record past the budget (no cost reaches it).
 static const uint PAST = 0xffffffffu;
 groupshared uint costs[64];
+groupshared uint offsets[64];
 // One group walks the records in tiles of 64: every lane clamps its own
-// record, then the first lane charges the tile's records in order. No
-// other group shares the budget: a shared add wraps once enough records
-// are rejected, and a compare-exchange retries more the more records fit.
+// record, then the first lane charges the tile's records in order and assigns
+// compacted slots for non-empty survivors.
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint lane : SV_GroupIndex) {
     uint left = 0;
+    uint total = 0;
     if (lane == 0) {
         left = BUDGET - min(budget.Load(0), BUDGET);
     }
     for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
         uint record = tile * 64 + lane;
         uint at = record * stride;
+        uint4 w = uint4(0, 0, 0, 0);
+        uint w4 = 0;
         uint cost = 0;
         if (record < records) {
-            cost = clamped(at);
+            cost = load_clamped(at, w, w4);
         }
         costs[lane] = cost;
         GroupMemoryBarrierWithGroupSync();
         if (lane == 0) {
-            for (uint i = 0; i < 64; i++) {
-                if (costs[i] > left) {
-                    // The first record that does not fit takes what is
-                    // left, so those after it run empty too.
-                    costs[i] = PAST;
-                    left = 0;
-                } else {
-                    left -= costs[i];
+            uint n = min(64u, records - tile * 64u);
+            if (do_compact != 0) {
+                for (uint i = 0; i < n; i++) {
+                    uint c = costs[i];
+                    if (c > left) {
+                        costs[i] = PAST;
+                        left = 0;
+                    } else {
+                        left -= c;
+                        if (c > 0) {
+                            offsets[i] = total;
+                            total++;
+                        }
+                    }
+                }
+            } else {
+                for (uint i = 0; i < n; i++) {
+                    uint c = costs[i];
+                    if (c > left) {
+                        // The first record that does not fit takes what is
+                        // left, so those after it run empty too.
+                        costs[i] = PAST;
+                        left = 0;
+                    } else {
+                        left -= c;
+                    }
                 }
             }
         }
         GroupMemoryBarrierWithGroupSync();
-        if (costs[lane] == PAST) {
-            // Draws keep their layout with no vertices; groups become zero.
-            dest.Store(at, 0);
+        if (record < records) {
+            if (do_compact != 0) {
+                if (costs[lane] != PAST && cost > 0) {
+                    store_record(16u + offsets[lane] * stride, w, w4);
+                }
+            } else {
+                if (costs[lane] == PAST) {
+                    // Draws keep their layout with no vertices; groups become zero.
+                    w.x = 0;
+                }
+                store_record(at, w, w4);
+            }
         }
     }
     if (lane == 0) {
         budget.Store(0, BUDGET - left);
+        if (do_compact != 0) {
+            dest.Store(0, total);
+        }
     }
 }
 "#;
@@ -185,12 +232,23 @@ fn make() -> windows::core::Result<Clamp> {
     }
 }
 
+/// Output of [`bound`]: the list's own clamped argument buffer and offsets
+/// for `ExecuteIndirect`.
+pub(crate) struct Clamped {
+    pub(crate) buffer: ID3D12Resource,
+    pub(crate) args_offset: u64,
+    pub(crate) count_offset: Option<u64>,
+}
+
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` (a title
 /// buffer's copy, only read) into the list's own argument buffer, left
 /// ready to be read as arguments: that buffer, for [`done`] after the
-/// execution. Replaces the list's compute root signature and pipeline
-/// (callers bind theirs after). `None` if the clamp is not available.
+/// execution. When `enable_compaction` is set and `records` reaches
+/// [`COMPACT_MIN_RECORDS`], non-empty surviving records are packed after a
+/// 16-byte header holding the compacted command count at offset 0. Replaces
+/// the list's compute root signature and pipeline (callers bind theirs
+/// after). `None` if the clamp is not available.
 ///
 /// Title buffers' copies are never transitioned: they are common between
 /// submissions and every use promotes them (shader and root views, the
@@ -203,16 +261,37 @@ fn make() -> windows::core::Result<Clamp> {
 // promoted to a write state the input assembler may not use (the debug
 // layer cannot see view accesses; GPU-based validation might); upgrade to
 // per-list tracked buffer states if a driver or that validation minds.
-pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
+pub(crate) fn bound(
+    list: &HostList,
+    gpu: u64,
+    spec: (u32, u32, u32),
+    enable_compaction: bool,
+) -> Option<Clamped> {
+    let do_compact = enable_compaction && spec.2 >= COMPACT_MIN_RECORDS;
+    bound_inner(list, gpu, spec, do_compact)
+}
+
+fn bound_inner(
+    list: &HostList,
+    gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+    do_compact: bool,
+) -> Option<Clamped> {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return None;
     };
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return None;
     }
-    let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
+    let payload_bytes = u64::from(stride).checked_mul(u64::from(records.max(1)))?;
+    let needed = if do_compact {
+        16u64.checked_add(payload_bytes)?
+    } else {
+        payload_bytes
+    };
+    let out = list.arguments(needed)?;
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let constants = [kind, stride, records, u32::from(do_compact)];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // a title buffer's copy the caller's list holds.
     unsafe {
@@ -234,7 +313,11 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
             transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
         ]);
     }
-    Some(out)
+    Some(Clamped {
+        buffer: out,
+        args_offset: if do_compact { 16 } else { 0 },
+        count_offset: do_compact.then_some(0),
+    })
 }
 
 /// After the execution: the list's argument buffer back to common.
@@ -297,9 +380,9 @@ mod tests {
             let gpu = buffer.GetGPUVirtualAddress();
             let mut out = None;
             for _ in 0..calls {
-                let clamped = super::bound(&list, gpu, spec).unwrap();
-                super::done(&list, &clamped);
-                out = Some(clamped);
+                let clamped = super::bound(&list, gpu, spec, false).unwrap();
+                super::done(&list, &clamped.buffer);
+                out = Some(clamped.buffer);
             }
             list.close();
             host.execute(&[&list]);
@@ -379,10 +462,10 @@ mod tests {
             let recorded: Vec<_> = lists
                 .iter()
                 .map(|l| {
-                    let out = super::bound(l, gpu, (2, 12, 1)).unwrap();
-                    super::done(l, &out);
+                    let out = super::bound(l, gpu, (2, 12, 1), true).unwrap();
+                    super::done(l, &out.buffer);
                     l.close();
-                    (out, issued())
+                    (out.buffer, issued())
                 })
                 .collect();
             let order = if a_first { [0, 1] } else { [1, 0] };
@@ -416,5 +499,326 @@ mod tests {
             return; // no host GPU here
         };
         assert!(twice.iter().all(|&count| count == 0));
+    }
+
+    /// Compaction skips zero-work records while preserving exact submission
+    /// order across multi-tile batches, writes zero count when all records
+    /// are empty, skips compaction below the record threshold, and reuses
+    /// oversized per-list argument buffers (> 2 MiB) across calls.
+    #[test]
+    fn compaction_preserves_order_and_drops_empty_records() {
+        use windows::core::Interface;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let records = 150u32;
+        let per = 4usize;
+        let stride = (per * 4) as u32;
+        let (buffer, data) = host.shared_buffer((records as u64) * u64::from(stride)).unwrap();
+        let data = data.cast::<u32>();
+        let list = host.new_list().unwrap();
+        // SAFETY: mapped buffers alive for the duration of the command list.
+        unsafe {
+            for i in 0..records {
+                let base = i as usize * per;
+                let verts = if i % 3 == 0 { 0 } else { 10 + i };
+                data.add(base).write_volatile(verts);
+                data.add(base + 1).write_volatile(1);
+                data.add(base + 2).write_volatile(i);
+                data.add(base + 3).write_volatile(0);
+            }
+            let gpu = buffer.GetGPUVirtualAddress();
+            let compacted = super::bound(&list, gpu, (0, stride, records), true).unwrap();
+            assert_eq!(compacted.count_offset, Some(0));
+            assert_eq!(compacted.args_offset, 16);
+            super::done(&list, &compacted.buffer);
+
+            list.close();
+            host.execute(&[&list]);
+
+            let mut mapped = std::ptr::null_mut();
+            compacted.buffer.Map(0, None, Some(&mut mapped)).unwrap();
+            let count = mapped.cast::<u32>().read_volatile();
+            let expected: Vec<u32> = (0..records).filter(|i| i % 3 != 0).collect();
+            assert_eq!(count as usize, expected.len());
+            let args_ptr = (mapped as *const u8).add(compacted.args_offset as usize).cast::<u32>();
+            for (slot, &orig) in expected.iter().enumerate() {
+                assert_eq!(args_ptr.add(slot * per).read_volatile(), 10 + orig);
+                assert_eq!(args_ptr.add(slot * per + 2).read_volatile(), orig);
+            }
+            compacted.buffer.Unmap(0, None);
+
+            // Second submission on the same list: all-empty batch produces count 0,
+            // and oversized (> 2 MiB) buffer allocations reuse the same ID3D12Resource.
+            list.reset();
+            for i in 0..records {
+                data.add(i as usize * per).write_volatile(0);
+            }
+            let all_empty = super::bound(&list, gpu, (0, stride, records), true).unwrap();
+            super::done(&list, &all_empty.buffer);
+
+            let tiny = super::bound(&list, gpu, (0, stride, super::COMPACT_MIN_RECORDS - 1), true).unwrap();
+            assert_eq!(tiny.count_offset, None);
+            assert_eq!(tiny.args_offset, 0);
+            super::done(&list, &tiny.buffer);
+
+            let huge_records = 200_000u32; // ~3.2 MiB > 2 MiB
+            let (huge_buf, huge_data) = host.shared_buffer(u64::from(huge_records) * u64::from(stride)).unwrap();
+            huge_data.cast::<u32>().write_volatile(3);
+            let huge_gpu = huge_buf.GetGPUVirtualAddress();
+            let first_huge = super::bound(&list, huge_gpu, (0, stride, huge_records), true).unwrap();
+            super::done(&list, &first_huge.buffer);
+            let second_huge = super::bound(&list, huge_gpu, (0, stride, huge_records), true).unwrap();
+            super::done(&list, &second_huge.buffer);
+            assert_eq!(first_huge.buffer.as_raw(), second_huge.buffer.as_raw());
+
+            list.close();
+            host.execute(&[&list]);
+
+            let mut empty_mapped = std::ptr::null_mut();
+            all_empty.buffer.Map(0, None, Some(&mut empty_mapped)).unwrap();
+            assert_eq!(empty_mapped.cast::<u32>().read_volatile(), 0);
+            all_empty.buffer.Unmap(0, None);
+        }
+    }
+
+    /// Synthetic hardware benchmark on the host GPU comparing uncompacted vs
+    /// compacted indirect dispatches and draws across record counts and sparsity.
+    #[test]
+    #[ignore = "hardware GPU timing benchmark; run with --ignored --nocapture"]
+    fn bench_indirect_compaction() {
+        use super::*;
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+
+        let Some(host) = super::host() else {
+            return;
+        };
+        let Some(freq) = host.timestamp_frequency() else {
+            return;
+        };
+        let device = &host.device;
+
+        let compile = |src: &str, entry: windows::core::PCSTR, target: windows::core::PCSTR| -> Vec<u8> {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: static shader strings and valid out pointer.
+            unsafe {
+                D3DCompile(
+                    src.as_ptr().cast(),
+                    src.len(),
+                    None,
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
+                .unwrap();
+                let blob = code.unwrap();
+                std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()).to_vec()
+            }
+        };
+
+        let cs_bytes = compile(
+            r#"#define RS ""
+               [RootSignature(RS)]
+               [numthreads(1, 1, 1)]
+               void main() {}"#,
+            s!("main"),
+            s!("cs_5_1"),
+        );
+        let vs_bytes = compile(
+            r#"#define RS ""
+               [RootSignature(RS)]
+               float4 main() : SV_Position { return float4(0, 0, 0, 1); }"#,
+            s!("main"),
+            s!("vs_5_1"),
+        );
+        let ps_bytes = compile(
+            r#"float4 main() : SV_Target { return float4(0, 0, 0, 0); }"#,
+            s!("main"),
+            s!("ps_5_1"),
+        );
+
+        // SAFETY: valid compiled bytecode blobs and descriptor structs for device object creation.
+        let (cs_root, cs_pso, dispatch_sig, gfx_root, gfx_pso, draw_sig, query_heap, readback) = unsafe {
+            let cs_root: ID3D12RootSignature = device.CreateRootSignature(0, &cs_bytes).unwrap();
+            let cs_pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&cs_root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: cs_bytes.as_ptr().cast(),
+                        BytecodeLength: cs_bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            let gfx_root: ID3D12RootSignature = device.CreateRootSignature(0, &vs_bytes).unwrap();
+            let mut gfx_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&gfx_root),
+                VS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: vs_bytes.as_ptr().cast(),
+                    BytecodeLength: vs_bytes.len(),
+                },
+                PS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: ps_bytes.as_ptr().cast(),
+                    BytecodeLength: ps_bytes.len(),
+                },
+                SampleMask: u32::MAX,
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 0,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            gfx_desc.RasterizerState = D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                ..Default::default()
+            };
+            gfx_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0x0F;
+            let gfx_pso: ID3D12PipelineState = device.CreateGraphicsPipelineState(&gfx_desc).unwrap();
+
+            let mk_sig = |kind: i32, stride: u32| -> ID3D12CommandSignature {
+                let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind),
+                    ..Default::default()
+                };
+                let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                    ByteStride: stride,
+                    NumArgumentDescs: 1,
+                    pArgumentDescs: &arg,
+                    NodeMask: 0,
+                };
+                let mut sig: Option<ID3D12CommandSignature> = None;
+                device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig).unwrap();
+                sig.unwrap()
+            };
+            let dispatch_sig = mk_sig(2, 12);
+            let draw_sig = mk_sig(0, 16);
+
+            let mut qh: Option<ID3D12QueryHeap> = None;
+            device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                        Count: 4,
+                        NodeMask: 0,
+                    },
+                    &mut qh,
+                )
+                .unwrap();
+            let mut rb: Option<ID3D12Resource> = None;
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+            let rdesc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 32,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rdesc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut rb)
+                .unwrap();
+            (cs_root, cs_pso, dispatch_sig, gfx_root, gfx_pso, draw_sig, qh.unwrap(), rb.unwrap())
+        };
+
+        let list = host.new_list().unwrap();
+        let max_records = 4096u32;
+        let (title_buf, title_ptr) = host.shared_buffer(u64::from(max_records) * 16).unwrap();
+        // SAFETY: live shared buffer.
+        let title_gpu = unsafe { title_buf.GetGPUVirtualAddress() };
+
+        let run_case = |kind: u32, records: u32, active_every: u32, compact: bool| -> (f64, f64) {
+            let stride = if kind == 2 { 12u32 } else { 16u32 };
+            let words_per = (stride / 4) as usize;
+            // SAFETY: mapped shared buffer sized for `max_records * 16` bytes.
+            unsafe {
+                let p = title_ptr.cast::<u32>();
+                for i in 0..records {
+                    let active = active_every != 0 && i % active_every == 0;
+                    let base = i as usize * words_per;
+                    if kind == 2 {
+                        p.add(base).write_volatile(u32::from(active));
+                        p.add(base + 1).write_volatile(1);
+                        p.add(base + 2).write_volatile(1);
+                    } else {
+                        p.add(base).write_volatile(if active { 3 } else { 0 });
+                        p.add(base + 1).write_volatile(1);
+                        p.add(base + 2).write_volatile(0);
+                        p.add(base + 3).write_volatile(0);
+                    }
+                }
+            }
+            let mut total_samples = Vec::with_capacity(15);
+            let mut exec_samples = Vec::with_capacity(15);
+            for iter in 0..18 {
+                // SAFETY: open command list, live PSOs, signatures, buffers, and query heap.
+                unsafe {
+                    list.list.EndQuery(&query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                    let clamped = super::bound_inner(&list, title_gpu, (kind, stride, records), compact).unwrap();
+                    if kind == 2 {
+                        list.list.SetComputeRootSignature(&cs_root);
+                        list.list.SetPipelineState(&cs_pso);
+                    } else {
+                        list.list.SetGraphicsRootSignature(&gfx_root);
+                        list.list.SetPipelineState(&gfx_pso);
+                        list.list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    }
+                    list.list.EndQuery(&query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                    let sig = if kind == 2 { &dispatch_sig } else { &draw_sig };
+                    list.list.ExecuteIndirect(
+                        sig,
+                        records,
+                        &clamped.buffer,
+                        clamped.args_offset,
+                        clamped.count_offset.map(|_| &clamped.buffer),
+                        clamped.count_offset.unwrap_or(0),
+                    );
+                    list.list.EndQuery(&query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 2);
+                    super::done(&list, &clamped.buffer);
+                    list.list.EndQuery(&query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
+                    list.list.ResolveQueryData(&query_heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 4, &readback, 0);
+                }
+                list.close();
+                host.execute(&[&list]);
+                list.reset();
+                if iter >= 3 {
+                    // SAFETY: list execution finished; readback buffer holds 4 resolved u64 timestamps.
+                    unsafe {
+                        let mut p = std::ptr::null_mut();
+                        readback.Map(0, None, Some(&mut p)).unwrap();
+                        let ts = std::slice::from_raw_parts(p.cast::<u64>(), 4);
+                        let total_us = (ts[3].saturating_sub(ts[0])) as f64 * 1e6 / freq as f64;
+                        let exec_us = (ts[2].saturating_sub(ts[1])) as f64 * 1e6 / freq as f64;
+                        readback.Unmap(0, None);
+                        total_samples.push(total_us);
+                        exec_samples.push(exec_us);
+                    }
+                }
+            }
+            total_samples.sort_by(f64::total_cmp);
+            exec_samples.sort_by(f64::total_cmp);
+            (total_samples[total_samples.len() / 2], exec_samples[exec_samples.len() / 2])
+        };
+
+        for (label, kind) in [("dispatch", 2u32), ("draw", 0u32)] {
+            println!("{label} benchmark (freq={freq} Hz):");
+            for &records in &[1u32, 2, 4, 8, 16, 64, 256, 1024, 4096] {
+                for &(sparsity, every) in &[("0%_active", 0u32), ("5%_active", 20), ("100%_active", 1)] {
+                    let (u_tot, u_exec) = run_case(kind, records, every, false);
+                    let (c_tot, c_exec) = run_case(kind, records, every, true);
+                    println!(
+                        "records={records:>4} {sparsity:<11}: uncompacted total={u_tot:7.2}us exec={u_exec:7.2}us | compacted total={c_tot:7.2}us exec={c_exec:7.2}us"
+                    );
+                }
+            }
+        }
     }
 }

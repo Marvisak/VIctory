@@ -1123,6 +1123,12 @@ impl Host {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn timestamp_frequency(&self) -> Option<u64> {
+        // SAFETY: plain query on a live command queue.
+        unsafe { self.queue.GetTimestampFrequency() }.ok()
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
