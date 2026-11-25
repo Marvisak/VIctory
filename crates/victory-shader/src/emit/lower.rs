@@ -64,7 +64,7 @@ pub(crate) struct Lowered {
     #[cfg(test)]
     pub wave_ops: bool,
     /// Whether it declares rasterizer-ordered views.
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub rovs: bool,
     /// Whether the module declares `dx.op.waveGetLaneIndex`.
     #[cfg(test)]
@@ -1406,7 +1406,7 @@ impl<'a> Lower<'a> {
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            #[cfg(test)]
+            #[cfg(all(test, windows))]
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
@@ -4717,24 +4717,60 @@ impl<'a> Lower<'a> {
     }
 
     /// Sets bit `n` in the title-memory dirty bitmap `bitmap`.
+    /// Called inside the access guard: only lanes that owe a mark participate.
     fn mark_memory_bit(&mut self, bitmap: V, n: V) {
         let c = self.cur;
-        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
-        let (k5, k31, k2, one) = (k(self, 5), k(self, 31), k(self, 2), k(self, 1));
-        let iu = self.s.m.undef(self.s.t.i32);
-        // Byte offset of the bitmap dword; operation 2 is OR.
-        let word = self.s.m.bin(c, Bin::LShr, n, k5);
-        let word = self.s.m.bin(c, Bin::Shl, word, k2);
-        let bit = self.s.m.bin(c, Bin::And, n, k31);
-        let bit = self.s.m.bin(c, Bin::Shl, one, bit);
-        self.s.op(
+        let [five, two, low, one] = [5, 2, 31, 1].map(|k| self.s.m.i32(k));
+        let word = self.s.m.bin(c, Bin::LShr, n, five);
+        let offset = self.s.m.bin(c, Bin::Shl, word, two);
+        let shift = self.s.m.bin(c, Bin::And, n, low);
+        let bit = self.s.m.bin(c, Bin::Shl, one, shift);
+
+        // One active lane can mark the whole wave only when the word is shared.
+        // Otherwise each lane keeps its own word and bit. No fixed wave size.
+        self.s.flags |= flags::WAVE_OPS;
+        let same = self.s.op(
             c,
+            "waveActiveAllEqual.i32",
+            Attr::NoUnwind,
+            self.s.t.i1,
+            115,
+            &[word],
+        );
+        let or = self.s.m.i8(1);
+        let bits = self.s.op(
+            c,
+            "waveActiveBit.i32",
+            Attr::NoUnwind,
+            self.s.t.i32,
+            120,
+            &[bit, or],
+        );
+        let first = self
+            .s
+            .op(c, "waveIsFirstLane", Attr::NoUnwind, self.s.t.i1, 110, &[]);
+        let mask = self.s.m.select(c, same, bits, bit);
+        let yes = self.s.m.bool(true);
+        let writer = self.s.m.select(c, same, first, yes);
+        let at = self.begin_guarded(Some(writer));
+
+        // Until the submission finishes bits only accumulate. A stale load can
+        // cause an extra OR, and a partially set mask still needs the atomic.
+        let old = self.raw_dword(bitmap, offset);
+        let set = self.s.m.bin(self.cur, Bin::And, old, mask);
+        let missing = self.s.m.cmp(self.cur, pred::NE, set, mask);
+        let update = self.begin_guarded(Some(missing));
+        let iu = self.s.m.undef(self.s.t.i32);
+        self.s.op(
+            self.cur,
             "atomicBinOp.i32",
             Attr::NoUnwind,
             self.s.t.i32,
             78,
-            &[bitmap, k2, word, iu, iu, bit],
+            &[bitmap, two, offset, iu, iu, mask],
         );
+        self.end_guarded(update, &[]);
+        self.end_guarded(at, &[]);
     }
 
     /// The level-2 page-table index, block, and level-1 index of title
