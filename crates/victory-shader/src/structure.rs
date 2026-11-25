@@ -39,6 +39,12 @@ pub struct Bool(u32);
 impl Bool {
     pub const FALSE: Bool = Bool(0);
     pub const TRUE: Bool = Bool(1);
+
+    /// A node by number, for tests of code that only compares them.
+    #[cfg(test)]
+    pub(crate) const fn test(n: u32) -> Bool {
+        Bool(n)
+    }
 }
 
 /// What a variable of [`Bools`] stands for.

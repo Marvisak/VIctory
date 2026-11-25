@@ -19,8 +19,10 @@ use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
+use known::{Known, Reached};
 
 mod bvh;
+mod known;
 
 type Why = &'static str;
 
@@ -10581,38 +10583,11 @@ impl<'a> Lower<'a> {
     /// (the loop redefines their conditions). Fewer conditions are weaker,
     /// so keeping only the last few stays sound.
     fn live_edges(&self) -> HashSet<(Value, usize)> {
-        const MAX_KNOWN: usize = 4;
-        /// What is known of the lanes along a path: the last few branch
-        /// conditions taken, in order (a value, not a heap allocation:
-        /// shaders with control flow push thousands of them).
-        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-        struct Known {
-            conditions: [(Bool, bool); MAX_KNOWN],
-            len: usize,
-        }
-        impl Known {
-            fn get(&self) -> &[(Bool, bool)] {
-                &self.conditions[..self.len]
-            }
-            /// With `c` after the others, the oldest dropped past the limit.
-            fn and(mut self, c: (Bool, bool)) -> Known {
-                if self.len == MAX_KNOWN {
-                    self.conditions.copy_within(1.., 0);
-                    self.len -= 1;
-                }
-                self.conditions[self.len] = c;
-                self.len += 1;
-                self
-            }
-        }
-        let none = Known {
-            conditions: [(Bool::FALSE, false); MAX_KNOWN],
-            len: 0,
-        };
         let (p, st) = (self.x.p, &self.x.st);
-        let mut work: Vec<(Value, Known)> = self.read_phis.iter().map(|&v| (v, none)).collect();
+        let mut work: Vec<(Value, Known)> =
+            self.read_phis.iter().map(|&v| (v, Known::NONE)).collect();
         let mut live = HashSet::new();
-        let mut seen = HashMap::<Value, Vec<Known>>::new();
+        let mut seen = HashMap::<Value, Reached>::new();
         // Whether some lane meets each set of conditions: paths into a join
         // ask again for the same sets.
         let mut meets = HashMap::<Known, bool>::new();
@@ -10620,20 +10595,15 @@ impl<'a> Lower<'a> {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
-            let done = seen.entry(v).or_default();
             // Known of fewer lanes than before: nothing new is live.
-            if done
-                .iter()
-                .any(|d| d.get().iter().all(|c| known.get().contains(c)))
-            {
+            if !seen.entry(v).or_default().add(known) {
                 continue;
             }
-            done.push(known);
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 if self.tail[q].is_none() {
                     continue;
                 }
-                let mut k = none;
+                let mut k = Known::NONE;
                 // Forward edges out of a block that is no loop's latch (a
                 // loop's exit is also taken at its iteration limit).
                 if let LaneExit::Branch {
