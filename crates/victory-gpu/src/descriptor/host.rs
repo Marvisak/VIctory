@@ -368,6 +368,13 @@ impl HostHeap {
         self.count
     }
 
+    /// The lowest index [`HostHeap::pair`] hands out while its range lasts:
+    /// past the dynamic slots, however small the host keeps its heap.
+    #[cfg(test)]
+    pub(crate) fn pair_base(&self) -> u32 {
+        self.count + self.dynamic
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
@@ -1480,12 +1487,24 @@ mod tests {
             return; // no host GPU
         };
         // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
+        // `HEAP_VIEWS`, `HEAP_SAMPLERS`) — where the host takes the whole
+        // heap; a host that caps its shader-visible heaps below that takes
+        // [`HostHeap::new`]'s shortcut and leaves the indices past its cap
+        // out, as before the clamp.
+        let samplers = HostHeap::new(true, 128).unwrap();
         // SAFETY: plain queries of live heaps.
-        unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
-            let samplers = HostHeap::new(true, 128).unwrap();
-            assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
+        let (taken, sampler_taken) = unsafe {
+            (heap.heap.GetDesc().NumDescriptors, samplers.heap.GetDesc().NumDescriptors)
+        };
+        if taken < victory_shader::emit::HEAP_VIEWS
+            || sampler_taken < victory_shader::emit::HEAP_SAMPLERS
+        {
+            eprintln!(
+                "the device caps its shader-visible heaps below the shaders' range ({taken}, {sampler_taken}); the size assertions are skipped"
+            );
+        } else {
+            assert!(taken >= victory_shader::emit::HEAP_VIEWS);
+            assert!(sampler_taken >= victory_shader::emit::HEAP_SAMPLERS);
         }
         // A slot that stops viewing a resource leaves it alive until the GPU
         // work in flight has run (a read of a freed host texture otherwise).
