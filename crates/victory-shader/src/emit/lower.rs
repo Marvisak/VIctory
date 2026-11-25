@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod rndne;
 
 type Why = &'static str;
 
@@ -6313,6 +6314,7 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::SDiv, one, a);
                 float(self, r)
             }
+            "v_rndne_f64" => self.round_ne_f64(inst, guard),
             "v_rsq_f32" | "v_sqrt_f32" | "v_log_f32" | "v_exp_f32" | "v_fract_f32"
             | "v_trunc_f32" | "v_floor_f32" | "v_ceil_f32" | "v_rndne_f32" | "v_sin_f32"
             | "v_cos_f32" => {
