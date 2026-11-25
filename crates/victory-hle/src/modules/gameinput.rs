@@ -18,7 +18,7 @@ use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
-use super::xgameruntime::{HRESULT, S_OK};
+use super::xgameruntime::{Guid, HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
 /// The documented errors.
@@ -27,6 +27,28 @@ pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
 pub const READING_NOT_FOUND: HRESULT = 0x838A_0003_u32 as i32;
 pub const REFERENCE_TOO_OLD: HRESULT = 0x838A_0004_u32 as i32;
 const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
+
+/// The COM interfaces the input objects answer.
+const IID_IUNKNOWN: Guid = Guid::new(0, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
+const INPUT_IID: Guid = Guid::new(
+    0x11be_2a7e,
+    0x4254,
+    0x445a,
+    [0x9c, 0x09, 0xff, 0xc4, 0x0f, 0x00, 0x69, 0x18],
+);
+const DEVICE_IID: Guid = Guid::new(
+    0x31dd_86fb,
+    0x4c1b,
+    0x408a,
+    [0x86, 0x8f, 0x43, 0x9b, 0x3c, 0xd4, 0x71, 0x25],
+);
+const READING_IID: Guid = Guid::new(
+    0x2156_947a,
+    0xe1fa,
+    0x4de0,
+    [0xa3, 0x0b, 0xd8, 0x12, 0x93, 0x1d, 0xbd, 0x8d],
+);
 
 /// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
@@ -183,7 +205,7 @@ pub struct Object {
 
 #[repr(C)]
 pub struct Device {
-    vtable: &'static Table<21>,
+    vtable: &'static Table<22>,
     hub: *const Hub,
     index: usize,
     info: DeviceInfo,
@@ -612,9 +634,43 @@ fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
     }
 }
 
-extern "system" fn no_interface(_: *const c_void, _iid: *const c_void, out: Out) -> HRESULT {
-    tracing::warn!("input QueryInterface not implemented");
-    fail(out, E_NOINTERFACE)
+/// Clears `out` and returns `E_POINTER` for null required pointers,
+/// `E_NOINTERFACE` for an unsupported IID, and otherwise AddRefs `this`
+/// through its own slot 1 and hands it back.
+fn query_interface(this: *const c_void, iid: *const Guid, out: Out, expected: Guid) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: checked non-null; the title passes room for a pointer.
+    unsafe { out.write(std::ptr::null()) };
+    if this.is_null() || iid.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: checked non-null; the caller passes an IID.
+    let requested = unsafe { *iid };
+    if requested != IID_IUNKNOWN && requested != expected {
+        return E_NOINTERFACE;
+    }
+    // SAFETY: every object here starts with its method table.
+    let table = unsafe { *(this as *const *const *const ()) };
+    // SAFETY: slot 1 is AddRef in every table here.
+    let add_ref = unsafe { *table.add(1) };
+    // SAFETY: slot 1 is an `extern "system" fn(this) -> u32`.
+    let add_ref: extern "system" fn(*const c_void) -> u32 = unsafe { std::mem::transmute(add_ref) };
+    add_ref(this);
+    // SAFETY: checked non-null; the title passes room for a pointer.
+    unsafe { out.write(this) };
+    S_OK
+}
+
+extern "system" fn input_interface(this: *const c_void, iid: *const Guid, out: Out) -> HRESULT {
+    query_interface(this, iid, out, INPUT_IID)
+}
+extern "system" fn device_interface(this: *const c_void, iid: *const Guid, out: Out) -> HRESULT {
+    query_interface(this, iid, out, DEVICE_IID)
+}
+extern "system" fn reading_interface(this: *const c_void, iid: *const Guid, out: Out) -> HRESULT {
+    query_interface(this, iid, out, READING_IID)
 }
 /// The input object and devices live as long as the process.
 extern "system" fn add_ref(_: *const c_void) -> u32 {
@@ -919,7 +975,7 @@ extern "system" fn enable_oem_device(
 extern "system" fn set_focus_policy(_: This, _policy: u32) {}
 
 static INPUT: Table<22> = Table([
-    no_interface as *const (),        // 0x00
+    input_interface as *const (),     // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
     timestamp as *const (),           // 0x18
@@ -975,6 +1031,20 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
     lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
 }
+/// Whether a force-feedback motor is powered: the host pads we expose have no
+/// motor this can report (XInput's vibration is not a powered motor).
+extern "system" fn force_feedback_motor_powered_on(_: *const Device, _motor: u32) -> bool {
+    false
+}
+
+/// Exclusive raw access is refused: the host pad stays shared.
+extern "system" fn acquire_raw_device_access(_: *const Device, _timeout: u64) -> bool {
+    false
+}
+
+/// Releasing exclusive raw access does nothing: none was acquired.
+extern "system" fn release_raw_device_access(_: *const Device) {}
+
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
         slot = format_args!("{SLOT:#x}"),
@@ -983,28 +1053,29 @@ extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     E_NOTIMPL
 }
 
-static DEVICE: Table<21> = Table([
-    no_interface as *const (),        // 0x00
+static DEVICE: Table<22> = Table([
+    device_interface as *const (),    // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
     device_info as *const (),         // 0x18
     device_status as *const (),       // 0x20
     unsupported::<0x28> as *const (), // battery
     unsupported::<0x30> as *const (), // force feedback
-    unsupported::<0x38> as *const (), //
-    unsupported::<0x40> as *const (), //
+    force_feedback_motor_powered_on as *const (), // 0x38
+    unsupported::<0x40> as *const (), // 0x40
     unsupported::<0x48> as *const (), // haptics
     set_rumble as *const (),          // 0x50
     unsupported::<0x58> as *const (), // input synchronization
-    unsupported::<0x60> as *const (), //
+    unsupported::<0x60> as *const (), // 0x60
     unsupported::<0x68> as *const (), // power off
     unsupported::<0x70> as *const (), // raw device access
-    unsupported::<0x78> as *const (), //
-    unsupported::<0x80> as *const (), //
-    unsupported::<0x88> as *const (), //
-    unsupported::<0x90> as *const (), //
-    unsupported::<0x98> as *const (), //
-    unsupported::<0xa0> as *const (), //
+    unsupported::<0x78> as *const (), // 0x78
+    unsupported::<0x80> as *const (), // 0x80
+    unsupported::<0x88> as *const (), // 0x88
+    unsupported::<0x90> as *const (), // 0x90
+    unsupported::<0x98> as *const (), // 0x98
+    acquire_raw_device_access as *const (), // 0xa0
+    release_raw_device_access as *const (), // 0xa8
 ]);
 
 fn reading<'a>(this: *const Reading) -> &'a Reading {
@@ -1076,7 +1147,7 @@ extern "system" fn nothing(_: *const c_void) -> usize {
 }
 
 static READING: Table<25> = Table([
-    no_interface as *const (),      // 0x00
+    reading_interface as *const (), // 0x00
     reading_add_ref as *const (),   // 0x08
     reading_release as *const (),   // 0x10
     input_kind as *const (),        // 0x18
@@ -1476,6 +1547,74 @@ mod tests {
             Some(Provenance::Hle)
         );
         assert_eq!(r.classify("GameInput.dll", &ImportSymbol::Ordinal(2)), None);
+    }
+
+    #[test]
+    fn query_interface_answers_identity_and_the_objects_own_iid() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+
+        type Query = extern "system" fn(*const c_void, *const Guid, Out) -> HRESULT;
+        let unknown = Guid::new(1, 2, 3, [4; 8]);
+        let mut out = std::ptr::dangling::<c_void>();
+
+        // IGameInput: IUnknown and its own interface both hand back the object.
+        let input = &hub.object as *const Object;
+        let query = slot::<Query, _>(input, 0);
+        assert_eq!(query(input.cast(), &IID_IUNKNOWN, &mut out), S_OK);
+        assert_eq!(out, input.cast());
+        out = std::ptr::dangling::<c_void>();
+        assert_eq!(query(input.cast(), &INPUT_IID, &mut out), S_OK);
+        assert_eq!(out, input.cast());
+        out = std::ptr::dangling::<c_void>();
+        assert_eq!(query(input.cast(), &unknown, &mut out), E_NOINTERFACE);
+        assert!(out.is_null());
+        assert_eq!(
+            query(input.cast(), &IID_IUNKNOWN, std::ptr::null_mut()),
+            E_POINTER
+        );
+        out = std::ptr::dangling::<c_void>();
+        assert_eq!(query(input.cast(), std::ptr::null(), &mut out), E_POINTER);
+        assert!(out.is_null());
+
+        // IGameInputDevice answers its own id, not the input object's.
+        let device = &hub.devices[0] as *const Device;
+        let query = slot::<Query, _>(device, 0);
+        out = std::ptr::dangling::<c_void>();
+        assert_eq!(query(device.cast(), &DEVICE_IID, &mut out), S_OK);
+        assert_eq!(out, device.cast());
+        out = std::ptr::dangling::<c_void>();
+        assert_eq!(
+            query(device.cast(), &INPUT_IID, &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+
+        // The 22-slot device table: the typed stubs at 0x38, 0xa0 and
+        // 0xa8 answer (false / nothing) rather than E_NOTIMPL.
+        let powered = slot::<extern "system" fn(*const Device, u32) -> bool, _>(device, 0x38);
+        assert!(!powered(device, 0));
+        let acquire = slot::<extern "system" fn(*const Device, u64) -> bool, _>(device, 0xa0);
+        assert!(!acquire(device, 0));
+        let release_raw = slot::<extern "system" fn(*const Device), _>(device, 0xa8);
+        release_raw(device);
+
+        // IGameInputReading is counted: QueryInterface's AddRef is released.
+        let reading = current(hub, GAMEPAD_KIND, 0).unwrap();
+        let query = slot::<Query, _>(reading, 0);
+        out = std::ptr::dangling::<c_void>();
+        assert_eq!(
+            query(reading.cast(), &READING_IID, &mut out),
+            S_OK
+        );
+        assert_eq!(out, reading.cast());
+        release(out.cast());
+        out = std::ptr::dangling::<c_void>();
+        assert_eq!(query(reading.cast(), &IID_IUNKNOWN, &mut out), S_OK);
+        assert_eq!(out, reading.cast());
+        release(out.cast());
+        release(reading);
     }
 
     #[test]
