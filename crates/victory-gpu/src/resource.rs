@@ -242,6 +242,175 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// R8G8B8A8_UNORM, which stands in for a packed 16-bit render target or
+/// unordered-access texture the host cannot make (see [`target_format`]).
+pub(crate) const RGBA8_UNORM: u32 = 28;
+
+/// The console's packed 16-bit colour formats a title renders to or writes
+/// via UAVs: B5G5R5A1_UNORM (86) and B4G4R4A4_UNORM (115).
+pub(crate) const PACKED_16: [u32; 2] = [86, 115];
+
+/// Whether the host GPU lacks render-target or typed unordered-access
+/// support for `format` (asked once per format). NVIDIA lacks render-target
+/// support for B4G4R4A4 and typed UAV support for B5G5R5A1, which Grand
+/// Theft Auto VI's 2560x1440 targets need; AMD has both.
+#[cfg(windows)]
+fn host_lacks_target(format: u32) -> bool {
+    use std::sync::OnceLock;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static LACKS: [OnceLock<bool>; 2] = [OnceLock::new(), OnceLock::new()];
+    let Some(i) = PACKED_16.iter().position(|&f| f == format) else {
+        return false;
+    };
+    *LACKS[i].get_or_init(|| {
+        let Some(host) = crate::host::host() else {
+            return false;
+        };
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT(format as i32),
+            ..Default::default()
+        };
+        // SAFETY: the structure the feature names, ours.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+            )
+        };
+        let needed =
+            D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+        let lacks = asked.is_err() || support.Support1.0 & needed != needed;
+        if lacks {
+            tracing::info!(
+                format,
+                "packed 16-bit render targets are R8G8B8A8_UNORM on this GPU"
+            );
+        }
+        lacks
+    })
+}
+
+#[cfg(not(windows))]
+fn host_lacks_target(_: u32) -> bool {
+    false
+}
+
+/// The format a render target or unordered-access texture of `format` is
+/// made in on the host, and that render target views and pipelines name:
+/// R8G8B8A8_UNORM for a packed 16-bit format the GPU cannot render to or
+/// write typed (each channel keeps its value, with more precision); else
+/// the format as the host has it. Textures only sampled keep theirs.
+pub(crate) fn target_format(format: u32) -> u32 {
+    let format = pc_format(format);
+    if PACKED_16.contains(&format) && host_lacks_target(format) {
+        RGBA8_UNORM
+    } else {
+        format
+    }
+}
+
+/// Expands one packed 16-bit texel in DXGI `B5G5R5A1_UNORM` (86: B bits 0-4,
+/// G 5-9, R 10-14, A 15) or `B4G4R4A4_UNORM` (115: B 0-3, G 4-7, R 8-11, A
+/// 12-15) into `R8G8B8A8_UNORM` by bit replication.
+fn unpack_16(format: u32, packed: u16) -> [u8; 4] {
+    let bits = |shift: u32, width: u32| -> u8 { ((packed >> shift) & ((1 << width) - 1)) as u8 };
+    match format {
+        86 => {
+            let (r, g, b) = (bits(10, 5), bits(5, 5), bits(0, 5));
+            let a = if packed >> 15 != 0 { 255 } else { 0 };
+            [
+                (r << 3) | (r >> 2),
+                (g << 3) | (g >> 2),
+                (b << 3) | (b >> 2),
+                a,
+            ]
+        }
+        115 => {
+            let (r, g, b, a) = (bits(8, 4), bits(4, 4), bits(0, 4), bits(12, 4));
+            [(r << 4) | r, (g << 4) | g, (b << 4) | b, (a << 4) | a]
+        }
+        _ => unreachable!("only B5G5R5A1 and B4G4R4A4 are packed 16-bit"),
+    }
+}
+
+/// Expands `src` (`B5G5R5A1_UNORM` 86 or `B4G4R4A4_UNORM` 115, 2 bytes per
+/// texel) into `dst` (`R8G8B8A8_UNORM`, 4 bytes per texel).
+pub(crate) fn expand_packed16(format: u32, src: &[u8], dst: &mut [u8]) {
+    if !PACKED_16.contains(&format) {
+        return;
+    }
+    for (s, d) in src
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+    {
+        *d = unpack_16(format, u16::from_le_bytes(*s));
+    }
+}
+
+/// Expands `lines` rows of `width` texels in packed 16-bit `format`
+/// (`src_pitch` bytes apart) into `R8G8B8A8_UNORM` (`dst_pitch` bytes apart).
+#[cfg(any(windows, test))]
+pub(crate) fn expand_packed16_rows(
+    format: u32,
+    width: usize,
+    lines: usize,
+    src: &[u8],
+    src_pitch: usize,
+    dst: &mut [u8],
+    dst_pitch: usize,
+) {
+    if !PACKED_16.contains(&format) || width == 0 || lines == 0 {
+        return;
+    }
+    for line in 0..lines {
+        let s = &src[line * src_pitch..][..width * 2];
+        let d = &mut dst[line * dst_pitch..][..width * 4];
+        expand_packed16(format, s, d);
+    }
+}
+
+/// Whether a GPU-to-GPU copy or resolve between `to` and `from` mixes a
+/// native packed 16-bit texture with a widened (or different) format, logging
+/// once per packed format so callers can skip the command before recording
+/// barriers or marking the destination written.
+#[cfg(windows)]
+pub(crate) fn skip_mixed_packed_copy(
+    op: &str,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> bool {
+    use std::sync::Once;
+    // SAFETY: live host resources.
+    let (to_fmt, from_fmt) =
+        unsafe { (to.GetDesc().Format.0 as u32, from.GetDesc().Format.0 as u32) };
+    if to_fmt == from_fmt {
+        return false;
+    }
+    let Some(packed) = [from_fmt, to_fmt]
+        .into_iter()
+        .find(|f| PACKED_16.contains(f))
+    else {
+        return false;
+    };
+    static ONCE: [Once; 2] = [Once::new(), Once::new()];
+    if let Some(i) = PACKED_16.iter().position(|&f| f == packed) {
+        ONCE[i].call_once(|| {
+            tracing::warn!(
+                op,
+                packed_format = packed,
+                to_format = to_fmt,
+                from_format = from_fmt,
+                "skipping GPU copy between packed 16-bit texture and widened R8G8B8A8_UNORM target"
+            );
+        });
+    }
+    true
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -289,7 +458,9 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own).then_some(own)
+    // Widened packed targets are typed R8G8B8A8_UNORM, so null view descs
+    // can stay null and inherit the resource's exact dimension.
+    (format != own && format != target_format(own)).then_some(own)
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -1119,7 +1290,12 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    const RENDER_TARGET: u32 = 1;
+    d.format = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+        target_format(d.format)
+    } else {
+        pc_format(d.format)
+    };
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1240,6 +1416,10 @@ fn shared_texture(
             }
         }
     }
+    const RENDER_TARGET: u32 = 1;
+    if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+        d.format = target_format(d.format);
+    }
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
@@ -1300,9 +1480,14 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
+        const RENDER_TARGET: u32 = 1;
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+            target_format(value[0])
+        } else {
+            pc_format(value[0])
+        };
         value
     });
     let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
@@ -3165,5 +3350,38 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn packed_16_expansion_matches_dxgi_layout() {
+        let mut out = [0u8; 4];
+        for (packed, expected) in [
+            (0x0000u16, [0, 0, 0, 0]),
+            (0xffff, [255, 255, 255, 255]),
+            (0x8000, [0, 0, 0, 255]),
+            (0x7c00, [255, 0, 0, 0]),
+            (0x03e0, [0, 255, 0, 0]),
+            (0x001f, [0, 0, 255, 0]),
+            (0x8000 | (24 << 10) | (10 << 5) | 21, [198, 82, 173, 255]),
+        ] {
+            expand_packed16(86, &packed.to_le_bytes(), &mut out);
+            assert_eq!(out, expected, "B5G5R5A1 {packed:#06x}");
+        }
+        for (packed, expected) in [
+            (0x0000u16, [0, 0, 0, 0]),
+            (0xffff, [255, 255, 255, 255]),
+            (0xf000, [0, 0, 0, 255]),
+            (0x0f00, [255, 0, 0, 0]),
+            (0x00f0, [0, 255, 0, 0]),
+            (0x000f, [0, 0, 255, 0]),
+            (0xca73, [0xaa, 0x77, 0x33, 0xcc]),
+        ] {
+            expand_packed16(115, &packed.to_le_bytes(), &mut out);
+            assert_eq!(out, expected, "B4G4R4A4 {packed:#06x}");
+        }
+        let mut rows_out = vec![0u8; 512];
+        let src = [0xca73u16.to_le_bytes(), [0; 2]].concat();
+        expand_packed16_rows(115, 1, 1, &src, 4, &mut rows_out, 256);
+        assert_eq!(&rows_out[..4], &[0xaa, 0x77, 0x33, 0xcc]);
     }
 }
