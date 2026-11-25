@@ -208,7 +208,7 @@ fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) {
 /// streamed textures and video planes through a pool view and maps the
 /// pages into its tiled heap, where a guard sees none of it).
 pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
-    if len == 0 || !runtime_memory(start, views) {
+    if len == 0 || !runtime_memory(start, start + len, views) {
         return None;
     }
     install();
@@ -226,27 +226,45 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
-/// Whether memory at `at` is the runtime's GPU memory: a write-watched
-/// pool, or (with `views`) a view or a placeholder (anything but plain
-/// committed memory).
-fn runtime_memory(at: usize, views: bool) -> bool {
+/// Whether `[start, end)` is all the runtime's GPU memory: write-watched
+/// pools, or (with `views`) views and placeholders (anything but plain
+/// committed memory, and not free memory: a null address's window is free,
+/// and guarding it would guard whatever is allocated there later; under
+/// Wine the process heap lies in the first 4 MiB). Every region counts: a
+/// range starting in a reservation can hold plain committed memory further
+/// in, which a guard would block just the same.
+fn runtime_memory(start: usize, end: usize, views: bool) -> bool {
     use windows_sys::Win32::System::Memory::{
-        GetWriteWatch, MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        GetWriteWatch, MEM_COMMIT, MEM_FREE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
-    let page = at & !(4096 - 1);
-    let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
-    // SAFETY: room for one answer; no reset, so nothing changes.
-    let watched = unsafe {
-        GetWriteWatch(0, page as *const _, 4096, (&raw mut found).cast(), &mut count, &mut granularity)
-    } == 0;
-    if watched || !views {
-        return watched;
+    let mut at = start & !(4096 - 1);
+    while at < end {
+        let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+        // SAFETY: room for one answer; no reset, so nothing changes.
+        let watched = unsafe {
+            GetWriteWatch(
+                0,
+                at as *const _,
+                4096,
+                (&raw mut found).cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } == 0;
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+            return false;
+        }
+        let view_or_placeholder =
+            info.State != MEM_FREE && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
+        if !(watched || views && view_or_placeholder) {
+            return false;
+        }
+        at = info.BaseAddress as usize + info.RegionSize;
     }
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(page as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE)
+    true
 }
 
 impl Drop for Tracked {
@@ -738,6 +756,42 @@ pub(crate) mod tests {
         title_memory_remapped(r, PAGE);
         assert_eq!(t.take(r, r + 2 * PAGE), [(r, r + PAGE)]);
         drop(t);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Free memory is not tracked: the window a null address falls in (a
+    /// loose copy of title memory starting at 0). Tracked, its blocks would
+    /// be guarded once something is allocated there: under Wine the process
+    /// heap, whose writes then fault into the handler while a thread holds
+    /// the guard lock.
+    #[test]
+    fn free_memory_is_not_tracked() {
+        assert!(
+            track(0, 4 << 20, true).is_none(),
+            "the window of a null address"
+        );
+    }
+
+    /// A range starting in a reservation with plain committed memory
+    /// further in is not tracked: a guard there would block whoever
+    /// allocated it, as in free memory.
+    #[test]
+    fn committed_memory_further_in_is_not_tracked() {
+        // SAFETY: a reservation of ours, its second block committed; freed
+        // below.
+        let r = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) }
+            as usize;
+        assert_ne!(r, 0);
+        // SAFETY: inside our reservation.
+        let c = unsafe { VirtualAlloc((r + PAGE) as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) }
+            as usize;
+        assert_eq!(c, r + PAGE);
+        assert!(track(r, PAGE, true).is_some(), "the reserved block alone");
+        assert!(
+            track(r, 2 * PAGE, true).is_none(),
+            "committed memory further in"
+        );
         // SAFETY: our reservation.
         unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
     }
