@@ -1021,8 +1021,13 @@ extern "system" fn clear_rtv(
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
+        // A target the host texture does not take (its format's uses:
+        // `resource::host_desc`) is not cleared: its view reads null, and
+        // making it would be an invalid call.
         const RENDER_TARGET: u32 = 0x4;
-        let rtv = host.rtv(&texture, record.desc().as_ref());
+        let Some(rtv) = host.rtv(&texture, record.desc().as_ref()) else {
+            return;
+        };
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
@@ -1070,7 +1075,12 @@ extern "system" fn clear_dsv(
         });
         const DEPTH_WRITE: u32 = 0x10;
         ensure_state(list, record.resource, DEPTH_WRITE);
-        let dsv = host.dsv(&texture, record.depth_desc().as_ref());
+        // A texture the host made without the depth use (its format's uses:
+        // `resource::host_desc`) is not cleared: its view reads null, and
+        // making it would be an invalid call.
+        let Some(dsv) = host.dsv(&texture, record.depth_desc().as_ref()) else {
+            return;
+        };
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list

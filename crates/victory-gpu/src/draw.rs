@@ -418,18 +418,24 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
+            // A target the host texture does not take (its format's uses:
+            // `resource::host_desc`) is left out, like one without a view.
+            let Some(rtv) = host.rtv(&texture, record.desc().as_ref()) else {
+                continue;
+            };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
+            rtvs.push(rtv);
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
+            let dsv = host.dsv(&texture, record.depth_desc().as_ref())?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            Some(host.dsv(&texture, record.depth_desc().as_ref()))
+            Some(dsv)
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -2105,7 +2111,7 @@ uint ps() : SV_Target { return 1; }
             ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
-        let (rtv, dsv) = (host.rtv(&target, None), host.dsv(texture, Some(&dsv)));
+        let (rtv, dsv) = (host.rtv(&target, None).unwrap(), host.dsv(texture, Some(&dsv)).unwrap());
         // SAFETY: an open list; the target in the render target state, the
         // depth texture in the depth write state; copies into our buffer.
         unsafe {
@@ -2806,7 +2812,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
-        let handle = host.dsv(&copy.texture, Some(&dsv));
+        let handle = host.dsv(&copy.texture, Some(&dsv)).unwrap();
         // SAFETY: an open list, the texture in the depth write state.
         unsafe {
             list.list.ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.5, 0x11, None)

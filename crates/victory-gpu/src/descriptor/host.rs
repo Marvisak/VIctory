@@ -1320,6 +1320,7 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     if DEPTH_FORMATS.iter().any(|&(typed, _)| typed == view) || is_typeless(view) {
         once!(unordered, view, own, "view the host does not allow");
         return false;
+
     }
     let cast = castable.contains(&view);
     if family(view) != family(own) && !cast {
@@ -1333,6 +1334,7 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
             own,
             "an unordered view in a format the host cannot store"
         );
+
         return false;
     }
     if let Some(format) = format
@@ -1753,6 +1755,41 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Typed unordered access view formats the device stores are exactly
+    /// what its `CheckFeatureSupport` reports: the 16-bit packed ones on
+    /// NVIDIA (B5G5R5A1, B4G4R4A4) do not take one, and a view of a
+    /// texture in such a format is held back instead of made -- making it
+    /// removes the device (#2725).
+    #[cfg(windows)]
+    #[test]
+    fn an_unordered_view_names_a_format_the_device_stores() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let Some(h) = host() else {
+            return; // no host GPU here
+        };
+        for format in [86, 115, 28] {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT(format as i32),
+                ..Default::default()
+            };
+            // SAFETY: a plain query into a struct of its size.
+            unsafe {
+                h.device
+                    .CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut support).cast(), size_of_val(&support) as u32)
+            }
+            .unwrap();
+            assert_eq!(
+                typed_store(format),
+                support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0,
+                "format {format}: what it holds back, the device reports"
+            );
+        }
+    }
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.
