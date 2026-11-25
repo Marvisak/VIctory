@@ -77,6 +77,9 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
+Set `VICTORY_CONFIG` to select a different config file instead of
+`victory.toml` in the current directory.
+
 Run the title:
 
 ```powershell
