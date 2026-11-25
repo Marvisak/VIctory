@@ -225,6 +225,135 @@ fn run_cases(
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+const PKNORM_OPCODES: [(u16, bool, bool); 4] = [
+    (0x368, false, true),  // v_cvt_pknorm_i16_f32
+    (0x369, false, false), // v_cvt_pknorm_u16_f32
+    (0x312, true, true),   // v_cvt_pknorm_i16_f16
+    (0x313, true, false),  // v_cvt_pknorm_u16_f16
+];
+
+#[test]
+fn v_cvt_pknorm_rounds_clamps_and_packs() {
+    // f32 input, f16 bits, SNORM16 bits, UNORM16 bits.
+    let edges = [
+        (0.0, 0x0000, 0x0000, 0x0000),
+        (-0.0, 0x8000, 0x0000, 0x0000),
+        (1.0, 0x3C00, 0x7FFF, 0xFFFF),
+        (-1.0, 0xBC00, 0x8001, 0x0000),
+        (0.5, 0x3800, 0x4000, 0x8000),
+        (-0.5, 0xB800, 0xC000, 0x0000),
+        (2.0, 0x4000, 0x7FFF, 0xFFFF),
+        (-2.0, 0xC000, 0x8001, 0x0000),
+        (f32::INFINITY, 0x7C00, 0x7FFF, 0xFFFF),
+        (f32::NEG_INFINITY, 0xFC00, 0x8001, 0x0000),
+        (f32::NAN, 0x7E00, 0x0000, 0x0000),
+        // Exact-product rounding: 0x3801 (0.5 + 2^-11) gives 0x400F / 0x801F
+        // rather than 0x4010 / 0x8020 from rounding the f32 product first.
+        (f16_to_f32(0x3801), 0x3801, 0x400F, 0x801F),
+    ];
+    for (opcode, half, signed) in PKNORM_OPCODES {
+        let shader = build_valu_cs(&vop3(opcode, 0, vgpr(1), vgpr(2), 0));
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let sfi0 = container.part(crate::FourCC::SFI0).unwrap();
+        let features = u64::from_le_bytes(sfi0.data.try_into().unwrap());
+        assert_eq!(features & 0x8000, 0, "opcode {opcode:#x} requires Int64");
+
+        let input = |(float, bits, _, _): (f32, u32, u32, u32)| {
+            if half {
+                0x3A00_0000 | bits
+            } else {
+                float.to_bits()
+            }
+        };
+        let expected = |(_, _, snorm, unorm)| if signed { snorm } else { unorm };
+        let other = |i| (i + 3) % edges.len();
+        let inputs: Vec<_> = edges
+            .iter()
+            .enumerate()
+            .map(|(i, &edge)| [input(edge), input(edges[other(i)]), 0, 0])
+            .collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let want = expected(edges[i]) | (expected(edges[other(i)]) << 16);
+            assert_eq!(got, want, "{backend}, opcode {opcode:#x}, case {i}");
+        });
+    }
+
+    // Native RDNA2 f32 exact-product rounding witnesses (from #596 / #2100).
+    let snorm_shader = build_valu_cs(&vop3(0x368, 0, vgpr(1), vgpr(2), 0));
+    run_cases(
+        &snorm_shader,
+        &[
+            [0x3F73_34E6, 0x3F73_34E6, 0, 0],
+            [0xBF73_34E6, 0xBF73_34E6, 0, 0],
+        ],
+        |backend, i, _, got| {
+            let want = if i == 0 { 0x7999_7999 } else { 0x8667_8667 };
+            assert_eq!(got, want, "{backend}, snorm witness {i}");
+        },
+    );
+    let unorm_shader = build_valu_cs(&vop3(0x369, 0, vgpr(1), vgpr(2), 0));
+    run_cases(
+        &unorm_shader,
+        &[[0x3E2A_BAAB, 0x3E2A_BAAB, 0, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got, 0x2AAF_2AAF, "{backend}, unorm witness");
+        },
+    );
+}
+
+#[test]
+fn v_cvt_pknorm_honors_source_modifiers() {
+    for (opcode, half, signed) in PKNORM_OPCODES {
+        // abs(-0.25) and -(-0.5). Swap their source slots to test each
+        // modifier on each operand, with the negated half selected high.
+        for abs_src in 0..2 {
+            let neg_src = 1 - abs_src;
+            let mut body = vop3(opcode, 0, vgpr(1), vgpr(2), 0);
+            body[0] |= 1 << (8 + abs_src);
+            body[1] |= 1 << (29 + neg_src);
+            let mut inputs = [0; 4];
+            if half {
+                body[0] |= 1 << (11 + neg_src);
+                inputs[abs_src] = 0x3C00_B400; // +1.0, -0.25 (low)
+                inputs[neg_src] = 0xB800_3C00; // -0.5 (high), +1.0
+            } else {
+                inputs[abs_src] = (-0.25f32).to_bits();
+                inputs[neg_src] = (-0.5f32).to_bits();
+            }
+            let shader = build_valu_cs(&body);
+            let (abs, neg) = if signed {
+                (0x2000, 0x4000)
+            } else {
+                (0x4000, 0x8000)
+            };
+            let want = (abs << (16 * abs_src)) | (neg << (16 * neg_src));
+            run_cases(&shader, &[inputs], |backend, _, _, got| {
+                assert_eq!(got, want, "{backend}, opcode {opcode:#x}, abs src{abs_src}");
+            });
+        }
+    }
+}
+
+#[test]
+fn v_cvt_pknorm_rejects_output_modifiers() {
+    for (opcode, _, _) in PKNORM_OPCODES {
+        let [w0, w1] = vop3(opcode, 0, vgpr(1), vgpr(2), 0);
+        for body in [[w0 | (1 << 15), w1], [w0, w1 | (1 << 27)]] {
+            let error = try_build_valu_cs(&body).expect_err("output modifier accepted");
+            assert!(
+                matches!(
+                    error,
+                    crate::ShaderError::Unsupported {
+                        what: "integer output modifiers",
+                        ..
+                    }
+                ),
+                "{error}"
+            );
+        }
+    }
+}
+
 #[test]
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
