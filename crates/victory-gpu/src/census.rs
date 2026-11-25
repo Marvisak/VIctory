@@ -13,7 +13,7 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_GPU_CENSUS").is_some())
+    *ENABLED.get_or_init(|| crate::switch::on("VICTORY_GPU_CENSUS"))
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -57,7 +57,7 @@ impl Work {
             Self::Dispatch(groups) | Self::Mesh(groups) => groups,
             Self::Draw(count, instances) | Self::Indexed(count, instances) => [count, instances, 1],
             Self::Indirect { limit, stride, .. } => [limit, stride, 0],
-            Self::Clamp(records) => [records.div_ceil(64), 1, 1],
+            Self::Clamp(records) => [records.min(1), 1, 1],
         }
     }
 }
@@ -442,6 +442,11 @@ mod tests {
         assert_eq!(indirect.counted_indirect_calls, 2);
         assert_eq!(indirect.counted_indirect_limit, 15);
         assert_eq!(indirect.timings.summary(), (0, 0.0, 0.0, 0.0));
+
+        let mut clamp = Execution::default();
+        clamp.add(Work::Clamp(65), None);
+        assert_eq!(clamp.max_dimensions, [1, 1, 1]);
+        assert_eq!(clamp.total_items, 65);
     }
 }
 
