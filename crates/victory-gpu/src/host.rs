@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
@@ -283,6 +283,37 @@ fn process_memory() -> (u64, u64) {
     (c.PagefileUsage as u64, c.WorkingSetSize as u64)
 }
 
+/// Waits for the submitted value even if the event wait fails or wakes
+/// for an older signal. The caller handles the device-removed sentinel.
+fn wait_for_fence_value(fence: &ID3D12Fence, value: u64, event: HANDLE) -> u64 {
+    // SAFETY: the caller owns the live fence and Win32 event.
+    let mut wait_on_event = match unsafe { fence.SetEventOnCompletion(value, event) } {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, value, "registering a host fence event failed");
+            false
+        }
+    };
+    loop {
+        if wait_on_event {
+            // SAFETY: the event is live, and only this waiter consumes it.
+            let status = unsafe { WaitForSingleObject(event, INFINITE) };
+            if status != WAIT_OBJECT_0 {
+                tracing::warn!(?status, value, "host fence event wait failed");
+                wait_on_event = false;
+            }
+        }
+        // SAFETY: a plain query of the live fence.
+        let completed = unsafe { fence.GetCompletedValue() };
+        if completed >= value {
+            return completed;
+        }
+        if !wait_on_event {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -429,6 +460,59 @@ pub(crate) mod tests {
     }
 
     use super::*;
+
+    /// A pending queue signal and a native event that was already signalled
+    /// can coexist. The wait must report the D3D12 value that ran.
+    #[test]
+    fn submission_wait_confirms_fence_after_an_early_event() {
+        use std::sync::mpsc;
+        use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+
+        let Some(host) = host() else { return };
+        // SAFETY: plain creation of a private queue and its fences.
+        let (queue, gate, completed): (ID3D12CommandQueue, ID3D12Fence, ID3D12Fence) = unsafe {
+            (
+                host.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                }).unwrap(),
+                host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap(),
+                host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap(),
+            )
+        };
+        // SAFETY: live private queue and fences.
+        unsafe {
+            queue.Wait(&gate, 1).unwrap();
+            queue.Signal(&completed, 1).unwrap();
+        }
+        std::thread::scope(|scope| {
+            let (starting, started) = mpsc::channel();
+            let (returning, returned) = mpsc::channel();
+            let fence = &completed;
+            scope.spawn(move || {
+                // SAFETY: a private auto-reset event, initially signalled.
+                let event = unsafe { CreateEventW(None, false, true, None) }.unwrap();
+                starting.send(()).unwrap();
+                let value = wait_for_fence_value(fence, 1, event);
+                returning.send(value).unwrap();
+                // If an early wake escaped, keep the event live until the
+                // gate opens and the outstanding notification signals it.
+                if value == 0 {
+                    // SAFETY: this thread owns the live event.
+                    assert_eq!(unsafe { WaitForSingleObject(event, 3_000) }, WAIT_OBJECT_0);
+                }
+                // SAFETY: both the wait and the fence notification finished.
+                unsafe { CloseHandle(event) }.unwrap();
+            });
+            let began = started.recv_timeout(Duration::from_secs(3));
+            let early = returned.recv_timeout(Duration::from_millis(100));
+            // SAFETY: releasing the private queue's gated signal.
+            unsafe { gate.Signal(1) }.unwrap();
+            began.unwrap();
+            assert_eq!(early, Err(mpsc::RecvTimeoutError::Timeout), "returned before GPU completion");
+            assert_eq!(returned.recv_timeout(Duration::from_secs(3)).unwrap(), 1);
+        });
+    }
 
     /// Shaders that use title memory mark their reads in their own bitmap:
     /// read marks of both bitmaps are taken, each slot once until it is
@@ -1265,25 +1349,25 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        let mut removed = false;
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
+            // SAFETY: closed lists and a live queue and fence.
+            let signaled = unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-                }
+                self.queue.Signal(&self.fence, *submitted)
+            };
+            if let Err(e) = signaled {
+                fail(format_args!("signalling the host submission fence failed: {e}"));
+            }
+            if wait_for_fence_value(&self.fence, *submitted, self.event) == u64::MAX {
+                removed = true;
+                removed_in = removed_in.or((groups.len() > 1).then_some(i));
+                break;
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
@@ -1322,7 +1406,7 @@ impl Host {
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
         }
         // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+        if removed || unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}{}",
                 runs.len(),
