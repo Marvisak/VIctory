@@ -105,6 +105,7 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
     };
     let lowered = lowered(&native)?;
     Ok(HostShader {
+        wave_size: lowered.wave_size,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -900,6 +901,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
         }
         HostShader {
             stage: native.stage,
+            wave_size: l.wave_size,
             dxil: l.dxil,
             user_data: l.user_data,
             samplers: l.samplers,

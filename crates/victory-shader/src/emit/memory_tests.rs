@@ -194,6 +194,7 @@ fn program() -> HostShader {
     assert!(l.memory && l.memory_writes && l.view_addresses);
     assert!(l.root_uavs.is_empty(), "the root UAV is read as title memory");
     let shader = HostShader {
+        wave_size: l.wave_size,
         stage: HwStage::Cs,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -429,6 +430,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         .collect();
     assert_eq!(marks, [(6, super::ROOT_SRV_VIEW), (7, super::ROOT_VIEW_OFFSET)]);
     let shader = HostShader {
+        wave_size: l.wave_size,
         stage: HwStage::Cs,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -564,6 +566,7 @@ fn writes_through_views_mark_their_pages() {
     .expect("lower");
     assert!(l.view_marks && !l.memory, "marks without the page table");
     let shader = HostShader {
+        wave_size: l.wave_size,
         stage: HwStage::Cs,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -698,6 +701,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
     assert!(l.view_marks && l.heap, "a heap-direct read is marked");
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: l.wave_size,
         dxil: l.dxil,
         user_data: l.user_data,
         samplers: l.samplers,
@@ -805,6 +809,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
     assert!(l.memory && l.memory_writes);
     let shader = HostShader {
         stage: HwStage::Cs,
+        wave_size: l.wave_size,
         dxil: l.dxil,
         user_data: l.user_data,
         samplers: l.samplers,
