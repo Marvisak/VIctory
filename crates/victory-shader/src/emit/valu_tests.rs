@@ -1657,6 +1657,60 @@ fn fspx_programs_run_with_the_hardwares_dot_products() {
             assert_eq!(got, want, "{backend}: {body:08x?}");
         });
     }
+
+    let runtime_cases: &[(&[u32], [u32; 4], u32)] = &[
+        (
+            &dot4(0, vgpr(1), 244, vgpr(3), 0b010, 0b101),
+            [a, 0, acc, 0],
+            dot4_ref(a, 0x4000, acc),
+        ),
+        (
+            &dot4(0, 244, vgpr(2), vgpr(3), 0b001, 0b110),
+            [0, b, acc, 0],
+            dot4_ref(0x4000, b, acc),
+        ),
+        (
+            &[vop1(0x001, 2, 0xFF), 0x0000_0001, dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7)[0], dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7)[1]],
+            [a, 0, acc, 0],
+            dot4_ref(a, 0x0000_0001, acc),
+        ),
+        (
+            &[vop1(0x001, 2, 0xFF), 0x0000_8000, dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7)[0], dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7)[1]],
+            [a, 0, acc, 0],
+            dot4_ref(a, 0x0000_8000, acc),
+        ),
+        (
+            &[vop1(0x001, 2, 0xFF), 0xFFFF_8000, dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7)[0], dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7)[1]],
+            [a, 0, acc, 0],
+            dot4_ref(a, 0xFFFF_8000, acc),
+        ),
+        (
+            &[vop1(0x001, 2, 0xFF), 0xFFFF_FFFF, dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7)[0], dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7)[1]],
+            [a, 0, acc, 0],
+            dot4_ref(a, 0xFFFF_FFFF, acc),
+        ),
+        (
+            &[vop1(0x001, 2, 0xFF), 0x0000_0000, dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7)[0], dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7)[1]],
+            [a, 0, acc, 0],
+            dot4_ref(a, 0x0000_0000, acc),
+        ),
+        (
+            &[vop1(0x001, 2, 0xFF), 0xFFFF_FFFE, vop1(0x001, 0, vgpr(3)), 0x0d << 25 | 2 << 9 | vgpr(1) as u32],
+            [a, 0, acc, 0],
+            dot4_ref(a, 0xFFFF_FFFE, acc),
+        ),
+        (
+            &dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7),
+            [a, b, acc, 0],
+            dot4_ref(a, b, acc),
+        ),
+    ];
+    for &(body, inputs, want) in runtime_cases {
+        let shader = build_valu_cs(body);
+        run_cases(&shader, &[inputs], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: runtime dot4 {body:08x?}");
+        });
+    }
 }
 
 /// `v_pk_fmac_f16` (VOP2): each half of the destination plus the product

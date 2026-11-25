@@ -2280,6 +2280,70 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, nan, least, median)
     }
 
+    /// Lowers a signed 4x i8 dot product `acc + dot4(a, b)`. Constant
+    /// multiplicands are expanded in scalar arithmetic rather than passed to
+    /// `dx.op.dot4AddPacked.i32`, avoiding Intel Arc IGC's 16-bit constant
+    /// broadcast miscompilation when either multiplicand folds to a constant.
+    fn dot4_i8(&mut self, c: usize, acc: V, a: V, b: V) -> V {
+        match (self.s.m.eval_u32(a), self.s.m.eval_u32(b)) {
+            (Some(ka), Some(kb)) => {
+                let dot = (0..4).fold(0i32, |s, k| {
+                    let x = i32::from((ka >> (8 * k)) as i8);
+                    let y = i32::from((kb >> (8 * k)) as i8);
+                    s.wrapping_add(x * y)
+                });
+                if dot == 0 {
+                    acc
+                } else {
+                    let kd = self.s.m.i32(dot as u32);
+                    self.s.m.bin(c, Bin::Add, acc, kd)
+                }
+            }
+            (Some(k), None) => self.dot4_i8_const(c, acc, b, k),
+            (None, Some(k)) => self.dot4_i8_const(c, acc, a, k),
+            (None, None) => self.s.op(
+                c,
+                "dot4AddPacked.i32",
+                Attr::ReadNone,
+                self.s.t.i32,
+                163,
+                &[acc, a, b],
+            ),
+        }
+    }
+
+    fn dot4_i8_const(&mut self, c: usize, mut acc: V, var: V, k: u32) -> V {
+        let mut k24 = None;
+        for byte in 0..4u32 {
+            let w = i32::from((k >> (8 * byte)) as i8);
+            if w == 0 {
+                continue;
+            }
+            let k24_v = *k24.get_or_insert_with(|| self.s.m.i32(24));
+            let left = (3 - byte) * 8;
+            let aligned = if left == 0 {
+                var
+            } else {
+                let kl = self.s.m.i32(left);
+                self.s.m.bin(c, Bin::Shl, var, kl)
+            };
+            let lane = self.s.m.bin(c, Bin::AShr, aligned, k24_v);
+            let prod = match w {
+                1 => lane,
+                -1 => {
+                    acc = self.s.m.bin(c, Bin::Sub, acc, lane);
+                    continue;
+                }
+                _ => {
+                    let kw = self.s.m.i32(w as u32);
+                    self.s.m.bin(c, Bin::Mul, lane, kw)
+                }
+            };
+            acc = self.s.m.bin(c, Bin::Add, acc, prod);
+        }
+        acc
+    }
+
     /// `a - floor(a)`, which on the hardware never reaches 1.0: where it
     /// would round to it (a tiny negative `a`), the result is `below_one`,
     /// the largest value under 1.0 in the operation's width. Hosts differ
@@ -5585,15 +5649,7 @@ impl<'a> Lower<'a> {
                     return Err("an accumulator");
                 };
                 let acc = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
-                let i32_ty = self.s.t.i32;
-                let r = self.s.op(
-                    c,
-                    "dot4AddPacked.i32",
-                    Attr::ReadNone,
-                    i32_ty,
-                    163,
-                    &[acc, a, bb],
-                );
+                let r = self.dot4_i8(c, acc, a, bb);
                 int(self, r)
             }
             "v_dot4_i32_i8" => {
@@ -5611,6 +5667,14 @@ impl<'a> Lower<'a> {
                         xs.push(x);
                         continue;
                     }
+                    if let Some(val) = self.s.m.eval_u32(x) {
+                        let top = val >> 16;
+                        let bot = val & 0xFFFF;
+                        let packed = ((if hi { top } else { bot }) << 16)
+                            | (if lo { top } else { bot });
+                        xs.push(self.s.m.i32(packed));
+                        continue;
+                    }
                     let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
                     let top = self.s.m.bin(c, Bin::LShr, x, k16);
                     let bottom = self.s.m.bin(c, Bin::And, x, low);
@@ -5621,15 +5685,7 @@ impl<'a> Lower<'a> {
                     xs.push(self.s.m.bin(c, Bin::Or, if lo { top } else { bottom }, hi));
                 }
                 let acc = s(self, 2)?;
-                let i32_ty = self.s.t.i32;
-                let r = self.s.op(
-                    c,
-                    "dot4AddPacked.i32",
-                    Attr::ReadNone,
-                    i32_ty,
-                    163,
-                    &[acc, xs[0], xs[1]],
-                );
+                let r = self.dot4_i8(c, acc, xs[0], xs[1]);
                 int(self, r)
             }
             "v_mov_b32" => {
