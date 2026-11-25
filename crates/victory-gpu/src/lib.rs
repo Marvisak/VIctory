@@ -70,7 +70,7 @@ mod watch;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{HdrDisplayInfo, display_hdr_info, on_failure};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped,

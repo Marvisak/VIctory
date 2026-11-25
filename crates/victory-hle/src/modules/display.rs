@@ -57,13 +57,55 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
-/// 2: disabled. We present in SDR, so the title must render SDR.
-// shortcut: HDR output is not done (see the presentation items in
-// `TODO.md`); report enabled, with the host display's luminance, once the
-// swap chain can present HDR.
-extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) -> u32 {
+/// Display HDR luminance bounds (nits) returned to the caller.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct HdrModeInfo {
+    min_nits: f32,
+    max_nits: f32,
+    max_full_frame_nits: f32,
+}
+
+fn try_enable_hdr_with(
+    preference: u32,
+    info: *mut c_void,
+    hdr: Option<victory_gpu::HdrDisplayInfo>,
+) -> u32 {
+    if let Some(hdr) = hdr {
+        if !info.is_null() {
+            // SAFETY: caller passed a writable luminance info pointer.
+            unsafe {
+                info.cast::<HdrModeInfo>().write_unaligned(HdrModeInfo {
+                    min_nits: hdr.min_luminance,
+                    max_nits: hdr.max_luminance,
+                    max_full_frame_nits: hdr.max_full_frame_luminance,
+                });
+            }
+        }
+        tracing::info!(
+            preference,
+            min = hdr.min_luminance,
+            max = hdr.max_luminance,
+            max_ff = hdr.max_full_frame_luminance,
+            "HDR mode: enabled"
+        );
+        return 1;
+    }
     tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
     2
+}
+
+/// Enables HDR (`1`) and fills the host display's luminance bounds when
+/// Windows HDR is active; otherwise returns disabled (`2`).
+extern "system" fn try_enable_hdr(_: This, preference: u32, info: *mut c_void) -> u32 {
+    #[cfg(windows)]
+    {
+        try_enable_hdr_with(preference, info, victory_gpu::display_hdr_info())
+    }
+    #[cfg(not(windows))]
+    {
+        try_enable_hdr_with(preference, info, None)
+    }
 }
 
 /// Nothing launches URIs for the title: no store, browser or console app
@@ -176,12 +218,26 @@ mod tests {
     use crate::modules::xgameruntime::{S_OK, method};
 
     #[test]
-    fn sdr_and_display_deferrals() {
-        type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
+    fn hdr_and_display_deferrals() {
+        let sample = victory_gpu::HdrDisplayInfo {
+            min_luminance: 0.01,
+            max_luminance: 1000.0,
+            max_full_frame_luminance: 400.0,
+        };
+        let mut info = HdrModeInfo::default();
+        assert_eq!(try_enable_hdr_with(0, (&raw mut info).cast(), Some(sample)), 1);
+        assert_eq!(info.min_nits, sample.min_luminance);
+        assert_eq!(info.max_nits, sample.max_luminance);
         assert_eq!(
-            method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, std::ptr::null_mut()),
-            2
+            info.max_full_frame_nits,
+            sample.max_full_frame_luminance
         );
+        assert_eq!(try_enable_hdr_with(0, std::ptr::null_mut(), Some(sample)), 1);
+        assert_eq!(try_enable_hdr_with(0, (&raw mut info).cast(), None), 2);
+
+        type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
+        let res = method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, std::ptr::null_mut());
+        assert!(res == 1 || res == 2);
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();
