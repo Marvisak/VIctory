@@ -784,16 +784,23 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
+        && len != 0
     {
-        let len = len as usize;
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        let (d, s, len) = (dst as usize, src as usize, len as usize);
+        if d < s.saturating_add(len) && s < d.saturating_add(len) {
+            list.defer(move || {
+                if crate::texture::committed(s as *const u8, len)
+                    && crate::texture::committed(d as *const u8, len)
+                {
+                    let _writing = crate::watch::writing(d, len);
+                    // SAFETY: both ranges are committed title memory; `ptr::copy`
+                    // preserves overlapping `memmove` semantics.
+                    unsafe { std::ptr::copy(s as *const u8, d as *mut u8, len) };
+                }
+            });
+        } else {
+            list.defer_copy(d as *mut u8, s as *const u8, len);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
