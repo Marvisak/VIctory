@@ -1155,6 +1155,82 @@ fn signed_64_bit_operands_sign_extend_their_literal() {
     check("s_ashr_i64", &ashr, &[([0; 4], u32::MAX)]);
 }
 
+/// `victory_formats::bcpack::add_index`, the function the test below runs as console code.
+fn add_index_reference(cur: i16, bits: u8, refv: i16, ref_bits: u8) -> i16 {
+    let up = |v: i16, b: u8| {
+        if b == 0 || b > 16 {
+            0
+        } else {
+            (v as u16) << (16 - b)
+        }
+    };
+    let sum = up(cur, bits).wrapping_add(up(refv, ref_bits)) as i16;
+    if bits == 0 { 0 } else { sum >> (16 - bits) }
+}
+
+fn add_index_body() -> Vec<u32> {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = cur, v2 = bits, v3 = refv, v4 = ref_bits. v6 = cur left-aligned to 16 bits.
+    body.extend(vop3(0x126, 5, 128 + 16, vgpr(2), 128)); // v_sub_nc_u32 v5, 16, v2
+    body.extend(vop3(0x11A, 6, vgpr(5), vgpr(1), 128)); // v_lshlrev_b32 v6, v5, v1
+    body.extend(vop3(0x148, 6, vgpr(6), 128, 128 + 16)); // v_bfe_u32 v6, v6, 0, 16
+    body.extend(vop3(0x125, 7, 193, vgpr(2), 128)); // v_add_nc_u32 v7, -1, v2
+    body.extend(vop3(0x0C4, 106, 128 + 16, vgpr(7), 128)); // v_cmp_gt_u32 vcc, 16, v7
+    body.extend(vop3(0x101, 6, 128, vgpr(6), vcc)); // v_cndmask_b32 v6, 0, v6, vcc
+    // v9 = refv left-aligned the same way.
+    body.extend(vop3(0x126, 8, 128 + 16, vgpr(4), 128));
+    body.extend(vop3(0x11A, 9, vgpr(8), vgpr(3), 128));
+    body.extend(vop3(0x148, 9, vgpr(9), 128, 128 + 16));
+    body.extend(vop3(0x125, 10, 193, vgpr(4), 128));
+    body.extend(vop3(0x0C4, 106, 128 + 16, vgpr(10), 128));
+    body.extend(vop3(0x101, 9, 128, vgpr(9), vcc));
+    // The 16-bit sum, signed, back down to `bits` bits; nothing at a width of 0.
+    body.extend(vop3(0x125, 11, vgpr(6), vgpr(9), 128)); // v_add_nc_u32 v11, v6, v9
+    body.extend(vop3(0x149, 11, vgpr(11), 128, 128 + 16)); // v_bfe_i32 v11, v11, 0, 16
+    body.extend(vop3(0x118, 0, vgpr(5), vgpr(11), 128)); // v_ashrrev_i32 v0, v5, v11
+    body.extend(vop3(0x0C2, 106, 128, vgpr(2), 128)); // v_cmp_eq_u32 vcc, 0, v2
+    body.extend(vop3(0x101, 0, vgpr(0), 128, vcc)); // v_cndmask_b32 v0, v0, 0, vcc
+    body
+}
+
+/// BCPack's index residual plus its reference, written as console code, matches the formats
+/// crate's function on the GPU at every width, reference widths out of range included.
+#[test]
+fn bcpack_index_residual_sum_matches_the_formats_function() {
+    let shader = build_valu_cs(&add_index_body());
+    let mut cases = Vec::new();
+    let mut want = Vec::new();
+    for bits in 0u8..=16 {
+        // (residual, reference, reference width). The last two valid-width cases wrap the
+        // signed 16-bit sum in opposite directions when the residual width is also 16.
+        for (cur, refv, ref_bits) in [
+            (-7i16, 19i16, 0u8),
+            (0, 1, 1),
+            (-1, 5, 4),
+            (0x1235, -7, 8),
+            (-0x1235, 0x2a5, 15),
+            (i16::MAX, 1, 16),
+            (i16::MIN, -1, 16),
+            (1, -1, 17),
+            // At width 48 the shift count wraps to zero; the validity check must clear refv.
+            (0, -1, 48),
+            (-1, 1, 255),
+        ] {
+            cases.push([
+                cur as i32 as u32,
+                u32::from(bits),
+                refv as i32 as u32,
+                u32::from(ref_bits),
+            ]);
+            want.push(add_index_reference(cur, bits, refv, ref_bits) as i32 as u32);
+        }
+    }
+    run_cases(&shader, &cases, |backend, i, inputs, got| {
+        assert_eq!(got, want[i], "{backend}: add_index{inputs:?}");
+    });
+}
+
 #[test]
 fn bfe_signed_and_unsigned_match_rdna2() {
     // v_bfe_i32 v0, v1, v2, v3 (VOP3 opcode 0x149)
