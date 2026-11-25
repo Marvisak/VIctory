@@ -24,7 +24,7 @@ pub(crate) struct HostHeap {
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    records: Mutex<SlotRecords>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -57,6 +57,12 @@ pub(crate) struct HostHeap {
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
+}
+
+struct SlotRecords {
+    made: Vec<u64>,
+    /// Deferred texture records needed to populate the metadata table on first use.
+    deferred_metadata: std::collections::BTreeMap<u32, u64>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -192,7 +198,10 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            records: Mutex::new(SlotRecords {
+                made: vec![0; count as usize],
+                deferred_metadata: Default::default(),
+            }),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -540,12 +549,20 @@ impl HostHeap {
     /// The host address of the slots' view addresses (see the field), made
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
+        if let Some(table) = self.addresses.get() {
+            return table.as_ref().map(|entry| entry.2);
+        }
+        // Hold this through publication so mirrors cannot miss the new table.
+        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
         let made = self.addresses.get_or_init(|| {
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 8)?;
+            let (buffer, data) = host()?.upload_buffer((u64::from(self.count) + 2) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            for (i, &key) in made.iter().enumerate() {
+            // SAFETY: the allocation starts with a count and a null row.
+            unsafe { (data as *mut [u32; 8]).write_unaligned([self.count, 0, 0, 0, 0, 0, 0, 0]) };
+            let deferred = std::mem::take(&mut records.deferred_metadata);
+            for (i, &made) in records.made.iter().enumerate() {
+                let key = deferred.get(&(i as u32)).copied().unwrap_or(made);
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
                 write_address(data, i, view.as_ref());
             }
@@ -650,19 +667,21 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
+            if records.made[index as usize] != 0 {
+                records.made[index as usize] = 0;
                 self.make_null(index);
-                self.note_address(index, None);
             }
+            // Deferred texture views can still have published metadata.
+            records.deferred_metadata.remove(&index);
+            self.note_address(index, None);
             return None;
         };
-        if made[index as usize] != key {
+        if records.made[index as usize] != key {
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -672,7 +691,12 @@ impl HostHeap {
             // staging copy) for each of the ~20,000 the title has views of
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
-            made[index as usize] = if later { 0 } else { key };
+            records.made[index as usize] = if later { 0 } else { key };
+            if later && self.addresses.get().is_none() {
+                records.deferred_metadata.insert(index, key);
+            } else {
+                records.deferred_metadata.remove(&index);
+            }
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -695,7 +719,7 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = *self.records.lock().unwrap_or_else(|e| e.into_inner()).made.get(index as usize)?;
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
@@ -714,7 +738,7 @@ impl HostHeap {
     /// Whether slot `index` was made from a record (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
-        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
+        self.records.lock().unwrap_or_else(|e| e.into_inner()).made[index as usize] != 0
     }
 }
 
@@ -804,13 +828,92 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 }
 
 /// Writes slot `index`'s view address into the view addresses at `data`:
-/// a buffer view's title address (dword 0 low, dword 1 bits 0-15 high);
-/// zeros for anything else.
+/// dwords 0–1 hold a buffer view's title address. Texture width spans
+/// dwords 1–2. Dword 3 holds supported view type and mip fields.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
     let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-    let words = [address as u32, (address >> 32) as u32 & 0xFFFF];
-    // SAFETY: the mapped view addresses hold 8 bytes per title slot.
-    unsafe { ((data + 8 * index) as *mut [u32; 2]).write_unaligned(words) };
+    let [width_low, size, view_kind] = view.and_then(view_size_words).unwrap_or_default();
+    let words = [
+        address as u32,
+        ((address >> 32) as u32 & 0xFFFF) | width_low,
+        size,
+        view_kind,
+    ];
+    // SAFETY: the mapped view addresses hold 16 bytes per title slot.
+    unsafe { ((data + 16 * (index + 2)) as *mut [u32; 4]).write_unaligned(words) };
+}
+
+/// The texture extent encoded in the console descriptor's third word.
+fn view_size_words(view: &View) -> Option<[u32; 3]> {
+    let (dimension, width, height, layers, samples, levels, words, unordered) = match view {
+        View::Shader(resource, words) | View::Unordered(resource, _, words) => {
+            // SAFETY: a mirrored resource has a live host copy.
+            let desc = unsafe { crate::resource::host_resource(*resource as crate::object::This)?.GetDesc() };
+            (desc.Dimension.0 as u32, desc.Width, desc.Height, u32::from(desc.DepthOrArraySize), desc.SampleDesc.Count, u32::from(desc.MipLevels), words.as_ref(), matches!(view, View::Unordered(..)))
+        }
+        View::Placed(unordered, resource, desc) => (
+            resource[0],
+            u64::from(resource[4]) | (u64::from(resource[5]) << 32),
+            resource[6],
+            resource[7] & 0xffff,
+            resource[9],
+            resource[7] >> 16,
+            Some(desc[..10].try_into().ok()?),
+            *unordered,
+        ),
+        _ => return None,
+    };
+    if dimension == 1 {
+        let words = words?;
+        if words[1] != 1 { return None; }
+        // SAFETY: only read the buffer union member for a buffer view.
+        return Some([0, unsafe {
+            if unordered { uav_desc(words).Anonymous.Buffer.NumElements }
+            else { srv_desc(words).Anonymous.Buffer.NumElements }
+        }, 0]);
+    }
+    let mip = words.map_or(0, |words| {
+        // The first dword of the texture union is the base mip for these
+        // dimensions. MSAA views have no mip selection.
+        if unordered {
+            if matches!(words[1], 2..=5 | 8) { words[2] } else { 0 }
+        } else if matches!(words[1], 2..=5 | 8..=10) {
+            words[4]
+        } else {
+            0
+        }
+    });
+    let width = width.checked_shr(mip).unwrap_or(0).max(1) - 1;
+    let height = if dimension == 2 { 0 } else { height.checked_shr(mip).unwrap_or(0).max(1) - 1 };
+    let kind = match words.map(|words| words[1]) {
+        Some(2) => 8,
+        Some(3) => 12,
+        Some(4) => 9,
+        Some(5) => 13,
+        Some(6) if !unordered => 14,
+        Some(7) if !unordered => 15,
+        Some(8) => 10,
+        Some(9 | 10) if !unordered => 11,
+        None => match (dimension, layers > 1, samples > 1) {
+            (2, false, _) => 8,
+            (2, true, _) => 12,
+            (3, false, false) => 9,
+            (3, true, false) => 13,
+            (3, false, true) => 14,
+            (3, true, true) => 15,
+            (4, _, _) => 10,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let available = levels.saturating_sub(mip).max(1);
+    let view_levels = if unordered || matches!(kind, 14 | 15) {
+        1
+    } else {
+        words.map_or(available, |words| words[5].min(available)).max(1)
+    };
+    let size = ((width >> 2) as u32 & 0x3fff) | ((height & 0x3fff) << 14);
+    Some([(width as u32 & 3) << 30, size, (kind << 28) | (((view_levels - 1) & 15) << 16)])
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
@@ -1426,6 +1529,106 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn view_size_metadata_follows_mirrored_slot_rewrites_and_clear() {
+        let heap = HostHeap::new(false, 4).expect("WARP descriptor heap");
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let mut resource = [0; 14];
+        resource[0] = 3;
+        resource[4] = 1024;
+        resource[6] = 256;
+        resource[7] = (8 << 16) | 6;
+        let mut desc = [0; 16];
+        desc[1] = 5;
+        desc[4] = 2;
+        desc[5] = 3;
+        super::super::record(handle, View::Placed(false, resource, desc));
+        assert!(heap.mirror(1, handle, false).is_some());
+        let mut cleared_slot = [0u32; 8];
+        let cleared_handle = cleared_slot.as_mut_ptr() as u64;
+        super::super::record(cleared_handle, View::Placed(false, resource, desc));
+        assert!(heap.mirror(2, cleared_handle, false).is_some());
+        cleared_slot.fill(0);
+        assert!(heap.mirror(2, cleared_handle, false).is_none());
+
+        heap.view_addresses().expect("mapped metadata table");
+        let (_, data, _) = heap.addresses.get().and_then(Option::as_ref).unwrap();
+        // SAFETY: the table was just allocated and initialized.
+        assert_eq!(unsafe { (*data as *const [u32; 8]).read_unaligned() }, [4, 0, 0, 0, 0, 0, 0, 0]);
+        let read = |slot: usize| {
+            // SAFETY: both slots exist and each has four mapped dwords.
+            unsafe { ((*data + 16 * (slot + 2)) as *const [u32; 4]).read_unaligned() }
+        };
+        assert_eq!(read(1), [0, 3 << 30, 63 | (63 << 14), (13 << 28) | (2 << 16)]);
+        assert_eq!(read(2), [0; 4]);
+
+        desc[4] = 1;
+        super::super::record(handle, View::Placed(false, resource, desc));
+        assert!(heap.mirror(1, handle, false).is_some());
+        assert_eq!(read(1), [0, 3 << 30, 127 | (127 << 14), (13 << 28) | (2 << 16)]);
+
+        slot.fill(0);
+        assert!(heap.mirror(1, handle, false).is_none());
+        assert_eq!(read(1), [0; 4]);
+    }
+
+
+    #[test]
+    fn view_size_metadata_tracks_view_kind_and_mips() {
+        let mut resource = [0; 14];
+        resource[0] = 3;
+        resource[4] = 1024;
+        resource[6] = 256;
+        resource[7] = (8 << 16) | 6;
+        let mut desc = [0; 16];
+        desc[1] = 5; // Texture2DArray SRV.
+        desc[4] = 2;
+        desc[5] = 3;
+        assert_eq!(
+            super::view_size_words(&super::View::Placed(false, resource, desc)),
+            Some([3 << 30, 63 | (63 << 14), (13 << 28) | (2 << 16)])
+        );
+        desc[1] = 11; // Unsupported explicit view dimension.
+        assert_eq!(super::view_size_words(&super::View::Placed(false, resource, desc)), None);
+
+        desc[1] = 9; // TextureCube SRV.
+        desc[5] = u32::MAX;
+        assert_eq!(
+            super::view_size_words(&super::View::Placed(false, resource, desc)),
+            Some([3 << 30, 63 | (63 << 14), (11 << 28) | (5 << 16)])
+        );
+
+        resource[0] = 4;
+        resource[7] = (8 << 16) | 16;
+        desc[1] = 8; // Texture3D UAV.
+        desc[2] = 1;
+        assert_eq!(
+            super::view_size_words(&super::View::Placed(true, resource, desc)),
+            Some([3 << 30, 127 | (127 << 14), 10 << 28])
+        );
+    }
+
+    #[test]
+    fn view_size_metadata_keeps_buffer_record_count_and_slot_stride() {
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        let mut desc = [0; 16];
+        desc[1] = 1; // Buffer SRV.
+        desc[6] = 42;
+        let view = super::View::Placed(false, resource, desc);
+        assert_eq!(super::view_size_words(&view), Some([0, 42, 0]));
+
+        let mut metadata = [0xA5A5A5A5u32; 20];
+        let address = metadata.as_mut_ptr() as usize;
+        super::write_address(address, 1, Some(&view));
+        super::write_address(address, 2, None);
+        assert_eq!(&metadata[..12], &[0xA5A5A5A5; 12]);
+        assert_eq!(&metadata[12..16], &[0, 0, 42, 0]);
+        assert_eq!(&metadata[16..], &[0; 4]);
+    }
+
     use super::*;
 
     /// The world's 16-byte view of 0 elements removed the device.

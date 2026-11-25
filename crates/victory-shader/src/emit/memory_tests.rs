@@ -77,9 +77,9 @@ fn program() -> HostShader {
     w.extend(global(64, 0, 3, 6, 0, 0x44)); // global_atomic_fmax at +0x84
     // The address of the view at heap index 1 from its descriptor (as the
     // tracers take their BVH's), read through.
-    w.extend(s_load(1, 16, 4, 0x20)); // s[16:17] = descriptor 1, dwords 0-1
+    w.extend(s_load(2, 16, 4, 0x20)); // s[16:19] = descriptor 1
     w.push(S_WAITCNT_ALL);
-    w.extend(s_load(0, 18, 16, 0x100)); // s18 = the dword at +0x100
+    w.extend(s_load(0, 28, 16, 0x100)); // s28 = the dword at +0x100
     w.push(S_WAITCNT_ALL);
     // Pointers into a page no copy holds and into a 256 MiB region with no
     // block, read through: zeros, and both marked missed.
@@ -90,7 +90,7 @@ fn program() -> HostShader {
     w.extend(s_load(0, 27, 24, 0));
     w.push(S_WAITCNT_ALL);
     w.push(v_mov_b32(5, 14));
-    w.push(v_mov_b32(7, 18));
+    w.push(v_mov_b32(7, 28));
     w.extend(buffer_store_dword(2, 8, 0));
     w.extend(buffer_store_dword(5, 8, 4));
     w.extend(buffer_store_dword(7, 8, 8));
@@ -104,6 +104,14 @@ fn program() -> HostShader {
     w.extend(global(12, 9, 1, 0, 6, 0x24)); // global_load_dword v9, v1, s[6:7]
     w.push(S_WAITCNT_ALL);
     w.extend(buffer_store_dword(9, 8, 20));
+    w.push(v_mov_b32(5, 18));
+    w.push(v_mov_b32(7, 19));
+    w.extend(buffer_store_dword(5, 8, 24));
+    w.extend(buffer_store_dword(7, 8, 28));
+    w.extend(s_load(2, 16, 4, 0xA0)); // descriptor 5, just past the table
+    w.push(S_WAITCNT_ALL);
+    w.push(v_mov_b32(5, 18));
+    w.extend(buffer_store_dword(5, 8, 32));
     w.push(S_ENDPGM);
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -242,8 +250,11 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     memory[0x84 / 4] = (-1.0f32).to_bits();
     let value = 0xCAFE_F00D;
     // Heap index 1 (the memory's view) has the title address.
-    let mut view_addresses = vec![0u32; 2 * 5];
-    view_addresses[2..4].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
+    let mut view_addresses = vec![0u32; 4 * (5 + 2)];
+    view_addresses[0] = 5;
+    let size = 63 | (63 << 14);
+    let kind_and_mips = (13 << 28) | (2 << 16);
+    view_addresses[12..16].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32, size, kind_and_mips]);
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -275,7 +286,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                             (3, Root::View { srv: true, data: view_addresses.clone() }),
                         ],
                         views: &[
-                            View::RawUav(6),
+                            View::RawUav(9),
                             View::Memory(&memory),
                             View::Pair,
                             View::NullPair,
@@ -288,7 +299,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(
                 out[0],
-                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333],
+                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333, size, kind_and_mips, 0],
                 "{label}: reads"
             );
             assert_eq!(out[1][0x40 / 4], value, "{label}: the store");
