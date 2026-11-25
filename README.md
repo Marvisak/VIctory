@@ -85,6 +85,17 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
+On **Windows 10** the Direct3D 12 runtime in the system refuses the root
+signatures the translated shaders need ("Unsupported bit-flag set"), so no
+host pipeline can be made. Windows 11's accepts them and needs nothing more.
+For Windows 10, download the DirectX Agility SDK 1.620.x (the NuGet package
+`Microsoft.Direct3D.D3D12`; a `.nupkg` is a zip) and copy
+`build\native\bin\x64\D3D12Core.dll` into a `D3D12` folder next to
+`victory.exe` (`target\release\D3D12\`). `victory.exe` tries the system runtime
+first and loads that one only if the system's refuses the flags
+(`crates/victory-shader/src/d3d12_runtime.rs`); the log's first host line
+says which one is in use.
+
 Run the title:
 
 ```powershell

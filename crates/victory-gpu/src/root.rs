@@ -91,6 +91,35 @@ fn without_console_flags(desc: Desc) -> Desc {
     }
 }
 
+/// Serializes on the Agility runtime (`victory_shader::d3d12_runtime`) a
+/// description laid out as on PC; the blob and error pointers are the title's.
+#[cfg(windows)]
+fn agility_serialize(
+    desc: &VersionedDesc,
+    blob: *mut *mut c_void,
+    error: *mut *mut c_void,
+) -> HRESULT {
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::Win32::Graphics::Direct3D12::D3D12_VERSIONED_ROOT_SIGNATURE_DESC;
+    if blob.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: the description has the leading fields every version shares
+    // and is read as its version says; `Option<ID3DBlob>` is a nullable
+    // pointer, as the title's out pointers are.
+    let result = unsafe {
+        victory_shader::d3d12_runtime::serialize_versioned_root_signature(
+            std::ptr::from_ref(desc).cast::<D3D12_VERSIONED_ROOT_SIGNATURE_DESC>(),
+            blob.cast::<Option<ID3DBlob>>(),
+            (!error.is_null()).then(|| error.cast::<Option<ID3DBlob>>()),
+        )
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => e.code().0,
+    }
+}
+
 /// `d3d12_xs!D3D12SerializeRootSignature`.
 pub extern "system" fn serialize(
     desc: *const Desc,
@@ -102,20 +131,34 @@ pub extern "system" fn serialize(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    #[cfg(windows)]
+    if victory_shader::d3d12_runtime::uses_agility() {
+        // The runtime in Windows refuses the flags the title's signatures
+        // carry; the Agility runtime's serializer takes them.
+        let versioned = VersionedDesc {
+            version,
+            desc: without_console_flags(desc),
+        };
+        return agility_serialize(&versioned, blob, error);
+    }
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
     let Some(address) = host_export(&FUNCTION, c"D3D12SerializeRootSignature") else {
         tracing::warn!("no host d3d12.dll to serialize root signatures");
         return E_NOTIMPL;
     };
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe {
+    let hr = unsafe {
         std::mem::transmute::<usize, Serialize>(address)(
             &without_console_flags(desc),
             version,
             blob,
             error,
         )
+    };
+    if hr < 0 {
+        tracing::warn!(hr = format_args!("{hr:#x}"), flags = format_args!("{:#x}", desc.flags), "title root signature not serialized");
     }
+    hr
 }
 
 /// `d3d12_xs!D3D12SerializeVersionedRootSignature`.
@@ -128,17 +171,25 @@ pub extern "system" fn serialize_versioned(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    let desc = VersionedDesc {
+        desc: without_console_flags(desc.desc),
+        ..desc
+    };
+    #[cfg(windows)]
+    if victory_shader::d3d12_runtime::uses_agility() {
+        return agility_serialize(&desc, blob, error);
+    }
     static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
     let Some(address) = host_export(&FUNCTION, c"D3D12SerializeVersionedRootSignature") else {
         tracing::warn!("no host d3d12.dll to serialize root signatures");
         return E_NOTIMPL;
     };
-    let desc = VersionedDesc {
-        desc: without_console_flags(desc.desc),
-        ..desc
-    };
     // SAFETY: the export has this signature; it takes what the title passed.
-    unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
+    let hr = unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) };
+    if hr < 0 {
+        tracing::warn!(hr = format_args!("{hr:#x}"), flags = format_args!("{:#x}", desc.desc.flags), "title versioned root signature not serialized");
+    }
+    hr
 }
 
 type Deserialize =

@@ -1,4 +1,4 @@
-//! The host GPU: one D3D12 device and direct queue (decision 0007), and a
+﻿//! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
@@ -10,9 +10,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::{
-    D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
-};
+use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -181,20 +179,23 @@ fn create() -> windows::core::Result<Host> {
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
-        let mut device: Option<ID3D12Device> = None;
+        // The runtime in Windows, or the Agility SDK's where that cannot
+        // make the pipelines (`victory_shader::d3d12_runtime`).
+        tracing::info!("{}", victory_shader::d3d12_runtime::description());
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
+        let device = if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let device = victory_shader::d3d12_runtime::create_device(&adapter)?;
             tracing::info!("host device on the software adapter (WARP)");
+            device
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let device = victory_shader::d3d12_runtime::create_device(None::<&windows::core::IUnknown>)?;
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
-        }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
+            device
+        };
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -713,6 +714,7 @@ pub(crate) mod tests {
     fn a_list_knows_every_pointer_it_answers_with() {
         // SAFETY: plain device and list creation on the software adapter.
         unsafe {
+            use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
             let Ok(adapter) = warp_adapter() else { return };
             let mut device: Option<ID3D12Device> = None;
             if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {

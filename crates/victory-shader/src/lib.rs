@@ -6,6 +6,8 @@
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
+#[cfg(all(windows, any(test, feature = "host")))]
+pub mod d3d12_runtime;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
