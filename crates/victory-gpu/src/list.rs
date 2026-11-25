@@ -1502,26 +1502,49 @@ mod state {
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
-        if y * z != 1 {
+        if y.checked_mul(z) != Some(1) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
+    /// Inferred from `dispatch_mesh` and standard D3D12 `DispatchMesh`:
+    /// dispatches whose group count is in GPU memory (`indirect != 0`)
+    /// are routed through `State::execute_indirect` as a single `MESH`
+    /// (kind 10) command with a 12-byte `D3D12_DISPATCH_MESH_ARGUMENTS`
+    /// `(x, y, z)` record (`x`, `flags`, and `payload` ignored).
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
-        _flags: u64,
+        flags: u64,
         indirect: u64,
-        _payload: u64,
+        payload: u64,
     ) {
         super::count_draw();
-        if indirect != 0 {
+        if flags != 0 || payload != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            ONCE.call_once(|| {
+                tracing::warn!(flags, payload = format_args!("{payload:#x}"), "dispatch_mesh_x flags/payload ignored");
+            });
+        }
+        if indirect != 0 {
+            const MESH: u32 = 10;
+            const STRIDE: u32 = 12;
+            let mut ran = false;
+            with_state(this, |list, s| {
+                ran = s.execute_indirect(list, (MESH, STRIDE, 1), indirect, None);
+            });
+            if !ran {
+                super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        indirect = format_args!("{indirect:#x}"),
+                        "indirect mesh dispatch_mesh_x dropped"
+                    );
+                });
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -2030,5 +2053,33 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn indirect_dispatch_mesh_x_routes_through_execute_indirect() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        // Drain any prior indirect drop counter, then verify `indirect == 0`
+        // takes the direct path (does not increment `INDIRECT`) while
+        // `indirect != 0` routes through `execute_indirect` (which returns
+        // `false` here because no pipeline is bound, incrementing `INDIRECT`).
+        let _ = take_indirect();
+        state::dispatch_mesh_x(list, 1, 0, 0, 0);
+        assert_eq!(take_indirect(), 0);
+        state::dispatch_mesh_x(list, 0, 0, u64::MAX, 0);
+        assert!(take_indirect() >= 1);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
     }
 }
