@@ -393,6 +393,13 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     emit_with(&c, &native, &p, &st, &io, &res, options)
 }
 
+/// The container parts outside DXIL that affect emission, in the order
+/// input signature, output signature, primitive signature, runtime info.
+pub fn emission_metadata<'a>(c: &Container<'a>) -> [Option<&'a [u8]>; 4] {
+    [FourCC::ISG1, FourCC::OSG1, FourCC::PSG1, FourCC::PSV0]
+        .map(|kind| c.part(kind).map(|part| part.data))
+}
+
 /// Emits a program whose earlier stages already ran, without write marks.
 pub fn emit(
     c: &Container,
@@ -415,15 +422,16 @@ pub fn emit_with(
     res: &resource::Resources,
     options: Options,
 ) -> Result<HostShader, ShaderError> {
-    let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
-        match c.part(fourcc) {
-            Some(part) => signature(part.data),
+    let [isg, osg, psg, psv] = emission_metadata(c);
+    let sig = |part| -> Result<Vec<container::SigElement>, ShaderError> {
+        match part {
+            Some(data) => signature(data),
             None => Ok(Vec::new()),
         }
     };
     let pixel = native.stage == HwStage::Ps;
-    let mut inputs = sig(FourCC::ISG1)?;
-    let mut outputs = sig(FourCC::OSG1)?;
+    let mut inputs = sig(isg)?;
+    let mut outputs = sig(osg)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
@@ -448,7 +456,7 @@ pub fn emit_with(
     // Per-primitive outputs are constant. The console never exports a
     // primitive id or cull flag a mesh shader writes (it culls with the
     // primitive export), so those rows are left out.
-    let mut prims = sig(FourCC::PSG1)?;
+    let mut prims = sig(psg)?;
     prims.retain(|e| !matches!(e.kind, 10 | 30));
     for e in &mut prims {
         e.interp = 1;
@@ -460,7 +468,6 @@ pub fn emit_with(
     // when the HLSL group fills its waves (Grand Theft Auto VI's do).
     let mesh_stride = match &native.io {
         crate::native::StageIo::Ms(ms) => {
-            let psv = c.part(FourCC::PSV0).map(|p| p.data);
             let threads = psv
                 .filter(|d| crate::dxbc::u32_at(d, 0).is_ok_and(|n| n >= 48))
                 .and_then(|d| crate::dxbc::u32_at(d, 4 + 36).ok());
