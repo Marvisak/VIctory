@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod trunc;
 
 type Why = &'static str;
 
@@ -6008,6 +6009,7 @@ impl<'a> Lower<'a> {
                 self.write(inst, Reg::V(reg + 1), hi, guard);
                 Ok(())
             }
+            "v_trunc_f64" => self.trunc_f64(inst, guard),
             "v_mad_u64_u32" | "v_mad_i64_i32" => {
                 // 32 × 32 → 64-bit product plus a 64-bit addend (address
                 // arithmetic); the carry out is a lane mask.
