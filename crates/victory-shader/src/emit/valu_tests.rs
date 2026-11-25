@@ -1807,3 +1807,6 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+#[path = "valu_sweep_tests.rs"]
+mod sweep;
