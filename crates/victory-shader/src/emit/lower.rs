@@ -6204,6 +6204,24 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
+    /// Source `k` of a 16-bit integer operation: [`Self::half_src`] with
+    /// the neg modifier as a 16-bit two's complement. Only the integer
+    /// operations use it: the f16 callers apply the neg modifier as a
+    /// sign flip of their own, and a neg here too negates the source twice.
+    fn half_isrc(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let x = self.half_src(inst, k)?;
+        if v.neg >> k & 1 == 0 {
+            return Ok(x);
+        }
+        let c = self.cur;
+        let (z, m) = (self.s.m.i32(0), self.s.m.i32(0xFFFF));
+        let x = self.s.m.bin(c, Bin::Sub, z, x);
+        Ok(self.s.m.bin(c, Bin::And, x, m))
+    }
+
     /// An f16 source as an f32 (exact), with its abs/neg modifiers.
     fn half_fsrc(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
@@ -6464,8 +6482,11 @@ impl<'a> Lower<'a> {
             let r = self.cvt_norm16(inst, name == "v_cvt_norm_i16_f16")?;
             return self.write_half(inst, r, guard);
         }
-        // 16-bit integers: computed on the low halves, the low 16 bits kept.
-        if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        // 16-bit integers: computed on the low halves, the low 16 bits
+        // kept; the per-operand neg modifier is applied in `half_isrc`
+        // (`half_fsrc` for v_cvt_u16_f16 and v_cvt_i16_f16), the clamp,
+        // output modifier and abs are not lowered yet.
+        if v.clamp || v.omod != 0 || v.abs != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = match name {
@@ -6488,7 +6509,7 @@ impl<'a> Lower<'a> {
                 self.s.m.select(c, nan, z, r)
             }
             _ => {
-                let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                let (mut a, mut b) = (self.half_isrc(inst, 0)?, self.half_isrc(inst, 1)?);
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
                     let t = l.s.m.bin(c, Bin::Shl, x, k16);
@@ -10724,5 +10745,12 @@ mod tests {
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
         }
+    }
+
+    #[test]
+    fn a_16bit_integer_with_a_neg_modifier_lowers() {
+        // v_add_nc_u16 v0, -v1, v2 (VOP3 opcode 0x303, neg on src0;
+        // src0 = 257 (v1), src1 = 258 (v2))
+        lowers_valu(&[0xD703_0000, 0x2002_0501]).unwrap();
     }
 }

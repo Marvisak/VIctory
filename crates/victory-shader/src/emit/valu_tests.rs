@@ -379,6 +379,18 @@ fn normalized_buffer_formats_load_their_ends_exactly() {
 }
 
 #[test]
+fn an_f16_neg_modifier_negates_the_source_once() {
+    // v_add_f16 v0, -1.0, 2.0 (VOP3 opcode 0x132, neg on src0; inline
+    // constants 242 = 1.0 and 244 = 2.0). -1.0 + 2.0 = 1.0 (0x3C00). A
+    // source negated twice, as a 16-bit integer and then as an f16, is
+    // +4.0 and gives 6.0 (0x4600).
+    let shader = build_valu_cs(&[0xD532_0000, 0x2001_E8F2]);
+    run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+        assert_eq!(got & 0xFFFF, 0x3C00, "{backend}: v_add_f16 v0, -1.0, 2.0 = {got:#010x}");
+    });
+}
+
+#[test]
 fn packed_add_selects_halves_of_inline_constants() {
     // Add the inline constant 1/(2*pi) to v1 (zero) to read back its two halves.
     // The same GFX10 source field (248) has a different bit pattern for a
@@ -1746,4 +1758,36 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         "{:?}",
         refused.err()
     );
+}
+
+#[test]
+fn a_16bit_integer_neg_modifier_negates_the_low_half() {
+    // v_mov_b32 v0, 0; v_add_nc_u16 v0, -v1, v2 or v0, v1, -v2 (VOP3 0x303,
+    // neg on src0 or src1): the operand is negated as a 16-bit integer.
+    let cases: &[(u16, u16, u16, u16)] = &[
+        // (v1, v2, -v1 + v2, v1 + -v2)
+        (1, 10, 9, 0xFFF7),
+        (0, 5, 5, 0xFFFB),
+        (0xFFFF, 2, 3, 0xFFFD),
+        (0x8000, 0, 0x8000, 0x8000),
+        (10, 3, 0xFFF9, 7),
+    ];
+    for (neg, what, pick) in [(1u32 << 29, "-v1 + v2", 0usize), (1 << 30, "v1 + -v2", 1)] {
+        let [w0, w1] = vop3(0x303, 0, vgpr(1), vgpr(2), 0);
+        let shader = build_valu_cs(&[vop1(0x001, 0, 128), w0, w1 | neg]);
+        let inputs: Vec<[u32; 4]> = cases
+            .iter()
+            .map(|c| [u32::from(c.0), u32::from(c.1), 0, 0])
+            .collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let want = if pick == 0 { cases[i].2 } else { cases[i].3 };
+            assert_eq!(
+                got & 0xFFFF,
+                u32::from(want),
+                "{backend}: v_add_nc_u16 {what} with v1={:#06x}, v2={:#06x}",
+                cases[i].0,
+                cases[i].1,
+            );
+        });
+    }
 }
