@@ -52,6 +52,21 @@ What each part does today and what it still needs:
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Menus, loading and the world run with the PC upscaler (`VICTORY_FIDELITYFX_DIR`, about 1 s a frame) | The title's own upscaler DLLs: six of their passes are untranslated, so their picture is wrong |
 
+## Contributing
+
+You can build and test changes on Windows without a copy of the game. Install
+the Rust and MSVC tools listed under [Getting started](#getting-started).
+Read the [asset policy](docs/asset-policy.md) before adding test fixtures.
+
+To run the same checks as the [pull request workflow](.github/workflows/ci.yml),
+run these commands from the repository root:
+
+```powershell
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --locked
+```
+
 ## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
