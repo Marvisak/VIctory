@@ -9893,10 +9893,16 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
+                let arg = phi.args[n];
+                let st = self.x.st;
+                // A number joined in (a constant before a branch) only where
+                // the join was checked to hold per lane.
+                let checked = st.active.contains(&phi.value);
+                let m = *st
+                    .masks
+                    .get(&arg)
+                    .or_else(|| st.numbers.get(&arg).filter(|_| checked))
+                    .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
                 let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
