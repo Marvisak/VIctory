@@ -189,17 +189,18 @@ fn left_kind(view: &View) -> usize {
 ///
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
-pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
-    static LIST: Mutex<Holder> = Mutex::new(Holder(None));
+pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Arc<HostList>> {
+    // Host serializes preparation with the previous submission's completion.
+    static LIST: Mutex<Option<Arc<HostList>>> = Mutex::new(None);
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
-    match &guard.0 {
+    match &*guard {
         // Closed by the last submission, which has run.
         Some(list) => list.reset(),
         // Made open.
-        None => guard.0 = Some(crate::host::host()?.new_list().ok()?),
+        None => *guard = Some(Arc::new(crate::host::host()?.new_list().ok()?)),
     }
-    let list = guard.0.as_ref()?;
+    let list = guard.as_ref()?;
     let mut recorded = false;
     let mut done = std::collections::HashSet::new();
     for viewed in heaps {
@@ -223,22 +224,7 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     }
     list.close();
     // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads(guard))
-}
-
-/// The upload list, used under its lock only.
-pub(crate) struct Holder(Option<HostList>);
-// SAFETY: D3D12 objects are free-threaded; the list is used by one
-// submission at a time, under the lock.
-unsafe impl Send for Holder {}
-
-/// The upload list of a submission, ours until it has run.
-pub(crate) struct Uploads(std::sync::MutexGuard<'static, Holder>);
-
-impl Uploads {
-    pub(crate) fn list(&self) -> &HostList {
-        self.0.0.as_ref().expect("made before it is handed out")
-    }
+    recorded.then(|| list.clone())
 }
 
 /// Per submission: brings the buffer ranges a heap's views reach up to date

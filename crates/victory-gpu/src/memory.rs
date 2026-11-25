@@ -88,6 +88,39 @@ struct Layout {
     owner: Vec<Option<usize>>,
 }
 
+/// `VICTORY_SPARSE_PAGE_BITMAP=0` restores the original bitmap scans.
+fn sparse_page_bitmap() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("VICTORY_SPARSE_PAGE_BITMAP").is_ok_and(|v| v.trim() == "0"))
+}
+
+impl Layout {
+    /// Whether any mark names a missing page or a region with no block.
+    fn has_misses(&self, marks: &[u32], sparse: bool) -> bool {
+        let is_missing = |entry: usize| {
+            entry / BLOCK == 0
+                || entry / BLOCK >= self.blocks.len()
+                || self.owner.get(entry).is_none_or(Option::is_none)
+        };
+        if sparse {
+            for (w, &mark) in marks.iter().enumerate() {
+                let mut bits = mark;
+                while bits != 0 {
+                    let entry = w * 32 + bits.trailing_zeros() as usize;
+                    if is_missing(entry) {
+                        return true;
+                    }
+                    bits &= bits - 1;
+                }
+            }
+            return false;
+        }
+        marks.iter().enumerate().any(|(w, &mark)| {
+            (0..32).filter(|b| mark >> b & 1 != 0).any(|b| is_missing(w * 32 + b))
+        })
+    }
+}
+
 /// A view heap's page table, shared by every list using title memory with
 /// the heap bound, and the view pairs of the copies it names.
 struct Shared {
@@ -158,7 +191,24 @@ pub(crate) fn note_withheld(bytes: u64) {
 
 /// A draw or dispatch of `pipeline` uses title memory.
 pub(crate) fn note_use(pipeline: &str) {
-    stats(|s| *s.uses.entry(pipeline.to_owned()).or_default() += 1);
+    stats(|s| {
+        // A pipeline counted before is found by its name, without making
+        // a key (`VICTORY_NOTE_USE_LOOKUP=0`: a new name every draw).
+        if note_use_lookup()
+            && let Some(n) = s.uses.get_mut(pipeline)
+        {
+            *n += 1;
+            return;
+        }
+        *s.uses.entry(pipeline.to_owned()).or_default() += 1;
+    });
+}
+
+/// `VICTORY_NOTE_USE_LOOKUP` (default on): [`note_use`] finds a pipeline
+/// counted before by its name, not with an owned copy of it per draw.
+fn note_use_lookup() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NOTE_USE_LOOKUP").is_none_or(|v| v != "0"))
 }
 
 /// Logs what title memory did since the last call, if anything: a line per
@@ -298,7 +348,7 @@ impl Shared {
                         ONCE.call_once(|| tracing::warn!("no descriptor slots for a title memory copy's views: it reads as missing"));
                         continue;
                     };
-                    heap.raw_pair_at(slot, Some(&c.buffer), c.range().1.next_multiple_of(4));
+                    heap.raw_pair_at(slot, Some(c.host_resource()), c.range().1.next_multiple_of(4));
                     self.pairs.insert(key, slot);
                     slot
                 }
@@ -392,12 +442,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let l = layout(key);
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
-        marks.iter().enumerate().any(|(w, &mark)| {
-            (0..32).filter(|b| mark >> b & 1 != 0).any(|b| {
-                let entry = w * 32 + b;
-                entry / BLOCK == 0 || l.blocks.get(entry / BLOCK).is_none() || l.owner.get(entry).is_none_or(|o| o.is_none())
-            })
-        })
+        l.has_misses(marks, sparse_page_bitmap())
     });
     list.defer_after(move || {
         let Layout { copies, blocks, owner } = &*layout(key);
@@ -406,7 +451,11 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let mut writes = Vec::new();
+        let sparse = sparse_page_bitmap();
         for (w, mark) in marks.iter_mut().enumerate() {
+            if sparse && *mark == 0 {
+                continue;
+            }
             let mut bits = std::mem::take(mark);
             while bits != 0 {
                 let entry = w * 32 + bits.trailing_zeros() as usize;
@@ -435,6 +484,22 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // shortcut: root UAV writes of such a list still go back (their
         // bytes, `Shadow::gpu_writes`).
         let withheld = if pages + regions > 0 { writes.len() as u64 } else { 0 };
+        if withheld == 0 && !writes.is_empty() {
+            let ranges: Vec<_> = writes
+                .iter()
+                .filter_map(|&(k, at)| {
+                    let copy = &copies[k];
+                    copy.vram_resource()?;
+                    let (offset, len) = copy.page_range(at as usize)?;
+                    Some((copy.clone(), offset, len))
+                })
+                .collect();
+            if !ranges.is_empty()
+                && let Some(host) = crate::host::host()
+            {
+                host.readback_vram_in_execute(&ranges);
+            }
+        }
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
             let n = copies[k].copy_back_page(at as usize);
@@ -465,6 +530,78 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn note_use_counts_each_pipeline_by_name() {
+        let names = ["note-use test pipeline a", "note-use test pipeline b"];
+        for name in [names[0], names[1], names[0], names[0]] {
+            super::note_use(name);
+        }
+        let counts = super::stats(|s| names.map(|n| s.uses.get(n).copied()));
+        assert_eq!(counts, [Some(3), Some(1)]);
+    }
+    #[test]
+    fn sparse_page_bitmap_matches_named_pages_and_misses() {
+        let mut layout = Layout {
+            blocks: vec![usize::MAX, 1, 2],
+            owner: vec![Some(0); 3 * BLOCK - 1],
+            ..Layout::default()
+        };
+        layout.owner[2 * BLOCK + 32] = None;
+        for (entries, expected) in [
+            (vec![], false),
+            (vec![BLOCK + 31, 2 * BLOCK + 31], false),
+            (vec![BLOCK + 1, 2 * BLOCK + 32], true),
+            (vec![31, BLOCK + 31], true),
+            (vec![3 * BLOCK - 1], true),
+            (vec![3 * BLOCK + 33], true),
+        ] {
+            let mut marks = vec![0; (4 * BLOCK) / 32];
+            for entry in entries {
+                marks[entry / 32] |= 1 << (entry % 32);
+            }
+            assert_eq!(layout.has_misses(&marks, false), expected);
+            assert_eq!(layout.has_misses(&marks, true), expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "offline performance benchmark"]
+    fn sparse_page_bitmap_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let layout = Layout {
+            blocks: vec![0; 33],
+            owner: vec![Some(0); 33 * BLOCK],
+            ..Layout::default()
+        };
+        let mut marks = vec![0; ((CAPACITY + 1) * BLOCK) / 32];
+        for entry in (BLOCK..33 * BLOCK).step_by(1021) {
+            marks[entry / 32] |= 1 << (entry % 32);
+        }
+        for (label, first) in [("all pages named", 0), ("early region miss", 8)] {
+            marks[0] = first;
+            let mut times = [Vec::new(), Vec::new()];
+            for sample in 0..10 {
+                for mode in [sample % 2, 1 - sample % 2] {
+                    let start = Instant::now();
+                    for _ in 0..40 {
+                        black_box(layout.has_misses(black_box(&marks), mode != 0));
+                    }
+                    if sample > 0 {
+                        times[mode].push(start.elapsed());
+                    }
+                }
+            }
+            for samples in &mut times {
+                samples.sort_unstable();
+            }
+            let medians = times.map(|s| s[s.len() / 2].as_secs_f64() * 1e6 / 40.0);
+            println!("{label}: {:.2} us per original scan, {:.2} us sparse", medians[0], medians[1]);
+        }
+    }
 
     /// The shader's lookup (`victory_shader` lowering) over a table's
     /// dwords: the view index and the byte offset in that view.

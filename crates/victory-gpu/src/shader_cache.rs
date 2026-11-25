@@ -64,8 +64,35 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        // The settings that change what the translator emits key the entry
+        // too: a translation made with them off is not served with them on.
+        let flags = [u8::from(view_marks()), u8::from(heap_usage()) | u8::from(heap_table_marks()) << 1];
+        let mut h = blake3::Hasher::new();
+        h.update(&key(victory_shader::SOURCE_HASH, ENCODING, limit));
+        h.update(&flags);
+        *h.finalize().as_bytes()
     })
+}
+
+/// `VICTORY_VIEW_MARKS=1`: shaders mark the pages they write through views
+/// and copy-backs compare only those. Off by default: with it on, Grand
+/// Theft Auto VI 1.0.2.1 crashed in its prologue cutscene (a title read of
+/// address -1, twice, at Marvisak's 940d32f; not without cd94d35/940d32f).
+pub(crate) fn view_marks() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_VIEW_MARKS").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Whether the translator marks the heap slots shaders read
+/// (`VICTORY_HEAP_USAGE`, on unless 0): part of the cache key.
+fn heap_usage() -> bool {
+    std::env::var("VICTORY_HEAP_USAGE").map_or(true, |v| v != "0")
+}
+
+/// Whether descriptors loaded dynamically from tables are marked too
+/// (`VICTORY_HEAP_TABLE_MARKS`, on unless 0): part of the cache key.
+fn heap_table_marks() -> bool {
+    std::env::var("VICTORY_HEAP_TABLE_MARKS").map_or(true, |v| v != "0")
 }
 
 /// This file, whose `encode` and `decode` define the entries.
@@ -84,7 +111,7 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true };
+    let options = victory_shader::emit::Options { view_marks: view_marks() };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
@@ -208,6 +235,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         root_uavs,
         memory,
         memory_writes,
+        heap_usage,
         view_addresses,
         heap,
         heap_writes,
@@ -261,7 +289,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*view_addresses) << 2
             | u32::from(*heap) << 3
             | u32::from(*heap_writes) << 4
-            | u32::from(*view_marks) << 5,
+            | u32::from(*view_marks) << 5
+            | u32::from(*heap_usage) << 6,
     );
     out
 }
@@ -335,6 +364,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         root_uavs,
         memory: memory & 1 != 0,
         memory_writes: memory & 2 != 0,
+        heap_usage: memory & 64 != 0,
         view_addresses: memory & 4 != 0,
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
@@ -368,6 +398,7 @@ mod tests {
             root_uavs: vec![4],
             memory: true,
             memory_writes: true,
+            heap_usage: true,
             view_addresses: true,
             heap: true,
             heap_writes: true,
@@ -440,14 +471,16 @@ mod tests {
         assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
         assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
         assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
-        assert_eq!(
-            *build(),
-            key(
-                victory_shader::SOURCE_HASH,
-                ENCODING,
-                victory_shader::emit::loop_limit()
-            )
-        );
+        // The build key is that key with the emission settings mixed in.
+        let with = |flags: [u8; 2]| {
+            let mut h = blake3::Hasher::new();
+            h.update(&key(victory_shader::SOURCE_HASH, ENCODING, victory_shader::emit::loop_limit()));
+            h.update(&flags);
+            *h.finalize().as_bytes()
+        };
+        assert_eq!(*build(), with([u8::from(view_marks()), u8::from(heap_usage()) | u8::from(heap_table_marks()) << 1]));
+        assert_ne!(with([0, 1]), with([1, 1]), "view marks change the key");
+        assert_ne!(with([0, 1]), with([0, 0]), "heap usage changes the key");
         // The encoding part is this file as built.
         assert!(
             std::str::from_utf8(ENCODING)

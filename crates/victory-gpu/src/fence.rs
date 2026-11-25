@@ -1,5 +1,4 @@
-//! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
-//! GPU yet, so only signals (the title's, later our queues') move one.
+//! Title fences: a 64-bit value, visible in title memory, and its waiters.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
@@ -83,9 +82,15 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
 extern "system" fn completed(this: This) -> u64 {
+    #[cfg(windows)]
+    crate::host::drain_async();
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
+    #[cfg(windows)]
+    if event.is_null() {
+        crate::host::drain_async();
+    }
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
@@ -104,6 +109,13 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     S_OK
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
+    #[cfg(windows)]
+    crate::host::drain_async();
+    publish(this, value);
+    S_OK
+}
+
+pub(crate) fn publish(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
@@ -114,7 +126,17 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
         }
         !reached
     });
-    S_OK
+}
+
+#[cfg(windows)]
+pub(crate) fn retained_signal(this: This, value: u64) -> impl FnOnce() + Send + 'static {
+    object::add_ref(this);
+    let address = this as usize;
+    move || {
+        let this = address as This;
+        publish(this, value);
+        release(this);
+    }
 }
 
 extern "system" fn creation_flags(this: This) -> u32 {

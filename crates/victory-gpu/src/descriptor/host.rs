@@ -6,6 +6,8 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::{Acquire, Release};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -23,8 +25,11 @@ pub(crate) struct HostHeap {
     /// where the host takes them, else [`MIN_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
-    /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    /// The record (view index and generation) each slot was last made from,
+    /// read without a lock ([`mirror_fast`]); written under `making`.
+    made: Box<[AtomicU64]>,
+    /// Held while a slot is made from its record ([`Self::mirror`]).
+    making: Mutex<()>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -192,7 +197,8 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: (0..count).map(|_| AtomicU64::new(0)).collect(),
+            making: Mutex::new(()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -544,8 +550,9 @@ impl HostHeap {
             let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 8)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            for (i, &key) in made.iter().enumerate() {
+            let _making = self.making.lock().unwrap_or_else(|e| e.into_inner());
+            for (i, key) in self.made.iter().enumerate() {
+                let key = key.load(Acquire);
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
                 write_address(data, i, view.as_ref());
             }
@@ -631,6 +638,34 @@ impl HostHeap {
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
+    /// Makes the view of slot `index` (at `handle` in title memory) if it
+    /// is a placed texture's left null for later ([`Self::mirror`]), as a
+    /// draw reading it through a table would: true if it made it.
+    pub(crate) fn make_placed(&self, index: u32, handle: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if index >= self.count || self.sampler {
+            PLACED_WHY[0].fetch_add(1, Relaxed);
+            return false;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        if self.made[index as usize].load(std::sync::atomic::Ordering::Acquire) == key {
+            PLACED_WHY[1].fetch_add(1, Relaxed);
+            return false;
+        }
+        let Some(view) = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten() else {
+            PLACED_WHY[2].fetch_add(1, Relaxed);
+            return false;
+        };
+        if !is_placed_texture(&view) {
+            PLACED_WHY[3].fetch_add(1, Relaxed);
+            return false;
+        }
+        self.mirror(index, handle, true);
+        true
+    }
+
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -650,19 +685,36 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let made = &self.made[index as usize];
+        // The slot made from this record already: its view, without the
+        // lock every recording thread binding from this heap would wait on
+        // (the title's view records hold the records' lock meanwhile).
+        if mirror_fast()
+            && tag == VIEW_TAG
+            && made.load(Acquire) == key
+            && let Some(view) = view_at(i, generation)
+        {
+            return Some(view);
+        }
+        let waiting = crate::cpuprof::time(crate::cpuprof::Stage::MirrorMadeLock);
+        let _making = self.making.lock().unwrap_or_else(|e| e.into_inner());
+        drop(waiting);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
+            if made.load(Acquire) != 0 {
+                let _gpu = crate::host::guard_descriptor_write();
+                made.store(0, Release);
                 self.make_null(index);
                 self.note_address(index, None);
             }
             return None;
         };
-        if made[index as usize] != key {
+        if made.load(Acquire) != key {
+            crate::cpuprof::count(crate::cpuprof::Count::SlotRemade);
+            let _making = crate::cpuprof::time(crate::cpuprof::Stage::MirrorMake);
+            let _gpu = crate::host::guard_descriptor_write();
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -672,7 +724,9 @@ impl HostHeap {
             // staging copy) for each of the ~20,000 the title has views of
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
-            made[index as usize] = if later { 0 } else { key };
+            // Cleared while the slot is made: a lock-free reader takes the
+            // key only once the slot holds its view (stored below).
+            made.store(0, Release);
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -680,12 +734,16 @@ impl HostHeap {
             };
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
+                if !later && is_placed_texture(&view) {
+                    PLACED_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 null_for(&view, self.cpu(index));
             }
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
             self.keep(index, kept.flatten());
+            made.store(if later { 0 } else { key }, Release);
         }
         Some(view)
     }
@@ -695,7 +753,7 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = self.made.get(index as usize)?.load(std::sync::atomic::Ordering::Acquire);
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
@@ -714,8 +772,17 @@ impl HostHeap {
     /// Whether slot `index` was made from a record (tests).
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
-        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
+        self.made[index as usize].load(std::sync::atomic::Ordering::Acquire) != 0
     }
+}
+
+/// Whether a slot already made from the record a draw finds is read
+/// without the heap's lock (`VICTORY_MIRROR_FAST`, on unless `0`): with it,
+/// the world's recording threads waited ~10 us per table entry on each
+/// other.
+pub(crate) fn mirror_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MIRROR_FAST").is_none_or(|v| v != "0"))
 }
 
 /// Logs `what` the first time it happens.
@@ -904,9 +971,10 @@ fn buffer_srv(
         }
         return None;
     };
+    let resource = shadow.host_resource();
     buffer.FirstElement = shadow.offset(start) / element;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
+    if !in_buffer(resource, first, count, element) {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), first, count, element, "refused buffer view: empty or past its copy");
@@ -918,9 +986,9 @@ fn buffer_srv(
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
-            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
+            .CreateShaderResourceView(resource, Some(&desc), at)
     };
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((resource.clone(), own.then_some(shadow))))
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
@@ -961,8 +1029,9 @@ fn buffer_uav(
     }
     let start = address + buffer.FirstElement * element;
     let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let resource = shadow.host_resource();
     // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+    let flags = unsafe { resource.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
@@ -970,7 +1039,7 @@ fn buffer_uav(
     buffer.FirstElement = shadow.offset(start) / element;
     buffer.CounterOffsetInBytes = 0;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
+    if !in_buffer(resource, first, count, element) {
         once!(first, count, element, "unordered buffer view empty or past its host copy");
         return None;
     }
@@ -978,10 +1047,10 @@ fn buffer_uav(
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
-            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
+            .CreateUnorderedAccessView(resource, None::<&ID3D12Resource>, Some(&desc), at)
     };
     MARK.with(|m| m.set(shadow.mark_entry(start)));
-    Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+    Some(Some((resource.clone(), own.then_some(shadow))))
 }
 
 thread_local! {
@@ -1240,6 +1309,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 }
 
 /// Whether `view` is a view of a texture the title placed in memory itself.
+/// Marked slots not made, by reason: past the heap or a sampler heap,
+/// already made, no view of ours there, not a placed texture.
+/// Placed-texture views the host tried to make and could not (left null
+/// although marked made).
+pub(crate) static PLACED_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) static PLACED_WHY: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 fn is_placed_texture(view: &View) -> bool {
     matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
 }
@@ -1427,6 +1504,67 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recording threads mirror table slots while the title rewrites them:
+    /// each draw gets one of the views the slot held, and once the title
+    /// stops, the slot is made from its last record (lock-free reads of
+    /// slots made already, `VICTORY_MIRROR_FAST`).
+    #[test]
+    fn slots_mirrored_by_many_threads_follow_the_title_records() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 64, 1, 0, 0, 0, 0, 0];
+        let mut h = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut h), crate::object::S_OK);
+        let title = crate::descriptor::heap(h);
+        let host = title.host().expect("a host view heap");
+        let slot = title.start + 3 * 32;
+        let memory = vec![0u8; 1 << 16];
+        let [a, b] = [0u64, 4096].map(|o| memory.as_ptr() as u64 + o);
+        let cbv = |at: u64| crate::descriptor::create_cbv(null, &[at as u32, (at >> 32) as u32, 256, 0], slot);
+        let key = || {
+            // SAFETY: a descriptor slot of the title heap.
+            let [_, i, generation] = unsafe { (slot as *const [u32; 3]).read_unaligned() };
+            u64::from(generation) << 32 | u64::from(i)
+        };
+        cbv(a);
+        assert_eq!(host.mirror(3, slot, true), Some(View::Constant(a, 256)));
+        assert_eq!(host.made[3].load(Acquire), key());
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let readers: Vec<_> = (0..4)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut n = 0;
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) || n < 1000 {
+                            let view = host.mirror(3, slot, true);
+                            assert!(
+                                matches!(view, Some(View::Constant(at, 256)) if at == a || at == b),
+                                "{view:?}"
+                            );
+                            n += 1;
+                        }
+                    })
+                })
+                .collect();
+            for k in 0..2000 {
+                cbv(if k % 2 == 0 { b } else { a });
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            for r in readers {
+                r.join().unwrap();
+            }
+        });
+        // The title's last record, b: a draw finds the slot made from it.
+        cbv(b);
+        assert_eq!(host.mirror(3, slot, true), Some(View::Constant(b, 256)));
+        assert_eq!(host.made[3].load(Acquire), key());
+        assert_eq!(host.mirror(3, slot, true), Some(View::Constant(b, 256)), "unchanged: the same");
+        drop(memory);
+    }
 
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]

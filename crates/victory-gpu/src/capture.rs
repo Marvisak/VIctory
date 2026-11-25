@@ -23,6 +23,7 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     LIST.get_or_init(|| numbers("VICTORY_CAPTURE_FRAMES")).contains(&n)
+        || TRIGGERED.load(std::sync::atomic::Ordering::Relaxed) == n
         || WORLD
             .get()
             .is_some_and(|&w| world_offsets().iter().any(|&k| w + k == n))
@@ -43,9 +44,20 @@ fn world_offsets() -> &'static [u64] {
 /// The first frame that ran 500 draws on the host.
 static WORLD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
+/// A frame asked for while running: `capture-now` created in the capture
+/// folder makes the frame after the next one captured (the file is removed).
+static TRIGGERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Frame `n` was presented: notes the world's first frame.
 pub(crate) fn presented(n: u64) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    if let Some(folder) = folder() {
+        let trigger = folder.join("capture-now");
+        if trigger.exists() && std::fs::remove_file(&trigger).is_ok() {
+            TRIGGERED.store(n + 2, Relaxed);
+            tracing::info!(frame = n + 2, "capture asked for (capture-now)");
+        }
+    }
     static LAST: AtomicU64 = AtomicU64::new(0);
     let drawn = crate::draw::drawn();
     let draws = drawn - LAST.swap(drawn, Relaxed).min(drawn);

@@ -189,6 +189,136 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// Per list: the heap-usage bitmap shaders that take views from the view
+/// heap `heap` mark the slots they read in (`victory_shader::emit`,
+/// `HostShader::heap_usage`), as its host GPU address. After the list ran,
+/// each marked slot whose view the host left null (a placed texture, see
+/// `host::HostHeap::mirror`) is made, so it reads from the next list on;
+/// the bitmap is cleared. With `VICTORY_HEAP_USAGE=0` (or no such heap) the
+/// marks are ignored.
+#[cfg(windows)]
+pub(crate) fn usage_bitmap(list: &crate::host::HostList, heap: usize) -> Option<u64> {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    if heap_usage_vram_on() {
+        if let Some((gpu, data, pending)) = list.heap_usage_vram() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::info!("heap usage feedback in default heap with per-list readback"));
+            let data = data as usize;
+            list.defer_feedback(move || {
+                // A submission can execute one list twice; its final
+                // readback contains both executions, processed once.
+                if pending.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    // SAFETY: list-owned readback, after the GPU fence.
+                    let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
+                    publish_usage(heap, marks.iter().copied());
+                }
+            });
+            return Some(gpu);
+        }
+        static FALLBACK: std::sync::Once = std::sync::Once::new();
+        FALLBACK.call_once(|| tracing::warn!("default-heap feedback unavailable; using the shared bitmap"));
+    }
+    let (bitmap, data) = crate::host::host()?.shared_buffer((words as u64 * 4).next_multiple_of(256))?;
+    crate::host::name(&bitmap, || "heap slots read".into());
+    // SAFETY: our mapped buffer of at least `words` dwords.
+    unsafe { std::ptr::write_bytes(data.cast::<u32>(), 0, words) };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { bitmap.GetGPUVirtualAddress() };
+    list.keep(&bitmap);
+    let data = data as usize;
+    list.defer_feedback(move || {
+        // SAFETY: the bitmap is mapped and the list's run is over.
+        let marks = unsafe { std::slice::from_raw_parts_mut(data as *mut u32, words) };
+        publish_usage(heap, marks.iter_mut().map(|mark| {
+            if *mark == 0 { 0 } else { std::mem::take(mark) }
+        }));
+    });
+    Some(gpu)
+}
+
+#[cfg(windows)]
+fn usage_slots(marks: impl Iterator<Item = u32>, on: bool) -> Vec<u32> {
+    let mut used = Vec::new();
+    for (w, mut bits) in marks.enumerate() {
+        while on && bits != 0 {
+            used.push((w * 32) as u32 + bits.trailing_zeros());
+            bits &= bits - 1;
+        }
+    }
+    used
+}
+
+#[cfg(windows)]
+fn publish_usage(heap: usize, marks: impl Iterator<Item = u32>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if heap == 0 {
+        USAGE.2.fetch_add(1, Relaxed);
+    }
+    let used = usage_slots(marks, heap_usage_on() && heap != 0);
+    if !used.is_empty() {
+        let made = make_used(heap, &used);
+        USAGE.0.fetch_add(used.len() as u64, Relaxed);
+        USAGE.1.fetch_add(made, Relaxed);
+    }
+}
+
+#[cfg(windows)]
+fn heap_usage_vram_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("VICTORY_HEAP_USAGE_VRAM").as_deref(), Ok("1")))
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn heap_usage_decodes_sparse_words_in_slot_order() {
+    let words = [0, 0x8000_0001, 0x10, 0];
+    assert_eq!(usage_slots(words.into_iter(), true), [32, 63, 68]);
+    assert!(usage_slots(words.into_iter(), false).is_empty());
+}
+
+/// Heap slots marked read, and views made for them, since the last call.
+#[cfg(windows)]
+pub(crate) fn take_usage() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (USAGE.0.swap(0, Relaxed), USAGE.1.swap(0, Relaxed))
+}
+#[cfg(windows)]
+pub(crate) static USAGE: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64) =
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
+
+#[cfg(windows)]
+fn heap_usage_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_USAGE").map_or(true, |v| v != "0"))
+}
+
+/// Makes the views of slots `used` of the title view heap `heap` that the
+/// host left null for later (placed textures); how many it made.
+#[cfg(windows)]
+fn make_used(heap: usize, used: &[u32]) -> u64 {
+    // Held throughout: a heap is not dropped while its slots are made.
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if !heaps.iter().any(|&(_, _, h)| h == heap) {
+        USAGE.2.fetch_add(1000, std::sync::atomic::Ordering::Relaxed);
+        return 0;
+    }
+    // SAFETY: registered heaps are live (removed when dropped).
+    let h = unsafe { &*(heap as *const Heap) };
+    let (Some(Some(host)), Some(step)) = (h.host.get(), increment(h.desc.kind)) else {
+        USAGE.2.fetch_add(1_000_000, std::sync::atomic::Ordering::Relaxed);
+        return 0;
+    };
+    let step = u64::from(step);
+    let mut made = 0;
+    for &index in used {
+        if host.make_placed(index, h.start + u64::from(index) * step) {
+            made += 1;
+        }
+    }
+    drop(heaps);
+    made
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
@@ -369,7 +499,9 @@ struct Views {
     free: Vec<u32>,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+/// Read by every table entry a draw binds, written as the title records
+/// views: readers share it.
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
@@ -392,7 +524,21 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    // Most records are of views recorded before: the shared lock finds them.
+    let known = {
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        views.index.get(&view).map(|&i| {
+            let generation = views.list[i as usize].1;
+            // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+            unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+        })
+    };
+    if known.is_some() {
+        #[cfg(windows)]
+        mirror(handle);
+        return;
+    }
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let i = match views.index.get(&view) {
         Some(&i) => i,
         None => {
@@ -423,7 +569,7 @@ fn record(handle: u64, view: View) {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -445,7 +591,9 @@ pub(crate) fn forget(resource: usize) {
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let waiting = crate::cpuprof::time(crate::cpuprof::Stage::ViewsLock);
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    drop(waiting);
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
 }
@@ -457,7 +605,9 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let waiting = crate::cpuprof::time(crate::cpuprof::Stage::ViewsLock);
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    drop(waiting);
     let (view, current) = views.list.get(i as usize)?;
     (tag == VIEW_TAG && *current == generation).then(|| view.clone())
 }
@@ -689,6 +839,12 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     object::answer(DESCRIPTOR_HEAP, iid, found, out)
 }
 extern "system" fn release(this: This) -> u32 {
+    #[cfg(windows)]
+    if matches!(heap(this).desc.kind, 0 | 1) {
+        // Lists hold the native heap, while its backing views and metadata
+        // still belong to this title heap.
+        crate::host::drain_async();
+    }
     object::release_boxed::<Heap>(this)
 }
 extern "system" fn desc(this: This, out: *mut HeapDesc) {

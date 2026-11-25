@@ -220,7 +220,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    HEAP_USAGE, USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
 /// The loop limit without an override: 2^20.
@@ -291,6 +291,12 @@ pub struct HostShader {
     /// Whether the host binds the page bitmap `u0` in [`MEMORY_SPACE`]
     /// (pages written and pages missed): whenever [`HostShader::memory`].
     pub memory_writes: bool,
+    /// Whether the host binds the heap-usage bitmap `u1` in
+    /// [`MEMORY_SPACE`]: shaders taking resource views from the heap itself
+    /// set bit `index` for each slot they read (once per wave when uniform),
+    /// so that the host makes the views it left null (placed textures) the
+    /// next time.
+    pub heap_usage: bool,
     /// Whether it reads buffer views' title addresses from their
     /// descriptors: the host binds the view addresses `t1` in
     /// [`MEMORY_SPACE`] (module notes, "Title memory").
@@ -515,6 +521,7 @@ pub fn emit_with(
         root_uavs: l.root_uavs,
         memory: l.memory,
         memory_writes: l.memory_writes,
+        heap_usage: l.heap_usage,
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
@@ -562,6 +569,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             8 => 2,
             9 => 13,
             10 => 12,
+            23 => 28, // barycentrics
             64 => 16,
             65 => 17,
             66 => 14,
@@ -874,6 +882,7 @@ mod tests {
             root_uavs: Vec::new(),
             memory: false,
             memory_writes: false,
+            heap_usage: false,
             view_addresses: false,
             heap: false,
             heap_writes: false,
@@ -891,6 +900,7 @@ mod tests {
                 root_uavs: Vec::new(),
                 memory: false,
                 memory_writes: false,
+                heap_usage: false,
                 view_addresses: false,
                 heap: false,
                 heap_writes: false,
@@ -1187,6 +1197,56 @@ mod tests {
         assert_eq!(center[4 + 1], 0, "center interpolation is per pixel");
         let sample = psv_of(1 << 0);
         assert_eq!(sample[4 + 1], 1, "PSInfo.SampleFrequency");
+    }
+
+    #[test]
+    fn direct_barycentrics_reach_pixel_export_through_a_join() {
+        let words = [
+            0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 to the export
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xF800_180F,
+            0x0100_0100, // exp mrt0 v0, v1, v0, v1 done vm
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![crate::RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 1, // Perspective center I and J.
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg = rows(&[("SV_Target", 16, false)], false);
+        let c = crate::dxbc::build(&[(FourCC::OSG1, &osg)]);
+        let c = Container::parse(&c).unwrap();
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let mut shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let output = Container::parse(&shader.dxil).unwrap();
+        let sig = super::signature(output.part(FourCC::ISG1).unwrap().data).unwrap();
+        assert_eq!((sig[0].kind, sig[0].row, sig[0].cols), (28, None, 3));
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shader.dxil).unwrap();
+        }
     }
 
     /// Emits a pixel program of `words` with these inputs and signatures.

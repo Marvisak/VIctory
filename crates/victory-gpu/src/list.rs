@@ -116,7 +116,7 @@ struct List {
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Upload>>,
     #[cfg(windows)]
-    host: Option<crate::host::HostList>,
+    host: Option<std::sync::Arc<crate::host::HostList>>,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
@@ -140,7 +140,16 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
         return None;
     }
     // SAFETY: the title passes one of our lists.
-    unsafe { (*this.cast::<List>()).host.as_ref() }
+    unsafe { (*this.cast::<List>()).host.as_deref() }
+}
+
+#[cfg(windows)]
+pub(crate) fn retain_host_list(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: the title holds the list for the duration of submission.
+    unsafe { (*this.cast::<List>()).host.clone() }
 }
 
 pub(crate) extern "system" fn create_allocator(
@@ -223,7 +232,7 @@ fn new_list(
         uploads: Default::default(),
         #[cfg(windows)]
         host: crate::host::host().and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
+            Ok(list) => Some(std::sync::Arc::new(list)),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
                 None
@@ -259,6 +268,10 @@ extern "system" fn list_query(this: This, iid: *const Iid, out: *mut This) -> HR
     object::answer(LIST, iid, object::is(iid, &LIST_IIDS).then_some(this), out)
 }
 extern "system" fn list_release(this: This) -> u32 {
+    #[cfg(windows)]
+    if let Some(host) = host_list(this) {
+        host.wait_for_reuse();
+    }
     object::release_boxed::<List>(this)
 }
 extern "system" fn list_type(this: This) -> u32 {
@@ -276,7 +289,10 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Every submission of the list has run (submissions are waited for).
+    #[cfg(windows)]
+    if let Some(host) = host_list(this) {
+        host.wait_for_reuse();
+    }
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -404,6 +420,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
+    #[cfg(windows)]
+    crate::cpuprof::count(crate::cpuprof::Count::Barrier);
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
@@ -493,12 +511,20 @@ extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32
 pub(crate) struct CopyLocation {
     resource: This,
     kind: u32,
+    location: CopyLocationData,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+union CopyLocationData {
+    subresource: u32,
     footprint: crate::resource::PlacedFootprint,
 }
 
-/// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+const SUBRESOURCE: u32 = 0;
+const FOOTPRINT: u32 = 1;
+
+/// Texture copies on the GPU, with linear staging for title buffers.
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -512,7 +538,6 @@ extern "system" fn copy_texture_region(
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
         use windows::core::Interface;
-        const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
         let (Some(list), Some(&dst), Some(&src)) =
             (host_list(this), unsafe { dst.as_ref() }, unsafe {
@@ -521,20 +546,32 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        if dst.kind == FOOTPRINT && src.kind == SUBRESOURCE {
+            copy_texture_to_buffer(list, dst, [x, y, z], src, source_box);
+            return;
+        }
+        if dst.kind != SUBRESOURCE || !matches!(src.kind, SUBRESOURCE | FOOTPRINT) {
+            return;
+        }
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
         };
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
+        let mut composed = None;
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            // SAFETY: a placed footprint is the active location.
+            let mut footprint = unsafe { src.location.footprint };
+            let title_offset = footprint.offset;
+            let (Some(host), Some(bytes)) = (crate::host::host(), footprint.bytes()) else {
                 return;
             };
-            let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
+            if !footprint.row_pitch.is_multiple_of(256) {
+                return;
+            }
+            let Some(data) = buffer_range(src.resource, title_offset, bytes) else {
                 return;
             };
             let Some((buffer, staging)) = list.upload(host, bytes) else {
@@ -543,12 +580,23 @@ extern "system" fn copy_texture_region(
             // The list owns this mapped D3D12 upload buffer. Wine can report
             // its address as MEM_FREE, so use the host-upload path.
             list.defer_fill(staging, data, bytes as usize);
-            from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            let title = data as u64..data as u64 + bytes;
+            let readbacks = list.texture_readbacks(&title);
+            if !readbacks.is_empty() {
+                let Some(merged) = compose_texture_upload(list, host, &buffer, title, &readbacks) else {
+                    return;
+                };
+                composed = Some(merged);
+            }
+            let upload = composed.as_ref().unwrap_or(&buffer);
+            from.resource = upload.as_raw().cast_const().cast();
+            footprint.format = crate::resource::pc_format(footprint.format);
+            footprint.offset = 0;
+            from.location = CopyLocationData { footprint };
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { upload.GetGPUVirtualAddress() }, bytes));
             }
             _upload = buffer;
         } else {
@@ -580,7 +628,7 @@ extern "system" fn copy_texture_region(
                     dst.kind,
                     src.resource,
                     src.kind,
-                    (src.kind == FOOTPRINT).then_some(src.footprint)
+                    (src.kind == FOOTPRINT).then(|| unsafe { src.location.footprint })
                 )
             };
             match read {
@@ -602,6 +650,9 @@ extern "system" fn copy_texture_region(
                 host_box,
             )
         };
+        if let Some(buffer) = composed {
+            release_copy_source(list, &buffer);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
@@ -619,6 +670,264 @@ extern "system" fn copy_texture_region_x(
     _flags: u32,
 ) {
     copy_texture_region(this, dst, x, y, z, src, source_box);
+}
+
+/// The bytes a texture box occupies in a linear buffer, excluding padding.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct CopyRows {
+    first: u64,
+    count: u32,
+    depth: u32,
+    row_pitch: u64,
+    slice_pitch: u64,
+    row_bytes: u64,
+}
+
+#[cfg(windows)]
+impl CopyRows {
+    fn new(
+        footprint: crate::resource::PlacedFootprint,
+        at: [u32; 3],
+        size: [u32; 3],
+    ) -> Option<Self> {
+        let (element, block) = crate::resource::element(footprint.format)?;
+        footprint.bytes()?;
+        let [x, y, z] = at;
+        let [w, h, d] = size;
+        let block = block as u32;
+        if size.contains(&0)
+            || !x.is_multiple_of(block)
+            || !y.is_multiple_of(block)
+            || x.checked_add(w)? > footprint.width
+            || y.checked_add(h)? > footprint.height
+            || z.checked_add(d)? > footprint.depth
+        {
+            return None;
+        }
+        let row_pitch = u64::from(footprint.row_pitch);
+        let slice_pitch = row_pitch * u64::from(footprint.height.div_ceil(block));
+        Some(Self {
+            first: u64::from(z) * slice_pitch + u64::from(y / block) * row_pitch
+                + u64::from(x / block) * element,
+            count: h.div_ceil(block),
+            depth: d,
+            row_pitch,
+            slice_pitch,
+            row_bytes: u64::from(w.div_ceil(block)) * element,
+        })
+    }
+
+    fn end(self) -> u64 {
+        self.first + u64::from(self.depth - 1) * self.slice_pitch
+            + u64::from(self.count - 1) * self.row_pitch + self.row_bytes
+    }
+
+    fn ranges(self) -> impl Iterator<Item = std::ops::Range<u64>> {
+        (0..self.depth).flat_map(move |z| {
+            (0..self.count).map(move |row| {
+                let start = self.first + u64::from(z) * self.slice_pitch
+                    + u64::from(row) * self.row_pitch;
+                start..start + self.row_bytes
+            })
+        })
+    }
+}
+
+/// An earlier texture copy whose linear bytes are available on this list.
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct TextureReadback {
+    buffer: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    title: u64,
+    rows: CopyRows,
+}
+
+#[cfg(windows)]
+impl TextureReadback {
+    pub(crate) fn overlaps(&self, target: &std::ops::Range<u64>) -> bool {
+        self.rows.ranges().any(|r| self.title + r.start < target.end
+            && target.start < self.title + r.end)
+    }
+}
+
+#[cfg(windows)]
+fn release_copy_source(
+    list: &crate::host::HostList,
+    buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    // SAFETY: an open list, after reading this private staging buffer.
+    unsafe {
+        list.list.ResourceBarrier(&[crate::host::transition(
+            buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON,
+        )]);
+    }
+}
+
+/// Overlay same-list readbacks on the title's earlier contents, in GPU order.
+#[cfg(windows)]
+fn compose_texture_upload(
+    list: &crate::host::HostList,
+    host: &crate::host::Host,
+    upload: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    title: std::ops::Range<u64>,
+    readbacks: &[TextureReadback],
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+    };
+    let buffer = host.default_buffer(title.end - title.start)?;
+    // SAFETY: a live upload and a private destination of the same size.
+    unsafe { list.list.CopyBufferRegion(&buffer, 0, upload, 0, title.end - title.start) };
+    for readback in readbacks {
+        // Finish the prior writes before overlaying any overlapping bytes.
+        // SAFETY: open list; the private buffer was just a destination.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        for row in readback.rows.ranges() {
+            let from = (readback.title + row.start).max(title.start);
+            let to = (readback.title + row.end).min(title.end);
+            if from < to {
+                // SAFETY: the intersection fits both buffers. Both use
+                // common-state promotion for the next copy.
+                unsafe { list.list.CopyBufferRegion(
+                    &buffer, from - title.start,
+                    &readback.buffer, from - readback.title,
+                    to - from,
+                ) };
+            }
+        }
+        release_copy_source(list, &readback.buffer);
+    }
+    // SAFETY: the staging buffer was last a destination, and the next
+    // command reads it as a texture footprint.
+    unsafe {
+        list.list.ResourceBarrier(&[crate::host::transition(
+            &buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+    }
+    list.keep(&buffer);
+    Some(buffer)
+}
+
+#[cfg(windows)]
+fn copy_texture_to_buffer(
+    list: &crate::host::HostList,
+    dst: CopyLocation,
+    at: [u32; 3],
+    src: CopyLocation,
+    source_box: *const [u32; 6],
+) {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BOX, D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+    };
+    use windows::core::Interface;
+    let (Some(host), Some(texture)) =
+        (crate::host::host(), crate::resource::host_resource(src.resource))
+    else {
+        return;
+    };
+    // SAFETY: the caller checked the active union members and passes a box
+    // or null. The host texture is live.
+    let (mut fp, index, bounds, desc) = unsafe {
+        (dst.location.footprint, src.location.subresource, source_box.as_ref().copied(), texture.GetDesc())
+    };
+    let mips = u32::from(desc.MipLevels);
+    let volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    let layers = if volume { 1 } else { u32::from(desc.DepthOrArraySize) };
+    if mips == 0 || index >= mips * layers || desc.SampleDesc.Count != 1
+        || desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+    {
+        tracing::warn!(index, "unsupported texture subresource for buffer copy");
+        return;
+    }
+    fp.format = crate::resource::pc_format(fp.format);
+    let format = desc.Format.0 as u32;
+    if crate::resource::family(fp.format) != crate::resource::family(format)
+        || matches!(fp.format, 68 | 69 | 116..)
+        || !fp.row_pitch.is_multiple_of(256)
+    {
+        tracing::warn!(?fp, format, "invalid texture-to-buffer format or row pitch");
+        return;
+    }
+    let mip = index % mips;
+    let extent = [
+        u32::try_from(desc.Width >> mip).unwrap_or(u32::MAX).max(1),
+        (desc.Height >> mip).max(1),
+        if volume { (u32::from(desc.DepthOrArraySize) >> mip).max(1) } else { 1 },
+    ];
+    let [left, top, front, right, bottom, back] =
+        bounds.unwrap_or([0, 0, 0, extent[0], extent[1], extent[2]]);
+    let Some((_, block)) = crate::resource::element(fp.format) else {
+        return;
+    };
+    let block = block as u32;
+    if left >= right || top >= bottom || front >= back
+        || right > extent[0] || bottom > extent[1] || back > extent[2]
+        || !left.is_multiple_of(block) || !top.is_multiple_of(block)
+        || (!right.is_multiple_of(block) && right != extent[0])
+        || (!bottom.is_multiple_of(block) && bottom != extent[1])
+    {
+        tracing::warn!(?bounds, ?extent, "invalid texture-to-buffer source box");
+        return;
+    }
+    let Some(rows) = CopyRows::new(fp, at, [right - left, bottom - top, back - front]) else {
+        tracing::warn!(?fp, ?at, "invalid texture-to-buffer destination footprint");
+        return;
+    };
+    let Some(bytes) = fp.bytes() else { return };
+    let Some(data) = buffer_range(dst.resource, fp.offset, bytes) else { return };
+    let Some((buffer, staging)) = host.shared_buffer(bytes) else { return };
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, texture);
+    }
+    ensure_state(list, src.resource, COPY_SOURCE);
+    let from = CopyLocation { resource: texture.as_raw().cast_const().cast(), ..src };
+    // The title buffer is linear, as for an upload. The staging buffer
+    // starts at zero independently of the title's placed offset.
+    fp.offset = 0;
+    let to = CopyLocation {
+        resource: buffer.as_raw().cast_const().cast(),
+        kind: FOOTPRINT,
+        location: CopyLocationData { footprint: fp },
+    };
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!(
+        "copy texture to buffer: subresource {index} {:?} to {:?} {data:p}, {fp:?} at {at:?} box {bounds:?}",
+        src.resource, dst.resource
+    ));
+    // SAFETY: open list, live resources, checked source and destination
+    // extents and a host-aligned linear footprint. The private buffer
+    // starts in COMMON and promotes to COPY_DEST.
+    unsafe {
+        list.list.CopyTextureRegion(
+            (&raw const to).cast(), at[0], at[1], at[2], (&raw const from).cast(),
+            (!source_box.is_null()).then_some(source_box.cast::<D3D12_BOX>()),
+        );
+        list.list.ResourceBarrier(&[crate::host::transition(
+            &buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON,
+        )]);
+    }
+    list.defer_texture_readback(TextureReadback { buffer, title: data as u64, rows });
+    let (title, staging) = (data as usize, staging as usize);
+    list.defer_after(move || {
+        // The copy finished before this callback. Open watched destination
+        // pages as for ordinary title-buffer copies, and leave padding and
+        // texels outside the box alone.
+        let _writing = crate::watch::writing(title + rows.first as usize, (rows.end() - rows.first) as usize);
+        for row in rows.ranges() {
+            crate::host::write_mapped(
+                (title + row.start as usize) as *mut u8,
+                (staging + row.start as usize) as *const u8,
+                (row.end - row.start) as usize,
+            );
+        }
+    });
 }
 
 extern "system" fn resolve(
@@ -1640,6 +1949,165 @@ mod tests {
         });
         assert_eq!(release(allocator), 0);
     }
+
+    // ---- PlacedFootprint::bytes and CopyRows math -------------------------
+
+    fn rgba8_fp(w: u32, h: u32, d: u32) -> crate::resource::PlacedFootprint {
+        // RGBA8 = format 28, 4 bytes/texel, block=1
+        let pitch = (w * 4).next_multiple_of(256);
+        crate::resource::PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: w,
+            height: h,
+            depth: d,
+            row_pitch: pitch,
+        }
+    }
+
+    fn bc1_fp(w: u32, h: u32, d: u32) -> crate::resource::PlacedFootprint {
+        // BC1 = format 71, 8 bytes/block (4x4), block=4
+        let blocks_w = w.div_ceil(4);
+        let pitch = (blocks_w * 8).next_multiple_of(256);
+        crate::resource::PlacedFootprint {
+            offset: 0,
+            format: 71,
+            width: w,
+            height: h,
+            depth: d,
+            row_pitch: pitch,
+        }
+    }
+
+    /// bytes() = pitch*(rows-1) + last_row; for a 1×1 RGBA8 that is just 4.
+    #[test]
+    fn placed_footprint_bytes_1x1() {
+        let fp = rgba8_fp(1, 1, 1);
+        // last row = 1 * 4 = 4; zero full-pitch rows.
+        assert_eq!(fp.bytes(), Some(4));
+    }
+
+    /// For a 1×2 RGBA8: pitch*(2-1) + 4 = 256 + 4 = 260.
+    #[test]
+    fn placed_footprint_bytes_two_rows() {
+        let fp = rgba8_fp(1, 2, 1);
+        assert_eq!(fp.bytes(), Some(256 + 4));
+    }
+
+    /// A 256×256 RGBA8: last row = 256*4 = 1024, pitch = 1024.
+    /// bytes = 1024*(256-1) + 1024 = 1024*256 = 262144.
+    #[test]
+    fn placed_footprint_bytes_full_row() {
+        let fp = rgba8_fp(256, 256, 1);
+        assert_eq!(fp.bytes(), Some(1024 * 256));
+    }
+
+    /// BC1 4×4 single block: 8 bytes, one row.
+    #[test]
+    fn placed_footprint_bytes_bc1_one_block() {
+        let fp = bc1_fp(4, 4, 1);
+        // 1 block wide × 8 = 8 bytes last row; 1 row total.
+        assert_eq!(fp.bytes(), Some(8));
+    }
+
+    /// An invalid footprint where last row bytes > pitch returns None.
+    #[test]
+    fn placed_footprint_bytes_invalid_too_wide() {
+        let mut fp = rgba8_fp(256, 1, 1);
+        fp.row_pitch = 100; // narrower than the 1024-byte row: invalid
+        assert_eq!(fp.bytes(), None);
+    }
+
+    /// Zero height/width: no element → None.
+    #[test]
+    fn placed_footprint_bytes_unknown_format() {
+        let fp = crate::resource::PlacedFootprint {
+            offset: 0, format: 0, width: 4, height: 4, depth: 1, row_pitch: 256,
+        };
+        assert_eq!(fp.bytes(), None);
+    }
+
+    // ---- CopyRows ---------------------------------------------------------
+    // These are only compiled on Windows (CopyRows is #[cfg(windows)]).
+
+    /// Full 2×2 RGBA8 copy: first=0, count=2, row_bytes=8.
+    #[cfg(windows)]
+    #[test]
+    fn copy_rows_full_2x2() {
+        let fp = rgba8_fp(2, 2, 1);
+        let rows = CopyRows::new(fp, [0, 0, 0], [2, 2, 1]).unwrap();
+        assert_eq!(rows.first, 0);
+        assert_eq!(rows.count, 2);
+        assert_eq!(rows.depth, 1);
+        assert_eq!(rows.row_bytes, 8); // 2 texels × 4 bytes
+        assert_eq!(rows.row_pitch, 256);
+        // end: row 0 at 0..8, row 1 at 256..264 → end = 264
+        assert_eq!(rows.end(), 256 + 8);
+    }
+
+    /// A sub-box copy: skip the first row of a 4×2 RGBA8.
+    #[cfg(windows)]
+    #[test]
+    fn copy_rows_sub_box_skip_first_row() {
+        let fp = rgba8_fp(4, 4, 1);
+        // Source box covers [0,1] × [2,4] (rows 1 and 2 of the footprint).
+        let rows = CopyRows::new(fp, [0, 1, 0], [4, 2, 1]).unwrap(); // at=(0,1,0), size=(4,2,1)
+        assert_eq!(rows.count, 2);
+        // first byte = row 1 × pitch = 256
+        assert_eq!(rows.first, 256);
+        assert_eq!(rows.row_bytes, 16); // 4 × 4
+    }
+
+    /// X offset within a row (must be block-aligned = 1 for uncompressed).
+    #[cfg(windows)]
+    #[test]
+    fn copy_rows_x_offset() {
+        let fp = rgba8_fp(8, 1, 1);
+        // at=(4,0,0), size=(4,1,1): second half of the row
+        let rows = CopyRows::new(fp, [4, 0, 0], [4, 1, 1]).unwrap();
+        assert_eq!(rows.first, 16); // 4 texels × 4 bytes
+        assert_eq!(rows.count, 1);
+        assert_eq!(rows.row_bytes, 16);
+    }
+
+    /// A 3-D footprint: two slices.
+    #[cfg(windows)]
+    #[test]
+    fn copy_rows_volume_two_slices() {
+        let fp = rgba8_fp(2, 2, 2);
+        let rows = CopyRows::new(fp, [0, 0, 0], [2, 2, 2]).unwrap();
+        assert_eq!(rows.depth, 2);
+        assert_eq!(rows.count, 2);
+        // slice_pitch = pitch * height = 256 * 2 = 512
+        assert_eq!(rows.slice_pitch, 512);
+        // ranges: z=0 rows 0,1; z=1 rows 0,1 (shifted by slice_pitch)
+        let r: Vec<_> = rows.ranges().collect();
+        assert_eq!(r.len(), 4);
+        assert_eq!(r[0], 0..8);
+        assert_eq!(r[1], 256..264);
+        assert_eq!(r[2], 512..520);
+        assert_eq!(r[3], 768..776);
+    }
+
+    /// Size zero is rejected.
+    #[cfg(windows)]
+    #[test]
+    fn copy_rows_zero_size_rejected() {
+        let fp = rgba8_fp(4, 4, 1);
+        assert!(CopyRows::new(fp, [0, 0, 0], [0, 4, 1]).is_none());
+        assert!(CopyRows::new(fp, [0, 0, 0], [4, 0, 1]).is_none());
+    }
+
+    /// Box outside footprint is rejected.
+    #[cfg(windows)]
+    #[test]
+    fn copy_rows_out_of_bounds_rejected() {
+        let fp = rgba8_fp(4, 4, 1);
+        assert!(CopyRows::new(fp, [2, 0, 0], [4, 4, 1]).is_none()); // x+w > width
+        assert!(CopyRows::new(fp, [0, 2, 0], [4, 4, 1]).is_none()); // y+h > height
+    }
+
+    // -----------------------------------------------------------------------
 
     /// ClearUnorderedAccessViewUint/Float and DiscardResource come before
     /// the methods newer lists insert: the AMD upscaler calls them there.

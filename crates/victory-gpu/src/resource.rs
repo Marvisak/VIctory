@@ -316,20 +316,26 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        let lines = u64::from(self.height)
+            .div_ceil(block)
+            .checked_mul(u64::from(self.depth))?;
+        let last = u64::from(self.width).div_ceil(block).checked_mul(element)?;
+        let pitch = u64::from(self.row_pitch);
+        if last == 0 || last > pitch {
+            return None;
+        }
+        pitch.checked_mul(lines.checked_sub(1)?)?.checked_add(last)
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -1701,6 +1707,8 @@ extern "system" fn resource_release(this: This) -> u32 {
 /// `out` only asks for residency.
 extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *mut u8) -> HRESULT {
     if !out.is_null() {
+        #[cfg(windows)]
+        crate::host::drain_async();
         // SAFETY: checked non-null; the title passes room for a pointer.
         unsafe { out.write(resource(this).data()) };
     }

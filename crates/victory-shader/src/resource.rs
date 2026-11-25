@@ -65,8 +65,12 @@ pub enum Source {
     /// Fixed in the code (an immediate sampler, say).
     Constant(Vec<u32>),
     /// Chosen by control flow: one source per predecessor of `block`, in
-    /// [`crate::ir::Block::preds`] order.
-    Phi { block: usize, args: Vec<Source> },
+    /// [`crate::ir::Block::preds`] order, `None` on an edge no active lane
+    /// takes.
+    Phi {
+        block: usize,
+        args: Vec<Option<Source>>,
+    },
     /// Chosen by SCC (`scc`, the value an `s_cselect` or `s_cmov` of each
     /// dword reads): the source when it is set, then when it is clear.
     Select { scc: Value, args: Vec<Source> },
@@ -94,10 +98,10 @@ impl Source {
     /// The sources this one picks from (itself unless a phi).
     pub fn leaves(&self) -> Vec<&Source> {
         match self {
-            Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } => {
+            Source::Select { args, .. } | Source::Lanes { args, .. } => {
                 args.iter().flat_map(Source::leaves).collect()
             }
-            Source::LanePhi { args, .. } => {
+            Source::Phi { args, .. } | Source::LanePhi { args, .. } => {
                 args.iter().flatten().flat_map(Source::leaves).collect()
             }
             s => vec![s],
@@ -943,13 +947,58 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// Whether active lanes can reach `block` along the edge from `q` given `known`.
+    fn edge_reachable(&self, lanes: &Structured, q: usize, block: usize, known: &mut Known) -> bool {
+        let n = known.len();
+        known.push((lanes.reach[q], true));
+        if let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = lanes.exits[q]
+            && taken != not_taken
+        {
+            known.push((when, taken == block));
+        }
+        let ok = meet(lanes, known);
+        known.truncate(n);
+        ok
+    }
+
     /// `hi` is `high` (0 for a table), possibly plus a carry.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
-        hi == want
+        if hi == want
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
             ))
+        {
+            return true;
+        }
+        let Term::Value(v) = hi else {
+            return false;
+        };
+        if !phi_prune_enabled() {
+            return false;
+        }
+        let (Some(lanes), Some((block, phi_idx))) = (self.lanes, self.phis[v.0 as usize]) else {
+            return false;
+        };
+        let phis = &self.p.blocks[block].phis;
+        let preds = &self.p.blocks[block].preds;
+        let mut any = false;
+        let mut known = Known::new();
+        for (j, &q) in preds.iter().enumerate() {
+            if !self.edge_reachable(lanes, q, block, &mut known) {
+                continue;
+            }
+            any = true;
+            let edge = self.origin(phis[phi_idx].args[j]);
+            if edge == hi || !self.high_half(edge, high) {
+                return false;
+            }
+        }
+        any
     }
 
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
@@ -1161,8 +1210,26 @@ impl<'a> Tracer<'a> {
         }
         joins.push(block);
         let phis = &self.p.blocks[block].phis;
-        let args = (0..self.p.blocks[block].preds.len())
-            .map(|j| {
+        let prune = phi_prune_enabled();
+        let mut args = Vec::with_capacity(self.p.blocks[block].preds.len());
+        for (j, &q) in self.p.blocks[block].preds.iter().enumerate() {
+            let n = known.len();
+            let reachable = if prune && let Some(lanes) = self.lanes {
+                known.push((lanes.reach[q], true));
+                if let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = lanes.exits[q]
+                    && taken != not_taken
+                {
+                    known.push((when, taken == block));
+                }
+                meet(lanes, known)
+            } else {
+                true
+            };
+            let arg = if reachable {
                 let edge: Vec<Term> = words
                     .iter()
                     .map(|w| match phi_of(w) {
@@ -1170,11 +1237,21 @@ impl<'a> Tracer<'a> {
                         None => *w,
                     })
                     .collect();
-                self.classify(&edge, joins, known)
-            })
-            .collect::<Result<_, _>>();
+                self.classify(&edge, joins, known).map(Some)
+            } else {
+                Ok(None)
+            };
+            known.truncate(n);
+            match arg {
+                Ok(a) => args.push(a),
+                Err(e) => {
+                    joins.pop();
+                    return Err(e);
+                }
+            }
+        }
         joins.pop();
-        Ok(Some(Source::Phi { block, args: args? }))
+        Ok(Some(Source::Phi { block, args }))
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
@@ -2134,6 +2211,13 @@ pub(crate) fn inline(code: u8) -> Option<u32> {
     }
 }
 
+/// Whether unreachable predecessor edges are pruned in scalar descriptor phis
+/// (`VICTORY_PHI_PRUNE`, on unless 0).
+fn phi_prune_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PHI_PRUNE").map_or(true, |v| v != "0"))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2319,7 +2403,7 @@ pub(crate) mod tests {
         let offsets: Vec<_> = args
             .iter()
             .map(|a| match a {
-                Source::Loaded { load, .. } => {
+                Some(Source::Loaded { load, .. }) => {
                     r.scalar.iter().find(|s| s.0 == *load).unwrap().1.offset
                 }
                 a => panic!("{a:?}"),
@@ -3579,5 +3663,63 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn unreachable_phi_edge_after_wqm_is_pruned() {
+        // Save initial exec in s26, enter WQM, then s_and_saveexec with s26:
+        // the `s_cbranch_execz` skip edge is unreachable for active lanes, so
+        // the descriptor loaded only in the fallthrough edge joins cleanly.
+        let r = track_words(
+            &[
+                0xBE9A_037E, // 0x00: s_mov_b32 s26, exec_lo
+                0xBEFE_097E, // 0x04: s_wqm_b32 exec_lo, exec_lo
+                0xBE86_3C1A, // 0x08: s_and_saveexec_b32 s6, s26
+                0xBF88_0004, // 0x0c: s_cbranch_execz -> join (0x20)
+                0xBE8C_0309, // 0x10: s_mov_b32 s12, s9
+                0xBE8D_0380, // 0x14: s_mov_b32 s13, 0
+                0xF408_0006,
+                0xFA00_0000, // 0x18: s_load_dwordx4 s[0:3], s[12:13], null
+                0xBEFE_0306, // 0x20: join: s_mov_b32 exec_lo, s6
+                0xF420_0100,
+                0xFA00_0000, // 0x24: s_buffer_load_dword s4, s[0:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Cs,
+        );
+        let Source::Phi { args, .. } = &r.descriptors[0].source else {
+            panic!("{:?}", r.descriptors)
+        };
+        assert_eq!(args.len(), 2);
+        assert_eq!(args.iter().filter(|a| a.is_some()).count(), 1);
+        assert_eq!(args.iter().filter(|a| a.is_none()).count(), 1);
+    }
+
+    #[test]
+    fn unreachable_high_half_phi_edge_is_pruned() {
+        // s13 = 0 only on the live fallthrough edge; the unreachable
+        // `s_cbranch_execz` skip edge leaves a phi in s13, which `high_half`
+        // accepts by checking reachable predecessors only.
+        let r = track_words(
+            &[
+                0xBE9A_037E, // 0x00: s_mov_b32 s26, exec_lo
+                0xBEFE_097E, // 0x04: s_wqm_b32 exec_lo, exec_lo
+                0xBE8C_0309, // 0x08: s_mov_b32 s12, s9
+                0xBE86_3C1A, // 0x0c: s_and_saveexec_b32 s6, s26
+                0xBF88_0001, // 0x10: s_cbranch_execz -> join (0x18)
+                0xBE8D_0380, // 0x14: s_mov_b32 s13, 0
+                0xBEFE_0306, // 0x18: join: s_mov_b32 exec_lo, s6
+                0xF408_0006,
+                0xFA00_0000, // 0x1c: s_load_dwordx4 s[0:3], s[12:13], null
+                0xF420_0100,
+                0xFA00_0000, // 0x24: s_buffer_load_dword s4, s[0:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.descriptors.len(), 1);
+        assert!(matches!(r.descriptors[0].source, Source::Loaded { .. }));
     }
 }
