@@ -83,17 +83,19 @@
 //!   vertex shader's outputs completes each rectangle with its fourth
 //!   corner opposite the right angle ([`right_angle`]), as the console's
 //!   hardware does.
-//! * **Heap indices** (added 2026-11-24) are clamped to [`HEAP_VIEWS`] − 1
+//! * **Heap indices** (added 2026-11-24) are clamped to [`heap_views`] − 1
 //!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
 //!   many slots, those past its own null, so an index past the heap (data
 //!   still wrong; the console would read whatever memory follows its heap)
-//!   reads nothing instead of faulting the device.
+//!   reads nothing instead of faulting the device. [`heap_views`] is
+//!   [`HEAP_VIEWS`], or the host's cap where its heaps stop below that
+//!   (NVIDIA, 10^6; 2026-11-25): title slots past the cap then read null.
 //! * **Buffer views at computed heap indices** (added 2026-11-24): a
 //!   buffer read through a descriptor the shader takes from the resource
 //!   heap itself first looks up the view-stride table (root SRV
 //!   `t`[`VIEW_STRIDES`], which then covers every index below
-//!   [`HEAP_VIEWS`], dynamic slots too); where it holds 0 (no buffer view
-//!   there) the shader reads heap index [`NULL_BUFFER_VIEW`] instead (for
+//!   [`heap_views`], dynamic slots too); where it holds 0 (no buffer view
+//!   there) the shader reads heap index [`null_buffer_view`] instead (for
 //!   unordered access the index below), which the host keeps a null raw
 //!   buffer SRV (UAV). The index comes from data, and a texture descriptor
 //!   read as a buffer one is a wild address (the texture's shifted 8 bits
@@ -258,6 +260,56 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+static HEAP_LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// The view-heap slots translated shaders index: heap indices are clamped
+/// below this, and the null buffer views sit at its last slots
+/// ([`null_buffer_view`]). [`HEAP_VIEWS`] unless the host set a smaller one
+/// ([`set_heap_views`]) before the first translation. The value is part of
+/// the translation, so the shader cache must key on it (`victory-gpu`'s
+/// does).
+///
+/// Ordering: the first read locks the value. The host must probe its heaps
+/// (`victory-gpu`'s host creation) before anything translates or hashes a
+/// shader cache key; a caller that reads this first locks in
+/// [`HEAP_VIEWS`], and a capped host then faults past its heap (the probe
+/// logs an error when [`set_heap_views`] comes too late).
+pub fn heap_views() -> u32 {
+    *HEAP_LIMIT.get_or_init(|| HEAP_VIEWS)
+}
+
+/// Sets [`heap_views`] for a host whose shader-visible view heaps stop
+/// below [`HEAP_VIEWS`] (NVIDIA: 10^6), so an index past them reads a null
+/// slot instead of faulting the device. Has no effect once read or set:
+/// whether [`heap_views`] is now `views` (capped at [`HEAP_VIEWS`]).
+pub fn set_heap_views(views: u32) -> bool {
+    let views = views.min(HEAP_VIEWS);
+    let _ = HEAP_LIMIT.set(views);
+    heap_views() == views
+}
+
+/// The dynamic slots of a host view heap capped below [`HEAP_VIEWS`]: they
+/// and the three null slots ([`null_buffer_view`]) follow the title's.
+pub const CAPPED_DYNAMIC: u32 = 1 << 16;
+
+/// The title view slots a host heap keeps: [`heap_views`], or where the
+/// host capped it below [`HEAP_VIEWS`], those before the
+/// [`CAPPED_DYNAMIC`] dynamic slots and the null ones. Translated shaders
+/// read a title index past them from the null last slot.
+pub fn title_views() -> u32 {
+    capped_title(heap_views())
+}
+
+fn capped_title(views: u32) -> u32 {
+    if views < HEAP_VIEWS { views - CAPPED_DYNAMIC - 3 } else { views }
+}
+
+/// The heap index of the host's null raw buffer SRV (the null raw UAV at
+/// the index below): [`heap_views`] - 2. [`NULL_BUFFER_VIEW`] by default.
+pub fn null_buffer_view() -> u32 {
+    heap_views() - 2
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -632,6 +684,16 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// A capped heap (NVIDIA, 10^6 views) keeps 934461 title slots: its
+    /// last 2^16 + 3 are the dynamic and null ones, which a title index
+    /// must not reach. An uncapped heap keeps every slot below it.
+    #[test]
+    fn a_capped_heap_keeps_title_slots_below_its_dynamic_ones() {
+        assert_eq!(super::capped_title(1_000_000), 934_461);
+        assert_eq!(super::capped_title(1_000_000) + super::CAPPED_DYNAMIC + 3, 1_000_000);
+        assert_eq!(super::capped_title(super::HEAP_VIEWS), super::HEAP_VIEWS);
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {

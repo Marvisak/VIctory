@@ -50,10 +50,10 @@ pub(crate) struct HostHeap {
     /// view there, `VIEW_MARK_NONE` for none. Mapped at the address kept
     /// beside it.
     marks: Option<(ID3D12Resource, usize)>,
-    /// Per title slot, the console descriptor's dwords 0-3 as far as the
-    /// host knows them (shaders reading a descriptor as data, `crate::memory`;
-    /// [`write_address`]): the buffer, its mapping and host address, made on
-    /// first use.
+    /// Per slot (`indexed_slots`, 0 past the title's slots), the console
+    /// descriptor's dwords 0-3 as far as the host knows them (shaders
+    /// reading a descriptor as data, `crate::memory`; [`write_address`]):
+    /// the buffer, its mapping and host address, made on first use.
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
@@ -83,8 +83,9 @@ pub(crate) fn near_heaps(va: u64) -> String {
 }
 
 /// The host's limit for shader-visible view heaps on resource binding
-/// tiers 1 and 2; tier 3 hardware may take more.
-const PORTABLE_VIEWS: u32 = 1_000_000;
+/// tiers 1 and 2; tier 3 hardware may take more. Translated shaders clamp
+/// to it where the host takes no heap of `HEAP_VIEWS` (`host::create`).
+pub(crate) const PORTABLE_VIEWS: u32 = 1_000_000;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -93,9 +94,18 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// each a device removal shortly after; #59).
 const DYNAMIC: u32 = 1 << 18;
 
+/// Entries in a per-slot table translated shaders read as a root view
+/// (strides, marks, view addresses): every index they can compute. A root
+/// view has no bounds, and they clamp indices below `heap_views`, at most
+/// `HEAP_VIEWS`, which may pass the title's `count` (a capped heap keeps
+/// fewer). A read past the table read past its buffer, and hung NVIDIA.
+fn indexed_slots(count: u32) -> u32 {
+    count.max(victory_shader::emit::HEAP_VIEWS)
+}
+
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
-const MIN_DYNAMIC: u32 = 1 << 16;
+const MIN_DYNAMIC: u32 = victory_shader::emit::CAPPED_DYNAMIC;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -121,12 +131,12 @@ impl HostHeap {
         // heap, and dynamic ones): shaders read the table as a root view,
         // which has no bounds, at indices clamped below `HEAP_VIEWS`.
         let strides = (!sampler)
-            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
+            .then(|| host.upload_buffer(u64::from(indexed_slots(count)) * 4))
             .flatten()
             .map(|(buffer, data)| (buffer, data as usize));
         let marks = (!sampler)
             .then(|| {
-                let bytes = u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 8;
+                let bytes = u64::from(indexed_slots(count)) * 8;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 crate::host::name(&buffer, || "view marks".into());
                 // Every slot unmarked (all ones) until a view is made there.
@@ -137,9 +147,15 @@ impl HostHeap {
             .flatten();
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
-        // Translated shaders clamp their indices below `HEAP_VIEWS` or
+        // Translated shaders clamp their indices below `heap_views` or
         // `HEAP_SAMPLERS`: slots up to there exist and stay null.
-        let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
+        // Each view heap also has room past the dynamic slots for the null
+        // buffer views (the 3 slots below `views`, `null_buffer_view`).
+        let (views, samplers) = (victory_shader::emit::heap_views(), victory_shader::emit::HEAP_SAMPLERS);
+        // A capped host: shaders clamp below `views`, so the heap is exactly
+        // that, its last slots null (a larger one would put title views
+        // where shaders expect null ones).
+        let fits = |extra: u32| views == victory_shader::emit::HEAP_VIEWS || count + extra + 3 <= views;
         let (heap, count, extra) = if sampler {
             match make(count.max(samplers)) {
                 Ok(heap) => (heap, count, 0),
@@ -148,18 +164,24 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
+        } else if fits(DYNAMIC) && let Ok(heap) = make((count + DYNAMIC + 3).max(views)) {
             (heap, count, DYNAMIC)
+        } else if fits(MIN_DYNAMIC) && let Ok(heap) = make((count + MIN_DYNAMIC + 3).max(views)) {
+            (heap, count, MIN_DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+            // shortcut: title slots past the host's cap (NVIDIA) are left
+            // out. The dynamic slots, then the null buffer views, take the
+            // heap's last slots. Shaders read a title index past the kept
+            // ones from the null last slot (`title_views`), not a dynamic
+            // slot's view (another draw's, a hang on NVIDIA). A title that
+            // draws with them needs remapping.
+            // `title_views()` where the host is capped; uncapped, the title
+            // still keeps room for the dynamic and null slots.
+            let title = views - MIN_DYNAMIC - 3;
+            match make(views) {
+                Ok(heap) => {
+                    tracing::warn!(count, kept = title, "host view heap capped at {views}");
+                    (heap, count.min(title), MIN_DYNAMIC)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -196,7 +218,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
-            pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
+            pairs_end: match victory_shader::emit::null_buffer_view() {
                 null if !sampler && null > count + extra && null < total => null - 1,
                 _ => total,
             },
@@ -220,7 +242,7 @@ impl HostHeap {
         // What shaders read instead of a slot without a buffer view where
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.
-        let null = victory_shader::emit::NULL_BUFFER_VIEW;
+        let null = victory_shader::emit::null_buffer_view();
         if !sampler && null > count + extra && null < total {
             h.raw_view_at(null, None, 0, 0, false);
             h.raw_view_at(null - 1, None, 0, 0, true);
@@ -542,7 +564,7 @@ impl HostHeap {
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
         let made = self.addresses.get_or_init(|| {
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 16)?;
+            let (buffer, data) = host()?.upload_buffer(u64::from(indexed_slots(self.count)) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -892,40 +914,47 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 /// The byte stride of a buffer view (its element size, at least 1), 0 for
 /// other views: what the view-stride table holds for it.
 fn view_stride(view: &View) -> u32 {
+    // Nonzero: shaders taking views at computed indices read the null buffer
+    // view where the table holds 0 (`victory_shader::emit`).
+    buffer_element(view).map_or(0, |(element, _)| element.max(1) as u32)
+}
+
+/// A buffer view's element size and structure stride.
+fn buffer_element(view: &View) -> Option<(u64, u32)> {
     let (unordered, words): (bool, &[u32; 10]) = match view {
         // Read as raw buffers (`make`).
-        View::Constant(..) => return 4,
+        View::Constant(..) => return Some((4, 0)),
         View::Shader(_, Some(desc)) => (false, desc),
         View::Unordered(_, _, Some(desc)) => (true, desc),
         View::Placed(unordered, resource, desc) if resource[0] == 1 => {
             match desc[..10].try_into() {
                 Ok(words) => (*unordered, words),
-                Err(_) => return 0,
+                Err(_) => return None,
             }
         }
-        _ => return 0,
+        _ => return None,
     };
     // The view dimension: buffer (1) for shader and unordered views alike.
     if words[1] != 1 {
-        return 0;
+        return None;
     }
-    let element = if unordered {
+    Some(if unordered {
         let desc = uav_desc(words);
         // SAFETY: a buffer view's union member.
         let buffer = unsafe { desc.Anonymous.Buffer };
-        if buffer.StructureByteStride > 0 {
+        let element = if buffer.StructureByteStride > 0 {
             u64::from(buffer.StructureByteStride)
         } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
             4
         } else {
             crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
-        }
+        };
+        (element, buffer.StructureByteStride)
     } else {
-        element_size(&srv_desc(words))
-    };
-    // Nonzero: shaders taking views at computed indices read the null buffer
-    // view where the table holds 0 (`victory_shader::emit`).
-    element.max(1) as u32
+        let desc = srv_desc(words);
+        // SAFETY: a buffer view's union member.
+        (element_size(&desc), unsafe { desc.Anonymous.Buffer }.StructureByteStride)
+    })
 }
 
 /// The view-stride table's format-kind bits of a buffer view: a typed view
@@ -1103,7 +1132,8 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    let (element, stride) = buffer_element(view)?;
+    let (shadow, _) = crate::shadow::for_view(address, len, copy_align(element, stride))?;
     Some((shadow, address, len))
 }
 
@@ -1149,8 +1179,9 @@ fn buffer_srv(
     }
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
+    let align = copy_align(element, buffer.StructureByteStride);
     let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
+        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)
     else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
@@ -1168,6 +1199,12 @@ fn buffer_srv(
         once!(first, count, element, "buffer view empty or past its host copy");
         return None;
     }
+    if let Some((first, count)) = as_raw(first, count, buffer.StructureByteStride) {
+        (buffer.FirstElement, buffer.NumElements) = (first, count);
+        buffer.StructureByteStride = 0;
+        buffer.Flags |= D3D12_BUFFER_SRV_FLAG_RAW;
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -1175,6 +1212,30 @@ fn buffer_srv(
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
+}
+
+/// A structured view's range as a raw view's (4-byte words): translated
+/// shaders read every structured buffer through a raw handle at byte
+/// `index * stride + offset` (the stride may only be known at run time, from
+/// the view-stride table), and some drivers (NVIDIA) read a structured view
+/// through a raw handle wrongly.
+fn as_raw(first: u64, count: u32, stride: u32) -> Option<(u64, u32)> {
+    (stride > 0 && stride.is_multiple_of(4)).then(|| {
+        let words = u64::from(stride / 4);
+        // The host's most elements in a buffer view (as `raw_view_at`).
+        (first * words, (u64::from(count) * words).min(1 << 27) as u32)
+    })
+}
+
+/// Where in its host copy a view of `element`-byte elements must start: on
+/// an element, and a structured view (made raw, [`as_raw`]) also on 16 bytes
+/// (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`).
+fn copy_align(element: u64, stride: u32) -> u64 {
+    if as_raw(0, 0, stride).is_some() {
+        element << (4 - element.trailing_zeros().min(4))
+    } else {
+        element
+    }
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
@@ -1214,7 +1275,8 @@ fn buffer_uav(
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let align = copy_align(element, buffer.StructureByteStride);
+    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -1227,6 +1289,12 @@ fn buffer_uav(
     if !in_buffer(&shadow.buffer, first, count, element) {
         once!(first, count, element, "unordered buffer view empty or past its host copy");
         return None;
+    }
+    if let Some((first, count)) = as_raw(first, count, buffer.StructureByteStride) {
+        (buffer.FirstElement, buffer.NumElements) = (first, count);
+        buffer.StructureByteStride = 0;
+        buffer.Flags |= D3D12_BUFFER_UAV_FLAG_RAW;
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -1293,15 +1361,15 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        return !typeless && (!unordered || stores(own, own));
     }
     let cast = castable.contains(&view);
     if family(view) != family(own) && !cast {
         once!(view, own, "view format of another family");
         return false;
     }
-    if cast && family(view) != family(own) && unordered && !typed_store(view) {
-        once!(view, own, "an unordered view in a format the host cannot store");
+    // The format the view gets (below): the title's, or the texture's own.
+    if unordered && !stores(if typeless || cast { view } else { own }, own) {
         return false;
     }
     if let Some(format) = format
@@ -1327,6 +1395,17 @@ fn default_view(resource: crate::object::This) -> bool {
     other.is_none()
 }
 
+/// Whether the host makes typed unordered views of `format` on a texture of
+/// `own`: an optional feature for some formats (16-bit packed ones such as
+/// B5G5R5A1 on NVIDIA), whose view without it removes the device.
+fn stores(format: u32, own: u32) -> bool {
+    let ok = typed_store(format);
+    if !ok {
+        once!(format, own, "an unordered view in a format the host cannot store");
+    }
+    ok
+}
+
 /// Whether the host stores to typed unordered views of `format`.
 fn typed_store(format: u32) -> bool {
     static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
@@ -1349,6 +1428,7 @@ fn typed_store(format: u32) -> bool {
         }
         .is_ok()
             && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+            && support.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0
     });
     known.push((format, ok));
     ok
@@ -1972,6 +2052,18 @@ mod tests {
         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
     }
 
+    /// f607780aa8e502d0 read the view addresses at a table index past a
+    /// capped heap's title slots: past the buffer (DEVICE_HUNG, GTX 1660).
+    #[test]
+    fn per_slot_tables_cover_every_index_a_shader_reads() {
+        use victory_shader::emit::HEAP_VIEWS;
+        // GTX 1660: heap capped at 10^6, 934461 title slots kept.
+        for (count, views) in [(934_461, 1_000_000), (1_245_184, HEAP_VIEWS), (10, HEAP_VIEWS)] {
+            assert!(indexed_slots(count) >= views, "{count} {views}");
+            assert!(indexed_slots(count) >= count);
+        }
+    }
+
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]
     fn empty_and_overlong_buffer_views_are_refused() {
@@ -1980,6 +2072,19 @@ mod tests {
         assert!(!within(64, 0, 0, 16));
         assert!(!within(64, 3, 2, 16));
         assert!(!within(64, u64::MAX, 1, 16));
+    }
+
+    /// Structured views become raw ones in words, at most the host's 2^27
+    /// elements; other views stay as they are.
+    #[test]
+    fn structured_views_become_raw_within_the_element_limit() {
+        assert_eq!(as_raw(3, 10, 16), Some((12, 40)));
+        assert_eq!(as_raw(0, 1 << 24, 64), Some((0, 1 << 27)));
+        assert_eq!(as_raw(0, 10, 0), None);
+        assert_eq!(as_raw(0, 10, 6), None);
+        assert_eq!(copy_align(4, 4), 16);
+        assert_eq!(copy_align(24, 24), 48);
+        assert_eq!(copy_align(4, 0), 4);
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
@@ -2024,10 +2129,10 @@ mod tests {
             return; // no host GPU
         };
         // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
+        // `heap_views`, `HEAP_SAMPLERS`).
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::heap_views());
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }

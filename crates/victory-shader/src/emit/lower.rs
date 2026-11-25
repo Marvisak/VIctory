@@ -4123,6 +4123,8 @@ impl<'a> Lower<'a> {
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
+        // The bytes of a record, for a buffer counted in records.
+        let mut per = 0;
         let (props, image) = match &ui.fields {
             Fields::Image { dim, .. } => {
                 let kind = match dim {
@@ -4142,7 +4144,9 @@ impl<'a> Lower<'a> {
                 {
                     (10 | u, 0x409)
                 } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
+                    // Host buffer views are raw: bytes, counted in records below.
+                    per = stride;
+                    (11 | u, 0)
                 } else {
                     (11 | u, 0)
                 };
@@ -4161,7 +4165,10 @@ impl<'a> Lower<'a> {
                 }
                 let props = match used.stride {
                     0 | 1 => (11 | u, 0),
-                    s if s.is_multiple_of(4) => (12 | u, s),
+                    s if s.is_multiple_of(4) => {
+                        per = s;
+                        (11 | u, 0)
+                    }
                     _ => return Err("a scalar-loaded buffer of odd stride read as data"),
                 };
                 (props, None)
@@ -4217,6 +4224,11 @@ impl<'a> Lower<'a> {
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
+            }
+            None if per > 0 => {
+                let per = self.s.m.i32(per);
+                let bytes = field(self, 0);
+                vec![(2, self.s.m.bin(c, Bin::UDiv, bytes, per))]
             }
             None => vec![(2, field(self, 0))],
         };
@@ -5305,12 +5317,13 @@ impl<'a> Lower<'a> {
     /// buffer one (a wild address: the texture's address shifted 8 bits
     /// down) and faulted the device.
     fn buffer_guard(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> V {
+        let index = self.title_guard(src, index, sampler);
         // Typed, raw and structured buffers (DXIL resource kinds 10-12).
         if sampler || !(10..=12).contains(&(props.0 & 0xFF)) || !self.is_heap_direct(src) {
             return index;
         }
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let last = self.s.m.i32(super::heap_views() - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
@@ -5323,22 +5336,51 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
+        let null = super::null_buffer_view() - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
     }
 
-    /// Whether a descriptor comes from the resource heap itself (root type
-    /// 5, not a table) on some path.
-    fn is_heap_direct(&self, src: &Source) -> bool {
-        src.leaves().iter().any(|l| match l {
+    /// `index`, or the heap's last slot (null) where a capped host heap
+    /// keeps no title slot there (module notes, "Heap indices"): for a
+    /// view taken from the resource heap itself on every path, an index at
+    /// or past [`super::title_views`] would read a dynamic slot, another
+    /// draw's view, perhaps of another kind (a GPU hang on NVIDIA, with no
+    /// page fault). Tables hold dynamic slots' indices and are left alone.
+    fn title_guard(&mut self, src: &Source, index: V, sampler: bool) -> V {
+        let title = super::title_views();
+        if sampler || title == super::heap_views() || !self.all_heap_direct(src) {
+            return index;
+        }
+        let c = self.cur;
+        let first = self.s.m.i32(title);
+        let past = self.s.m.cmp(c, pred::IUGE, index, first);
+        let null = self.s.m.i32(super::heap_views() - 1);
+        self.s.m.select(c, past, null, index)
+    }
+
+    /// Whether a descriptor comes from the resource heap itself on every
+    /// path.
+    fn all_heap_direct(&self, src: &Source) -> bool {
+        let leaves = src.leaves();
+        !leaves.is_empty() && leaves.iter().all(|l| self.leaf_heap_direct(l))
+    }
+
+    fn leaf_heap_direct(&self, l: &Source) -> bool {
+        match l {
             Source::Loaded { load, .. } | Source::Fetched { load, .. } => self
                 .scalar
                 .get(load)
                 .and_then(|a| self.x.native.layout.get(a.param))
                 .is_some_and(|p| p.root == RootType::ResourceHeap),
             _ => false,
-        })
+        }
+    }
+
+    /// Whether a descriptor comes from the resource heap itself (root type
+    /// 5, not a table) on some path.
+    fn is_heap_direct(&self, src: &Source) -> bool {
+        src.leaves().iter().any(|l| self.leaf_heap_direct(l))
     }
 
     /// The address of the descriptor load at `load` when root parameters
@@ -9236,11 +9278,11 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
                     let s = self.s.m.i32(stride);
                     let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
                     let byte = self.s.m.bin(self.cur, Bin::Add, row, off);
-                    (h, [index, off, iu], byte)
+                    (h, [byte, iu, iu], byte)
                 }
                 None => {
                     let (h, off) = self.raw_view(site, src, off, 4, (11 | u, 0), true, guard)?;
@@ -9389,11 +9431,12 @@ impl<'a> Lower<'a> {
                         if stride < 4 || !stride.is_multiple_of(4) {
                             return Err("a structured buffer of unknown stride");
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
+                        args.push(self.handle(site, src, false, (11 | u, 0))?);
                         let s = self.s.m.i32(stride);
                         let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
-                        (byte, bytes) = (self.s.m.bin(self.cur, Bin::Add, row, off), 4 * count);
+                        byte = self.s.m.bin(self.cur, Bin::Add, row, off);
+                        args.extend([byte, iu]);
+                        bytes = 4 * count;
                     }
                     None => {
                         let n = 4 * count;
@@ -9499,14 +9542,17 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    let s = self.s.m.i32(stride);
+                    let row = self.s.m.bin(c, Bin::Mul, index, s);
+                    let byte = self.s.m.bin(c, Bin::Add, row, off);
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         139,
-                        &[h, index, off, mask, align],
+                        &[h, byte, iu, mask, align],
                     )
                 }
                 None => {

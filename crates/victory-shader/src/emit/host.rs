@@ -129,6 +129,23 @@ impl Host {
         }
     }
 
+    /// Whether the device takes a shader-visible view heap of
+    /// [`super::HEAP_VIEWS`] slots, as [`View::NullBuffers`] needs (NVIDIA
+    /// stops at 10^6).
+    pub fn takes_full_view_heap(&self) -> bool {
+        // SAFETY: a plain heap creation on a live device.
+        unsafe {
+            self.device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: super::HEAP_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+                .is_ok()
+        }
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
@@ -1705,11 +1722,13 @@ impl Host {
                                 0,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
                             ),
+                            // Raw, as the runtime makes a structured view
+                            // (its stride is in the view-stride table).
                             Stride::Structured(s) => (
-                                DXGI_FORMAT_UNKNOWN,
-                                data.len() * 4 / s as usize,
-                                s,
-                                D3D12_BUFFER_SRV_FLAG_NONE,
+                                DXGI_FORMAT_R32_TYPELESS,
+                                data.len() * 4 / s as usize * s as usize / 4,
+                                0,
+                                D3D12_BUFFER_SRV_FLAG_RAW,
                             ),
                             Stride::Format(f, bytes) => (
                                 f,
