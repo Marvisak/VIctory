@@ -40,6 +40,8 @@ mod indirect;
 pub mod list;
 #[cfg(windows)]
 mod memory;
+#[cfg(all(test, windows))]
+mod marks_bench;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
