@@ -242,6 +242,30 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// Copies [`alias_copy`] recorded since the last frame-rate line.
 pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// How many subresources, in order, two textures have the same bytes in
+/// (footprints, rows and bytes per row of each): mips of a block-compressed
+/// texture past its last whole block do not, nor do those with another
+/// row width.
+fn common_subresources(
+    fa: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+    ra: &[u32],
+    sa: &[u64],
+    fb: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+    rb: &[u32],
+    sb: &[u64],
+) -> u32 {
+    (0..fa.len().min(fb.len()))
+        .take_while(|&i| {
+            let (x, y) = (fa[i], fb[i]);
+            x.Offset == y.Offset
+                && x.Footprint.RowPitch == y.Footprint.RowPitch
+                && ra[i] == rb[i]
+                && sa[i] == sb[i]
+                && x.Footprint.Depth == y.Footprint.Depth
+        })
+        .count() as u32
+}
+
 /// Records, once per list, the copy of `from`'s host texture into `to`'s:
 /// two title textures at one memory that cannot share a host texture
 /// (`resource::alias_source`: block-compressed against plain formats of
@@ -276,24 +300,26 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     let footprints = |d: &D3D12_RESOURCE_DESC, n: u32| {
         let mut f = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n as usize];
         let mut rows = vec![0u32; n as usize];
+        let mut sizes = vec![0u64; n as usize];
         let mut total = 0;
         // SAFETY: outputs sized for `n` subresources.
         unsafe {
-            host.device
-                .GetCopyableFootprints(d, 0, n, 0, Some(f.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total));
+            host.device.GetCopyableFootprints(
+                d,
+                0,
+                n,
+                0,
+                Some(f.as_mut_ptr()),
+                Some(rows.as_mut_ptr()),
+                Some(sizes.as_mut_ptr()),
+                Some(&mut total),
+            );
         }
-        (f, rows, total)
+        (f, rows, sizes, total)
     };
-    let (fa, ra, total) = footprints(&da, count(&da));
-    let (fb, rb, _) = footprints(&db, count(&db));
-    // Subresources in order while both have the same bytes there (mips of
-    // a block-compressed texture past its last whole block do not).
-    let n = (0..fa.len().min(fb.len()))
-        .take_while(|&i| {
-            let (x, y) = (fa[i], fb[i]);
-            x.Offset == y.Offset && x.Footprint.RowPitch == y.Footprint.RowPitch && ra[i] == rb[i] && x.Footprint.Depth == y.Footprint.Depth
-        })
-        .count() as u32;
+    let (fa, ra, sa, total) = footprints(&da, count(&da));
+    let (fb, rb, sb, _) = footprints(&db, count(&db));
+    let n = common_subresources(&fa, &ra, &sa, &fb, &rb, &sb);
     if n == 0 {
         once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
         return;
@@ -844,6 +870,21 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 25x16 RGBA32 and a 100x64 BC7 texture of two mips: the same
+    /// footprints, but mip 1 is 192 bytes a row in one and 208 in the other
+    /// (the copy would read past its buffer).
+    #[test]
+    fn aliased_subresources_need_the_same_bytes_per_row() {
+        let footprint = |offset: u64, pitch: u32| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: offset,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT { RowPitch: pitch, Depth: 1, ..Default::default() },
+        };
+        let f = [footprint(0, 512), footprint(8192, 256)];
+        let rows = [16, 8];
+        assert_eq!(common_subresources(&f, &rows, &[400, 192], &f, &rows, &[400, 208]), 1);
+        assert_eq!(common_subresources(&f, &rows, &[400, 192], &f, &rows, &[400, 192]), 2);
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
