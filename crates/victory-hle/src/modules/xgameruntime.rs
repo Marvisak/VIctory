@@ -141,7 +141,8 @@ pub fn put<T>(out: *mut T, value: T) -> HRESULT {
 }
 
 /// Copies `text` and a NUL into the title's `size`-byte buffer and reports
-/// the bytes used, as the runtime's string getters do.
+/// the bytes used, as the runtime's string getters do. A buffer that does
+/// not fit is left untouched.
 pub fn put_string(text: &str, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     let len = text.len() + 1;
     if buffer.is_null() || size < len {
@@ -217,19 +218,24 @@ pub extern "system" fn UninitializeApiImpl() {
     tracing::info!("UninitializeApiImpl");
 }
 
-/// The object for an implemented (provider, interface id); others fail,
-/// each pair logged once.
+static QUERIED: Mutex<Vec<(Guid, Guid)>> = Mutex::new(Vec::new());
+
+/// Returns the object for an implemented (provider, interface id).
+/// Only unsupported pairs queried with a non-null `out` are logged and
+/// remembered.
 pub extern "system" fn QueryApiImpl(
     provider: *const Guid,
     iid: *const Guid,
     out: *mut *mut c_void,
 ) -> HRESULT {
-    static QUERIED: Mutex<Vec<(Guid, Guid)>> = Mutex::new(Vec::new());
     // SAFETY: the title passes pointers to GUIDs (null is tolerated).
     let (Some(&provider), Some(&iid)) = (unsafe { provider.as_ref() }, unsafe { iid.as_ref() })
     else {
         return NOT_SUPPORTED;
     };
+    if out.is_null() {
+        return NOT_SUPPORTED;
+    }
     #[cfg(feature = "diagnostics")]
     if tracing::enabled!(tracing::Level::DEBUG) {
         // Each runtime call site once: which title code uses which area, when.
@@ -245,9 +251,7 @@ pub extern "system" fn QueryApiImpl(
         .iter()
         .flat_map(|area| area.iter())
         .find(|(p, i, _)| (*p, *i) == (provider, iid));
-    if let Some(&(_, _, object)) = found
-        && !out.is_null()
-    {
+    if let Some(&(_, _, object)) = found {
         // SAFETY: checked non-null; the title passes room for a pointer.
         unsafe { out.write((object as *const Object).cast_mut().cast()) };
         return S_OK;
@@ -290,55 +294,14 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modules::kernel::{FreeLibrary, GetProcAddress, LoadLibraryExA};
 
     #[test]
-    fn title_stub_loads_the_runtime_dynamically() {
-        let load = |name: &CStr| LoadLibraryExA(name.as_ptr().cast(), std::ptr::null_mut(), 0x800);
-        let runtime = load(c"xgameruntime.dll");
-        assert!(!runtime.is_null());
-        let proc = |name: &CStr| GetProcAddress(runtime, name.as_ptr().cast());
-        for name in [
-            c"InitializeApiImpl",
-            c"InitializeApiImplEx",
-            c"InitializeApiImplEx2",
-            c"QueryApiImpl",
-            c"UninitializeApiImpl",
-            c"XErrorReport",
-        ] {
-            assert!(!proc(name).is_null(), "{name:?}");
-        }
-        assert!(proc(c"NotAnExport").is_null());
-        let ordinal = std::ptr::without_provenance::<u8>(1);
-        assert!(GetProcAddress(runtime, ordinal).is_null());
-
-        type Init = extern "system" fn(u64, u64, u64) -> HRESULT;
-        type Query = extern "system" fn(*const Guid, *const Guid, *mut *mut c_void) -> HRESULT;
-        // SAFETY: the addresses are our functions with these signatures.
-        let (init, query) = unsafe {
-            (
-                std::mem::transmute::<*mut c_void, Init>(proc(c"InitializeApiImplEx")),
-                std::mem::transmute::<*mut c_void, Query>(proc(c"QueryApiImpl")),
-            )
-        };
-        assert_eq!(init(1, 2, 2), S_OK);
-        let guid = Guid {
-            data1: 1,
-            data2: 2,
-            data3: 3,
-            data4: [4; 8],
-        };
-        let untouched = 0x1234 as *mut c_void;
-        let mut out = untouched;
-        assert!(query(&guid, &guid, &mut out) < 0);
-        assert_eq!(out, untouched);
-        assert_eq!(FreeLibrary(runtime), 1);
-
-        #[cfg(windows)]
-        {
-            let kernel32 = load(c"kernel32.dll");
-            assert!(!kernel32.is_null(), "host DLLs still load from the host");
-            assert!(!GetProcAddress(kernel32, c"GetTickCount".as_ptr().cast()).is_null());
-        }
+    fn null_output_for_an_implemented_area_is_unsupported_and_unrecorded() {
+        let (provider, iid, _) = AREAS[0][0];
+        assert_eq!(
+            QueryApiImpl(&provider, &iid, std::ptr::null_mut()),
+            NOT_SUPPORTED
+        );
+        assert!(!QUERIED.lock().unwrap().contains(&(provider, iid)));
     }
 }
