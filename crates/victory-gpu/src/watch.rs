@@ -712,13 +712,67 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+/// Releases a complete private title allocation and invalidates its tracked
+/// pages. Query every protection region: a guarded allocation is not
+/// necessarily described by a single VirtualQuery result.
+///
+/// # Safety
+/// `address` must point into a live private allocation owned by the caller,
+/// with the same lifetime requirements as VirtualFree(MEM_RELEASE). Only
+/// its base address is accepted for release; interior addresses are rejected.
+pub unsafe fn release_title_allocation(address: *mut std::ffi::c_void) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_PRIVATE, MEM_RELEASE, MEMORY_BASIC_INFORMATION, VirtualFree, VirtualQuery,
+    };
+
+    let base = address as usize;
+    let mut end = base;
+    // SAFETY: this C structure consists of integers and raw pointers;
+    // zero is valid for every field before VirtualQuery fills it.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: valid output buffer for the query.
+        if unsafe { VirtualQuery(end as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.AllocationBase != address
+            || info.Type != MEM_PRIVATE
+        {
+            break;
+        }
+        let Some(next) = (info.BaseAddress as usize).checked_add(info.RegionSize) else {
+            return false;
+        };
+        if next <= end {
+            return false;
+        }
+        end = next;
+    }
+    if end == base {
+        return false;
+    }
+    let mut g = guards();
+    // SAFETY: the caller owns the reservation; a release requires size zero.
+    if unsafe { VirtualFree(address, 0, MEM_RELEASE) } == 0 {
+        return false;
+    }
+    let (first, last) = (base / PAGE, end.div_ceil(PAGE));
+    // The old mapping no longer exists. Do not VirtualProtect its address
+    // (which another allocator might already have reused).
+    g.protected.retain(|&page| page < first || page >= last);
+    remapped(&mut g, first, last);
+    true
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
+    remapped(&mut g, first, last);
+}
+
+fn remapped(g: &mut Guards, first: usize, last: usize) {
     // What it showed is gone already: nothing to keep.
-    changed(&mut g, first, last, false);
+    changed(g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -1222,4 +1276,58 @@ pub(crate) mod tests {
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
     }
+    /// A release spans differently protected regions of the same allocation.
+    /// A surviving tracker must see the release and the later new mapping.
+    #[test]
+    #[ignore = "run in isolation: releases and reserves the same virtual address"]
+    fn release_and_reuse_marks_the_whole_title_allocation() {
+        let p = pool(2);
+        let t = track(p, 2 * PAGE, true).expect("tracked");
+        assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+        // Page zero is guarded, page one is writable: VirtualQuery splits them.
+        assert!(t.changed(p / PAGE + 1));
+        assert!(!t.changed(p / PAGE));
+        // A rejected interior release must not dirty page zero.
+        // SAFETY: the interior address belongs to our live allocation;
+        // the release helper rejects non-base addresses.
+        assert!(!unsafe { release_title_allocation((p + PAGE) as *mut _) });
+        assert!(!t.changed(p / PAGE));
+        assert_eq!(t.take(p + PAGE, p + 2 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
+        // Open the second page, then take the first one again if necessary.
+        drop(writing(p + PAGE, PAGE));
+        assert!(!t.changed(p / PAGE));
+        // SAFETY: p is the base of our live allocation and we own its lifetime.
+        assert!(unsafe { release_title_allocation(p as *mut _) });
+        assert!(t.changed(p / PAGE) && t.changed(p / PAGE + 1));
+        assert_eq!(t.take_split(p, p + 2 * PAGE), (vec![], vec![(p, p + 2 * PAGE)]));
+        assert!(t.clean());
+        // SAFETY: isolated test; request a fresh allocation at the old address.
+        let q = unsafe {
+            VirtualAlloc(
+                p as *const _,
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        if q != p {
+            drop(t);
+            if q != 0 {
+                free(q);
+            }
+            panic!("fixture could not reserve the same address");
+        }
+        title_memory_remapped(p, 2 * PAGE);
+        // SAFETY: freshly allocated pages are writable.
+        unsafe { (p as *mut u8).write_volatile(0x22) };
+        let copied = t.take_split(p, p + 2 * PAGE);
+        assert_eq!(copied, (vec![(p, p + 2 * PAGE)], vec![]));
+        assert!(t.clean());
+        // SAFETY: the new page is guarded and its handler observes the write.
+        unsafe { (p as *mut u8).write_volatile(0x33) };
+        assert!(t.changed(p / PAGE));
+        drop(t);
+        free(p);
+    }
+
 }
