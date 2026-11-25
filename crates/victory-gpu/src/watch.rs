@@ -813,8 +813,11 @@ pub fn writing(at: usize, len: usize) -> Writing {
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
-    // What it showed is gone already: nothing to keep.
-    changed(&mut g, first, last, false);
+    // What it showed is gone already: nothing to keep. Only `[first, last)`
+    // itself changed what it shows; other mappings of those physical pages
+    // still show them, untouched.
+    mark_changed(&mut g, first, last, false);
+    open_guarded(&mut g, first, last);
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -824,6 +827,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
                 if links.is_empty() {
                     g.alias_of.remove(&other);
                 }
+            }
+            if !g.holders.contains_key(&other)
+                && !g
+                    .alias_of
+                    .get(&other)
+                    .is_some_and(|links| links.iter().any(|p| g.holders.contains_key(p)))
+            {
+                open(&mut g, other);
             }
         }
     }
