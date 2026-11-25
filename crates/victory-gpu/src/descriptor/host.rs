@@ -96,8 +96,11 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// below [`PORTABLE_VIEWS`].
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+/// Slot pairs kept on a capped heap for unified title memory copies.
+const CAPPED_PAIRS: u32 = 24_576;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -150,21 +153,46 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
+        } else if let Some(total) = count.checked_add(DYNAMIC)
+            && let Ok(heap) = make(total.max(views))
+        {
             (heap, count, DYNAMIC)
+        } else if let Some(total) = count.checked_add(DYNAMIC)
+            && total <= PORTABLE_VIEWS - CAPPED_PAIRS
+            && let Ok(heap) = make(PORTABLE_VIEWS)
+        {
+            (heap, count, DYNAMIC)
+        } else if let Some(total) = count.checked_add(MIN_DYNAMIC)
+            && total <= PORTABLE_VIEWS - CAPPED_PAIRS
+            && let Ok(heap) = make(PORTABLE_VIEWS)
+        {
+            (heap, count, MIN_DYNAMIC)
+        } else if count.saturating_add(MIN_DYNAMIC) > PORTABLE_VIEWS - CAPPED_PAIRS
+            && let Ok(heap) = make(PORTABLE_VIEWS)
+        {
+            // shortcut: descriptors past `PORTABLE_VIEWS - DYNAMIC - CAPPED_PAIRS`
+            // are left out (`HostHeap::mirror` returns `None` for
+            // `index >= self.count`); keeping the full `DYNAMIC` range and
+            // `CAPPED_PAIRS` prevents world draws from dropping on 1M-capped
+            // hosts (#1496).
+            let kept = PORTABLE_VIEWS - DYNAMIC - CAPPED_PAIRS;
+            tracing::warn!(
+                count,
+                capped = kept,
+                dynamic = DYNAMIC,
+                pairs = CAPPED_PAIRS,
+                "host view heap capped at {PORTABLE_VIEWS}"
+            );
+            (heap, kept, DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
-                Err(e) => {
+            match count.checked_add(MIN_DYNAMIC).map(make) {
+                Some(Ok(heap)) => (heap, count, MIN_DYNAMIC),
+                Some(Err(e)) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+                None => {
+                    tracing::warn!(count, sampler, "descriptor heap count overflow");
                     return None;
                 }
             }
@@ -2307,6 +2335,25 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    /// A title heap that hits `PORTABLE_VIEWS` keeps the full `DYNAMIC`
+    /// range (`2^18` slots) rather than shrinking to `MIN_DYNAMIC`, while a
+    /// middle-range heap (`PORTABLE_VIEWS - MIN_DYNAMIC`) keeps every title slot.
+    #[test]
+    fn capped_heap_keeps_full_dynamic_range() {
+        let Some(heap) = HostHeap::new(false, PORTABLE_VIEWS) else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.dynamic, DYNAMIC);
+        assert!(heap.count + heap.dynamic + CAPPED_PAIRS >= PORTABLE_VIEWS);
+
+        let mid = PORTABLE_VIEWS - MIN_DYNAMIC - CAPPED_PAIRS;
+        let Some(mid_heap) = HostHeap::new(false, mid) else {
+            return; // no host GPU
+        };
+        assert_eq!(mid_heap.count, mid);
+        assert!(mid_heap.dynamic >= MIN_DYNAMIC);
     }
 
     /// A texture view's size words are the console image descriptor's
