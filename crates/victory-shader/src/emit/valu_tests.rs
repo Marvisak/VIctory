@@ -1042,6 +1042,34 @@ fn v_cvt_f16_u16_and_i16_widen_the_integer_first() {
     }
 }
 
+/// Translate the BCPack decoder's BC6H index-width lookup and check every mode byte.
+#[test]
+fn bcpack_bc6_index_width_for_every_mode() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the mode. Two range tests as unsigned compares of the mode less the range's start.
+    body.extend(vop3(0x125, 5, 193, vgpr(1), 128)); // v_add_nc_u32 v5, -1, v1
+    body.extend(vop3(0x0C4, 106, 128 + 10, vgpr(5), 128)); // v_cmp_gt_u32 vcc, 10, v5
+    body.extend(vop3(0x101, 6, 128, 128 + 3, vcc)); // v_cndmask_b32 v6, 0, 3, vcc
+    body.extend(vop3(0x126, 5, vgpr(1), 128 + 11, 128)); // v_sub_nc_u32 v5, v1, 11
+    body.extend(vop3(0x0C4, 106, 128 + 4, vgpr(5), 128)); // v_cmp_gt_u32 vcc, 4, v5
+    body.extend(vop3(0x101, 7, 128, 128 + 4, vcc)); // v_cndmask_b32 v7, 0, 4, vcc
+    body.extend(vop3(0x11C, 0, vgpr(6), vgpr(7), 128)); // v_or_b32 v0, v6, v7
+    let shader = build_valu_cs(&body);
+    let cases: Vec<_> = (0..=u8::MAX)
+        .map(|mode| [u32::from(mode), 0, 0, 0])
+        .collect();
+    run_cases(&shader, &cases, |backend, _, inputs, got| {
+        let mode = inputs[0];
+        let expected = match mode {
+            1..=10 => 3,
+            11..=14 => 4,
+            _ => 0,
+        };
+        assert_eq!(got, expected, "{backend}: bc6_index_bits({mode})");
+    });
+}
+
 #[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
