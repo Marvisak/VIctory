@@ -1,24 +1,31 @@
 # Architecture
 
 ```
- user's files (outside repo)             VIctory
- ───────────────────────────             ─────────────────────────────────────────
- game assets ──────────────────────────► victory-pipeline + victory-game
-                                         (victory-formats, victory-shader)
-                                                    │
-                                                    ▼
-                                         cache_dir: converted data
-                                                    │
- game executable ─► victory-loader ────► title code (native x86-64)
-                    prepare, map, bind      │ imports
-                                            ▼
-                                         victory-hle ── host Windows (shared APIs)
-                                            │ D3D12.X
-                                            ▼
-                                         victory-gpu ─► host D3D12
-                                            │ shaders at pipeline creation
-                                            ▼
-                                         victory-shader ◄─► cache_dir
+┌──────────────────┐   ┌──────────────────────────────────────────────────────────┐
+│ User files       │   │ VIctory                                                  │
+│ (outside repo)   │   ├──────────────────────────────────────────────────────────┤
+├──────────────────┤   │ Asset conversion                                         │
+│ Game assets      │──►│ victory-pipeline + victory-game                          │
+│                  │   │ (victory-formats, victory-shader)                        │
+│                  │   │            │                                             │
+│                  │   │            ▼                                             │
+│                  │   │ cache_dir: converted data ──────────────────────────┐    │
+│                  │   ├─────────────────────────────────────────────────────┤────┤
+│                  │   │ Runtime                                             │    │
+│ Game executable  │──►│ victory-loader                                      │    │
+└──────────────────┘   │      │ prepare, map, bind                           │    │
+                       │      ▼                                              │    │
+                       │ title code (native x86-64) ◄────────────────────────┘    │
+                       │      │ imports                                           │
+                       │      ▼                                                   │
+                       │ victory-hle ──► host Windows (shared APIs)               │
+                       │      │ D3D12.X                                           │
+                       │      ▼                                                   │
+                       │ victory-gpu ──► host D3D12                               │
+                       │      │ shaders at pipeline creation                      │
+                       │      ▼                                                   │
+                       │ victory-shader ◄──► cache_dir                            │
+                       └──────────────────────────────────────────────────────────┘
 ```
 
 Shaders are translated when the title creates a pipeline, from the bytes it
