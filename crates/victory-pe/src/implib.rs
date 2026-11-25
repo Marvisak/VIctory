@@ -631,4 +631,48 @@ mod tests {
             Err(PeError::Malformed(_))
         ));
     }
+
+    #[test]
+    fn malformed_short_import_counts_as_other_member() {
+        let mut truncated = import_object(
+            import_type::CODE,
+            name_type::NAME,
+            0,
+            "CreateWidget",
+            "foo.dll",
+            None,
+        );
+        truncated.truncate(20);
+        let lib = archive(vec![("bad.obj/", truncated)]);
+        let parsed = ImportLibrary::parse(&lib).unwrap();
+        assert!(parsed.imports.is_empty());
+        assert_eq!(parsed.other_members, 1);
+    }
+
+    #[test]
+    fn named_import_normalizes_hint_to_zero() {
+        let lib = archive(vec![(
+            "foo.obj/",
+            import_object(
+                import_type::CODE,
+                name_type::NAME,
+                42,
+                "CreateWidget",
+                "foo.dll",
+                None,
+            ),
+        )]);
+        let parsed = ImportLibrary::parse(&lib).unwrap();
+        assert_eq!(
+            parsed.imports,
+            vec![LibImport {
+                dll: "foo.dll".into(),
+                export: ImportSymbol::Name {
+                    hint: 0,
+                    name: "CreateWidget".into(),
+                },
+                kind: LibImportKind::Code,
+            }]
+        );
+    }
 }
