@@ -216,6 +216,32 @@ fn trace(path: &[u16], host: Option<&[u16]>) {
     );
 }
 
+fn acp_to_wide(bytes: &[u8]) -> Option<Vec<u16>> {
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    let len = i32::try_from(bytes.len()).ok()?;
+    // SAFETY: sizing call, then a call with room for `n` units.
+    unsafe {
+        let n = MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0);
+        let count = usize::try_from(n).ok().filter(|&c| c > 0)?;
+        let mut wide = vec![0u16; count];
+        MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n);
+        Some(wide)
+    }
+}
+
+fn widen_ansi(path: *const c_char) -> Option<Vec<u16>> {
+    if path.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes a NUL-terminated path.
+    let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+    let mut wide = acp_to_wide(bytes)?;
+    wide.push(0);
+    Some(wide)
+}
+
 /// A narrow path (ANSI code page, as the host decodes it) on a virtual
 /// drive, as a wide host path.
 fn narrow(path: *const c_char) -> Option<Vec<u16>> {
@@ -232,17 +258,30 @@ fn narrow(path: *const c_char) -> Option<Vec<u16>> {
             return None;
         }
     }
-    let len = i32::try_from(bytes.len()).ok()?;
-    // SAFETY: sizing call, then a call with room for `n` units.
-    let wide = unsafe {
-        let n = MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0);
-        let mut wide = vec![0u16; usize::try_from(n).ok()?];
-        MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n);
-        wide
-    };
+    let wide = acp_to_wide(bytes)?;
     let host = translate(&wide);
     trace(&wide, host.as_deref());
     host
+}
+
+struct WidePath(Option<Vec<u16>>);
+
+impl WidePath {
+    fn ptr(&self) -> *const u16 {
+        self.0.as_deref().map_or(std::ptr::null(), <[u16]>::as_ptr)
+    }
+}
+
+/// Rewrites a `(from, to)` narrow path pair whenever at least one path is on
+/// a virtual drive, widening any non-virtual partner so both can go to `*W`.
+fn narrow_pair(from: *const c_char, to: *const c_char) -> Option<(WidePath, WidePath)> {
+    match (narrow(from), narrow(to)) {
+        (None, None) => None,
+        (f, t) => Some((
+            WidePath(f.or_else(|| widen_ansi(from))),
+            WidePath(t.or_else(|| widen_ansi(to))),
+        )),
+    }
 }
 
 /// An ASCII mode string (`"rb"`, `"w, ccs=UTF-8"`) for a wide CRT call.
@@ -350,9 +389,40 @@ pub extern "system" fn DeleteFileW(path: *const u16) -> i32 {
     host!("kernel32.dll", "DeleteFileW": extern "system" fn(*const u16) -> i32)(p.ptr())
 }
 
+pub extern "system" fn RemoveDirectoryA(path: *const c_char) -> i32 {
+    match narrow(path) {
+        Some(p) => {
+            host!("kernel32.dll", "RemoveDirectoryW": extern "system" fn(*const u16) -> i32)(
+                p.as_ptr(),
+            )
+        }
+        None => {
+            host!("kernel32.dll", "RemoveDirectoryA": extern "system" fn(*const c_char) -> i32)(
+                path,
+            )
+        }
+    }
+}
+
 pub extern "system" fn RemoveDirectoryW(path: *const u16) -> i32 {
     let p = wide(path);
     host!("kernel32.dll", "RemoveDirectoryW": extern "system" fn(*const u16) -> i32)(p.ptr())
+}
+
+pub extern "system" fn SetFileAttributesA(path: *const c_char, attributes: u32) -> i32 {
+    match narrow(path) {
+        Some(p) => {
+            host!("kernel32.dll", "SetFileAttributesW": extern "system" fn(*const u16, u32) -> i32)(
+                p.as_ptr(),
+                attributes,
+            )
+        }
+        None => {
+            host!("kernel32.dll", "SetFileAttributesA": extern "system" fn(*const c_char, u32) -> i32)(
+                path, attributes,
+            )
+        }
+    }
 }
 
 pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32 {
@@ -378,12 +448,49 @@ pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
     }
 }
 
+pub extern "system" fn CreateDirectoryA(path: *const c_char, security: *const c_void) -> i32 {
+    match narrow(path) {
+        Some(p) => {
+            host!("kernel32.dll", "CreateDirectoryW": extern "system" fn(*const u16, *const c_void) -> i32)(
+                p.as_ptr(),
+                security,
+            )
+        }
+        None => {
+            host!("kernel32.dll", "CreateDirectoryA": extern "system" fn(*const c_char, *const c_void) -> i32)(
+                path, security,
+            )
+        }
+    }
+}
+
 pub extern "system" fn CreateDirectoryW(path: *const u16, security: *const c_void) -> i32 {
     let p = wide(path);
     host!("kernel32.dll", "CreateDirectoryW": extern "system" fn(*const u16, *const c_void) -> i32)(
         p.ptr(),
         security,
     )
+}
+
+pub extern "system" fn GetFileAttributesExA(
+    path: *const c_char,
+    level: i32,
+    info: *mut c_void,
+) -> i32 {
+    match narrow(path) {
+        Some(p) => {
+            host!("kernel32.dll", "GetFileAttributesExW": extern "system" fn(*const u16, i32, *mut c_void) -> i32)(
+                p.as_ptr(),
+                level,
+                info,
+            )
+        }
+        None => {
+            host!("kernel32.dll", "GetFileAttributesExA": extern "system" fn(*const c_char, i32, *mut c_void) -> i32)(
+                path, level, info,
+            )
+        }
+    }
 }
 
 pub extern "system" fn GetFileAttributesExW(
@@ -402,6 +509,29 @@ pub extern "system" fn GetFileAttributesExW(
 pub extern "system" fn GetFileAttributesW(path: *const u16) -> u32 {
     let p = wide(path);
     host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(p.ptr())
+}
+
+pub extern "system" fn GetDiskFreeSpaceExA(
+    path: *const c_char,
+    available: *mut u64,
+    total: *mut u64,
+    free: *mut u64,
+) -> i32 {
+    match narrow(path) {
+        Some(p) => {
+            host!("kernel32.dll", "GetDiskFreeSpaceExW": extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32)(
+                p.as_ptr(),
+                available,
+                total,
+                free,
+            )
+        }
+        None => {
+            host!("kernel32.dll", "GetDiskFreeSpaceExA": extern "system" fn(*const c_char, *mut u64, *mut u64, *mut u64) -> i32)(
+                path, available, total, free,
+            )
+        }
+    }
 }
 
 pub extern "system" fn GetDiskFreeSpaceExW(
@@ -472,6 +602,47 @@ pub extern "system" fn FindFirstFileExW(
     )
 }
 
+pub extern "system" fn MoveFileA(from: *const c_char, to: *const c_char) -> i32 {
+    match narrow_pair(from, to) {
+        Some((from, to)) => {
+            host!("kernel32.dll", "MoveFileW": extern "system" fn(*const u16, *const u16) -> i32)(
+                from.ptr(),
+                to.ptr(),
+            )
+        }
+        None => {
+            host!("kernel32.dll", "MoveFileA": extern "system" fn(*const c_char, *const c_char) -> i32)(
+                from, to,
+            )
+        }
+    }
+}
+
+pub extern "system" fn MoveFileW(from: *const u16, to: *const u16) -> i32 {
+    let (from, to) = (wide(from), wide(to));
+    host!("kernel32.dll", "MoveFileW": extern "system" fn(*const u16, *const u16) -> i32)(
+        from.ptr(),
+        to.ptr(),
+    )
+}
+
+pub extern "system" fn MoveFileExA(from: *const c_char, to: *const c_char, flags: u32) -> i32 {
+    match narrow_pair(from, to) {
+        Some((from, to)) => {
+            host!("kernel32.dll", "MoveFileExW": extern "system" fn(*const u16, *const u16, u32) -> i32)(
+                from.ptr(),
+                to.ptr(),
+                flags,
+            )
+        }
+        None => {
+            host!("kernel32.dll", "MoveFileExA": extern "system" fn(*const c_char, *const c_char, u32) -> i32)(
+                from, to, flags,
+            )
+        }
+    }
+}
+
 pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32 {
     let (from, to) = (wide(from), wide(to));
     host!("kernel32.dll", "MoveFileExW": extern "system" fn(*const u16, *const u16, u32) -> i32)(
@@ -479,6 +650,43 @@ pub extern "system" fn MoveFileExW(from: *const u16, to: *const u16, flags: u32)
         to.ptr(),
         flags,
     )
+}
+
+pub extern "system" fn CopyFileA(
+    from: *const c_char,
+    to: *const c_char,
+    fail_if_exists: i32,
+) -> i32 {
+    match narrow_pair(from, to) {
+        Some((from, to)) => {
+            host!("kernel32.dll", "CopyFileW": extern "system" fn(*const u16, *const u16, i32) -> i32)(
+                from.ptr(),
+                to.ptr(),
+                fail_if_exists,
+            )
+        }
+        None => {
+            host!("kernel32.dll", "CopyFileA": extern "system" fn(*const c_char, *const c_char, i32) -> i32)(
+                from,
+                to,
+                fail_if_exists,
+            )
+        }
+    }
+}
+
+pub extern "system" fn CopyFileW(from: *const u16, to: *const u16, fail_if_exists: i32) -> i32 {
+    let (from, to) = (wide(from), wide(to));
+    host!("kernel32.dll", "CopyFileW": extern "system" fn(*const u16, *const u16, i32) -> i32)(
+        from.ptr(),
+        to.ptr(),
+        fail_if_exists,
+    )
+}
+
+pub extern "system" fn SetCurrentDirectoryW(path: *const u16) -> i32 {
+    let p = wide(path);
+    host!("kernel32.dll", "SetCurrentDirectoryW": extern "system" fn(*const u16) -> i32)(p.ptr())
 }
 
 pub extern "system" fn SetCurrentDirectoryA(path: *const c_char) -> i32 {
@@ -610,6 +818,28 @@ pub extern "C" fn _wstat64(path: *const u16, stat: *mut c_void) -> i32 {
     host!("ucrtbase.dll", "_wstat64": extern "C" fn(*const u16, *mut c_void) -> i32)(p.ptr(), stat)
 }
 
+pub extern "C" fn _stat64(path: *const c_char, stat: *mut c_void) -> i32 {
+    match narrow(path) {
+        Some(p) => {
+            host!("ucrtbase.dll", "_wstat64": extern "C" fn(*const u16, *mut c_void) -> i32)(
+                p.as_ptr(),
+                stat,
+            )
+        }
+        None => host!("ucrtbase.dll", "_stat64": extern "C" fn(*const c_char, *mut c_void) -> i32)(
+            path, stat,
+        ),
+    }
+}
+
+pub extern "C" fn _wstat64i32(path: *const u16, stat: *mut c_void) -> i32 {
+    let p = wide(path);
+    host!("ucrtbase.dll", "_wstat64i32": extern "C" fn(*const u16, *mut c_void) -> i32)(
+        p.ptr(),
+        stat,
+    )
+}
+
 pub extern "C" fn _stat64i32(path: *const c_char, stat: *mut c_void) -> i32 {
     match narrow(path) {
         Some(p) => {
@@ -633,9 +863,136 @@ pub extern "C" fn remove(path: *const c_char) -> i32 {
     }
 }
 
+pub extern "C" fn _wremove(path: *const u16) -> i32 {
+    let p = wide(path);
+    host!("ucrtbase.dll", "_wremove": extern "C" fn(*const u16) -> i32)(p.ptr())
+}
+
+pub extern "C" fn _unlink(path: *const c_char) -> i32 {
+    match narrow(path) {
+        Some(p) => host!("ucrtbase.dll", "_wunlink": extern "C" fn(*const u16) -> i32)(p.as_ptr()),
+        None => host!("ucrtbase.dll", "_unlink": extern "C" fn(*const c_char) -> i32)(path),
+    }
+}
+
+pub extern "C" fn _wunlink(path: *const u16) -> i32 {
+    let p = wide(path);
+    host!("ucrtbase.dll", "_wunlink": extern "C" fn(*const u16) -> i32)(p.ptr())
+}
+
+pub extern "C" fn rename(from: *const c_char, to: *const c_char) -> i32 {
+    match narrow_pair(from, to) {
+        Some((from, to)) => {
+            host!("ucrtbase.dll", "_wrename": extern "C" fn(*const u16, *const u16) -> i32)(
+                from.ptr(),
+                to.ptr(),
+            )
+        }
+        None => {
+            host!("ucrtbase.dll", "rename": extern "C" fn(*const c_char, *const c_char) -> i32)(
+                from, to,
+            )
+        }
+    }
+}
+
+pub extern "C" fn _wrename(from: *const u16, to: *const u16) -> i32 {
+    let (from, to) = (wide(from), wide(to));
+    host!("ucrtbase.dll", "_wrename": extern "C" fn(*const u16, *const u16) -> i32)(
+        from.ptr(),
+        to.ptr(),
+    )
+}
+
+pub extern "C" fn _mkdir(path: *const c_char) -> i32 {
+    match narrow(path) {
+        Some(p) => host!("ucrtbase.dll", "_wmkdir": extern "C" fn(*const u16) -> i32)(p.as_ptr()),
+        None => host!("ucrtbase.dll", "_mkdir": extern "C" fn(*const c_char) -> i32)(path),
+    }
+}
+
+pub extern "C" fn _wmkdir(path: *const u16) -> i32 {
+    let p = wide(path);
+    host!("ucrtbase.dll", "_wmkdir": extern "C" fn(*const u16) -> i32)(p.ptr())
+}
+
+pub extern "C" fn _rmdir(path: *const c_char) -> i32 {
+    match narrow(path) {
+        Some(p) => host!("ucrtbase.dll", "_wrmdir": extern "C" fn(*const u16) -> i32)(p.as_ptr()),
+        None => host!("ucrtbase.dll", "_rmdir": extern "C" fn(*const c_char) -> i32)(path),
+    }
+}
+
+pub extern "C" fn _wrmdir(path: *const u16) -> i32 {
+    let p = wide(path);
+    host!("ucrtbase.dll", "_wrmdir": extern "C" fn(*const u16) -> i32)(p.ptr())
+}
+
+pub extern "C" fn _access(path: *const c_char, mode: i32) -> i32 {
+    match narrow(path) {
+        Some(p) => host!("ucrtbase.dll", "_waccess": extern "C" fn(*const u16, i32) -> i32)(
+            p.as_ptr(),
+            mode,
+        ),
+        None => {
+            host!("ucrtbase.dll", "_access": extern "C" fn(*const c_char, i32) -> i32)(path, mode)
+        }
+    }
+}
+
+pub extern "C" fn _waccess(path: *const u16, mode: i32) -> i32 {
+    let p = wide(path);
+    host!("ucrtbase.dll", "_waccess": extern "C" fn(*const u16, i32) -> i32)(p.ptr(), mode)
+}
+
+pub extern "C" fn _access_s(path: *const c_char, mode: i32) -> i32 {
+    match narrow(path) {
+        Some(p) => host!("ucrtbase.dll", "_waccess_s": extern "C" fn(*const u16, i32) -> i32)(
+            p.as_ptr(),
+            mode,
+        ),
+        None => {
+            host!("ucrtbase.dll", "_access_s": extern "C" fn(*const c_char, i32) -> i32)(path, mode)
+        }
+    }
+}
+
+pub extern "C" fn _waccess_s(path: *const u16, mode: i32) -> i32 {
+    let p = wide(path);
+    host!("ucrtbase.dll", "_waccess_s": extern "C" fn(*const u16, i32) -> i32)(p.ptr(), mode)
+}
+
+pub extern "C" fn _chmod(path: *const c_char, mode: i32) -> i32 {
+    match narrow(path) {
+        Some(p) => host!("ucrtbase.dll", "_wchmod": extern "C" fn(*const u16, i32) -> i32)(
+            p.as_ptr(),
+            mode,
+        ),
+        None => {
+            host!("ucrtbase.dll", "_chmod": extern "C" fn(*const c_char, i32) -> i32)(path, mode)
+        }
+    }
+}
+
 pub extern "C" fn _wchmod(path: *const u16, mode: i32) -> i32 {
     let p = wide(path);
     host!("ucrtbase.dll", "_wchmod": extern "C" fn(*const u16, i32) -> i32)(p.ptr(), mode)
+}
+
+pub extern "C" fn _utime64(path: *const c_char, times: *mut c_void) -> i32 {
+    match narrow(path) {
+        Some(p) => {
+            host!("ucrtbase.dll", "_wutime64": extern "C" fn(*const u16, *mut c_void) -> i32)(
+                p.as_ptr(),
+                times,
+            )
+        }
+        None => {
+            host!("ucrtbase.dll", "_utime64": extern "C" fn(*const c_char, *mut c_void) -> i32)(
+                path, times,
+            )
+        }
+    }
 }
 
 pub extern "C" fn _wutime64(path: *const u16, times: *mut c_void) -> i32 {
@@ -701,18 +1058,29 @@ pub(crate) fn module() -> HleModule {
             hle_export!(CreateFile2),
             hle_export!(DeleteFileA),
             hle_export!(DeleteFileW),
+            hle_export!(RemoveDirectoryA),
             hle_export!(RemoveDirectoryW),
+            hle_export!(SetFileAttributesA),
             hle_export!(SetFileAttributesW),
             hle_export!(GetFileAttributesA),
+            hle_export!(CreateDirectoryA),
             hle_export!(CreateDirectoryW),
             hle_export!(GetFileAttributesW),
+            hle_export!(GetFileAttributesExA),
             hle_export!(GetFileAttributesExW),
+            hle_export!(GetDiskFreeSpaceExA),
             hle_export!(GetDiskFreeSpaceExW),
             hle_export!(GetDiskFreeSpaceW),
             hle_export!(FindFirstFileW),
             hle_export!(FindFirstFileExW),
+            hle_export!(MoveFileA),
+            hle_export!(MoveFileW),
+            hle_export!(MoveFileExA),
             hle_export!(MoveFileExW),
+            hle_export!(CopyFileA),
+            hle_export!(CopyFileW),
             hle_export!(SetCurrentDirectoryA),
+            hle_export!(SetCurrentDirectoryW),
             hle_export!(_wfopen),
             hle_export!(_wfopen_s),
             hle_export!(_wfsopen),
@@ -721,9 +1089,26 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_open),
             hle_export!(_wopen),
             hle_export!(_wstat64),
+            hle_export!(_stat64),
+            hle_export!(_wstat64i32),
             hle_export!(_stat64i32),
             hle_export!(remove),
+            hle_export!(_wremove),
+            hle_export!(_unlink),
+            hle_export!(_wunlink),
+            hle_export!(rename),
+            hle_export!(_wrename),
+            hle_export!(_mkdir),
+            hle_export!(_wmkdir),
+            hle_export!(_rmdir),
+            hle_export!(_wrmdir),
+            hle_export!(_access),
+            hle_export!(_waccess),
+            hle_export!(_access_s),
+            hle_export!(_waccess_s),
+            hle_export!(_chmod),
             hle_export!(_wchmod),
+            hle_export!(_utime64),
             hle_export!(_wutime64),
             HleExport {
                 name: FIOPEN,
@@ -754,7 +1139,10 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let (mut out, mut n) = ([0u8; 10], 0);
         let handle = file.as_raw_handle().cast();
-        assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
+        assert_ne!(
+            ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()),
+            0
+        );
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
@@ -948,6 +1336,33 @@ mod tests {
         assert_ne!(error, 0);
         const OUT: i32 = 2;
         assert!(fiopen(path("d.txt").as_ptr().cast(), OUT, 0x40).is_null());
+        assert_eq!(CreateDirectoryA(path("dir_a").as_ptr().cast(), null), 0);
+        assert_eq!(_mkdir(path("dir_crt").as_ptr().cast()), -1);
+        assert_eq!(_access(path("present.txt").as_ptr().cast(), 0), -1);
+        assert_eq!(SetCurrentDirectoryA(path("").as_ptr().cast()), 0);
+        assert_eq!(SetCurrentDirectoryW(w(&format!("{inner}:")).as_ptr()), 0);
+        assert_eq!(
+            CopyFileA(
+                path("present.txt").as_ptr().cast(),
+                path("copy.txt").as_ptr().cast(),
+                0
+            ),
+            0
+        );
+        assert_eq!(
+            MoveFileA(
+                path("present.txt").as_ptr().cast(),
+                path("moved.txt").as_ptr().cast()
+            ),
+            0
+        );
+        assert_eq!(
+            rename(
+                path("present.txt").as_ptr().cast(),
+                path("renamed.txt").as_ptr().cast()
+            ),
+            -1
+        );
 
         // Nothing was made behind a path rewritten twice.
         let names: Vec<_> = std::fs::read_dir(&folder)
@@ -955,5 +1370,194 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    #[test]
+    fn narrow_and_wide_file_and_directory_wrappers_work_on_virtual_drives() {
+        let dir = tempfile::tempdir().unwrap();
+        let letter = mount(dir.path()).unwrap();
+        let cstr = |s: String| format!("{s}\0");
+        let null = std::ptr::null_mut();
+
+        // Win32 directory, attribute, and disk space APIs.
+        let sub_a = cstr(format!("{letter}:/sub_a"));
+        assert_ne!(CreateDirectoryA(sub_a.as_ptr().cast(), null), 0);
+        assert!(dir.path().join("sub_a").is_dir());
+
+        let mut attr_data = [0u64; 8];
+        assert_ne!(
+            GetFileAttributesExA(sub_a.as_ptr().cast(), 0, attr_data.as_mut_ptr().cast()),
+            0
+        );
+        let mut avail = 0u64;
+        assert_ne!(
+            GetDiskFreeSpaceExA(
+                cstr(format!("{letter}:\\")).as_ptr().cast(),
+                &mut avail,
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_ne!(RemoveDirectoryA(sub_a.as_ptr().cast()), 0);
+        assert!(!dir.path().join("sub_a").exists());
+
+        // CopyFileW/A and MoveFileW/A/ExA, including mixed virtual/host pairs.
+        let src_v = w(&format!("{letter}:\\src.txt"));
+        std::fs::write(dir.path().join("src.txt"), b"hello").unwrap();
+        let dst_vw = w(&format!("{letter}:\\dst_w.txt"));
+        assert_ne!(CopyFileW(src_v.as_ptr(), dst_vw.as_ptr(), 0), 0);
+        assert_eq!(
+            std::fs::read(dir.path().join("dst_w.txt")).unwrap(),
+            b"hello"
+        );
+
+        let host_dir = tempfile::tempdir().unwrap();
+        let host_file = cstr(host_dir.path().join("from_host.txt").display().to_string());
+        std::fs::write(host_dir.path().join("from_host.txt"), b"host").unwrap();
+        let dst_va = cstr(format!("{letter}:/from_host_copy.txt"));
+        assert_ne!(
+            CopyFileA(host_file.as_ptr().cast(), dst_va.as_ptr().cast(), 0),
+            0
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("from_host_copy.txt")).unwrap(),
+            b"host"
+        );
+
+        let moved_host = cstr(host_dir.path().join("moved_out.txt").display().to_string());
+        assert_ne!(
+            MoveFileA(dst_va.as_ptr().cast(), moved_host.as_ptr().cast()),
+            0
+        );
+        assert!(!dir.path().join("from_host_copy.txt").exists());
+        assert_eq!(
+            std::fs::read(host_dir.path().join("moved_out.txt")).unwrap(),
+            b"host"
+        );
+
+        let moved_w = w(&format!("{letter}:\\moved_w.txt"));
+        assert_ne!(MoveFileW(dst_vw.as_ptr(), moved_w.as_ptr()), 0);
+        assert!(!dir.path().join("dst_w.txt").exists());
+        let moved_ex = cstr(format!("{letter}:/moved_ex.txt"));
+        assert_ne!(
+            MoveFileExA(
+                cstr(format!("{letter}:/moved_w.txt")).as_ptr().cast(),
+                moved_ex.as_ptr().cast(),
+                1 // MOVEFILE_REPLACE_EXISTING
+            ),
+            0
+        );
+        assert!(dir.path().join("moved_ex.txt").is_file());
+
+        // SetFileAttributesA round-trips read-only then restores normal.
+        const FILE_ATTRIBUTE_READONLY: u32 = 1;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+        assert_ne!(
+            SetFileAttributesA(moved_ex.as_ptr().cast(), FILE_ATTRIBUTE_READONLY),
+            0
+        );
+        assert_ne!(
+            GetFileAttributesA(moved_ex.as_ptr().cast()) & FILE_ATTRIBUTE_READONLY,
+            0
+        );
+        assert_ne!(
+            SetFileAttributesA(moved_ex.as_ptr().cast(), FILE_ATTRIBUTE_NORMAL),
+            0
+        );
+        assert_ne!(DeleteFileA(moved_ex.as_ptr().cast()), 0);
+
+        // UCRT directory, access, stat, utime, chmod, rename, and remove twins.
+        let crt_a = cstr(format!("{letter}:/crt_a"));
+        let crt_w = w(&format!("{letter}:\\crt_w"));
+        assert_eq!(_mkdir(crt_a.as_ptr().cast()), 0);
+        assert_eq!(_wmkdir(crt_w.as_ptr()), 0);
+        assert_eq!(_access(crt_a.as_ptr().cast(), 0), 0);
+        assert_eq!(_waccess(crt_w.as_ptr(), 0), 0);
+        assert_eq!(_access_s(crt_a.as_ptr().cast(), 0), 0);
+        assert_eq!(_waccess_s(crt_w.as_ptr(), 0), 0);
+        assert_eq!(_rmdir(crt_a.as_ptr().cast()), 0);
+        assert_eq!(_wrmdir(crt_w.as_ptr()), 0);
+
+        let src_a = cstr(format!("{letter}:/src.txt"));
+        let mut stat_buf = [0u64; 8];
+        assert_eq!(
+            _stat64(src_a.as_ptr().cast(), stat_buf.as_mut_ptr().cast()),
+            0
+        );
+        assert_eq!(_wstat64i32(src_v.as_ptr(), stat_buf.as_mut_ptr().cast()), 0);
+
+        let mut times = [1_700_000_000i64; 2];
+        assert_eq!(
+            _utime64(src_a.as_ptr().cast(), times.as_mut_ptr().cast()),
+            0
+        );
+        const S_IREAD_WRITE: i32 = 0x180;
+        assert_eq!(_chmod(src_a.as_ptr().cast(), S_IREAD_WRITE), 0);
+
+        let ren_w = w(&format!("{letter}:\\ren_w.txt"));
+        assert_eq!(_wrename(src_v.as_ptr(), ren_w.as_ptr()), 0);
+        let ren_a = cstr(format!("{letter}:/ren_a.txt"));
+        assert_eq!(
+            rename(
+                cstr(format!("{letter}:/ren_w.txt")).as_ptr().cast(),
+                ren_a.as_ptr().cast()
+            ),
+            0
+        );
+        assert_eq!(_unlink(ren_a.as_ptr().cast()), 0);
+        assert!(!dir.path().join("ren_a.txt").exists());
+
+        std::fs::write(dir.path().join("u_w.bin"), b"1").unwrap();
+        assert_eq!(_wunlink(w(&format!("{letter}:\\u_w.bin")).as_ptr()), 0);
+        std::fs::write(dir.path().join("r_w.bin"), b"2").unwrap();
+        assert_eq!(_wremove(w(&format!("{letter}:\\r_w.bin")).as_ptr()), 0);
+        assert!(!dir.path().join("u_w.bin").exists());
+        assert!(!dir.path().join("r_w.bin").exists());
+    }
+
+    /// Run in a child process so mutating the process working directory does
+    /// not race with parallel tests. Does nothing otherwise.
+    #[test]
+    fn set_current_directory_child() {
+        let Ok(root) = std::env::var("VICTORY_FILES_CWD_CHILD") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let letter = mount(&root).unwrap();
+        let sub_a = format!("{letter}:\\dir_a");
+        let sub_b = format!("{letter}:\\dir_b");
+        assert_ne!(
+            SetCurrentDirectoryA(format!("{sub_a}\0").as_ptr().cast()),
+            0
+        );
+        assert_eq!(
+            std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap(),
+            std::fs::canonicalize(root.join("dir_a")).unwrap()
+        );
+        assert_ne!(SetCurrentDirectoryW(w(&sub_b).as_ptr()), 0);
+        assert_eq!(
+            std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap(),
+            std::fs::canonicalize(root.join("dir_b")).unwrap()
+        );
+        // Leave the temp directory before exit so the parent can remove it.
+        let _ = std::env::set_current_dir(std::env::temp_dir());
+    }
+
+    #[test]
+    fn set_current_directory_rewrites_virtual_drives() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("dir_a")).unwrap();
+        std::fs::create_dir(dir.path().join("dir_b")).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "modules::files::tests::set_current_directory_child",
+                "--nocapture",
+            ])
+            .env("VICTORY_FILES_CWD_CHILD", dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{status:?}");
     }
 }
