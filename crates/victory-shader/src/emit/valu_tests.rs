@@ -989,6 +989,116 @@ fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
     assert_eq!(nibble(0xF), -0.0625);
 }
 
+fn reciprocal_f64_results(
+    setup: &[u32],
+    instruction: &[u32],
+    inputs: &[u64],
+) -> Vec<(String, Vec<u64>)> {
+    let cases: Vec<_> = inputs.iter().map(|&n| [n as u32, (n >> 32) as u32, 0, 0]).collect();
+    let mut outputs = std::collections::BTreeMap::<String, Vec<u64>>::new();
+    for (word, shift) in [(6, 0), (7, 32)] {
+        let mut body = setup.to_vec();
+        body.extend(instruction);
+        body.push(vop1(0x001, 0, vgpr(word)));
+        let shader = try_build_valu_cs(&body).unwrap_or_else(|error| panic!("V_RCP_F64: {error}"));
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let feature_bits = container.part(crate::FourCC::SFI0).unwrap().data;
+        assert_eq!(u64::from_le_bytes(feature_bits.try_into().unwrap()) & 0x8001, 0);
+        run_cases(&shader, &cases, |backend, index, _, value| {
+            let slots = outputs.entry(backend.to_owned()).or_insert_with(|| vec![0; cases.len()]);
+            slots[index] |= u64::from(value) << shift;
+        });
+    }
+    outputs.into_iter().collect()
+}
+
+#[test]
+fn reciprocal_f64_tracks_range_rounding_and_special_values() {
+    const SIGN: u64 = 1 << 63;
+    const INF: u64 = 0x7ff0_0000_0000_0000;
+    const QUIET: u64 = 1 << 51;
+    let magnitudes = [
+        0,
+        1,
+        (1 << 50) - 1,
+        1 << 50,
+        (1 << 50) + 1,
+        1 << 51,
+        (1 << 52) - 1,
+        1 << 52,
+        0.125f64.to_bits(),
+        1.0f64.to_bits(),
+        1.0f64.to_bits() + 1,
+        3.0f64.to_bits(),
+        11.375f64.to_bits(),
+        0x7fd0_0000_0000_0000,
+        0x7fd0_0000_0000_0001,
+        f64::MAX.to_bits(),
+        INF,
+        INF | 17,
+    ];
+    let inputs: Vec<_> = magnitudes.into_iter().flat_map(|n| [n, SIGN | n]).collect();
+    for mode in 0..4 {
+        let setup = [0xbfa4_0000 | mode << 2]; // s_round_mode
+        for (backend, outputs) in reciprocal_f64_results(&setup, &[vop1(0x02f, 6, vgpr(1))], &inputs) {
+            for (&input, got) in inputs.iter().zip(outputs) {
+                let sign = input & SIGN;
+                let abs = input & !SIGN;
+                let away = (mode == 1 && sign == 0) || (mode == 2 && sign != 0);
+                assert_eq!(got & SIGN, sign, "{backend}: sign for {input:#018x}");
+                let result = got & !SIGN;
+                let want = (1.0 / f64::from_bits(abs)).to_bits();
+                if abs > INF {
+                    assert_eq!(got, input | QUIET, "{backend}: NaN {input:#018x}");
+                } else if abs == 0 || abs == INF {
+                    assert_eq!(result, want, "{backend}: special input {input:#018x}");
+                } else if want == INF {
+                    let overflow = if mode == 0 || away { INF } else { f64::MAX.to_bits() };
+                    assert_eq!(result, overflow, "{backend}: overflow mode {mode}, {input:#018x}");
+                } else {
+                    assert!(
+                        result < INF && result.abs_diff(want) <= 1 << 29,
+                        "{backend}: {input:#018x}, mode {mode}, {result:#018x} vs {want:#018x}"
+                    );
+                    if away {
+                        assert!(result >= want, "{backend}: rounding away for {input:#018x}");
+                    } else if mode != 0 {
+                        assert!(result <= want, "{backend}: rounding inward for {input:#018x}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn reciprocal_f64_obeys_input_and_output_denormal_modes() {
+    const SIGN: u64 = 1 << 63;
+    let subnormal = f64::MIN_POSITIVE.to_bits() / 2;
+    let large = f64::MAX.to_bits();
+    let inputs = [subnormal, SIGN | subnormal, large, SIGN | large];
+    for mode in 0..4 {
+        let setup = [0xbfa5_0000 | mode << 2]; // s_denorm_mode
+        for (backend, values) in reciprocal_f64_results(&setup, &vop3(0x1af, 6, sgpr(0), 0, 0), &inputs) {
+            let from_subnormal = if mode & 1 == 0 {
+                f64::INFINITY.to_bits()
+            } else {
+                (1.0 / f64::from_bits(subnormal)).to_bits()
+            };
+            assert_eq!(values[0], from_subnormal, "{backend}");
+            assert_eq!(values[1], SIGN | from_subnormal, "{backend}");
+            if mode & 2 == 0 {
+                assert_eq!(&values[2..], [0, SIGN], "{backend}");
+            } else {
+                let want = (1.0 / f64::MAX).to_bits();
+                assert!((1..f64::MIN_POSITIVE.to_bits()).contains(&values[2]), "{backend}");
+                assert!(values[2].abs_diff(want) <= 1 << 29, "{backend}");
+                assert_eq!(values[3], SIGN | values[2], "{backend}");
+            }
+        }
+    }
+}
+
 #[test]
 fn v_fract_f32_never_returns_one() {
     // v_fract_f32 v0, v1 (VOP1 opcode 0x020)
