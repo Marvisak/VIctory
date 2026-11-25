@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod doctor;
 mod inspect;
 mod prebuild;
 mod run;
@@ -121,6 +122,26 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// List the failures of a run, each with a link that searches the
+    /// issues and pull requests for it; `--draft N` writes an issue for one.
+    Doctor {
+        /// The run's log (what `run --execute` wrote to stderr).
+        log: PathBuf,
+        /// The crashes.log to read (default: every one in the data folder).
+        #[arg(long)]
+        crashes: Option<PathBuf>,
+        /// Write an issue draft for failure N.
+        #[arg(long, value_name = "N")]
+        draft: Option<usize>,
+        /// The repository the links search.
+        #[arg(long, default_value = "Marvisak/VIctory")]
+        repo: String,
+        /// Print the failures as JSON (for scripts and agents that triage
+        /// run reports): number, kind, key, title, count, search terms,
+        /// shaders, search URL, excerpt.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -204,6 +225,13 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Doctor {
+            log,
+            crashes,
+            draft,
+            repo,
+            json,
+        } => doctor::run(&log, crashes, draft, &repo, json),
         Command::Config => show_config(),
     }
 }
