@@ -1264,10 +1264,64 @@ pub enum Stride {
     Raw,
     /// RGBA32F elements.
     Typed,
-    /// Structured, elements of this many bytes.
+    /// Structured, elements of this many bytes: a raw byte-address view
+    /// like [`Stride::Raw`], as the host binds title buffers, with the
+    /// element size in the view-stride table the lowered code reads.
     Structured(u32),
     /// Typed, elements in this format of this many bytes.
     Format(DXGI_FORMAT, u32),
+}
+
+/// The SRV a [`View::Buffer`] is bound as, by how the test views it and its
+/// length in dwords. Every arm is a byte-address view except the typed ones:
+/// the host binds a title's buffers raw and carries the element stride in the
+/// view-stride table, so a lowering that multiplies by that stride itself
+/// (`Buffer views at computed heap indices`) is what the tests exercise.
+#[cfg(test)]
+fn buffer_view_desc(view: Stride, dwords: usize) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    let (format, elements, stride, flags) = match view {
+        Stride::Raw => (
+            DXGI_FORMAT_R32_TYPELESS,
+            dwords,
+            0,
+            D3D12_BUFFER_SRV_FLAG_RAW,
+        ),
+        Stride::Typed => (
+            DXGI_FORMAT_R32G32B32A32_FLOAT,
+            dwords / 4,
+            0,
+            D3D12_BUFFER_SRV_FLAG_NONE,
+        ),
+        Stride::Structured(_) => (
+            // Not a structured descriptor: the driver would then scale the
+            // byte index the lowered code passes by the structure stride a
+            // second time, which is how a GeForce read the wrong elements
+            // (#2317).
+            DXGI_FORMAT_R32_TYPELESS,
+            dwords,
+            0,
+            D3D12_BUFFER_SRV_FLAG_RAW,
+        ),
+        Stride::Format(f, bytes) => (
+            f,
+            dwords * 4 / bytes as usize,
+            0,
+            D3D12_BUFFER_SRV_FLAG_NONE,
+        ),
+    };
+    D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: 0,
+                NumElements: elements as u32,
+                StructureByteStride: stride,
+                Flags: flags,
+            },
+        },
+    }
 }
 
 /// Bindings for [`Host::dispatch`]: root arguments, the view heap in order,
@@ -1629,45 +1683,7 @@ impl Host {
                     }
                     View::Buffer { data, stride } => {
                         let b = upload(data)?;
-                        let (format, elements, stride, flags) = match stride {
-                            Stride::Raw => (
-                                DXGI_FORMAT_R32_TYPELESS,
-                                data.len(),
-                                0,
-                                D3D12_BUFFER_SRV_FLAG_RAW,
-                            ),
-                            Stride::Typed => (
-                                DXGI_FORMAT_R32G32B32A32_FLOAT,
-                                data.len() / 4,
-                                0,
-                                D3D12_BUFFER_SRV_FLAG_NONE,
-                            ),
-                            Stride::Structured(s) => (
-                                DXGI_FORMAT_UNKNOWN,
-                                data.len() * 4 / s as usize,
-                                s,
-                                D3D12_BUFFER_SRV_FLAG_NONE,
-                            ),
-                            Stride::Format(f, bytes) => (
-                                f,
-                                data.len() * 4 / bytes as usize,
-                                0,
-                                D3D12_BUFFER_SRV_FLAG_NONE,
-                            ),
-                        };
-                        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                            Format: format,
-                            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                                Buffer: D3D12_BUFFER_SRV {
-                                    FirstElement: 0,
-                                    NumElements: elements as u32,
-                                    StructureByteStride: stride,
-                                    Flags: flags,
-                                },
-                            },
-                        };
+                        let desc = buffer_view_desc(stride, data.len());
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
                         keep.push(b);
                     }
@@ -1874,5 +1890,42 @@ impl Host {
             drop(keep);
             Ok(out)
         }
+    }
+}
+
+#[cfg(test)]
+mod srv_desc_tests {
+    use super::*;
+
+    /// The host binds a title's buffers as raw byte-address views and carries
+    /// the element stride in the view-stride table; the lowered code
+    /// multiplies by that stride itself. A structured descriptor here would
+    /// give the driver a stride to apply on top of the byte index the code
+    /// passes (#2317).
+    #[test]
+    fn a_structured_test_view_is_bound_as_the_host_binds_it() {
+        let d = buffer_view_desc(Stride::Structured(12), 96);
+        // SAFETY: the descriptor is a BUFFER SRV, which the union holds.
+        let buffer = unsafe { d.Anonymous.Buffer };
+        assert_eq!(d.Format, DXGI_FORMAT_R32_TYPELESS);
+        assert_eq!(buffer.NumElements, 96, "bytes, not elements");
+        assert_eq!(buffer.StructureByteStride, 0);
+        assert_eq!(buffer.Flags, D3D12_BUFFER_SRV_FLAG_RAW);
+    }
+
+    /// The typed views keep the format and element count they name.
+    #[test]
+    fn typed_views_keep_their_format() {
+        let t = buffer_view_desc(Stride::Format(DXGI_FORMAT_R32G32_FLOAT, 8), 96);
+        // SAFETY: the descriptor is a BUFFER SRV, which the union holds.
+        let tb = unsafe { t.Anonymous.Buffer };
+        assert_eq!(t.Format, DXGI_FORMAT_R32G32_FLOAT);
+        assert_eq!(tb.NumElements, 48);
+        assert_eq!(tb.StructureByteStride, 0);
+        let v = buffer_view_desc(Stride::Typed, 96);
+        // SAFETY: the descriptor is a BUFFER SRV, which the union holds.
+        let vb = unsafe { v.Anonymous.Buffer };
+        assert_eq!(v.Format, DXGI_FORMAT_R32G32B32A32_FLOAT);
+        assert_eq!(vb.NumElements, 24);
     }
 }
