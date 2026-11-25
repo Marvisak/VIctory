@@ -3509,7 +3509,7 @@ mod batch {   // `mod tests` is already taken at the top of this file
         // SAFETY: our pool, guarded since the copy took it.
         unsafe { ((p + PAGE + 8) as *mut u8).write_volatile(7) };
         // The next submission: two lists ask for the copy.
-        let mut batch = Batch::default();
+        batch = Batch::default();
         batch.add(&copy, p, len);
         batch.add(&copy, p + 100, 200);
         assert_eq!(batch.flush(), PAGE, "the page written");
@@ -3522,6 +3522,9 @@ mod batch {   // `mod tests` is already taken at the top of this file
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
         crate::shadow::unregister(p, p as u64);
+        // The batch holds the copy, which watches the pool: gone before the
+        // pool, whose addresses a test running beside this one may take.
+        drop(batch);
         drop(copy);
         crate::watch::tests::free(p);
     }
