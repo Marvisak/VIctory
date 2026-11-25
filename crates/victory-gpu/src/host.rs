@@ -379,6 +379,69 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
     Some([info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?])
 }
 
+/// Errors the debug layer reported, as [`Host::log_messages`] read them
+/// (tests: `VICTORY_D3D12_DEBUG`, diagnostics builds).
+#[cfg(test)]
+pub(crate) static DEBUG_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Runs this binary's test `name` again in a child process, with the D3D12
+/// debug layer on: true in that child, where the test does its work (the
+/// host, made once per process, can only get the layer at its start);
+/// false in the parent, once the child passed.
+///
+/// The child says what it did ([`debug_layer_outcome`]): read the layer's
+/// messages, or skipped (no device, no layer installed). A skip is printed
+/// as one, and fails where `VICTORY_REQUIRE_DEBUG_LAYER=1` asks for the
+/// check to run; a child that says neither fails.
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn rerun_with_debug_layer(name: &str) -> bool {
+    const CHILD: &str = "VICTORY_TEST_DEBUG_LAYER_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--test-threads=1", "--nocapture"])
+        .env(CHILD, "1")
+        .env("VICTORY_D3D12_DEBUG", "1")
+        .output()
+        .unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{name} under the debug layer:\n{text}"
+    );
+    assert!(text.contains("1 passed"), "{name} did not run:\n{text}");
+    let outcome = text
+        .lines()
+        // (After libtest's `test <name> ... ` on the same line.)
+        .find_map(|l| {
+            l.split_once(DEBUG_LAYER_OUTCOME)
+                .map(|(_, outcome)| outcome)
+        })
+        .unwrap_or_else(|| panic!("{name} said neither that it checked nor why not:\n{text}"));
+    if let Some(why) = outcome.strip_prefix("skipped: ") {
+        let required = std::env::var_os("VICTORY_REQUIRE_DEBUG_LAYER").is_some_and(|v| v == "1");
+        assert!(
+            !required,
+            "{name}: the debug layer check was required, and skipped: {why}"
+        );
+        eprintln!("{name}: skipped, {why}");
+    }
+    false
+}
+
+/// The line a test run by [`rerun_with_debug_layer`] prints: `checked` once
+/// it has read the layer's messages, or `skipped: ` and why.
+#[cfg(all(test, feature = "diagnostics"))]
+const DEBUG_LAYER_OUTCOME: &str = "debug layer check: ";
+
+/// Prints what a test run by [`rerun_with_debug_layer`] did.
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn debug_layer_outcome(outcome: &str) {
+    println!("{DEBUG_LAYER_OUTCOME}{outcome}");
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     thread_local! {
@@ -406,6 +469,32 @@ pub(crate) mod tests {
             }
         }
         Ok(())
+    }
+
+    /// Making the host (its probes run D3D12 work of their own, such as
+    /// `victory_shader`'s fused multiply-add probe) leaves no errors in the
+    /// debug layer: the probe's root signature indexes the sampler heap
+    /// directly, and it bound none.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn making_the_host_leaves_no_debug_layer_errors() {
+        if !super::rerun_with_debug_layer(
+            "host::tests::making_the_host_leaves_no_debug_layer_errors",
+        ) {
+            return;
+        }
+        let Some(host) = super::host() else {
+            super::debug_layer_outcome("skipped: no host GPU here");
+            return;
+        };
+        if !host.debug_layer() {
+            super::debug_layer_outcome("skipped: no debug layer installed");
+            return;
+        }
+        host.log_messages();
+        let errors = super::DEBUG_ERRORS.lock().unwrap().clone();
+        assert!(errors.is_empty(), "{errors:#?}");
+        super::debug_layer_outcome("checked");
     }
 
     #[test]
@@ -1584,6 +1673,12 @@ impl Host {
         text
     }
 
+    /// Whether the debug layer's messages are read (`VICTORY_D3D12_DEBUG`).
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(crate) fn debug_layer(&self) -> bool {
+        self.messages.is_some()
+    }
+
     /// Moves the debug layer's messages into our log; returns the first
     /// error among them.
     pub(crate) fn log_messages(&self) -> Option<String> {
@@ -1607,8 +1702,15 @@ impl Host {
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
                     tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
-                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
-                        first_error = Some(text.to_owned());
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                        #[cfg(test)]
+                        DEBUG_ERRORS
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(text.to_owned());
+                        if first_error.is_none() {
+                            first_error = Some(text.to_owned());
+                        }
                     }
                 }
             }
