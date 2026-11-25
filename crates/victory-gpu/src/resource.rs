@@ -178,8 +178,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         && let Some(t) = texture_layout(desc)
     {
         // As the console: the layout's own alignment unless more is asked
-        // (4 KiB for 4 KiB modes, where PC says 64 KiB). Grand Theft Auto
-        // VI keeps these sizes in its texture tables, and its streaming
+        // (4 KiB for 4 KiB modes, where PC says 64 KiB). the title keeps these sizes in its texture tables, and its streaming
         // asserts when they disagree with the streamed layout.
         let alignment = desc.alignment.max(t.alignment);
         if !alignment.is_power_of_two() {
@@ -575,7 +574,7 @@ static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::
 
 /// Committed resources get their memory from the title's general
 /// allocator, as on the console, where titles hook it to place graphics
-/// memory themselves (Grand Theft Auto VI places its back buffers in a
+/// memory themselves (the title places its back buffers in a
 /// block of its own and checks they fill it). The runtime names it before
 /// the device exists.
 pub fn use_allocator(alloc: AllocRoutine, free: FreeRoutine) {
@@ -850,8 +849,19 @@ static REPLACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 #[cfg(windows)]
 pub(crate) fn texture_counts() -> (u64, u64, u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    let shared = (SHARED.load(Relaxed), SAVED.load(Relaxed), REPLACED.load(Relaxed));
-    (TEXTURES.load(Relaxed), TEXTURE_BYTES.load(Relaxed), USED.load(Relaxed), shared.0, shared.1, shared.2)
+    let shared = (
+        SHARED.load(Relaxed),
+        SAVED.load(Relaxed),
+        REPLACED.load(Relaxed),
+    );
+    (
+        TEXTURES.load(Relaxed),
+        TEXTURE_BYTES.load(Relaxed),
+        USED.load(Relaxed),
+        shared.0,
+        shared.1,
+        shared.2,
+    )
 }
 
 #[cfg(windows)]
@@ -865,7 +875,12 @@ impl Drop for HostTexture {
         #[cfg(feature = "diagnostics")]
         {
             use windows::core::Interface;
-            life::note(self.texture.as_raw() as usize, life::LET_GO, 0, life::holders(&self.texture));
+            life::note(
+                self.texture.as_raw() as usize,
+                life::LET_GO,
+                0,
+                life::holders(&self.texture),
+            );
         }
     }
 }
@@ -918,10 +933,9 @@ pub(crate) mod life {
     /// What happened to the texture named `name` (`...@0x<address>`), with
     /// the submissions around it, times relative to now.
     pub(crate) fn of(name: &str) -> String {
-        let Some(at) = name
-            .rsplit_once("@0x")
-            .and_then(|(_, a)| usize::from_str_radix(a.split(|c: char| !c.is_ascii_hexdigit()).next()?, 16).ok())
-        else {
+        let Some(at) = name.rsplit_once("@0x").and_then(|(_, a)| {
+            usize::from_str_radix(a.split(|c: char| !c.is_ascii_hexdigit()).next()?, 16).ok()
+        }) else {
             return String::new();
         };
         let now = std::time::Instant::now();
@@ -1005,7 +1019,7 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     d.alignment = 0;
     d.flags &= PC_FLAGS;
     // PC refuses depth targets that are also unordered-access (the console
-    // allows both; Grand Theft Auto VI's shadow maps and material depth ask
+    // allows both; the title's shadow maps and material depth ask
     // for it): unordered views of such a texture write its twin
     // (`crate::twin`).
     if d.flags & DEPTH != 0 {
@@ -1116,7 +1130,14 @@ fn shared_texture(
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(host) = crate::host::host() {
             // SAFETY: a plain query on a host description (same layout).
-            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[std::ptr::from_ref(&d).cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>().read_unaligned()]) };
+            let info = unsafe {
+                host.device.GetResourceAllocationInfo(
+                    0,
+                    &[std::ptr::from_ref(&d)
+                        .cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>()
+                        .read_unaligned()],
+                )
+            };
             SAVED.fetch_add(info.SizeInBytes, std::sync::atomic::Ordering::Relaxed);
         }
         return live;
@@ -1128,7 +1149,10 @@ fn shared_texture(
     if let Some(k) = key {
         if live.is_some() {
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(?k, "a texture memory's host texture replaced by one with more uses or another format");
+            tracing::debug!(
+                ?k,
+                "a texture memory's host texture replaced by one with more uses or another format"
+            );
         }
         if map.len().is_power_of_two() {
             map.retain(|_, w| w.strong_count() > 0);
@@ -1182,19 +1206,29 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         value[0] = pc_format(value[0]);
         value
     });
-    let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
+    let clear_value = clear_value
+        .as_ref()
+        .map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
+    let mut castable_formats = if d.flags & DEPTH == 0 {
+        castable(d.format)
+    } else {
+        Vec::new()
+    };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     if !castable_formats.is_empty()
         && let Ok(device) = host.device.cast::<ID3D12Device10>()
     {
         // SAFETY: the description has the host layout (checked size).
-        let p = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+        let p = unsafe {
+            std::ptr::from_ref(d)
+                .cast::<D3D12_RESOURCE_DESC>()
+                .read_unaligned()
+        };
         // The plain description plus the sampler feedback region (none).
         let desc1 = D3D12_RESOURCE_DESC1 {
             Dimension: p.Dimension,
@@ -1209,7 +1243,10 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             Flags: p.Flags,
             SamplerFeedbackMipRegion: Default::default(),
         };
-        let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
+        let formats: Vec<DXGI_FORMAT> = castable_formats
+            .iter()
+            .map(|&f| DXGI_FORMAT(f as i32))
+            .collect();
         // SAFETY: a host description and our out pointer; the list and the
         // clear value live through the call.
         let made = unsafe {
@@ -1256,7 +1293,14 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let texture = texture?;
     crate::host::name(&texture, || {
         // Its address, for the lifetime notes (`life`) of a freed one.
-        format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
+        format!(
+            "texture {}x{} f{} flags {:#x} @{:#x}",
+            d.width,
+            d.height,
+            d.format,
+            d.flags,
+            texture.as_raw() as usize
+        )
     });
     let initial = crate::host::legal_state(&texture, initial);
     Some(HostTexture::new(texture, initial, castable_formats))
@@ -1373,7 +1417,14 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         let (size, block) = element(d.format)?;
         let swizzle = texture_layout(d).map_or(d.layout, |t| t.planes[0].layout.desc.swizzle.0);
         let rows = u64::from(d.height).div_ceil(block);
-        Some((d.dimension, d.width.div_ceil(block) * size, rows, d.depth_or_array_size, d.sample_count, swizzle))
+        Some((
+            d.dimension,
+            d.width.div_ceil(block) * size,
+            rows,
+            d.depth_or_array_size,
+            d.sample_count,
+            swizzle,
+        ))
     };
     let want = bytes(&b.desc)?;
     map.get(&(b.data() as u64))?
@@ -1412,7 +1463,12 @@ impl Drop for Resource {
         #[cfg(feature = "diagnostics")]
         if let Some(h) = &self.host {
             use windows::core::Interface;
-            life::note(h.texture.as_raw() as usize, life::RELEASED, 0, life::holders(&h.texture));
+            life::note(
+                h.texture.as_raw() as usize,
+                life::RELEASED,
+                0,
+                life::holders(&h.texture),
+            );
         }
         crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension != BUFFER {
@@ -1475,7 +1531,7 @@ pub(crate) extern "system" fn create_committed(
     )
 }
 
-/// Device method 0x3f8, inferred from Grand Theft Auto VI's calls
+/// Device method 0x3f8, inferred from the title's calls
 /// (title+0x193e1b4: its back buffers, heap flag "allow display"): the
 /// committed resource creation of the enhanced-barrier interfaces,
 /// `(heap, heap flags, desc1, initial layout, clear value, protected
@@ -1538,7 +1594,7 @@ pub(crate) extern "system" fn unregister_page_pool(_: This, handle: usize) -> HR
 }
 
 /// Device method 0x428, one of the `ID3D12Device9` to `ID3D12Device11`
-/// additions. From Grand Theft Auto VI's call: a resource at a virtual
+/// additions. From the title's call: a resource at a virtual
 /// address the title mapped itself, `(address, desc1, initial barrier
 /// layout, clear value, iid, out)`, as `CreatePlacedResourceX` with
 /// enhanced barriers. GPU addresses are CPU addresses, so the resource is
@@ -1588,7 +1644,7 @@ pub(crate) extern "system" fn create_at_address(
 }
 
 /// Textures the title placed in its own memory and views without a
-/// resource object (device 0x230, Grand Theft Auto VI's streamed and
+/// resource object (device 0x230, the title's streamed and
 /// interface textures), by address and description: a resource at that
 /// address, made the first time a draw reads one.
 /// shortcut: never released (one host texture per distinct address and
@@ -1928,17 +1984,40 @@ mod tests {
     /// another memory. The library's own layout pick resolves as spelled.
     #[test]
     fn one_memory_one_key_in_any_format_of_its_element() {
-        let a = ResourceDesc { flags: 4, ..texture(192, 108, 42, 1) };
-        let b = ResourceDesc { format: 67, flags: 0, ..a };
+        let a = ResourceDesc {
+            flags: 4,
+            ..texture(192, 108, 42, 1)
+        };
+        let b = ResourceDesc {
+            format: 67,
+            flags: 0,
+            ..a
+        };
         let key = memory_key(0x1_0000, &a);
         assert!(key.is_some());
         assert_eq!(key, memory_key(0x1_0000, &b));
-        assert_eq!(key, memory_key(0x1_0000, &ResourceDesc { layout: 0x105, ..b }));
+        assert_eq!(
+            key,
+            memory_key(0x1_0000, &ResourceDesc { layout: 0x105, ..b })
+        );
         assert_ne!(key, memory_key(0x2_0000, &a));
         assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { width: 96, ..a }));
         assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { format: 10, ..a }));
-        assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { layout: 0x102, ..a }));
-        assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { flags: 2, format: 40, ..a }));
+        assert_ne!(
+            key,
+            memory_key(0x1_0000, &ResourceDesc { layout: 0x102, ..a })
+        );
+        assert_ne!(
+            key,
+            memory_key(
+                0x1_0000,
+                &ResourceDesc {
+                    flags: 2,
+                    format: 40,
+                    ..a
+                }
+            )
+        );
         assert_eq!(memory_key(0x1_0000, &buffer(256)), None);
     }
 
@@ -2009,7 +2088,7 @@ mod tests {
         slot::<Custom>(device, 0xd0)(&mut p, device, 1, 1);
         assert_eq!(p.cpu_pages, 1, "default: not CPU-visible");
 
-        // 0x428: a buffer over memory the title owns, as GTA VI asks.
+        // 0x428: a buffer over memory the title owns, as the title asks.
         type At = extern "system" fn(
             This,
             u64,

@@ -1,7 +1,6 @@
 # VIctory
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+Runs supported console titles natively on Windows, from files the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
 the platform underneath it and converts the title's data, ahead of time where
@@ -74,9 +73,11 @@ Run the title:
 
 ```powershell
 cargo build --release -p victory
-target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
+target\release\victory.exe translate --cache --pipelines <game folder>
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
+
+Double-click `victory.exe` to choose a console profile, run a title, or translate shaders and pipelines before launch.
 
 The `translate --cache` step (minutes; again after a change of the shader
 translator) translates every shader the title can ask for into the cache

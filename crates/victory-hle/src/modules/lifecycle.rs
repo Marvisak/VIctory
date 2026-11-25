@@ -235,12 +235,7 @@ fn window_limit() -> Option<(i32, i32)> {
     })
 }
 
-fn fit_with_limit(
-    area: &RECT,
-    width: i32,
-    height: i32,
-    limit: Option<(i32, i32)>,
-) -> (i32, i32) {
+fn fit_with_limit(area: &RECT, width: i32, height: i32, limit: Option<(i32, i32)>) -> (i32, i32) {
     let Some((max_width, max_height)) = limit else {
         return fit_into(area, width, height);
     };
@@ -442,8 +437,7 @@ extern "system" fn window_proc(
     // Alt or F10 puts a window into menu mode: the system runs a modal menu
     // loop on the thread that owns the window, which is the title's. The
     // title then stops (no frames, no input) until a key ends the loop, and
-    // nothing shows it, since the window has no menu bar; Grand Theft Auto
-    // VI aborts itself about half a minute later. A console has no window
+    // nothing shows it, since the window has no menu bar; the title aborts itself about half a minute later. A console has no window
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
@@ -518,7 +512,7 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
 
 /// Runs the constrained-change routines (constrained), then the suspend
 /// routines (quiesced), as the console does when it suspends a title.
-/// Grand Theft Auto VI's suspend routine waits for a state that only its
+/// the title's suspend routine waits for a state that only its
 /// constrained routine brings about; called alone it never returns.
 fn constrain_then_suspend(constrain: &[Registration], suspend: &[Registration]) {
     for &(_, routine, context) in constrain.iter().chain(suspend) {
@@ -689,8 +683,14 @@ mod tests {
             right: 2660,
             bottom: 1490,
         };
-        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((1920, 1080))), (1920, 1080));
-        assert_eq!(fit_with_limit(&area, 640, 480, Some((1920, 1080))), (640, 480));
+        assert_eq!(
+            fit_with_limit(&area, 3840, 2160, Some((1920, 1080))),
+            (1920, 1080)
+        );
+        assert_eq!(
+            fit_with_limit(&area, 640, 480, Some((1920, 1080))),
+            (640, 480)
+        );
         assert_eq!(fit_with_limit(&area, 3840, 2160, None), (2560, 1440));
     }
 
@@ -702,7 +702,10 @@ mod tests {
             right: 1920,
             bottom: 1040,
         };
-        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((2560, 1440))), (1848, 1040));
+        assert_eq!(
+            fit_with_limit(&area, 3840, 2160, Some((2560, 1440))),
+            (1848, 1040)
+        );
         assert_eq!(
             fit_with_limit(&area, wm::CW_USEDEFAULT, 0, Some((1920, 1080))),
             (wm::CW_USEDEFAULT, 0)
@@ -717,7 +720,10 @@ mod tests {
             right: 2560,
             bottom: 1440,
         };
-        assert_eq!(fit_with_limit(&area, 1600, 1200, Some((1920, 1080))), (1440, 1080));
+        assert_eq!(
+            fit_with_limit(&area, 1600, 1200, Some((1920, 1080))),
+            (1440, 1080)
+        );
     }
 
     #[test]

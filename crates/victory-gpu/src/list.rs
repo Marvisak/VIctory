@@ -32,7 +32,7 @@ const ALLOCATOR_IIDS: [Iid; 4] = [
 
 /// The list interfaces up to `ID3D12GraphicsCommandList6` (the table has
 /// all their slots): those whose ids are the same as on PC, the console's
-/// own List5 and List6 (Grand Theft Auto VI asks for List6), then the
+/// own List5 and List6 (the title asks for List6), then the
 /// device child's.
 const LIST_IIDS: [Iid; 10] = [
     guid(
@@ -106,7 +106,7 @@ struct List {
     graphics_root_headers: [u32; 128],
     compute_root_headers: [u32; 128],
     pipeline_shadow: [u32; 8],
-    /// Newer titles' lists are larger: Grand Theft Auto VI's state flush
+    /// Newer titles' lists are larger: the title's state flush
     /// (title+0x32786) copies a pipeline's 32 bytes to +0x544..+0x564 and
     /// tests +0x548, so its layout runs past 0x560. Its size is unknown;
     /// this keeps our fields clear of whatever the title writes there.
@@ -126,7 +126,10 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(
+    this: This,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) {
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
@@ -769,8 +772,13 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+            list.list.ClearDepthStencilView(
+                dsv,
+                D3D12_CLEAR_FLAGS(flags as i32 & 3),
+                depth,
+                stencil,
+                rects,
+            )
         };
     }
     #[cfg(not(windows))]
@@ -900,12 +908,15 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 
 /// Newer lists' 0x4a0 `(size, alignment) -> pointer`: memory the list
 /// owns until it is reset, which the CPU writes and the GPU reads at the
-/// same address; null on failure. Grand Theft Auto VI's BVH builder puts
+/// same address; null on failure. the title's BVH builder puts
 /// its instance descriptions there (and wrote through our old
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
+    let Some(len) = usize::try_from(size)
+        .ok()
+        .and_then(|s| s.checked_add(align))
+    else {
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
@@ -919,7 +930,10 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    uploads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(block);
     at
 }
 
@@ -1278,7 +1292,7 @@ extern "system" fn draw(_: This) {
 }
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
-/// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
+/// offset)`. the title's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
 /// (12), mesh dispatch (12), and the console's single-pass dispatch, type
 /// 105 (stride 12: the three group counts; its flags live in the
@@ -1308,7 +1322,11 @@ extern "system" fn execute_indirect(
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let kind = if *kind == DISPATCH_SINGLE {
+            DISPATCH
+        } else {
+            *kind
+        };
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -1378,7 +1396,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        let barrier =
+            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1496,7 +1515,7 @@ const MORE_METHODS: [(usize, *const ()); 12] = [
 /// base list, after the clears (0x198/0x1a0 as before) and before
 /// ExecuteIndirect, which moved from 0x1d8 to 0x1e8: every slot from 0x1d8
 /// on is two later (taken here as starting exactly at 0x1d8). Inferred from
-/// Grand Theft Auto VI's call shapes: ExecuteIndirect 0x1e8, bottom-of-pipe
+/// the title's call shapes: ExecuteIndirect 0x1e8, bottom-of-pipe
 /// writes 0x238/0x240, waits 0x248/0x250, depth bounds 0x230, shading rate
 /// 0x3f0/0x400, syncs 0x418/0x420, ResetX 0x458 (asserts on failure).
 const fn newer_slot(slot: usize) -> usize {
@@ -1506,7 +1525,7 @@ const fn newer_slot(slot: usize) -> usize {
 /// Methods only newer titles' lists have. 0x490: the enhanced barrier
 /// `(group count, groups)`, with 16-byte groups `(type, count, barriers)`
 /// and 40-byte buffer barriers (title+0x95e0 builds them). 0x470 `(u64)`,
-/// called from Grand Theft Auto VI's state flush with its result unused.
+/// called from the title's state flush with its result unused.
 /// shortcut: 0x470's purpose is unknown; ignored until a title shows it
 /// matters.
 const NEWER_METHODS: [(usize, *const ()); 3] = [
@@ -1673,7 +1692,7 @@ mod tests {
             (at(0x18), at(0x28), at(0x30))
         };
         assert!(put >= draw_limit && put >= api_limit);
-        // The console's ID3D12GraphicsCommandList6, as Grand Theft Auto VI asks.
+        // The console's ID3D12GraphicsCommandList6, as the title asks.
         let mut same = null;
         assert_eq!(list_query(list, &LIST_IIDS[7], &mut same), S_OK);
         assert_eq!(same, list);
@@ -1691,10 +1710,17 @@ mod tests {
         assert!((1 << 32..1 << 40).contains(&(p as usize)), "{p:p}");
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
-        assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
+        assert!(
+            allocate_upload(list, 8, 0x30).is_null(),
+            "not a power of two"
+        );
         assert_eq!(reset(list, allocator, null), S_OK);
-        // SAFETY: the list is ours.
-        assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        // SAFETY: the list was created above and remains valid until release below.
+        let uploads_empty = unsafe { &(*list.cast::<List>()).uploads }
+            .lock()
+            .unwrap()
+            .is_empty();
+        assert!(uploads_empty);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

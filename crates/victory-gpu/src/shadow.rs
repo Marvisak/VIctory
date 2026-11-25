@@ -201,7 +201,9 @@ impl Shadow {
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
         let tracked = crate::watch::track(start as usize, len as usize, true);
-        let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
+        let marks = tracked
+            .as_ref()
+            .and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
             buffer,
             data,
@@ -255,9 +257,20 @@ impl Shadow {
     /// `marked`: the shaders mark the pages they write through this copy's
     /// views (`victory_shader::emit`, "Write marks"): no snapshot then, only
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
-    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
+    pub(crate) fn gpu_writes(
+        self: &Arc<Self>,
+        list: &HostList,
+        address: u64,
+        len: u64,
+        marked: bool,
+    ) {
         let len = len.min(self.left(address));
-        list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
+        list.defer_gpu_write(
+            self,
+            address as usize,
+            len as usize,
+            marked && self.marked(),
+        );
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -285,20 +298,30 @@ impl Shadow {
             return;
         }
         // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let host =
+            |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let segments = &mut before.0;
         // The segments the range overlaps or touches.
         let first = segments.partition_point(|(at, bytes)| at + bytes.len() < from);
-        let last = first + segments[first..].iter().take_while(|(at, _)| *at <= to).count();
+        let last = first
+            + segments[first..]
+                .iter()
+                .take_while(|(at, _)| *at <= to)
+                .count();
         if let [(at, bytes)] = &segments[first..last]
             && *at <= from
             && to <= at + bytes.len()
         {
             return;
         }
-        let start = segments.get(first).filter(|_| first < last).map_or(from, |s| s.0.min(from));
-        let end = segments[first..last].last().map_or(to, |(at, bytes)| (at + bytes.len()).max(to));
+        let start = segments
+            .get(first)
+            .filter(|_| first < last)
+            .map_or(from, |s| s.0.min(from));
+        let end = segments[first..last]
+            .last()
+            .map_or(to, |(at, bytes)| (at + bytes.len()).max(to));
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SnapshotUs);
         #[cfg(feature = "diagnostics")]
@@ -342,13 +365,16 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
+        if let Some((taken, before)) = segments
+            .iter()
+            .find(|(at, bytes)| *at <= from && to <= at + bytes.len())
             && back
             && from < to
         {
             let before = &before[from - taken..to - taken];
             #[cfg(feature = "diagnostics")]
-            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
+            let _timed =
+                crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
@@ -396,7 +422,10 @@ impl Shadow {
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
             if let Some(t) = &self.tracked {
-                let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
+                let whole: Vec<usize> = synced
+                    .into_iter()
+                    .filter(|p| (first..last).contains(p))
+                    .collect();
                 t.taken(&whole);
             }
         }
@@ -565,7 +594,10 @@ impl Shadow {
             let started = std::time::Instant::now();
             let runs = t.take(from, to);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
+            crate::copystat::add(
+                crate::copystat::C::WatchUs,
+                started.elapsed().as_micros() as u64,
+            );
             // Cut to the range: next to it shaders may be writing the copy.
             let copied: usize = runs.into_iter().map(|(a, b)| self.copy(a, b)).sum();
             #[cfg(feature = "diagnostics")]
@@ -816,7 +848,10 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
+    if buffers()
+        .remove(&(start, resource))
+        .is_some_and(|e| e.shadow.is_some())
+    {
         changed();
     }
 }
@@ -919,7 +954,8 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shad
 /// Asks for, and copies made of, views off their copy's elements, the
 /// copies' bytes and the largest (diagnostics).
 #[cfg(feature = "diagnostics")]
-static VIEWS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static VIEWS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Logs [`VIEWS`] per frame over `frames`.
 #[cfg(feature = "diagnostics")]
@@ -950,7 +986,8 @@ pub(crate) fn log_views(frames: f64) {
 /// new copy of the same bytes took the refreshes). With the size the map
 /// is next pruned of dead entries at.
 #[allow(clippy::type_complexity)]
-static EXACT: Mutex<(usize, BTreeMap<(u64, u64), std::sync::Weak<Shadow>>)> = Mutex::new((0, BTreeMap::new()));
+static EXACT: Mutex<(usize, BTreeMap<(u64, u64), std::sync::Weak<Shadow>>)> =
+    Mutex::new((0, BTreeMap::new()));
 
 fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
@@ -981,8 +1018,17 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
-    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    let mut all: Vec<Arc<Shadow>> = buffers()
+        .values()
+        .filter_map(|e| e.shadow.clone())
+        .collect();
+    all.extend(
+        LOOSE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned(),
+    );
     all
 }
 
@@ -1042,8 +1088,15 @@ mod tests {
         copy.writing(p, len, false);
         // SAFETY: (all title reads and writes below) bytes of our pool.
         unsafe { title(PAGE + 20).write_volatile(0x55) };
-        assert!(copy.update(p + PAGE + 16, 16) > 0, "the title's write is copied");
-        assert_eq!(host(PAGE + 20), 0x55, "the title's constant reaches the copy");
+        assert!(
+            copy.update(p + PAGE + 16, 16) > 0,
+            "the title's write is copied"
+        );
+        assert_eq!(
+            host(PAGE + 20),
+            0x55,
+            "the title's constant reaches the copy"
+        );
         // The shaders run: one byte written. The title writes meanwhile.
         copy.write_host((p + 10) as u64, &[0xaa]);
         // SAFETY: a byte of our pool.
@@ -1051,8 +1104,16 @@ mod tests {
         copy.copy_back(p, len);
         // SAFETY: bytes of our pool.
         unsafe {
-            assert_eq!(title(10).read_volatile(), 0xaa, "the shader's write goes back");
-            assert_eq!(title(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
+            assert_eq!(
+                title(10).read_volatile(),
+                0xaa,
+                "the shader's write goes back"
+            );
+            assert_eq!(
+                title(PAGE + 20).read_volatile(),
+                0x66,
+                "the title's later write stays"
+            );
         }
         unregister(p, p as u64);
     }
@@ -1070,25 +1131,53 @@ mod tests {
             return; // no host GPU here
         };
         copy.update(p, len);
-        let bytes = |s: &Shadow| s.before.lock().unwrap().0.iter().map(|(_, b)| b.len()).sum::<usize>();
+        let bytes = |s: &Shadow| {
+            s.before
+                .lock()
+                .unwrap()
+                .0
+                .iter()
+                .map(|(_, b)| b.len())
+                .sum::<usize>()
+        };
         copy.writing(p + 16, 64, false);
         copy.writing(p + 3 * PAGE, 100, false);
         assert_eq!(bytes(&copy), 164, "two segments");
         copy.writing(p + PAGE, 2 * PAGE, false);
         copy.writing(p + PAGE, PAGE, false);
         copy.writing(p + 80, 8, false);
-        assert_eq!(bytes(&copy), 72 + 2 * PAGE + 100, "merged where they overlap or touch");
+        assert_eq!(
+            bytes(&copy),
+            72 + 2 * PAGE + 100,
+            "merged where they overlap or touch"
+        );
         // The GPU writes inside two ranges.
         copy.write_host((p + 20) as u64, &[1, 2, 3]);
         copy.write_host((p + PAGE + 5) as u64, &[9]);
-        assert_eq!(copy.copy_back(p + 16, 64), 64, "the range's part of the piece");
-        assert_eq!(copy.copy_back(p + PAGE, 2 * PAGE), PAGE, "the piece written");
+        assert_eq!(
+            copy.copy_back(p + 16, 64),
+            64,
+            "the range's part of the piece"
+        );
+        assert_eq!(
+            copy.copy_back(p + PAGE, 2 * PAGE),
+            PAGE,
+            "the piece written"
+        );
         assert_eq!(copy.copy_back(p + PAGE, PAGE), 0, "compared once");
         assert_eq!(copy.copy_back(p + 3 * PAGE, 100), 0);
         assert_eq!(copy.copy_back(p + 80, 8), 0);
         // SAFETY: our pool.
         let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
-        assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
+        assert_eq!(
+            [
+                title(p + 20),
+                title(p + 21),
+                title(p + 22),
+                title(p + PAGE + 5)
+            ],
+            [1, 2, 3, 9]
+        );
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
         unregister(p, p as u64);
     }
@@ -1109,7 +1198,10 @@ mod tests {
             return; // no host GPU here
         };
         let base = copy.marks.expect("tracked memory gets mark bits") as usize;
-        assert_eq!(copy.mark_entry(p as u64 + PAGE as u64 + 8), Some((base as u32 + 1, 8)));
+        assert_eq!(
+            copy.mark_entry(p as u64 + PAGE as u64 + 8),
+            Some((base as u32 + 1, 8))
+        );
         copy.update(p, len);
         copy.writing(p, len, true);
         assert!(copy.before.lock().unwrap().0.is_empty(), "no snapshot");
@@ -1134,10 +1226,20 @@ mod tests {
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { title(at).read_volatile() };
         assert_eq!(read(10), 0xaa, "the shader's byte, page 0");
-        assert_eq!((read(PAGE + 20), read(PAGE + 40)), (0xbb, 0x11), "both writers' bytes, page 1");
-        assert_eq!((read(2 * PAGE + 30), read(2 * PAGE + 50)), (0, 0x22), "page 2 not marked");
+        assert_eq!(
+            (read(PAGE + 20), read(PAGE + 40)),
+            (0xbb, 0x11),
+            "both writers' bytes, page 1"
+        );
+        assert_eq!(
+            (read(2 * PAGE + 30), read(2 * PAGE + 50)),
+            (0, 0x22),
+            "page 2 not marked"
+        );
         // SAFETY: dwords of the mapped bitmap.
-        let left: u32 = (base / 32..=(base + 1) / 32).map(|w| unsafe { *bits.add(w) }).fold(0, |a, w| a | w);
+        let left: u32 = (base / 32..=(base + 1) / 32)
+            .map(|w| unsafe { *bits.add(w) })
+            .fold(0, |a, w| a | w);
         assert_eq!(left, 0, "bits cleared");
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
         unregister(p, p as u64);
@@ -1151,9 +1253,17 @@ mod tests {
         m.give_back(0, 3);
         assert_eq!(m.take(1), Some(0), "first fit");
         m.give_back(3, 2);
-        assert_eq!(m.free.iter().collect::<Vec<_>>(), [(&1, &4)], "3-4 joins the free 1-2");
+        assert_eq!(
+            m.free.iter().collect::<Vec<_>>(),
+            [(&1, &4)],
+            "3-4 joins the free 1-2"
+        );
         m.give_back(0, 1);
-        assert_eq!(m.free.iter().collect::<Vec<_>>(), [(&0, &5)], "and 0 joins them");
+        assert_eq!(
+            m.free.iter().collect::<Vec<_>>(),
+            [(&0, &5)],
+            "and 0 joins them"
+        );
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);

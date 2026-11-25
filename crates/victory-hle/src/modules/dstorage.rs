@@ -1,7 +1,7 @@
 //! The console's DirectStorage (`XCRDAPI.dll`): a factory that opens files
 //! and creates request queues and status arrays the title polls. Its
 //! interfaces have grown since 2020 (new interface ids, new slots); the
-//! slots here are the ones Grand Theft Auto VI calls, read from its call
+//! slots here are the ones the title calls, read from its call
 //! sites. Slots nobody has needed yet log their offset.
 //!
 //! Submitted requests of every queue run on one pool of workers, as the
@@ -31,7 +31,7 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
 
-/// The factory interface Grand Theft Auto VI asks for.
+/// The factory interface the title asks for.
 const FACTORY: Guid = Guid::new(
     0x6295_9d11,
     0xd45f,
@@ -171,7 +171,7 @@ extern "system" fn create_status_array(
 }
 
 /// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field Grand Theft Auto VI sets to 1.
+/// name), plus a field the title sets to 1.
 #[repr(C)]
 struct QueueDesc {
     source_type: u64,
@@ -216,7 +216,7 @@ extern "system" fn create_queue(
     )
 }
 
-/// Grand Theft Auto VI asks for 32 MiB and stops if this fails.
+/// the title asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
@@ -289,7 +289,7 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
         .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
 }
 
-/// Grand Theft Auto VI polls this (entry 0, a `Sleep(1)` loop) and never
+/// the title polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
 extern "system" fn is_complete(this: Array, index: u32) -> bool {
     status_result(this, index) != E_PENDING
@@ -448,7 +448,10 @@ fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
-            lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
+            lanes = scheduler
+                .work
+                .wait(lanes)
+                .unwrap_or_else(|e| e.into_inner());
             continue;
         };
         drop(lanes);
@@ -490,7 +493,8 @@ impl Lanes {
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                bcpack_workers =
+                    format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 page_destinations = std::mem::take(&mut self.pages),
                 waiting,
                 "dstorage: last {:.1} s",
@@ -603,7 +607,11 @@ impl Lane {
     fn flush(&mut self) {
         while let Some(&(seq, _)) = self.statuses.front() {
             let waiting = self.reads.front().map(|r| r.0);
-            if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
+            if waiting
+                .into_iter()
+                .chain(self.running.first().copied())
+                .any(|s| s < seq)
+            {
                 return;
             }
             let Some((_, status)) = self.statuses.pop_front() else {
@@ -674,7 +682,7 @@ struct Request {
     source_size: u32,
     /// Compressed size between two decompression stages; unused here.
     intermediate_size: u32,
-    /// Matched by cancellation; Grand Theft Auto VI leaves it 0.
+    /// Matched by cancellation; the title leaves it 0.
     tag: u64,
     name: *const c_char,
 }
@@ -687,7 +695,7 @@ const BCPACK: u64 = 0xf << 1;
 const PAGE_DESTINATION: u64 = 1 << 21;
 const MEMORY_SOURCE: u64 = 1 << 22;
 // Bits 5-20 select a further transform, bit 23 a source in physical pages;
-// Grand Theft Auto VI's packages need neither, so requests with them fail.
+// the title's packages need neither, so requests with them fail.
 
 const PAGE: usize = 64 * 1024;
 
@@ -695,7 +703,6 @@ enum Command {
     Read(Request),
     Status(Status),
 }
-
 
 /// A status entry to write, holding a reference on its array.
 struct Status {
@@ -785,7 +792,7 @@ extern "system" fn submit(this: QueueRef) {
 
 /// Ends the queue whatever its reference count: what was not started never
 /// completes, and this returns once the reads already running have
-/// finished. Grand Theft Auto VI calls this, not `Release`.
+/// finished. the title calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
@@ -824,7 +831,11 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         return into_destination(request, size, |out| read_into(request, out).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
-    let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
+    let tables = if bc != 0 {
+        Some(bcpack_tables()?)
+    } else {
+        None
+    };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
@@ -896,7 +907,9 @@ fn use_bcpack_tables(dir: std::path::PathBuf) {
 
 #[cfg(test)]
 fn load_bcpack_tables() -> Result<Tables, String> {
-    let dir = BCPACK_DIR.get().ok_or("no folder set for the test tables")?;
+    let dir = BCPACK_DIR
+        .get()
+        .ok_or("no folder set for the test tables")?;
     let bytes = std::fs::read(dir.join("tables.bin")).map_err(|e| e.to_string())?;
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
@@ -922,7 +935,9 @@ static READING: AtomicU64 = AtomicU64::new(0);
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
-        out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
+        out.copy_from_slice(unsafe {
+            std::slice::from_raw_parts(request.source.cast(), out.len())
+        });
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
@@ -1022,8 +1037,7 @@ const LATE_LIST_TRIES: u32 = 8;
 /// Page lists filled after their request started (written late).
 static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
 
-/// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
-/// VI's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
+/// Slots by the 2020 order, which the argument shapes at the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
 static QUEUE_VTABLE: Methods<12> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<Queue> as *const (),
@@ -1247,7 +1261,8 @@ mod tests {
         // Requests in flight together run in any order, so none of them
         // shares a destination (failed ones leave theirs undefined).
         let mut buffers = [[0u8; 16]; 5];
-        let [failed, failed_too, out, other, bcpack] = buffers.each_mut().map(|b| b.as_mut_ptr().cast());
+        let [failed, failed_too, out, other, bcpack] =
+            buffers.each_mut().map(|b| b.as_mut_ptr().cast());
 
         // Segment 0: a read past the end, then a bad stream; the first wins.
         enqueue(queue, &request(0, failed, 16, file, 4090, 16));
@@ -1464,7 +1479,10 @@ mod tests {
         let (_dir, file) = file_with(&contents);
         let (queue, array) = (new_queue(0), status_array(1));
         let mut out = [0u8; 16];
-        enqueue(queue, &request(4 << 1, out.as_mut_ptr().cast(), 16, file, 100, 88));
+        enqueue(
+            queue,
+            &request(4 << 1, out.as_mut_ptr().cast(), 16, file, 100, 88),
+        );
         enqueue_status(queue, array, 0);
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);

@@ -43,7 +43,7 @@ pub const DEVICE_PROVIDER: Guid = Guid::new(
     [0x86, 0xb7, 0x27, 0x37, 0x76, 0x7c, 0x0b, 0xf1],
 );
 
-/// The device interface as Minecraft (2022) asks for it.
+/// The device interface as an earlier title (2022) asks for it.
 pub const DEVICE_IID: Guid = Guid::new(
     0x0cc6_a956,
     0xe7e1,
@@ -81,7 +81,7 @@ pub static DEVICE_OBJECT: Object = Object::new("user devices", &DEVICE_VTABLE);
 
 pub const INTERFACES: &[Interface] = &[
     (PROVIDER, IID, &OBJECT),
-    // Grand Theft Auto VI (2026) asks with the provider's id; its thunks call
+    // the title (2026) asks with the provider's id; its thunks call
     // the same slots with the same arguments (0x108/0x110 change events).
     (PROVIDER, PROVIDER, &OBJECT),
     (PROVIDER, GAMERTAG_IID, &GAMERTAG_OBJECT),

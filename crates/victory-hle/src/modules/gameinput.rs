@@ -760,7 +760,7 @@ fn token(out: *mut u64) -> HRESULT {
     S_OK
 }
 
-// shortcut: reading callbacks never run; Grand Theft Auto VI registers none
+// shortcut: reading callbacks never run; the title registers none
 // (it polls).
 extern "system" fn register_reading(
     _: This,
@@ -866,7 +866,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -959,7 +962,7 @@ extern "system" fn device_status(this: *const Device) -> u32 {
 // shortcut: trigger motors are dropped (XInput has none). The host API that
 // drives them without a redistributable is Windows.Gaming.Input (WinRT
 // `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+// diagnostics builds; the title sends trigger levels in slot 0x50.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
@@ -1678,7 +1681,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1687,7 +1699,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
+        assert!(
+            !unregister(&hub.object, token, 5000),
+            "times out while it runs"
+        );
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);
@@ -1742,7 +1757,10 @@ mod tests {
         }
         hub.poll();
 
-        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
         let r = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(
             pad(r),

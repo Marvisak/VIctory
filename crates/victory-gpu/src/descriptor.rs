@@ -34,7 +34,7 @@ pub(crate) struct HeapDesc {
     nodes: u32,
 }
 
-/// Newer titles (Grand Theft Auto VI) pass the description followed by
+/// Newer titles (the title) pass the description followed by
 /// memory of their own for the descriptors: an address and its size in
 /// bytes, or a null address to have the heap allocate (inferred from the
 /// title's call sites; older titles pass the plain description).
@@ -77,7 +77,7 @@ impl Heap {
     }
 
     /// The host heap, made on first use from what the title wrote so far.
-    /// Made late because a host view heap the size of Grand Theft Auto VI's
+    /// Made late because a host view heap the size of the title's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
@@ -152,7 +152,7 @@ fn mirror(handle: u64) {
 }
 
 /// Mirrors what the title wrote into its shader-visible heaps without a
-/// call: Grand Theft Auto VI copies descriptors (our records) into its heap
+/// call: the title copies descriptors (our records) into its heap
 /// as bytes, so only a change of its memory shows them. Each slot of a page
 /// written since the last sync is made again if its record changed (in the
 /// world 1,300-14,400 slots a frame, against a few hundred views made by
@@ -180,7 +180,10 @@ pub(crate) fn sync_heaps() {
                 if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
                     continue;
                 }
-                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                let (first, last) = (
+                    (page as u64 - start) / step,
+                    (end as u64 - start).div_ceil(step),
+                );
                 for index in first..last.min(u64::from(heap.desc.count)) {
                     host.mirror(index as u32, start + index * step, false);
                 }
@@ -830,7 +833,11 @@ mod tests {
             // Our record, written where no heap sees it, then copied in.
             let mut elsewhere = [0u64; 2];
             let at = elsewhere.as_mut_ptr() as u64;
-            create_sampler(std::ptr::null(), &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], at);
+            create_sampler(
+                std::ptr::null(),
+                &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0],
+                at,
+            );
             let slot = memory as u64 + 5 * 16;
             // SAFETY: 16 bytes of each, ours; the heap's page is guarded
             // (our handler opens it).
@@ -843,7 +850,7 @@ mod tests {
         crate::watch::tests::free(memory);
     }
 
-    /// Grand Theft Auto VI places its shader-visible heap in its own memory
+    /// the title places its shader-visible heap in its own memory
     /// and checks that the heap starts there.
     #[test]
     fn placed_heaps_start_at_the_title_memory() {

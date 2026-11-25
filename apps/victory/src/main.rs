@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod menu;
 mod prebuild;
 mod run;
 mod shader;
@@ -142,6 +143,10 @@ fn main() -> Result<()> {
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
         return Ok(());
+    }
+    // A double-click gets the console menu.
+    if menu::wanted() {
+        return menu::run();
     }
     let cli = Cli::parse();
     match cli.command {

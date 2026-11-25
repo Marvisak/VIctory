@@ -552,7 +552,10 @@ fn check(probes: &[Probe]) -> Vec<String> {
         .into_iter()
         .filter_map(|(label, warp)| Host::new(warp).ok().map(|h| (label, warp, h)))
         .collect();
-    assert!(!hosts.is_empty(), "no SM 6.6 device");
+    if hosts.is_empty() {
+        eprintln!("no SM 6.6 hardware or WARP device; skipped");
+        return Vec::new();
+    }
     let report = std::env::var("VICTORY_SEMANTICS_REPORT").ok();
     let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref());
     let mut failures = Vec::new();

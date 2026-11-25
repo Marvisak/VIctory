@@ -108,7 +108,7 @@ pub extern "system" fn XMemVirtualAlloc(
     // A reservation of 64 KiB pages takes physical pages later
     // (`XMemMapPhysicalPages`); on the host only a placeholder can.
     // shortcut: committing part of such a reservation later would fail
-    // (Grand Theft Auto VI's 23 calls never do); replace that part of the
+    // (the title's 23 calls never do); replace that part of the
     // placeholder then.
     let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
     if placeholder {
@@ -190,7 +190,7 @@ pub struct BasicInformation {
 }
 
 // shortcut: every committed page reports graphics memory and no tag, since
-// all of it is GPU-reachable here (Grand Theft Auto VI's BVH builder, the
+// all of it is GPU-reachable here (the title's BVH builder, the
 // only caller, wants graphics memory); remember the flags of
 // `XMemVirtualAlloc` regions if a title tells CPU-only memory apart.
 pub extern "system" fn XMemVirtualQuery(
@@ -235,7 +235,7 @@ type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
 type FreeRoutine = extern "system" fn(*mut c_void, u64);
 
 /// The allocation and free routines the title's exe exports as
-/// `__XMemAllocationHooks__` (Grand Theft Auto VI does): `XMemAlloc` and
+/// `__XMemAllocationHooks__` (the title does): `XMemAlloc` and
 /// `XMemFree` call them, for the title's own calls and its middleware's;
 /// the `…Default` exports do not.
 fn hooks() -> [usize; 2] {
@@ -305,7 +305,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     };
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
-    // (Grand Theft Auto VI uses its GPU heap). Sub-allocate from a
+    // (the title uses its GPU heap). Sub-allocate from a
     // reservation below 2^40 if one does.
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
@@ -411,7 +411,12 @@ pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
         .next_back()
         .filter(|(base, (size, _))| *base + size > at)
         .map(|(base, _)| *base);
-    let starts = first.into_iter().chain(physical.views.range(at.saturating_add(1)..end).map(|(b, _)| *b));
+    let starts = first.into_iter().chain(
+        physical
+            .views
+            .range(at.saturating_add(1)..end)
+            .map(|(b, _)| *b),
+    );
     for base in starts.collect::<Vec<_>>() {
         let (size, slice) = &physical.views[&base];
         let (from, to) = (at.max(base), end.min(base + size));
@@ -472,7 +477,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         return 0;
     };
     // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
+    // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
     // SAFETY: plain section creation.
     let handle = unsafe {
@@ -519,7 +524,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
-/// 16: Grand Theft Auto VI keeps them as 21-bit `number >> 4` and rebuilds
+/// 16: the title keeps them as 21-bit `number >> 4` and rebuilds
 /// them with `<< 4` (128 GiB of pages at most).
 const FRAMES: usize = PAGE >> 12;
 
@@ -615,7 +620,11 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
-    let shown = shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[]));
+    let shown = shown_at(
+        pages
+            .get(offset / PAGE..(offset + data.len()).div_ceil(PAGE))
+            .unwrap_or(&[]),
+    );
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -667,7 +676,11 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
-        shown: shown_at(pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[])),
+        shown: shown_at(
+            pages
+                .get(offset / PAGE..(offset + len).div_ceil(PAGE))
+                .unwrap_or(&[]),
+        ),
     })
 }
 
@@ -711,7 +724,7 @@ pub extern "system" fn XMemMapPhysicalPages(
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
-/// (Grand Theft Auto VI passes 0 for addresses to clear).
+/// (the title passes 0 for addresses to clear).
 pub extern "system" fn XMemMapPhysicalPagesScatter(
     addresses: *const *mut c_void,
     n: usize,
@@ -741,8 +754,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
-/// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`): Grand Theft Auto
-/// VI maps pages into a pool view, then has the GPU map them into its tiled
+/// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`): the title maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
@@ -938,7 +950,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
     }
 }
 
-/// The oldest layout we know; newer titles pass other flag values (Minecraft
+/// The oldest layout we know; newer titles pass other flag values (an earlier title
 /// 0x20000001) and read the same leading fields.
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -1230,7 +1242,11 @@ mod tests {
         both.sort_unstable();
         assert_eq!(both, [b as usize, at(b, 1) as usize]);
         assert!(map_alias(b as u64, 0, PAGE as u64));
-        assert_eq!(others(at(a, 2)), [at(b, 1) as usize], "unmapped views are forgotten");
+        assert_eq!(
+            others(at(a, 2)),
+            [at(b, 1) as usize],
+            "unmapped views are forgotten"
+        );
         assert_eq!(query(b).host.State, MEM_RESERVE);
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);

@@ -175,9 +175,15 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .unwrap_or("");
         path.push(name);
         let body = field_text(rest);
-        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
-            .iter()
-            .fold(body, |b, (entity, c)| b.replace(entity, c));
+        let body = [
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&apos;", "'"),
+            ("&amp;", "&"),
+        ]
+        .iter()
+        .fold(body, |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();
@@ -217,7 +223,7 @@ pub fn title() -> Title {
 }
 
 /// Gives the process the console's millisecond timers. Titles pace
-/// themselves with short waits (Grand Theft Auto VI's audio mixer sleeps
+/// themselves with short waits (the title's audio mixer sleeps
 /// about 4 ms per 5.3 ms block) and cannot tune the timer on the console;
 /// a desktop process waits in 15.6 ms ticks unless it asks for finer ones,
 /// and Windows 11 drops that request while the window is hidden unless the
