@@ -332,6 +332,21 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+/// The host GPU's widest wave, set once by the device creation.
+/// `0` before a device exists: the lowering's own default.
+static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Sets the host GPU's widest wave (call once, from `Host::new`).
+pub fn set_host_max_wave(lanes: u32) {
+    HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The host GPU's widest wave, or `0` before a device exists.
+#[must_use]
+pub(super) fn host_max_wave() -> u32 {
+    HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that

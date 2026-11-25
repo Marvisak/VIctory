@@ -226,6 +226,16 @@ pub use shader::{
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
+pub use lower::set_host_max_wave;
+
+/// The host GPU's widest wave, or `0` before a device exists.
+/// The shader cache must key on this: a wave64 program lowers
+/// differently for a 32-lane host than for a 64-lane host.
+#[must_use]
+pub fn host_max_wave() -> u32 {
+    lower::host_max_wave()
+}
+
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///
