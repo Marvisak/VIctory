@@ -14,9 +14,17 @@
 //! Pipelines a draw waits for go ahead of those started early (at the
 //! title's creation, because an earlier run drew them).
 //!
-//! shortcut: the budget (half a second of waiting per title frame) is a
-//! guess; a pass the title runs only once and whose pipeline takes longer
-//! is lost.
+//! Passes over the screen (no vertex input, no depth) have workers of
+//! their own: the title fills its lighting tables with such draws once, at
+//! the world's first frame, and behind a world's worth of pipelines they
+//! waited out their kind of the budget before a worker ever reached them;
+//! a run that lost them had no diffuse light at all. Each kind keeps its
+//! own budget, but both are the same half a second: a misclassified pass
+//! can only move to the other pool, never wait longer.
+//!
+//! shortcut: the budget (half a second of waiting per title frame kind) is
+//! a guess; a pass the title runs only once and whose pipeline takes
+//! longer is lost, and logged once when it does.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -36,6 +44,8 @@ pub(crate) struct Pending {
     now: AtomicBool,
     taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// A pass over the screen (see [`GraphicsState::screen_pass`]).
+    screen: bool,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     pub(crate) key: String,
@@ -58,6 +68,7 @@ impl Pending {
         });
         Pending {
             key,
+            screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
             graphics,
             queued: AtomicBool::new(false),
@@ -161,7 +172,11 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
+/// Waiting allowed per title frame, over all threads, per kind (a
+/// pipeline's own pool; see `Pending::screen`). The two stay apart so a
+/// world's pipelines cannot spend a screen pass's budget, and both are the
+/// same half a second so a pass classified on either side never waits
+/// longer than only the ordinary pool allowed.
 const BUDGET: Duration = Duration::from_millis(500);
 
 /// Pipelines queued and not made yet.
@@ -185,8 +200,29 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, true);
         wait(p, crate::frame::current());
+        if p.made.get().is_none() {
+            dropped(p);
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Logs a draw whose pipeline was not made within its kind of the budget,
+/// so its draw is skipped: once per pipeline key, as a pass drawn only
+/// once is never drawn again.
+fn dropped(p: &Pending) {
+    static DROPPED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let dropped = DROPPED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if dropped
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(p.key.clone())
+    {
+        tracing::warn!(
+            key = %p.key,
+            "a draw's pipeline is not made within the frame's budget; its draw is skipped this frame — a pass drawn only once is lost"
+        );
+    }
 }
 
 /// Queues `p` for the workers: once, and once more ahead of the early
@@ -217,14 +253,16 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
+/// Waits for `p` while frame `frame` has budget of its kind left.
 fn wait(p: &Pending, frame: u64) {
-    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-    static WAITED_US: AtomicU64 = AtomicU64::new(0);
-    if FRAME.swap(frame, Ordering::Relaxed) != frame {
-        WAITED_US.store(0, Ordering::Relaxed);
+    static FRAME: [AtomicU64; 2] = [const { AtomicU64::new(u64::MAX) }; 2];
+    static WAITED_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let kind = usize::from(p.screen);
+    let waited = &WAITED_US[kind];
+    if FRAME[kind].swap(frame, Ordering::Relaxed) != frame {
+        waited.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let left = BUDGET.saturating_sub(Duration::from_micros(waited.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -235,25 +273,41 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Pipelines for the workers: those draws wait for, then those started
-/// early.
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
-    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
+/// Two-priority queue pair (draws waiting, early starts) for one pipeline kind.
+type KindQueues = (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar);
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Pipelines for the workers: ordinary pipelines, then screen passes;
+/// within each kind, those draws wait for, then those started early.
+static QUEUES: [KindQueues; 2] = [
+    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new()),
+    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new()),
+];
+
+/// Hands `p` to the workers (half the logical processors, 2 to 8, and two
+/// for screen passes), started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
-    static WORKERS: OnceLock<usize> = OnceLock::new();
-    let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+    static WORKERS: [OnceLock<usize>; 2] = [const { OnceLock::new() }; 2];
+    let screen = p.screen;
+    let kind = usize::from(screen);
+    let workers = *WORKERS[kind].get_or_init(|| {
+        let n = if screen {
+            2
+        } else {
+            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+        };
         (0..n)
             .filter(|i| {
+                let name = if screen {
+                    format!("victory-pipelines-screen-{i}")
+                } else {
+                    format!("victory-pipelines-{i}")
+                };
                 let spawned = std::thread::Builder::new()
-                    .name(format!("victory-pipelines-{i}"))
-                    .spawn(work);
+                    .name(name)
+                    .spawn(move || work(screen));
                 if let Err(e) = &spawned {
                     tracing::warn!(error = %e, "no pipeline worker");
                 }
@@ -269,21 +323,21 @@ fn queue(p: Arc<Pending>, now: bool) {
         }
         return;
     }
-    let (lock, work) = &QUEUES;
+    let (lock, work) = &QUEUES[kind];
     lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
     work.notify_one();
 }
 
-/// A worker: makes queued pipelines, those draws wait for first, and saves
-/// the cache when idle (first uses of pipelines made before).
-fn work() {
+/// A worker: makes queued pipelines of its kind (`screen` or ordinary),
+/// those draws wait for first, and saves the cache when idle.
+fn work(screen: bool) {
     // Below the title's own threads (loading, recording).
     // SAFETY: a plain call on our own thread.
     unsafe {
         use windows::Win32::System::Threading::*;
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
-    let (lock, work) = &QUEUES;
+    let (lock, work) = &QUEUES[usize::from(screen)];
     loop {
         let p = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -368,5 +422,23 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A screen-classified pipeline (no inputs, no depth, triangle) is
+    /// routed to the screen pool, whose workers make it like any other
+    /// (here: no shaders, so no host pipeline — the answer is the same
+    /// shape, and the screen workers exist: the routing path ran).
+    #[test]
+    fn a_screen_pass_is_made_by_its_own_workers() {
+        let state = GraphicsState::screen_triangle_state();
+        assert!(state.screen_pass());
+        let p = Arc::new(Pending::new(Vec::new(), Some(Box::new(state))));
+        assert!(p.screen);
+        assert!(ready(&p).is_none());
+        let started = Instant::now();
+        while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        assert!(p.made.get().is_some());
     }
 }
