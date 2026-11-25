@@ -1578,7 +1578,7 @@ fn remade(k: &MemoryKey) {
 /// or resolve wrote it), so a texture made again has them back.
 #[cfg(windows)]
 fn evictable(t: &HostTexture) -> bool {
-    t.key.is_some() && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
+    t.key.is_some() && crate::texture::title_written(&t.texture) && !crate::texture::copy_host_written(t)
 }
 
 /// Once per presented frame, before a submission (`Host::execute`, one at a

@@ -214,21 +214,63 @@ unsafe impl Sync for Staging {}
 
 /// A host copy or resolve that `list` records writes `resource`: from the
 /// submission that runs `list` on, its host texture's contents are the
-/// host's, not title memory's, which stays as it was. Marked when that
-/// submission is made, not when `list` is recorded: a list recorded before
-/// it but run after it must not upload title memory over the host's texels
-/// (submissions run in the order they are made, which need not be the
-/// order their lists were recorded in), and one run before it must still
-/// get its upload.
+/// host's, not title memory's, which stays as it was, until the title
+/// writes its watched memory. Marked when that submission is made, not
+/// when `list` is recorded: a list recorded before it but run after it
+/// must not upload title memory over the host's texels (submissions run
+/// in the order they are made, which need not be the order their lists
+/// were recorded in), and one run before it must still get its upload.
 pub(crate) fn host_writes(list: &HostList, resource: This) {
     if let Some(copy) = crate::resource::host_copy(resource) {
-        list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
+        list.defer_host(move || {
+            if let Some(staging) = copy.staging.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+            {
+                let size = staging.layout.size as usize;
+                if let Some(tracked) = &staging.tracked {
+                    let start = staging.memory as usize;
+                    let _ = tracked.take(start, start + size);
+                } else if committed(staging.memory, size) {
+                    // SAFETY: committed memory of the texture's layout size.
+                    let tiled = unsafe { std::slice::from_raw_parts(staging.memory, size) };
+                    let mut last = staging.last.lock().unwrap_or_else(|e| e.into_inner());
+                    last.hash = Some(blake3::hash(tiled));
+                }
+            }
+            copy.host_written
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        });
     }
 }
 
+/// Whether `copy`'s contents are still the host's (written by a host copy
+/// or resolve, and not since written by the title in its watched memory).
+pub(crate) fn copy_host_written(copy: &crate::resource::HostTexture) -> bool {
+    if !copy.host_written.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if let Some(staging) = copy.staging.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        let size = staging.layout.size as usize;
+        let invalidated = if let Some(tracked) = &staging.tracked {
+            !tracked.clean()
+        } else if committed(staging.memory, size) {
+            // SAFETY: committed memory of the texture's layout size.
+            let tiled = unsafe { std::slice::from_raw_parts(staging.memory, size) };
+            let hash = blake3::hash(tiled);
+            let last = staging.last.lock().unwrap_or_else(|e| e.into_inner());
+            last.hash != Some(hash)
+        } else {
+            false
+        };
+        if invalidated {
+            copy.host_written.store(false, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+    }
+    true
+}
+
 fn is_host_written(resource: This) -> bool {
-    crate::resource::host_copy(resource)
-        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Relaxed))
+    crate::resource::host_copy(resource).is_some_and(|c| copy_host_written(&c))
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -877,5 +919,65 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn host_written_invalidates_after_write_watch_hit() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let base = crate::watch::tests::pool(1);
+        struct PoolGuard(usize);
+        impl Drop for PoolGuard {
+            fn drop(&mut self) {
+                crate::watch::tests::free(self.0);
+            }
+        }
+        let _pool = PoolGuard(base);
+        let (buffer, _data) = host.upload_buffer(4).expect("upload buffer");
+        let layout = victory_formats::texture::Layout::new(&victory_formats::texture::Desc {
+            dimension: victory_formats::texture::Dimension::Tex2d,
+            width: 128,
+            height: 128,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: victory_formats::texture::Swizzle(0),
+        })
+        .expect("layout");
+        let tracked =
+            crate::watch::track(base, layout.size as usize, false).expect("tracked");
+        let staging = Arc::new(Staging {
+            size: 4,
+            footprints: Vec::new(),
+            rows: Vec::new(),
+            layout,
+            mips: 1,
+            memory: base as *const u8,
+            tracked: Some(tracked),
+            spans: Vec::new(),
+            last: Mutex::default(),
+            uploads: Default::default(),
+            copied: Default::default(),
+        });
+        let copy = crate::resource::HostTexture::new(buffer, 0, Vec::new());
+        *copy.staging.lock().unwrap() = Some(staging.clone());
+        let _ = staging
+            .tracked
+            .as_ref()
+            .unwrap()
+            .take(base, base + staging.layout.size as usize);
+        copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(copy_host_written(&copy));
+        // SAFETY: `base` is a committed RW watch-tracked page.
+        unsafe { (base as *mut u8).write_volatile(0x42) };
+        assert!(!copy_host_written(&copy));
+        assert!(!copy.host_written.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            !staging.tracked.as_ref().unwrap().clean(),
+            "invalidation keeps dirty ranges for refresh_now"
+        );
     }
 }
