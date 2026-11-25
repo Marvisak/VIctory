@@ -171,6 +171,33 @@ impl GraphicsState {
 
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
+    /// The blend state the host is given: blending off on integer render
+    /// targets. The console's colour blocks bypass blending for integer
+    /// formats; D3D12 leaves it undefined, and vkd3d-proton refuses the
+    /// whole pipeline when the pixel shader writes such a target (seen as a
+    /// world mesh pipeline with blending on an `R8_UINT` target 2). Without
+    /// independent blending, target 0's state is first spread to each.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let integer = |i: usize| crate::twin::integer(self.targets.RTFormats[i].0 as u32);
+        let of = |b: &D3D12_BLEND_DESC, i: usize| {
+            // Target 0's state is every target's unless blending is independent.
+            b.RenderTarget[i * usize::from(b.IndependentBlendEnable.as_bool())]
+        };
+        if !(0..count).any(|i| integer(i) && of(&blend, i).BlendEnable.as_bool()) {
+            return blend;
+        }
+        if !blend.IndependentBlendEnable.as_bool() {
+            blend.RenderTarget = [blend.RenderTarget[0]; 8];
+            blend.IndependentBlendEnable = true.into();
+        }
+        for i in (0..count).filter(|&i| integer(i)) {
+            blend.RenderTarget[i].BlendEnable = false.into();
+        }
+        blend
+    }
+
     pub(crate) fn describe(&self) -> String {
         let inputs: Vec<String> = self
             .inputs
@@ -621,7 +648,7 @@ impl HostPipeline {
                 pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
                 BytecodeLength: gs.len(),
             },
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -726,7 +753,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
@@ -869,5 +896,55 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    fn targets(formats: &[DXGI_FORMAT]) -> D3D12_RT_FORMAT_ARRAY {
+        let mut t = D3D12_RT_FORMAT_ARRAY {
+            NumRenderTargets: formats.len() as u32,
+            ..Default::default()
+        };
+        t.RTFormats[..formats.len()].copy_from_slice(formats);
+        t
+    }
+
+    fn blending(d: &D3D12_BLEND_DESC) -> Vec<bool> {
+        let on = |t: &D3D12_RENDER_TARGET_BLEND_DESC| t.BlendEnable.as_bool();
+        d.RenderTarget[..3].iter().map(on).collect()
+    }
+
+    /// A world mesh pipeline blends into an `R8_UINT` target 2, which
+    /// vkd3d-proton refuses: blending goes off there (the console's colour
+    /// blocks ignore it for integer formats) and stays on elsewhere.
+    #[test]
+    fn integer_targets_do_not_blend() {
+        let formats = [
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R8_UINT,
+        ];
+        let mut state = GraphicsState {
+            targets: targets(&formats),
+            ..GraphicsState::default()
+        };
+        state.blend.RenderTarget[0].BlendEnable = true.into();
+        // Target 0's state for all: spread to each target, then off on 2.
+        let host = state.host_blend();
+        assert!(host.IndependentBlendEnable.as_bool());
+        let on = blending(&host);
+        assert_eq!(on, [true, true, false]);
+        let spread = host.RenderTarget[1].SrcBlend;
+        assert_eq!(spread, state.blend.RenderTarget[0].SrcBlend);
+        // Independent state: only target 2 changes.
+        state.blend.IndependentBlendEnable = true.into();
+        state.blend.RenderTarget[2].BlendEnable = true.into();
+        let host = state.host_blend();
+        let on = blending(&host);
+        assert_eq!(on, [true, false, false]);
+        // Nothing to change: the title's state as it is.
+        let plain = GraphicsState {
+            targets: targets(&formats[..2]),
+            ..state
+        };
+        assert_eq!(plain.host_blend(), plain.blend);
     }
 }
