@@ -54,13 +54,14 @@ pub(crate) extern "system" fn set_interval(
         us => Duration::from_micros(u64::from(us)),
     };
     tracing::info!(?interval, "frame interval");
-    // A new interval starts from now, after the last tick handed out.
+    // Read the last reserved tick while holding the lock used by next_tick.
+    let mut clock = clock();
     let first = LAST
         .iter()
         .map(|t| t.load(Ordering::Relaxed))
         .max()
         .unwrap_or(0);
-    *clock() = Some(Clock {
+    *clock = Some(Clock {
         start: Instant::now(),
         interval,
         first,
@@ -182,8 +183,12 @@ pub(crate) extern "system" fn statistics(
 mod tests {
     use super::*;
 
+    // These tests share the production clock and tick reservations.
+    static FRAME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
+        let _test = FRAME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
@@ -235,12 +240,33 @@ mod tests {
     /// none. The old code marked the tick after the sleep, so both got it.
     #[test]
     fn waits_begun_together_take_different_ticks() {
+        let _test = FRAME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         const VBLANK: u32 = 1;
-        let long = Duration::from_secs(1);
-        let (first, _) = next_tick(VBLANK, long);
-        let (second, _) = next_tick(VBLANK, long);
-        assert!(second > first, "{second} after {first}");
+        let null = std::ptr::null();
+        assert_eq!(set_interval(null, null, 16_667, 1, 0), S_OK);
+        let barrier = std::sync::Barrier::new(8);
+        let mut ticks = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        next_tick(VBLANK, Duration::MAX).0
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        ticks.sort_unstable();
+        assert!(ticks.windows(2).all(|pair| pair[0] < pair[1]), "{ticks:?}");
         next_tick(VBLANK, Duration::ZERO);
-        assert_eq!(last(VBLANK).load(Ordering::Relaxed), second);
+        assert_eq!(last(VBLANK).load(Ordering::Relaxed), ticks[7]);
+
+        let latest = LAST.iter().map(|tick| tick.load(Ordering::Relaxed)).max().unwrap();
+        assert_eq!(set_interval(null, null, 16_667, 1, 0), S_OK);
+        assert_eq!(clock().as_ref().unwrap().first, latest);
     }
 }
