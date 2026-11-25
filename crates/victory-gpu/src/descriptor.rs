@@ -366,21 +366,27 @@ impl RtvRecord {
     #[cfg(windows)]
     fn host_desc<T>(&self, dimension: u32) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
-        let mut words = if self.described != 0 {
-            self.desc
-        } else {
-            [
-                crate::resource::view_format(self.resource)?,
-                dimension,
-                0,
-                0,
-                0,
-                0,
-            ]
-        };
-        words[0] = crate::resource::pc_format(words[0]);
+        let words = self.host_words(dimension, || crate::resource::view_format(self.resource))?;
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+    }
+
+    /// [`RtvRecord::host_desc`]'s words; `own` is the format a view of the
+    /// resource must name if its host copy is typeless (none if typed).
+    #[cfg(windows)]
+    fn host_words(&self, dimension: u32, own: impl FnOnce() -> Option<u32>) -> Option<[u32; 6]> {
+        let mut words = if self.described == 0 {
+            [own()?, dimension, 0, 0, 0, 0]
+        } else {
+            let mut words = self.desc;
+            // "The resource's format" (unknown) names none to a typeless copy.
+            if words[0] == 0 {
+                words[0] = own().unwrap_or(0);
+            }
+            words
+        };
+        words[0] = crate::resource::pc_format(words[0]);
+        Some(words)
     }
 }
 
@@ -885,6 +891,24 @@ pub(crate) mod tests {
         assert!(crate::memory::has_table(key));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
         assert!(!crate::memory::has_table(key), "released with its heap");
+    }
+
+    /// A view description with the unknown format on a texture the host
+    /// made typeless (a depth texture shaders read) takes the title's.
+    #[cfg(windows)]
+    #[test]
+    fn an_unknown_format_in_a_view_description_is_the_resources() {
+        let record = |format| RtvRecord {
+            tag: RTV_TAG,
+            described: 1,
+            resource: std::ptr::null(),
+            desc: [format, 3, 1, 0, 0, 0],
+        };
+        let d32 = 40;
+        assert_eq!(record(0).host_words(3, || Some(d32)).unwrap()[..2], [d32, 3], "typeless host copy");
+        assert_eq!(record(0).host_words(3, || None).unwrap()[0], 0, "typed host copy");
+        assert_eq!(record(45).host_words(3, || Some(d32)).unwrap()[0], 45, "a format named is kept");
+        assert_eq!(record(0).host_words(3, || Some(118)).unwrap()[0], 20, "as the host has it");
     }
 
     #[test]
