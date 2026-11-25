@@ -142,6 +142,17 @@ impl ImageInfo {
             )));
         }
 
+        let size_of_image = opt.size_of_image();
+        let entry_rva = opt.address_of_entry_point();
+        // Zero denotes no entry point (for example a resource-only DLL).
+        // The loader calls the original entry itself after preparing a copy
+        // whose entry is cleared, so it must not point outside that image.
+        if entry_rva != 0 && entry_rva >= size_of_image {
+            return Err(PeError::Malformed(format!(
+                "entry point RVA {entry_rva:#x} is outside the image ({size_of_image:#x} bytes)"
+            )));
+        }
+
         let sections: Vec<SectionInfo> = file
             .section_table()
             .iter()
@@ -205,8 +216,8 @@ impl ImageInfo {
             subsystem: opt.subsystem().0,
             dll_characteristics: opt.dll_characteristics().0,
             image_base: opt.image_base(),
-            size_of_image: opt.size_of_image(),
-            entry_rva: opt.address_of_entry_point(),
+            size_of_image,
+            entry_rva,
             stack_reserve: opt.size_of_stack_reserve(),
             stack_commit: opt.size_of_stack_commit(),
             sections,
@@ -539,6 +550,47 @@ mod tests {
         d.extend_from_slice(body);
         d.resize(0x400, 0);
         d
+    }
+
+    fn synthetic_entry_point(entry_rva: u32, dll: bool) -> Vec<u8> {
+        let mut data = synthetic_image(&[0; 0x200]);
+        let opt = layout::optional_header_offset(&data).unwrap();
+        // This fixture needs no exports: isolate the entry-point field.
+        data[opt + layout::OPT_DATA_DIRECTORY..opt + layout::OPT_DATA_DIRECTORY + 8].fill(0);
+        data[opt + layout::OPT_ADDRESS_OF_ENTRY_POINT
+            ..opt + layout::OPT_ADDRESS_OF_ENTRY_POINT + 4]
+            .copy_from_slice(&entry_rva.to_le_bytes());
+        let fh = layout::file_header_offset(&data).unwrap();
+        let characteristics = 0x22 | if dll { layout::file_flags::DLL } else { 0 };
+        data[fh + layout::FILE_HEADER_CHARACTERISTICS
+            ..fh + layout::FILE_HEADER_CHARACTERISTICS + 2]
+            .copy_from_slice(&characteristics.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn rejects_entry_points_outside_the_image() {
+        for dll in [false, true] {
+            for entry_rva in [0x2000, 0x2001, u32::MAX] {
+                let result = ImageInfo::parse(&synthetic_entry_point(entry_rva, dll));
+                assert!(
+                    matches!(&result, Err(PeError::Malformed(message)) if message.contains("entry point")),
+                    "entry={entry_rva:#x}, dll={dll}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preserves_absent_and_in_image_entry_points() {
+        for dll in [false, true] {
+            for entry_rva in [0, 0x1000, 0x1fff] {
+                let info = ImageInfo::parse(&synthetic_entry_point(entry_rva, dll)).unwrap();
+                assert_eq!(info.entry_rva, entry_rva);
+                assert_eq!(info.size_of_image, 0x2000);
+                assert_eq!(info.is_dll(), dll);
+            }
+        }
     }
 
     #[test]
