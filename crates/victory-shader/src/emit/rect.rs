@@ -33,8 +33,12 @@ pub fn right_angle(xy: [[f32; 2]; 3]) -> usize {
 }
 
 /// The geometry shader that completes the rectangles of the vertex shader
-/// container `vs` (its output signature is the shader's input and output).
-pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
+/// container `vs` (its output signature is the shader's input and output)
+/// for the pixel shader container `ps`, if the pipeline has one: a pixel
+/// shader that reads `SV_PrimitiveID` takes it from a geometry stage where
+/// there is one, so it is one more output, the rectangle's number (without
+/// it the host refuses the pipeline).
+pub fn rectangle_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, ShaderError> {
     let c = Container::parse(vs)?;
     let part = c
         .part(FourCC::OSG1)
@@ -44,6 +48,10 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
     for e in &mut elements {
         e.usage = (1 << e.cols) - 1;
     }
+    let primitive_id = match ps {
+        Some(ps) => primitive_id_input(ps, &elements)?,
+        None => None,
+    };
     let mut s = Shader::new(false);
     s.gs = Some(6);
     let b = s.entry;
@@ -118,6 +126,10 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
         }
     }
     corners.extend(second);
+    // The rectangle's number: the input triangle's (both halves share it).
+    let number = primitive_id
+        .is_some()
+        .then(|| s.op(b, "primitiveID.i32", Attr::ReadNone, s.t.i32, 108, &[]));
     for triangle in [[0, 1, 2], [3, 4, 5]] {
         for k in triangle {
             for (id, e) in elements.iter().enumerate() {
@@ -128,6 +140,10 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
                     s.op(b, &format!("storeOutput{suffix}"), Attr::NoUnwind, s.t.void, 5, &args);
                 }
             }
+            if let Some(id) = number {
+                let args = [s.m.i32(elements.len() as u32), s.m.i32(0), s.m.i8(0), id];
+                s.op(b, "storeOutput.i32", Attr::NoUnwind, s.t.void, 5, &args);
+            }
             let stream = [s.m.i8(0)];
             s.op(b, "emitStream", Attr::NoUnwind, s.t.void, 97, &stream);
         }
@@ -136,8 +152,45 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
     }
     s.inputs = elements.clone();
     s.outputs = elements;
+    s.outputs.extend(primitive_id);
     s.m.terminate(b, Term::Ret);
     Ok(s.finish())
+}
+
+/// The `SV_PrimitiveID` input of the pixel shader container `ps` as an
+/// output beside the vertex shader's `outputs` (`None`: it reads none, or
+/// the vertex shader writes one). A primitive id that shares a register
+/// with a vertex output is refused unless that output is constant too and
+/// in other columns: a register has one interpolation mode.
+fn primitive_id_input(
+    ps: &[u8],
+    outputs: &[super::container::SigElement],
+) -> Result<Option<super::container::SigElement>, ShaderError> {
+    let c = Container::parse(ps)?;
+    let Some(part) = c.part(FourCC::ISG1) else {
+        return Ok(None);
+    };
+    let inputs = super::signature(part.data)?;
+    let Some(id) = inputs.into_iter().find(|e| e.kind == 10 && e.row.is_some()) else {
+        return Ok(None);
+    };
+    if outputs.iter().any(|o| o.kind == 10) {
+        return Ok(None);
+    }
+    if outputs.iter().any(|o| {
+        let overlap = o.col < id.col + id.cols && id.col < o.col + o.cols;
+        o.row == id.row && (o.interp != 1 || overlap)
+    }) {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a rectangle list whose primitive id shares a register with a vertex output",
+        });
+    }
+    Ok(Some(super::container::SigElement {
+        interp: 1,
+        usage: (1 << id.cols) - 1,
+        ..id
+    }))
 }
 
 #[cfg(test)]
@@ -233,7 +286,7 @@ mod tests {
     #[test]
     fn rectangles_get_their_fourth_corner() {
         let (vs, ps) = (shader(false), shader(true));
-        let gs = super::rectangle_gs(&vs).unwrap();
+        let gs = super::rectangle_gs(&vs, Some(&ps)).unwrap();
         if let Ok(mut v) =
             super::super::validator::Validator::load(super::super::validator::Validator::default_path().as_deref())
         {
@@ -269,6 +322,82 @@ mod tests {
                     assert!(near, "warp {warp} order {n} pixel ({x}, {y}): {t:?}, want {want:?}");
                 }
             }
+        }
+    }
+    /// A pixel shader writing `SV_PrimitiveID + 1` to target 0's red.
+    fn primitive_id_ps() -> Vec<u8> {
+        use super::super::bitcode::{Bin, Cast};
+        let mut s = Shader::new(true);
+        let b = s.entry;
+        let mut id = element("SV_PrimitiveID", 10, 1, 2, 1);
+        id.comp = 5; // uint
+        let args = [s.m.i32(1), s.m.i32(0), s.m.i8(0), s.m.undef(s.t.i32)];
+        let n = s.op(b, "loadInput.i32", Attr::ReadNone, s.t.i32, 4, &args);
+        let n = s.m.cast(b, Cast::UiToFp, n, s.t.f32);
+        let one = s.m.f32(1f32.to_bits());
+        let red = s.m.bin(b, Bin::Add, n, one);
+        for (col, v) in [red, one, one, one].into_iter().enumerate() {
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col as u8), v];
+            s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+        }
+        s.inputs = vec![element("SV_Position", 3, 4, 0, 4), id];
+        s.outputs = vec![element("SV_Target", 16, 0, 0, 4)];
+        s.m.terminate(b, Term::Ret);
+        s.finish()
+    }
+
+    /// A pixel shader reading `SV_PrimitiveID` behind the rectangle stage
+    /// gets each rectangle's number (the host refuses the pipeline when the
+    /// geometry stage does not write it): two rectangles, the left 0, the
+    /// right 1. Without a pixel shader the stage has no such output.
+    #[test]
+    fn rectangles_number_themselves_for_the_pixel_shader() {
+        let (vs, ps) = (shader(false), primitive_id_ps());
+        let gs = super::rectangle_gs(&vs, Some(&ps)).unwrap();
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            for c in [&gs, &ps] {
+                v.validate(&mut c.clone()).unwrap();
+            }
+        }
+        let alone = super::rectangle_gs(&vs, None).unwrap();
+        assert!(alone.len() < gs.len());
+        let corner = |x: f32, y: f32| [x, y, 0.5, 1.0, x, y];
+        let rectangle = |left: f32| {
+            [
+                corner(left, 0.5),
+                corner(left, -0.5),
+                corner(left + 0.5, -0.5),
+            ]
+        };
+        let vertices = [rectangle(-0.75), rectangle(0.25)].as_flattened().concat();
+        let mut ran = 0;
+        for warp in [false, true] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let root = host.root_signature_for(&[]).unwrap();
+            let pso = host.pipeline_gs(&root, &vs, &gs, &ps).unwrap();
+            let draw = Draw {
+                roots: Vec::new(),
+                textures: &[],
+                samplers: &[],
+                vertices: &vertices,
+                stride: 24,
+                size: (32, 32),
+                mesh_groups: 0,
+            };
+            let texels = host.draw(&root, &pso, &draw).unwrap();
+            // Inside the left rectangle, inside the right one, between them.
+            let at = |x: usize, y: usize| texels[y * 32 + x][0];
+            assert_eq!(
+                (at(6, 16), at(26, 16), at(16, 16)),
+                (1.0, 2.0, 0.0),
+                "warp {warp}"
+            );
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("no SM 6.6 device; skipped");
         }
     }
 }

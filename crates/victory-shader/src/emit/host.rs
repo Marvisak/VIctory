@@ -944,7 +944,8 @@ pub struct Draw<'a> {
     pub textures: &'a [(u32, u32, &'a [[f32; 4]])],
     /// Samplers at sampler-heap indices 0..
     pub samplers: &'a [D3D12_SAMPLER_DESC],
-    /// Three vertices of stride bytes (none for position-free layouts).
+    /// Vertices of stride bytes, drawn as a triangle list (none for
+    /// position-free layouts, which draw three).
     pub vertices: &'a [f32],
     pub stride: u32,
     pub size: (u32, u32),
@@ -1202,7 +1203,11 @@ impl Host {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {
-                list.DrawInstanced(3, 1, 0, 0);
+                let count = match d.stride {
+                    0 => 3,
+                    stride => (d.vertices.len() * 4 / stride as usize).max(3) as u32,
+                };
+                list.DrawInstanced(count, 1, 0, 0);
             }
             list.ResourceBarrier(&[transition(
                 &target,
