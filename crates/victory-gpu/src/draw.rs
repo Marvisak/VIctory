@@ -418,6 +418,13 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
+            if !crate::resource::renders(texture) {
+                once!(
+                    handle = format_args!("{h:#x}"),
+                    "render target whose host texture cannot be one (format without render target support); not bound"
+                );
+                continue;
+            }
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
