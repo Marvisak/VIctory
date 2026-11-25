@@ -3,7 +3,7 @@
 //! The package is the folder of the title's executable (`G:` to the title).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{CString, c_char, c_void};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -35,6 +35,7 @@ pub const INTERFACES: &[Interface] = &[(PROVIDER, IID_2026, &OBJECT)];
 
 /// The documented "could not resolve an identifier for the package".
 pub const NO_PACKAGE: HRESULT = 0x8924_5208_u32 as i32;
+const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
 
 /// Our installation's identifier: the title id in hex (titles keep it in 33
 /// bytes and hand it back to us).
@@ -264,17 +265,64 @@ extern "system" fn mount_result(
     xasync::result(block, (&raw const MOUNT).cast(), out)
 }
 
-/// Titles enumerate content packages (kind 1); there are none.
-// shortcut: the game kind (0) also lists nothing, not this installation;
-// Grand Theft Auto VI enumerates only content (kind 1, title+0x2937bf0).
+/// The details record the title's enumeration callback reads.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PackageDetails {
+    pub package_identifier: *const c_char,
+    pub version: u64,
+    pub kind: u32,
+    pub display_name: *const c_char,
+    pub description: *const c_char,
+    pub publisher: *const c_char,
+    pub store_id: *const c_char,
+    pub installing: bool,
+    pub index: u32,
+    pub count: u32,
+    pub age_restricted: bool,
+    pub title_id: *const c_char,
+}
+
+type EnumerateCallback = extern "system" fn(*mut c_void, *const PackageDetails) -> bool;
+
+/// Enumerates packages of `kind`: `0` (`Game`) yields this installation;
+/// `1` (`Content`) yields none.
 extern "system" fn enumerate(
     _: This,
     kind: u32,
     _scope: u32,
-    _context: *mut c_void,
-    _callback: *const c_void,
+    context: *mut c_void,
+    callback: *const c_void,
 ) -> HRESULT {
-    tracing::debug!(kind, "packages enumerated: none");
+    if callback.is_null() {
+        return E_INVALIDARG;
+    }
+    if kind != 0 {
+        tracing::debug!(kind, "packages enumerated: none");
+        return S_OK;
+    }
+    let id = CString::new(identifier()).unwrap_or_default();
+    let store = CString::new(runtime::title().store_id).unwrap_or_default();
+    let title_id = CString::new(format!("{:08X}", runtime::title().id)).unwrap_or_default();
+    let empty = c"";
+    let details = PackageDetails {
+        package_identifier: id.as_ptr(),
+        version: 0,
+        kind: 0,
+        display_name: empty.as_ptr(),
+        description: empty.as_ptr(),
+        publisher: empty.as_ptr(),
+        store_id: store.as_ptr(),
+        installing: false,
+        index: 0,
+        count: 1,
+        age_restricted: false,
+        title_id: title_id.as_ptr(),
+    };
+    // SAFETY: `callback` is non-null and follows the title's enumeration callback ABI;
+    // `id`, `store`, `title_id`, and `empty` live for the duration of the synchronous call.
+    let cb: EnumerateCallback = unsafe { std::mem::transmute(callback) };
+    let _ = cb(context, &details);
     S_OK
 }
 
@@ -405,5 +453,51 @@ mod tests {
             S_OK
         );
         assert_eq!(xasync::XAsyncGetStatus(&mut block, true), NO_PACKAGE);
+
+        type Enum = extern "system" fn(This, u32, u32, *mut c_void, *const c_void) -> HRESULT;
+        let enum_fn = method::<Enum>(&OBJECT, 0x138);
+        assert_eq!(enum_fn(this, 0, 0, std::ptr::null_mut(), std::ptr::null()), E_INVALIDARG);
+
+        #[derive(Default)]
+        struct Seen {
+            calls: usize,
+            id: String,
+            title_id: String,
+            kind: u32,
+            index: u32,
+            count: u32,
+            installing: bool,
+            age_restricted: bool,
+        }
+        extern "system" fn on_pkg(ctx: *mut c_void, details: *const PackageDetails) -> bool {
+            // SAFETY: test passes `&mut Seen` and a valid `PackageDetails`.
+            let (seen, d) = unsafe { (&mut *ctx.cast::<Seen>(), &*details) };
+            seen.calls += 1;
+            seen.id = text(d.package_identifier).unwrap_or_default().to_owned();
+            seen.title_id = text(d.title_id).unwrap_or_default().to_owned();
+            seen.kind = d.kind;
+            seen.index = d.index;
+            seen.count = d.count;
+            seen.installing = d.installing;
+            seen.age_restricted = d.age_restricted;
+            true
+        }
+        let mut seen = Seen::default();
+        assert_eq!(
+            enum_fn(this, 0, 0, (&raw mut seen).cast(), on_pkg as *const c_void),
+            S_OK
+        );
+        assert_eq!(seen.calls, 1);
+        assert_eq!(seen.id, identifier());
+        assert_eq!(seen.title_id, format!("{:08X}", runtime::title().id));
+        assert_eq!((seen.kind, seen.index, seen.count), (0, 0, 1));
+        assert!(!seen.installing && !seen.age_restricted);
+
+        let mut content_seen = Seen::default();
+        assert_eq!(
+            enum_fn(this, 1, 0, (&raw mut content_seen).cast(), on_pkg as *const c_void),
+            S_OK
+        );
+        assert_eq!(content_seen.calls, 0);
     }
 }
