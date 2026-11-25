@@ -63,6 +63,8 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    null_root: OnceLock<Option<(ID3D12Resource, u64)>>,
+    null_uav: OnceLock<Option<(ID3D12Resource, u64)>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -265,6 +267,8 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
+            null_root: OnceLock::new(),
+            null_uav: OnceLock::new(),
         })
     }
 }
@@ -675,6 +679,20 @@ pub(crate) mod tests {
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
+    }
+
+    #[test]
+    fn null_root_view_is_aligned() {
+        let Some(host) = host() else {
+            return;
+        };
+        let gpu = host.null_root_view().unwrap();
+        let uav = host.null_root_uav().unwrap();
+        assert_ne!(gpu, 0);
+        assert_ne!(uav, 0);
+        assert_ne!(gpu, uav);
+        assert!(gpu.is_multiple_of(256));
+        assert!(uav.is_multiple_of(256));
     }
 
     /// A node of the device-removed data is a list by pointer or by name.
@@ -1657,6 +1675,35 @@ impl Host {
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
             handle
+        }
+    }
+
+    /// A 64 KiB zeroed buffer for unset or null root CBVs and SRVs, so a
+    /// freshly bound root signature never leaves a root descriptor undefined.
+    pub(crate) fn null_root_view(&self) -> Option<u64> {
+        self.null_root
+            .get_or_init(|| self.zeroed_root_buffer("null root view"))
+            .as_ref()
+            .map(|(_, gpu)| *gpu)
+    }
+
+    /// A 64 KiB buffer for unset or null root UAVs, separate from
+    /// [`Host::null_root_view`] so shader writes never dirty the zeroed view.
+    pub(crate) fn null_root_uav(&self) -> Option<u64> {
+        self.null_uav
+            .get_or_init(|| self.zeroed_root_buffer("null root uav"))
+            .as_ref()
+            .map(|(_, gpu)| *gpu)
+    }
+
+    fn zeroed_root_buffer(&self, label: &'static str) -> Option<(ID3D12Resource, u64)> {
+        let (buffer, data) = self.shared_buffer(1 << 16)?;
+        name(&buffer, || label.into());
+        // SAFETY: `shared_buffer(1 << 16)` returns a mapped 64 KiB buffer.
+        unsafe {
+            data.write_bytes(0, 1 << 16);
+            let gpu = buffer.GetGPUVirtualAddress();
+            Some((buffer, gpu))
         }
     }
 }

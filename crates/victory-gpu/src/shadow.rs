@@ -1010,6 +1010,9 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if address == 0 {
+        return None;
+    }
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -1656,5 +1659,10 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    #[test]
+    fn null_address_does_not_allocate_shadow_copy() {
+        assert!(find(0, 1).is_none());
     }
 }

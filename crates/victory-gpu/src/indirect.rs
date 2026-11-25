@@ -24,14 +24,15 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0), SRV(t1)"
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint has_count; };
 // The title's records, read only; the clamped ones go to the list's own.
 ByteAddressBuffer args : register(t0);
 RWByteAddressBuffer dest : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
+ByteAddressBuffer count_buf : register(t1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
@@ -71,6 +72,7 @@ uint clamped(uint at) {
 // A record past the budget (no cost reaches it).
 static const uint PAST = 0xffffffffu;
 groupshared uint costs[64];
+groupshared uint limit;
 // One group walks the records in tiles of 64: every lane clamps its own
 // record, then the first lane charges the tile's records in order. No
 // other group shares the budget: a shared add wraps once enough records
@@ -81,12 +83,15 @@ void main(uint lane : SV_GroupIndex) {
     uint left = 0;
     if (lane == 0) {
         left = BUDGET - min(budget.Load(0), BUDGET);
+        limit = has_count != 0 ? min(records, count_buf.Load(0)) : records;
     }
-    for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
+    GroupMemoryBarrierWithGroupSync();
+    uint tiles = limit / 64 + min(limit % 64, 1u);
+    for (uint tile = 0; tile < tiles; tile++) {
         uint record = tile * 64 + lane;
         uint at = record * stride;
         uint cost = 0;
-        if (record < records) {
+        if (record < limit) {
             cost = clamped(at);
         }
         costs[lane] = cost;
@@ -104,7 +109,7 @@ void main(uint lane : SV_GroupIndex) {
             }
         }
         GroupMemoryBarrierWithGroupSync();
-        if (costs[lane] == PAST) {
+        if (record < limit && costs[lane] == PAST) {
             // Draws keep their layout with no vertices; groups become zero.
             dest.Store(at, 0);
         }
@@ -187,7 +192,7 @@ fn make() -> windows::core::Result<Clamp> {
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` (a title
-/// buffer's copy, only read) into the list's own argument buffer, left
+/// buffer's copy, only read; bounded by `count` when present) into the list's own argument buffer, left
 /// ready to be read as arguments: that buffer, for [`done`] after the
 /// execution. Replaces the list's compute root signature and pipeline
 /// (callers bind theirs after). `None` if the clamp is not available.
@@ -203,16 +208,24 @@ fn make() -> windows::core::Result<Clamp> {
 // promoted to a write state the input assembler may not use (the debug
 // layer cannot see view accesses; GPU-based validation might); upgrade to
 // per-list tracked buffer states if a driver or that validation minds.
-pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
+pub(crate) fn bound(
+    list: &HostList,
+    gpu: u64,
+    count: Option<u64>,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<ID3D12Resource> {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return None;
     };
-    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
+    if !gpu.is_multiple_of(4)
+        || !stride.is_multiple_of(4)
+        || count.is_some_and(|g| !g.is_multiple_of(4))
+    {
         return None;
     }
     let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let constants = [kind, stride, records, u32::from(count.is_some())];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // a title buffer's copy the caller's list holds.
     unsafe {
@@ -227,6 +240,7 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
         l.SetComputeRootShaderResourceView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
+        l.SetComputeRootShaderResourceView(4, count.unwrap_or(gpu));
         // One group walks every record.
         l.Dispatch(records.min(1), 1, 1);
         l.ResourceBarrier(&[
@@ -297,7 +311,7 @@ mod tests {
             let gpu = buffer.GetGPUVirtualAddress();
             let mut out = None;
             for _ in 0..calls {
-                let clamped = super::bound(&list, gpu, spec).unwrap();
+                let clamped = super::bound(&list, gpu, None, spec).unwrap();
                 super::done(&list, &clamped);
                 out = Some(clamped);
             }
@@ -379,7 +393,7 @@ mod tests {
             let recorded: Vec<_> = lists
                 .iter()
                 .map(|l| {
-                    let out = super::bound(l, gpu, (2, 12, 1)).unwrap();
+                    let out = super::bound(l, gpu, None, (2, 12, 1)).unwrap();
                     super::done(l, &out);
                     l.close();
                     (out, issued())
@@ -416,5 +430,64 @@ mod tests {
             return; // no host GPU here
         };
         assert!(twice.iter().all(|&count| count == 0));
+    }
+
+    #[test]
+    fn clamp_honours_count_buffer_and_does_not_wrap_budget() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let (args, args_ptr) = host.shared_buffer(4096).unwrap();
+        let (count, count_ptr) = host.shared_buffer(256).unwrap();
+        // SAFETY: both buffers are mapped shared memory of the sizes above.
+        let (args_gpu, count_gpu) = unsafe {
+            let records = std::slice::from_raw_parts_mut(args_ptr.cast::<[u32; 4]>(), 80);
+            records[0] = [100, 2, 0, 0];
+            for slot in &mut records[1..] {
+                *slot = [1 << 24, 16, 0, 0];
+            }
+            count_ptr.cast::<u32>().write(1);
+            (args.GetGPUVirtualAddress(), count.GetGPUVirtualAddress())
+        };
+        let clamped1 = super::bound(&list, args_gpu, Some(count_gpu), (0, 16, 80)).unwrap();
+        super::done(&list, &clamped1);
+        list.close();
+        host.execute(&[&list]);
+        let mut out_ptr = std::ptr::null_mut();
+        // SAFETY: `host.execute` waits for completion; `clamped1` and `args` are mapped.
+        let (out1, args_out) = unsafe {
+            clamped1.Map(0, None, Some(&mut out_ptr)).unwrap();
+            (
+                std::slice::from_raw_parts(out_ptr.cast::<[u32; 4]>(), 80),
+                std::slice::from_raw_parts(args_ptr.cast::<[u32; 4]>(), 80),
+            )
+        };
+        assert_eq!(out1[0], [100, 2, 0, 0]);
+        assert_eq!(out1[1], [0, 0, 0, 0]);
+        assert_eq!(args_out[1], [1 << 24, 16, 0, 0]);
+
+        let list2 = host.new_list().unwrap();
+        // SAFETY: mapped shared memory.
+        unsafe {
+            let records = std::slice::from_raw_parts_mut(args_ptr.cast::<[u32; 4]>(), 80);
+            for slot in records.iter_mut() {
+                *slot = [1 << 24, 16, 0, 0];
+            }
+            count_ptr.cast::<u32>().write(0);
+        }
+        let first2 = super::bound(&list2, args_gpu, Some(count_gpu), (0, 16, 80)).unwrap();
+        super::done(&list2, &first2);
+        let clamped2 = super::bound(&list2, args_gpu, None, (0, 16, 80)).unwrap();
+        super::done(&list2, &clamped2);
+        list2.close();
+        host.execute(&[&list2]);
+        let mut out2_ptr = std::ptr::null_mut();
+        // SAFETY: `host.execute` waits for completion.
+        let out2 = unsafe {
+            clamped2.Map(0, None, Some(&mut out2_ptr)).unwrap();
+            std::slice::from_raw_parts(out2_ptr.cast::<[u32; 4]>(), 80)
+        };
+        assert_eq!(out2.iter().filter(|r| r[0] > 0).count(), 2);
     }
 }

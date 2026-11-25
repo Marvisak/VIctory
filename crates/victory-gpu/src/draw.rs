@@ -207,6 +207,9 @@ pub(crate) fn dispatched() -> u64 {
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
 fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64> {
+    if address == 0 {
+        return None;
+    }
     let shadow = crate::shadow::find(address, 1)?;
     let len = shadow
         .left(address)
@@ -771,9 +774,11 @@ impl State {
                         None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
                             // Where the root address lies in the copy its view shows.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
-                                Some(&Root::View(address)) => crate::shadow::find(address, 1)
-                                    .and_then(|s| u32::try_from(s.offset(address)).ok()),
-                                _ => None,
+                                Some(&Root::View(address)) if address != 0 => {
+                                    crate::shadow::find(address, 1)
+                                        .and_then(|s| u32::try_from(s.offset(address)).ok())
+                                }
+                                _ => Some(0),
                             };
                             match offset {
                                 Some(offset) => offset,
@@ -828,12 +833,21 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
-                        once!(slot, "a shader reads a root view the title did not set");
-                        continue;
+                    let gpu = match self.roots_ref(compute).get(usize::from(slot)) {
+                        Some(Root::View(address)) => root_view(list, *address, kind == 1, kind == 2),
+                        _ => {
+                            once!(slot, "a shader reads a root view the title did not set");
+                            None
+                        }
                     };
-                    let Some(gpu) = root_view(list, *address, kind == 1, kind == 2) else {
+                    let Some(gpu) = gpu.or_else(|| {
+                        let host = crate::host::host()?;
+                        if kind == 2 {
+                            host.null_root_uav()
+                        } else {
+                            host.null_root_view()
+                        }
+                    }) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
@@ -913,38 +927,21 @@ impl State {
     /// heap the shader indexes, made once per list and copy; the range from
     /// the root address brought up to date at submission
     /// (`victory_shader::emit`, "Root SRVs and root UAVs"). None if the
-    /// draw must be dropped: no root view set, or no dynamic slot.
+    /// draw must be dropped (no dynamic slot); null or unset views get a
+    /// null raw view.
     /// The copy is brought up to date from the root address to its end: a
     /// shader reaches wherever data its root view leads to lie (a vertex
     /// fetch's streams sit at offsets in the root view's own header).
     /// shortcut: what shaders write through a root UAV goes back to title
     /// memory for 1 MiB from its address, as before the views.
     fn root_view(&mut self, list: &HostList, compute: bool, slot: u8, uav: bool) -> Option<(u32, u32)> {
-        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
-            once!(slot, "a shader reads a root view the title did not set: dropped");
-            not_run("a root view the title did not set");
-            return None;
+        let address = match self.roots_ref(compute).get(usize::from(slot)) {
+            Some(&Root::View(address)) => address,
+            _ => {
+                once!(slot, "a shader reads a root view the title did not set");
+                0
+            }
         };
-        let Some(shadow) = crate::shadow::find(address, 1) else {
-            not_run("a root view outside title buffers");
-            return None;
-        };
-        let Some(offset) = u32::try_from(shadow.offset(address)).ok() else {
-            not_run("a root view 4 GiB or more into its copy");
-            return None;
-        };
-        let (refresh_at, refresh_len) = if uav && shadow.marked() {
-            shadow.page_range(address, shadow.left(address))
-        } else {
-            (address, shadow.left(address))
-        };
-        shadow.refresh(list, refresh_at, refresh_len);
-        if uav {
-            // Writes through the view are marked wherever they land in the
-            // copy; else declared for 1 MiB.
-            let len = if shadow.marked() { shadow.left(address) } else { shadow.left(address).min(1 << 20) };
-            shadow.gpu_writes(list, address, len, true);
-        }
         let (key, host) = match self.heaps[0] {
             0 => (MEMORY_HEAP, crate::memory::heap()),
             h => (
@@ -956,7 +953,36 @@ impl State {
             not_run("a root view without a host view heap");
             return None;
         };
-        let copy = std::sync::Arc::as_ptr(&shadow) as usize;
+        let (shadow, offset, copy) = if address == 0 {
+            (None, 0, 0)
+        } else {
+            let Some(shadow) = crate::shadow::find(address, 1) else {
+                not_run("a root view outside title buffers");
+                return None;
+            };
+            let Some(offset) = u32::try_from(shadow.offset(address)).ok() else {
+                not_run("a root view 4 GiB or more into its copy");
+                return None;
+            };
+            let (refresh_at, refresh_len) = if uav && shadow.marked() {
+                shadow.page_range(address, shadow.left(address))
+            } else {
+                (address, shadow.left(address))
+            };
+            shadow.refresh(list, refresh_at, refresh_len);
+            if uav {
+                // Writes through the view are marked wherever they land in the
+                // copy; else declared for 1 MiB.
+                let len = if shadow.marked() {
+                    shadow.left(address)
+                } else {
+                    shadow.left(address).min(1 << 20)
+                };
+                shadow.gpu_writes(list, address, len, true);
+            }
+            let copy = std::sync::Arc::as_ptr(&shadow) as usize;
+            (Some(shadow), offset, copy)
+        };
         if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
             return Some((index, offset));
         }
@@ -973,9 +999,13 @@ impl State {
         let index = self.root_run.1;
         self.root_run.1 += 1;
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
-        host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
+        match &shadow {
+            Some(s) => host.raw_view_at(index, Some(&s.buffer), 0, s.range().1 & !3, uav),
+            None => host.raw_view_at(index, None, 0, 0, uav),
+        }
         if uav {
-            host.set_mark(index, shadow.mark_entry(shadow.range().0));
+            let mark = shadow.as_ref().and_then(|s| s.mark_entry(s.range().0));
+            host.set_mark(index, mark);
         }
         self.root_slots.insert((key, copy, uav), index);
         Some((index, offset))
@@ -1763,9 +1793,15 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        let count_arg = counter.as_ref().map(|(s, at)| s.gpu(*at));
         // Bounded first: the clamp binds a compute pipeline of its own.
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+        let Some(clamped) = crate::indirect::bound(
+            list,
+            args.gpu(arguments),
+            count_arg,
+            (kind, stride, max),
+        ) else {
+            why("not bounded (no clamp, or arguments or count not 4-byte aligned)");
             return false;
         };
         self.host_pipeline = 0;
@@ -2698,6 +2734,53 @@ uint ps() : SV_Target { return 1; }
             host.execute(&[&list]);
             assert_eq!(out.read_host(dst_bytes as u64, 16), want, "round {round}");
         }
+    }
+
+    #[test]
+    fn null_and_unset_root_views_read_zeros() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let dst = buffer(256);
+        let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_uav(null, dst, null, &uav, title_heap.start + 32);
+        let heap_host = title_heap.host().expect("a host view heap");
+        let (root, pso) = compile();
+        let list = host.new_list().unwrap();
+        let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
+        out.write_host(dst_bytes as u64, &[0xff; 64]);
+
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_view(true, 0, 0);
+        let (srv_slot, srv_off) = state.root_view(&list, true, 0, false).expect("null root srv");
+        assert_eq!(srv_off, 0);
+        assert_eq!(state.root_view(&list, true, 1, false), Some((srv_slot, 0)));
+        let (uav_slot, uav_off) = state.root_view(&list, true, 0, true).expect("null root uav");
+        assert_ne!(uav_slot, srv_slot);
+        assert_eq!(uav_off, 0);
+
+        let constants = [0u32, 0];
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(srv_slot));
+            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(1));
+            list.list.SetComputeRoot32BitConstants(2, 2, constants.as_ptr().cast(), 0);
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(out.read_host(dst_bytes as u64, 16), vec![0u32; 16]);
     }
 
     /// Title memory of `bytes` (64 KiB aligned) for textures at an address.
