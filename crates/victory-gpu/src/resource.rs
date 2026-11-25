@@ -1131,7 +1131,67 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // Hosts differ in which formats take unordered access (NVIDIA has none
+    // for B5G5R5A1_UNORM, AMD has). D3D12 still takes the use when a format
+    // the texture can be cast to has it (B5G5R5A1's 16-bit aliases such as
+    // R16_UINT), and `make_texture` makes it with those formats: the use
+    // goes only when neither the format nor one it casts to takes it.
+    if d.flags & UNORDERED != 0
+        && !host_unordered_format(d.format)
+        && !castable(d.format).into_iter().any(host_unordered_format)
+    {
+        d.flags &= !UNORDERED;
+    }
     Some(d)
+}
+
+/// Whether the host GPU takes textures of `format` with unordered access
+/// (typed unordered views, or a typeless format: its family's views decide
+/// later). Asked once per format; without a host, yes.
+#[cfg(windows)]
+fn host_unordered_format(format: u32) -> bool {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+        D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static ASKED: std::sync::Mutex<Vec<(u32, bool)>> = std::sync::Mutex::new(Vec::new());
+    // A typeless format (its family's first, which the next one belongs
+    // to) is taken with unordered access; a format of no family is not.
+    if family(format) == format && family(format + 1) == format {
+        return true;
+    }
+    let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = asked.iter().find(|&&(f, _)| f == format) {
+        return ok;
+    }
+    let Some(host) = crate::host::host() else {
+        return true;
+    };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: the query writes its own structure of the given size.
+    let ok = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    }
+    .is_ok()
+        && support
+            .Support1
+            .contains(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW);
+    if !ok {
+        tracing::info!(
+            format,
+            "the host has no unordered access for this format: its textures are made without it"
+        );
+    }
+    asked.push((format, ok));
+    ok
 }
 
 const DEPTH: u32 = 2;
@@ -1389,6 +1449,13 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     }
     if texture.is_none() {
         castable_formats.clear();
+        // Without castable formats a use only an alias format takes is not
+        // legal: unordered access in a format the host cannot write.
+        let mut plain = *d;
+        if plain.flags & UNORDERED != 0 && !host_unordered_format(plain.format) {
+            plain.flags &= !UNORDERED;
+        }
+        let d = &plain;
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
         let made = unsafe {
@@ -2742,6 +2809,37 @@ mod tests {
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
+    /// A texture whose format the host GPU cannot write from shaders keeps
+    /// unordered access when a format it casts to takes it (B5G5R5A1_UNORM's
+    /// 16-bit aliases on NVIDIA) and drops it only when none does, and the
+    /// host makes it either way: with the castable formats, or without them
+    /// and without that use.
+    #[cfg(windows)]
+    #[test]
+    fn unordered_access_only_where_the_format_or_an_alias_takes_it() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const RENDER_TARGET: u32 = 1;
+        for format in [86, 28, 87, 2, 10, 85] {
+            let title = ResourceDesc {
+                flags: RENDER_TARGET | UNORDERED,
+                ..texture(64, 64, format, 1)
+            };
+            let d = host_desc(&title).expect("a texture");
+            assert_eq!(d.flags & RENDER_TARGET, RENDER_TARGET, "format {format}");
+            let takes = host_unordered_format(d.format)
+                || castable(d.format).into_iter().any(host_unordered_format);
+            assert_eq!(d.flags & UNORDERED != 0, takes, "format {format}");
+            assert!(
+                make_texture(&d, 0, std::ptr::null()).is_some(),
+                "format {format}: no host texture"
+            );
+        }
+        // Typeless formats keep unordered access (their views decide).
+        assert!(host_unordered_format(27));
+    }
+
     #[cfg(windows)]
     #[test]
     fn buffer_data_reaches_the_host_texture() {
