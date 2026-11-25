@@ -1600,11 +1600,26 @@ impl Host {
     }
 
     /// A host render target view of `resource`, valid until it is recorded.
+    /// `None` when the resource does not take one (it was made without the
+    /// render target use, as `resource::host_desc` leaves the uses its
+    /// format cannot take away): the view then reads null, a clear of it is
+    /// dropped — not a device removal.
     pub(crate) fn rtv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    ) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        // SAFETY: a live resource.
+        if unsafe { resource.GetDesc() }
+            .Flags
+            .0
+            & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+            == 0
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("a render target view of a texture the host made without the render target use: dropped"));
+            return None;
+        }
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
@@ -1612,7 +1627,7 @@ impl Host {
             handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
+            Some(handle)
         }
     }
 
@@ -1625,12 +1640,24 @@ impl Host {
         handle
     }
 
-    /// A host depth view of `resource`, valid until it is recorded.
+    /// A host depth view of `resource`, valid until it is recorded. `None`
+    /// when the resource does not take one (as [`Self::rtv`]).
     pub(crate) fn dsv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    ) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        // SAFETY: a live resource.
+        if unsafe { resource.GetDesc() }
+            .Flags
+            .0
+            & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0
+            == 0
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("a depth view of a texture the host made without the depth use: dropped"));
+            return None;
+        }
         let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
@@ -1638,7 +1665,7 @@ impl Host {
             handle.ptr += (slot * self.dsv_size) as usize;
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
-            handle
+            Some(handle)
         }
     }
 }
