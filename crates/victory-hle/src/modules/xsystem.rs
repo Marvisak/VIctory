@@ -270,7 +270,11 @@ mod device_type {
     pub(crate) fn module() -> HleModule {
         HleModule {
             name: "device type",
-            dlls: &["advapi32.dll", "api-ms-win-core-registry-*"],
+            dlls: &[
+                "advapi32.dll",
+                "kernelbase.dll",
+                "api-ms-win-core-registry-*",
+            ],
             exports: vec![
                 hle_export!(RegOpenKeyW),
                 hle_export!(RegOpenKeyExW),
@@ -359,6 +363,108 @@ mod device_type {
             );
             assert!(size > 0);
             assert_eq!(RegCloseKey(key), SUCCESS);
+        }
+
+        #[test]
+        fn kernelbase_registry_lookup_hits_emulated_console_mode() {
+            use victory_loader::{ImportResolver, Provenance, Resolution};
+            use victory_pe::ImportSymbol;
+
+            use crate::{HleResolver, HostPolicy};
+
+            let sym = |n: &str| ImportSymbol::Name {
+                hint: 0,
+                name: n.into(),
+            };
+            let resolver = HleResolver::new(HostPolicy::none());
+
+            for export in [
+                "RegOpenKeyW",
+                "RegOpenKeyExW",
+                "RegQueryValueExW",
+                "RegCloseKey",
+            ] {
+                let via_kernelbase = resolver.resolve("kernelbase.dll", &sym(export));
+                let via_advapi32 = resolver.resolve("advapi32.dll", &sym(export));
+                assert!(
+                    matches!(
+                        via_kernelbase,
+                        Resolution::Found {
+                            provenance: Provenance::Hle,
+                            ..
+                        }
+                    ),
+                    "{export} via kernelbase.dll"
+                );
+                assert_eq!(via_kernelbase, via_advapi32, "{export}");
+                assert_eq!(
+                    resolver.classify("KERNELBASE.DLL", &sym(export)),
+                    Some(Provenance::Hle),
+                    "{export} case-insensitive"
+                );
+            }
+
+            let resolve_fn = |name: &str| match resolver.resolve("kernelbase.dll", &sym(name)) {
+                Resolution::Found {
+                    address,
+                    provenance: Provenance::Hle,
+                } => address,
+                other => panic!("expected HLE resolution for {name}, got {other:?}"),
+            };
+
+            // SAFETY: each address comes from `hle_export!` in `device_type::module`
+            // with the matching `extern "system"` signature.
+            let open_ex: extern "system" fn(Key, *const u16, u32, u32, *mut Key) -> u32 =
+                unsafe { std::mem::transmute::<usize, _>(resolve_fn("RegOpenKeyExW")) };
+            // SAFETY: same as above, `RegQueryValueExW` signature.
+            let query: extern "system" fn(
+                Key,
+                *const u16,
+                *mut u32,
+                *mut u32,
+                *mut u8,
+                *mut u32,
+            ) -> u32 = unsafe { std::mem::transmute::<usize, _>(resolve_fn("RegQueryValueExW")) };
+            // SAFETY: same as above, `RegCloseKey` signature.
+            let close: extern "system" fn(Key) -> u32 =
+                unsafe { std::mem::transmute::<usize, _>(resolve_fn("RegCloseKey")) };
+
+            let mut key = std::ptr::null_mut();
+            let path = w(KEY);
+            assert_eq!(
+                open_ex(LOCAL_MACHINE, path.as_ptr(), 0, 1, &mut key),
+                SUCCESS
+            );
+            assert_eq!(key, oem());
+
+            let name = w(VALUE);
+            let (mut kind, mut value, mut size) = (0, 0u32, 4);
+            assert_eq!(
+                query(
+                    key,
+                    name.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut kind,
+                    (&raw mut value).cast(),
+                    &mut size,
+                ),
+                SUCCESS
+            );
+            assert_eq!((kind, size), (DWORD, 4));
+            assert_eq!(value, console_mode(console::current()));
+            assert_eq!(close(key), SUCCESS);
+
+            // Other kernelbase.dll exports (including un-emulated registry APIs)
+            // are not claimed by device_type and pass through to the host.
+            let with_host = HleResolver::default();
+            for other in ["GetLastError", "RegEnumKeyExW"] {
+                assert_eq!(resolver.classify("kernelbase.dll", &sym(other)), None);
+                assert_eq!(
+                    with_host.classify("kernelbase.dll", &sym(other)),
+                    Some(Provenance::Host),
+                    "{other} should pass through to host"
+                );
+            }
         }
     }
 }
