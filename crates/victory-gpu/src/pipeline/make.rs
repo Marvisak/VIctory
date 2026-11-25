@@ -36,6 +36,8 @@ pub(crate) struct Pending {
     now: AtomicBool,
     taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// Its worker was lost to it (see [`worker_lost`]): it will not be made.
+    lost: AtomicBool,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     pub(crate) key: String,
@@ -64,6 +66,7 @@ impl Pending {
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             made: OnceLock::new(),
+            lost: AtomicBool::new(false),
             used: AtomicBool::new(false),
         }
     }
@@ -108,6 +111,9 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
+        None if p.lost.load(Ordering::Relaxed) => {
+            Some(format!("lost to the driver's compiler {:?}", p.shaders))
+        }
         None => Some("being made".into()),
         Some(None) => {
             let failed: Vec<String> = p
@@ -182,7 +188,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         #[cfg(feature = "diagnostics")]
         log("used", &p.key, String::new);
     }
-    if p.made.get().is_none() {
+    if p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
         start(p, true);
         wait(p, crate::frame::current());
     }
@@ -228,7 +234,7 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
@@ -283,6 +289,7 @@ fn work() {
         use windows::Win32::System::Threading::*;
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
+    super::wine::hook();
     let (lock, work) = &QUEUES;
     loop {
         let p = {
@@ -305,13 +312,50 @@ fn work() {
         if p.taken.swap(true, Ordering::Relaxed) {
             continue; // its other queue entry
         }
+        MAKING.set(Some(p.clone()));
         p.make();
+        MAKING.set(None);
         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
             drained();
         } else {
             super::library::save(false);
         }
     }
+}
+
+thread_local! {
+    /// The pipeline this worker is making.
+    static MAKING: std::cell::Cell<Option<Arc<Pending>>> = const { std::cell::Cell::new(None) };
+}
+
+/// The host driver's compiler crashed under this thread (Wine, see
+/// [`super::wine`]), which will not run again. If it is a worker making a
+/// pipeline: the pipeline counts as lost from now on (nothing waits for
+/// it, its draws are dropped), the name it holds in the library is let
+/// go, and another worker takes this one's place. False for any other
+/// thread.
+pub(super) fn worker_lost() -> bool {
+    let Ok(Some(p)) = MAKING.try_with(std::cell::Cell::take) else {
+        return false;
+    };
+    p.lost.store(true, Ordering::Relaxed);
+    tracing::error!(
+        shaders = ?p.shaders,
+        "the host driver's compiler crashed making a pipeline: its draws are dropped, the run goes on",
+    );
+    super::library::abandon();
+    {
+        let (lock, done) = &DONE;
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+    }
+    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+        drained();
+    }
+    if let Err(e) = std::thread::Builder::new().name("victory-pipelines-again".into()).spawn(work) {
+        tracing::warn!(error = %e, "no pipeline worker in place of the lost one");
+    }
+    true
 }
 
 /// The most pipelines waiting at once since the workers last ran out.

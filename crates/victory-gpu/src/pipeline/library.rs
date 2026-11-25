@@ -256,6 +256,12 @@ pub(crate) fn pipeline(
         return create();
     };
     let _held = NAMES.hold(name);
+    if abandoned(name) {
+        // E_FAIL: the driver's compiler crashed on it in this run.
+        let fail = windows::core::HRESULT(0x8000_4005_u32 as i32);
+        return Err(windows::core::Error::from_hresult(fail));
+    }
+    HOLDS.set(Some(name.to_owned()));
     // The interface alone under the lock: loads take up to seconds. Its
     // blob lives as long as the library, which is never dropped.
     let loads = library
@@ -264,13 +270,16 @@ pub(crate) fn pipeline(
         .library
         .clone();
     if let Ok(pso) = load(&loads, PCWSTR(wide.as_ptr())) {
+        HOLDS.set(None);
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
     // Compiled outside the lock: compiles take up to seconds.
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), false)));
-    let pso = create()?;
+    let pso = create();
+    HOLDS.set(None);
+    let pso = pso?;
     MADE.fetch_add(1, Ordering::Relaxed);
     let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
@@ -279,6 +288,33 @@ pub(crate) fn pipeline(
         l.added += 1;
     }
     Ok(pso)
+}
+
+thread_local! {
+    /// The name this thread holds in [`NAMES`] while it loads or makes it.
+    static HOLDS: std::cell::Cell<Option<String>> = const { std::cell::Cell::new(None) };
+}
+
+/// Names whose making crashed the host driver's compiler in this run.
+static ABANDONED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+fn abandoned(name: &str) -> bool {
+    ABANDONED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|a| a.contains(name))
+}
+
+/// This thread will not return from the load or creation it is in (see
+/// `make::worker_lost`): the name it holds is let go, and refused to the
+/// threads waiting for it and to later ones.
+pub(super) fn abandon() {
+    let Ok(Some(name)) = HOLDS.try_with(std::cell::Cell::take) else { return };
+    let mut abandoned = ABANDONED.lock().unwrap_or_else(|e| e.into_inner());
+    abandoned.get_or_insert_default().insert(name.clone());
+    drop(abandoned);
+    let mut held = NAMES.held.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = held.as_mut() {
+        h.remove(&name);
+    }
+    NAMES.released.notify_all();
 }
 
 #[cfg(feature = "diagnostics")]
