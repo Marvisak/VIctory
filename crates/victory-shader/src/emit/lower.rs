@@ -280,15 +280,13 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
-    /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
-    /// the one in force at the instruction being lowered (see [`round16`]).
-    round16: Vec<Option<u8>>,
+    /// The 16/64-bit round mode in force at the instruction being lowered.
     mode16: Option<u8>,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
 /// after `inst`, from `mode` before it (`None`: not known).
-fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
+fn round16_after(lower: &Lower<'_>, inst: &Inst, mode: Option<u8>) -> Option<u8> {
     match (inst.name(), &inst.fields) {
         ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
         (
@@ -301,12 +299,11 @@ fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
             if id != 1 || off >= 4 || off + size <= 2 {
                 return mode;
             }
-            match src.first() {
-                Some(&Operand::Literal(x)) if off <= 2 && off + size >= 4 => {
-                    Some((x >> (2 - off) & 3) as u8)
-                }
-                _ => None,
+            if off > 2 || off + size < 4 {
+                return None;
             }
+            let input = lower.konst_operand(&HashMap::new(), inst, src.first()?)?;
+            Some((input >> (2 - off) & 3) as u8)
         }
         _ => mode,
     }
@@ -315,7 +312,8 @@ fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
 /// The 16/64-bit round mode each block starts with: nearest even at the
 /// program's start, then as the MODE writes on the way set it; `None` where
 /// paths that set it differently join (or a write is not a constant).
-fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
+fn round16(lower: &Lower<'_>) -> Vec<Option<u8>> {
+    let p = lower.x.p;
     // None: not reached yet; Some(m): the mode (m None: not known).
     let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
     entry[0] = Some(Some(0));
@@ -325,7 +323,7 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
         for &b in &order {
             let Some(mut m) = entry[b] else { continue };
             for inst in &p.blocks[b].insts {
-                m = round16_after(inst, m);
+                m = round16_after(lower, inst, m);
             }
             for s in p.blocks[b].exit.successors() {
                 let new = match entry[s] {
@@ -723,7 +721,6 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
-            round16: round16(p),
             mode16: Some(0),
         }
     }
@@ -1294,6 +1291,7 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        let entry_round16 = round16(&self);
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -1352,7 +1350,7 @@ impl<'a> Lower<'a> {
                 self.vals.insert(phi.value, val);
             }
             let mut i = 0;
-            self.mode16 = self.round16[b];
+            self.mode16 = entry_round16[b];
             while i < p.blocks[b].insts.len() {
                 if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
                     // A pixel's discard: the lanes stay on as helpers.
@@ -1365,7 +1363,7 @@ impl<'a> Lower<'a> {
                         .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
                 }
                 self.inst(b, i)?;
-                self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
+                self.mode16 = round16_after(&self, &p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);

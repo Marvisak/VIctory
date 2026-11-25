@@ -2989,6 +2989,34 @@ fn f16_results_round_as_the_mode_says() {
     })]));
 }
 
+#[test]
+fn f16_rounding_follows_a_constant_setreg_source() {
+    // s_setreg_b32 hwreg(MODE, 2, 2), s[reg].
+    let setreg = |reg: u32| 0xB980_0881 | reg << 16;
+    let body = [
+        sop1(0x03, 0, int(3)), // s_mov_b32 s0, 3
+        sop1(0x03, 1, s(0)),   // s_mov_b32 s1, s0
+        setreg(1),
+        vop1(0x0A, 5, v(1)),
+        0xB002_0000, // s_movk_i32 s2, 0
+        setreg(2),
+        vop1(0x0A, 6, v(1)),
+    ];
+    let inputs = unary(&[
+        0x3F80_1800, // Between 1 and the next f16, above their midpoint.
+        0xBF80_1800,
+        0x4780_0000, // Finite overflow rounds to max finite or infinity.
+        0x337F_FFFF, // Subnormal round-up to the least nonzero f16.
+        0x3FC0_0000, // Exact in both modes.
+        0x8000_0000,
+    ]);
+    assert_clean(check(&[probe(body, inputs, F16, |i| {
+        let source = f64::from(fl(i[0]));
+        let high = i[3] & 0xFFFF_0000;
+        vec![high | to_f16(source, true), high | to_f16(source, false)]
+    })]));
+}
+
 /// The check `victory-gpu` runs at device creation: the RX 6700 XT fuses
 /// the lowering's multiply-add, WARP does not.
 #[test]
