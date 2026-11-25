@@ -2353,9 +2353,54 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// Maximum gap between two pending refreshes of the same copy that
+/// [`coalesce_ranges`] merges into a single update (one 64 KiB guard page).
+/// Overlapping or adjacent ranges still coalesce; wider gaps across a shared
+/// GPU heap do not pull unrelated dirty or unwatched pages into the copy.
+const COALESCE_GAP: usize = crate::watch::PAGE;
+
+/// A half-open title-memory byte range `[from, to)`.
+type Span = (usize, usize);
+
+/// Pending refresh spans for one host copy within a [`Batch`].
+struct PendingRefresh {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    spans: Vec<Span>,
+}
+
+/// Disjoint spans of one host copy already brought up to date in this
+/// submission.
+struct CurrentRefresh {
+    _shadow: std::sync::Arc<crate::shadow::Shadow>,
+    spans: Vec<Span>,
+}
+
+/// Sorts `ranges` (half-open `[from, to)`) and merges any pair that overlaps
+/// or is separated by at most `gap` bytes. Empty ranges (`from >= to`) are
+/// dropped.
+fn coalesce_ranges(ranges: &mut Vec<Span>, gap: usize) {
+    ranges.retain(|&(from, to)| from < to);
+    if ranges.len() <= 1 {
+        return;
+    }
+    ranges.sort_unstable();
+    let mut out = 0;
+    for i in 1..ranges.len() {
+        let (from, to) = ranges[i];
+        let (_, cur_to) = &mut ranges[out];
+        if from <= cur_to.saturating_add(gap) {
+            *cur_to = (*cur_to).max(to);
+        } else {
+            out += 1;
+            ranges[out] = (from, to);
+        }
+    }
+    ranges.truncate(out + 1);
+}
+
+/// A submission's refreshes not done yet, coalesced per buffer copy across
+/// overlapping or nearby ranges: done before a step that writes title memory
+/// or gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -2369,33 +2414,40 @@ impl HostList {
 /// GPU).
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<PendingRefresh>,
     /// Where each copy's refresh is in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
-    /// The range of each copy brought up to date since the last title
+    /// The ranges of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    current: std::collections::HashMap<usize, CurrentRefresh>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
-        if shadow.clean() {
+        if len == 0 || shadow.clean() {
             return;
         }
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        let (key, end) = (
+            std::sync::Arc::as_ptr(shadow) as usize,
+            address.saturating_add(len),
+        );
+        if self
+            .current
+            .get(&key)
+            .is_some_and(|c| c.spans.iter().any(|&(a, b)| a <= address && end <= b))
+        {
             return;
         }
         match self.pending.get(&key) {
-            Some(&i) => {
-                let (_, from, to) = &mut self.refreshes[i];
-                (*from, *to) = ((*from).min(address), (*to).max(end));
-            }
+            Some(&i) => self.refreshes[i].spans.push((address, end)),
             None => {
                 self.pending.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push(PendingRefresh {
+                    shadow: shadow.clone(),
+                    spans: vec![(address, end)],
+                });
             }
         }
     }
@@ -2413,24 +2465,28 @@ impl Batch {
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-            total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
+        for PendingRefresh { shadow, mut spans } in self.refreshes.drain(..) {
+            coalesce_ranges(&mut spans, COALESCE_GAP);
+            if spans.is_empty() {
+                continue;
             }
+            for &(from, to) in &spans {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                total += copied;
+            }
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            let entry = self.current.entry(key).or_insert_with(|| CurrentRefresh {
+                _shadow: shadow,
+                spans: Vec::new(),
+            });
+            entry.spans.extend(spans);
+            coalesce_ranges(&mut entry.spans, 0);
         }
         total
     }
@@ -3488,7 +3544,7 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, COALESCE_GAP, coalesce_ranges};
 
     /// A host copy of tracked title memory: a submission whose lists all ask
     /// for it whole copies the one page the title wrote, once, and again
@@ -3525,8 +3581,90 @@ mod batch {   // `mod tests` is already taken at the top of this file
         drop(copy);
         crate::watch::tests::free(p);
     }
-}
 
+    #[test]
+    fn coalesce_ranges_merges_nearby_but_keeps_distant_ranges_separate() {
+        let mut ranges = vec![
+            (16 << 20, (16 << 20) + 4096),
+            (0x1000, 0x1000), // empty range dropped
+            (0x2000, 0x2400),
+            (0x2400 + COALESCE_GAP, 0x2800 + COALESCE_GAP),
+            (0x2000, 0x2200), // nested inside [0x2000, 0x2400)
+            (0x2800 + COALESCE_GAP + COALESCE_GAP + 1, 0x3000 + COALESCE_GAP * 2),
+        ];
+        coalesce_ranges(&mut ranges, COALESCE_GAP);
+        assert_eq!(
+            ranges,
+            vec![
+                (0x2000, 0x2800 + COALESCE_GAP),
+                (
+                    0x2800 + COALESCE_GAP + COALESCE_GAP + 1,
+                    0x3000 + COALESCE_GAP * 2,
+                ),
+                (16 << 20, (16 << 20) + 4096),
+            ]
+        );
+
+        let mut max_edge = vec![(usize::MAX - 16, usize::MAX), (usize::MAX - 32, usize::MAX - 16)];
+        coalesce_ranges(&mut max_edge, COALESCE_GAP);
+        assert_eq!(max_edge, vec![(usize::MAX - 32, usize::MAX)]);
+    }
+
+    /// Disjoint refreshes of the same tracked copy do not pull unrelated dirty
+    /// pages in the gap between them into the upload, while still marking both
+    /// requested spans current for the rest of the submission.
+    #[test]
+    fn disjoint_ranges_skip_dirty_gap_pages() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(6);
+        let len = 6 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        assert_eq!(batch.flush(), len, "all of it at first");
+        // Dirty pages 0, 2, 3, and 5; pages 2 and 3 sit in a 4-page gap
+        // (> COALESCE_GAP) between the two requested spans.
+        // SAFETY: our pool, guarded since the copy took it.
+        unsafe {
+            ((p + 8) as *mut u8).write_volatile(0x11);
+            ((p + 2 * PAGE + 8) as *mut u8).write_volatile(0x22);
+            ((p + 3 * PAGE + 8) as *mut u8).write_volatile(0x33);
+            ((p + 5 * PAGE + 8) as *mut u8).write_volatile(0x55);
+        }
+        let mut batch = Batch::default();
+        batch.add(&copy, p, PAGE);
+        batch.add(&copy, p + 5 * PAGE, PAGE);
+        assert_eq!(
+            batch.flush(),
+            2 * PAGE,
+            "only the two requested pages, skipping dirty gap pages"
+        );
+        assert_eq!(copy.read_host((p + 8) as u64, 1)[0], 0x11);
+        assert_eq!(copy.read_host((p + 5 * PAGE + 8) as u64, 1)[0], 0x55);
+        assert_eq!(
+            copy.read_host((p + 2 * PAGE + 8) as u64, 1)[0],
+            0,
+            "dirty gap page was not copied"
+        );
+        // Both disjoint spans are now current in this submission ...
+        batch.add(&copy, p, PAGE);
+        batch.add(&copy, p + 5 * PAGE, PAGE);
+        assert_eq!(batch.flush(), 0, "disjoint spans already current");
+        // ... while the unrequested gap is not, and still copies when needed.
+        batch.add(&copy, p + 2 * PAGE, 2 * PAGE);
+        assert_eq!(batch.flush(), 2 * PAGE, "gap pages refresh when requested");
+        assert_eq!(copy.read_host((p + 2 * PAGE + 8) as u64, 1)[0], 0x22);
+        assert_eq!(copy.read_host((p + 3 * PAGE + 8) as u64, 1)[0], 0x33);
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+}
 
 #[cfg(test)]
 mod withholding {
