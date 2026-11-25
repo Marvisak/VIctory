@@ -6,9 +6,15 @@
 mod census;
 mod inspect;
 mod prebuild;
+#[cfg(windows)]
+mod private_heap;
 mod run;
 mod shader;
 mod translate;
+
+#[cfg(windows)]
+#[global_allocator]
+static ALLOC: private_heap::PrivateHeap = private_heap::PrivateHeap;
 
 use std::path::PathBuf;
 

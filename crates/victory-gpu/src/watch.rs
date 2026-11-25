@@ -208,6 +208,9 @@ fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) {
 /// streamed textures and video planes through a pool view and maps the
 /// pages into its tiled heap, where a guard sees none of it).
 pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
+    if crate::switch::on("VICTORY_NO_WATCH_GUARDS") {
+        return None;
+    }
     if len == 0 || !runtime_memory(start, views) {
         return None;
     }
