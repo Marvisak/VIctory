@@ -323,17 +323,35 @@ impl State {
         };
         self.targets.clear();
         let mut rtvs = Vec::new();
+        // A target the host cannot bind gets a null view in its slot: the
+        // title's slots are positional (`SV_Target<n>`), so skipping one
+        // would move every later target to the wrong output.
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
-                    "render target without a recorded view"
+                    "render target without a recorded view: a null view in its slot"
                 );
+                rtvs.push(host.null_rtv(None));
                 continue;
             };
+            let format = record.desc().map(|d| d.Format);
             let Some(texture) = crate::resource::host_resource(record.resource) else {
+                once!(
+                    resource = format_args!("{:#x}", record.resource as usize),
+                    "render target without a host texture: a null view in its slot"
+                );
+                rtvs.push(host.null_rtv(format));
                 continue;
             };
+            if !crate::host::renders_to(texture) {
+                once!(
+                    resource = format_args!("{:#x}", record.resource as usize),
+                    "render target the host cannot render to: a null view in its slot"
+                );
+                rtvs.push(host.null_rtv(format));
+                continue;
+            }
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
@@ -2134,6 +2152,115 @@ void main(uint3 id : SV_DispatchThreadID) {
     o.Store4((id.y * 64 + id.x) * 16, asuint(t.Load(int3(id.xy, 0))));
 }
 "#;
+
+    /// Render targets keep their slots when one of them cannot be bound:
+    /// with no recorded view in slot 0, or the title's typed null view
+    /// there (no resource), the texture in slot 1 still gets `SV_Target1`
+    /// (it got `SV_Target0` when the slot was skipped).
+    #[test]
+    fn a_target_that_cannot_be_bound_keeps_the_others_in_their_slots() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const SHADERS: &str = r#"
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    return float4(id == 1 ? 3.0 : -1.0, id == 2 ? -3.0 : 1.0, 0.0, 1.0);
+}
+struct Out { float4 a : SV_Target0; float4 b : SV_Target1; };
+Out ps() { Out o; o.a = float4(1, 0, 0, 1); o.b = float4(0, 1, 0, 1); return o; }
+"#;
+        let compile = |entry: windows::core::PCSTR, target: windows::core::PCSTR| {
+            let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+            // SAFETY: the source and names outlive the call.
+            unsafe {
+                D3DCompile(SHADERS.as_ptr().cast(), SHADERS.len(), s!("targets"), None, None, entry, target, 0, 0, &mut code, Some(&mut errors))
+                    .unwrap();
+            }
+            code.unwrap()
+        };
+        let (vs, ps) = (compile(s!("vs"), s!("vs_5_1")), compile(s!("ps"), s!("ps_5_1")));
+        let bytecode = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
+            // SAFETY: the blob's own bytes.
+            pShaderBytecode: unsafe { b.GetBufferPointer() },
+            // SAFETY: as above.
+            BytecodeLength: unsafe { b.GetBufferSize() },
+        };
+        // SAFETY: plain creation from an empty description.
+        let root: ID3D12RootSignature = unsafe {
+            let mut blob = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).unwrap();
+            let blob = blob.unwrap();
+            host.device
+                .CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()))
+                .unwrap()
+        };
+        let mut formats = [DXGI_FORMAT(0); 8];
+        formats[..2].fill(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM);
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the call does not release.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            VS: bytecode(&vs),
+            PS: bytecode(&ps),
+            BlendState: D3D12_BLEND_DESC {
+                RenderTarget: [D3D12_RENDER_TARGET_BLEND_DESC { RenderTargetWriteMask: 0xf, ..Default::default() }; 8],
+                ..Default::default()
+            },
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE_SOLID, CullMode: D3D12_CULL_MODE_NONE, ..Default::default() },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 2,
+            RTVFormats: formats,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        // SAFETY: a complete description whose parts outlive the call.
+        let pso: ID3D12PipelineState = unsafe { host.device.CreateGraphicsPipelineState(&desc) }.unwrap();
+        // A 16x16 R8G8B8A8_UNORM title texture that may be a render target,
+        // and its recorded view; slot 0's handle has no recorded view.
+        let records = vec![0u8; 3 * 128];
+        let (none, typed_null, good) = (records.as_ptr() as u64, records.as_ptr() as u64 + 128, records.as_ptr() as u64 + 256);
+        // A typed null view: R8G8B8A8_UNORM, 2D, no resource.
+        crate::descriptor::create_rtv(std::ptr::null(), std::ptr::null(), &[28, 4, 0, 0, 0, 0], typed_null);
+        for slot0 in [none, typed_null] {
+            let texture = texture_at_address(title_memory(1 << 20), &texture_words(16, 16, 28, 0x105, 1));
+            crate::descriptor::create_rtv(std::ptr::null(), texture, std::ptr::null(), good);
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            const RENDER_TARGET: u32 = 0x4;
+            if let Some((copy, before)) = list.transition(texture, RENDER_TARGET) {
+                // SAFETY: an open list; the title texture's live host copy.
+                unsafe {
+                    list.list.ResourceBarrier(&[crate::host::transition(copy, D3D12_RESOURCE_STATES(before as i32), D3D12_RESOURCE_STATES(RENDER_TARGET as i32))]);
+                }
+            }
+            state.set_targets(&list, &[slot0, good], 0);
+            // SAFETY: an open list and live objects.
+            unsafe {
+                list.list.RSSetViewports(&[D3D12_VIEWPORT { Width: 16.0, Height: 16.0, MaxDepth: 1.0, ..Default::default() }]);
+                list.list.RSSetScissorRects(&[RECT { left: 0, top: 0, right: 16, bottom: 16 }]);
+                list.list.SetGraphicsRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                list.list.DrawInstanced(3, 1, 0, 0);
+            }
+            let slots = Slots::new(1);
+            let read = compile_cs(READ);
+            let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+            let view = View::Shader(texture as usize, None);
+            readable(&list, &used(ResourceType::Srv), &view, false);
+            slots.make(0, &view);
+            run(&list, &slots, &read, 0, Some(&out), (2, 2));
+            list.close();
+            host.execute(&[&list]);
+            for (x, y) in [(0usize, 0usize), (15, 15), (7, 9)] {
+                // SAFETY: inside the mapped output.
+                let got = unsafe { (data.add((y * 64 + x) * 16) as *const [f32; 4]).read() };
+                let case = if slot0 == none { "no view" } else { "typed null view" };
+                assert_eq!(got, [0.0, 1.0, 0.0, 1.0], "{case} in slot 0, texel {x},{y}: SV_Target1, not SV_Target0");
+            }
+        }
+        drop(records);
+    }
 
     /// One texture memory written through an unordered view of a resource
     /// object in one format and read through a placed view in another: a
