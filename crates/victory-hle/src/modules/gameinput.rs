@@ -1252,7 +1252,7 @@ mod host {
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<KeyHold>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
@@ -1275,14 +1275,77 @@ mod host {
                     vk,
                 ))
             });
-            (Instant::now(), keys.collect())
+            (Instant::now(), scheduled_key_holds(keys))
         });
         let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
+        active_scripted_keys(keys, start.elapsed())
+    }
+
+    // Keep each continuous hold's first and last scheduled press. Using
+    // the last start instead of an end avoids overflowing Duration.
+    #[cfg(any(test, feature = "diagnostics"))]
+    type KeyHold = (Duration, Duration, u8);
+
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn scheduled_key_holds(keys: impl Iterator<Item = (Duration, u8)>) -> Vec<KeyHold> {
+        let mut keys: Vec<_> = keys.collect();
+        keys.sort_by_key(|&(at, _)| at);
+        let mut holds: Vec<KeyHold> = Vec::new();
+        for (at, vk) in keys {
+            if let Some((_, last, _)) = holds.iter_mut().rev().find(|hold| hold.2 == vk)
+                && at.saturating_sub(*last) <= Duration::from_millis(200)
+            {
+                *last = at;
+            } else {
+                holds.push((at, at, vk));
+            }
+        }
+        holds
+    }
+
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn active_scripted_keys(holds: &[KeyHold], now: Duration) -> Vec<u8> {
+        holds
+            .iter()
+            .filter(|&&(first, last, _)| {
+                now >= first && now.saturating_sub(last) < Duration::from_millis(200)
+            })
+            .map(|&(_, _, vk)| vk)
             .collect()
+    }
+
+    #[test]
+    fn overlapping_scripted_presses_hold_one_key_until_both_end() {
+        let ms = Duration::from_millis;
+        let holds = scheduled_key_holds([(ms(0), b'W'), (ms(50), b'A'), (ms(100), b'W')].into_iter());
+        for at in [100, 199, 200, 249] {
+            assert_eq!(active_scripted_keys(&holds, ms(at)), b"WA");
+        }
+        assert_eq!(active_scripted_keys(&holds, ms(250)), b"W");
+        assert!(active_scripted_keys(&holds, ms(300)).is_empty());
+    }
+
+    #[test]
+    fn scripted_holds_sort_stably_merge_touching_and_keep_gaps() {
+        let ms = Duration::from_millis;
+        let holds = scheduled_key_holds(
+            [(ms(200), b'W'), (ms(50), b'A'), (ms(0), b'W'), (ms(50), b'B'), (ms(401), b'W')]
+                .into_iter(),
+        );
+        assert_eq!(active_scripted_keys(&holds, ms(49)), b"W");
+        assert_eq!(active_scripted_keys(&holds, ms(200)), b"WAB");
+        assert_eq!(active_scripted_keys(&holds, ms(399)), b"W");
+        assert!(active_scripted_keys(&holds, ms(400)).is_empty());
+        assert_eq!(active_scripted_keys(&holds, ms(401)), b"W");
+        assert!(active_scripted_keys(&holds, ms(601)).is_empty());
+    }
+
+    #[test]
+    fn scripted_hold_at_max_duration_does_not_overflow() {
+        let at = Duration::MAX;
+        let holds = scheduled_key_holds([(at, b'W')].into_iter());
+        assert!(active_scripted_keys(&holds, at - Duration::from_millis(1)).is_empty());
+        assert_eq!(active_scripted_keys(&holds, at), b"W");
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
