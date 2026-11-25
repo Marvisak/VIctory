@@ -6,8 +6,9 @@
 //! * Connects (also by name, by list, `ConnectEx` from `WSAIoctl`) and
 //!   datagram sends to anything but 127.0.0.0/8 and ::1 fail with
 //!   `WSAENETUNREACH`.
-//! * Forward lookups other than `localhost` and IP literals fail with
-//!   `WSAHOST_NOT_FOUND`; reverse lookups of other addresses come back
+//! * Forward lookups accept `localhost`, IP literals and the machine's own
+//!   hostname (as `localhost`). Other names fail with `WSAHOST_NOT_FOUND`;
+//!   reverse lookups of other addresses come back
 //!   numeric, or fail if a name is required, as with no network.
 //! * `WinHttpConnect` to a host that is not loopback fails with
 //!   `ERROR_WINHTTP_CANNOT_CONNECT`, so no request (or WebSocket) handle can
@@ -174,21 +175,52 @@ fn reachable_name(name: Option<String>) -> bool {
     }
 }
 
-/// Names answered without asking the network: none, `localhost`, IP
-/// literals (connecting to one is vetted separately).
-fn resolvable(name: Option<String>) -> bool {
-    match name {
-        Some(name)
-            if !(name.is_empty()
-                || name.eq_ignore_ascii_case("localhost")
-                || name.parse::<IpAddr>().is_ok()) =>
-        {
-            once("network name lookup blocked", name);
-            wsa_error(WSAHOST_NOT_FOUND);
-            false
-        }
-        _ => true,
+/// The name to pass to Winsock. Only the machine's own name is rewritten:
+/// handing the original to a resolver could return a LAN address.
+fn lookup_node<T>(
+    node: *const T,
+    name: Option<String>,
+    localhost: *const T,
+    is_hostname: impl FnOnce() -> bool,
+) -> Option<*const T> {
+    let Some(name) = name else { return Some(node) };
+    if name.is_empty() || name.eq_ignore_ascii_case("localhost") || name.parse::<IpAddr>().is_ok() {
+        return Some(node);
     }
+    if is_hostname() {
+        return Some(localhost);
+    }
+    once("network name lookup blocked", name);
+    wsa_error(WSAHOST_NOT_FOUND);
+    None
+}
+
+fn lookup_node_a(node: *const c_char) -> Option<*const c_char> {
+    lookup_node(node, narrow(node), c"localhost".as_ptr(), || {
+        let mut host = [0; 256];
+        let get = host!("ws2_32.dll", "gethostname": extern "system" fn(*mut c_char, i32) -> i32);
+        if get(host.as_mut_ptr(), host.len() as i32) != 0 {
+            return false;
+        }
+        // SAFETY: the caller supplied a name and gethostname succeeded.
+        let (node, host) = unsafe { (CStr::from_ptr(node), CStr::from_ptr(host.as_ptr())) };
+        let (node, host) = (node.to_bytes(), host.to_bytes());
+        // An ASCII letter byte can be part of a multibyte ANSI character.
+        node == host || (host.is_ascii() && node.eq_ignore_ascii_case(host))
+    })
+}
+
+fn lookup_node_w(node: *const u16) -> Option<*const u16> {
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+    lookup_node(node, wide(node), windows_sys::w!("localhost"), || {
+        let mut host = [0; 256];
+        let get = host!("ws2_32.dll", "GetHostNameW": extern "system" fn(*mut u16, i32) -> i32);
+        if get(host.as_mut_ptr(), host.len() as i32) != 0 {
+            return false;
+        }
+        // SAFETY: both strings are NUL-terminated. Compare without locale rules.
+        unsafe { CompareStringOrdinal(node, -1, host.as_ptr(), -1, 1) == CSTR_EQUAL }
+    })
 }
 
 /// Reverse lookups ask DNS unless the address is loopback.
@@ -551,9 +583,9 @@ pub extern "system" fn getaddrinfo(
     hints: *const c_void,
     result: *mut *mut c_void,
 ) -> i32 {
-    if !resolvable(narrow(node)) {
+    let Some(node) = lookup_node_a(node) else {
         return blocked_lookup(result);
-    }
+    };
     host!("ws2_32.dll", "getaddrinfo": extern "system" fn(*const c_char, *const c_char, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
     )
@@ -565,9 +597,9 @@ pub extern "system" fn GetAddrInfoW(
     hints: *const c_void,
     result: *mut *mut c_void,
 ) -> i32 {
-    if !resolvable(wide(node)) {
+    let Some(node) = lookup_node_w(node) else {
         return blocked_lookup(result);
-    }
+    };
     host!("ws2_32.dll", "GetAddrInfoW": extern "system" fn(*const u16, *const u16, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
     )
@@ -585,9 +617,9 @@ pub extern "system" fn GetAddrInfoExA(
     completion: *const c_void,
     handle: *mut Handle,
 ) -> i32 {
-    if !resolvable(narrow(name)) {
+    let Some(name) = lookup_node_a(name) else {
         return blocked_lookup(result);
-    }
+    };
     host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
@@ -605,18 +637,18 @@ pub extern "system" fn GetAddrInfoExW(
     completion: *const c_void,
     handle: *mut Handle,
 ) -> i32 {
-    if !resolvable(wide(name)) {
+    let Some(name) = lookup_node_w(name) else {
         return blocked_lookup(result);
-    }
+    };
     host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
 }
 
 pub extern "system" fn gethostbyname(name: *const c_char) -> *mut c_void {
-    if !resolvable(narrow(name)) {
+    let Some(name) = lookup_node_a(name) else {
         return std::ptr::null_mut();
-    }
+    };
     host!("ws2_32.dll", "gethostbyname": extern "system" fn(*const c_char) -> *mut c_void)(name)
 }
 
@@ -627,9 +659,9 @@ pub extern "system" fn WSAAsyncGetHostByName(
     buf: *mut c_char,
     buf_len: i32,
 ) -> Handle {
-    if !resolvable(narrow(name)) {
+    let Some(name) = lookup_node_a(name) else {
         return std::ptr::null_mut();
-    }
+    };
     host!("ws2_32.dll", "WSAAsyncGetHostByName": extern "system" fn(Handle, u32, *const c_char, *mut c_char, i32) -> Handle)(
         window, message, name, buf, buf_len,
     )
@@ -902,6 +934,80 @@ mod tests {
     // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
     const AWAY: [u8; 4] = [192, 0, 2, 1];
     const HOME: [u8; 4] = [127, 0, 0, 1];
+
+    #[test]
+    fn the_local_hostname_resolves_only_to_loopback() {
+        use std::ptr::{null, null_mut};
+        use windows_sys::Win32::Networking::WinSock as ws;
+
+        fn check_addresses<T>(
+            mut entry: *mut T,
+            fields: impl Fn(&T) -> (*mut ws::SOCKADDR, usize, *mut T),
+        ) {
+            assert!(!entry.is_null());
+            // SAFETY: Winsock returned a list that stays live until the matching free call.
+            while let Some(info) = unsafe { entry.as_ref() } {
+                let (address, len, next) = fields(info);
+                let addr = socket_addr(address.cast(), len.try_into().unwrap()).unwrap();
+                assert!(addr.ip().is_loopback(), "{addr}");
+                entry = next;
+            }
+        }
+
+        let mut hostname = [0u8; 256];
+        let mut wide_hostname = [0u16; 256];
+        // SAFETY: Winsock receives an initialized WSADATA and buffers of the stated sizes.
+        unsafe {
+            assert_eq!(ws::WSAStartup(0x0202, &mut ws::WSADATA::default()), 0);
+            assert_eq!(ws::gethostname(hostname.as_mut_ptr(), 256), 0);
+            assert_eq!(ws::GetHostNameW(wide_hostname.as_mut_ptr(), 256), 0);
+        }
+        let mut result = null_mut();
+        assert_eq!(
+            getaddrinfo(hostname.as_ptr().cast(), null(), null(), &mut result),
+            0
+        );
+        check_addresses(result.cast::<ws::ADDRINFOA>(), |entry| {
+            (entry.ai_addr, entry.ai_addrlen, entry.ai_next)
+        });
+        // SAFETY: getaddrinfo returned this list.
+        unsafe { ws::freeaddrinfo(result.cast()) };
+
+        let mut result = null_mut();
+        assert_eq!(
+            GetAddrInfoW(wide_hostname.as_ptr(), null(), null(), &mut result),
+            0
+        );
+        check_addresses(result.cast::<ws::ADDRINFOW>(), |entry| {
+            (entry.ai_addr, entry.ai_addrlen, entry.ai_next)
+        });
+        // SAFETY: GetAddrInfoW returned this list.
+        unsafe { ws::FreeAddrInfoW(result.cast()) };
+
+        if hostname.is_ascii() {
+            for byte in hostname.iter_mut().filter(|b| b.is_ascii_alphabetic()) {
+                *byte ^= 0x20;
+            }
+        }
+        let host = gethostbyname(hostname.as_ptr().cast()).cast::<ws::HOSTENT>();
+        // SAFETY: Winsock owns the HOSTENT and its null-terminated list until the next lookup.
+        unsafe {
+            let host = host.as_ref().expect("lookup of the case-varied local name");
+            let mut addr = host.h_addr_list;
+            assert!(!addr.is_null() && !(*addr).is_null());
+            while !(*addr).is_null() {
+                let ip = raw_ip(*addr, host.h_length.into(), host.h_addrtype.into()).unwrap();
+                assert!(ip.is_loopback(), "{ip}");
+                addr = addr.add(1);
+            }
+        }
+        assert!(gethostbyname(c"blocked.invalid".as_ptr()).is_null());
+        // SAFETY: WSAGetLastError takes no arguments, and WSACleanup balances WSAStartup above.
+        unsafe {
+            assert_eq!(ws::WSAGetLastError(), WSAHOST_NOT_FOUND);
+            assert_eq!(ws::WSACleanup(), 0);
+        }
+    }
 
     #[test]
     fn blocked_name_lookups_clear_the_result() {

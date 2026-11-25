@@ -52,6 +52,9 @@ windows-core = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
+
 [features]
 # Debugging switches (scripted keys and the like).
 diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows-core"]
