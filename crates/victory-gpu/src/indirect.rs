@@ -153,7 +153,10 @@ fn make() -> windows::core::Result<Clamp> {
         if let Some(errors) = errors {
             // SAFETY: the blob's own bytes.
             let text = unsafe {
-                std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
+                std::slice::from_raw_parts(
+                    errors.GetBufferPointer().cast::<u8>(),
+                    errors.GetBufferSize(),
+                )
             };
             tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
         }
@@ -162,7 +165,8 @@ fn make() -> windows::core::Result<Clamp> {
     let code = code.ok_or_else(windows::core::Error::empty)?;
     // SAFETY: the blob's own bytes; the root signature is inside the shader.
     unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let bytes =
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
@@ -176,14 +180,11 @@ fn make() -> windows::core::Result<Clamp> {
     }
 }
 
-/// Records, in `list`, the clamp of `records` records of `kind` (PC
-/// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
-/// the list's compute root signature and pipeline (callers bind theirs
-/// after). False if the clamp is not available.
-pub(crate) fn bound(
+/// Clamps `records` indirect arguments of `kind` (`stride` bytes apart at `gpu`),
+/// leaving `buffer` in its current `UNORDERED_ACCESS` state. Replaces the list's
+/// compute root signature and pipeline.
+pub(crate) fn clamp_only(
     list: &HostList,
-    buffer: &ID3D12Resource,
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
 ) -> bool {
@@ -207,14 +208,32 @@ pub(crate) fn bound(
         l.SetComputeRootUnorderedAccessView(2, budget);
         // One group walks every record.
         l.Dispatch(records.min(1), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
-        ]);
+        l.ResourceBarrier(&[uav_barrier()]);
+    }
+    true
+}
+
+/// Records, in `list`, the clamp of `records` records of `kind` (PC
+/// argument numbering) `stride` bytes apart at host address `gpu` in
+/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
+/// the list's compute root signature and pipeline (callers bind theirs
+/// after). False if the clamp is not available.
+pub(crate) fn bound(
+    list: &HostList,
+    buffer: &ID3D12Resource,
+    gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+) -> bool {
+    if !clamp_only(list, gpu, (kind, stride, records)) {
+        return false;
+    }
+    // SAFETY: an open list and live buffer.
+    unsafe {
+        list.list.ResourceBarrier(&[transition(
+            buffer,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )]);
     }
     true
 }
@@ -232,12 +251,14 @@ pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
     };
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
         },
     }
 }

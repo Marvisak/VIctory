@@ -401,3 +401,46 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A local debugging aid: extracts the real containers named by the
+    /// run-time log's shader hashes (blake3 of the container bytes, first 16
+    /// hex digits) from the title's shader archive, so a draw-path test can
+    /// replay exactly what the emulator bound. `VICTORY_SHADER_RPF` names the
+    /// archive. Run with
+    /// `cargo test -p victory extract_containers -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs the title's shader archive on disk"]
+    fn extract_containers() {
+        let want = ["d4111a6e6ea49d91", "c0a7fe77b1862e10"];
+        let rpf = std::env::var("VICTORY_SHADER_RPF")
+            .unwrap_or_else(|_| r"E:\Games\GTA6.Xbox.v1.0.2.1\shaders.rpf".into());
+        let out =
+            std::env::var("VICTORY_CONTAINER_DIR").unwrap_or_else(|_| r"E:\Temp\opencode".into());
+        let data = std::fs::read(&rpf).expect("shaders.rpf");
+        let mut found = Vec::new();
+        for source in sources(&data) {
+            let Some(bytes) = source.bytes() else {
+                continue;
+            };
+            if Container::parse(&bytes).is_err() {
+                continue;
+            }
+            let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+            if want.contains(&hash.as_str()) && !found.contains(&hash) {
+                let path = format!(r"{out}\{hash}.cdxil");
+                std::fs::write(&path, bytes.as_ref()).expect("write container");
+                println!(
+                    "{hash}: {} bytes -> {path} ({})",
+                    bytes.len(),
+                    source.label()
+                );
+                found.push(hash);
+            }
+        }
+        assert!(found.len() == want.len(), "found {found:?} of {want:?}");
+    }
+}

@@ -150,6 +150,20 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    mesh: emit::MeshMode,
+}
+
+fn mesh_mode(host: Option<&Host>) -> emit::MeshMode {
+    match std::env::var("VICTORY_MESH_EMULATION")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => emit::MeshMode::Emulate,
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => emit::MeshMode::Native,
+        _ if host.is_some_and(|h| !h.mesh_shaders()) => emit::MeshMode::Emulate,
+        _ => emit::MeshMode::Native,
+    }
 }
 
 pub fn run(
@@ -173,15 +187,19 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
-    if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
-    }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
         .filter_map(|p| p.split_once('+'))
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
+    let probe_host = if pipelines || !pairs.is_empty() {
+        Some(Host::new(false).map_err(anyhow::Error::msg)?)
+    } else {
+        None
+    };
+    let mesh = mesh_mode(probe_host.as_ref());
+    drop(probe_host);
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -217,6 +235,7 @@ pub fn run(
                                 host: pipelines
                                     .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                     .flatten(),
+                                mesh,
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -293,11 +312,15 @@ pub fn run(
         for (v, p) in &pairs {
             let made = match (find(v), find(p)) {
                 (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
-                    host.mesh_pipeline(vs, ps)
+                    if vs.mesh_emu.is_some() {
+                        host.emulated_mesh_pipelines(vs, ps).map(drop)
+                    } else {
+                        host.mesh_pipeline(vs, ps).map(drop)
+                    }
                 } else {
-                    host.pipeline(vs, ps)
+                    host.pipeline(vs, ps).map(drop)
                 }
-                .map(|_| "pipeline created".to_owned())
+                .map(|()| "pipeline created".to_owned())
                 .unwrap_or_else(|e| e),
                 _ => "not emitted".to_owned(),
             };
@@ -317,6 +340,16 @@ pub fn run(
     Ok(())
 }
 
+fn is_mesh_container(container: &[u8]) -> bool {
+    let Ok(c) = Container::parse(container) else {
+        return false;
+    };
+    let Some(part) = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) else {
+        return false;
+    };
+    native_programs(part.data).is_ok_and(|ps| ps.iter().any(|p| p.stage == HwStage::Ms))
+}
+
 /// The warm-up (`--cache`): every distinct container found goes through
 /// the shader cache `run` reads (`<cache>/shaders`, decision 0003), by the
 /// same code, so a run finds it translated or refused. With `pipelines`,
@@ -328,6 +361,11 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
         anyhow::bail!("no shader cache in {}", shaders.display());
     };
+    // The run's mesh mode: mesh programs warm the cache in the form a host
+    // without mesh shaders (or `VICTORY_MESH_EMULATION`) translates them.
+    let probe_host = victory_shader::emit::host::Host::new(false).ok();
+    let mesh = mesh_mode(probe_host.as_ref());
+    drop(probe_host);
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     // The pre-build's key listing (diagnostics) translates nothing.
@@ -368,8 +406,15 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                     continue;
                                 }
                                 let one = std::time::Instant::now();
+                                let entry_mesh = if mesh == emit::MeshMode::Emulate
+                                    && is_mesh_container(container)
+                                {
+                                    emit::MeshMode::Emulate
+                                } else {
+                                    emit::MeshMode::Native
+                                };
                                 let (done, cached) =
-                                    victory_gpu::shader_cache::host_shader(container);
+                                    victory_gpu::shader_cache::host_shader(container, entry_mesh);
                                 let k = if cached {
                                     0
                                 } else if done.is_ok() {
@@ -568,8 +613,11 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    let marks = emit::Options { view_marks: true };
-                    match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
+                    let options = emit::Options {
+                        view_marks: true,
+                        mesh: checks.mesh,
+                    };
+                    match emit::emit_with(&container, &p, &program, &s, &i, &r, options) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
@@ -620,6 +668,9 @@ fn check(
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
+            HwStage::Ms if shader.mesh_emu.is_some() => {
+                h.emulated_mesh_pipelines(&shader, stub_ps).map(drop)
+            }
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
@@ -639,7 +690,14 @@ fn check(
         }
         return;
     };
-    match v.validate(&mut shader.dxil) {
+    let res = v.validate(&mut shader.dxil).and_then(|()| {
+        if let Some(emu) = &shader.mesh_emu {
+            let mut unpack = emit::unpack_vertex_shader(emu, None).map_err(|e| e.to_string())?;
+            v.validate(&mut unpack)?;
+        }
+        Ok(())
+    });
+    match res {
         Ok(()) => {
             *counter(t, shader.stage, 2) += 1;
             if t.list {

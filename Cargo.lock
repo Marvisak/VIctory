@@ -695,6 +695,7 @@ dependencies = [
  "miniz_oxide",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",

@@ -112,7 +112,7 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let (done, cached) = translate(&self.container);
+                let (done, cached) = translate(&self.container, self.stage);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
@@ -149,7 +149,10 @@ impl Shader {
 fn thread_cpu() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-    let mut t = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+    let mut t = [FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }; 4];
     let [created, exited, kernel, user] = &mut t;
     // SAFETY: four times of our own thread into our own variables.
     unsafe { GetThreadTimes(GetCurrentThread(), created, exited, kernel, user) };
@@ -166,11 +169,24 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
     ((now.0 - then.0) / 10_000, (now.1 - then.1) / 10_000)
 }
 
-/// The translation, and whether it came from the cache.
+/// The translation, and whether it came from the cache. Mesh programs
+/// translate in the host's mesh mode (`MeshMode::Emulate` on GPUs without
+/// mesh shaders).
 #[cfg(windows)]
-fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
-    let (host, cached) = crate::shader_cache::host_shader(container);
-    (host.and_then(|host| with_resources(container, host)), cached)
+fn translate(container: &[u8], stage: &str) -> (Result<Translated, String>, bool) {
+    use victory_shader::emit::MeshMode;
+    let mesh = if stage == "mesh"
+        && crate::host::host().is_some_and(crate::host::Host::emulate_mesh_shaders)
+    {
+        MeshMode::Emulate
+    } else {
+        MeshMode::Native
+    };
+    let (host, cached) = crate::shader_cache::host_shader(container, mesh);
+    (
+        host.and_then(|host| with_resources(container, host)),
+        cached,
+    )
 }
 
 #[cfg(windows)]
@@ -330,7 +346,10 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
@@ -629,7 +648,11 @@ impl Prebuild {
 
     /// Its shaders and state as a diagnostics build logs them.
     pub fn describe(&self) -> String {
-        let state = self.graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
+        let state = self
+            .graphics
+            .as_ref()
+            .map(|g| g.describe())
+            .unwrap_or_default();
         format!("{:?}\t{state}", self.shaders)
     }
 
@@ -654,10 +677,12 @@ impl Prebuild {
         library::save(false);
         match made {
             Some(_) => Ok(()),
-            None => Err(match self.shaders.iter().find(|s| s.translated().is_none()) {
-                Some(s) => format!("{} shader does not translate", s.stage),
-                None => "the host refuses it".into(),
-            }),
+            None => Err(
+                match self.shaders.iter().find(|s| s.translated().is_none()) {
+                    Some(s) => format!("{} shader does not translate", s.stage),
+                    None => "the host refuses it".into(),
+                },
+            ),
         }
     }
 }
@@ -696,6 +721,123 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// A local debugging aid: replays the emulated mesh dispatch of the real
+    /// title shaders the run-time log names (`VICTORY_CONTAINER_DIR` holds
+    /// their containers, extracted with `victory`'s `extract_containers`
+    /// test), on a real host list, and closes it. The close failing names the
+    /// invalid command with `VICTORY_D3D12_DEBUG=1` in a diagnostics build.
+    /// Run on a host without mesh shaders (or with `VICTORY_MESH_EMULATION=1`):
+    /// `cargo test -p victory-gpu emulated_mesh_dispatch -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs the title's containers on disk"]
+    fn emulated_mesh_dispatch_closes() {
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt().with_test_writer().finish(),
+        );
+        let dir =
+            std::env::var("VICTORY_CONTAINER_DIR").unwrap_or_else(|_| r"E:\Temp\opencode".into());
+        let ms = std::fs::read(format!(r"{dir}\d4111a6e6ea49d91.cdxil")).expect("mesh container");
+        let ps = std::fs::read(format!(r"{dir}\c0a7fe77b1862e10.cdxil")).expect("pixel container");
+        // The stream layout Grand Theft Auto VI builds: mesh then pixel.
+        let mut stream = vec![0u8; 0x2b0];
+        let mut put = |at: usize, v: u64| stream[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        for (at, kind) in [
+            (0x10, 24),
+            (0x28, 2),
+            (0x40, 3),
+            (0x58, 4),
+            (0x70, 5),
+            (0x88, 8),
+            (0x1d8, 9),
+            (0x1e0, 10),
+            (0x210, 21),
+            (0x250, 17),
+            (0x260, 12),
+            (0x278, 14),
+            (0x280, 15),
+            (0x2a8, 16),
+        ] {
+            put(at, kind);
+        }
+        put(0x18, ms.as_ptr() as u64);
+        put(0x20, ms.len() as u64);
+        put(0x30, ps.as_ptr() as u64);
+        put(0x38, ps.len() as u64);
+        put(0x278, 14 | 3 << 32); // triangles
+        put(0x280, 15 | 28 << 32); // one R8G8B8A8 target
+        put(0x2a0, 1 << 32);
+        // Valid blend, sample mask, rasterizer, and sample description, so
+        // the state the stream leaves is one the host accepts.
+        put(0x254, 1); // one sample per pixel
+        put(0x8c, 0); // alpha-to-coverage off
+        put(0x90, 0); // target 0: no blending
+        put(0xb8, 0xf); // target 0: write all channels
+        put(0x1dc, u32::MAX as u64); // sample mask
+        put(0x1e4, 3 | 1 << 32); // solid fill, cull none
+        put(0x1fc, 1); // depth clip
+        let desc = StreamDesc {
+            size: stream.len(),
+            stream: stream.as_ptr(),
+        };
+        let mut p: This = std::ptr::null();
+        assert_eq!(
+            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
+        let host = crate::host::host().expect("host");
+        let (translated, _) =
+            crate::shader_cache::host_shader(&ms, victory_shader::emit::MeshMode::Emulate);
+        match translated {
+            Ok(s) => println!(
+                "translate ok: dxil {} B, mesh_emu {}",
+                s.dxil.len(),
+                s.mesh_emu.is_some()
+            ),
+            Err(e) => panic!("translate failed: {e}"),
+        }
+        let list = host.new_list().expect("list");
+        let mut st = crate::draw::State::default();
+        st.reset(p);
+        st.set_topology(&list, 5);
+        // The first dispatch starts the pipeline's worker and is dropped.
+        st.dispatch_mesh(&list, 128);
+        let mut waited = 0;
+        while !p.is_null() && crate::pipeline::host_pipeline(p).is_none() {
+            assert!(waited < 600, "host pipeline never made");
+            waited += 1;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let ready = crate::pipeline::host_pipeline(p).expect("host pipeline");
+        assert!(
+            ready.mesh_emu.is_some(),
+            "the host did not emulate mesh shaders"
+        );
+        st.dispatch_mesh(&list, 128);
+        st.dispatch_mesh(&list, 300);
+        // The world's mesh dispatches run indirectly: records of (x, y, z)
+        // groups in title memory, with and without a count buffer.
+        let mut records = [0u32; 12];
+        records[0..3].copy_from_slice(&[100, 1, 1]);
+        records[3..6].copy_from_slice(&[0, 1, 1]);
+        records[6..9].copy_from_slice(&[7, 1, 1]);
+        let arguments = records.as_ptr() as u64;
+        let counted = [2u32; 1];
+        println!("indirect without count");
+        assert!(st.execute_indirect(&list, (10, 12, 3), arguments, None));
+        println!("indirect with count");
+        assert!(st.execute_indirect(&list, (10, 12, 3), arguments, Some(counted.as_ptr() as u64)));
+        println!("closing the list");
+        list.close();
+        println!("closed");
+        // A second close is a no-op now: the title's error paths close a
+        // sealed list again, which used to end the run as an invalid command.
+        println!("closing again");
+        list.close();
+        println!("closed again");
+        host.execute(&[&list]);
+        println!("executed");
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
@@ -815,10 +957,16 @@ mod tests {
             element[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
         }
         let mut stream = vec![0u8; 0x2b0];
-        let put = |s: &mut Vec<u8>, at: usize, v: u64| {
-            s[at..at + 8].copy_from_slice(&v.to_le_bytes())
-        };
-        let kinds = [(0x10, 1), (0x28, 2), (0x40, 3), (0x58, 4), (0x70, 5), (0x88, 8)];
+        let put =
+            |s: &mut Vec<u8>, at: usize, v: u64| s[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        let kinds = [
+            (0x10, 1),
+            (0x28, 2),
+            (0x40, 3),
+            (0x58, 4),
+            (0x70, 5),
+            (0x88, 8),
+        ];
         for (at, kind) in kinds.into_iter().chain([(0x210, 21), (0x250, 17)]) {
             put(&mut stream, at, kind);
         }
@@ -842,7 +990,10 @@ mod tests {
             stream: stream.as_ptr(),
         };
         let mut p = std::ptr::null();
-        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert_eq!(
+            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
         // SAFETY: the stream points at live code and elements.
         let pre = unsafe { Prebuild::graphics(&stream) };
         let title = pipeline(p);

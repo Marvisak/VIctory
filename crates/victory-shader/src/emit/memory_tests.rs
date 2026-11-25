@@ -179,6 +179,7 @@ fn program() -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        emulate_mesh: false,
         view_marks: false,
     })
     .expect("lower");
@@ -198,6 +199,7 @@ fn program() -> HostShader {
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        mesh_emu: None,
         view_marks: l.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -405,6 +407,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        emulate_mesh: false,
         view_marks: false,
     })
     .expect("lower");
@@ -430,6 +433,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        mesh_emu: None,
         view_marks: l.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -547,6 +551,7 @@ fn writes_through_views_mark_their_pages() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        emulate_mesh: false,
         view_marks: true,
     })
     .expect("lower");
@@ -565,6 +570,7 @@ fn writes_through_views_mark_their_pages() {
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        mesh_emu: None,
         view_marks: l.view_marks,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

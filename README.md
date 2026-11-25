@@ -49,8 +49,8 @@ What each part does today and what it still needs:
 ## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+shader model 6.6 (hardware mesh shaders or SM 6.6 compute + vertex fallback),
+Rust (pinned in `rust-toolchain.toml`).
 
 To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
 the installer from https://rustup.rs). The first `cargo` command in this
@@ -189,6 +189,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
 | `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_MESH_EMULATION=1\|0` | forces compute (`cs_6_6`) + unpack vertex (`vs_6_6`) mesh shader emulation (`1`) or disables the automatic fallback on GPUs without hardware mesh shaders (`0`) |
+| `VICTORY_MESH_BUFFER_MB=<n>` | size in MiB (`1..=1024`, default `128` with fallback down to `16`) of the intermediate buffer for emulated mesh shaders |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 

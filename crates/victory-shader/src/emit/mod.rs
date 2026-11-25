@@ -193,6 +193,7 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod mesh_emu;
 mod rect;
 pub use rect::rectangle_gs;
 #[cfg(all(test, windows))]
@@ -217,10 +218,12 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+pub use mesh_emu::{INDIRECT_SLOT_MAP_FLAG, MeshEmu, MeshMode, MeshOutput, unpack_vertex_shader};
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, MESH_EMU_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE,
+    SAMPLER_SPACE, USER_DATA_SPACE, VIEW_MARK_NONE, VIEW_MARKS, VIEW_STRIDES, VIEW_WRITE_BITS,
+    VIEW_WRITES,
 };
 
 /// The loop limit without an override: 2^20.
@@ -302,6 +305,9 @@ pub struct HostShader {
     /// Whether some of those are unordered access views: it may write
     /// through any of the heap's.
     pub heap_writes: bool,
+    /// Populated when a mesh program (`HwStage::Ms`) was translated in
+    /// [`MeshMode::Emulate`] mode as a `cs_6_6` compute shader.
+    pub mesh_emu: Option<MeshEmu>,
     /// Whether it marks the pages it writes through buffer views: the host
     /// binds the view-mark table `t`[`VIEW_MARKS`] and the bitmap
     /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
@@ -357,10 +363,13 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// How mesh programs (`HwStage::Ms`) are translated (`MeshMode::Native`
+    /// or `MeshMode::Emulate`).
+    pub mesh: MeshMode,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container, without write marks.
+/// shader container with native mesh output and without write marks.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     translate_with(container, Options::default())
 }
@@ -393,7 +402,8 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     emit_with(&c, &native, &p, &st, &io, &res, options)
 }
 
-/// Emits a program whose earlier stages already ran, without write marks.
+/// Emits a program whose earlier stages already ran, with native mesh output
+/// and without write marks.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -480,6 +490,7 @@ pub fn emit_with(
         outputs: outputs.clone(),
         prims: prims.clone(),
         mesh_stride,
+        emulate_mesh: native.stage == HwStage::Ms && options.mesh == MeshMode::Emulate,
         view_marks: options.view_marks,
     };
     let l = match lower::lower(&parts(st, res)) {
@@ -518,6 +529,7 @@ pub fn emit_with(
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
+        mesh_emu: l.mesh_emu,
         view_marks: l.view_marks,
     })
 }
@@ -877,6 +889,7 @@ mod tests {
             view_addresses: false,
             heap: false,
             heap_writes: false,
+            mesh_emu: None,
             view_marks: false,
         };
         let file = |var: &str, stage| {
@@ -894,6 +907,7 @@ mod tests {
                 view_addresses: false,
                 heap: false,
                 heap_writes: false,
+                mesh_emu: None,
                 view_marks: false,
             })
         };

@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, MeshEmu, MeshMode, MeshOutput, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -80,14 +80,23 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
 }
 
 /// The translation of a console shader container, from the cache when
-/// there is one, and whether it came from there.
-pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+/// there is one, and whether it came from there. Mesh programs translate
+/// in `mesh` mode, which has entries of its own.
+pub fn host_shader(container: &[u8], mesh: MeshMode) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let options = victory_shader::emit::Options {
+        view_marks: true,
+        mesh,
+    };
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let id = match mesh {
+        MeshMode::Native => "shader.dxil",
+        MeshMode::Emulate => "shader.dxil.mesh-emu",
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, build(), id, container, translate),
         None => (translate(container), false),
     }
 }
@@ -95,13 +104,14 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
 /// The cache entry's converter: the build and the container in, the
 /// encoded translation (or refusal) out. `ran` tells a miss from a hit.
 struct Translate<F> {
+    id: &'static str,
     translate: F,
     ran: AtomicBool,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
     fn id(&self) -> &'static str {
-        "shader.dxil"
+        self.id
     }
     fn version(&self) -> u32 {
         // The build fingerprint in the input does the versioning.
@@ -116,11 +126,13 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
+    id: &'static str,
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> (Result<HostShader, String>, bool) {
     let input = [&build[..], container].concat();
     let converter = Translate {
+        id,
         translate,
         ran: AtomicBool::new(false),
     };
@@ -150,7 +162,7 @@ fn cached(
     ((converter.translate)(container), false)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 /// A container that does not translate: the reason follows.
 const REFUSED: &[u8; 4] = b"VSHE";
 const STAGES: [HwStage; 8] = [
@@ -211,6 +223,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         view_addresses,
         heap,
         heap_writes,
+        mesh_emu,
         view_marks,
     } = s;
     let mut out = MAGIC.to_vec();
@@ -263,6 +276,44 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap_writes) << 4
             | u32::from(*view_marks) << 5,
     );
+    let encode_outputs = |out: &mut Vec<u8>, items: &[MeshOutput]| {
+        word(out, items.len() as u32);
+        for o in items {
+            let name = o.name.as_bytes();
+            word(out, name.len() as u32);
+            out.extend(name);
+            for v in [
+                o.index,
+                u32::from(o.kind),
+                u32::from(o.comp),
+                u32::from(o.interp),
+                o.row.unwrap_or(u32::MAX),
+                u32::from(o.col),
+                u32::from(o.cols),
+                o.dword_offset,
+            ] {
+                word(out, v);
+            }
+        }
+    };
+    match mesh_emu {
+        None => word(&mut out, 0),
+        Some(m) => {
+            word(&mut out, 1);
+            for v in [
+                m.threads,
+                m.max_vertices,
+                m.max_primitives,
+                m.vertex_dwords,
+                m.prim_dwords,
+                u32::from(m.reads_group_id),
+            ] {
+                word(&mut out, v);
+            }
+            encode_outputs(&mut out, &m.vertex_outputs);
+            encode_outputs(&mut out, &m.prim_outputs);
+        }
+    }
     out
 }
 
@@ -280,6 +331,36 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         fn list(&mut self) -> Option<Vec<u8>> {
             let n = self.word()? as usize;
             Some(self.take(n)?.to_vec())
+        }
+        fn outputs(&mut self) -> Option<Vec<MeshOutput>> {
+            let n = self.word()? as usize;
+            let mut out = Vec::with_capacity(n.min(256));
+            for _ in 0..n {
+                let name = String::from_utf8(self.list()?).ok()?;
+                let index = self.word()?;
+                let kind = u8::try_from(self.word()?).ok()?;
+                let comp = u8::try_from(self.word()?).ok()?;
+                let interp = u8::try_from(self.word()?).ok()?;
+                let row = match self.word()? {
+                    u32::MAX => None,
+                    r => Some(r),
+                };
+                let col = u8::try_from(self.word()?).ok()?;
+                let cols = u8::try_from(self.word()?).ok()?;
+                let dword_offset = self.word()?;
+                out.push(MeshOutput {
+                    name,
+                    index,
+                    kind,
+                    comp,
+                    interp,
+                    row,
+                    col,
+                    cols,
+                    dword_offset,
+                });
+            }
+            Some(out)
         }
     }
     if let Some(reason) = bytes.strip_prefix(REFUSED) {
@@ -324,6 +405,24 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let memory = r.word()?;
+    let mesh_emu = match r.word()? {
+        0 => None,
+        1 => Some(MeshEmu {
+            threads: r.word()?,
+            max_vertices: r.word()?,
+            max_primitives: r.word()?,
+            vertex_dwords: r.word()?,
+            prim_dwords: r.word()?,
+            reads_group_id: match r.word()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
+            vertex_outputs: r.outputs()?,
+            prim_outputs: r.outputs()?,
+        }),
+        _ => return None,
+    };
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
         dxil,
@@ -338,6 +437,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         view_addresses: memory & 4 != 0,
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
+        mesh_emu,
         view_marks: memory & 32 != 0,
     }))
 }
@@ -371,7 +471,70 @@ mod tests {
             view_addresses: true,
             heap: true,
             heap_writes: true,
+            mesh_emu: None,
             view_marks: true,
+        }
+    }
+
+    fn mesh_emu_shader() -> HostShader {
+        HostShader {
+            stage: HwStage::Ms,
+            dxil: b"DXBC emulated mesh cs".to_vec(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
+            heap: false,
+            heap_writes: false,
+            view_marks: false,
+            mesh_emu: Some(MeshEmu {
+                threads: 64,
+                max_vertices: 32,
+                max_primitives: 16,
+                vertex_dwords: 8,
+                prim_dwords: 4,
+                reads_group_id: true,
+                vertex_outputs: vec![
+                    MeshOutput {
+                        name: "SV_Position".into(),
+                        index: 0,
+                        kind: 3,
+                        comp: 9,
+                        interp: 4,
+                        row: None,
+                        col: 0,
+                        cols: 4,
+                        dword_offset: 0,
+                    },
+                    MeshOutput {
+                        name: "COLOR".into(),
+                        index: 0,
+                        kind: 0,
+                        comp: 9,
+                        interp: 2,
+                        row: Some(0),
+                        col: 0,
+                        cols: 4,
+                        dword_offset: 4,
+                    },
+                ],
+                prim_outputs: vec![MeshOutput {
+                    name: "PRIMID".into(),
+                    index: 0,
+                    kind: 0,
+                    comp: 5,
+                    interp: 1,
+                    row: Some(1),
+                    col: 0,
+                    cols: 1,
+                    dword_offset: 0,
+                }],
+            }),
         }
     }
 
@@ -387,33 +550,51 @@ mod tests {
             Ok(shader())
         };
         assert_eq!(
-            cached(&cache, &build, container, translate),
+            cached(&cache, &build, "shader.dxil", container, translate),
             (Ok(shader()), false)
         );
         assert_eq!(
-            cached(&cache, &build, container, translate),
+            cached(&cache, &build, "shader.dxil", container, translate),
             (Ok(shader()), true)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
+        // Another converter id (the mesh-emu one) caches separately.
+        let emu_runs = AtomicU64::new(0);
+        let emu_translate = |_: &[u8]| {
+            emu_runs.fetch_add(1, Ordering::Relaxed);
+            Ok(mesh_emu_shader())
+        };
+        assert_eq!(
+            cached(
+                &cache,
+                &build,
+                "shader.dxil.mesh-emu",
+                container,
+                emu_translate
+            ),
+            (Ok(mesh_emu_shader()), false)
+        );
+        assert_eq!(emu_runs.load(Ordering::Relaxed), 1);
+
         // Another build translates again.
         assert_eq!(
-            cached(&cache, &[8; 32], container, translate).0,
+            cached(&cache, &[8; 32], "shader.dxil", container, translate).0,
             Ok(shader())
         );
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(
-            cached(&cache, &build, container, translate),
+            cached(&cache, &build, "shader.dxil", container, translate),
             (Ok(shader()), false)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
         assert_eq!(
-            cached(&cache, &build, container, translate),
+            cached(&cache, &build, "shader.dxil", container, translate),
             (Ok(shader()), true)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -425,8 +606,14 @@ mod tests {
             Err::<HostShader, _>("unsupported".to_owned())
         };
         let refused = (Err("unsupported".to_owned()), false);
-        assert_eq!(cached(&cache, &build, b"other", fail), refused);
-        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0, true));
+        assert_eq!(
+            cached(&cache, &build, "shader.dxil", b"other", fail),
+            refused
+        );
+        assert_eq!(
+            cached(&cache, &build, "shader.dxil", b"other", fail),
+            (refused.0, true)
+        );
         assert_eq!(fails.load(Ordering::Relaxed), 1);
     }
 
@@ -470,13 +657,90 @@ mod tests {
 
     #[test]
     fn entries_round_trip_and_reject_damage() {
-        let bytes = encode(&Ok(shader()));
-        assert_eq!(decode(&bytes), Some(Ok(shader())));
-        assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
-        assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
-        assert_eq!(decode(b"VSH0"), None);
+        for s in [shader(), mesh_emu_shader()] {
+            let bytes = encode(&Ok(s.clone()));
+            assert_eq!(decode(&bytes), Some(Ok(s)));
+            assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
+            assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
+        }
+        assert_eq!(decode(b"VSH1"), None);
         let refusal = Err("GFX10 code at 0x10: x is not supported".to_owned());
         assert_eq!(decode(&encode(&refusal)), Some(refusal));
         assert_eq!(decode(&[b"VSHE".as_slice(), &[0xff]].concat()), None);
+    }
+
+    /// A local debugging aid: dumps the bindings of the mesh (emulated)
+    /// entries in a real run's cache, so the draw path's root parameters can
+    /// be checked against what the title's shaders actually read. Run with
+    /// `cargo test -p victory-gpu dump_cached_mesh -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs a local run's shader cache"]
+    fn dump_cached_mesh_entries() {
+        let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+            return;
+        };
+        let dir = std::path::Path::new(&local).join("victory").join("cache");
+        let entries = walk(&dir);
+        let mut mesh = 0;
+        for e in &entries {
+            let Ok(bytes) = std::fs::read(e) else {
+                continue;
+            };
+            let Some(Ok(s)) = decode(&bytes) else {
+                continue;
+            };
+            if s.stage != HwStage::Ms {
+                continue;
+            }
+            mesh += 1;
+            println!(
+                "=== {} ({}) mesh_emu: {}",
+                e.display(),
+                s.dxil.len(),
+                s.mesh_emu.is_some()
+            );
+            println!(
+                "user_data ({}): {:?}",
+                s.user_data.len(),
+                s.user_data
+                    .iter()
+                    .map(|u| format!("dword {} slot {} {:?}+{}", u.index, u.slot, u.root, u.dword))
+                    .collect::<Vec<_>>()
+            );
+            println!("root_cbvs {:?} root_srvs {:?}", s.root_cbvs, s.root_srvs);
+            println!(
+                "samplers {} static {}",
+                s.samplers.len(),
+                s.static_samplers.len()
+            );
+            if let Some(m) = &s.mesh_emu {
+                println!(
+                    "mesh_emu: threads {} verts {} prims {} vert_dwords {} prim_dwords {} \
+                     reads_group_id {} group_bytes {}",
+                    m.threads,
+                    m.max_vertices,
+                    m.max_primitives,
+                    m.vertex_dwords,
+                    m.prim_dwords,
+                    m.reads_group_id,
+                    m.group_bytes()
+                );
+                println!(
+                    "vertex outputs: {:?}",
+                    m.vertex_outputs
+                        .iter()
+                        .map(|o| format!("{}@{}", o.name, o.dword_offset))
+                        .collect::<Vec<_>>()
+                );
+                println!(
+                    "prim outputs: {:?}",
+                    m.prim_outputs
+                        .iter()
+                        .map(|o| format!("{}@{}", o.name, o.dword_offset))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        println!("mesh entries: {mesh} of {}", entries.len());
     }
 }

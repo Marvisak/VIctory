@@ -184,12 +184,16 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
 fn tag(blob: &[u8]) -> String {
     let limit = victory_shader::emit::loop_limit().to_le_bytes();
     let translator = victory_shader::SOURCE_HASH.as_bytes();
+    let mesh_emu = [u8::from(
+        crate::host::host().is_some_and(crate::host::Host::emulate_mesh_shaders),
+    )];
     let mut h = blake3::Hasher::new();
     for part in [
         blob,
         translator,
         include_bytes!("../shader_cache.rs"),
         &limit,
+        &mesh_emu[..],
         include_bytes!("host.rs"),
         include_bytes!("library.rs"),
     ] {

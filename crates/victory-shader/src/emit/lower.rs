@@ -53,6 +53,7 @@ pub(crate) struct Lowered {
     pub view_marks: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    pub mesh_emu: Option<super::MeshEmu>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -75,6 +76,7 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    pub emulate_mesh: bool,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
 }
@@ -168,6 +170,43 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+struct MeshEmuVals {
+    uav: V,
+    local_group: V,
+    group_base: V,
+    flat_lt_verts: Option<V>,
+    flat_lt_prims: Option<V>,
+    index_bytes: u32,
+    vertex_stride_bytes: u32,
+    prim_offset_bytes: u32,
+    prim_stride_bytes: u32,
+}
+
+struct MeshEmuState {
+    threads: u32,
+    max_vertices: u32,
+    max_primitives: u32,
+    topology: u8,
+    vertex_sigs: Vec<SigElement>,
+    vertex_offsets: Vec<u32>,
+    vertex_dwords: u32,
+    prim_sigs: Vec<SigElement>,
+    prim_offsets: Vec<u32>,
+    prim_dwords: u32,
+    reads_group_id: bool,
+    vals: Option<MeshEmuVals>,
+}
+
+fn pack_offsets(sigs: &[SigElement]) -> (Vec<u32>, u32) {
+    let mut offsets = Vec::with_capacity(sigs.len());
+    let mut next = 0u32;
+    for e in sigs {
+        offsets.push(next);
+        next += u32::from(e.cols);
+    }
+    (offsets, next)
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -258,6 +297,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Mesh shader lowered to compute + buffer output when emulating.
+    mesh_emu: Option<MeshEmuState>,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
@@ -484,7 +525,11 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
-        let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
+        let root_memory = x
+            .res
+            .scalar
+            .iter()
+            .any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
         if let StageIo::Cs(cs) = x.native.io {
@@ -532,15 +577,38 @@ impl<'a> Lower<'a> {
             }
         }
         let mut no_barrier = HashSet::new();
+        let mut mesh_emu = None;
         if let StageIo::Ms(ms) = &x.native.io {
-            s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
-            s.mesh = Some(super::shader::Mesh {
-                max_vertices: ms.max_vertices,
-                max_primitives: ms.max_primitives,
-                topology: ms.topology,
-            });
+            if x.emulate_mesh {
+                s.inputs.clear();
+                s.outputs.clear();
+                s.prims.clear();
+                let (vertex_offsets, vertex_dwords) = pack_offsets(&x.outputs);
+                let (prim_offsets, prim_dwords) = pack_offsets(&x.prims);
+                mesh_emu = Some(MeshEmuState {
+                    threads: ms.threads,
+                    max_vertices: ms.max_vertices,
+                    max_primitives: ms.max_primitives,
+                    topology: ms.topology,
+                    vertex_sigs: x.outputs.clone(),
+                    vertex_offsets,
+                    vertex_dwords,
+                    prim_sigs: x.prims.clone(),
+                    prim_offsets,
+                    prim_dwords,
+                    reads_group_id: false,
+                    vals: None,
+                });
+            } else {
+                s.prims = x.prims.clone();
+                s.mesh = Some(super::shader::Mesh {
+                    max_vertices: ms.max_vertices,
+                    max_primitives: ms.max_primitives,
+                    topology: ms.topology,
+                });
+            }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -648,6 +716,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            mesh_emu,
             round16: round16(p),
             mode16: Some(0),
         }
@@ -945,8 +1014,14 @@ impl<'a> Lower<'a> {
             args.resize(3 + 4, iu);
             args.push(self.s.m.i8((1u8 << n) - 1));
             args.push(self.s.m.i32(4));
-            self.s
-                .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+            self.s.op(
+                self.cur,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                void,
+                140,
+                &args,
+            );
             self.mark_view_write(h, off, 4 * u32::from(n), None);
             self.end_guarded(at, &[]);
             return Ok(());
@@ -1230,6 +1305,20 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
+        self.cur = self.s.entry;
+        self.find_sections();
+        if self.mesh_emu.is_some() {
+            self.mesh_emu_init().map_err(|w| unsupported(0, w))?;
+        }
+        self.inputs()?;
+        if let Some(mesh) = self.s.mesh {
+            self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
+        } else if self.mesh_emu.is_some() {
+            self.mesh_emu_prologue();
+        }
+        if self.cur != self.s.entry {
+            self.block[order[0]] = Some(self.cur);
+        }
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
             let header = p.blocks[b]
@@ -1241,13 +1330,6 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
             }
-        }
-        self.cur = self.s.entry;
-        self.find_sections();
-        self.inputs()?;
-        if let Some(mesh) = self.s.mesh {
-            self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
-            self.block[order[0]] = Some(self.cur);
         }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
@@ -1314,6 +1396,34 @@ impl<'a> Lower<'a> {
         let memory_writes = self.s.memory_dirty.is_some();
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
+        let mesh_emu = self.mesh_emu.take().map(|m| {
+            let to_outputs = |sigs: Vec<SigElement>, offsets: Vec<u32>| {
+                sigs.into_iter()
+                    .zip(offsets)
+                    .map(|(s, dword_offset)| super::MeshOutput {
+                        name: s.name,
+                        index: s.index,
+                        kind: s.kind,
+                        comp: s.comp,
+                        interp: s.interp,
+                        row: s.row,
+                        col: s.col,
+                        cols: s.cols,
+                        dword_offset,
+                    })
+                    .collect()
+            };
+            super::MeshEmu {
+                threads: m.threads,
+                max_vertices: m.max_vertices,
+                max_primitives: m.max_primitives,
+                vertex_dwords: m.vertex_dwords,
+                prim_dwords: m.prim_dwords,
+                reads_group_id: m.reads_group_id,
+                vertex_outputs: to_outputs(m.vertex_sigs, m.vertex_offsets),
+                prim_outputs: to_outputs(m.prim_sigs, m.prim_offsets),
+            }
+        });
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -1324,6 +1434,7 @@ impl<'a> Lower<'a> {
             view_addresses,
             heap: self.heap[0],
             heap_writes: self.heap[1],
+            mesh_emu,
             view_marks: self.s.view_writes.is_some(),
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
@@ -1410,6 +1521,57 @@ impl<'a> Lower<'a> {
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
+                if let Some(m) = self.mesh_emu.as_mut() {
+                    m.reads_group_id = true;
+                    let local_group = m.vals.as_ref().expect("mesh emu init").local_group;
+                    let cbv = self.s.emu_cbv_handle();
+                    let srv = self.s.emu_srv_handle();
+                    let c = self.cur;
+                    let i32t = self.s.t.i32;
+                    let k0 = self.s.m.i32(0);
+                    let base_ret = self.s.op(
+                        c,
+                        "cbufferLoadLegacy.i32",
+                        Attr::ReadOnly,
+                        self.s.t.cbuf_ret,
+                        59,
+                        &[cbv, k0],
+                    );
+                    let base = self.s.m.extract(c, base_ret, 0);
+                    let flag = self.s.m.i32(super::INDIRECT_SLOT_MAP_FLAG);
+                    let is_map = self.s.m.cmp(c, pred::EQ, base, flag);
+                    let map_bb = self.s.m.new_block();
+                    let add_bb = self.s.m.new_block();
+                    let join_bb = self.s.m.new_block();
+                    self.s.m.terminate(c, Term::CondBr(is_map, map_bb, add_bb));
+
+                    let k2 = self.s.m.i32(2);
+                    let off = self.s.m.bin(map_bb, Bin::Shl, local_group, k2);
+                    let undef = self.s.m.undef(i32t);
+                    let mask1 = self.s.m.i8(1);
+                    let align4 = self.s.m.i32(4);
+                    let r = self.s.op(
+                        map_bb,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[srv, off, undef, mask1, align4],
+                    );
+                    let f = self.s.m.extract(map_bb, r, 0);
+                    let g_map = self.s.m.cast(map_bb, Cast::Bitcast, f, i32t);
+                    self.s.m.terminate(map_bb, Term::Br(join_bb));
+
+                    let g_add = self.s.m.bin(add_bb, Bin::Add, local_group, base);
+                    self.s.m.terminate(add_bb, Term::Br(join_bb));
+
+                    let g = self.s.m.phi(join_bb, i32t);
+                    self.s.m.set_phi(g, vec![(g_map, map_bb), (g_add, add_bb)]);
+                    let n = self.s.m.i32(self.x.mesh_stride);
+                    let res = self.s.m.bin(join_bb, Bin::Mul, g, n);
+                    self.cur = join_bb;
+                    return Val::I32(res);
+                }
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
                 };
@@ -1618,7 +1780,11 @@ impl<'a> Lower<'a> {
             index,
             slot: rp.slot,
             root: RootType::Descriptor,
-            dword: if uav { super::ROOT_UAV_VIEW } else { super::ROOT_SRV_VIEW },
+            dword: if uav {
+                super::ROOT_UAV_VIEW
+            } else {
+                super::ROOT_SRV_VIEW
+            },
         });
         let props = if uav { (11 | 0x1000, 0) } else { (11, 0) };
         let h = self.s.heap_handle(self.s.entry, i, false, false, props);
@@ -1634,7 +1800,9 @@ impl<'a> Lower<'a> {
             return None;
         };
         let rp = *self.x.native.layout.get(address.param)?;
-        let cbv = self.used_kind(src).is_some_and(|u| u.kind == ResourceType::Cbv);
+        let cbv = self
+            .used_kind(src)
+            .is_some_and(|u| u.kind == ResourceType::Cbv);
         if self.root_memory || rp.root != RootType::Descriptor || cbv {
             return None;
         }
@@ -1681,7 +1849,9 @@ impl<'a> Lower<'a> {
             return None;
         };
         let rp = self.x.native.layout.get(address.param)?;
-        let cbv = self.used_kind(src).is_some_and(|u| u.kind == ResourceType::Cbv);
+        let cbv = self
+            .used_kind(src)
+            .is_some_and(|u| u.kind == ResourceType::Cbv);
         if !self.root_memory || rp.root != RootType::Descriptor || cbv {
             return None;
         }
@@ -2714,11 +2884,15 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
+    fn is_mesh(&self) -> bool {
+        self.s.mesh.is_some() || self.mesh_emu.is_some()
+    }
+
     /// Code that depends on the lane layout: wave operations, and in compute
     /// the console's wave size (lanes are thread ids in group order there).
     /// Pixel lanes match only within a quad.
     fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
-        if self.s.mesh.is_some() {
+        if self.is_mesh() {
             // shortcut: no wave size for mesh shaders in SM 6.6, so host
             // lanes cannot follow the console's; emulate through group-shared
             // memory if mesh programs turn out to need these.
@@ -2817,6 +2991,111 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    fn mesh_emu_init(&mut self) -> Result<(), Why> {
+        let (threads, raw_verts, raw_prims, topology, vertex_dwords, prim_dwords) = {
+            let m = self.mesh_emu.as_ref().expect("mesh emu");
+            (
+                m.threads,
+                m.max_vertices,
+                m.max_primitives,
+                m.topology,
+                m.vertex_dwords,
+                m.prim_dwords,
+            )
+        };
+        if topology != 2 {
+            return Err("a mesh shader not drawing triangles");
+        }
+        if threads == 0 || threads > 1024 || raw_verts > 256 || raw_prims > 256 {
+            return Err("a mesh shader beyond the host's limits");
+        }
+        let max_vertices = raw_verts.min(threads);
+        let max_primitives = raw_prims.min(threads);
+        if max_vertices == 0 || max_primitives == 0 {
+            return Err("an empty mesh shader output");
+        }
+        let index_bytes = max_primitives * 4;
+        let vertex_stride_bytes = vertex_dwords * 4;
+        let prim_offset_bytes = index_bytes + max_vertices * vertex_stride_bytes;
+        let prim_stride_bytes = prim_dwords * 4;
+        let group_bytes = prim_offset_bytes + max_primitives * prim_stride_bytes;
+
+        let e = self.s.entry;
+        let i32t = self.s.t.i32;
+        let uav = self.s.emu_uav_handle();
+        let k0 = self.s.m.i32(0);
+        let local_group = self.s.op(e, "groupId.i32", Attr::ReadNone, i32t, 94, &[k0]);
+        let flat = self.mesh_thread();
+        let group_stride = self.s.m.i32(group_bytes);
+        let group_base = self.s.m.bin(e, Bin::Mul, local_group, group_stride);
+        let flat_lt_verts = (threads > max_vertices).then(|| {
+            let mv = self.s.m.i32(max_vertices);
+            self.s.m.cmp(e, pred::IULT, flat, mv)
+        });
+        let flat_lt_prims = (threads > max_primitives).then(|| {
+            let mp = self.s.m.i32(max_primitives);
+            self.s.m.cmp(e, pred::IULT, flat, mp)
+        });
+        let m = self.mesh_emu.as_mut().expect("mesh emu");
+        m.max_vertices = max_vertices;
+        m.max_primitives = max_primitives;
+        m.vals = Some(MeshEmuVals {
+            uav,
+            local_group,
+            group_base,
+            flat_lt_verts,
+            flat_lt_prims,
+            index_bytes,
+            vertex_stride_bytes,
+            prim_offset_bytes,
+            prim_stride_bytes,
+        });
+        Ok(())
+    }
+
+    /// Initializes every primitive index word in the group slice as culled
+    /// (`bit 31 = 1`) so unexported slots never draw stale data.
+    fn mesh_emu_prologue(&mut self) {
+        let (uav, group_base, flat_lt_prims) = {
+            let v = self
+                .mesh_emu
+                .as_ref()
+                .expect("mesh emu")
+                .vals
+                .as_ref()
+                .expect("mesh emu init");
+            (v.uav, v.group_base, v.flat_lt_prims)
+        };
+        let flat = self.mesh_thread();
+        let at = self.begin_guarded(flat_lt_prims);
+        let c = self.cur;
+        let k2 = self.s.m.i32(2);
+        let byte_off = self.s.m.bin(c, Bin::Shl, flat, k2);
+        let addr = self.s.m.bin(c, Bin::Add, group_base, byte_off);
+        let undef = self.s.m.undef(self.s.t.i32);
+        let culled = self.s.m.i32(0x8000_0000);
+        let mask1 = self.s.m.i8(1);
+        let align4 = self.s.m.i32(4);
+        let void = self.s.t.void;
+        self.s.op(
+            c,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[uav, addr, undef, culled, undef, undef, undef, mask1, align4],
+        );
+        self.end_guarded(at, &[]);
+    }
+
+    fn combine_guards(&mut self, a: Option<V>, b: Option<V>) -> Option<V> {
+        match (a, b) {
+            (Some(x), Some(y)) => Some(self.s.m.bin(self.cur, Bin::And, x, y)),
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        }
+    }
+
     /// Mesh: the thread's index in the group, which is its vertex and
     /// primitive index.
     fn mesh_thread(&mut self) -> V {
@@ -2842,7 +3121,7 @@ impl<'a> Lower<'a> {
     }
 
     fn lane_index(&mut self) -> V {
-        if self.s.mesh.is_some() {
+        if self.is_mesh() {
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
             let f = self.mesh_thread();
@@ -2978,7 +3257,7 @@ impl<'a> Lower<'a> {
                 || offset & 0x1C == 0x1C && offset & 0x380 == 0 && offset >> 10 & 0x1F < 4;
             // Mesh: host quads are threads 4n..4n+3 of a 1D group, as the
             // console's, so quad-local swizzles read through quad operations.
-            let mesh_quad = self.s.mesh.is_some() && quad;
+            let mesh_quad = self.is_mesh() && quad;
             if !mesh_quad {
                 self.cross_lane(quad)?;
             }
@@ -3855,10 +4134,20 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
-        if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == USER_DATA) {
+        if let Some(a) = self
+            .scalar
+            .get(&site)
+            .copied()
+            .filter(|a| a.param == USER_DATA)
+        {
             return self.user_data_smem(inst, a);
         }
-        if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == MEMORY) {
+        if let Some(a) = self
+            .scalar
+            .get(&site)
+            .copied()
+            .filter(|a| a.param == MEMORY)
+        {
             return self.memory_smem(inst, a);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
@@ -4219,7 +4508,9 @@ impl<'a> Lower<'a> {
         };
         let count = smem_dwords(inst.name()).ok_or("a scalar load from title memory")?;
         let word = |l: &mut Self, k: u8| -> Result<V, Why> {
-            let v = inst.read(Reg::S(base + k)).ok_or("a scalar memory address")?;
+            let v = inst
+                .read(Reg::S(base + k))
+                .ok_or("a scalar memory address")?;
             l.i32_of(v)
         };
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
@@ -4265,7 +4556,11 @@ impl<'a> Lower<'a> {
     /// The dword at byte `at` of raw buffer `h`.
     fn raw_dword(&mut self, h: V, at: V) -> V {
         let c = self.cur;
-        let (u, mask, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1), self.s.m.i32(4));
+        let (u, mask, al) = (
+            self.s.m.undef(self.s.t.i32),
+            self.s.m.i8(1),
+            self.s.m.i32(4),
+        );
         let r = self.s.op(
             c,
             "rawBufferLoad.f32",
@@ -4445,8 +4740,13 @@ impl<'a> Lower<'a> {
         let block = self.raw_dword(map, at);
         let block = self.s.m.select(c, inside, block, zero);
         // Level 2: block b holds 4096 entries of two dwords after level 1.
-        let (k16, k12, mask, k3, first) =
-            (k(self, 16), k(self, 12), k(self, 0xFFF), k(self, 3), k(self, 4096 * 4));
+        let (k16, k12, mask, k3, first) = (
+            k(self, 16),
+            k(self, 12),
+            k(self, 0xFFF),
+            k(self, 3),
+            k(self, 4096 * 4),
+        );
         let page = self.s.m.bin(c, Bin::LShr, lo, k16);
         let page = self.s.m.bin(c, Bin::And, page, mask);
         let entry = self.s.m.bin(c, Bin::Shl, block, k12);
@@ -4490,7 +4790,10 @@ impl<'a> Lower<'a> {
     // computed part is taken as whole descriptors (32-byte multiples).
     fn view_addresses(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
         const OTHER: Why = "a descriptor read only as data";
-        let a = *self.scalar.get(&site).ok_or("a descriptor read only as data")?;
+        let a = *self
+            .scalar
+            .get(&site)
+            .ok_or("a descriptor read only as data")?;
         if !matches!(
             self.x.native.layout.get(a.param).map(|p| p.root),
             Some(RootType::Table | RootType::ResourceHeap)
@@ -4950,9 +5253,7 @@ impl<'a> Lower<'a> {
                 // One of two immediate samplers, chosen by uniform control
                 // flow: what reads it runs with both, the edge taken picks
                 // the result (static samplers cannot be indexed).
-                let [a, b] = &args[..] else {
-                    unreachable!()
-                };
+                let [a, b] = &args[..] else { unreachable!() };
                 let ha = self.handle(site, a, sampler, props)?;
                 let hb = self.handle(site, b, sampler, props)?;
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
@@ -5044,7 +5345,14 @@ impl<'a> Lower<'a> {
         let at = self.s.m.bin(c, Bin::Mul, index, four);
         let table = self.s.root_srv_handle(VIEW_STRIDES);
         let (iu, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1));
-        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, iu, mask, four]);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, at, iu, mask, four],
+        );
         let x = self.s.m.extract(c, r, 0);
         let stride = self.as_int(x);
         let zero = self.s.m.i32(0);
@@ -5263,7 +5571,7 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
-        let mesh_quad = self.s.mesh.is_some() && quad;
+        let mesh_quad = self.is_mesh() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
         }
@@ -7178,7 +7486,7 @@ impl<'a> Lower<'a> {
                         return Err("v_mbcnt of a mask that is no ballot (console lane layout)");
                     }
                     self.s.flags |= flags::WAVE_OPS;
-                } else if self.s.mesh.is_none() {
+                } else if !self.is_mesh() {
                     self.cross_lane(false)?;
                 }
                 let lane = self.lane_index();
@@ -8732,9 +9040,14 @@ impl<'a> Lower<'a> {
         // in dword 1 (bits 16-29) and no record limit (dword 2 is -1): an
         // index is a byte offset into the raw root view.
         let index = match (src, index) {
-            (Source::Built { address, bits, words }, Some(ix))
-                if address.param < self.x.native.layout.len() && !typed =>
-            {
+            (
+                Source::Built {
+                    address,
+                    bits,
+                    words,
+                },
+                Some(ix),
+            ) if address.param < self.x.native.layout.len() && !typed => {
                 if bits >> 30 != 0 || words[0] != u32::MAX {
                     return Err("a root view indexed with swizzling or a record limit");
                 }
@@ -8769,7 +9082,14 @@ impl<'a> Lower<'a> {
                     let a = self.s.m.bin(c, Bin::Add, byte, four);
                     let (mask, al) = (self.s.m.i8(1), self.s.m.i32(4));
                     let u = self.s.m.undef(self.s.t.i32);
-                    let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, a, u, mask, al]);
+                    let r = self.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, a, u, mask, al],
+                    );
                     let x = self.s.m.extract(c, r, 0);
                     let x = self.as_int(x);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
@@ -9123,7 +9443,7 @@ impl<'a> Lower<'a> {
             return Err("a compressed export");
         }
         let guard = self.guard(b, i)?;
-        let mesh = self.s.mesh.is_some();
+        let mesh = self.is_mesh();
         let c = self.cur;
         // A pixel export whose lanes outside its guard the `done` export
         // after it discards: what those lanes write is lost, so it stores in
@@ -9141,6 +9461,9 @@ impl<'a> Lower<'a> {
                 .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
         }
         if mesh && e.target == Target::Primitive {
+            if self.mesh_emu.is_some() {
+                return self.emit_indices_emu(e, guard);
+            }
             return self.emit_indices(e, guard);
         }
         let param_row = |usage: Usage, row: u8| match usage {
@@ -9153,10 +9476,11 @@ impl<'a> Lower<'a> {
         // outputs are elements of `prims`.
         let mut stores = Vec::new();
         let primitive = matches!(e.target, Target::PrimitiveParam { .. });
-        let outputs = if primitive {
-            &self.s.prims
-        } else {
-            &self.s.outputs
+        let outputs = match (&self.mesh_emu, primitive) {
+            (Some(m), true) => &m.prim_sigs,
+            (Some(m), false) => &m.vertex_sigs,
+            (None, true) => &self.s.prims,
+            (None, false) => &self.s.outputs,
         };
         let by_kind = |kind: u8| outputs.iter().position(|o| o.kind == kind);
         // 16-bit vertex outputs: the halves each dword carries, as (output
@@ -9253,7 +9577,13 @@ impl<'a> Lower<'a> {
             }
         }
         fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {
-            if primitive {
+            if let Some(m) = l.mesh_emu.as_mut() {
+                if primitive {
+                    &mut m.prim_sigs
+                } else {
+                    &mut m.vertex_sigs
+                }
+            } else if primitive {
                 &mut l.s.prims
             } else {
                 &mut l.s.outputs
@@ -9264,6 +9594,9 @@ impl<'a> Lower<'a> {
             .any(|s| s.3.is_none() && elements(self, primitive)[s.0].half)
         {
             return Err("a 16-bit output the stage data does not mark");
+        }
+        if self.mesh_emu.is_some() {
+            return self.store_mesh_emu_outputs(guard, primitive, &stores);
         }
         // A mesh lane writes its own vertex or primitive, where it exports.
         let at = if mesh {
@@ -9353,6 +9686,174 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Emulated mesh: `exp prim` writes the packed primitive index word
+    /// (preserving bit 31 as the cull flag) to `u0, space 3`.
+    fn emit_indices_emu(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
+        let v = e.values[0].ok_or("a primitive export without its indices")?;
+        let x = self.i32_of(v)?;
+        let (uav, group_base, flat_lt_prims) = {
+            let v = self
+                .mesh_emu
+                .as_ref()
+                .expect("mesh emu")
+                .vals
+                .as_ref()
+                .expect("mesh emu init");
+            (v.uav, v.group_base, v.flat_lt_prims)
+        };
+        let guard = self.combine_guards(guard, flat_lt_prims);
+        let flat = self.mesh_thread();
+        let at = self.begin_guarded(guard);
+        let c = self.cur;
+        let k2 = self.s.m.i32(2);
+        let byte_off = self.s.m.bin(c, Bin::Shl, flat, k2);
+        let addr = self.s.m.bin(c, Bin::Add, group_base, byte_off);
+        let undef = self.s.m.undef(self.s.t.i32);
+        let mask1 = self.s.m.i8(1);
+        let align4 = self.s.m.i32(4);
+        let void = self.s.t.void;
+        self.s.op(
+            c,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[uav, addr, undef, x, undef, undef, undef, mask1, align4],
+        );
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// Emulated mesh: stores vertex (`primitive == false`) or per-primitive
+    /// (`primitive == true`) exported scalars into `u0, space 3`, coalescing
+    /// contiguous dword slots up to 4 dwords per store.
+    fn store_mesh_emu_outputs(
+        &mut self,
+        guard: Option<V>,
+        primitive: bool,
+        stores: &[(usize, u8, Value, Option<bool>)],
+    ) -> Result<(), Why> {
+        if stores.is_empty() {
+            return Ok(());
+        }
+        let mut items: Vec<(u32, V, Option<bool>)> = Vec::with_capacity(stores.len());
+        for &(id, col, value, half) in stores {
+            let x = self.i32_of(value)?;
+            let slot = {
+                let m = self.mesh_emu.as_mut().expect("mesh emu");
+                let (sigs, offsets) = if primitive {
+                    (&mut m.prim_sigs, &m.prim_offsets)
+                } else {
+                    (&mut m.vertex_sigs, &m.vertex_offsets)
+                };
+                sigs[id].usage |= 1 << col;
+                offsets[id] + u32::from(col)
+            };
+            items.push((slot, x, half));
+        }
+        items.sort_by_key(|&(slot, _, _)| slot);
+        let mut deduped: Vec<(u32, V, Option<bool>)> = Vec::with_capacity(items.len());
+        for item in items {
+            if let Some(last) = deduped.last_mut()
+                && last.0 == item.0
+            {
+                *last = item;
+            } else {
+                deduped.push(item);
+            }
+        }
+        let (uav, group_base, bound_guard, base_offset, stride_bytes) = {
+            let v = self
+                .mesh_emu
+                .as_ref()
+                .expect("mesh emu")
+                .vals
+                .as_ref()
+                .expect("mesh emu init");
+            if primitive {
+                (
+                    v.uav,
+                    v.group_base,
+                    v.flat_lt_prims,
+                    v.prim_offset_bytes,
+                    v.prim_stride_bytes,
+                )
+            } else {
+                (
+                    v.uav,
+                    v.group_base,
+                    v.flat_lt_verts,
+                    v.index_bytes,
+                    v.vertex_stride_bytes,
+                )
+            }
+        };
+        let guard = self.combine_guards(guard, bound_guard);
+        let flat = self.mesh_thread();
+        let at = self.begin_guarded(guard);
+        let c = self.cur;
+        let mut converted = Vec::with_capacity(deduped.len());
+        for (slot, mut x, half) in deduped {
+            if let Some(high) = half {
+                if high {
+                    let k16 = self.s.m.i32(16);
+                    x = self.s.m.bin(c, Bin::LShr, x, k16);
+                }
+                let f32t = self.s.t.f32;
+                let f = self
+                    .s
+                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                x = self.as_int(f);
+            }
+            converted.push((slot, x));
+        }
+        let stride = self.s.m.i32(stride_bytes);
+        let rel = self.s.m.bin(c, Bin::Mul, flat, stride);
+        let off = if base_offset == 0 {
+            rel
+        } else {
+            let base_k = self.s.m.i32(base_offset);
+            self.s.m.bin(c, Bin::Add, base_k, rel)
+        };
+        let rec_base = self.s.m.bin(c, Bin::Add, group_base, off);
+        let undef = self.s.m.undef(self.s.t.i32);
+        let align4 = self.s.m.i32(4);
+        let void = self.s.t.void;
+        let mut idx = 0;
+        while idx < converted.len() {
+            let start_slot = converted[idx].0;
+            let mut len = 1usize;
+            while len < 4
+                && idx + len < converted.len()
+                && converted[idx + len].0 == start_slot + len as u32
+            {
+                len += 1;
+            }
+            let addr = if start_slot == 0 {
+                rec_base
+            } else {
+                let disp = self.s.m.i32(start_slot * 4);
+                self.s.m.bin(c, Bin::Add, rec_base, disp)
+            };
+            let v0 = converted[idx].1;
+            let v1 = if len > 1 { converted[idx + 1].1 } else { undef };
+            let v2 = if len > 2 { converted[idx + 2].1 } else { undef };
+            let v3 = if len > 3 { converted[idx + 3].1 } else { undef };
+            let mask = self.s.m.i8((1u8 << len) - 1);
+            self.s.op(
+                c,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                void,
+                140,
+                &[uav, addr, undef, v0, v1, v2, v3, mask, align4],
+            );
+            idx += len;
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
     /// The per-vertex arbitrary row no mesh output entry names but one
     /// (the 2020 compiler's zeroed entry).
     fn unnamed_row(&self) -> Option<u8> {
@@ -9364,9 +9865,11 @@ impl<'a> Lower<'a> {
                 .iter()
                 .any(|o| o.param & 0x80 == 0 && o.usage != Usage::Other(0) && u32::from(o.row) == r)
         };
-        let free: std::collections::BTreeSet<u32> = self
-            .s
-            .outputs
+        let vertex_sigs = match &self.mesh_emu {
+            Some(m) => &m.vertex_sigs,
+            None => &self.s.outputs,
+        };
+        let free: std::collections::BTreeSet<u32> = vertex_sigs
             .iter()
             .filter(|o| o.kind == 0)
             .filter_map(|o| o.row)
@@ -9858,9 +10361,7 @@ impl<'a> Lower<'a> {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     // No lane from this edge reads it, or no lane comes
                     // along it at all: any value will do.
-                    _ if read
-                        && (self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg)) =>
-                    {
+                    _ if read && (self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg)) => {
                         if bit {
                             self.s.m.bool(false)
                         } else {
@@ -9945,6 +10446,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            emulate_mesh: false,
             view_marks: false,
         })
         .map(|_| ())
@@ -9996,6 +10498,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            emulate_mesh: false,
             view_marks: false,
         })
     }
@@ -10186,6 +10689,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            emulate_mesh: false,
             view_marks: false,
         })
         .unwrap();

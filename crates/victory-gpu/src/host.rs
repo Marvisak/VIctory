@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -70,14 +70,18 @@ unsafe impl Sync for Host {}
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
-static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
-static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+static COPY_BACK: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
@@ -87,6 +91,10 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
+
+/// Host command lists closed a second time (the title's error paths) since
+/// the run started: tolerated as no-ops.
+static DOUBLE_CLOSED: AtomicU64 = AtomicU64::new(0);
 
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
@@ -110,9 +118,9 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
-            None if host.messages.is_none() => text.push_str(
-                "; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command",
-            ),
+            None if host.messages.is_none() => {
+                text.push_str("; a diagnostics build with VICTORY_D3D12_DEBUG=1 names the command")
+            }
             None => {}
         }
     }
@@ -492,6 +500,10 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Whether `Close` has sealed the list (until `reset` reopens it): a
+    /// second close is a no-op, as the console API tolerates from the
+    /// title's error paths, instead of the E_FAIL D3D12 gives.
+    closed: AtomicBool,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -514,10 +526,8 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
-    usize,
-    (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
->;
+type States =
+    std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -681,40 +691,81 @@ struct Deferred {
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshSupport {
+    Native,
+    Emulate,
+    Unsupported,
+}
+
 impl Host {
-    /// Whether the host runs mesh shaders at shader model 6.6 (translated
-    /// mesh shaders need both); logged once.
-    pub(crate) fn mesh_shaders(&self) -> bool {
-        static MESH: OnceLock<bool> = OnceLock::new();
+    fn mesh_support(&self) -> MeshSupport {
+        static MESH: OnceLock<MeshSupport> = OnceLock::new();
         *MESH.get_or_init(|| {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
             let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
             // SAFETY: each query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS7,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .is_ok()
-                    && self
-                        .device
+            let (opt_ok, sm_ok) = unsafe {
+                (
+                    self.device
+                        .CheckFeatureSupport(
+                            D3D12_FEATURE_D3D12_OPTIONS7,
+                            (&raw mut options).cast(),
+                            size_of_val(&options) as u32,
+                        )
+                        .is_ok(),
+                    self.device
                         .CheckFeatureSupport(
                             D3D12_FEATURE_SHADER_MODEL,
                             (&raw mut model).cast(),
                             size_of_val(&model) as u32,
                         )
-                        .is_ok()
+                        .is_ok(),
+                )
             };
-            let mesh = ok
-                && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
-                && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
-            tracing::info!(mesh, "host mesh shader support");
-            mesh
+            let sm66 = sm_ok && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+            let hardware = opt_ok && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+            let override_env = std::env::var("VICTORY_MESH_EMULATION").ok();
+            let mode = match override_env.as_deref().map(str::trim) {
+                Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => {
+                    if sm66 {
+                        MeshSupport::Emulate
+                    } else {
+                        MeshSupport::Unsupported
+                    }
+                }
+                Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => {
+                    if sm66 && hardware {
+                        MeshSupport::Native
+                    } else {
+                        MeshSupport::Unsupported
+                    }
+                }
+                _ => {
+                    if !sm66 {
+                        MeshSupport::Unsupported
+                    } else if hardware {
+                        MeshSupport::Native
+                    } else {
+                        MeshSupport::Emulate
+                    }
+                }
+            };
+            tracing::info!(?mode, sm66, hardware, "host mesh shader support");
+            mode
         })
+    }
+
+    /// Whether the host runs native mesh shaders at shader model 6.6; logged once.
+    pub(crate) fn mesh_shaders(&self) -> bool {
+        self.mesh_support() == MeshSupport::Native
+    }
+
+    /// Whether mesh shaders should be emulated with compute + vertex shaders at SM 6.6.
+    pub(crate) fn emulate_mesh_shaders(&self) -> bool {
+        self.mesh_support() == MeshSupport::Emulate
     }
 
     /// Whether the host runs 64-bit atomics on typed resources in the
@@ -787,6 +838,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
+                closed: AtomicBool::new(false),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -826,7 +878,8 @@ impl Host {
             })
             .collect();
         #[cfg(feature = "diagnostics")]
-        let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+        let uploading =
+            crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         let uploads = (!heaps.is_empty())
             .then(|| crate::bindless::uploads(&heaps))
             .flatten();
@@ -866,7 +919,8 @@ impl Host {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
-            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
+            let _timed =
+                crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
@@ -875,7 +929,10 @@ impl Host {
         batch.flush();
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
+        crate::copystat::add(
+            crate::copystat::C::FaultsPrep,
+            crate::copystat::page_faults().saturating_sub(faults),
+        );
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
@@ -915,14 +972,25 @@ impl Host {
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                let commands = runs[i]
+                    .notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .len();
+                tracing::warn!(
+                    ms = started.elapsed().as_millis(),
+                    commands,
+                    "slow host list"
+                );
                 for (ms, op) in runs[i].slowest(frequency, 6) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
             // SAFETY: a plain query.
-            if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            let removed = groups.len() > 1
+                && removed_in.is_none()
+                && unsafe { self.device.GetDeviceRemovedReason() }.is_err();
+            if removed {
                 removed_in = Some(i);
             }
             let _ = (i, started);
@@ -935,9 +1003,19 @@ impl Host {
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
                 .iter()
-                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .flat_map(|l| {
+                    l.pipelines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                })
                 .collect();
-            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
+            tracing::warn!(
+                ms = gpu.as_millis(),
+                lists = runs.len(),
+                ?pipelines,
+                "slow host submission"
+            );
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
@@ -958,7 +1036,8 @@ impl Host {
         let faults = crate::copystat::page_faults();
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
-        let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
+        let mut index: std::collections::HashMap<(usize, usize, usize), usize> =
+            std::collections::HashMap::new();
         for list in runs {
             let deferred = list.deferred();
             // Shaders that read memory with no copy computed something else
@@ -1003,7 +1082,10 @@ impl Host {
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
+        crate::copystat::add(
+            crate::copystat::C::FaultsBack,
+            crate::copystat::page_faults().saturating_sub(faults),
+        );
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
@@ -1257,14 +1339,20 @@ impl HostList {
                 let device = &host()?.device;
                 let mut heap: Option<ID3D12QueryHeap> = None;
                 let mut back: Option<ID3D12Resource> = None;
-                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+                let readback = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_READBACK,
+                    ..Default::default()
+                };
                 let desc = D3D12_RESOURCE_DESC {
                     Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
                     Width: u64::from(STAMPS) * 8,
                     Height: 1,
                     DepthOrArraySize: 1,
                     MipLevels: 1,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
                     Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                     ..Default::default()
                 };
@@ -1272,7 +1360,11 @@ impl HostList {
                 unsafe {
                     device
                         .CreateQueryHeap(
-                            &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0 },
+                            &D3D12_QUERY_HEAP_DESC {
+                                Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                                Count: STAMPS,
+                                NodeMask: 0,
+                            },
                             &mut heap,
                         )
                         .ok()?;
@@ -1301,7 +1393,10 @@ impl HostList {
             return Vec::new();
         };
         let mut data = std::ptr::null_mut();
-        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        let range = D3D12_RANGE {
+            Begin: 0,
+            End: (count + 1) * 8,
+        };
         // SAFETY: a read-back buffer the finished list resolved into.
         let stamps: Vec<u64> = unsafe {
             if back.Map(0, Some(&range), Some(&mut data)).is_err() {
@@ -1314,7 +1409,10 @@ impl HostList {
         let mut times: Vec<(f64, String)> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                (
+                    ticks as f64 * 1e3 / frequency.max(1) as f64,
+                    notes[i].0.chars().take(300).collect(),
+                )
             })
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -1345,13 +1443,29 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // A second close (the title's error paths close a sealed list again)
+        // is a no-op rather than the E_FAIL D3D12's Close returns for it,
+        // which used to read as an invalid command and end the run.
+        if self.closed.swap(true, Ordering::Relaxed) {
+            static SEEN: std::sync::Once = std::sync::Once::new();
+            DOUBLE_CLOSED.fetch_add(1, Ordering::Relaxed);
+            SEEN.call_once(|| {
+                tracing::warn!(
+                    closed_twice = DOUBLE_CLOSED.load(Ordering::Relaxed),
+                    "a host command list closed twice; the second close does nothing"
+                );
+            });
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+            let count =
+                (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
             // SAFETY: an open list, our heap and read-back buffer.
             unsafe {
                 self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
-                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+                self.list
+                    .ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
         // SAFETY: our list.
@@ -1366,13 +1480,23 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.closed.store(false, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
-        self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -1414,7 +1538,11 @@ impl HostList {
     /// The list's state for host texture `copy` becomes `wanted` (a legal
     /// one): the state it leaves, if that is a change. Nothing for the
     /// list's first use (its prelude moves the texture there).
-    fn track(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
+    fn track(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -1509,7 +1637,9 @@ impl HostList {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
                 for (depth, to_depth) in &copies {
-                    let Some(Some(twin)) = depth.twin.get() else { continue };
+                    let Some(Some(twin)) = depth.twin.get() else {
+                        continue;
+                    };
                     // From each texture's real state to the copy's and back.
                     let mut back = Vec::new();
                     twin.copy(list, depth, *to_depth, &mut |t, wanted| {
@@ -1521,7 +1651,11 @@ impl HostList {
                                 D3D12_RESOURCE_STATES(wanted as i32),
                                 D3D12_RESOURCE_STATES(real as i32),
                             ));
-                            transition(&t.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(wanted as i32))
+                            transition(
+                                &t.texture,
+                                D3D12_RESOURCE_STATES(real as i32),
+                                D3D12_RESOURCE_STATES(wanted as i32),
+                            )
                         })
                     });
                     if !back.is_empty() {
@@ -1560,7 +1694,9 @@ impl HostList {
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if dred_on() {
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
+            if let Some((heap, _)) = self.stamps()
+                && at < STAMPS - 1
+            {
                 // SAFETY: an open list and our query heap.
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
@@ -1570,7 +1706,8 @@ impl HostList {
             const UNICODE: u32 = 0;
             // SAFETY: an open list; the marker is copied when recorded.
             unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                self.list
+                    .SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
             };
             self.notes
                 .lock()
@@ -1750,9 +1887,9 @@ impl HostList {
             deferred.budget_zeroed = true;
             let at = *data;
             // SAFETY: the list's own mapped word, written before it runs.
-            deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+            deferred.copies.push(Step::Host(Box::new(move || unsafe {
+                (at as *mut u32).write_volatile(0)
+            })));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
@@ -1902,7 +2039,8 @@ struct Batch {
     pending: std::collections::HashMap<usize, usize>,
     /// The range of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    current:
+        std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
@@ -1910,7 +2048,11 @@ struct Batch {
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        if self
+            .current
+            .get(&key)
+            .is_some_and(|&(_, a, b)| a <= address && end <= b)
+        {
             return;
         }
         match self.pending.get(&key) {
@@ -1928,7 +2070,8 @@ impl Batch {
     /// Whether `staging` is still to be refreshed in this submission (and
     /// notes it refreshed).
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
-        self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+        self.textures
+            .insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
     /// Before a step that writes title memory: pending refreshes are done
@@ -2001,7 +2144,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+    crate::copystat::add(
+        crate::copystat::C::MoveUs,
+        moved.elapsed().as_micros() as u64,
+    );
     if whole {
         return;
     }
@@ -2193,7 +2339,10 @@ impl Host {
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
@@ -2360,16 +2509,14 @@ impl Meter {
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
+        let [cpu, gpu] =
+            [0, 1].map(|i| SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
         let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
         });
-        let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-        });
+        let [back_ms, back_mb] =
+            [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
@@ -2386,7 +2533,8 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
-            let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
+            let (textures, bytes, used, shared, saved, replaced) =
+                crate::resource::texture_counts();
             tracing::info!(
                 "host textures: {textures} ({:.0} MB, {:.0} MB of them used by lists), title textures sharing one {shared} (saving {:.0} MB), replacing one {replaced}; \
                  copies between textures of one memory {:.1}/frame, depth twin copies {:.1}/frame",
@@ -2689,6 +2837,57 @@ impl Host {
             }
         }
     }
+
+    /// A default-heap GPU buffer (starting in `UNORDERED_ACCESS` when `flags`
+    /// allows unordered access, else `COMMON`).
+    pub(crate) fn unordered_buffer(
+        &self,
+        size: u64,
+        flags: D3D12_RESOURCE_FLAGS,
+    ) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let state = if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0 {
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        } else {
+            D3D12_RESOURCE_STATE_COMMON
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain default-heap buffer allocation with valid heap and resource descriptions.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                state,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no default buffer");
+                None
+            }
+        }
+    }
 }
 
 /// Host resources that view heap slots stopped viewing while a submission
@@ -2700,7 +2899,10 @@ static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
 /// GPU runs, and a shader that took the old descriptor still reads what it
 /// views.
 pub(crate) fn retire(resource: ID3D12Resource) {
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(resource);
 }
 
 /// After a submission has run, with none running: the retired resources go.
@@ -2718,9 +2920,15 @@ fn traced(what: &str) {
     static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let hashes = HASHES.get_or_init(|| {
         let v = std::env::var("VICTORY_TRACE_SHADERS").unwrap_or_default();
-        v.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_owned).collect()
+        v.split(',')
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_owned)
+            .collect()
     });
-    if hashes.iter().any(|h| what.contains(h.as_str())) && LOGGED.fetch_add(1, Ordering::Relaxed) < 500 {
+    if hashes.iter().any(|h| what.contains(h.as_str()))
+        && LOGGED.fetch_add(1, Ordering::Relaxed) < 500
+    {
         tracing::info!("traced command: {what}");
     }
 }
@@ -2731,7 +2939,10 @@ fn removed_during(runs: &[&HostList], list: Option<usize>) -> String {
     #[cfg(feature = "diagnostics")]
     if let Some(i) = list {
         let notes = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner());
-        let mut text = format!("; removed while list {i} ran alone ({} commands):", notes.len());
+        let mut text = format!(
+            "; removed while list {i} ran alone ({} commands):",
+            notes.len()
+        );
         for (k, (n, _)) in notes.iter().enumerate() {
             text.push_str(&format!(" [{k}] {n}"));
         }
@@ -2751,7 +2962,11 @@ fn last_notes(runs: &[&HostList]) -> String {
         for (i, r) in runs.iter().enumerate() {
             let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
             for (n, _) in notes.iter().rev().take(6).rev() {
-                text.push_str(&format!("; list {i} of {}, of its {}: {n}", runs.len(), notes.len()));
+                text.push_str(&format!(
+                    "; list {i} of {}, of its {}: {n}",
+                    runs.len(),
+                    notes.len()
+                ));
             }
         }
         text
@@ -2782,9 +2997,16 @@ fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
 /// barriers overlaps on the GPU), by kind, and what the markers just
 /// before them say (`HostList::note_op`: diagnostics builds with
 /// device-removed data on).
-fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], done: usize) -> String {
+fn in_flight(
+    history: &[D3D12_AUTO_BREADCRUMB_OP],
+    markers: &[(u32, String)],
+    done: usize,
+) -> String {
     let barrier = |op: &D3D12_AUTO_BREADCRUMB_OP| *op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER;
-    let from = history[..done].iter().rposition(barrier).map_or(0, |b| b + 1);
+    let from = history[..done]
+        .iter()
+        .rposition(barrier)
+        .map_or(0, |b| b + 1);
     let to = history[done..]
         .iter()
         .position(barrier)
@@ -2907,7 +3129,8 @@ fn pump() {
 }
 
 #[cfg(test)]
-mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
+mod batch {
+    // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
 

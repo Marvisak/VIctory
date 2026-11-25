@@ -140,6 +140,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        emulate_mesh: false,
         view_marks: false,
     })?;
 
@@ -157,6 +158,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        mesh_emu: None,
         view_marks: lowered.view_marks,
     };
 
@@ -1225,6 +1227,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        emulate_mesh: false,
         view_marks: false,
     })
     .expect("lower");
@@ -1242,6 +1245,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        mesh_emu: None,
         view_marks: lowered.view_marks,
     };
     if let (true, Ok(mut v)) = (
