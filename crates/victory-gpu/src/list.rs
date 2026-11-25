@@ -1021,6 +1021,11 @@ extern "system" fn clear_rtv(
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
+        // A host texture its format keeps from being a render target is not
+        // cleared (a view of it would remove the device).
+        if !crate::resource::renders(texture) {
+            return;
+        }
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(&texture, record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.

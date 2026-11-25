@@ -3067,6 +3067,8 @@ impl Host {
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
                 .map_err(|e| ("DXGI factory", e))?;
+            // With DLSS the swap chain is Streamline's.
+            let factory = crate::dlss::present_factory(self.device.as_raw(), factory);
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
