@@ -42,6 +42,9 @@ pub(crate) extern "system" fn create(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    if desc.count == 0 {
+        return E_INVALIDARG;
+    }
     tracing::debug!(?desc, "query heap");
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
@@ -95,6 +98,36 @@ mod tests {
             ),
             E_INVALIDARG
         );
+    }
+
+    #[test]
+    fn empty_query_heaps_are_rejected_at_creation() {
+        type Create = extern "system" fn(This, *const Desc, *const Iid, *mut This) -> HRESULT;
+        let dev = crate::device::device();
+        let create = slot::<Create>(dev, 0x138);
+        let mut desc = Desc {
+            kind: 1, // timestamps
+            count: 0,
+            nodes: 0,
+        };
+        let sentinel = std::ptr::dangling();
+        let mut heap = sentinel;
+        let created = create(dev, &desc, &HEAP_IIDS[0], &mut heap);
+        if created == S_OK && heap != sentinel && !heap.is_null() {
+            release(heap);
+        }
+        let probed = create(dev, &desc, &HEAP_IIDS[0], std::ptr::null_mut());
+        assert_eq!(
+            (created, probed, heap == sentinel),
+            (E_INVALIDARG, E_INVALIDARG, true),
+            "a zero-count query heap must be rejected before writing the output"
+        );
+
+        desc.count = 1;
+        heap = std::ptr::null();
+        assert_eq!(create(dev, &desc, &HEAP_IIDS[0], &mut heap), S_OK);
+        assert!(!heap.is_null());
+        assert_eq!(release(heap), 0);
     }
 
     #[test]
