@@ -279,13 +279,19 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The shader hashes `VICTORY_SKIP_PIPELINES` lists.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
+fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
+    HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
-    });
+    })
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    let hashes = skip_hashes();
     if hashes.is_empty() {
         return None;
     }
@@ -293,6 +299,15 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
+}
+
+/// Whether a host pipeline of `shaders` is left unmade: one of them is
+/// listed in `VICTORY_SKIP_PIPELINES`. Its draws and dispatches are skipped
+/// anyway, and making it may be what crashes the host driver's compiler.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn skip_making(shaders: &[Arc<Shader>]) -> bool {
+    let hashes = skip_hashes();
+    !hashes.is_empty() && shaders.iter().any(|shader| hashes.contains(&shader.hash))
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]

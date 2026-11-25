@@ -313,6 +313,10 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        #[cfg(feature = "diagnostics")]
+        if super::skip_making(shaders) {
+            return refuse("a shader VICTORY_SKIP_PIPELINES lists", shaders);
+        }
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),

@@ -222,6 +222,10 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     todo.sort_by_key(|&(later, _)| later);
     let todo: Vec<Job> = todo.into_iter().map(|(_, job)| job).collect();
 
+    // Diagnostics, `VICTORY_PREBUILD_TRACE=1`: each pipeline's shaders on
+    // stderr before it is made, so a driver that crashes compiling one
+    // leaves its name last (alone with `--jobs 1`).
+    let trace = std::env::var_os("VICTORY_PREBUILD_TRACE").is_some_and(|v| v != "0");
     let next = AtomicUsize::new(0);
     let (made0, loaded0) = pipeline::pipeline_counts();
     let counts = || {
@@ -233,6 +237,9 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
             .map(|_| {
                 s.spawn(|| {
                     while let Some(&job) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        if trace {
+                            eprintln!("making {job:?} {}", shaders_of(job));
+                        }
                         if let Err(why) = prepare(job).and_then(|p| p.make()) {
                             skip(why);
                         }

@@ -483,8 +483,20 @@ fn translate(
     t: &mut Tally,
     checks: &mut Checks,
 ) {
-    let example = || format!("{}{}", path.display(), source.label());
-    let Some(bytes) = source.bytes() else {
+    let bytes = source.bytes();
+    let hash = match (only(), &bytes) {
+        (Some(listed), Some(b)) => {
+            let hash = container_hash(b);
+            if !listed.contains(&hash) {
+                return;
+            }
+            format!(" {hash}")
+        }
+        (Some(_), None) => return,
+        (None, _) => String::new(),
+    };
+    let example = || format!("{}{}{hash}", path.display(), source.label());
+    let Some(bytes) = bytes else {
         return t.fail("corrupt record".into(), example);
     };
     t.containers += 1;
@@ -591,6 +603,33 @@ fn translate(
             }
         }
     }
+}
+
+/// Diagnostics, `VICTORY_TRANSLATE_ONLY=<hashes>`: only the containers
+/// listed, by the hash the pre-build's trace and `VICTORY_SKIP_PIPELINES`
+/// name them by, which their labels (and so `VICTORY_EMIT_DUMP`'s file
+/// names) then end with. Every container when unset.
+fn only() -> Option<&'static HashSet<String>> {
+    static ONLY: std::sync::OnceLock<Option<HashSet<String>>> = std::sync::OnceLock::new();
+    ONLY.get_or_init(|| {
+        let list = std::env::var("VICTORY_TRANSLATE_ONLY").ok()?;
+        Some(
+            (list.split(','))
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
+        )
+    })
+    .as_ref()
+}
+
+/// A container's hash as the pre-build names it: the first 16 hex digits
+/// of the BLAKE3 of the container alone (a source can run on past it).
+fn container_hash(bytes: &[u8]) -> String {
+    let size = bytes
+        .get(0x18..0x1c)
+        .map_or(0, |b| u32::from_le_bytes(b.try_into().expect("4")) as usize);
+    blake3::hash(&bytes[..size.min(bytes.len())]).to_hex()[..16].to_owned()
 }
 
 /// Validates an emitted shader if asked to.
