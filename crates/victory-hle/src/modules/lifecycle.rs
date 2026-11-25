@@ -485,6 +485,7 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     if ENDING.swap(true, Ordering::SeqCst) {
         return;
     }
+    super::gameinput::reset_hardware();
     let constrain = constrained().clone();
     let suspend = routines().clone();
     tracing::info!(
