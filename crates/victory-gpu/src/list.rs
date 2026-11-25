@@ -11,6 +11,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::mem::offset_of;
+#[cfg(windows)]
+use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC;
 
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
@@ -944,7 +946,6 @@ extern "system" fn resolve(
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
         };
-        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
@@ -956,10 +957,12 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
-            let format = DXGI_FORMAT(format as i32);
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            let planes = [(&b, src_sub), (&a, dst_sub)];
+            let stencil = is_stencil_plane(format, planes);
+            let host_format = resolve_format(format, planes);
+            if (a.Width, a.Height) == (b.Width, b.Height) && !stencil {
                 list.list
-                    .ResolveSubresource(&to, dst_sub, &from, src_sub, format);
+                    .ResolveSubresource(&to, dst_sub, &from, src_sub, host_format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
                 // The console clips a larger source to the destination.
                 let rect = RECT {
@@ -976,14 +979,72 @@ extern "system" fn resolve(
                     &from,
                     src_sub,
                     Some(&rect),
-                    format,
-                    D3D12_RESOLVE_MODE_AVERAGE,
+                    host_format,
+                    if stencil {
+                        STENCIL_RESOLVE_MODE
+                    } else {
+                        D3D12_RESOLVE_MODE_AVERAGE
+                    },
                 );
             }
         }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
+}
+
+/// How a resolve of the stencil plane combines the samples of a pixel
+/// (format 120, and the stencil subresources of 118). The host refuses the
+/// average for stencil, an integer format; MAX is the rule we chose, NOT the
+/// console's (unknown for pixels whose samples differ; where they agree, any
+/// mode gives their value). At the edge of a drawn shape the samples inside
+/// carry the written value and those outside the one it replaced (usually
+/// the cleared 0): MAX keeps the written value, so a stencil mask is not
+/// eaten at its edges, where MIN would erase them and shrink every mask by
+/// the edge pixels. Change it here.
+#[cfg(windows)]
+const STENCIL_RESOLVE_MODE: windows::Win32::Graphics::Direct3D12::D3D12_RESOLVE_MODE =
+    windows::Win32::Graphics::Direct3D12::D3D12_RESOLVE_MODE_MAX;
+
+/// Whether a resolve in the console's `format` is of the stencil plane:
+/// format 120, or 118 where both subresources are stencil ones.
+#[cfg(windows)]
+fn is_stencil_plane(format: u32, subresources: [(&D3D12_RESOURCE_DESC, u32); 2]) -> bool {
+    format == 120
+        || (format == 118
+            && subresources
+                .into_iter()
+                .all(|(desc, index)| !is_depth_plane(desc, index)))
+}
+
+/// On a 2D MSAA resolve, all mip levels and array slices of plane 0 (depth)
+/// precede the first stencil subresource.
+#[cfg(windows)]
+fn is_depth_plane(desc: &D3D12_RESOURCE_DESC, index: u32) -> bool {
+    index < u32::from(desc.MipLevels) * u32::from(desc.DepthOrArraySize)
+}
+
+/// A resolve of the depth plane of format 118 takes the host's depth-plane
+/// format (`pc_format(119)`), and one of the stencil plane its stencil-plane
+/// format (`pc_format(120)`). The host's depth/stencil view names both planes.
+#[cfg(windows)]
+fn resolve_format(
+    format: u32,
+    subresources: [(&D3D12_RESOURCE_DESC, u32); 2],
+) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    let mapped = if format == 118
+        && subresources
+            .into_iter()
+            .all(|(desc, index)| is_depth_plane(desc, index))
+    {
+        crate::resource::pc_format(119)
+    } else if is_stencil_plane(format, subresources) {
+        crate::resource::pc_format(120)
+    } else {
+        crate::resource::pc_format(format)
+    };
+    DXGI_FORMAT(mapped as i32)
 }
 
 #[repr(C)]
@@ -1863,6 +1924,9 @@ pub(crate) fn has_newer_table(list: This) -> bool {
     table == NEWER_LIST_FUNCTIONS.0.as_ptr()
 }
 
+#[cfg(all(test, windows))]
+mod resolve_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1897,6 +1961,29 @@ mod tests {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolves_select_the_depth_format_only_when_both_subresources_are_depth() {
+        let src = D3D12_RESOURCE_DESC {
+            MipLevels: 1,
+            DepthOrArraySize: 2,
+            ..Default::default()
+        };
+        let dst = D3D12_RESOURCE_DESC {
+            MipLevels: 3,
+            ..src
+        };
+        let format = |guest, from, to| resolve_format(guest, [(&src, from), (&dst, to)]).0;
+        assert_eq!(format(118, 1, 5), 21);
+        assert_eq!(format(118, 2, 5), 20);
+        assert_eq!(format(118, 1, 6), 20);
+        assert_eq!(format(119, 1, 5), 21);
+        assert_eq!(format(120, 2, 6), 22);
+        assert_eq!(format(118, 2, 6), 22, "both subresources of the stencil plane");
+        assert_eq!(format(120, 0, 0), 22);
+        assert_eq!(format(28, 0, 0), 28);
     }
 
     #[test]
