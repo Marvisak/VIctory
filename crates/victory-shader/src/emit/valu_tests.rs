@@ -2151,7 +2151,7 @@ fn fspx_programs_run_with_the_hardwares_dot_products() {
         ),
     ];
     for (body, want) in cases {
-        let mut words = load.clone();
+        let mut words = load.to_vec();
         words.extend(&body);
         let shader = fspx_cs(&words);
         run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
