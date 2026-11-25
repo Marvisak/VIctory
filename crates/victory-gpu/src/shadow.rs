@@ -76,17 +76,82 @@ fn pooled(n: usize) -> Vec<u8> {
 /// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
 fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    retain_idle(&mut pool, v, snapshot_pool_limit());
+}
+
+fn retain_idle(pool: &mut Vec<Vec<u8>>, v: Vec<u8>, limit: usize) {
+    // Active snapshots have already finished before reaching this function.
+    // An oversized idle allocation must not evict smaller reusable buffers.
+    if v.capacity() > limit || limit == 0 {
+        return;
+    }
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut total = 0;
+    let mut remaining = limit;
     pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
+        if let Some(left) = remaining.checked_sub(v.capacity()) {
+            remaining = left;
+            true
+        } else {
+            false
+        }
     });
 }
 
 /// Snapshot memory kept for reuse.
 const POOL_BYTES: usize = 2 << 30;
+
+fn snapshot_pool_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let value = std::env::var("VICTORY_SNAPSHOT_POOL_MIB").ok();
+        let limit = value.as_deref().and_then(snapshot_pool_limit_from);
+        if let Some(bytes) = limit {
+            tracing::info!(limit_mib = bytes / (1024 * 1024), "idle snapshot pool cap enabled");
+        } else if value.is_some() {
+            tracing::warn!("invalid VICTORY_SNAPSHOT_POOL_MIB: retaining upstream default");
+        }
+        limit.unwrap_or(POOL_BYTES)
+    })
+}
+
+fn snapshot_pool_limit_from(value: &str) -> Option<usize> {
+    value.trim().parse::<u64>().ok().map(|mib| mib.min(1024) as usize * 1024 * 1024)
+}
+
+#[cfg(test)]
+mod idle_pool_tests {
+    use super::{retain_idle, snapshot_pool_limit_from};
+
+    #[test]
+    fn pool_budget_counts_capacity_and_reuses_fitting_allocations() {
+        let mut pool = Vec::new();
+        retain_idle(&mut pool, Vec::with_capacity(64), 100);
+        retain_idle(&mut pool, Vec::with_capacity(32), 100);
+        retain_idle(&mut pool, Vec::with_capacity(80), 100);
+        assert_eq!(pool.iter().map(Vec::capacity).collect::<Vec<_>>(), [80]);
+        retain_idle(&mut pool, Vec::with_capacity(16), 100);
+        assert_eq!(pool.iter().map(Vec::capacity).sum::<usize>(), 96);
+        retain_idle(&mut pool, Vec::with_capacity(128), 100);
+        assert_eq!(pool.iter().map(Vec::capacity).sum::<usize>(), 96);
+    }
+
+    #[test]
+    fn zero_budget_keeps_no_idle_allocation() {
+        let mut pool = Vec::new();
+        retain_idle(&mut pool, Vec::with_capacity(64), 0);
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn cap_parser_bounds_explicit_settings() {
+        assert_eq!(snapshot_pool_limit_from("128"), Some(128 << 20));
+        assert_eq!(snapshot_pool_limit_from(" 0 "), Some(0));
+        assert_eq!(snapshot_pool_limit_from("2048"), Some(1024 << 20));
+        assert_eq!(snapshot_pool_limit_from("-1"), None);
+        assert_eq!(snapshot_pool_limit_from("invalid"), None);
+    }
+}
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.

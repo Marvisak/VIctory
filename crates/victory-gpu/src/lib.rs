@@ -36,6 +36,8 @@ pub mod frame;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod mesh_indirect;
 pub mod list;
 #[cfg(windows)]
 mod memory;

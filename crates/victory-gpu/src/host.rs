@@ -655,6 +655,8 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    mesh_arguments: Option<ID3D12Resource>,
+    mesh_buffer: Option<(ID3D12Resource, u64)>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -1245,7 +1247,44 @@ impl Host {
     }
 }
 
+fn mesh_capacity(bytes: u64) -> Option<u64> {
+    (bytes > 0 && bytes <= 16 * 1024 * 1024).then(|| bytes.max(65536).next_power_of_two())
+}
+
 impl HostList {
+    pub(crate) fn mesh_arguments(&self) -> Option<ID3D12Resource> {
+        let mut deferred = self.deferred();
+        if let Some(buffer) = &deferred.mesh_arguments { return Some(buffer.clone()); }
+        let buffer = crate::mesh_indirect::argument_buffer(&host()?.device).ok()?;
+        deferred.mesh_arguments = Some(buffer.clone());
+        Some(buffer)
+    }
+
+    pub(crate) fn mesh_buffer(&self, bytes: u64) -> Option<ID3D12Resource> {
+        let bytes = mesh_capacity(bytes)?;
+        let mut deferred = self.deferred();
+        if let Some((buffer, size)) = &deferred.mesh_buffer
+            && *size >= bytes { return Some(buffer.clone()); }
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1,
+            DepthOrArraySize: 1, MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: owned descriptions and output, with a bounded buffer size.
+        unsafe { host()?.device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut buffer,
+        ).ok()?; }
+        let buffer = buffer?;
+        if let Some((previous, _)) = deferred.mesh_buffer.replace((buffer.clone(), bytes)) {
+            deferred.kept.push(previous.cast().ok()?);
+        }
+        Some(buffer)
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {

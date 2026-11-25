@@ -63,6 +63,10 @@ pub struct Instruction {
 }
 
 impl Instruction {
+    #[cfg(test)]
+    pub(crate) fn synthetic(encoding: Encoding, opcode: u16) -> Self {
+        Self { offset: 0, encoding, opcode, words: vec![0], name: name(encoding, opcode) }
+    }
     /// AMD's name for the opcode, if it is in our table.
     pub fn name(&self) -> Option<&'static str> {
         self.name

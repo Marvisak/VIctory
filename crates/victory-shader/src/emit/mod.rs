@@ -141,10 +141,13 @@
 //!   dword 0 the address's low dword, 1 the high), and the host must have
 //!   a copy holding each such address.
 //! * **View addresses** ([`HostShader::view_addresses`]): a buffer
-//!   descriptor's dwords 0-1 read as numbers (the BVH SRV's base address)
-//!   come from the root SRV `t1` in [`MEMORY_SPACE`]: per resource-heap
-//!   index, two dwords, the buffer view's title address (high dword bits
-//!   0-15; stride bits 0), zeros for no buffer view.
+//!   descriptor's dwords 0-1 read as numbers (the BVH SRV's base address),
+//!   and an image descriptor's size, levels and type (dwords 2-4, loaded
+//!   whole; 2026-11-25) come from the root SRV `t1` in [`MEMORY_SPACE`]:
+//!   per resource-heap index, eight dwords in the descriptor's layout: a
+//!   buffer view's title address (high dword bits 0-15; stride bits 0), a
+//!   texture view's width, height, last level, type and depth as the host
+//!   view has them (base level and layer 0), zeros for anything else.
 //! * **Write marks** ([`HostShader::view_marks`], with
 //!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
 //!   through an unordered buffer view from the heap (tables, the heap
@@ -185,6 +188,8 @@
 mod bitcode;
 #[cfg(all(test, windows))]
 mod bvh_tests;
+#[cfg(all(test, windows))]
+mod compute_sample_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
@@ -193,6 +198,10 @@ mod flow_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+pub mod mesh_compute;
+mod wave64;
+#[cfg(all(test, windows))]
+mod native_compute_tests;
 mod rect;
 pub use rect::rectangle_gs;
 #[cfg(all(test, windows))]
@@ -209,6 +218,10 @@ mod synthetic_tests;
 pub mod validator;
 #[cfg(all(test, windows))]
 mod valu_tests;
+#[cfg(all(test, windows))]
+mod uav_stage_tests;
+#[cfg(all(test, windows))]
+mod view_image_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
@@ -415,6 +428,16 @@ pub fn emit_with(
     res: &resource::Resources,
     options: Options,
 ) -> Result<HostShader, ShaderError> {
+    emit_mode(c, native, p, st, io, res, options, false, false)
+}
+
+// Same analysis inputs as emit_with, plus the two private lowering modes.
+#[allow(clippy::too_many_arguments)]
+fn emit_mode(
+    c: &Container, native: &NativeProgram, p: &ir::Program,
+    st: &structure::Structured, io: &io::Io, res: &resource::Resources,
+    options: Options, mesh_compute: bool, wave64_dag: bool,
+) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -481,6 +504,8 @@ pub fn emit_with(
         prims: prims.clone(),
         mesh_stride,
         view_marks: options.view_marks,
+        mesh_compute,
+        wave64_dag,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
@@ -494,7 +519,7 @@ pub fn emit_with(
         l => l?,
     };
     Ok(HostShader {
-        stage: native.stage,
+        stage: if mesh_compute { HwStage::Cs } else { native.stage },
         dxil: l.dxil,
         user_data: l.user_data,
         static_samplers: l

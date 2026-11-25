@@ -59,6 +59,8 @@ pub(crate) struct State {
     heaps: [usize; 2],
     graphics: Vec<Root>,
     compute: Vec<Root>,
+    /// The mesh producer is a host compute stage but reads title graphics roots.
+    fallback_graphics_roots: bool,
     vertex: [VertexView; 32],
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
@@ -71,7 +73,7 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
+    /// Tables made afresh in this list: (table, what it holds) â†’ first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
@@ -83,7 +85,7 @@ pub(crate) struct State {
     /// and its view heap.
     memory: Option<(usize, crate::memory::Map)>,
     /// Views made for root SRVs and UAVs in this list ([`State::root_view`]):
-    /// (view heap, host copy, unordered access) → dynamic slot.
+    /// (view heap, host copy, unordered access) â†’ dynamic slot.
     root_slots: std::collections::HashMap<(usize, usize, bool), u32>,
     /// The run of dynamic slots root views take from (view heap, next
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
@@ -672,6 +674,9 @@ impl State {
             }
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
+                    if kind == 1 && slot == victory_shader::emit::mesh_compute::VERTEX_SRV {
+                        continue; // Private scratch is bound by the two-pass draw.
+                    }
                     if kind == 1 && slot == victory_shader::emit::VIEW_STRIDES {
                         // The bound view heap's stride table; without one
                         // the shader would read an unbound root view.
@@ -1027,6 +1032,16 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+            && p.fallback.is_some()
+        {
+            if !self.mesh_compute_draw(list, p, x) {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                dropped(list, self.pipeline, "mesh fallback");
+            }
+            return;
+        }
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -1046,8 +1061,121 @@ impl State {
         }
     }
 
+    fn mesh_compute_draw(&mut self, list: &HostList, p: &HostPipeline, groups: u32) -> bool {
+        let f = p.fallback.as_ref().unwrap();
+        if groups == 0 { return true; }
+        let Some(bytes) = f.layout.allocation(groups) else {
+            once!(groups, "mesh compute draw exceeds its bounded scratch allocation"); return false;
+        };
+        let Some(buffer) = list.mesh_buffer(bytes) else { return false; };
+        if !self.prepare_for(list, false, true) { return false; }
+        self.fallback_graphics_roots = true;
+        let bound = self.bind(list, &f.compute, true);
+        self.fallback_graphics_roots = false;
+        if !bound { return false; }
+        // SAFETY: an open list; bounded dispatch, owned scratch, matched PSOs.
+        unsafe {
+            let l = &list.list;
+            l.SetComputeRootUnorderedAccessView(f.output_param, buffer.GetGPUVirtualAddress());
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("mesh fallback compute {}: {groups} groups, {bytes} scratch bytes", f.compute.name));
+            l.Dispatch(groups, 1, 1);
+            l.ResourceBarrier(&[crate::host::transition(&buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+            if !self.bind(list, p, false) {
+                l.ResourceBarrier(&[crate::host::transition(&buffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                return false;
+            }
+            l.SetGraphicsRootShaderResourceView(f.input_param, buffer.GetGPUVirtualAddress());
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4));
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("mesh fallback raster {}: {groups} groups, {} vertices/group, {bytes} scratch bytes", p.name, f.layout.primitives * 3));
+            l.DrawInstanced(f.layout.primitives * 3, groups, 0, 0);
+            l.ResourceBarrier(&[crate::host::transition(&buffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            self.set_topology(list, self.topology);
+        }
+        static FALLBACK_DRAWS: AtomicU64 = AtomicU64::new(0);
+        let draw = FALLBACK_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
+        if draw.is_power_of_two() {
+            tracing::info!(draw, groups, bytes, "experimental compute and vertex mesh draw recorded");
+        }
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    fn mesh_compute_indirect(&mut self, list: &HostList, p: &HostPipeline, arguments: u64) -> bool {
+        use crate::mesh_indirect as convert;
+        let f = p.fallback.as_ref().unwrap();
+        if !arguments.is_multiple_of(4) { return false; }
+        let Some(vertices) = f.layout.primitives.checked_mul(3) else { return false; };
+        let Some(capacity) = convert::limits(u64::from(f.layout.bytes()), vertices) else { return false; };
+        let Some(bytes) = f.layout.allocation(capacity) else { return false; };
+        let (Some(converter), Some(dispatch), Some(draw), Some(input)) = (
+            convert::converter(), host_signature(2,12), host_signature(0,16),
+            crate::shadow::find(arguments,12),
+        ) else { return false; };
+        let Ok(input_offset)=u32::try_from(input.offset(arguments)) else { return false; };
+        if input_offset.checked_add(12).is_none() { return false; }
+        let (Some(records), Some(output)) = (list.mesh_buffer(bytes), list.mesh_arguments()) else { return false; };
+        if !self.prepare_for(list,false,true) { return false; }
+        self.fallback_graphics_roots = true;
+        let bound = self.bind(list,&f.compute,true);
+        self.fallback_graphics_roots = false;
+        if !bound { return false; }
+        input.refresh(list,arguments,12);
+        let Some(budget) = list.budget() else { return false; };
+        // Bind the aligned resource base, not an arbitrary 4-byte-aligned
+        // ExecuteIndirect offset as the root UAV address.
+        // SAFETY: the shadow owns a live buffer retained through submission.
+        let input_base=unsafe { input.buffer.GetGPUVirtualAddress() };
+        converter.record(list,input_base,input_offset,&output,budget,capacity,vertices);
+        // The converter changed these host bindings, not the title's roots.
+        self.host_pipeline=0;
+        self.host_roots[1]=0;
+        self.fallback_graphics_roots = true;
+        let bound = self.bind(list,&f.compute,true);
+        self.fallback_graphics_roots = false;
+        if !bound {
+            convert::done(list,&output);
+            return false;
+        }
+        // SAFETY: one bounded generated record; both signatures contain
+        // only their dispatch/draw command and therefore change no roots.
+        unsafe {
+            let l=&list.list;
+            l.SetComputeRootUnorderedAccessView(f.output_param,records.GetGPUVirtualAddress());
+            #[cfg(feature="diagnostics")]
+            list.note_op(|| format!("indirect mesh fallback compute {}: GPU groups <= {capacity}, {bytes} bytes",f.compute.name));
+            l.ExecuteIndirect(&dispatch,1,&output,0,None,0);
+            l.ResourceBarrier(&[crate::host::transition(&records,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+            if !self.bind(list,p,false) {
+                l.ResourceBarrier(&[crate::host::transition(&records,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                convert::done(list,&output);
+                return false;
+            }
+            l.SetGraphicsRootShaderResourceView(f.input_param,records.GetGPUVirtualAddress());
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4));
+            #[cfg(feature="diagnostics")]
+            list.note_op(|| format!("indirect mesh fallback raster {}: {vertices} vertices/group, GPU groups <= {capacity}",p.name));
+            l.ExecuteIndirect(&draw,1,&output,convert::DRAW_OFFSET,None,0);
+            l.ResourceBarrier(&[crate::host::transition(&records,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            self.set_topology(list,self.topology);
+        }
+        static RECORDED: AtomicU64=AtomicU64::new(0);
+        let count=RECORDED.fetch_add(1,Ordering::Relaxed)+1;
+        if count.is_power_of_two() {
+            tracing::info!(count,mesh=%f.compute.name,capacity,bytes,
+                "experimental indirect compute and vertex mesh draw recorded (GPU dimensions)");
+        }
+        convert::done(list,&output);
+        DRAWN.fetch_add(1,Ordering::Relaxed);
+        true
+    }
+
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
-        if compute {
+        if compute && !self.fallback_graphics_roots {
             &self.compute
         } else {
             &self.graphics
@@ -1561,6 +1689,16 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             why("no host pipeline");
+            return false;
+        }
+        if kind == 10
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+            && p.fallback.is_some()
+        {
+            if crate::mesh_indirect::enabled() && crate::mesh_indirect::shape(kind,stride,max,count.is_some()) {
+                return self.mesh_compute_indirect(list,p,arguments);
+            }
+            why("unsupported indirect shape for vertex fallback");
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));

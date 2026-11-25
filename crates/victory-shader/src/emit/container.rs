@@ -166,9 +166,14 @@ pub(crate) struct Psv<'a> {
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
+    /// Validator 1.8 (a compute shader): runtime info version 3, which
+    /// names the entry function (`main`, first in the string table, as DXC
+    /// writes it for a shader without signatures).
+    pub entry_name: bool,
 }
 
-/// `PSV0` with runtime info version 2 (validator 1.6).
+/// `PSV0` with runtime info version 2 (validator 1.6), or 3 with
+/// [`Psv::entry_name`].
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -184,8 +189,13 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[48]);
-    let mut info = [0u8; 48];
+    let size = if p.entry_name { 52 } else { 48 };
+    u32s(&mut out, &[size as u32]);
+    let mut info = [0u8; 52];
+    if p.entry_name {
+        // EntryFunctionName: "main" at offset 1 of the string table.
+        info[48..52].copy_from_slice(&1u32.to_le_bytes());
+    }
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
         // PSInfo.SampleFrequency: an input interpolated per sample, or the
@@ -224,7 +234,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[12] = u8::from(p.flag);
         info[26..28].copy_from_slice(&(max as u16).to_le_bytes());
     }
-    out.extend(info);
+    out.extend(&info[..size]);
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
@@ -237,6 +247,9 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     }
     // Names of arbitrary semantics (system values use ""), then indices.
     let mut strings = vec![0u8];
+    if p.entry_name {
+        strings.extend(b"main\0");
+    }
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {

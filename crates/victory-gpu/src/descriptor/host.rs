@@ -25,6 +25,10 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// The records of slots holding views of textures the title placed
+    /// itself that are not made yet (`mirror`; `made` holds 0 for them):
+    /// for the view addresses, when made after them.
+    unmade: Mutex<std::collections::HashMap<u32, u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -50,10 +54,11 @@ pub(crate) struct HostHeap {
     /// view there, `VIEW_MARK_NONE` for none. Mapped at the address kept
     /// beside it.
     marks: Option<(ID3D12Resource, usize)>,
-    /// Per title slot, the title address of the buffer view it holds, as a
-    /// buffer descriptor's dwords 0 and 1 (shaders reading a descriptor's
-    /// address as data, `crate::memory`): the buffer, its mapping and host
-    /// address, made on first use.
+    /// Per title slot, [`ENTRY_WORDS`] dwords of a descriptor rebuilt from the
+    /// view it holds, for shaders that read a descriptor as data
+    /// ([`write_address`]): a buffer view's title address (`crate::memory`)
+    /// and size, a texture view's size, levels and type. The buffer, its
+    /// mapping and host address, made on first use.
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
@@ -82,10 +87,6 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
-/// The host's limit for shader-visible view heaps on resource binding
-/// tiers 1 and 2; tier 3 hardware may take more.
-const PORTABLE_VIEWS: u32 = 1_000_000;
-
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
@@ -96,6 +97,13 @@ const DYNAMIC: u32 = 1 << 18;
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
+
+fn portable_layout(count: u32) -> (u32, u32) {
+    // The last three slots are the null UAV, null SRV and clamped sentinel.
+    let usable = victory_shader::emit::NULL_BUFFER_VIEW - 1;
+    let extra = if count <= usable - DYNAMIC { DYNAMIC } else { MIN_DYNAMIC };
+    (count.min(usable - extra), extra)
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -135,10 +143,8 @@ impl HostHeap {
                 Some((buffer, data as usize))
             })
             .flatten();
-        // The larger dynamic range only where the host takes it on top of
-        // every title slot; else the smaller one, and the cap after that.
-        // Translated shaders clamp their indices below `HEAP_VIEWS` or
-        // `HEAP_SAMPLERS`: slots up to there exist and stay null.
+        // The actual heap and translator must agree on the clamp and null
+        // indices, including on hardware that rejects a two-million heap.
         let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
         let (heap, count, extra) = if sampler {
             match make(count.max(samplers)) {
@@ -148,19 +154,15 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
-            (heap, count, DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
+            let (kept, extra) = portable_layout(count);
+            if kept < count {
+                // As in upstream's capped path, titles reaching omitted
+                // descriptors still need remapping; this is not solved here.
+                tracing::warn!(count, kept, "host view heap capped; omitted title slots require remapping");
+            }
+            match make(views) {
+                Ok(heap) => (heap, kept, extra),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
@@ -193,6 +195,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            unmade: Mutex::new(std::collections::HashMap::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -541,11 +544,13 @@ impl HostHeap {
     /// on first use from the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
         let made = self.addresses.get_or_init(|| {
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 8)?;
+            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 4 * ENTRY_WORDS as u64)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let unmade = self.unmade.lock().unwrap_or_else(|e| e.into_inner());
             for (i, &key) in made.iter().enumerate() {
+                let key = if key == 0 { unmade.get(&(i as u32)).copied().unwrap_or(0) } else { key };
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
                 write_address(data, i, view.as_ref());
             }
@@ -655,9 +660,12 @@ impl HostHeap {
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
+            let unmade = self.unmade.lock().unwrap_or_else(|e| e.into_inner()).remove(&index);
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);
+                self.note_address(index, None);
+            } else if unmade.is_some() {
                 self.note_address(index, None);
             }
             return None;
@@ -673,6 +681,14 @@ impl HostHeap {
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
             made[index as usize] = if later { 0 } else { key };
+            {
+                let mut unmade = self.unmade.lock().unwrap_or_else(|e| e.into_inner());
+                if later {
+                    unmade.insert(index, key);
+                } else {
+                    unmade.remove(&index);
+                }
+            }
             let (kept, mark) = if later {
                 (None, None)
             } else {
@@ -803,14 +819,154 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     }
 }
 
-/// Writes slot `index`'s view address into the view addresses at `data`:
-/// a buffer view's title address (dword 0 low, dword 1 bits 0-15 high);
-/// zeros for anything else.
+/// Dwords per title slot in the view addresses: a whole GFX10 image
+/// descriptor (the view heap's 32-byte slots), so a shader reads dword `k`
+/// of the descriptor at heap index `i` at byte `32 i + 4 k`.
+pub(crate) const ENTRY_WORDS: usize = 8;
+
+/// Writes slot `index`'s entry into the view addresses at `data`: the
+/// descriptor dwords a shader may read as data, in the GFX10 layout, from
+/// the view the slot holds (zeros, a null descriptor, for none):
+///
+/// * a buffer view: its title address (dword 0 low, dword 1 bits 0-15
+///   high);
+/// * a texture view: [`image_words`] in dwords 1 to 4;
+/// * anything else: zeros.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
-    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-    let words = [address as u32, (address >> 32) as u32 & 0xFFFF];
-    // SAFETY: the mapped view addresses hold 8 bytes per title slot.
-    unsafe { ((data + 8 * index) as *mut [u32; 2]).write_unaligned(words) };
+    let words = entry_words(view);
+    // SAFETY: the mapped view addresses hold `ENTRY_WORDS` dwords per title
+    // slot.
+    unsafe { ((data + 4 * ENTRY_WORDS * index) as *mut [u32; ENTRY_WORDS]).write_unaligned(words) };
+}
+
+/// The view-address entry [`write_address`] writes for `view`.
+fn entry_words(view: Option<&View>) -> [u32; ENTRY_WORDS] {
+    let mut words = [0u32; ENTRY_WORDS];
+    if let Some((address, _)) = view.and_then(buffer_range) {
+        words[0] = address as u32;
+        words[1] = (address >> 32) as u32 & 0xFFFF;
+    } else if let Some(image) = view.and_then(image_words) {
+        words[1..5].copy_from_slice(&image);
+    }
+    words
+}
+
+/// A texture shader view's GFX10 image descriptor dwords 1 to 4 as a shader
+/// reading them as data needs them, from the host texture and the view's
+/// description, as the host view sees it (the layout
+/// `victory_shader::emit` rebuilds from a handle's dimensions): width - 1
+/// in dword 1 bits 30-31 and dword 2 bits 0-11, height - 1 in dword 2 bits
+/// 14-27, dword 3 the identity swizzle, the last level at bit 16 and the
+/// type at bit 28, dword 4 the depth or the layers - 1. `None` for views of
+/// anything else and multisampled textures.
+// shortcut: the base level reads 0 and sizes are the view's most detailed
+// level's (the host view starts there, as `victory_shader::emit` takes it);
+// a cube's dword 4 reads its faces - 1.
+fn image_words(view: &View) -> Option<[u32; 4]> {
+    let (t, desc) = match view {
+        View::Shader(resource, desc) => {
+            let copy = crate::resource::host_copy(*resource as crate::object::This)?;
+            // SAFETY: a live texture.
+            (unsafe { copy.texture.GetDesc() }, desc.as_ref().map(srv_desc))
+        }
+        // A texture the title placed itself: from its description, without
+        // making its host texture (`mirror` makes those only when a draw
+        // reads them).
+        View::Placed(false, resource, desc) if resource[0] != 1 => {
+            // SAFETY: 56 bytes in the host's resource description layout.
+            let t = unsafe { resource.as_ptr().cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+            let words: Option<&[u32; 10]> = desc[..10].try_into().ok();
+            (t, words.map(srv_desc))
+        }
+        _ => return None,
+    };
+    image_words_of(&t, desc.as_ref())
+}
+
+/// GFX10 image types.
+const IMAGE_1D: u32 = 8;
+const IMAGE_2D: u32 = 9;
+const IMAGE_3D: u32 = 10;
+const IMAGE_CUBE: u32 = 11;
+const IMAGE_1D_ARRAY: u32 = 12;
+const IMAGE_2D_ARRAY: u32 = 13;
+
+/// [`image_words`] of texture `t` viewed through `desc` (none: the
+/// texture's own view).
+fn image_words_of(t: &D3D12_RESOURCE_DESC, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> Option<[u32; 4]> {
+    if t.SampleDesc.Count > 1 {
+        return None;
+    }
+    let all = u32::MAX;
+    let layers_of = |n: u32| n.max(1);
+    // (type, most detailed level, levels, layers)
+    let (ty, top, levels, layers) = match desc {
+        // SAFETY: each arm reads the union member the dimension names.
+        Some(d) => unsafe {
+            let a = &d.Anonymous;
+            match d.ViewDimension {
+                D3D12_SRV_DIMENSION_TEXTURE1D => (IMAGE_1D, a.Texture1D.MostDetailedMip, a.Texture1D.MipLevels, 1),
+                D3D12_SRV_DIMENSION_TEXTURE1DARRAY => (
+                    IMAGE_1D_ARRAY,
+                    a.Texture1DArray.MostDetailedMip,
+                    a.Texture1DArray.MipLevels,
+                    layers_of(a.Texture1DArray.ArraySize),
+                ),
+                D3D12_SRV_DIMENSION_TEXTURE2D => (IMAGE_2D, a.Texture2D.MostDetailedMip, a.Texture2D.MipLevels, 1),
+                D3D12_SRV_DIMENSION_TEXTURE2DARRAY => (
+                    IMAGE_2D_ARRAY,
+                    a.Texture2DArray.MostDetailedMip,
+                    a.Texture2DArray.MipLevels,
+                    layers_of(a.Texture2DArray.ArraySize),
+                ),
+                D3D12_SRV_DIMENSION_TEXTURE3D => (IMAGE_3D, a.Texture3D.MostDetailedMip, a.Texture3D.MipLevels, 1),
+                D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                    (IMAGE_CUBE, a.TextureCube.MostDetailedMip, a.TextureCube.MipLevels, 6)
+                }
+                D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => (
+                    IMAGE_CUBE,
+                    a.TextureCubeArray.MostDetailedMip,
+                    a.TextureCubeArray.MipLevels,
+                    6 * layers_of(a.TextureCubeArray.NumCubes),
+                ),
+                _ => return None,
+            }
+        },
+        None => {
+            let n = u32::from(t.DepthOrArraySize);
+            match t.Dimension {
+                D3D12_RESOURCE_DIMENSION_TEXTURE1D if n > 1 => (IMAGE_1D_ARRAY, 0, all, n),
+                D3D12_RESOURCE_DIMENSION_TEXTURE1D => (IMAGE_1D, 0, all, 1),
+                D3D12_RESOURCE_DIMENSION_TEXTURE2D if n > 1 => (IMAGE_2D_ARRAY, 0, all, n),
+                D3D12_RESOURCE_DIMENSION_TEXTURE2D => (IMAGE_2D, 0, all, 1),
+                D3D12_RESOURCE_DIMENSION_TEXTURE3D => (IMAGE_3D, 0, all, 1),
+                _ => return None,
+            }
+        }
+    };
+    // Levels 0: the whole chain (a title's description).
+    let mips = match t.MipLevels {
+        0 => {
+            let deepest = if ty == IMAGE_3D { u64::from(t.DepthOrArraySize) } else { 0 };
+            64 - t.Width.max(u64::from(t.Height)).max(deepest).max(1).leading_zeros()
+        }
+        n => u32::from(n),
+    };
+    if top >= mips {
+        return None;
+    }
+    let levels = if levels == all { mips - top } else { levels.clamp(1, mips - top) };
+    let at = |x: u64| u32::try_from((x >> top).max(1)).unwrap_or(u32::MAX);
+    let width = at(t.Width);
+    let height = if matches!(ty, IMAGE_1D | IMAGE_1D_ARRAY) { 1 } else { at(u64::from(t.Height)) };
+    let depth = if ty == IMAGE_3D { at(u64::from(t.DepthOrArraySize)) } else { layers };
+    let (w, h) = (width - 1, height - 1);
+    Some([
+        (w & 3) << 30,
+        (w >> 2) & 0xFFF | (h & 0x3FFF) << 14,
+        0xFAC | (levels - 1) << 16 | ty << 28,
+        depth - 1,
+    ])
 }
 
 /// The title memory a buffer shader or unordered access view reads: its
@@ -1428,6 +1584,115 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    fn texture(dimension: D3D12_RESOURCE_DIMENSION, size: [u32; 3], mips: u16, samples: u32) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: dimension,
+            Width: u64::from(size[0]),
+            Height: size[1],
+            DepthOrArraySize: size[2] as u16,
+            MipLevels: mips,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
+            ..Default::default()
+        }
+    }
+
+    /// The GFX10 fields `image_words` fills: width - 1, height - 1, last
+    /// level, type, dword 4.
+    fn fields(w: [u32; 4]) -> [u32; 5] {
+        [
+            w[0] >> 30 | (w[1] & 0xFFF) << 2,
+            w[1] >> 14 & 0x3FFF,
+            w[2] >> 16 & 0xF,
+            w[2] >> 28,
+            w[3],
+        ]
+    }
+
+    /// Texture views' image descriptor words (shaders reading a heap
+    /// image's size as data, the title's `CS_RaytracingResolve`): the size
+    /// of the view's most detailed level, its levels, type and layers.
+    #[test]
+    fn texture_views_give_their_image_words() {
+        let t = texture(D3D12_RESOURCE_DIMENSION_TEXTURE2D, [1920, 1080, 1], 11, 1);
+        // The texture's own view: all 11 levels from level 0.
+        let w = image_words_of(&t, None).expect("2D");
+        assert_eq!(fields(w), [1919, 1079, 10, IMAGE_2D, 0]);
+        assert_eq!(w[2] & 0xF000, 0, "base level 0");
+        // From level 1, all the rest: 960x540, 10 levels.
+        let mut d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        d.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: 1, MipLevels: u32::MAX, ..Default::default() };
+        assert_eq!(fields(image_words_of(&t, Some(&d)).unwrap()), [959, 539, 9, IMAGE_2D, 0]);
+        // A 6-layer array viewed as 4 layers, 2 levels.
+        let a = texture(D3D12_RESOURCE_DIMENSION_TEXTURE2D, [256, 128, 6], 3, 1);
+        d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        d.Anonymous.Texture2DArray =
+            D3D12_TEX2D_ARRAY_SRV { MostDetailedMip: 0, MipLevels: 2, FirstArraySlice: 2, ArraySize: 4, ..Default::default() };
+        assert_eq!(fields(image_words_of(&a, Some(&d)).unwrap()), [255, 127, 1, IMAGE_2D_ARRAY, 3]);
+        // A cube: 6 faces.
+        d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        d.Anonymous.TextureCube = D3D12_TEXCUBE_SRV { MostDetailedMip: 0, MipLevels: u32::MAX, ..Default::default() };
+        assert_eq!(fields(image_words_of(&a, Some(&d)).unwrap()), [255, 127, 2, IMAGE_CUBE, 5]);
+        // 3D: the depth of the level.
+        let v = texture(D3D12_RESOURCE_DIMENSION_TEXTURE3D, [64, 32, 16], 4, 1);
+        assert_eq!(fields(image_words_of(&v, None).unwrap()), [63, 31, 3, IMAGE_3D, 15]);
+        d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        d.Anonymous.Texture3D = D3D12_TEX3D_SRV { MostDetailedMip: 2, MipLevels: 1, ..Default::default() };
+        assert_eq!(fields(image_words_of(&v, Some(&d)).unwrap()), [15, 7, 0, IMAGE_3D, 3]);
+        // 1D: height 1. Largest 2D size fits its fields.
+        let l = texture(D3D12_RESOURCE_DIMENSION_TEXTURE1D, [4096, 1, 1], 1, 1);
+        assert_eq!(fields(image_words_of(&l, None).unwrap()), [4095, 0, 0, IMAGE_1D, 0]);
+        let big = texture(D3D12_RESOURCE_DIMENSION_TEXTURE2D, [16384, 16384, 1], 15, 1);
+        assert_eq!(fields(image_words_of(&big, None).unwrap()), [16383, 16383, 14, IMAGE_2D, 0]);
+        // Levels 0 in a title's description: the whole chain.
+        let chain = texture(D3D12_RESOURCE_DIMENSION_TEXTURE2D, [1920, 1080, 1], 0, 1);
+        assert_eq!(fields(image_words_of(&chain, None).unwrap()), [1919, 1079, 10, IMAGE_2D, 0]);
+        let chain = texture(D3D12_RESOURCE_DIMENSION_TEXTURE3D, [8, 8, 64], 0, 1);
+        assert_eq!(fields(image_words_of(&chain, None).unwrap()), [7, 7, 6, IMAGE_3D, 63]);
+    }
+
+    /// A texture the title placed itself gives its words from its
+    /// description and view, without a host texture.
+    #[test]
+    fn placed_texture_views_give_image_words_unmade() {
+        let t = texture(D3D12_RESOURCE_DIMENSION_TEXTURE2D, [512, 256, 1], 0, 1);
+        let mut resource = [0u32; 14];
+        // SAFETY: 56 bytes both.
+        unsafe { resource.as_mut_ptr().cast::<D3D12_RESOURCE_DESC>().write_unaligned(t) };
+        let mut desc = [0u32; 16];
+        desc[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+        desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        // The view's union starts at word 4 (8-byte aligned): level 0, all.
+        desc[5] = u32::MAX;
+        let w = image_words(&View::Placed(false, resource, desc)).expect("a placed texture's words");
+        assert_eq!(fields(w), [511, 255, 9, IMAGE_2D, 0]);
+        // Unordered views are not read as data here.
+        assert_eq!(image_words(&View::Placed(true, resource, desc)), None);
+    }
+
+    /// Nothing for what a descriptor's words cannot say as the host has it:
+    /// multisampled textures, levels past the texture's, buffers.
+    #[test]
+    fn other_views_give_no_image_words() {
+        let ms = texture(D3D12_RESOURCE_DIMENSION_TEXTURE2D, [64, 64, 1], 1, 4);
+        assert_eq!(image_words_of(&ms, None), None);
+        let t = texture(D3D12_RESOURCE_DIMENSION_TEXTURE2D, [64, 64, 1], 2, 1);
+        let mut d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        d.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: 2, MipLevels: 1, ..Default::default() };
+        assert_eq!(image_words_of(&t, Some(&d)), None);
+        let b = texture(D3D12_RESOURCE_DIMENSION_BUFFER, [256, 1, 1], 1, 1);
+        assert_eq!(image_words_of(&b, None), None);
+        // No view: a null descriptor.
+        assert_eq!(entry_words(None), [0; ENTRY_WORDS]);
+    }
+
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]
     fn empty_and_overlong_buffer_views_are_refused() {
@@ -1484,6 +1749,7 @@ mod tests {
         // SAFETY: plain queries of live heaps.
         unsafe {
             assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            assert!(heap.count + heap.dynamic < victory_shader::emit::NULL_BUFFER_VIEW);
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
@@ -1535,6 +1801,17 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn portable_layout_reserves_null_views_without_overflow() {
+        for requested in [0, 4, 737853, 737854, 934461, 1_000_000, 1 << 21, u32::MAX] {
+            let (count, extra) = portable_layout(requested);
+            assert!(count <= requested);
+            assert!(matches!(extra, DYNAMIC | MIN_DYNAMIC));
+            assert!(count + extra < victory_shader::emit::NULL_BUFFER_VIEW);
+        }
+        assert_eq!(portable_layout(4), (4, DYNAMIC));
     }
 
     #[test]

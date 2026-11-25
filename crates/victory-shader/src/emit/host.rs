@@ -151,6 +151,12 @@ impl Host {
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
     ) -> Result<ID3D12RootSignature, String> {
+        self.root_signature_for_with_mesh_output(stages, false)
+    }
+
+    pub(crate) fn root_signature_for_with_mesh_output(
+        &self, stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)], output: bool,
+    ) -> Result<ID3D12RootSignature, String> {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = stages
             .iter()
             .map(|&(s, vis)| D3D12_ROOT_PARAMETER1 {
@@ -242,6 +248,16 @@ impl Host {
                     ShaderVisibility: vis,
                 });
             }
+        }
+        if output {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 { Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0, RegisterSpace: super::mesh_compute::SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                } },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
         }
         let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
             Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
@@ -716,7 +732,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),
-        mesh_stride: 0,
+        mesh_stride: 0, mesh_compute: false, wave64_dag: false,
         view_marks: false,
     })?;
     Ok(HostShader {
@@ -873,6 +889,19 @@ pub struct Draw<'a> {
 }
 
 #[cfg(test)]
+type MeshCapture = (Vec<[f32; 4]>, Option<Vec<u32>>);
+
+#[cfg(test)]
+pub(crate) struct MeshComputeDraw<'a> {
+    pub root: &'a ID3D12RootSignature,
+    pub pipeline: &'a ID3D12PipelineState,
+    pub layout: super::mesh_compute::Layout,
+    pub groups: u32,
+    pub uav_param: u32,
+    pub srv_param: u32,
+}
+
+#[cfg(test)]
 impl Host {
     /// Draws one triangle into an RGBA32F target and returns its texels.
     pub fn draw(
@@ -881,6 +910,41 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_with_mesh_compute(root, pso, d, None)
+    }
+
+    pub(crate) fn draw_with_mesh_compute(
+        &self, root: &ID3D12RootSignature, pso: &ID3D12PipelineState, d: &Draw,
+        fallback: Option<&MeshComputeDraw>,
+    ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_with_mesh_capture(root, pso, d, fallback, false, &[])
+            .map(|(pixels, _)| pixels)
+    }
+
+    /// Test-only capture of the exact geometry buffer consumed by the VS.
+    /// The existing layout allocation bound applies to the optional copy.
+    pub(crate) fn draw_with_mesh_compute_readback(
+        &self, root: &ID3D12RootSignature, pso: &ID3D12PipelineState, d: &Draw,
+        fallback: &MeshComputeDraw,
+    ) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
+        self.draw_with_mesh_compute_readback_roots(root, pso, d, fallback, &[])
+    }
+
+    /// [`Self::draw_with_mesh_compute_readback`] with root arguments for
+    /// the mesh-compute dispatch (user data constants, descriptor tables
+    /// into the draw's view and sampler heaps).
+    pub(crate) fn draw_with_mesh_compute_readback_roots(
+        &self, root: &ID3D12RootSignature, pso: &ID3D12PipelineState, d: &Draw,
+        fallback: &MeshComputeDraw, compute_roots: &[(u32, Root)],
+    ) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
+        let (pixels, records) = self.draw_with_mesh_capture(root, pso, d, Some(fallback), true, compute_roots)?;
+        Ok((pixels, records.ok_or("missing mesh scratch readback")?))
+    }
+
+    fn draw_with_mesh_capture(
+        &self, root: &ID3D12RootSignature, pso: &ID3D12PipelineState, d: &Draw,
+        fallback: Option<&MeshComputeDraw>, capture_mesh: bool, compute_roots: &[(u32, Root)],
+    ) -> Result<MeshCapture, String> {
         let dev = &self.device;
         let (w, h) = d.size;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -1072,7 +1136,53 @@ impl Host {
                 Some(vb)
             };
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(sampler_heap.clone())]);
+            let geometry = if let Some(f) = fallback {
+                let bytes = f.layout.allocation(f.groups).ok_or("mesh scratch exceeds bound")?;
+                let mut desc = buf_desc(bytes);
+                desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                let geometry = make(D3D12_HEAP_TYPE_DEFAULT, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None)?;
+                list.SetComputeRootSignature(f.root);
+                list.SetPipelineState(f.pipeline);
+                list.SetComputeRootUnorderedAccessView(f.uav_param, geometry.GetGPUVirtualAddress());
+                for (param, arg) in compute_roots {
+                    match arg {
+                        Root::Constants(data) => list.SetComputeRoot32BitConstants(
+                            *param, data.len() as u32, data.as_ptr().cast(), 0,
+                        ),
+                        Root::Table { sampler, index } => {
+                            let (heap, size) = if *sampler { (&sampler_heap, sampler_size) } else { (&views, view_size) };
+                            let mut at = heap.GetGPUDescriptorHandleForHeapStart();
+                            at.ptr += (index * size) as u64;
+                            list.SetComputeRootDescriptorTable(*param, at);
+                        }
+                        Root::View { srv, data } => {
+                            let bytes = data.len().max(1) * 4;
+                            let buffer = make(D3D12_HEAP_TYPE_UPLOAD,
+                                &buf_desc(bytes.next_multiple_of(256) as u64),
+                                D3D12_RESOURCE_STATE_GENERIC_READ, None)?;
+                            let mut mapped = std::ptr::null_mut();
+                            buffer.Map(0, None, Some(&mut mapped)).map_err(err)?;
+                            std::ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u32>(), data.len());
+                            buffer.Unmap(0, None);
+                            if *srv {
+                                list.SetComputeRootShaderResourceView(*param, buffer.GetGPUVirtualAddress());
+                            } else {
+                                list.SetComputeRootConstantBufferView(*param, buffer.GetGPUVirtualAddress());
+                            }
+                            keep.push(buffer);
+                        }
+                        Root::Uav(_) => return Err("additional root UAVs in a mesh-compute draw".into()),
+                    }
+                }
+                list.Dispatch(f.groups, 1, 1);
+                list.ResourceBarrier(&[transition(&geometry, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+                list.SetPipelineState(pso);
+                Some(geometry)
+            } else { None };
             list.SetGraphicsRootSignature(root);
+            if let (Some(f), Some(g)) = (fallback, &geometry) {
+                list.SetGraphicsRootShaderResourceView(f.srv_param, g.GetGPUVirtualAddress());
+            }
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
@@ -1095,6 +1205,10 @@ impl Host {
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            // An optimized clear value does not initialize a resource.
+            // Define untouched pixels so missing/degenerate draws cannot
+            // accidentally pass against contents from an earlier test.
+            list.ClearRenderTargetView(rtv, &[0.0; 4], None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
                 Height: h as f32,
@@ -1117,12 +1231,29 @@ impl Host {
                     }]),
                 );
             }
-            if d.mesh_groups > 0 {
+            if let Some(f) = fallback {
+                list.DrawInstanced(f.layout.primitives * 3, f.groups, 0, 0);
+            } else if d.mesh_groups > 0 {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {
                 list.DrawInstanced(3, 1, 0, 0);
             }
+            let mesh_readback = if capture_mesh {
+                let f = fallback.ok_or("mesh capture without a compute draw")?;
+                let geometry = geometry.as_ref().ok_or("mesh capture without geometry")?;
+                let bytes = f.layout.allocation(f.groups).ok_or("mesh scratch exceeds bound")?;
+                let readback = make(
+                    D3D12_HEAP_TYPE_READBACK, &buf_desc(bytes),
+                    D3D12_RESOURCE_STATE_COPY_DEST, None,
+                )?;
+                list.ResourceBarrier(&[transition(
+                    geometry, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                list.CopyBufferRegion(&readback, 0, geometry, 0, bytes);
+                Some((readback, bytes as usize / 4))
+            } else { None };
             list.ResourceBarrier(&[transition(
                 &target,
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -1186,8 +1317,15 @@ impl Host {
                 out.extend_from_slice(row);
             }
             readback.Unmap(0, None);
+            let records = if let Some((readback, words)) = mesh_readback {
+                let mut p = std::ptr::null_mut();
+                readback.Map(0, None, Some(&mut p)).map_err(err)?;
+                let words = std::slice::from_raw_parts(p.cast::<u32>(), words).to_vec();
+                readback.Unmap(0, None);
+                Some(words)
+            } else { None };
             drop(keep);
-            Ok(out)
+            Ok((out, records))
         }
     }
 }
@@ -1569,6 +1707,7 @@ impl Host {
                             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                                 Buffer: D3D12_BUFFER_UAV {
                                     NumElements: elements,
+                                    StructureByteStride: 0,
                                     Flags: flags,
                                     ..Default::default()
                                 },

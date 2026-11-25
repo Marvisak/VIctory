@@ -279,6 +279,8 @@ pub(crate) struct HostPipeline {
     pub(crate) compute: bool,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
+    pub(crate) fallback: Option<MeshCompute>,
+    mesh_output: Option<u32>,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
@@ -298,6 +300,55 @@ pub(crate) struct HostPipeline {
     pub(crate) marks: Option<(u32, u32)>,
 }
 
+pub(crate) struct MeshCompute {
+    pub(crate) compute: Arc<HostPipeline>,
+    pub(crate) layout: victory_shader::emit::mesh_compute::Layout,
+    pub(crate) output_param: u32,
+    pub(crate) input_param: u32,
+}
+
+/// The parts independent of graphics state, owned by the deduplicated
+/// source shader. Its synthetic stages do not retain that source shader,
+/// so sharing them cannot make an Arc ownership cycle.
+pub(crate) struct MeshStages {
+    compute: Arc<HostPipeline>,
+    vertex: Arc<Shader>,
+    layout: victory_shader::emit::mesh_compute::Layout,
+    output_param: u32,
+}
+
+impl MeshStages {
+    pub(super) fn new(ms: &Shader) -> Option<Self> {
+        use victory_shader::emit::mesh_compute;
+        let wave64_dag = cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_MESH_WAVE64_DAG").is_ok_and(|v| v == "1");
+        let translated = if wave64_dag {
+            mesh_compute::translate_with(&ms.container, true, victory_shader::emit::Options { view_marks: true })
+        } else {
+            mesh_compute::translate_with(&ms.container, false, victory_shader::emit::Options { view_marks: true })
+        };
+        let fallback = match translated {
+            Ok(f) => f,
+            Err(e) => { tracing::warn!(error = %e, ?ms, wave64_dag, "mesh compute translation refused"); return None; }
+        };
+        let synthetic = |stage, host, used| Arc::new(Shader {
+            stage, hash: if wave64_dag { format!("{}-wave64-dag-{stage}-fallback", ms.hash) }
+                else { format!("{}-{stage}-fallback", ms.hash) }, container: Vec::new(),
+            translated: std::sync::OnceLock::from(Some(Translated { host, used })),
+            mesh_compute: std::sync::OnceLock::new(),
+        });
+        let cs = synthetic("compute", fallback.compute, super::with_resources(&ms.container, fallback.vertex.clone()).ok()?.used);
+        let compute = HostPipeline::new_inner(&[cs], None, true)?;
+        let output_param = compute.mesh_output?;
+        Some(Self {
+            compute: Arc::new(compute),
+            vertex: synthetic("vertex", fallback.vertex, Vec::new()),
+            layout: fallback.layout,
+            output_param,
+        })
+    }
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -313,6 +364,10 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        Self::new_inner(shaders, g, false)
+    }
+
+    fn new_inner(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, mesh_output: bool) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -341,6 +396,12 @@ impl HostPipeline {
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
+        if let Some(ms) = mesh
+            && cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_MESH_COMPUTE").is_ok_and(|v| v == "1")
+        {
+            return Self::mesh_compute(ms, find("pixel"), g?);
+        }
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
@@ -510,6 +571,22 @@ impl HostPipeline {
                 }
                 (first, first + 1)
             });
+        // Append after every upstream memory/view-mark root parameter.
+        let mesh_output = mesh_output.then(|| {
+            let index = params.len() as u32;
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: victory_shader::emit::mesh_compute::SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+            index
+        });
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -554,6 +631,8 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                fallback: None,
+                mesh_output,
                 pso,
                 root,
                 stages: bound,
@@ -588,6 +667,8 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                fallback: None,
+                mesh_output,
                 pso,
                 root,
                 stages: bound,
@@ -612,6 +693,8 @@ impl HostPipeline {
             },
             _ => Vec::new(),
         };
+        let pulling = stages[0].0.translated()?.host.root_srvs
+            .contains(&victory_shader::emit::mesh_compute::VERTEX_SRV);
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -625,12 +708,12 @@ impl HostPipeline {
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
-            InputLayout: D3D12_INPUT_LAYOUT_DESC {
+            InputLayout: if pulling { D3D12_INPUT_LAYOUT_DESC::default() } else { D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: g.inputs.as_ptr(),
                 NumElements: g.inputs.len() as u32,
-            },
+            } },
             IBStripCutValue: g.strip_cut,
-            PrimitiveTopologyType: host_topology(g),
+            PrimitiveTopologyType: if pulling { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE } else { host_topology(g) },
             NumRenderTargets: g.targets.NumRenderTargets,
             RTVFormats: g.targets.RTFormats,
             DSVFormat: g.depth_format,
@@ -673,16 +756,34 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
+                fallback: None,
+                mesh_output,
             pso,
             root,
             stages: bound,
             name: format!("{shaders:?}"),
             rectangles: !gs.is_empty(),
-            slots: g.slots(),
-            inputs: g.elements(),
+            slots: if pulling { 0 } else { g.slots() },
+            inputs: if pulling { Vec::new() } else { g.elements() },
             marks,
         })
     }
+    fn mesh_compute(ms: &Arc<Shader>, ps: Option<&Arc<Shader>>, g: &GraphicsState) -> Option<Self> {
+        use victory_shader::emit::mesh_compute;
+        let cached = ms.mesh_compute_stages()?;
+        let mut stages = vec![cached.vertex.clone()];
+        stages.extend(ps.cloned());
+        let mut graphics = Self::new_inner(&stages, Some(g), false)?;
+        let input_param = graphics.stages[0].root_srvs.iter().find(|p| p.0 == mesh_compute::VERTEX_SRV)?.1;
+        graphics.mesh = true;
+        graphics.fallback = Some(MeshCompute {
+            compute: cached.compute.clone(), layout: cached.layout,
+            output_param: cached.output_param, input_param,
+        });
+        tracing::info!(?ms, "experimental compute and vertex mesh pipeline");
+        Some(graphics)
+    }
+
 }
 
 /// The host's topology type: the console's rectangle and quad types draw

@@ -1,5 +1,13 @@
 # VIctory
 
+> **Experimental GTX branch (`codex/gtx-upstream-update`).** Ports the compute /
+> vertex mesh fallback onto upstream `940d32f`, with image-view metadata and
+> DXIL validation fixes. GTX 1070 Ti and WARP synthetic checks pass for the
+> fallback; two known upstream shader tests still fail on the GTX. Correct
+> world rendering and playable FPS have **not** been verified on this branch.
+> See [build instructions, tests and limitations](docs/mesh-fallback.md).
+> The status below describes the upstream project, not a result on this GTX.
+
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 

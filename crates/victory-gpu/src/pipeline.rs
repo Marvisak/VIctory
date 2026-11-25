@@ -63,6 +63,8 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    mesh_compute: OnceLock<Option<host::MeshStages>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -93,6 +95,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            mesh_compute: OnceLock::new(),
         }
     }
 }
@@ -106,6 +110,9 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    pub(crate) fn mesh_compute_stages(&self) -> Option<&host::MeshStages> {
+        self.mesh_compute.get_or_init(|| host::MeshStages::new(self)).as_ref()
+    }
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
