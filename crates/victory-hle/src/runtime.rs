@@ -222,17 +222,33 @@ pub fn title() -> Title {
 /// a desktop process waits in 15.6 ms ticks unless it asks for finer ones,
 /// and Windows 11 drops that request while the window is hidden unless the
 /// process opts out. Process-wide, for the whole run.
+/// Whether `use_console_timers` should opt out of Windows 11 Efficiency Mode
+/// execution-speed throttling (`VICTORY_EFFICIENCY_MODE=1` leaves the OS its choice).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn efficiency_mode_opt_out(value: Option<&str>) -> bool {
+    value != Some("1")
+}
+
+/// Processes that sleep often (1-5 ms) lose cadence when Windows falls back
+/// to 15.6 ms timer ticks or Windows 11 throttles execution speed in
+/// Efficiency Mode. Opt out of both unless `VICTORY_EFFICIENCY_MODE=1`.
 #[cfg(windows)]
 pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
         ProcessPowerThrottling, SetProcessInformation,
     };
+    let execution = if efficiency_mode_opt_out(std::env::var("VICTORY_EFFICIENCY_MODE").ok().as_deref()) {
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+    } else {
+        0
+    };
     let keep = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | execution,
         StateMask: 0,
     };
     // SAFETY: plain process settings; `keep` outlives the call.
@@ -285,5 +301,12 @@ mod tests {
         assert_eq!(t.id, 0x639A_A8DD);
         assert_eq!(t.store_id, "9&C");
         assert_eq!(t.storage_bytes, 1024 << 20);
+    }
+
+    #[test]
+    fn efficiency_mode_opt_out_defaults_on_and_respects_env() {
+        assert!(efficiency_mode_opt_out(None));
+        assert!(efficiency_mode_opt_out(Some("0")));
+        assert!(!efficiency_mode_opt_out(Some("1")));
     }
 }
