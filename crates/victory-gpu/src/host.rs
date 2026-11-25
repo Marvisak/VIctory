@@ -103,7 +103,7 @@ pub fn on_failure(report: fn(&str) -> !) {
 /// diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     let mut text = what.to_string();
-    if let Some(host) = host() {
+    if let Some(host) = created() {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
@@ -117,6 +117,8 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
     }
     tracing::error!("{text}");
+    #[cfg(test)]
+    removal::failed(&text);
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
@@ -125,16 +127,39 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
+#[cfg(not(test))]
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
+    created()
+}
+
+/// In tests, also `None` once another test found the device removed
+/// (`removal`): the tests after it skip the host GPU.
+#[cfg(test)]
+pub(crate) fn host() -> Option<&'static Host> {
+    created().filter(|host| removal::usable(host))
+}
+
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+
+fn created() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
+        Ok(host) => {
+            #[cfg(test)]
+            removal::watch();
+            Some(host)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
         }
     })
     .as_ref()
+}
+
+/// The host, if one was made already.
+#[cfg(test)]
+fn created_yet() -> Option<&'static Host> {
+    HOST.get().and_then(Option::as_ref)
 }
 
 fn create() -> windows::core::Result<Host> {
@@ -367,6 +392,9 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
     };
     Some([info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?])
 }
+
+#[cfg(test)]
+mod removal;
 
 #[cfg(test)]
 pub(crate) mod tests {
