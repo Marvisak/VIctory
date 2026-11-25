@@ -631,6 +631,65 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn upload_pool_reuses_smallest_fit_and_enforces_caps() {
+        let mut pool = UploadPool::default();
+        assert_eq!(UploadPool::<u32>::alloc_capacity(0), Some(FIRST_UPLOAD_BUFFER));
+        assert_eq!(UploadPool::<u32>::alloc_capacity(100 << 10), Some(128 << 10));
+        assert_eq!(UploadPool::<u32>::alloc_capacity(MAX_POOLED_UPLOAD), Some(MAX_POOLED_UPLOAD));
+        assert_eq!(UploadPool::<u32>::alloc_capacity(MAX_POOLED_UPLOAD + 1), None);
+
+        assert!(pool.retain(64 << 10, 1));
+        assert!(pool.retain(256 << 10, 2));
+        assert_eq!(pool.take(32 << 10), None);
+        pool.reset();
+        assert_eq!(pool.take(32 << 10), Some(1));
+        assert_eq!(pool.take(32 << 10), Some(2));
+        assert_eq!(pool.take(1), None);
+
+        pool.reset();
+        assert_eq!(pool.take(128 << 10), Some(2));
+        assert_eq!(pool.take(1), Some(1));
+
+        let mut capped = UploadPool::default();
+        for i in 0..8u32 {
+            assert!(capped.retain(MAX_POOLED_UPLOAD, i));
+        }
+        assert!(!capped.retain(FIRST_UPLOAD_BUFFER, 99));
+        assert!(!capped.retain(MAX_POOLED_UPLOAD + 1, 100));
+    }
+
+    #[test]
+    fn list_upload_reuses_buffers_after_reset_and_skips_pooling_oversized() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let (first_buf, first_ptr) = list.upload(host, 512).unwrap();
+        let (second_buf, second_ptr) = list.upload(host, 1024).unwrap();
+        assert_ne!(first_buf.as_raw(), second_buf.as_raw());
+        assert_ne!(first_ptr, second_ptr);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+
+        let (reused_a, reused_ptr_a) = list.upload(host, 512).unwrap();
+        let (reused_b, reused_ptr_b) = list.upload(host, 64 << 10).unwrap();
+        assert_eq!(reused_a.as_raw(), first_buf.as_raw());
+        assert_eq!(reused_ptr_a, first_ptr);
+        assert_eq!(reused_b.as_raw(), second_buf.as_raw());
+        assert_eq!(reused_ptr_b, second_ptr);
+
+        let (large_buf, _) = list.upload(host, MAX_POOLED_UPLOAD + 1).unwrap();
+        assert_ne!(large_buf.as_raw(), first_buf.as_raw());
+        assert_ne!(large_buf.as_raw(), second_buf.as_raw());
+        assert_eq!(list.uploads.lock().unwrap().total_bytes, 128 << 10);
+        assert_eq!(list.deferred().uploads.len(), 1);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert!(list.deferred().uploads.is_empty());
+        list.close();
+    }
+
+    #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
         // SAFETY: plain DXGI adapter queries.
@@ -766,6 +825,7 @@ pub(crate) struct HostList {
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
+    uploads: Mutex<UploadPool<UploadBuffer>>,
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
@@ -913,6 +973,87 @@ fn node_is_list(
                 || n.strip_prefix(name)
                     .is_some_and(|rest| rest.starts_with(" ("))
         })
+}
+
+const FIRST_UPLOAD_BUFFER: u64 = 64 << 10;
+const MAX_POOLED_UPLOAD: u64 = 4 << 20;
+const MAX_UPLOAD_POOL_BYTES: u64 = 32 << 20;
+
+#[derive(Clone)]
+struct UploadBuffer {
+    resource: ID3D12Resource,
+    mapped: usize,
+}
+
+struct UploadEntry<T> {
+    capacity: u64,
+    item: T,
+}
+
+struct UploadPool<T> {
+    free: Vec<UploadEntry<T>>,
+    in_use: Vec<UploadEntry<T>>,
+    total_bytes: u64,
+}
+
+impl<T> Default for UploadPool<T> {
+    fn default() -> Self {
+        Self {
+            free: Vec::new(),
+            in_use: Vec::new(),
+            total_bytes: 0,
+        }
+    }
+}
+
+impl<T: Clone> UploadPool<T> {
+    fn alloc_capacity(size: u64) -> Option<u64> {
+        let size = size.max(1);
+        if size > MAX_POOLED_UPLOAD {
+            return None;
+        }
+        Some(
+            size.max(FIRST_UPLOAD_BUFFER)
+                .checked_next_power_of_two()
+                .unwrap_or(MAX_POOLED_UPLOAD)
+                .min(MAX_POOLED_UPLOAD),
+        )
+    }
+
+    fn take(&mut self, needed: u64) -> Option<T> {
+        let index = self
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.capacity >= needed)
+            .min_by_key(|(_, entry)| entry.capacity)
+            .map(|(index, _)| index)?;
+        let entry = self.free.swap_remove(index);
+        let item = entry.item.clone();
+        self.in_use.push(entry);
+        Some(item)
+    }
+
+    fn can_retain(&self, capacity: u64) -> bool {
+        capacity <= MAX_POOLED_UPLOAD
+            && self
+                .total_bytes
+                .checked_add(capacity)
+                .is_some_and(|total| total <= MAX_UPLOAD_POOL_BYTES)
+    }
+
+    fn retain(&mut self, capacity: u64, item: T) -> bool {
+        if !self.can_retain(capacity) {
+            return false;
+        }
+        self.total_bytes += capacity;
+        self.in_use.push(UploadEntry { capacity, item });
+        true
+    }
+
+    fn reset(&mut self) {
+        self.free.append(&mut self.in_use);
+    }
 }
 
 /// Upload chunks handed out front to back: the chunks, the one in use and
@@ -1102,6 +1243,7 @@ impl Host {
                 allocator,
                 list,
                 deferred: Mutex::default(),
+                uploads: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
@@ -1753,6 +1895,7 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        self.uploads.lock().unwrap_or_else(|e| e.into_inner()).reset();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2131,12 +2274,35 @@ impl HostList {
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
     /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().uploads.push(buffer.clone());
+        let needed = size.max(1);
+        let alloc_size = match UploadPool::<UploadBuffer>::alloc_capacity(needed) {
+            Some(bucket) => {
+                let mut pool = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(entry) = pool.take(needed) {
+                    return Some((entry.resource, entry.mapped as *mut u8));
+                }
+                if pool.can_retain(bucket) {
+                    bucket
+                } else {
+                    needed
+                }
+            }
+            None => needed,
+        };
+        let (buffer, data) = host.upload_buffer(alloc_size)?;
+        name(&buffer, || format!("list upload {alloc_size:#x}"));
+        let retained = alloc_size <= MAX_POOLED_UPLOAD
+            && self.uploads.lock().unwrap_or_else(|e| e.into_inner()).retain(
+                alloc_size,
+                UploadBuffer {
+                    resource: buffer.clone(),
+                    mapped: data as usize,
+                },
+            );
+        if !retained {
+            self.deferred().uploads.push(buffer.clone());
+        }
         Some((buffer, data))
     }
 
