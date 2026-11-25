@@ -340,6 +340,7 @@ mod tests {
     /// once, unless a worker has taken it.
     #[test]
     fn draws_go_ahead_of_early_starts() {
+        let _guard = serial();
         let p = Pending::new(Vec::new(), None);
         assert_eq!(enqueue(&p, false), Some(false));
         assert_eq!(enqueue(&p, false), None);
@@ -356,17 +357,353 @@ mod tests {
         WAITING.fetch_sub(3, Ordering::Relaxed);
     }
 
-    /// A first use queues the pipeline and, within the budget, gets the
-    /// worker's answer (here: no host pipeline for no shaders).
+    /// Runs the tests in this module that use the shared queue one at a time.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A title shader container (no code, so it never translates).
+    fn shader(stage: &'static str, hash: &str) -> Arc<Shader> {
+        Arc::new(Shader {
+            stage,
+            hash: hash.to_owned(),
+            container: Vec::new(),
+            translated: OnceLock::new(),
+        })
+    }
+
+    /// Waits for the workers to finish everything queued.
+    fn idle() {
+        while waiting() > 0 {
+            std::thread::yield_now();
+        }
+    }
+
+    /// The key of a pipeline with the default graphics state, as `f` leaves
+    /// it.
+    fn state_key(f: impl FnOnce(&mut GraphicsState)) -> String {
+        let mut g = GraphicsState::default();
+        f(&mut g);
+        Pending::new(Vec::new(), Some(Box::new(g))).key
+    }
+
+    /// Reads a synthetic pipeline-state subobject into `g`, as a stream
+    /// hands one over: its type, then its description.
+    fn sub<T>(g: &mut GraphicsState, kind: u32, value: T) {
+        #[repr(C)]
+        struct Sub<T> {
+            kind: u32,
+            value: T,
+        }
+        let sub = Sub { kind, value };
+        // SAFETY: a whole subobject of type `kind`: its description follows
+        // the type at +4, or at +8 for those holding pointers (where
+        // `repr(C)` puts them), as `GraphicsState::read` expects.
+        unsafe { g.read(kind, std::ptr::from_ref(&sub).cast()) };
+    }
+
+    /// A first use queues the pipeline for a worker (here: no host pipeline
+    /// for no shaders).
     #[test]
     fn first_use_is_made_by_a_worker() {
+        let _serial = serial();
         let p = Arc::new(Pending::new(Vec::new(), None));
         assert!(ready(&p).is_none());
         assert!(p.queued.load(Ordering::Relaxed));
-        let started = Instant::now();
-        while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
-            std::thread::yield_now();
+        assert!(p.made.wait().is_none());
+        idle();
+    }
+
+    /// The key names the shaders, so the pipelines a run drew with are found
+    /// again by the next run's early start.
+    #[test]
+    fn keys_identify_the_shaders_a_pipeline_is_made_from() {
+        let vs = shader("vertex", "0123456789abcdef");
+        let ps = shader("pixel", "fedcba9876543210");
+        let key = |shaders: Vec<Arc<Shader>>| Pending::new(shaders, None).key;
+        assert_eq!(
+            key(vec![vs.clone(), ps.clone()]),
+            key(vec![vs.clone(), ps.clone()])
+        );
+        assert_ne!(key(vec![vs.clone()]), key(vec![vs.clone(), ps.clone()]));
+        assert_ne!(
+            key(vec![vs.clone()]),
+            key(vec![shader("pixel", "0123456789abcdef")])
+        );
+        assert_ne!(
+            key(vec![vs.clone()]),
+            key(vec![shader("vertex", "fedcba9876543210")])
+        );
+        // No state at all (a compute pipeline) is not the default state.
+        assert_ne!(
+            key(vec![vs.clone()]),
+            Pending::new(vec![vs], Some(Box::new(GraphicsState::default()))).key
+        );
+        let empty = key(Vec::new());
+        assert_eq!(
+            empty.len(),
+            32,
+            "sixteen bytes, as the early list holds them"
+        );
+        assert!(empty.bytes().all(|b| b.is_ascii_hexdigit()), "{empty}");
+    }
+
+    /// Every part of the graphics state is in the key: a pipeline must never
+    /// be started from the host pipeline of another state.
+    #[test]
+    fn keys_identify_every_part_of_the_graphics_state() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::PCSTR;
+
+        // A subobject's type as the stream that holds it writes it.
+        let kind = |t: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE| t.0 as u32;
+        let base = state_key(|_| {});
+        assert_eq!(base, state_key(|_| {}));
+        let element = [D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(c"POSITION".as_ptr().cast()),
+            SemanticIndex: 0,
+            Format: DXGI_FORMAT_R32G32B32_FLOAT,
+            InputSlot: 0,
+            AlignedByteOffset: 0,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        }];
+        let changes: [(&str, String); 10] = [
+            (
+                "blend",
+                state_key(|g| {
+                    sub(
+                        g,
+                        kind(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND),
+                        D3D12_BLEND_DESC {
+                            IndependentBlendEnable: true.into(),
+                            ..Default::default()
+                        },
+                    )
+                }),
+            ),
+            (
+                "sample mask",
+                state_key(|g| {
+                    sub(
+                        g,
+                        kind(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK),
+                        0xffu32,
+                    )
+                }),
+            ),
+            (
+                "rasterizer",
+                state_key(|g| {
+                    sub(
+                        g,
+                        kind(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER),
+                        D3D12_RASTERIZER_DESC {
+                            CullMode: D3D12_CULL_MODE_FRONT,
+                            ..Default::default()
+                        },
+                    )
+                }),
+            ),
+            (
+                "depth-stencil",
+                state_key(|g| {
+                    sub(
+                        g,
+                        kind(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL),
+                        D3D12_DEPTH_STENCIL_DESC {
+                            DepthFunc: D3D12_COMPARISON_FUNC_GREATER,
+                            ..Default::default()
+                        },
+                    )
+                }),
+            ),
+            (
+                "input layout",
+                state_key(|g| {
+                    sub(
+                        g,
+                        kind(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT),
+                        D3D12_INPUT_LAYOUT_DESC {
+                            pInputElementDescs: element.as_ptr(),
+                            NumElements: element.len() as u32,
+                        },
+                    )
+                }),
+            ),
+            (
+                "strip cut",
+                state_key(|g| {
+                    sub(
+                        g,
+                        kind(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE),
+                        D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF,
+                    )
+                }),
+            ),
+            (
+                "topology",
+                state_key(|g| {
+                    sub(
+                        g,
+                        kind(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY),
+                        D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
+                    )
+                }),
+            ),
+            (
+                "render targets",
+                state_key(|g| {
+                    sub(
+                        g,
+                        kind(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS),
+                        D3D12_RT_FORMAT_ARRAY {
+                            NumRenderTargets: 1,
+                            RTFormats: [DXGI_FORMAT_R8G8B8A8_UNORM; 8],
+                        },
+                    )
+                }),
+            ),
+            (
+                "depth format",
+                state_key(|g| {
+                    sub(
+                        g,
+                        kind(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT),
+                        DXGI_FORMAT_D32_FLOAT,
+                    )
+                }),
+            ),
+            (
+                "samples",
+                state_key(|g| {
+                    sub(
+                        g,
+                        kind(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC),
+                        DXGI_SAMPLE_DESC {
+                            Count: 4,
+                            Quality: 0,
+                        },
+                    )
+                }),
+            ),
+        ];
+        for (what, key) in changes {
+            assert_ne!(key, base, "the key must change with the {what}");
         }
-        assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A second use of a refused pipeline is answered at once: it is neither
+    /// queued nor waited for again.
+    #[test]
+    fn a_made_pipeline_is_not_queued_again() {
+        let _serial = serial();
+        idle();
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        assert!(p.made.set(None).is_ok());
+        assert!(ready(&p).is_none());
+        assert!(ready(&p).is_none());
+        assert!(!p.queued.load(Ordering::Relaxed), "it was never queued");
+        assert_eq!(waiting(), 0);
+    }
+
+    /// A first use queues the pipeline once, and its making leaves nothing
+    /// waiting (the frame line's count comes back to zero).
+    #[test]
+    fn queueing_once_leaves_nothing_waiting() {
+        let _serial = serial();
+        idle();
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        start(&p, false);
+        start(&p, false);
+        assert!(p.queued.load(Ordering::Relaxed));
+        p.made.wait();
+        idle();
+    }
+
+    /// A pipeline whose shaders do not translate is refused once, not queued
+    /// for again on every draw.
+    #[test]
+    fn a_pipeline_whose_shaders_do_not_translate_is_refused_once() {
+        let _serial = serial();
+        idle();
+        let p = Arc::new(Pending::new(
+            vec![shader("vertex", "0123456789abcdef")],
+            None,
+        ));
+        assert!(ready(&p).is_none());
+        assert!(p.made.wait().is_none());
+        assert!(ready(&p).is_none());
+        idle();
+    }
+
+    /// A pipeline is marked used on its first draw, even if building it is
+    /// refused, so later runs know to start it early.
+    #[test]
+    fn a_refused_pipeline_is_marked_used_on_first_use() {
+        let _serial = serial();
+        idle();
+        let p = Arc::new(Pending::new(
+            vec![shader("vertex", "aaaaaaaaaaaaaaaa")],
+            None,
+        ));
+        assert!(ready(&p).is_none());
+        assert!(p.made.wait().is_none());
+        assert!(p.used.load(Ordering::Relaxed));
+        idle();
+    }
+
+    /// At creation a pipeline that was never drawn with in an earlier run is
+    /// not queued early.
+    #[test]
+    fn early_does_not_queue_an_unseen_pipeline() {
+        let _serial = serial();
+        idle();
+        let unused = Arc::new(Pending::new(
+            vec![shader("vertex", "2222222222222222")],
+            None,
+        ));
+        early(&unused);
+        assert!(
+            !unused.queued.load(Ordering::Relaxed),
+            "it was never drawn with"
+        );
+        idle();
+    }
+
+    /// A pipeline that is being made says so (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_pipeline_being_made_says_so() {
+        let p = Pending::new(Vec::new(), None);
+        assert_eq!(missing(&p).as_deref(), Some("being made"));
+    }
+
+    /// A refused pipeline names the shaders that do not translate
+    /// (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_refused_pipeline_names_the_shaders_that_do_not_translate() {
+        let vs = shader("vertex", "0123456789abcdef");
+        let ps = shader("pixel", "fedcba9876543210");
+        assert!(vs.translated.set(None).is_ok());
+        let p = Pending::new(vec![vs, ps], None);
+        assert!(p.made.set(None).is_ok());
+        assert_eq!(missing(&p).as_deref(), Some("vertex 0123456789abcdef"));
+    }
+
+    /// A pipeline refused for its state, whose shaders all translate, names
+    /// its shaders instead (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_pipeline_refused_for_its_state_says_refused() {
+        let p = Pending::new(vec![shader("vertex", "0123456789abcdef")], None);
+        assert!(p.made.set(None).is_ok());
+        let why = missing(&p).expect("a reason");
+        assert!(why.starts_with("refused "), "{why}");
+        assert!(why.contains("vertex 0123456789abcdef"), "{why}");
     }
 }
