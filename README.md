@@ -46,6 +46,22 @@ What each part does today and what it still needs:
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
+## Local validation (2026-11-25)
+
+The GPU texture alias test now expects a shared host texture only when the
+host accepts the requested castable format. It checks the copy fallback when
+that format is not accepted; the focused test passes on the available
+adapters.
+
+On the current development machine (NVIDIA GeForce GTX 1650 and AMD Radeon
+integrated graphics), `cargo check --workspace --all-targets` and
+`cargo clippy --workspace --all-targets` pass. `cargo test --workspace` has
+six shader GPU comparison failures, which also reproduce when shader tests
+run sequentially: heap-buffer stride, texture gather, lane permute, dot
+product, 64-bit image atomic, and nested waterfall. These results have not
+been checked on the RX 6700 XT used for the rendering status above. No title
+run was performed during this check.
+
 ## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
