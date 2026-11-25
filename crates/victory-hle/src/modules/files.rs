@@ -102,6 +102,7 @@ fn root_wide(root: &Path) -> Vec<u16> {
 
 const SEPARATORS: [u16; 2] = [b'\\' as u16, b'/' as u16];
 const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+const OBJECT_PREFIX: [u16; 4] = [b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16];
 
 /// Host paths from this length on take the `\\?\` form, which lifts the
 /// host's MAX_PATH limit (248 characters for a directory, 260 for a file).
@@ -145,9 +146,12 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
 /// The host path, NUL-terminated, for `path` (without its NUL) if it is on
 /// a virtual drive.
 pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
-    let (prefix, rest) = match path.strip_prefix(&VERBATIM[..]) {
-        Some(rest) => (&VERBATIM[..], rest),
-        None => (&[][..], path),
+    let (prefix, rest) = if let Some(rest) = path.strip_prefix(&VERBATIM[..]) {
+        (&VERBATIM[..], rest)
+    } else if let Some(rest) = path.strip_prefix(&OBJECT_PREFIX[..]) {
+        (&OBJECT_PREFIX[..], rest)
+    } else {
+        (&[][..], path)
     };
     let &[letter, colon, ..] = rest else {
         return None;
@@ -166,7 +170,18 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
         return Some(out);
     }
     let mut out = prefix.to_vec();
-    out.extend_from_slice(root);
+    if !prefix.is_empty()
+        && let Some(r) = root.strip_prefix(&VERBATIM[..])
+    {
+        out.extend_from_slice(r);
+    } else if !prefix.is_empty()
+        && let Some(unc) = root.strip_prefix(&[b'\\' as u16; 2][..])
+    {
+        out.extend("UNC\\".encode_utf16());
+        out.extend_from_slice(unc);
+    } else {
+        out.extend_from_slice(root);
+    }
     // `X:` and `X:name` are relative to the root.
     if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
         out.push(b'\\'.into());
@@ -225,7 +240,11 @@ fn narrow(path: *const c_char) -> Option<Vec<u16>> {
     // SAFETY: the title passes a NUL-terminated path.
     let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
     // The drive part is ASCII in every code page; decode only candidates.
-    match bytes.strip_prefix(br"\\?\").unwrap_or(bytes) {
+    let rest = bytes
+        .strip_prefix(br"\\?\")
+        .or_else(|| bytes.strip_prefix(br"\??\"))
+        .unwrap_or(bytes);
+    match rest {
         [letter, b':', ..] if letter.is_ascii_alphabetic() => {}
         _ => {
             tracing::debug!(path = %String::from_utf8_lossy(bytes), "title path");
@@ -784,6 +803,10 @@ mod tests {
             tr(format!(r"\\?\{letter}:/a/b")),
             Some(format!(r"\\?\{root}\a\b"))
         );
+        assert_eq!(
+            tr(format!(r"\??\{letter}:/a/b")),
+            Some(format!(r"\??\{root}\a\b"))
+        );
         assert_eq!(tr(r"C:\Windows".into()), None);
         assert_eq!(tr("relative/path".into()), None);
         assert_eq!(tr(String::new()), None);
@@ -955,5 +978,39 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    #[test]
+    fn object_prefix_paths_reach_the_host_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let letter = mount(dir.path()).unwrap();
+        std::fs::write(dir.path().join("intro.bin"), b"ok").unwrap();
+
+        let obj_wide = w(&format!(r"\??\{letter}:\intro.bin"));
+        let translated = translate(&obj_wide[..obj_wide.len() - 1]).unwrap();
+        assert!(text(&translated).starts_with(r"\??\"));
+        assert_eq!(
+            std::fs::read(text(&translated)).ok().as_deref(),
+            Some(&b"ok"[..])
+        );
+
+        const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+        assert_ne!(
+            GetFileAttributesW(obj_wide.as_ptr()),
+            INVALID_FILE_ATTRIBUTES
+        );
+
+        let obj_narrow = format!("\\??\\{letter}:\\intro.bin\0");
+        assert!(narrow(obj_narrow.as_ptr().cast()).is_some());
+        assert_ne!(
+            GetFileAttributesA(obj_narrow.as_ptr().cast()),
+            INVALID_FILE_ATTRIBUTES
+        );
+
+        let verbatim_mount = mount(Path::new(&format!(r"\\?\{}", dir.path().display()))).unwrap();
+        let vm_wide = w(&format!(r"\??\{verbatim_mount}:\intro.bin"));
+        let vm_translated = text(&translate(&vm_wide[..vm_wide.len() - 1]).unwrap());
+        assert!(vm_translated.starts_with(r"\??\"));
+        assert!(!vm_translated.contains(r"\\?\"));
     }
 }
