@@ -2883,11 +2883,12 @@ impl<'a> Lower<'a> {
         r
     }
 
-    /// Whether a quad-local read must reach discarded lanes: after a pixel's
-    /// discard they are the host's helpers, which only quad reads see (wave
-    /// reads give 0 from them on AMD).
+    /// Whether a quad-local read must reach helper lanes: in a pixel shader,
+    /// always. At a triangle's edge the quad's other pixels are helpers (and so
+    /// are discarded ones), which only quad reads see (wave reads give 0 from
+    /// them on AMD).
     fn helpers_read(&self, quad: bool) -> bool {
-        quad && self.s.pixel && !self.x.st.discards.is_empty()
+        quad && self.s.pixel
     }
 
     /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:

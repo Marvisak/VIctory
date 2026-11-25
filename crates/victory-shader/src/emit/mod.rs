@@ -1438,7 +1438,10 @@ mod tests {
         if !dxc.exists() {
             return None;
         }
-        let file = std::env::temp_dir().join(format!("victory-interp-{}.dxil", std::process::id()));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file = std::env::temp_dir()
+            .join(format!("victory-interp-{}-{id}.dxil", std::process::id()));
         std::fs::write(&file, container).ok()?;
         let out = std::process::Command::new(dxc)
             .arg("-dumpbin")
@@ -1544,6 +1547,62 @@ mod tests {
             "clamp saturates the result"
         );
         assert!(!low.contains("dx.op.unary.f32(i32 7"));
+    }
+
+    #[test]
+    fn pixel_quad_swizzle_without_discard_uses_quad_reads() {
+        // ds_swizzle_b32 v1, v0 offset:swizzle(QUAD_PERM,1,0,3,2) + exp mrt0 + s_endpgm
+        let words = [
+            0xD8D4_80B1u32,
+            0x0100_0000u32,
+            0xF800_180Fu32,
+            0x0101_0101u32,
+            0xBF81_0000u32,
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = super::container::signature(
+            &[SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            }],
+            false,
+        );
+        let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        assert!(st.discards.is_empty());
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let dxil = super::emit(&c, &native, &p, &st, &io, &res).unwrap().dxil;
+        let Some(text) = dump_dxil(&dxil) else {
+            return;
+        };
+        assert!(
+            text.contains("quadReadLaneAt"),
+            "pixel quad swizzle without discard must use quadReadLaneAt"
+        );
     }
 
     /// A pixel shader reading channel z of an input whose element starts at
