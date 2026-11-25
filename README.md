@@ -117,7 +117,9 @@ it with the PC build on your GPU instead of the console build, get the
 and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
 `Kits/FidelityFX/signedbin` folder, which holds
 `amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
-upscaler for your GPU (the log says so), the title's own DLLs run.
+upscaler for your GPU (the log says so), the title's own DLLs run. Series X
+mode uses the title's own upscaler; a diagnostics build switches it to
+FidelityFX with `VICTORY_UPSCALER` and `VICTORY_FFX_SCALE` (below).
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
@@ -216,6 +218,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+| `VICTORY_UPSCALER=7` | Series X uses FidelityFX; set with the next |
+| `VICTORY_FFX_SCALE=<scale>` | render scale of FidelityFX (`0.5`: 1080p for a 4K output) |
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.

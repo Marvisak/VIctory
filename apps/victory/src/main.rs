@@ -8,6 +8,8 @@ mod inspect;
 mod prebuild;
 mod run;
 mod shader;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod title_patch;
 mod translate;
 
 use std::num::NonZeroUsize;
