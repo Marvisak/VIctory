@@ -98,13 +98,20 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
         if !out.status.success() {
             return Ok(None);
         }
-        Ok(Some(
-            out.stdout
-                .split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).replace('\\', "/"))
-                .collect(),
-        ))
+        // Git already uses '/' as the directory separator, even on Windows.
+        // On POSIX a literal backslash is part of the name. Replacing it, or
+        // replacing invalid UTF-8, would make us read a different file.
+        let files = out
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                std::str::from_utf8(s)
+                    .map(str::to_owned)
+                    .context("asset policy cannot check a non-UTF-8 filename listed by git")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(files))
     };
     if staged {
         return git(&[
@@ -128,18 +135,25 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
         return Ok(tracked);
     }
     // Not a git repository: walk everything except build output.
-    Ok(walkdir::WalkDir::new(root)
+    walkdir::WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| !matches!(e.file_name().to_str(), Some("target" | ".git")))
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
-        .filter_map(|e| {
-            e.path()
+        .map(|e| {
+            let relative = e
+                .path()
                 .strip_prefix(root)
-                .ok()
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .context("resolving asset-policy file path")?;
+            let path = relative.to_str().with_context(|| {
+                format!(
+                    "asset policy cannot check a non-UTF-8 filename: {}",
+                    relative.display()
+                )
+            })?;
+            Ok(path.replace(std::path::MAIN_SEPARATOR, "/"))
         })
-        .collect())
+        .collect()
 }
 
 /// All problems with one file. Pure, for testing.
@@ -223,6 +237,92 @@ fn longest_hex_literal_run(content: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::check;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_backslashes_do_not_hide_file_contents() {
+        // A backslash is part of a POSIX filename, not a directory separator.
+        // Also create the slash spelling as clean text: scanning that file
+        // instead must not hide the synthetic binary in the actual file.
+        for repository in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            if repository {
+                git(root.path(), &["init", "-q"]);
+            }
+            std::fs::create_dir(root.path().join("literal")).unwrap();
+            std::fs::write(root.path().join("literal/name.rs"), "// clean\n").unwrap();
+            std::fs::write(root.path().join(r"literal\name.rs"), [0]).unwrap();
+
+            assert!(
+                super::run(root.path(), false).is_err(),
+                "binary contents escaped inspection (repository={repository})"
+            );
+            if repository {
+                git(root.path(), &["add", "--", r"literal\name.rs"]);
+                assert!(super::run(root.path(), true).is_err());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_names_are_refused_instead_of_substituted() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        for repository in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            if repository {
+                git(root.path(), &["init", "-q"]);
+            }
+            let name = OsStr::from_bytes(b"nonutf8-\xff.rs");
+            std::fs::write(root.path().join(name), [0]).unwrap();
+            // This is the name from_utf8_lossy would substitute. Its clean
+            // contents must never stand in for the differently named file.
+            std::fs::write(root.path().join("nonutf8-\u{fffd}.rs"), "// clean\n").unwrap();
+
+            let error = super::run(root.path(), false).unwrap_err();
+            assert!(error.to_string().contains("non-UTF-8"), "{error:#}");
+            if repository {
+                git(root.path(), &["add", "--all"]);
+                let error = super::run(root.path(), true).unwrap_err();
+                assert!(error.to_string().contains("non-UTF-8"), "{error:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_unicode_paths_are_checked_in_both_modes() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        let name = "source-\u{6771}\u{4eac}.rs";
+        let path = root.path().join(name);
+        std::fs::write(&path, "// clean\n").unwrap();
+        git(root.path(), &["add", "--", name]);
+        super::run(root.path(), false).unwrap();
+        super::run(root.path(), true).unwrap();
+        std::fs::write(&path, [0]).unwrap();
+        assert!(super::run(root.path(), false).is_err());
+        // Staged mode reads the clean index version, not the worktree.
+        super::run(root.path(), true).unwrap();
+        git(root.path(), &["add", "--", name]);
+        assert!(super::run(root.path(), true).is_err());
+    }
 
     /// Enforces the policy wherever tests run, even in clones without the hook.
     #[test]
