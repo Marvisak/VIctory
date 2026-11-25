@@ -391,7 +391,7 @@ mod tests {
             let mut out = std::ptr::null();
             assert_eq!(query(root, iid, &mut out), S_OK);
             assert!(std::ptr::eq(out, root));
-            assert_eq!(object::release(out), 1, "the original reference remains");
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(out, 0x10)(out), 1, "the original reference remains");
         }
         let mut out = std::ptr::null();
         assert_eq!(query(root, &OTHER_IID, &mut out), E_NOINTERFACE);
@@ -401,7 +401,7 @@ mod tests {
             query(root, &ROOT_SIGNATURE_IIDS[0], std::ptr::null_mut()),
             E_POINTER
         );
-        assert_eq!(object::release(root), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(root, 0x10)(root), 0);
     }
 
     #[test]
@@ -428,7 +428,7 @@ mod tests {
             E_NOINTERFACE
         );
         assert!(device.is_null());
-        assert_eq!(object::release(root), 0);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(root, 0x10)(root), 0);
     }
 
     /// One 32-bit constant at b0, serialized by the host, then created.
