@@ -3010,3 +3010,530 @@ fn lds_bytes_and_halves_match_the_hardware() {
         }),
     ]));
 }
+
+// ---- instructions the families above leave out ----
+
+/// An opcode and what it computes.
+type Op<F> = (u16, F);
+type Wide2 = fn(u64, u64) -> u64;
+type WideShift = fn(u64, u32) -> u64;
+type Half2 = fn(u16, u16) -> u16;
+type Rounding = fn(f64) -> f64;
+
+/// SOPK: a signed 16-bit immediate.
+const fn sopk(op: u16, sdst: u8, imm: u16) -> u32 {
+    0xB000_0000 | (op as u32) << 23 | (sdst as u32) << 16 | imm as u32
+}
+
+/// Two 64-bit operands (the first in a and b, the second in c and d).
+fn wide(i: [u32; 4]) -> (u64, u64) {
+    (
+        u64::from(i[1]) << 32 | u64::from(i[0]),
+        u64::from(i[3]) << 32 | u64::from(i[2]),
+    )
+}
+
+/// 64-bit operands whose halves carry into each other.
+fn wide_inputs() -> Vec<[u32; 4]> {
+    let halves = [0u32, 1, 0x8000_0000, 0xFFFF_FFFF, 0x1234_5678];
+    halves
+        .iter()
+        .flat_map(|&a| triples(&[a], &halves, &halves))
+        .flat_map(|i| halves.map(|d| [i[0], i[1], i[2], d]))
+        .collect()
+}
+
+/// `op_word` writes s[20:21] (out in v5 and v6); SCC in v7 where `f` gives it.
+fn wide_out(
+    op_word: u32,
+    inputs: Vec<[u32; 4]>,
+    f: impl Fn([u32; 4]) -> (u64, Option<bool>) + 'static,
+) -> Probe {
+    let mut body = vec![op_word];
+    if f([0; 4]).1.is_some() {
+        body.push(sop2(0x0A, 22, int(1), int(0)));
+        body.push(vop1(0x01, 7, s(22)));
+    }
+    body.extend([vop1(0x01, 5, s(20)), vop1(0x01, 6, s(21))]);
+    scalar(body, inputs, move |i| {
+        let (r, scc) = f(i);
+        let mut out = vec![r as u32, (r >> 32) as u32];
+        out.extend(scc.map(u32::from));
+        out
+    })
+}
+
+/// Scalar logic in both widths, 64-bit shifts and bit counts, carries,
+/// immediates, bit sets and tests (RDNA2 ISA, SOP1/SOP2/SOPC/SOPK).
+#[test]
+fn more_scalar_alu_matches_the_hardware() {
+    let ab = pairs(&U32_EDGES[..24], &U32_EDGES[..24]);
+    let mut p = Vec::new();
+    // Logic: the 32-bit opcode, its 64-bit one the next.
+    let logic: [Op<Wide2>; 8] = [
+        (0x0E, |a, b| a & b),
+        (0x10, |a, b| a | b),
+        (0x12, |a, b| a ^ b),
+        (0x14, |a, b| a & !b),
+        (0x16, |a, b| a | !b),
+        (0x18, |a, b| !(a & b)),
+        (0x1A, |a, b| !(a | b)),
+        (0x1C, |a, b| !(a ^ b)),
+    ];
+    for (op, f) in logic {
+        p.push(scalar_out(
+            sop2(op, 20, s(16), s(17)),
+            ab.clone(),
+            move |i| {
+                let r = f(u64::from(i[0]), u64::from(i[1])) as u32;
+                (r, Some(r != 0))
+            },
+        ));
+        p.push(wide_out(
+            sop2(op + 1, 20, s(16), s(18)),
+            wide_inputs(),
+            move |i| {
+                let (a, b) = wide(i);
+                (f(a, b), Some(f(a, b) != 0))
+            },
+        ));
+    }
+    p.push(sop1_probe(0x07, unary(U32_EDGES), |a| (!a, Some(!a != 0))));
+    p.push(wide_out(sop1(0x08, 20, s(16)), wide_inputs(), |i| {
+        let r = !wide(i).0;
+        (r, Some(r != 0))
+    }));
+    p.push(wide_out(sop1(0x04, 20, s(16)), wide_inputs(), |i| {
+        (wide(i).0, None)
+    }));
+    // 64-bit shifts read the count's low six bits.
+    let shifted: Vec<[u32; 4]> = [
+        [0u32, 0],
+        [1, 0],
+        [0, 0x8000_0000],
+        [0x1234_5678, 0xDEAD_BEEF],
+        [u32::MAX; 2],
+    ]
+    .iter()
+    .flat_map(|&[a, b]| [0u32, 1, 31, 32, 33, 63, 64, 0xFFFF_FFC1].map(|n| [a, b, n, OLD]))
+    .collect();
+    let shifts: [Op<WideShift>; 3] = [
+        (0x1F, |a, n| a << n),
+        (0x21, |a, n| a >> n),
+        (0x23, |a, n| ((a as i64) >> n) as u64),
+    ];
+    for (op, f) in shifts {
+        p.push(wide_out(
+            sop2(op, 20, s(16), s(18)),
+            shifted.clone(),
+            move |i| {
+                let r = f(wide(i).0, i[2] & 63);
+                (r, Some(r != 0))
+            },
+        ));
+    }
+    p.push(scalar_out(sop1(0x10, 20, s(16)), wide_inputs(), |i| {
+        let n = wide(i).0.count_ones();
+        (n, Some(n != 0))
+    }));
+    p.push(scalar_out(sop1(0x14, 20, s(16)), wide_inputs(), |i| {
+        let a = wide(i).0;
+        (if a == 0 { u32::MAX } else { a.trailing_zeros() }, None)
+    }));
+    // First bit that differs from the sign, from the top; -1 for 0 and -1.
+    p.push(sop1_probe(0x17, unary(U32_EDGES), |a| {
+        (ffbh(if a >> 31 != 0 { !a } else { a }), None)
+    }));
+    // Subtractions, high products, shifted adds.
+    let arith: [Op<F2>; 7] = [
+        (0x01, u32::wrapping_sub),
+        (0x03, u32::wrapping_sub),
+        (0x36, |a, b| {
+            ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32
+        }),
+        (0x2E, |a, b| (a << 1).wrapping_add(b)),
+        (0x2F, |a, b| (a << 2).wrapping_add(b)),
+        (0x30, |a, b| (a << 3).wrapping_add(b)),
+        (0x31, |a, b| (a << 4).wrapping_add(b)),
+    ];
+    for (op, f) in arith {
+        p.push(scalar_out(
+            sop2(op, 20, s(16), s(17)),
+            ab.clone(),
+            move |i| (f(i[0], i[1]), None),
+        ));
+    }
+    // Carry and borrow through SCC, the last one read back.
+    for (first, second, subtract) in [(0x00, 0x04, false), (0x01, 0x05, true)] {
+        let body = [
+            sop2(first, 20, s(16), s(17)),
+            sop2(second, 21, s(18), s(19)),
+            sop2(0x0A, 22, int(1), int(0)),
+            vop1(0x01, 5, s(20)),
+            vop1(0x01, 6, s(21)),
+            vop1(0x01, 7, s(22)),
+        ];
+        p.push(scalar(body, wide_inputs(), move |i| {
+            let (lo, c) = match subtract {
+                true => i[0].overflowing_sub(i[1]),
+                false => i[0].overflowing_add(i[1]),
+            };
+            let (a, b, c) = (i64::from(i[2]), i64::from(i[3]), i64::from(c));
+            let t = if subtract { a - b - c } else { a + b + c };
+            vec![lo, t as u32, u32::from(!(0..1 << 32).contains(&t))]
+        }));
+    }
+    // Immediates: sign-extended.
+    for imm in [0u16, 1, 0x7FFF, 0x8000, 0xFFFF] {
+        let k = i32::from(imm as i16) as u32;
+        let with = move |op: u16| {
+            [
+                sop1(0x03, 20, s(16)),
+                sopk(op, 20, imm),
+                vop1(0x01, 5, s(20)),
+            ]
+        };
+        p.push(scalar(with(0x0F), unary(U32_EDGES), move |i| {
+            vec![i[0].wrapping_add(k)]
+        }));
+        p.push(scalar(with(0x10), unary(U32_EDGES), move |i| {
+            vec![i[0].wrapping_mul(k)]
+        }));
+        p.push(scalar(with(0x00), unary(&[7]), move |_| vec![k]));
+    }
+    // One bit of the destination cleared or set; one bit tested.
+    for (op, set) in [(0x1Bu16, false), (0x1D, true)] {
+        let body = [
+            sop1(0x03, 20, s(17)),
+            sop1(op, 20, s(16)),
+            vop1(0x01, 5, s(20)),
+        ];
+        p.push(scalar(body, ab.clone(), move |i| {
+            let bit = 1 << (i[0] & 31);
+            vec![if set { i[1] | bit } else { i[1] & !bit }]
+        }));
+    }
+    for (op, want) in [(0x0Cu16, 0), (0x0D, 1)] {
+        let body = [
+            sopc(op, s(16), s(17)),
+            sop2(0x0A, 20, int(1), int(0)),
+            vop1(0x01, 5, s(20)),
+        ];
+        p.push(scalar(body, ab.clone(), move |i| {
+            vec![u32::from(i[0] >> (i[1] & 31) & 1 == want)]
+        }));
+    }
+    for (op, equal) in [(0x12u16, true), (0x13, false)] {
+        let body = [
+            sopc(op, s(16), s(18)),
+            sop2(0x0A, 20, int(1), int(0)),
+            vop1(0x01, 5, s(20)),
+        ];
+        p.push(scalar(body, wide_inputs(), move |i| {
+            let (a, b) = wide(i);
+            vec![u32::from((a == b) == equal)]
+        }));
+    }
+    // s_cselect_b64.
+    p.push(scalar(
+        [
+            sopc(0x06, s(16), s(17)),
+            sop2(0x0B, 20, s(16), s(18)),
+            vop1(0x01, 5, s(20)),
+            vop1(0x01, 6, s(21)),
+        ],
+        wide_inputs(),
+        |i| {
+            if i[0] == i[1] {
+                vec![i[0], i[1]]
+            } else {
+                vec![i[2], i[3]]
+            }
+        },
+    ));
+    assert_clean(check(&p));
+}
+
+/// `v_perm_b32`: each byte of `sel` picks a byte of {a, b} (b the low
+/// four), a byte of copies of a sign bit (8-11), 0 (12) or 0xFF (RDNA2 ISA).
+fn perm(a: u32, b: u32, sel: u32) -> u32 {
+    let x = u64::from(a) << 32 | u64::from(b);
+    let byte = |k: u32| -> u32 {
+        match sel >> (8 * k) & 0xFF {
+            n @ 0..=7 => (x >> (8 * n)) as u32 & 0xFF,
+            n @ 8..=11 => 0xFF * ((x >> (16 * (n - 8) + 15)) as u32 & 1),
+            12 => 0,
+            _ => 0xFF,
+        }
+    };
+    (0..4).map(|k| byte(k) << (8 * k)).sum()
+}
+
+/// The sum of absolute differences of `n`-bit fields.
+fn sad(a: u32, b: u32, n: u32) -> u32 {
+    let mask = (u64::MAX >> (64 - n)) as u32;
+    (0..32 / n)
+        .map(|k| (a >> (n * k) & mask).abs_diff(b >> (n * k) & mask))
+        .fold(0, u32::wrapping_add)
+}
+
+/// High 24-bit products, 64-bit multiply-adds, differences, permutes, a
+/// swap, logic and the reversed borrow (RDNA2 ISA).
+#[test]
+fn more_integers_match_the_hardware() {
+    let ab = pairs(U32_EDGES, U32_EDGES);
+    let abc = triples(U32_EDGES, U32_EDGES, &[0, 1, 0xFFFF_FFFF, 0x1234_5678]);
+    let vop2_int = |op: u16, f: F2| {
+        probe([vop2(op, 5, v(1), 2)], ab.clone(), INT, move |i| {
+            vec![f(i[0], i[1])]
+        })
+    };
+    let vop3_int = |op: u16, f: F3, inputs: &Vec<[u32; 4]>| {
+        probe(
+            vop3(op, 5, [v(1), v(2), v(3)], NONE),
+            inputs.clone(),
+            INT,
+            move |i| vec![f(i[0], i[1], i[2])],
+        )
+    };
+    let bytes = [
+        0x1234_5678u32,
+        0x80FF_7F01,
+        0,
+        0xFFFF_FFFF,
+        0x89AB_CDEF,
+        0x0080_8000,
+    ];
+    let selectors = [
+        0x0302_0100u32,
+        0x0706_0504,
+        0x0B0A_0908,
+        0x0F0E_0D0C,
+        0x0C0D_FF80,
+        0x0004_0105,
+        0x1003_0B07,
+    ];
+    let mut p = vec![
+        vop2_int(0x0A, |a, b| ((sext24(a) * sext24(b)) >> 32) as u32),
+        vop2_int(0x0C, |a, b| {
+            ((u64::from(a & 0xFF_FFFF) * u64::from(b & 0xFF_FFFF)) >> 32) as u32
+        }),
+        vop2_int(0x1C, |a, b| a | b),
+        vop2_int(0x1E, |a, b| !(a ^ b)),
+        probe([vop1(0x37, 5, v(1))], unary(U32_EDGES), INT, |i| {
+            vec![!i[0]]
+        }),
+        vop3_int(0x15A, |a, b, c| sad(a, b, 8).wrapping_add(c), &abc),
+        vop3_int(0x15B, |a, b, c| (sad(a, b, 8) << 16).wrapping_add(c), &abc),
+        vop3_int(0x15C, |a, b, c| sad(a, b, 16).wrapping_add(c), &abc),
+        vop3_int(0x15D, |a, b, c| sad(a, b, 32).wrapping_add(c), &abc),
+        vop3_int(0x344, perm, &triples(&bytes, &bytes, &selectors)),
+        // v5 (d) and v1 change places.
+        probe(
+            [vop1(0x65, 5, v(1)), vop1(0x01, 6, v(1))],
+            ab.clone(),
+            INT,
+            |i| vec![i[0], i[3]],
+        ),
+    ];
+    // The addend is v[3:4] (c and d).
+    for (op, signed) in [(0x176u16, false), (0x177, true)] {
+        p.push(probe(
+            vop3b(op, 5, 106, [v(1), v(2), v(3)], false),
+            abc.clone(),
+            INT,
+            move |i| {
+                let product = match signed {
+                    true => (i64::from(i[0] as i32) * i64::from(i[1] as i32)) as u64,
+                    false => u64::from(i[0]) * u64::from(i[1]),
+                };
+                let r = product.wrapping_add(wide(i).1);
+                vec![r as u32, (r >> 32) as u32]
+            },
+        ));
+    }
+    // v_subrev_co_u32 into VCC, v_subrev_co_ci_u32 from it.
+    let mut subrev = vop3b(0x319, 5, 106, [v(1), v(2), 0], false).to_vec();
+    subrev.push(vop2(0x2A, 6, v(3), 4));
+    subrev.extend(vop3(0x101, 7, [int(0), int(1), VCC], NONE));
+    p.push(probe(subrev, abc, INT, |i| {
+        let (r, borrow) = i[1].overflowing_sub(i[0]);
+        let t = i64::from(i[3]) - i64::from(i[2]) - i64::from(borrow);
+        vec![r, t as u32, u32::from(t < 0)]
+    }));
+    assert_clean(check(&p));
+}
+
+/// 16-bit integers (VOP3): the operands' low halves; shifts read four bits
+/// of their count; the destination's high half stays (RDNA2 ISA).
+#[test]
+fn sixteen_bit_integers_match_the_hardware() {
+    let halves: Vec<u32> = [
+        0u32, 1, 2, 0xF, 0x10, 0x11, 0x7F, 0xFF, 0x1234, 0x7FFF, 0x8000, 0x8001, 0xFFFF,
+    ]
+    .iter()
+    .map(|h| 0xABCD_0000 | h)
+    .collect();
+    let ops: [Op<Half2>; 10] = [
+        (0x303, u16::wrapping_add),
+        (0x304, u16::wrapping_sub),
+        (0x305, u16::wrapping_mul),
+        (0x307, |n, x| x >> (n & 15)),
+        (0x308, |n, x| ((x as i16) >> (n & 15)) as u16),
+        (0x314, |n, x| x << (n & 15)),
+        (0x309, |a, b| a.max(b)),
+        (0x30A, |a, b| (a as i16).max(b as i16) as u16),
+        (0x30B, |a, b| a.min(b)),
+        (0x30C, |a, b| (a as i16).min(b as i16) as u16),
+    ];
+    let p: Vec<Probe> = ops
+        .into_iter()
+        .map(|(op, f)| {
+            probe(
+                vop3(op, 5, [v(1), v(2), 0], NONE),
+                pairs(&halves, &halves),
+                INT,
+                move |i| vec![i[3] & 0xFFFF_0000 | u32::from(f(i[0] as u16, i[1] as u16))],
+            )
+        })
+        .collect();
+    assert_clean(check(&p));
+}
+
+/// f16 rounding to integers (denormals kept, zeros signed) and
+/// `v_subrev_f16`; the literal forms of the f32 multiply-adds, over
+/// operands whose result is exact however it is rounded.
+#[test]
+fn more_floats_match_the_hardware() {
+    let mut xs = half_pairs();
+    xs.extend(unary(&[
+        0x0001, 0x8001, 0x03FF, 0x83FF, 0x3800, 0xB800, 0x3E00, 0xBE00, 0x4100,
+    ]));
+    let rounds: [Op<Rounding>; 4] = [
+        (0x5B, f64::floor),
+        (0x5C, f64::ceil),
+        (0x5D, f64::trunc),
+        (0x5E, f64::round_ties_even),
+    ];
+    let mut p: Vec<Probe> = rounds
+        .into_iter()
+        .map(|(op, f)| {
+            probe([vop1(op, 5, v(1))], xs.clone(), F16, move |i| {
+                vec![i[3] & 0xFFFF_0000 | to_f16(f(h(i[0])), false)]
+            })
+        })
+        .collect();
+    p.push(probe([vop2(0x34, 5, v(1), 2)], half_pairs(), F16, |i| {
+        vec![i[3] & 0xFFFF_0000 | to_f16(h(i[1]) - h(i[0]), false)]
+    }));
+    let exact = [
+        0x0000_0000u32,
+        0x8000_0000,
+        0x0000_0001,
+        0x807F_FFFF,
+        0x3F80_0000,
+        0xBF80_0000,
+        0x4000_0000,
+        0x3F00_0000,
+        0x7F80_0000,
+        0xFF80_0000,
+        0x7FC0_0000,
+        0xC2C8_0000,
+    ];
+    for k in [0x4040_0000u32, 0xBF80_0000, 0x0000_0001] {
+        for (mk, ak, f) in [(0x20u16, 0x21u16, mad as F3), (0x2C, 0x2D, fma as F3)] {
+            p.push(probe(
+                [vop2(mk, 5, v(1), 2), k],
+                pairs(&exact, &exact),
+                F32,
+                move |i| vec![f(i[0], k, i[1])],
+            ));
+            p.push(probe(
+                [vop2(ak, 5, v(1), 2), k],
+                pairs(&exact, &exact),
+                F32,
+                move |i| vec![f(i[0], i[1], k)],
+            ));
+        }
+    }
+    assert_clean(check(&p));
+}
+
+/// The eight relations of an integer compare's opcode (RDNA2 ISA, VOPC).
+fn relation<T: PartialOrd>(op: u16, a: T, b: T) -> bool {
+    match op & 7 {
+        0 => false,
+        1 => a < b,
+        2 => a == b,
+        3 => a <= b,
+        4 => a > b,
+        5 => a != b,
+        6 => a >= b,
+        _ => true,
+    }
+}
+
+/// Integer compares of every width and the f16 compares, as VCC.
+#[test]
+fn more_compares_match_the_hardware() {
+    let ab = pairs(U32_EDGES, U32_EDGES);
+    let halves: Vec<u32> = [
+        0u32, 1, 0x7F, 0x80, 0x3C00, 0xBC00, 0x7BFF, 0x7C00, 0xFC00, 0x7E00, 0x7FFF, 0x8000,
+        0x8001, 0xFFFF,
+    ]
+    .iter()
+    .map(|h| 0xABCD_0000 | h)
+    .collect();
+    let half_ab = pairs(&halves, &halves);
+    let vcc = |word: u32, inputs: &Vec<[u32; 4]>, f: Box<dyn Fn([u32; 4]) -> bool>| {
+        probe(with_vcc(word), inputs.clone(), INT, move |i| {
+            vec![u32::from(f(i))]
+        })
+    };
+    // A 64-bit compare's operands: v[1:2] and v[3:4].
+    let wide_ab = wide_inputs();
+    let mut p = Vec::new();
+    for op in 1..7u16 {
+        p.push(vcc(
+            vopc(0x80 + op, v(1), 2),
+            &ab,
+            Box::new(move |i| relation(op, i[0] as i32, i[1] as i32)),
+        ));
+        p.push(vcc(
+            vopc(0xC0 + op, v(1), 2),
+            &ab,
+            Box::new(move |i| relation(op, i[0], i[1])),
+        ));
+        p.push(vcc(
+            vopc(0x88 + op, v(1), 2),
+            &half_ab,
+            Box::new(move |i| relation(op, i[0] as i16, i[1] as i16)),
+        ));
+        p.push(vcc(
+            vopc(0xA8 + op, v(1), 2),
+            &half_ab,
+            Box::new(move |i| relation(op, i[0] as u16, i[1] as u16)),
+        ));
+        p.push(vcc(
+            vopc(0xA0 + op, v(1), 3),
+            &wide_ab,
+            Box::new(move |i| relation(op, wide(i).0 as i64, wide(i).1 as i64)),
+        ));
+        p.push(vcc(
+            vopc(0xE0 + op, v(1), 3),
+            &wide_ab,
+            Box::new(move |i| relation(op, wide(i).0, wide(i).1)),
+        ));
+    }
+    // f16: the predicates of the f32 compares, the second eight 0x20 on.
+    let wider = |x: u32| from_f16(x & 0xFFFF).to_bits();
+    for op in 1..15u16 {
+        let code = if op < 8 { 0xC8 + op } else { 0xE0 + op };
+        p.push(vcc(
+            vopc(code, v(1), 2),
+            &half_ab,
+            Box::new(move |i| compare(op, wider(i[0]), wider(i[1]))),
+        ));
+    }
+    assert_clean(check(&p));
+}
