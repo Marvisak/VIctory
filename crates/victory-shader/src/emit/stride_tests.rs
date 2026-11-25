@@ -245,11 +245,13 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
     assert_eq!(shader.root_srvs, [VIEW_STRIDES]);
     // 32 elements of 12 bytes: (100 + e, 200 + e, 300 + e).
     let data: Vec<u32> = (0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
+    // A raw view, as the host makes every heap buffer view: the shader
+    // reads it by byte address, the stride coming from the table alone.
     let views = [
         View::RawUav(32),
         View::Buffer {
             data: &data,
-            stride: Stride::Structured(12),
+            stride: Stride::Raw,
         },
     ];
     let _one = super::valu_tests::ONE_AT_A_TIME

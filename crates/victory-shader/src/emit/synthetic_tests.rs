@@ -207,9 +207,10 @@ fn gathers_at_a_level_match_the_hardware() {
     }
     let views = [
         View::Mipped(24, 16, 4, &texels),
+        // Read by byte address (`offen`): a raw view, as the host makes.
         View::Buffer {
             data: &input,
-            stride: Stride::Structured(16),
+            stride: Stride::Raw,
         },
         View::RawUav(32 * 12),
     ];
