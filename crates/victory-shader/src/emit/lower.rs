@@ -1390,7 +1390,7 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
-            rovs: self.s.flags & flags::ROVS != 0,
+            rovs: self.s.m.uses().rovs,
             #[cfg(test)]
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
@@ -5295,7 +5295,6 @@ impl<'a> Lower<'a> {
         props: (u32, u32),
     ) -> Result<V, Why> {
         let props = if self.pops && props.0 & 0x1000 != 0 {
-            self.s.flags |= flags::ROVS;
             (props.0 | 0x2000, props.1)
         } else {
             props
@@ -8957,8 +8956,6 @@ impl<'a> Lower<'a> {
             let mip = if name == "image_load_mip" {
                 addr_val(self, coords)?
             } else if uav {
-                // Our declarations have four channels.
-                self.s.flags |= flags::TYPED_UAV_LOADS;
                 iu
             } else {
                 self.s.m.i32(0)
@@ -9747,9 +9744,6 @@ impl<'a> Lower<'a> {
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
-            }
-            if uav {
-                self.s.flags |= flags::TYPED_UAV_LOADS;
             }
             let h = self.handle(site, src, false, (10 | u, 0x409))?;
             typed_h = Some(h);
