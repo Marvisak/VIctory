@@ -525,10 +525,8 @@ impl Shadow {
             let _writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
         }
-        // Equal to title memory now: taken, unless it holds the page in part.
-        if from == page && to == page + PAGE {
-            t.taken(&[page / PAGE]);
-        }
+        // Equal to title memory now (on what the copy holds of the page).
+        t.taken(&[page / PAGE]);
         written.map_or(0, |_| n)
     }
 
@@ -1640,6 +1638,33 @@ pub(crate) mod tests {
         assert_eq!([read(PAGE + 10), read(PAGE + 20)], [0xbb, 0x77]);
         copy.copy_back(p, PAGE + 16);
         unregister(p, p as u64);
+    }
+
+    /// A copy that holds its first page only in part: after a marked
+    /// copy-back puts the shaders' bytes into title memory, the page is
+    /// guarded again, so the next submission's marked writes there go back.
+    #[test]
+    fn a_partly_held_page_is_taken_after_its_marked_copy_back() {
+        let p = crate::watch::tests::pool(2);
+        let (start, len) = (p + 0x100, PAGE);
+        register(p, start as u64, len as u64);
+        let Some(copy) = find(start as u64, len as u64) else {
+            unregister(p, start as u64);
+            return; // no host GPU here
+        };
+        let t = copy.tracked.as_ref().expect("a pool is write-watched");
+        copy.update(start, len);
+        copy.writing(start, len, true);
+        copy.write_host((p + 0x200) as u64, &[0xaa]);
+        assert!(copy.copy_back_marked(p) > 0, "the shader's byte goes back");
+        // SAFETY: a byte of our pool.
+        assert_eq!(unsafe { ((p + 0x200) as *const u8).read_volatile() }, 0xaa);
+        assert!(!t.changed(p / PAGE), "the copy equals title memory on its part of the page");
+        // The next submission writes the page again.
+        copy.writing(start, len, true);
+        copy.write_host((p + 0x300) as u64, &[0xbb]);
+        assert!(copy.copy_back_marked(p) > 0, "its marked writes are not dropped");
+        unregister(p, start as u64);
     }
 
     /// Mark bits are handed out in runs and come back joined.
