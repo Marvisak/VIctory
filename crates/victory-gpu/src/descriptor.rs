@@ -106,6 +106,74 @@ impl Heap {
             .as_ref()
     }
 
+    /// Resolve a capped table from an owned snapshot of its title views.
+    /// No driver calls or recording work run under the view registry lock.
+    #[cfg(windows)]
+    pub(crate) fn with_texture_table<R>(
+        &self,
+        table: u64,
+        count: u32,
+        f: impl FnOnce(&[TextureView<'_>]) -> R,
+    ) -> Option<R> {
+        let records = self.texture_table_records(table, count)?;
+        let mut entries = Vec::with_capacity(records.len());
+        for record in &records {
+            let View::Shader(resource, Some(desc)) = &record.view else { unreachable!() };
+            let (resource, desc) = host::texture_srv(*resource as This, desc)?;
+            entries.push(TextureView {
+                slot: record.slot,
+                record: record.generation,
+                view: &record.view,
+                resource,
+                desc,
+            });
+        }
+        Some(f(&entries))
+    }
+
+    #[cfg(windows)]
+    fn texture_table_records(&self, table: u64, count: u32) -> Option<Vec<TextureRecord>> {
+        if self.desc.kind != VIEWS_KIND || count == 0 || count > host::DYNAMIC {
+            return None;
+        }
+        if !(table.checked_sub(self.start)?).is_multiple_of(32) {
+            return None;
+        }
+        self.index(table.checked_add(u64::from(count - 1) * 32)?)?;
+
+        // Resource release can invalidate registry entries, so the pins
+        // must always be dropped after the lock, including on failure.
+        let mut records = Vec::new();
+        let registry = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        for slot in 0..count {
+            let at = table + u64::from(slot) * 32;
+            // SAFETY: the checked span lies in the title descriptor heap.
+            let [tag, id, generation] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+            if [tag, id, generation] == [0, 0, 0] {
+                continue;
+            }
+            let (view, current) = registry.list.get(id as usize)?;
+            if tag != VIEW_TAG || *current != generation {
+                return None;
+            }
+            let View::Shader(resource, Some(_)) = view else { return None };
+            let resource = *resource as This;
+            // SAFETY: destruction invalidates the descriptor under VIEWS
+            // before freeing the resource. Do not retain a zero count.
+            if resource.is_null() || !unsafe { object::try_add_ref(resource) } {
+                return None;
+            }
+            records.push(TextureRecord {
+                slot,
+                generation: u64::from(generation) << 32 | u64::from(id),
+                view: view.clone(),
+                resource,
+            });
+        }
+        drop(registry);
+        (!records.is_empty()).then_some(records)
+    }
+
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
@@ -273,19 +341,6 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
         if let (Some(Some(host)), VIEWS_KIND) = (heap.host.get(), heap.desc.kind) {
             host.evict(textures);
         }
-    }
-}
-
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
-#[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(first, n);
     }
 }
 
@@ -468,6 +523,32 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     free: Vec::new(),
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+
+/// One descriptor generation and a temporary reference to its resource.
+#[cfg(windows)]
+struct TextureRecord {
+    slot: u32,
+    generation: u64,
+    view: View,
+    resource: This,
+}
+
+#[cfg(windows)]
+impl Drop for TextureRecord {
+    fn drop(&mut self) {
+        crate::resource::resource_release(self.resource);
+    }
+}
+
+/// A texture SRV resolved from a live title view generation.
+#[cfg(windows)]
+pub(crate) struct TextureView<'a> {
+    pub(crate) slot: u32,
+    record: u64,
+    pub(crate) view: &'a View,
+    resource: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    desc: windows::Win32::Graphics::Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC,
+}
 
 impl View {
     /// The resource objects the view names.
@@ -911,6 +992,65 @@ pub(crate) mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_table_rejects_non_texture_records_and_invalid_spans() {
+        let mut title_heap = std::ptr::null();
+        let desc = HeapDesc { kind: VIEWS_KIND, count: 4, flags: SHADER_VISIBLE, nodes: 0 };
+        let placed = Placement { address: 0, size: 0 };
+        assert_eq!(create(desc, placed, &mut title_heap), S_OK);
+        let heap = heap(title_heap);
+        let start = heap.start;
+        create_cbv(std::ptr::null(), &[0x1000, 1, 256, 0], start + 32);
+        fn reject(_: &[TextureView<'_>]) {
+            panic!("ineligible table was passed to the cache");
+        }
+        assert_eq!(heap.with_texture_table(start, 4, reject), None);
+        assert_eq!(heap.with_texture_table(start + 1, 1, reject), None);
+        assert_eq!(heap.with_texture_table(start + 96, 2, reject), None);
+        assert_eq!(heap.with_texture_table(start + 64, 2, reject), None);
+        assert_eq!(release(title_heap), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_table_snapshot_holds_the_resource_after_replacement() {
+        let null = std::ptr::null();
+        let mut title_heap = null;
+        let desc = HeapDesc { kind: VIEWS_KIND, count: 2, flags: SHADER_VISIBLE, nodes: 0 };
+        let placed = Placement { address: 0, size: 0 };
+        assert_eq!(create(desc, placed, &mut title_heap), S_OK);
+        let heap = heap(title_heap);
+        let start = heap.start;
+
+        let buffer_desc = [1u32, 0, 0, 0, 64, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let properties = [1u32, 0, 0, 0, 0];
+        let iid = guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut resource = null;
+        assert_eq!(crate::resource::create_committed(
+            null, properties.as_ptr().cast(), 0, buffer_desc.as_ptr().cast(),
+            0, null.cast(), &iid, &mut resource,
+        ), S_OK);
+        let original = View::Shader(resource as usize, Some([0; 10]));
+        record(start, original.clone());
+        create_cbv(null, &[0x1000, 1, 256, 0], start + 32);
+        assert!(heap.texture_table_records(start, 2).is_none());
+        assert_eq!(object::refs(resource), 1);
+        record(start + 32, original.clone());
+        let snapshot = heap.texture_table_records(start, 1).unwrap();
+        let release_resource = slot::<extern "system" fn(This) -> u32>(resource, 0x10);
+        assert_eq!(release_resource(resource), 1);
+        // Replacing a title slot while resolving the snapshot takes the
+        // registry lock again and leaves the captured generation intact.
+        create_cbv(null, &[0x1000, 1, 256, 0], start);
+        assert_eq!(snapshot[0].view, original);
+        assert_eq!(view(start + 32), Some(original));
+        assert!(crate::resource::buffer_bytes(resource).is_some());
+        drop(snapshot);
+        assert_eq!(view(start + 32), None);
+        assert_eq!(release(title_heap), 0);
     }
 
     #[test]

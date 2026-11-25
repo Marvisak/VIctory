@@ -71,12 +71,14 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// (native heap generation, title table, record hash) to dynamic slot.
+    fresh_tables: std::collections::HashMap<(usize, u64, u64), u32>,
+    /// Keep shared ranges while this recording can execute or replay.
+    /// Submissions finish before the title can reset the recording.
+    shared_tables:
+        std::collections::HashMap<usize, std::sync::Arc<crate::descriptor::host::SharedTextureTable>>,
+    /// List-local reservations released on reset or release.
+    dynamic: Vec<crate::descriptor::host::DynamicRange>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// The title-memory page table made for this list (`crate::memory`)
@@ -104,17 +106,6 @@ struct Fixed {
     /// Render target and depth view handles.
     targets: Option<(Vec<u64>, u64)>,
     topology: bool,
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            match (heap, crate::memory::heap()) {
-                (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
-                _ => crate::descriptor::release_dynamic(heap, first, n),
-            }
-        }
-    }
 }
 
 /// The key of our own view heap (`crate::memory::heap`) among the title's.
@@ -924,29 +915,28 @@ impl State {
             let len = if shadow.marked() { shadow.left(address) } else { shadow.left(address).min(1 << 20) };
             shadow.gpu_writes(list, address, len, true);
         }
-        let (key, host) = match self.heaps[0] {
-            0 => (MEMORY_HEAP, crate::memory::heap()),
-            h => (
-                std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize,
-                crate::descriptor::heap(h as This).host(),
-            ),
+        let host = match self.heaps[0] {
+            0 => crate::memory::heap(),
+            h => crate::descriptor::heap(h as This).host(),
         };
         let Some(host) = host else {
             not_run("a root view without a host view heap");
             return None;
         };
+        let key = host.identity();
         let copy = std::sync::Arc::as_ptr(&shadow) as usize;
         if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
             return Some((index, offset));
         }
         let (run_heap, next, end) = self.root_run;
         if run_heap != key || next >= end {
-            let Some(first) = host.dynamic(ROOT_VIEW_RUN) else {
+            let Some(range) = host.reserve_dynamic(ROOT_VIEW_RUN) else {
                 once!("no dynamic slots for root views: dropped");
                 not_run("no dynamic slots for root views");
                 return None;
             };
-            self.dynamic.push((key, first, ROOT_VIEW_RUN));
+            let first = range.first;
+            self.dynamic.push(range);
             self.root_run = (key, first, first + ROOT_VIEW_RUN);
         }
         let index = self.root_run.1;
@@ -1033,11 +1023,11 @@ impl State {
             return;
         };
         let Some(visible) = heap.host() else { return };
-        let Some(slot) = visible.dynamic(1) else {
+        let Some(range) = visible.reserve_dynamic(1) else {
             return;
         };
-        self.dynamic
-            .push((std::ptr::from_ref(heap) as usize, slot, 1));
+        let slot = range.first;
+        self.dynamic.push(range);
         visible.make_at(slot, &view);
         let at = host.cpu_view();
         let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
@@ -1284,6 +1274,25 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
+            if entries.iter().all(|u| u.kind == ResourceType::Srv)
+                && let Some(shared) = heap
+                    .with_texture_table(table, n, |views| {
+                        let shared = host.shared_textures(n, views)?;
+                        for u in &entries {
+                            let offset = u.table_offset_dwords / 8;
+                            if let Ok(i) = views.binary_search_by_key(&offset, |view| view.slot) {
+                                readable(list, u, views[i].view, true);
+                            }
+                        }
+                        Some(shared)
+                    })
+                    .flatten()
+            {
+                made.push((slot, shared.first() * 32));
+                let identity = std::sync::Arc::as_ptr(&shared) as usize;
+                self.shared_tables.entry(identity).or_insert(shared);
+                continue;
+            }
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -1293,7 +1302,7 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
-                (table, h.finish())
+                (host.identity(), table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -1305,7 +1314,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(range) = host.reserve_dynamic(n) else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
                 // view: a texture or null descriptor read as a buffer gives
@@ -1314,9 +1323,9 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
+            let first = range.first;
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            self.dynamic.push(range);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {

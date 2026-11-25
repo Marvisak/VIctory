@@ -1100,6 +1100,15 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host()
 }
 
+/// A materialized texture whose backing cannot be evicted or reused.
+#[cfg(windows)]
+pub(crate) fn fixed_table_texture(this: This) -> Option<std::sync::Arc<HostTexture>> {
+    if this.is_null() {
+        return None;
+    }
+    made(resource(this)).filter(|copy| copy.key.is_none() && copy.placement.is_none())
+}
+
 /// The host description of a title texture: the same, without the
 /// console's layout and flags, in a format the host takes for its use.
 #[cfg(windows)]
@@ -2132,7 +2141,7 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
         out,
     )
 }
-extern "system" fn resource_release(this: This) -> u32 {
+pub(crate) extern "system" fn resource_release(this: This) -> u32 {
     object::release_boxed::<Resource>(this)
 }
 /// Memory is always mapped (subresources are not told apart yet); a null

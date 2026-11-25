@@ -71,6 +71,17 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Takes a reference without resurrecting an object already being destroyed.
+/// The caller keeps its allocation alive while attempting the increment.
+#[cfg(windows)]
+pub(crate) unsafe fn try_add_ref(this: This) -> bool {
+    // SAFETY: the caller keeps the object header allocated for this call.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        if n == 0 { None } else { n.checked_add(1) }
+    }).is_ok()
+}
+
 /// An object's reference count.
 pub(crate) fn refs(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.

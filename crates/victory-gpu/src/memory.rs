@@ -488,7 +488,7 @@ impl Shared {
         // SAFETY: a live buffer.
         let gpu = unsafe { table.GetGPUVirtualAddress() };
         Some(Shared {
-            host: std::ptr::from_ref(heap) as usize,
+            host: heap.identity(),
             table,
             data: data as usize,
             gpu,
@@ -567,7 +567,7 @@ fn layout(key: usize) -> Arc<Layout> {
 pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
     let layout = with_heap(key, |heap| {
         let mut shared = shared();
-        let host = std::ptr::from_ref(heap) as usize;
+        let host = heap.identity();
         let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
         let now = crate::shadow::generation();
         if s.generation != now {
@@ -614,7 +614,7 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
 pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     let table = with_heap(key, |heap| {
         let mut shared = shared();
-        let host = std::ptr::from_ref(heap) as usize;
+        let host = heap.identity();
         if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host) {
             list.keep(&s.table);
             return Some(s.gpu);
