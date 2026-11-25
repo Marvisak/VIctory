@@ -89,6 +89,9 @@ compiles none of those either; the library belongs to the GPU and driver it
 was made on. Run again, it skips what is there in seconds; stopped
 early, it keeps what it made.
 
+For a build to keep rather than iterate on, build with `--profile ship`
+(`target\ship\victory.exe`).
+
 Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
 it with the PC build on your GPU instead of the console build, get the
 [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
