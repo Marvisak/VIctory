@@ -242,6 +242,85 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// Whether `host_format` is a host fallback promotion for `title_format`
+/// when the host adapter rejects RTV or UAV creation on `title_format`.
+#[cfg(windows)]
+pub(crate) fn promoted_format(title_format: u32, host_format: u32) -> bool {
+    matches!((title_format, host_format), (67, 26) | (115, 87) | (86, 87))
+}
+
+/// Host render-target format matching [`host_texture`] promotion when
+/// `format` does not support RTVs on the host adapter.
+#[cfg(windows)]
+pub(crate) fn rtv_host_format(format: u32) -> u32 {
+    use std::mem::size_of_val;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+        D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
+    let f = pc_format(format);
+    let Some(host) = crate::host::host() else {
+        return f;
+    };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(f as i32),
+        ..Default::default()
+    };
+    // SAFETY: a plain query into a struct of its size.
+    let supported = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    }
+    .is_ok()
+        && support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0;
+    if supported {
+        return f;
+    }
+    match f {
+        67 => 26,
+        86 | 115 => 87,
+        _ => f,
+    }
+}
+
+/// The host's render-target and typed-UAV support bits for `format`: zero
+/// without a host GPU (or a failed query).
+#[cfg(windows)]
+fn format_support(format: u32) -> i32 {
+    use std::mem::size_of_val;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
+    let Some(host) = crate::host::host() else {
+        return 0;
+    };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(pc_format(format) as i32),
+        ..Default::default()
+    };
+    // SAFETY: a plain query into a struct of its size.
+    if unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    }
+    .is_ok()
+    {
+        support.Support1.0
+    } else {
+        0
+    }
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -1269,8 +1348,7 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     let td = unsafe { t.texture.GetDesc() };
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
     d.flags & USES & !flags == 0
-        && (family(d.format) == family(own)
-            || t.castable.iter().any(|&c| family(c) == family(d.format)))
+        && (family(d.format) == family(own) || t.castable.contains(&d.format))
 }
 
 /// Whether `this`'s host texture is still its memory's (not replaced by one
@@ -1296,15 +1374,53 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     use windows::core::Interface;
+    const RENDER_TARGET: u32 = 1;
     let host = crate::host::host()?;
+    let mut d = *d;
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    let mut clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
         value
     });
+    // A host that refuses a title format's RTV or UAV gets a promoted
+    // format of the same shape, so views of one memory share this texture.
+    let typeless = family(d.format) == d.format && family(d.format + 1) == d.format;
+    if !typeless {
+        let mut support = format_support(d.format);
+        let need_rtv = d.flags & RENDER_TARGET != 0
+            && support & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 == 0;
+        let need_uav = d.flags & UNORDERED != 0
+            && support & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 == 0;
+        let promoted = match d.format {
+            67 if need_rtv || (need_uav && d.flags & !UNORDERED != 0) => 26,
+            115 if need_rtv || need_uav => 87,
+            86 if need_rtv => 87,
+            _ => 0,
+        };
+        if promoted != 0 {
+            d.format = promoted;
+            if let Some(v) = clear_value.as_mut() {
+                v[0] = promoted;
+            }
+            support = format_support(promoted);
+        }
+        if d.flags & UNORDERED != 0
+            && support & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 == 0
+        {
+            d.flags &= !UNORDERED;
+        }
+        if d.flags & RENDER_TARGET != 0
+            && support & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 == 0
+        {
+            d.flags &= !RENDER_TARGET;
+        }
+        if d.flags & (RENDER_TARGET | DEPTH) == 0 {
+            clear_value = None;
+        }
+    }
     let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -1315,7 +1431,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     // In a heap of textures if it fits there (`crate::placement`).
     // SAFETY: the description has the host layout (checked size).
-    let plain = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+    let plain = unsafe { std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
     let mut placement = None;
     if clear_value.is_none()
         && crate::placement::fits(&host.device, &plain)
@@ -1395,7 +1511,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             host.device.CreateCommittedResource(
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
-                std::ptr::from_ref(d).cast(),
+                std::ptr::from_ref(&d).cast(),
                 D3D12_RESOURCE_STATES(initial as i32),
                 clear_value,
                 &mut texture,
@@ -2513,6 +2629,26 @@ mod tests {
         assert!(!bc1.contains(&70) && !bc1.contains(&98) && !bc1.contains(&17));
         assert!(castable(98).contains(&95) && castable(98).contains(&77));
         assert!(castable(53).contains(&56) && !castable(53).contains(&55));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_texture_handles_unsupported_rtv_and_uav_formats() {
+       
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let tex = |format, flags| ResourceDesc { flags, ..texture(64, 64, format, 1) };
+        for (format, flags) in [(67, 5), (67, 4), (86, 5), (115, 1)] {
+            let clear = [format, 0, 0, 0, 0];
+            assert!(
+                make_texture(&tex(format, flags), 0, clear.as_ptr().cast()).is_some(),
+                "format {format} flags {flags}"
+            );
+        }
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     #[test]

@@ -31,7 +31,6 @@ use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
 use crate::resource::lane_of;
-
 /// A per-lane boolean: a node of [`Bools`]. Equal functions are equal nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Bool(u32);
@@ -40,7 +39,6 @@ impl Bool {
     pub const FALSE: Bool = Bool(0);
     pub const TRUE: Bool = Bool(1);
 }
-
 /// What a variable of [`Bools`] stands for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Atom {
@@ -60,7 +58,6 @@ pub enum Atom {
     /// A constant mask other than all lanes or none.
     Constant(u64),
 }
-
 /// Reduced ordered binary decision diagrams over [`Atom`]s.
 #[derive(Debug, Clone)]
 pub struct Bools {
@@ -74,11 +71,9 @@ pub struct Bools {
     ids: Map<Atom, u32>,
     overflow: bool,
 }
-
 /// The tables below have small integer keys; SipHash dominated run time.
 type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
 type Set<K> = HashSet<K, BuildHasherDefault<Fx>>;
-
 /// A set of what a walk has met: a list scan while it is small (most lane
 /// masks are a handful of nodes), a hash set once it grows.
 struct Seen<T> {
@@ -97,7 +92,6 @@ impl<T> Default for Seen<T> {
 
 impl<T: Copy + Eq + std::hash::Hash> Seen<T> {
     const SCAN: usize = 32;
-
     /// Adds `x`; false if it was already in.
     fn insert(&mut self, x: T) -> bool {
         if self.set.is_empty() {
@@ -113,7 +107,6 @@ impl<T: Copy + Eq + std::hash::Hash> Seen<T> {
         self.set.insert(x)
     }
 }
-
 /// FxHash's multiply-rotate step.
 #[derive(Default)]
 struct Fx(u64);
@@ -143,13 +136,12 @@ impl Hasher for Fx {
 }
 
 const TERMINAL: u32 = u32::MAX;
-const MAX_NODES: usize = 1 << 21;
+const MAX_NODES: usize = 1 << 19;
+const MAX_MEMO: usize = 1 << 18;
 /// Case splits [`Bools::meet`] makes before it gives up.
 const MAX_MEET: usize = 1 << 16;
 /// Cap the `ite` memo table so complex shaders cannot trigger multi-tens-of-MB
 /// HashMap resizes (e.g. 35 MB at 2^21 buckets) under concurrent compilation.
-const MAX_MEMO: usize = 1 << 18;
-
 impl Bools {
     fn new() -> Self {
         Bools {
@@ -165,21 +157,18 @@ impl Bools {
             overflow: false,
         }
     }
-
     /// The atom tested at the top of `b` and the results when it is false
     /// and true; `None` for the constants.
     pub fn node(&self, b: Bool) -> Option<(Atom, Bool, Bool)> {
         let (v, lo, hi) = self.nodes[b.0 as usize];
         (v != TERMINAL).then(|| (self.atoms[v as usize], lo, hi))
     }
-
     /// The atoms `b` depends on, in variable order.
     pub fn support(&self, b: Bool) -> Vec<Atom> {
         let mut vars = self.vars(b);
         vars.sort_unstable();
         vars.into_iter().map(|v| self.atoms[v as usize]).collect()
     }
-
     /// The variables `b` tests, in the order a depth-first walk meets them.
     /// Each node is visited once: scanning lists of every node and variable
     /// seen made this quadratic in the size of `b`.
@@ -209,6 +198,9 @@ impl Bools {
     }
 
     fn mk(&mut self, v: u32, lo: Bool, hi: Bool) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         if lo == hi {
             return lo;
         }
@@ -225,7 +217,6 @@ impl Bools {
         self.unique.insert((v, lo, hi), b);
         b
     }
-
     /// Cofactors of `b` for `v`, which is `b`'s top variable or above it.
     fn split(&self, b: Bool, v: u32) -> (Bool, Bool) {
         match self.nodes[b.0 as usize] {
@@ -281,7 +272,6 @@ impl Bools {
         let nb = self.not(b);
         self.ite(a, nb, b)
     }
-
     /// Whether some lane can satisfy every `(b, holds)` of `all` at once:
     /// `b` where `holds`, its negation where not. Yes when the search grows
     /// too large to finish.
@@ -289,7 +279,6 @@ impl Bools {
         let mut budget = MAX_MEET;
         self.meet_in(all.to_vec(), &mut budget, &mut HashSet::new())
     }
-
     /// `refuted`: conditions no lane meets, so a split reaching them again
     /// stops at once (diagrams sharing most atoms reach the same ones often).
     fn meet_in(
@@ -329,7 +318,6 @@ impl Bools {
         }
         met
     }
-
     /// The value `atom` has in every lane meeting `facts` (as [`Bools::meet`]
     /// takes them), if they decide it.
     pub fn decides(&self, facts: &[(Bool, bool)], atom: Atom) -> Option<bool> {
@@ -348,7 +336,6 @@ impl Bools {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
     }
-
     /// `b` with every atom born at reverse-postorder index `from` or later
     /// existentially quantified: what still holds once those are redefined.
     fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
@@ -372,7 +359,6 @@ impl Bools {
         memo.insert(b, r);
         r
     }
-
     /// `b` with every variable in `values` (sorted by variable) replaced by
     /// its value. Nothing below a node testing a later variable than the
     /// last of them changes.
@@ -400,7 +386,6 @@ impl Bools {
         }
         r
     }
-
     /// `b` with each atom that `known` decides replaced by its value. The
     /// atoms are replaced together, in one walk of `b`: cofactors for
     /// different variables commute, and a walk per atom made this cost the
@@ -423,7 +408,6 @@ impl Bools {
         self.restrict(b, &values, &mut Map::default())
     }
 }
-
 /// How a lane leaves a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaneExit {
@@ -438,7 +422,6 @@ pub enum LaneExit {
     End,
     Indirect,
 }
-
 /// A [`Program`] as one lane runs it: same blocks, per-lane branches.
 #[derive(Debug, Clone)]
 pub struct Structured {
@@ -483,12 +466,10 @@ impl Structured {
         .copied()
     }
 }
-
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     structure_as(program, true)
 }
-
 /// The per-lane form with a pixel's discarded lanes taken out of the live
 /// mask, as the console does: wrong for derivatives after a discard, but
 /// what a program needs whose discarded lanes would read values no
@@ -513,7 +494,6 @@ fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderEr
         l.reset();
     }
 }
-
 /// A lane mask by the values of its low and high dword (both the low one in
 /// wave32).
 type Key = (Value, Value);
@@ -553,7 +533,6 @@ struct Lanes<'a> {
     /// instruction.
     kills: HashSet<(usize, usize)>,
 }
-
 /// A mask join taken as `value` in every lane that reaches `block`: each
 /// incoming mask held (or failed) on its edge.
 struct Join {
@@ -642,7 +621,6 @@ impl<'a> Lanes<'a> {
         }
         Ok(l)
     }
-
     /// What lane `lane` of VGPR value `v` holds when `v_writelane_b32` put
     /// an SGPR there: `Ok(None)` for a phi in `seen` (being resolved).
     fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Value>, ()> {
@@ -694,7 +672,6 @@ impl<'a> Lanes<'a> {
         self.when.fill(None);
         self.active.clear();
     }
-
     /// Lane masks, branch conditions and forward-edge knowledge, block by
     /// block in reverse postorder; returns EXEC at each instruction reading it.
     fn masks_in_order(&mut self) -> Vec<Vec<Option<Bool>>> {
@@ -709,6 +686,8 @@ impl<'a> Lanes<'a> {
             self.masks.insert((lo, hi), Bool::TRUE);
             self.active.insert(lo);
         }
+        let idom = crate::ir::idoms(&p.blocks, &self.order, &self.index);
+        let mut exec_out: Vec<Option<Bool>> = vec![None; p.blocks.len()];
         let mut execs: Vec<Vec<Option<Bool>>> =
             p.blocks.iter().map(|b| vec![None; b.insts.len()]).collect();
         for n in 0..self.order.len() {
@@ -728,8 +707,28 @@ impl<'a> Lanes<'a> {
                     self.active.insert(phi.value);
                 }
             }
-            // EXEC where known in this block (read or written so far).
-            let mut now = None;
+            // EXEC at block entry (live-in from entry/phi or unique reaching dominator),
+            // updated as instructions in this block read or write EXEC.
+            let exec_phi = p.blocks[b]
+                .phis
+                .iter()
+                .find(|phi| phi.reg == Reg::S(EXEC))
+                .map(|phi| phi.value);
+            let exec_hi_phi = p.blocks[b]
+                .phis
+                .iter()
+                .find(|phi| p.wave64 && phi.reg == Reg::S(EXEC + 1))
+                .map(|phi| phi.value);
+            let mut now = if n == 0 {
+                input(Reg::S(EXEC)).map(|_| Bool::TRUE)
+            } else if let Some(lo) = exec_phi {
+                let hi = exec_hi_phi.unwrap_or(lo);
+                Some(self.mask((lo, hi)).0)
+            } else if exec_hi_phi.is_some() {
+                None
+            } else {
+                exec_out[idom[b]]
+            };
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
                 if inst.read(Reg::S(EXEC)).is_some() {
                     let e = self.exec(inst);
@@ -757,6 +756,7 @@ impl<'a> Lanes<'a> {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
                 }
             }
+            exec_out[b] = now;
             if let Exit::Branch { taken, not_taken } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
@@ -779,7 +779,6 @@ impl<'a> Lanes<'a> {
         }
         execs
     }
-
     /// `c` narrowed by the branch at the end of `q` towards one successor.
     fn edge(&mut self, c: Bool, q: usize, taken: bool) -> Bool {
         match self.when[q] {
@@ -791,7 +790,6 @@ impl<'a> Lanes<'a> {
             None => c,
         }
     }
-
     /// Joins whose constant fails on some edge, given what lanes know.
     fn wrong_joins(&mut self, cond: &[Bool]) -> Vec<Value> {
         let mut wrong = Vec::new();
@@ -917,7 +915,6 @@ impl<'a> Lanes<'a> {
             None => Bool::TRUE,
         }
     }
-
     /// The mask a value pair holds, and whether it derives from EXEC or a
     /// VALU result.
     fn mask(&mut self, k: Key) -> (Bool, bool) {
@@ -968,7 +965,6 @@ impl<'a> Lanes<'a> {
         cache.insert(k, m);
         (m, derived)
     }
-
     /// A mask joined by phis at a block entry, and whether a mask coming in
     /// on a forward edge derives from EXEC or a VALU result. Where every
     /// lane arriving so far has the incoming mask set (or clear), the join
@@ -1057,7 +1053,6 @@ impl<'a> Lanes<'a> {
             _ => return None,
         })
     }
-
     /// Lane-mask meaning of a lane-width scalar operation.
     fn sop(&mut self, inst: &Inst) -> Option<SopMasks> {
         let Fields::Sop { dst, src, .. } = &inst.fields else {
@@ -1168,7 +1163,6 @@ impl<'a> Lanes<'a> {
             _ => return None,
         })
     }
-
     /// Records the masks `inst` defines; `exec` is EXEC there, if known.
     fn step(&mut self, inst: &Inst, exec: Option<Bool>) {
         let name = inst.name();
@@ -1260,7 +1254,6 @@ impl<'a> Lanes<'a> {
             _ => {}
         }
     }
-
     /// Whether a join takes a value loaded from memory on some edge: data
     /// that the other paths leave a stale lane mask in place of (a register
     /// reused after a branch), so operations on it are no mask operations.
@@ -1275,7 +1268,6 @@ impl<'a> Lanes<'a> {
             })
         })
     }
-
     /// Whether `inst` branches on the SCC of `s_andn2 X, X, exec`: whether
     /// any lane is left in a pixel's live mask after a discard.
     fn discards(&self, inst: &Inst) -> bool {
@@ -1296,7 +1288,6 @@ impl<'a> Lanes<'a> {
             && src.first() == Some(d)
             && matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. }))
     }
-
     /// Whether a lane entering block `b` leaves the program doing nothing but
     /// scalar work and a `done` export to `null` (a discard's exit).
     fn kill_exit(&self, mut b: usize) -> bool {
@@ -1322,7 +1313,6 @@ impl<'a> Lanes<'a> {
         }
         false
     }
-
     /// The per-lane condition under which a block's closing branch is taken.
     fn branch(&mut self, inst: &Inst) -> Bool {
         let exec = self.exec(inst);
@@ -1360,7 +1350,6 @@ impl<'a> Lanes<'a> {
             }
         }
     }
-
     /// What a lane knows on entering each block, to a fixpoint. A loop
     /// header forgets what the back edge says about atoms the loop redefines.
     fn paths(&mut self) -> Result<Vec<Bool>, ShaderError> {
@@ -1405,7 +1394,6 @@ const TOO_LARGE: ShaderError = ShaderError::Isa {
     offset: 0,
     reason: "lane conditions too large",
 };
-
 /// `ir::build` splits irreducible loops; checked again because everything
 /// here assumes a reducible graph.
 fn check_reducible(p: &Program, order: &[usize], index: &[usize]) -> Result<(), ShaderError> {
@@ -1653,6 +1641,39 @@ mod tests {
         assert!(structure(&p).is_ok());
     }
 
+    #[test]
+    fn overflow_short_circuits_ite_and_bounds_memo() {
+        let mut b = Bools::new();
+        let x = b.atom(Atom::Uniform(ir::Value(0)), 0);
+        let y = b.atom(Atom::Uniform(ir::Value(1)), 0);
+        b.overflow = true;
+        let memo_before = b.memo.len();
+        assert_eq!(b.ite(x, y, Bool::FALSE), Bool::FALSE);
+        assert_eq!(b.memo.len(), memo_before);
+    }
+
+    #[test]
+    fn s_and_exec_at_block_top_inherits_live_in_exec_as_active() {
+        // Entry branches uniformly on SCC; taken block immediately runs
+        // `s_and_b64 s[4:5], exec, s[2:3]` before any other EXEC read.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE82_046A, // s_mov_b64 s[2:3], vcc
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0xBF84_0001, // s_cbranch_scc0 -> end
+                0x8784_027E, // s_and_b64 s[4:5], exec, s[2:3]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let and_dst = p.blocks[1].insts[0].write(Reg::S(4)).expect("s4 write");
+        assert!(
+            s.active.contains(&and_dst),
+            "mask narrowed by live-in EXEC should be active"
+        );
+        }
     /// [`Bools::vars`] as it was: lists of the nodes and variables seen.
     fn vars_by_scan(b: &Bools, root: Bool) -> Vec<u32> {
         let (mut seen, mut vars, mut stack) = (Vec::new(), Vec::new(), vec![root]);
@@ -1669,7 +1690,6 @@ mod tests {
         }
         vars
     }
-
     /// One variable's cofactor, as `restrict` did before it took several.
     fn restrict_one(
         b: &mut Bools,
@@ -1694,7 +1714,6 @@ mod tests {
         memo.insert(f, r);
         r
     }
-
     /// [`Bools::given`] as it was: a walk of `f` per decided variable.
     fn given_by_walks(b: &mut Bools, mut f: Bool, known: Bool) -> Bool {
         for v in vars_by_scan(b, f) {
@@ -1708,14 +1727,12 @@ mod tests {
         }
         f
     }
-
     /// Atoms `0..n` of a fresh [`Bools`], in variable order.
     fn atoms(n: u64) -> (Bools, Vec<Bool>) {
         let mut b = Bools::new();
         let xs = (0..n).map(|i| b.atom(Atom::Constant(i), 0)).collect();
         (b, xs)
     }
-
     /// `x[i] == y[i]` for every `i`, with every `x` ordered before every
     /// `y`: the classic order that makes the diagram exponential in `n`.
     fn pairs_equal(b: &mut Bools, xs: &[Bool], n: usize) -> Bool {
@@ -1727,7 +1744,6 @@ mod tests {
         }
         f
     }
-
     /// A deterministic mix of ands, ors and xors over `xs`.
     fn mixed(b: &mut Bools, xs: &[Bool], seed: u64, steps: usize) -> Bool {
         let mut s = seed;
@@ -1749,7 +1765,6 @@ mod tests {
         }
         f
     }
-
     /// The function of `f` on the assignment `bits` (bit `v`: variable `v`).
     fn value_at(b: &Bools, mut f: Bool, bits: u64) -> bool {
         loop {

@@ -79,6 +79,8 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+type ShadowRanges = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
 pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
@@ -1345,6 +1347,9 @@ impl Host {
                 }
             }
         }
+        // Group the ranges that go back per host buffer so overlapping or
+        // touching UAV writes across lists are copied back once.
+        let mut grouped: Vec<ShadowRanges> = Vec::new();
         // A range overlapping a withheld one of the same copy is withheld
         // too: its copy-back would take the other's bytes along (pages a
         // program using title memory and another both wrote).
@@ -1373,13 +1378,19 @@ impl Host {
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
-                let written = shadow.copy_back(address, len);
-                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                match grouped.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                    Some((_, ranges)) => ranges.push((address, len)),
+                    None => grouped.push((shadow.clone(), vec![(address, len)])),
+                }
             } else {
                 shadow.keep_writes(address, len);
                 crate::memory::note_withheld(len as u64);
                 crate::memory::drop_withheld(address, len);
             }
+        }
+        for (shadow, ranges) in &grouped {
+            let written = shadow.copy_back_ranges(ranges);
+            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         for list in runs {
             for work in &list.deferred().after {

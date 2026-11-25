@@ -16,7 +16,9 @@ use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
 use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
-use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
+use crate::native::{
+    HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, Usage, UsedResource,
+};
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
@@ -200,6 +202,9 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Amount by which the console's user-data dwords are compacted when the
+    /// compute shader's parameters are passed in a spill table (`s[0:1]`).
+    user_bias: u32,
     /// Handles of root SRVs and UAVs read as bounded views, by user-data
     /// dword ([`Lower::root_view`]).
     root_views: HashMap<u32, V>,
@@ -245,6 +250,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Compute and mesh: blocks executed in lockstep by the entire thread group.
+    group_uniform: Vec<bool>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
@@ -269,9 +276,14 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
-    /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
-    /// IR block, and its incoming (value, DXIL block) pairs.
-    counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Reachable loop header IR blocks (targets of at least one back edge).
+    loop_headers: HashSet<usize>,
+    /// Cumulative back-edge iteration count live at entry of each IR block
+    /// (shared across nested loops so total back-edge steps per invocation <= `LOOP_LIMIT`).
+    iter_in: Vec<Option<V>>,
+    /// Entry phis for join blocks and loop headers when loops exist:
+    /// `block -> (phi, incoming (value, DXIL predecessor block))`.
+    iter_phis: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
@@ -342,11 +354,12 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
 /// Iterations after which a loop is left (per entry into it), unless
 /// [`super::loop_limit`] says otherwise. The console runs a loop as long as
 /// its data says; data the host has not mirrored yet (a null view reads
-/// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it. A lane that reaches the limit leaves the
-/// program as killed (a pixel discards).
+/// zeros) can make that four billion iterations, and even 2^20 iterations
+/// allowed runaway world mesh/compute loops to exceed Windows' ~2 s TDR
+/// timeout (`DXGI_ERROR_DEVICE_HUNG` / `0x887A0006`) on NVIDIA GPUs. A lane
+/// that reaches the limit leaves the program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+pub(super) const LOOP_LIMIT: u32 = 4096;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -467,6 +480,293 @@ fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
         .collect()
 }
 
+/// Per-block thread-group uniformity (`true` when every thread in the group
+/// executes block `b` in lockstep, assuming group entry is uniform).
+fn uniform_blocks(p: &Program, st: &Structured, io: &Io) -> Vec<bool> {
+    let n = p.blocks.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; n];
+    for (pos, &b) in order.iter().enumerate() {
+        index[b] = pos;
+    }
+    let reachable = |b: usize| index[b] != usize::MAX;
+    let succs = |b: usize| -> [Option<usize>; 2] {
+        match st.exits[b] {
+            LaneExit::End | LaneExit::Indirect => [None, None],
+            LaneExit::Jump(t) => [Some(t), None],
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => [Some(taken), Some(not_taken)],
+        }
+    };
+
+    // Reverse-CFG post-dominators using virtual exit node `n`.
+    let v_exit = n;
+    let mut r_succs = vec![Vec::new(); n + 1];
+    for &b in &order {
+        let [s0, s1] = succs(b);
+        match (s0, s1) {
+            (None, None) => r_succs[v_exit].push(b),
+            _ => {
+                for s in [s0, s1].into_iter().flatten() {
+                    r_succs[s].push(b);
+                }
+            }
+        }
+    }
+    let mut seen = vec![false; n + 1];
+    let mut post = Vec::with_capacity(n + 1);
+    fn dfs_rev(
+        u: usize,
+        r_succs: &[Vec<usize>],
+        seen: &mut [bool],
+        post: &mut Vec<usize>,
+    ) {
+        if seen[u] {
+            return;
+        }
+        seen[u] = true;
+        for &v in &r_succs[u] {
+            dfs_rev(v, r_succs, seen, post);
+        }
+        post.push(u);
+    }
+    dfs_rev(v_exit, &r_succs, &mut seen, &mut post);
+    post.reverse();
+    let mut r_index = vec![usize::MAX; n + 1];
+    for (pos, &b) in post.iter().enumerate() {
+        r_index[b] = pos;
+    }
+    let mut r_preds = vec![Vec::new(); n + 1];
+    for &b in &order {
+        let [s0, s1] = succs(b);
+        match (s0, s1) {
+            (None, None) => r_preds[b].push(v_exit),
+            _ => {
+                for s in [s0, s1].into_iter().flatten() {
+                    r_preds[b].push(s);
+                }
+            }
+        }
+    }
+    let mut ipdom = vec![usize::MAX; n + 1];
+    if !post.is_empty() {
+        ipdom[v_exit] = v_exit;
+        let intersect = |ipdom: &[usize], mut a: usize, mut b: usize| {
+            while a != b {
+                while r_index[a] > r_index[b] {
+                    a = ipdom[a];
+                }
+                while r_index[b] > r_index[a] {
+                    b = ipdom[b];
+                }
+            }
+            a
+        };
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in &post[1..] {
+                let mut new = usize::MAX;
+                for &q in r_preds[b].iter().filter(|&&q| ipdom[q] != usize::MAX) {
+                    new = if new == usize::MAX {
+                        q
+                    } else {
+                        intersect(&ipdom, q, new)
+                    };
+                }
+                if ipdom[b] != new {
+                    ipdom[b] = new;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    let idom = crate::ir::idoms(&p.blocks, &order, &index);
+    let dominates = |h: usize, mut u: usize| -> bool {
+        while u != usize::MAX {
+            if u == h {
+                return true;
+            }
+            if idom[u] == u {
+                break;
+            }
+            u = idom[u];
+        }
+        false
+    };
+    let mut loops: Vec<(usize, HashSet<usize>)> = Vec::new();
+    for &u in &order {
+        for h in succs(u).into_iter().flatten() {
+            if !dominates(h, u) {
+                continue;
+            }
+            let mut body = HashSet::new();
+            body.insert(h);
+            if u != h {
+                let mut stack = vec![u];
+                body.insert(u);
+                while let Some(cur) = stack.pop() {
+                    for &q in &p.blocks[cur].preds {
+                        if reachable(q) && body.insert(q) {
+                            stack.push(q);
+                        }
+                    }
+                }
+            }
+            loops.push((h, body));
+        }
+    }
+
+    let mesh_group: HashSet<Value> = io
+        .inputs
+        .iter()
+        .filter_map(|&(v, inp)| matches!(inp, Input::MeshGroup).then_some(v))
+        .collect();
+    let mut non_group_uniform: HashSet<Value> = io
+        .inputs
+        .iter()
+        .filter_map(|&(v, inp)| {
+            matches!(
+                inp,
+                Input::ThreadIdInGroup(_) | Input::GroupInfo | Input::MergedWaveInfo
+            )
+            .then_some(v)
+        })
+        .chain(p.inputs.iter().filter_map(|&(reg, v)| {
+            (matches!(reg, Reg::V(_)) && !mesh_group.contains(&v)).then_some(v)
+        }))
+        .collect();
+
+    let mut uniform: Vec<bool> = (0..n)
+        .map(|b| reachable(b) && ipdom[b] != usize::MAX)
+        .collect();
+
+    // Propagate per-thread/per-wave values and divergent/abortable control flow
+    // to a joint fixpoint so wave-divergent branches never emit group barriers.
+    loop {
+        let mut changed = false;
+
+        for &b in &order {
+            let block = &p.blocks[b];
+            let has_non_uniform_pred = block.preds.iter().any(|&q| reachable(q) && !uniform[q]);
+            for phi in &block.phis {
+                if has_non_uniform_pred || phi.args.iter().any(|v| non_group_uniform.contains(v)) {
+                    changed |= non_group_uniform.insert(phi.value);
+                }
+            }
+            for inst in &block.insts {
+                let mesh_group_read = inst.name() == "v_readfirstlane_b32"
+                    && inst.reads.iter().all(|&(reg, v)| match reg {
+                        Reg::V(_) => mesh_group.contains(&v),
+                        Reg::S(r) => r == EXEC || r == EXEC + 1,
+                        Reg::Scc => false,
+                    });
+                let inst_non_uniform = !mesh_group_read
+                    && (!uniform[b]
+                        || inst.name().starts_with("v_mbcnt_")
+                        || matches!(inst.fields, Fields::Ds { .. })
+                        || inst.reads.iter().any(|&(reg, v)| {
+                            matches!(reg, Reg::S(r) if r == EXEC || r == EXEC + 1)
+                                || non_group_uniform.contains(&v)
+                        }));
+                if inst_non_uniform {
+                    for &(_, w) in &inst.writes {
+                        changed |= non_group_uniform.insert(w);
+                    }
+                }
+            }
+        }
+
+        let is_divergent_branch = |b: usize| match st.exits[b] {
+            LaneExit::Branch { when, .. } => st.bools.support(when).iter().any(|a| match a {
+                Atom::Uniform(v) => non_group_uniform.contains(v),
+                _ => true,
+            }),
+            _ => false,
+        };
+
+        // Mark blocks between each divergent branch and its immediate post-dominator.
+        for &b in &order {
+            if !is_divergent_branch(b) {
+                continue;
+            }
+            let stop = ipdom[b];
+            let mut work = Vec::new();
+            let mut visited = vec![false; n];
+            for s in succs(b).into_iter().flatten() {
+                if s != stop && !visited[s] {
+                    visited[s] = true;
+                    work.push(s);
+                }
+            }
+            while let Some(u) = work.pop() {
+                if std::mem::replace(&mut uniform[u], false) {
+                    changed = true;
+                }
+                for s in succs(u).into_iter().flatten() {
+                    if s != stop && !visited[s] {
+                        visited[s] = true;
+                        work.push(s);
+                    }
+                }
+            }
+        }
+
+        // Natural loops whose header/latch becomes non-uniform or that have a
+        // divergent exit branch lose lockstep across the whole loop body.
+        for (h, body) in &loops {
+            let latch_divergent = p.blocks[*h]
+                .preds
+                .iter()
+                .any(|&q| body.contains(&q) && !uniform[q]);
+            let exit_divergent = body.iter().any(|&x| {
+                is_divergent_branch(x)
+                    && succs(x).into_iter().flatten().any(|s| !body.contains(&s))
+            });
+            if !uniform[*h] || latch_divergent || exit_divergent {
+                for &x in body {
+                    if std::mem::replace(&mut uniform[x], false) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // A non-uniform back edge may exit early via `abort_block()` while
+        // other threads continue past the loop.
+        for &u in &order {
+            if uniform[u] || !succs(u).into_iter().flatten().any(|t| index[t] <= index[u]) {
+                continue;
+            }
+            let mut work: Vec<usize> = succs(u).into_iter().flatten().collect();
+            let mut visited = vec![false; n];
+            while let Some(cur) = work.pop() {
+                if !visited[cur] {
+                    visited[cur] = true;
+                    if std::mem::replace(&mut uniform[cur], false) {
+                        changed = true;
+                    }
+                    for s in succs(cur).into_iter().flatten() {
+                        if !visited[s] {
+                            work.push(s);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+    uniform
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -536,6 +836,8 @@ impl<'a> Lower<'a> {
         });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
+        let min_ud = x.native.layout.iter().map(|p| p.user_data).min().unwrap_or(0);
+        let user_bias = if min_ud >= 16 { u32::from(min_ud) } else { 0 };
         let mut console_lanes = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -565,6 +867,7 @@ impl<'a> Lower<'a> {
                         .flatten()
                         .copied()
                         .chain(whens)
+                        .chain(x.st.other.values().copied())
                         .collect();
                 all.sort_unstable();
                 all.dedup();
@@ -626,6 +929,11 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let group_uniform = if matches!(x.native.io, StageIo::Cs(_) | StageIo::Ms(_)) {
+            uniform_blocks(p, x.st, x.io)
+        } else {
+            Vec::new()
+        };
         Lower {
             s,
             x,
@@ -646,6 +954,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            user_bias,
             root_views: HashMap::new(),
             samplers: Vec::new(),
             descriptors: x
@@ -673,6 +982,7 @@ impl<'a> Lower<'a> {
             root_memory,
             flat: None,
             no_barrier,
+            group_uniform,
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -698,7 +1008,9 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
-            counters: HashMap::new(),
+            loop_headers: HashSet::new(),
+            iter_in: vec![None; x.p.blocks.len()],
+            iter_phis: HashMap::new(),
             abort: None,
             round16: round16(p),
             mode16: Some(0),
@@ -1282,16 +1594,31 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // Find loop headers and share a single per-invocation back-edge budget
+        // across all blocks so nested loops cannot multiply `LOOP_LIMIT`.
         for &b in &order {
             let header = p.blocks[b]
                 .preds
                 .iter()
                 .any(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q]);
             if header {
-                let blk = self.block[b].expect("reachable");
-                let phi = self.s.m.phi(blk, self.s.t.i32);
-                self.counters.insert(b, (phi, Vec::new()));
+                self.loop_headers.insert(b);
+            }
+        }
+        if !self.loop_headers.is_empty() {
+            self.iter_in[order[0]] = Some(self.s.m.i32(0));
+            for &b in &order[1..] {
+                let n_preds = p.blocks[b]
+                    .preds
+                    .iter()
+                    .filter(|&&q| self.block[q].is_some())
+                    .count();
+                if n_preds >= 2 || self.loop_headers.contains(&b) {
+                    let blk = self.block[b].expect("reachable");
+                    let phi = self.s.m.phi(blk, self.s.t.i32);
+                    self.iter_in[b] = Some(phi);
+                    self.iter_phis.insert(b, (phi, Vec::new()));
+                }
             }
         }
         self.cur = self.s.entry;
@@ -1302,6 +1629,15 @@ impl<'a> Lower<'a> {
             self.block[order[0]] = Some(self.cur);
         }
         for &b in &order {
+            if !self.loop_headers.is_empty() && self.iter_in[b].is_none() {
+                let pred = p.blocks[b]
+                    .preds
+                    .iter()
+                    .copied()
+                    .find(|&q| self.block[q].is_some())
+                    .expect("reachable predecessor");
+                self.iter_in[b] = self.iter_in[pred];
+            }
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
             let preds: Vec<usize> = p.blocks[b]
@@ -1644,7 +1980,7 @@ impl<'a> Lower<'a> {
     /// it (for a root descriptor: its GPU address, low dword first).
     fn user_dword(&mut self, param: usize, dword: u32) -> V {
         let rp = self.x.native.layout[param];
-        let index = u32::from(rp.user_data) + dword;
+        let index = u32::from(rp.user_data) + dword - self.user_bias;
         self.user_at(UserData {
             index,
             slot: rp.slot,
@@ -1664,7 +2000,7 @@ impl<'a> Lower<'a> {
         let rp = self.x.native.layout[param];
         // The descriptor's two user-data dwords hold its address on the
         // console; such a program never reads them as data (`user`).
-        let index = u32::from(rp.user_data);
+        let index = u32::from(rp.user_data) - self.user_bias;
         if let Some(&h) = self.root_views.get(&index) {
             return h;
         }
@@ -1693,7 +2029,7 @@ impl<'a> Lower<'a> {
             return None;
         }
         Some(self.user_at(UserData {
-            index: u32::from(rp.user_data) + 1,
+            index: u32::from(rp.user_data) + 1 - self.user_bias,
             slot: rp.slot,
             root: RootType::Descriptor,
             dword: super::ROOT_VIEW_OFFSET,
@@ -3325,11 +3661,21 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                let mode = self.s.m.i32(mode);
-                let void = self.s.t.void;
-                self.s
-                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                // Omit SyncThreadGroup (bit 1) when control flow can diverge
+                // across waves so `bar.sync 0` cannot deadlock on wave32 GPUs.
+                let group_uniform = self.group_uniform.get(b).copied().unwrap_or(true);
+                let mode = if group_uniform {
+                    if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 }
+                } else {
+                    (if self.writes_uavs { 2 } else { 0 })
+                        | (if self.s.lds_dwords > 0 { 8 } else { 0 })
+                };
+                if mode != 0 {
+                    let mode = self.s.m.i32(mode);
+                    let void = self.s.t.void;
+                    self.s
+                        .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                }
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -3918,6 +4264,12 @@ impl<'a> Lower<'a> {
             return self.memory_smem(inst, a);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
+            if let Some(a) = self.scalar.get(&site).copied()
+                && let Some(rp) = self.x.native.layout.get(a.param).copied()
+                && rp.root == RootType::Descriptor
+            {
+                return self.root_descriptor_smem(inst, &a, rp);
+            }
             return self.descriptor_data(inst, site);
         };
         let count = match rest {
@@ -4005,6 +4357,41 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
+        self.scalar_cbv_load(inst, code, count, h, addr, constant);
+        Ok(())
+    }
+
+    fn scalar_srv_load(&mut self, inst: &Inst, code: u8, count: u32, h: V, addr: V) {
+        let c = self.cur;
+        let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let mask = self.s.m.i8(1);
+        for k in 0..count {
+            let off = self.s.m.i32(4 * k);
+            let a = self.s.m.bin(c, Bin::Add, addr, off);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, a, u, mask, al],
+            );
+            let x = self.s.m.extract(c, r, 0);
+            let x = self.as_int(x);
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+    }
+
+    fn scalar_cbv_load(
+        &mut self,
+        inst: &Inst,
+        code: u8,
+        count: u32,
+        h: V,
+        addr: V,
+        constant: Option<u32>,
+    ) {
+        let c = self.cur;
         let mut rows: HashMap<u32, V> = HashMap::new();
         for k in 0..count {
             let x = match constant {
@@ -4036,7 +4423,62 @@ impl<'a> Lower<'a> {
             };
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
-        Ok(())
+    }
+
+    /// `s_load_dword*` directly from a root CBV or root SRV address.
+    fn root_descriptor_smem(
+        &mut self,
+        inst: &Inst,
+        a: &Address,
+        rp: RootParam,
+    ) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar load");
+        };
+        let count = smem_dwords(inst.name()).ok_or("a scalar load")?;
+        let c = self.cur;
+        let mut addr = self.s.m.i32(a.offset);
+        let constant = a.dynamic.is_none().then_some(a.offset);
+        if let Some(d) = a.dynamic {
+            let d = self.i32_of(d)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        }
+        let used = self
+            .x
+            .native
+            .used
+            .iter()
+            .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data);
+        match used.map(|u| u.kind) {
+            Some(ResourceType::Srv) => {
+                let h = if self.root_memory {
+                    self.s.root_srv_handle(rp.slot)
+                } else {
+                    let src = Source::Built {
+                        address: *a,
+                        bits: 0,
+                        words: [0, 0],
+                    };
+                    if let Some(at) = self.root_view_offset(&src) {
+                        addr = self.s.m.bin(c, Bin::Add, addr, at);
+                    }
+                    self.root_view(a.param, false)
+                };
+                self.scalar_srv_load(inst, code, count, h, addr);
+                Ok(())
+            }
+            Some(ResourceType::Cbv) | None => {
+                let h = self.s.root_cbv_handle(rp.slot);
+                self.scalar_cbv_load(inst, code, count, h, addr, constant);
+                Ok(())
+            }
+            Some(ResourceType::Uav) => Err("a scalar load from a root UAV"),
+            Some(_) => Err("a scalar load from a root descriptor"),
+        }
     }
 
     /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
@@ -4112,61 +4554,72 @@ impl<'a> Lower<'a> {
                 .filter(|&(s, a)| *s != site && address.is_some_and(|b| same(a, b)))
                 .find_map(|&(s, _)| use_of(s))
         });
-        let Some((at, first)) = use_at else {
-            return self.view_addresses(inst, site, code, count);
-        };
-        let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
+        let (src, uav, props, image, rel_bias) = match use_at {
+            Some((at, first)) => {
+                let src = Source::Loaded { load: site, first };
+                let used = self.used_kind(&src);
+                let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+                let un = ui.name();
+                let uav = un.contains("store")
+                    || un.contains("atomic")
+                    || used.is_some_and(|u| u.kind == ResourceType::Uav);
+                let u = if uav { 0x1000 } else { 0 };
+                let (props, image) = match &ui.fields {
+                    Fields::Image { dim, .. } => {
+                        let kind = match dim {
+                            0 => 1,
+                            1 => 2,
+                            2 => 4,
+                            4 => 6,
+                            5 => 7,
+                            _ => return Err("an image dimension (cube or MSAA)"),
+                        };
+                        ((kind | u, 0x409), Some(kind))
+                    }
+                    Fields::Buffer { idxen, format, .. } => {
+                        let stride = used.map_or(0, |u| u.stride);
+                        let props = if un.starts_with("buffer_load_format")
+                            || un.starts_with("buffer_store_format")
+                        {
+                            (10 | u, 0x409)
+                        } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                            (12 | u, stride)
+                        } else {
+                            (11 | u, 0)
+                        };
+                        if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                            return Err("a constant buffer's descriptor read as data");
+                        }
+                        (props, None)
+                    }
+                    // A buffer the code reads with scalar loads (`buf[buf.Length - 1]`
+                    // at a uniform index): structured by the used-resource entry's
+                    // stride, so its record count is in elements, else raw (bytes).
+                    Fields::Smem { .. } => {
+                        let used = used.ok_or("a scalar-loaded buffer of unknown kind read as data")?;
+                        if used.kind == ResourceType::Cbv {
+                            return Err("a constant buffer's descriptor read as data");
+                        }
+                        let props = match used.stride {
+                            0 | 1 => (11 | u, 0),
+                            s if s.is_multiple_of(4) => (12 | u, s),
+                            _ => return Err("a scalar-loaded buffer of odd stride read as data"),
+                        };
+                        (props, None)
+                    }
+                    _ => return Err("a scalar memory read as data"),
                 };
-                ((kind | u, 0x409), Some(kind))
+                (src, uav, props, image, u32::from(first).wrapping_neg())
             }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
+            None => {
+                // A table buffer read only as data (its record count): the
+                // table entry the program uses names the view's kind.
+                let table = self.table_buffer_view(site);
+                let Some((src, uav, props, rel_start)) = table else {
+                    return self.view_addresses(inst, site, code, count);
                 };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                (props, None)
+                (src, uav, props, None, rel_start)
             }
-            // A buffer the code reads with scalar loads (`buf[buf.Length - 1]`
-            // at a uniform index): structured by the used-resource entry's
-            // stride, so its record count is in elements, else raw (bytes).
-            Fields::Smem { .. } => {
-                let used = used.ok_or("a scalar-loaded buffer of unknown kind read as data")?;
-                if used.kind == ResourceType::Cbv {
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                let props = match used.stride {
-                    0 | 1 => (11 | u, 0),
-                    s if s.is_multiple_of(4) => (12 | u, s),
-                    _ => return Err("a scalar-loaded buffer of odd stride read as data"),
-                };
-                (props, None)
-            }
-            _ => return Err("a scalar memory read as data"),
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -4221,7 +4674,7 @@ impl<'a> Lower<'a> {
             None => vec![(2, field(self, 0))],
         };
         for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
+            let rel = k.wrapping_add(rel_bias);
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
@@ -4558,6 +5011,41 @@ impl<'a> Lower<'a> {
             l1,
             miss,
         }
+    }
+
+    /// A descriptor loaded from a table and read only as data (a buffer's
+    /// record count): the view kind comes from the table entry the program
+    /// uses, so the load is `(source, unordered access, properties, dword
+    /// bias into the 8-dword descriptor)`.
+    fn table_buffer_view(&self, site: Site) -> Option<(Source, bool, (u32, u32), u32)> {
+        let a = self.scalar.get(&site).copied()?;
+        let rp = self.x.native.layout.get(a.param).copied()?;
+        if rp.root != RootType::Table || !a.offset.is_multiple_of(4) {
+            return None;
+        }
+        let a_dword = a.offset / 4;
+        let used = self
+            .x
+            .native
+            .used
+            .iter()
+            .filter(|u| {
+                u.root == RootType::Table && u.user_data == rp.user_data && u.table_offset_dwords <= a_dword && a_dword < u.table_offset_dwords + u32::from(u.dwords) && a_dword < u.table_offset_dwords + u32::from(u.dwords)
+            })
+            .max_by_key(|u| u.table_offset_dwords)
+            .copied()?;
+        if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
+            return None;
+        }
+        let rel_start = (a_dword - used.table_offset_dwords) % 8;
+        let uav = used.kind == ResourceType::Uav;
+        let u = if uav { 0x1000 } else { 0 };
+        let props = if used.stride >= 4 && used.stride.is_multiple_of(4) {
+            (12 | u, used.stride)
+        } else {
+            (11 | u, 0)
+        };
+        Some((Source::Loaded { load: site, first: 0 }, uav, props, rel_start))
     }
 
     /// A descriptor load from a table or heap whose dwords the program only
@@ -8328,14 +8816,16 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (op, sample) = match name {
-            "image_sample" | "image_sample_o" => (60, true),
+            "image_sample" | "image_sample_o" | "image_sample_cl" | "image_sample_cl_o" => {
+                (60, true)
+            }
             "image_sample_lz" | "image_sample_l" => (62, true),
-            "image_sample_b" => (61, true),
+            "image_sample_b" | "image_sample_b_cl" => (61, true),
             "image_sample_c_lz" => (65, true),
             "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
-            "image_sample_c" if self.s.pixel => (64, true),
+            "image_sample_c" | "image_sample_c_cl" if self.s.pixel => (64, true),
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
             | "image_gather4_l_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
@@ -8411,8 +8901,8 @@ impl<'a> Lower<'a> {
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
-            let first =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
+            let bias = name.starts_with("image_sample_b");
+            let first = usize::from(offset_word) + usize::from(bias) + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
@@ -8439,6 +8929,12 @@ impl<'a> Lower<'a> {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
+            let clamp = if name.contains("_cl") {
+                let x = addr_val(self, first + grads + coords)?;
+                to_float(self, x)
+            } else {
+                fu
+            };
             if kind == 5 {
                 if *unorm || op == 81 {
                     return Err("a cube sample with texel coordinates or a level query");
@@ -8515,15 +9011,15 @@ impl<'a> Lower<'a> {
                         }
                     }
                     args.extend(&os);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
+                    let bias = addr_val(self, usize::from(offset_word))?;
                     let bias = to_float(self, bias);
                     args.extend(&os);
-                    args.extend([bias, fu]);
+                    args.extend([bias, clamp]);
                     self.s.op(
                         c,
                         "sampleBias.f32",
@@ -8622,7 +9118,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.push(reference);
                     let name = if op == 64 {
-                        args.push(fu);
+                        args.push(clamp);
                         "sampleCmp.f32"
                     } else {
                         "sampleCmpLevelZero.f32"
@@ -9726,6 +10222,16 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit output the stage data does not mark");
         }
         // A mesh lane writes its own vertex or primitive, where it exports.
+        let guard = if let Some(ms) = self.s.mesh {
+            let limit = if primitive {
+                ms.max_primitives
+            } else {
+                ms.max_vertices
+            };
+            self.guard_mesh_thread(guard, limit)
+        } else {
+            guard
+        };
         let at = if mesh {
             self.begin_guarded(guard)
         } else {
@@ -9787,6 +10293,23 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Mesh: intersects `guard` with `flat < limit` when the thread-group size
+    /// exceeds `limit` so out-of-range lanes never emit vertices/primitives.
+    fn guard_mesh_thread(&mut self, guard: Option<V>, limit: u32) -> Option<V> {
+        let threads = self.s.threads.map_or(0, |t| t[0]);
+        if threads <= limit {
+            return guard;
+        }
+        let flat = self.mesh_thread();
+        let max = self.s.m.i32(limit);
+        let in_bounds = self.s.m.cmp(self.cur, pred::IULT, flat, max);
+        Some(match guard {
+            Some(g) => self.s.m.bin(self.cur, Bin::And, g, in_bounds),
+            None => in_bounds,
+        })
+    }
+
+
     /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
     /// bits: a 9-bit vertex index and, above it, its edge flag (bits 9, 19
     /// and 29), which only the console's edge-flag rasterisation reads and
@@ -9795,15 +10318,24 @@ impl<'a> Lower<'a> {
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
+        let ms = self.s.mesh.expect("mesh stage");
+        let guard = self.guard_mesh_thread(guard, ms.max_primitives);
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
+        let max_v = self.s.m.i32(ms.max_vertices);
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let mut indices = Vec::with_capacity(3);
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
+            let oob = self.s.m.cmp(c, pred::IUGE, i, max_v);
+            culled = self.s.m.bin(c, Bin::Or, culled, oob);
+            indices.push(i);
+        }
+        let mut args = vec![self.mesh_thread()];
+        for i in indices {
             args.push(self.s.m.select(c, culled, z, i));
         }
         let void = self.s.t.void;
@@ -9844,13 +10376,13 @@ impl<'a> Lower<'a> {
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
-            LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
+            LaneExit::Jump(t) if self.loop_headers.contains(&t) && self.rpo[t] <= self.rpo[b] => {
+                let ok = self.count_iteration(b, t, pred::IULT);
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
-                self.enter_loop(b, t, self.cur);
+                self.enter_block(b, t, self.cur);
                 Term::Br(self.block[t].expect("reachable"))
             }
             LaneExit::Branch {
@@ -9873,16 +10405,17 @@ impl<'a> Lower<'a> {
                         (c, taken, not_taken)
                     }
                 };
-                // A back edge is taken only below the iteration limit.
-                let back =
-                    |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
+                // A back edge is taken only below the invocation's iteration limit.
+                let back = |l: &Self, to: usize| {
+                    l.loop_headers.contains(&to) && l.rpo[to] <= l.rpo[b]
+                };
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
                 let cond = if back(self, taken) {
-                    let ok = self.count_iteration(taken, pred::IULT);
+                    let ok = self.count_iteration(b, taken, pred::IULT);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
-                    let stop = self.count_iteration(not_taken, pred::IUGE);
+                    let stop = self.count_iteration(b, not_taken, pred::IUGE);
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
                 } else {
                     cond
@@ -9898,7 +10431,7 @@ impl<'a> Lower<'a> {
                         } else {
                             via
                         };
-                        self.enter_loop(b, to, from);
+                        self.enter_block(b, to, from);
                     }
                 }
                 Term::CondBr(cond, t, f)
@@ -9919,25 +10452,25 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// A forward edge into loop header `to` (from DXIL block `via`) starts
-    /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
-        if let Some((_, incoming)) = self.counters.get_mut(&to) {
-            let z = self.s.m.i32(0);
-            incoming.push((z, via));
+    /// A forward edge from `from` into block `to` (via DXIL block `via`)
+    /// carries `from`'s cumulative back-edge iteration count.
+    fn enter_block(&mut self, from: usize, to: usize, via: usize) {
+        if let Some((_, incoming)) = self.iter_phis.get_mut(&to) {
+            let count = self.iter_in[from].expect("iter_in");
+            incoming.push((count, via));
         }
     }
 
-    /// A back edge to header `to` (a back edge keeps its block, no
-    /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
-    fn count_iteration(&mut self, to: usize, p: u8) -> V {
+    /// A back edge from `from` to header `to`: increments the invocation's
+    /// cumulative iteration count and compares it against [`LOOP_LIMIT`] by `p`
+    /// (`IULT`: go on; `IUGE`: stop).
+    fn count_iteration(&mut self, from: usize, to: usize, p: u8) -> V {
         let c = self.cur;
-        let (phi, _) = self.counters[&to];
+        let cur_count = self.iter_in[from].expect("iter_in");
         let one = self.s.m.i32(1);
-        let next = self.s.m.bin(c, Bin::Add, phi, one);
+        let next = self.s.m.bin(c, Bin::Add, cur_count, one);
         let limit = self.s.m.i32(super::loop_limit());
-        self.counters
+        self.iter_phis
             .get_mut(&to)
             .expect("header")
             .1
@@ -10526,7 +11059,7 @@ impl<'a> Lower<'a> {
             }
             self.s.m.set_phi(v, incoming);
         }
-        for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+        for (phi, incoming) in std::mem::take(&mut self.iter_phis).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
         while let Some((v, b, i)) = self.pending_masks.pop() {

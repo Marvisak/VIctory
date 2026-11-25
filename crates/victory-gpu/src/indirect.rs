@@ -2,9 +2,11 @@
 //! title's own compute passes write most of them; a pass we drop or
 //! translate wrongly leaves whatever the memory held, and a draw of four
 //! billion vertices or a dispatch past the host's limits runs until the
-//! host resets the display driver. So every record is clamped on the GPU,
-//! just before its execution, by a compute shader of ours (HLSL compiled by
-//! the system's compiler; a 5.1 shader with its root signature inside).
+//! host resets the display driver. So every record is validated and bounded
+//! on the GPU, just before its execution, by a compute shader of ours (HLSL
+//! compiled by the system's compiler; a 5.1 shader with its root signature
+//! inside): a record past the limits runs empty rather than being clamped up
+//! to them.
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -40,8 +42,12 @@ uint clamped(uint at) {
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        uint count = args.Load(at);
+        uint instances = args.Load(at + 4);
+        if (count > (1u << 24) || instances > (1u << 26) / max(count, 1u)) {
+            dest.Store2(at, uint2(0, 0));
+            return 0;
+        }
         cost = count * instances;
         dest.Store2(at, uint2(count, instances));
         // The rest of the record as it is: first vertex and instance (4 words
@@ -52,17 +58,22 @@ uint clamped(uint at) {
             dest.Store2(at + 8, args.Load2(at + 8));
         }
     } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+        uint3 g = args.Load3(at);
         // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
+        if (any(g > uint3(65535, 65535, 65535)) ||
+            (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
+            dest.Store3(at, uint3(0, 0, 0));
+            return 0;
         }
         cost = g.x * g.y * g.z * 64;
         dest.Store3(at, g);
     } else {
-        // Mesh dispatches: the console's are one-dimensional.
+        // Mesh dispatches (kind 10): the console's are one-dimensional.
         uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        if (any(g > uint3(65535, 1, 1))) {
+            dest.Store3(at, uint3(0, 0, 0));
+            return 0;
+        }
         cost = g.x * g.y * g.z * 128;
         dest.Store3(at, g);
     }
@@ -318,11 +329,11 @@ mod tests {
     /// let four; of 600 garbage mesh dispatches 16, not 31.
     #[test]
     fn rejected_records_do_not_wrap_the_budget() {
-        let Some(draws) = clamped(0, &[u32::MAX], 128, 1) else {
+        let Some(draws) = clamped(0, &[1 << 24, 4, 0, 0], 128, 1) else {
             return; // no host GPU here
         };
         assert_eq!(draws.iter().filter(|&&count| count != 0).count(), 2);
-        let meshes = clamped(10, &[u32::MAX], 600, 1).unwrap();
+        let meshes = clamped(10, &[65535, 1, 1], 600, 1).unwrap();
         assert_eq!(meshes.iter().filter(|&&groups| groups != 0).count(), 16);
     }
 
@@ -401,7 +412,7 @@ mod tests {
                     out.Map(0, None, Some(&mut p)).unwrap();
                     p.cast::<[u32; 3]>().read_volatile()
                 };
-                assert_eq!(clamped, [65_535, 1, 1]);
+                assert_eq!(clamped, [0, 0, 0]);
             }
             // SAFETY: as above.
             assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1], "the title's copy as written");

@@ -11,7 +11,8 @@
 //! Each view heap has one page table, which every list using title memory
 //! with that heap bound reads, and each host copy has a pair of views in
 //! slots of the heap kept for it while it lives ([`HostHeap::pair`], past
-//! the per-draw dynamic slots). At each submission with such a list the
+//! the per-draw dynamic slots where the heap has room, else among them
+//! until the copy goes). At each submission with such a list the
 //! table is rewritten if copies came or went since, and every copy it names
 //! is brought up to date (page by page, as every refresh; once per
 //! submission until a step writes title memory). Shaders mark the pages
@@ -695,8 +696,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     /// Two lists of a submission read title memory through one page table;
     /// the copies' views stay where they are for later lists and
-    /// submissions, also when another copy comes; none takes a per-draw
-    /// dynamic slot.
+    /// submissions, also when another copy comes; where the heap has room
+    /// they are past the per-draw dynamic slots.
     #[test]
     fn lists_share_a_table_and_copies_keep_their_views() {
         use crate::watch::PAGE;
@@ -764,7 +765,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&lists[0], &lists[1]]);
         assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
-        assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
+        // SAFETY: a plain query of a live heap.
+        let total = unsafe { views.heap.GetDesc().NumDescriptors };
+        if total > victory_shader::emit::NULL_BUFFER_VIEW {
+            assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
+        } else {
+            let count = views.count();
+            assert!(pairs.0 >= count && pairs.1 >= count, "a pair of views");
+        }
         // A second submission, after a third copy came.
         let c = copy(memory[2], 1);
         for list in &lists {

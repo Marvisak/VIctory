@@ -1013,7 +1013,7 @@ mod tests {
 
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
-    fn constant_color() -> Vec<u8> {
+    pub(super) fn constant_color() -> Vec<u8> {
         let mut s = Shader::new(true);
         s.outputs.push(SigElement {
             name: "SV_Target".into(),

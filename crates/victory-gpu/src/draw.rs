@@ -2393,6 +2393,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let a = crate::resource::host_copy(object).unwrap();
             let b = crate::resource::host_copy(placed as This).unwrap();
+            // A host that refuses castable formats makes a second texture,
+            // bridged by a copy; only one family shares without a cast.
+            let shared = shared
+                && (crate::resource::family(written) == crate::resource::family(format)
+                    || a.castable.contains(&format));
             assert_eq!(std::sync::Arc::ptr_eq(&a, &b), shared, "round {round}: one host texture");
             let unordered = View::Unordered(object as usize, 0, Some([written, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
             slots.make(0, &unordered);
