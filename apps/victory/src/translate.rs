@@ -323,6 +323,9 @@ pub fn run(
 /// then the shader pack's pipelines go into the pipeline library
 /// (`prebuild`).
 pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+    let limit = std::env::var("VICTORY_WARM_SECONDS").ok().and_then(|v| v.trim().parse::<u64>().ok());
+    let began = std::time::Instant::now();
+    let time_is_up = || limit.is_some_and(|n| began.elapsed().as_secs() >= n);
     let paths = crate::default_paths(paths)?;
     let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
     let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
@@ -338,11 +341,12 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     let seen = Mutex::new(HashSet::new());
     // Containers already cached, translated now, refused now.
     let counts = [const { AtomicUsize::new(0) }; 3];
-    for root in &paths {
+    'scan: for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
             .filter_map(Result::ok)
         {
+            if time_is_up() { break 'scan; }
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
@@ -356,6 +360,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                     .map(|_| {
                         s.spawn(|| {
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            if time_is_up() { break; }
                                 let Some(bytes) = job.bytes() else { continue };
                                 // As the title passes it: the container's own size
                                 // (a raw source runs on to the end of the file).

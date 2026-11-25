@@ -3259,7 +3259,6 @@ impl<'a> Lower<'a> {
             } else {
                 within_half
             };
-            let r = self.read_lane(x, lane);
             let on = guard.unwrap_or_else(|| self.s.m.bool(true));
             let i32t = self.s.t.i32;
             let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
@@ -3271,6 +3270,9 @@ impl<'a> Lower<'a> {
                 self.s.m.extract(c, ballot, 1),
             );
             let running = self.lane_bit_of(c, lane, lo, hi);
+            let here = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            let source = self.s.m.select(c, running, lane, here);
+            let r = self.read_lane(x, source);
             let z = k(self, 0);
             let r = self.s.m.select(c, running, r, z);
             let reg = dst_reg.ok_or("a permute result")?;
@@ -4663,6 +4665,13 @@ impl<'a> Lower<'a> {
         write: bool,
         active: Option<V>,
     ) -> (V, V) {
+        let (handle, offset, _) = self.memory_with_residency(lo, hi, bytes, write, active);
+        (handle, offset)
+    }
+
+    fn memory_with_residency(
+        &mut self, lo: V, hi: V, bytes: u32, write: bool, active: Option<V>,
+    ) -> (V, V, V) {
         let e = self.memory_entry(lo, hi, write);
         let c = self.cur;
         // Writes always mark (written or missed pages), reads only misses.
@@ -4704,7 +4713,9 @@ impl<'a> Lower<'a> {
             self.mark_memory_bit(bitmap, second);
             self.end_guarded(at, &[]);
         }
-        (e.handle, e.offset)
+        let yes = self.s.m.bool(true);
+        let resident = self.s.m.bin(self.cur, Bin::Xor, e.miss, yes);
+        (e.handle, e.offset, resident)
     }
 
     /// Bitmap bit for a page-table lookup: `l1` in block 0 when the 256 MiB

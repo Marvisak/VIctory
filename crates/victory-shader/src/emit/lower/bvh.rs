@@ -190,15 +190,16 @@ impl Lower<'_> {
 
     /// The four result dwords of `ray` against the node `node` points to.
     fn bvh_lanes(&mut self, nodes: &Nodes, node: V, ray: &Ray) -> Result<[V; 4], Why> {
-        let w = self.node_dwords(nodes, 0, 16)?;
+        let (w, first_present) = self.node_dwords(nodes, 0, 16)?;
         let c = self.cur;
         let seven = self.s.m.i32(7);
         let ty = self.s.m.bin(c, Bin::And, node, seven);
         // The rest of a box32 node, read only for one.
         let five = self.s.m.i32(5);
         let is32 = self.s.m.cmp(c, pred::EQ, ty, five);
-        let at = self.begin_guarded(Some(is32));
-        let tail = match self.node_dwords(nodes, 16, 12) {
+        let need_tail = self.s.m.bin(c, Bin::And, is32, first_present);
+        let at = self.begin_guarded(Some(need_tail));
+        let (tail, tail_present) = match self.node_dwords(nodes, 16, 12) {
             Ok(t) => t,
             Err(why) => {
                 self.end_guarded(at, &[]);
@@ -206,8 +207,11 @@ impl Lower<'_> {
             }
         };
         let zero = self.s.m.i32(0);
-        let pairs: Vec<(V, V)> = tail.iter().map(|&t| (t, zero)).collect();
-        let tail = self.end_guarded(at, &pairs);
+        let mut pairs: Vec<(V, V)> = tail.iter().map(|&t| (t, zero)).collect();
+        let yes = self.s.m.bool(true);
+        pairs.push((tail_present, yes));
+        let mut tail = self.end_guarded(at, &pairs);
+        let tail_present = tail.pop().expect("tail residency");
         let w: Vec<V> = w.into_iter().chain(tail).collect();
         let boxes = self.bvh_box(&w, ty, ray);
         let tri = self.bvh_triangle(&w, ty, ray);
@@ -218,14 +222,18 @@ impl Lower<'_> {
         let t6 = self.s.m.bin(c, Bin::And, ty, six);
         let is_box = self.s.m.cmp(c, pred::EQ, t6, four);
         let none = self.s.m.i32(INVALID);
+        let box_present = self.s.m.bin(c, Bin::And, first_present, tail_present);
+        let valid_box = self.s.m.bin(c, Bin::And, is_box, box_present);
+        let miss = [0x7f80_0000, 0x3f80_0000, 0, 0].map(|dword| self.s.m.i32(dword));
         Ok(std::array::from_fn(|k| {
-            let x = self.s.m.select(c, is_box, boxes[k], none);
-            self.s.m.select(c, is_tri, tri[k], x)
+            let x = self.s.m.select(c, valid_box, boxes[k], none);
+            let triangle = self.s.m.select(c, first_present, tri[k], miss[k]);
+            self.s.m.select(c, is_tri, triangle, x)
         }))
     }
 
     /// `n` dwords of the node from dword `from`.
-    fn node_dwords(&mut self, nodes: &Nodes, from: u32, n: u32) -> Result<Vec<V>, Why> {
+    fn node_dwords(&mut self, nodes: &Nodes, from: u32, n: u32) -> Result<(Vec<V>, V), Why> {
         let (h, at) = match *nodes {
             Nodes::Buffer(h, at) => (h, at),
             Nodes::Raw(address) => return self.raw_load(address, 4 * from, n),
@@ -251,12 +259,12 @@ impl Lower<'_> {
                 out.push(self.as_int(x));
             }
         }
-        Ok(out)
+        Ok((out, self.s.m.bool(true)))
     }
 
     /// `dwords` dwords at byte `offset` past `address`, a 64-bit GPU address
     /// (`i64`), from title memory ([`Lower::memory`]).
-    fn raw_load(&mut self, address: V, offset: u32, dwords: u32) -> Result<Vec<V>, Why> {
+    fn raw_load(&mut self, address: V, offset: u32, dwords: u32) -> Result<(Vec<V>, V), Why> {
         let c = self.cur;
         let i64t = self.s.m.int(64);
         let off = self.s.m.int_const(i64t, i64::from(offset));
@@ -269,7 +277,7 @@ impl Lower<'_> {
         let mask = self.s.m.i32(0xFFFF);
         let hi = self.s.m.bin(c, Bin::And, hi, mask);
         // A node (64 bytes, 64-byte aligned) lies in one 64 KiB page.
-        let (h, at) = self.memory(lo, hi, 4 * dwords, false, None);
+        let (h, at, resident) = self.memory_with_residency(lo, hi, 4 * dwords, false, None);
         let c = self.cur;
         let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let mut out = Vec::new();
@@ -291,7 +299,7 @@ impl Lower<'_> {
                 out.push(self.as_int(x));
             }
         }
-        Ok(out)
+        Ok((out, resident))
     }
 
     /// The child pointers of a box node (`w`: its 28 dwords, past 16 zero

@@ -307,16 +307,14 @@ pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        return;
     }
+    *last = Some(std::time::Instant::now());
+    let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
     let (blob, prebuilt) = {
-        let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.load(Ordering::Relaxed) {
             return;
         }
         // SAFETY: a plain size query on a live library.
@@ -330,8 +328,6 @@ pub(crate) fn save(now: bool) {
         let bytes = unsafe { l.library.Serialize(&mut bytes) }.map(|()| bytes);
         match bytes {
             Ok(bytes) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
                 // Kept beside the bytes it holds for (also when a run adds
                 // pipelines).
                 let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
@@ -343,7 +339,11 @@ pub(crate) fn save(now: bool) {
             }
         }
     };
-    let used = used().as_ref().map(Used::list).unwrap_or_default();
+    let used = {
+        let used = used();
+        USED_CHANGED.store(false, Ordering::Relaxed);
+        used.as_ref().map(Used::list).unwrap_or_default()
+    };
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
@@ -354,7 +354,10 @@ pub(crate) fn save(now: bool) {
     let (created, distinct) = created();
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
-        Ok(()) => tracing::info!(
+        Ok(()) => {
+            l.added = 0;
+            l.prebuilt_changed = false;
+            tracing::info!(
             bytes = blob.len(),
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
@@ -365,8 +368,12 @@ pub(crate) fn save(now: bool) {
             shaders_cached,
             shaders_translated,
             "host pipeline library saved"
-        ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+            );
+        }
+        Err(e) => {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(error = %e, "host pipeline library not saved");
+        }
     }
 }
 
