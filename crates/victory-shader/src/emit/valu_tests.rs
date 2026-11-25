@@ -1008,6 +1008,40 @@ fn v_cvt_u16_and_i16_f16_saturate() {
     }
 }
 
+/// Translate the 64-bit host's `victory_formats::xma::log2` using two console registers.
+#[test]
+fn xma_integer_log2_handles_both_words() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 holds the low word and v2 holds the high word. Select the high word if nonzero.
+    body.extend(vop3(0x0C5, 106, vgpr(2), 128, 128)); // v_cmp_ne_u32 vcc, v2, 0
+    body.extend(vop3(0x101, 5, vgpr(1), vgpr(2), vcc)); // v_cndmask_b32 v5, v1, v2, vcc
+    body.extend(vop3(0x101, 6, 128 + 31, 128 + 63, vcc)); // v_cndmask_b32 v6, 31, 63, vcc
+    body.extend(vop3(0x114, 5, vgpr(5), 129, 128)); // v_max_u32 v5, v5, 1 (log2(0) = 0)
+    body.push(vop1(0x039, 7, vgpr(5))); // v_ffbh_u32 v7, v5
+    body.extend(vop3(0x126, 0, vgpr(6), vgpr(7), 128)); // v_sub_nc_u32 v0, v6, v7
+
+    let mut values = vec![u64::MAX, 0x0020_a500_ffff_ffff, 0x8000_0012_3456_789a];
+    for bit in 0..64 {
+        let power = 1u64 << bit;
+        values.extend([power - 1, power, power + 1]);
+    }
+    values.sort_unstable();
+    values.dedup();
+    let cases: Vec<_> = values
+        .iter()
+        .map(|&v| [v as u32, (v >> 32) as u32, 0, 0])
+        .collect();
+    run_cases(&build_valu_cs(&body), &cases, |backend, i, _, got| {
+        let v = values[i];
+        assert_eq!(
+            got,
+            v.checked_ilog2().unwrap_or(0),
+            "{backend}: log2({v:#x})"
+        );
+    });
+}
+
 #[test]
 fn v_cvt_f16_u16_and_i16_widen_the_integer_first() {
     // v_mov_b32 v0, 0; v_cvt_f16_u16 / v_cvt_f16_i16 v0, v1 (VOP1 0x050 / 0x051).
