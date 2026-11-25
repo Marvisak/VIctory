@@ -73,8 +73,15 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 pub fn log_crash(text: &str) {
     let text = format!("{text}
 {}", report_end());
-    eprint!("{text}");
+    print_to_stderr(&text);
     append_to_log(&text);
+}
+
+/// Prints a report to stderr. Not `eprint!`: that panics when stderr is gone (a pipe whose
+/// reader left), and the report must still reach the crash log then.
+fn print_to_stderr(text: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(text.as_bytes());
 }
 
 fn append_to_log(text: &str) {
@@ -641,10 +648,10 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     // Printed line by line (a fault while unwinding must not lose the
     // lines before it), and kept for the file.
     let mut text = String::new();
-    let mut line = |l: String| {
-        eprintln!("{l}");
+    let mut line = |mut l: String| {
+        l.push('\n');
+        print_to_stderr(&l);
         text.push_str(&l);
-        text.push('\n');
     };
     line(format!(
         "VIctory: {what} {:#010x} at {}{detail}",
@@ -678,7 +685,7 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     }
     if to_file {
         let end = report_end();
-        eprint!("{end}");
+        print_to_stderr(&end);
         text.push_str(&end);
         append_to_log(&text);
     }
@@ -687,10 +694,10 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         // SAFETY: the caller of `save_on_crash` named readable memory.
         let bytes = unsafe { std::slice::from_raw_parts(*address as *const u8, *len) };
         let saved = std::fs::write(file, bytes);
-        eprintln!(
-            "  saved {address:#x}+{len:#x} to {} ({saved:?})",
+        print_to_stderr(&format!(
+            "  saved {address:#x}+{len:#x} to {} ({saved:?})\n",
             file.display()
-        );
+        ));
     }
 }
 
