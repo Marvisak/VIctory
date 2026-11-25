@@ -2784,6 +2784,8 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// The `VICTORY_FPS` presents' pacer (none: presents are not paced).
+    pacer: crate::pace::Pacer,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -3044,6 +3046,9 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            // A paced present holds the title's own thread, which waits
+            // here, until the frame's deadline.
+            p.pacer.wait();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
@@ -3095,6 +3100,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                pacer: crate::pace::Pacer::from_env(),
             })
         }
     }

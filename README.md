@@ -122,6 +122,14 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
+Set `VICTORY_FPS=<frames per second>` before launching to pace presents to
+that cadence: the title's present waits for the next frame's deadline
+instead of showing finished frames as fast as the GPU makes them. This
+keeps a strong GPU from running flat out (its heat, on a laptop, throttles
+the play mid-scene) and does not slow the title's other threads.
+`VICTORY_FPS=30` is the console's own cadence. With the variable unset,
+presents are not paced.
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 
