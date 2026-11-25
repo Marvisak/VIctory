@@ -63,6 +63,9 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Whether its native program runs in 64-lane console waves.
+    #[cfg(windows)]
+    wave64: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -93,6 +96,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            wave64: OnceLock::new(),
         }
     }
 }
@@ -106,6 +111,20 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// Whether the container's native program runs in 64-lane console waves.
+    pub(crate) fn wave64(&self) -> bool {
+        *self.wave64.get_or_init(|| {
+            victory_shader::Container::parse(&self.container)
+                .ok()
+                .and_then(|c| {
+                    c.part(victory_shader::FourCC::DXIL)
+                        .map(|p| p.data.to_vec())
+                })
+                .and_then(|d| victory_shader::native::native_programs(&d).ok())
+                .is_some_and(|ps| ps.iter().any(|p| p.wave64))
+        })
+    }
+
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -169,7 +188,8 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
-    let (host, cached) = crate::shader_cache::host_shader(container);
+    let target = crate::shader_cache::host_target();
+    let (host, cached) = crate::shader_cache::host_shader(container, target);
     (host.and_then(|host| with_resources(container, host)), cached)
 }
 
