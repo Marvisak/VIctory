@@ -8,7 +8,8 @@
 //! texture's range is free again once nothing else holds its resource
 //! (heap slots keep views' resources until the running submission has run,
 //! lists until they are reset), so no view or list sees its memory reused.
-//! Empty heaps past [`SPARE`] are released.
+//! Empty heaps past [`SPARE`] are released. Small CPU-visible buffers have
+//! heaps of their own ([`crate::small_buffers`]).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
