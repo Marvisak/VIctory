@@ -454,7 +454,7 @@ impl Shadow {
         let written = match &saved {
             // The title's bytes are the copy's from before: what differs is
             // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
+            None => (*host != title[..]).then_some(&host[..]),
             Some(before) => {
                 let before = &before[from - page..to - page];
                 let mut changed = false;
@@ -465,12 +465,27 @@ impl Shadow {
                     }
                     *h = *t;
                 }
-                changed.then_some(title.as_ptr())
+                changed.then_some(&title[..])
             }
         };
         if let Some(bytes) = written {
             let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
+            crate::host::write_mapped(from as *mut u8, bytes.as_ptr(), n);
+            // The same bytes go into the snapshot of a declared range over the
+            // page (`copy_back_or_not` compares the copy against it): without
+            // that, the title's own writes — which the copy has taken — look
+            // like the GPU's, and the copy's older bytes go back over a title
+            // write made after this (the failure `copy_back`'s comment warns
+            // about).
+            // The segments hold offsets in the copy, not title addresses.
+            let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            for (at, segment) in snapshot.0.iter_mut() {
+                let (f, t) = ((from - start).max(*at), (to - start).min(*at + segment.len()));
+                if f < t {
+                    let (a, b) = (f + start - from, t + start - from);
+                    segment[f - *at..t - *at].copy_from_slice(&bytes[a..b]);
+                }
+            }
         }
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
@@ -1026,6 +1041,48 @@ mod tests {
     /// submission declared as written by shaders: the refresh before the
     /// submission runs still brings it to the copy, a shader's write still
     /// goes back, and a title write made after the refresh is not undone.
+    /// A marked copy-back puts the shaders' bytes into title memory and the
+    /// copy takes the title's others. A declared range over the same page
+    /// keeps its snapshot from before the submission, so a later copy-back
+    /// takes the title's writes for the GPU's and puts the copy's older
+    /// bytes back over them (#2436): the snapshot has to follow, as
+    /// `update_busy` does for the copy.
+    #[test]
+    fn a_marked_copy_back_keeps_a_declared_ranges_snapshot_in_step() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let title = |at: usize| (p + at) as *mut u8;
+        copy.update(p, len);
+        // A declared range over the page (its snapshot from before the
+        // submission), and the same page armed as written by shaders.
+        copy.writing(p, PAGE, false);
+        copy.writing(p, PAGE, true);
+        // The shader writes byte 10; the title writes byte 40 meanwhile.
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        // SAFETY: bytes of our pool.
+        unsafe { title(40).write_volatile(0x40) };
+        copy.copy_back_marked(p);
+        // The title writes both again after the marked copy-back.
+        // SAFETY: bytes of our pool.
+        unsafe {
+            title(10).write_volatile(0x11);
+            title(40).write_volatile(0x41);
+        }
+
+        copy.copy_back(p, PAGE);
+        // SAFETY: bytes of our pool.
+        unsafe {
+            assert_eq!(title(10).read_volatile(), 0x11, "the title's later write at 10 stays");
+            assert_eq!(title(40).read_volatile(), 0x41, "the title's later write at 40 stays");
+        }
+        unregister(p, p as u64);
+    }
+
     #[test]
     fn title_writes_under_a_busy_range_are_copied() {
         let p = crate::watch::tests::pool(2);
