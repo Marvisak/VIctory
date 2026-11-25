@@ -60,6 +60,8 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    full_hash: [u8; 32],
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
@@ -77,19 +79,25 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
+    let key = *full.as_bytes();
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
-        .or_insert_with(|| Arc::new(Shader::new(stage, bytes)))
+        .entry(key)
+        .or_insert_with(|| Arc::new(Shader::with_hash(stage, bytes, full)))
         .clone()
 }
 
 impl Shader {
     fn new(stage: &'static str, bytes: &[u8]) -> Shader {
+        Self::with_hash(stage, bytes, blake3::hash(bytes))
+    }
+
+    fn with_hash(stage: &'static str, bytes: &[u8], full: blake3::Hash) -> Shader {
         Shader {
             stage,
-            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
+            hash: full.to_hex()[..16].to_owned(),
+            full_hash: *full.as_bytes(),
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
@@ -112,7 +120,7 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let (done, cached) = translate(&self.container);
+                let (done, cached) = translate(&self.full_hash, &self.container);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
@@ -168,32 +176,35 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
-fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
+fn translate(full_hash: &[u8; 32], container: &[u8]) -> (Result<Translated, String>, bool) {
     let (host, cached) = crate::shader_cache::host_shader(container);
-    (host.and_then(|host| with_resources(container, host)), cached)
+    (host.and_then(|host| with_resources(full_hash, container, host)), cached)
 }
 
 #[cfg(windows)]
 fn with_resources(
+    full_hash: &[u8; 32],
     container: &[u8],
     host: victory_shader::emit::HostShader,
 ) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
-    let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
-        Some(part) => victory_shader::native_programs(part.data)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|p| {
-                matches!(
-                    p.stage,
-                    HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-                )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
+    let used = crate::shader_meta::get_or_compute(full_hash, || {
+        let c = Container::parse(container).map_err(|e| e.to_string())?;
+        match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
+            Some(part) => Ok(victory_shader::native_programs(part.data)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|p| {
+                    matches!(
+                        p.stage,
+                        HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+                    )
+                })
+                .map(|p| p.used)
+                .unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
+    })?;
     Ok(Translated { host, used })
 }
 

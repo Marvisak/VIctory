@@ -41,6 +41,7 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
+    crate::shader_meta::init(&dir);
     let _ = DIR.set(dir);
 }
 
@@ -302,6 +303,7 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    crate::shader_meta::save(dir);
     let (blob, prebuilt) = {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
