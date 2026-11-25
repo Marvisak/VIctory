@@ -593,6 +593,9 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        if compute || pipeline_writes_uav(p) {
+            list.end_hoisted_indirect();
+        }
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
@@ -1006,6 +1009,7 @@ impl State {
             user_data: 0,
             slot: 0,
         };
+        list.end_hoisted_indirect();
         readable(list, &written, &view, false);
         self.bind_heaps(list, false);
         list.keep(&resource);
@@ -1655,6 +1659,9 @@ impl State {
         };
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        if max == 0 {
+            return true;
+        }
         // A call with no host pipeline cannot run, and that is the common
         // case while the world builds its pipelines: #400 measures 1 400-1 750
         // indirect calls a frame dropped this way. Drop it here, before the
@@ -1662,13 +1669,13 @@ impl State {
         // the arguments and dispatch a compute shader for records nothing
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
-        if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             why("no host pipeline");
             return false;
-        }
-        let len = u64::from(stride) * u64::from(max.max(1));
+        };
+        let len = u64::from(stride) * u64::from(max);
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
             return false;
@@ -1694,44 +1701,86 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own.
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
-        };
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
-        let ran = match kind {
-            DRAW | INDEXED => {
-                (self.topology != RECTANGLES || self.completes_rectangles() || {
-                    not_run("rectangles");
-                    false
-                }) && self.prepare(list, kind == INDEXED)
-            }
-            MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
-                _ => false,
-            },
-            _ => false,
-        };
-        if !ran {
-            crate::indirect::done(list, &clamped);
-            #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => {
-                    crate::pipeline::note_drop(self.pipeline as This);
-                    list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
+        let spec = (kind, stride, max);
+        let args_gpu = args.gpu(arguments);
+        let (clamped, clamped_at, hoisted) = if kind != DISPATCH
+            && !pipeline_writes_uav(p)
+            && crate::indirect::can_hoist(list, args_gpu, spec)
+        {
+            let ran = match kind {
+                DRAW | INDEXED => {
+                    (self.topology != RECTANGLES || self.completes_rectangles() || {
+                        not_run("rectangles");
+                        false
+                    }) && self.prepare(list, kind == INDEXED)
                 }
-                Some(p) => why(&format!(
+                MESH => self.prepare_for(list, false, true),
+                _ => false,
+            };
+            if !ran {
+                #[cfg(feature = "diagnostics")]
+                why(&format!(
                     "prepare failed (compute {}, mesh {}): {}",
                     p.compute,
                     p.mesh,
                     NOT_RUN.with(|w| w.replace(""))
-                )),
+                ));
+                return false;
             }
-            return false;
-        }
+            if let Some((buf, at)) = crate::indirect::hoist(list, &args.buffer, args_gpu, spec) {
+                (buf, at, true)
+            } else {
+                list.end_hoisted_indirect();
+                let Some(clamped) = crate::indirect::bound(list, args_gpu, spec) else {
+                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                    return false;
+                };
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+                let rebound = match kind {
+                    DRAW | INDEXED => self.prepare(list, kind == INDEXED),
+                    MESH => self.prepare_for(list, false, true),
+                    _ => false,
+                };
+                if !rebound {
+                    crate::indirect::done(list, &clamped);
+                    return false;
+                }
+                (clamped, 0, false)
+            }
+        } else {
+            list.end_hoisted_indirect();
+            // Bounded first: the clamp binds a compute pipeline of its own.
+            let Some(clamped) = crate::indirect::bound(list, args_gpu, spec) else {
+                why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                return false;
+            };
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+            let ran = match kind {
+                DRAW | INDEXED => {
+                    (self.topology != RECTANGLES || self.completes_rectangles() || {
+                        not_run("rectangles");
+                        false
+                    }) && self.prepare(list, kind == INDEXED)
+                }
+                MESH => self.prepare_for(list, false, true),
+                DISPATCH => p.compute && self.bind(list, p, true),
+                _ => false,
+            };
+            if !ran {
+                crate::indirect::done(list, &clamped);
+                #[cfg(feature = "diagnostics")]
+                why(&format!(
+                    "prepare failed (compute {}, mesh {}): {}",
+                    p.compute,
+                    p.mesh,
+                    NOT_RUN.with(|w| w.replace(""))
+                ));
+                return false;
+            }
+            (clamped, 0, false)
+        };
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
@@ -1743,7 +1792,7 @@ impl State {
                 &signature,
                 max,
                 &clamped,
-                0,
+                clamped_at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
@@ -1757,10 +1806,12 @@ impl State {
             if always || crate::capture::dump_on() {
                 let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let name = crate::pipeline::shaders_of(pipeline);
-                crate::capture::read_indirect(list, (&clamped, 0), count, (kind, stride, max), name, always);
+                crate::capture::read_indirect(list, (&clamped, clamped_at), count, (kind, stride, max), name, always);
             }
         }
-        crate::indirect::done(list, &clamped);
+        if !hoisted {
+            crate::indirect::done(list, &clamped);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1871,6 +1922,25 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         }
         _ => {}
     }
+}
+
+/// Whether any stage of `p` may write to GPU memory (root UAV, table UAV,
+/// bindless heap write, view write-mark, or title memory store).
+fn pipeline_writes_uav(p: &HostPipeline) -> bool {
+    p.marks.is_some()
+        || p.stages.iter().any(|s| {
+            !s.root_uavs.is_empty()
+                || s.memory.is_some()
+                || s.translated().host.heap_writes
+                || s.translated()
+                    .used
+                    .iter()
+                    .any(|u| u.kind == ResourceType::Uav)
+                || s.translated().host.user_data.iter().any(|u| {
+                    u.root == RootType::Descriptor
+                        && u.dword == victory_shader::emit::ROOT_UAV_VIEW
+                })
+        })
 }
 
 /// A view in a few words (diagnostics builds).
