@@ -278,6 +278,19 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
+/// The formats of `f`'s family: the typeless head and its typed, sRGB and
+/// other twins, or `f` alone if it has none. Unlike [`castable`], which
+/// groups by element size, these are the formats a host UAV of `f` can reach
+/// without changing what the texels mean.
+pub(crate) fn family_formats(f: u32) -> impl Iterator<Item = u32> {
+    let head = family(f);
+    // `f` itself is in `1..=115` only for `f <= 115`, so a higher format
+    // with no family would otherwise iterate nothing, not "`f` alone".
+    (1..=115)
+        .filter(move |&g| family(g) == head)
+        .chain((f > 115).then_some(f))
+}
+
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
@@ -1131,6 +1144,19 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // The host refuses to create a resource flagged for unordered access whose
+    // format cannot be a typed UAV — e.g. B5G5R5A1_UNORM, which reaches one
+    // only by an element-size cast the plain-description calls
+    // (`GetResourceAllocationInfo`, the creation fallback) do not carry —
+    // even though the console allows it. Such a texture is made without the
+    // flag; its unordered views are then refused, the same as any other use
+    // the host does not take. The family is the format's own layout (typeless,
+    // linear, sRGB), not `castable`'s element-size group.
+    if d.flags & UNORDERED != 0
+        && !family_formats(d.format).any(crate::descriptor::host::typed_store)
+    {
+        d.flags &= !UNORDERED;
+    }
     Some(d)
 }
 
@@ -1389,13 +1415,24 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     }
     if texture.is_none() {
         castable_formats.clear();
+        // No cast list now: `ALLOW_UNORDERED_ACCESS` is legal only where the
+        // format itself takes a typed unordered view. The castable creation
+        // was offered only because one of its formats does; where the host
+        // refused it (a packed format it will not make castable), keeping the
+        // flag would remove the device, so the texture is made without it.
+        let mut fallback = *d;
+        if fallback.flags & UNORDERED != 0
+            && !crate::descriptor::host::typed_store(fallback.format)
+        {
+            fallback.flags &= !UNORDERED;
+        }
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
         let made = unsafe {
             host.device.CreateCommittedResource(
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
-                std::ptr::from_ref(d).cast(),
+                std::ptr::from_ref(&fallback).cast(),
                 D3D12_RESOURCE_STATES(initial as i32),
                 clear_value,
                 &mut texture,
@@ -2513,6 +2550,40 @@ mod tests {
         assert!(!bc1.contains(&70) && !bc1.contains(&98) && !bc1.contains(&17));
         assert!(castable(98).contains(&95) && castable(98).contains(&77));
         assert!(castable(53).contains(&56) && !castable(53).contains(&55));
+    }
+
+    /// The UAV flag a host texture is made with must be one the host can
+    /// legally create: some format of the texture's own family (same layout:
+    /// typeless, linear, sRGB) must take a typed unordered view. A typeless
+    /// colour texture keeps the flag through its typed member; `B5G5R5A1_UNORM`
+    /// (86) loses it — it reaches a typed UAV only by an element-size cast the
+    /// plain-description calls do not carry.
+    #[cfg(windows)]
+    #[test]
+    fn unordered_flag_follows_the_format_family() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let takes =
+            |f: u32| family_formats(f).any(crate::descriptor::host::typed_store);
+        // A format above the scanned range with no family is still itself.
+        assert!(
+            family_formats(200).any(|g| g == 200),
+            "a format with no family is its own family"
+        );
+        // The rule, not what this host supports: a device that stores
+        // `B5G5R5A1_UNORM` typed (WARP, some AMD) keeps the flag on 86, so the
+        // test must not hard-code that 86 loses it.
+        for &format in &[27u32, 28, 29, 86, 87, 10] {
+            let mut d = texture(4, 4, format, 1);
+            d.flags |= UNORDERED;
+            let made = host_desc(&d).unwrap();
+            assert_eq!(
+                made.flags & UNORDERED != 0,
+                takes(format),
+                "format {format}"
+            );
+        }
     }
 
     #[test]
