@@ -292,6 +292,13 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 impl HostHeap {
+    /// Where the pairs' region starts: past the title's and the dynamic
+    /// slots, whichever dynamic range this heap was made with.
+    #[cfg(test)]
+    pub(crate) fn pairs_start(&self) -> u32 {
+        self.pairs.lock().unwrap_or_else(|e| e.into_inner()).0
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
@@ -2023,11 +2030,17 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
+        // Every index a translated shader can reach exists while the host
+        // took the full heap; one that caps its heaps below `HEAP_VIEWS`
+        // (NVIDIA) takes the smaller dynamic range instead, by design.
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            let desc = heap.heap.GetDesc();
+            assert!(
+                (desc.NumDescriptors >= victory_shader::emit::HEAP_VIEWS)
+                    || (desc.NumDescriptors >= 4 + MIN_DYNAMIC),
+                "either the full heap, or the capped path's slots",
+            );
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }

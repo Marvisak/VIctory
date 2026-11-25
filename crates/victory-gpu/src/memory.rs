@@ -764,7 +764,16 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&lists[0], &lists[1]]);
         assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
-        assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
+        // Past the dynamic slots where the heap kept a pairs region; a
+        // capped heap (num descriptors < HEAP_VIEWS) gives dynamic ones
+        // (`HostHeap::pair`).
+        // SAFETY: a plain query of a live heap.
+        if views.pairs_start() < unsafe { views.heap.GetDesc() }.NumDescriptors {
+            assert!(
+                pairs.0 >= views.pairs_start() && pairs.1 >= views.pairs_start(),
+                "past the dynamic slots",
+            );
+        }
         // A second submission, after a third copy came.
         let c = copy(memory[2], 1);
         for list in &lists {
