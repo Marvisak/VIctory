@@ -3,7 +3,8 @@
 //!
 //! Covers RDNA2 hardware semantics that differ from naive DXIL lowering:
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
-//! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
+//! near `1.0`, `v_frexp_*` decomposition, and turn-range reduction for
+//! `v_sin_*`/`v_cos_*`.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -820,6 +821,135 @@ fn v_fract_f16_never_returns_one() {
             ),
         }
     });
+}
+
+fn build_frexp_cs(body: &[u32]) -> HostShader {
+    let shader = build_valu_cs(body);
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let sfi0 = container.part(crate::FourCC::SFI0).unwrap().data;
+    let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+    assert_eq!(
+        features & 0x8001,
+        0,
+        "frexp requests double or Int64 support"
+    );
+    shader
+}
+
+#[test]
+fn v_frexp_f32_decomposes_normals_flushes_subnormals_and_handles_special_values() {
+    // (input bits, significand bits, signed exponent)
+    let cases: [(u32, u32, i32); 12] = [
+        (0x3F80_0000, 0x3F00_0000, 1),    // +1.0
+        (0xC000_0000, 0xBF00_0000, 2),    // -2.0
+        (0x3F40_0000, 0x3F40_0000, 0),    // +0.75
+        (0x0080_0000, 0x3F00_0000, -125), // smallest positive normal
+        (0x0000_0001, 0x0000_0000, 0),    // smallest positive subnormal
+        (0x8000_0003, 0x8000_0000, 0),    // negative subnormal with a fractional bit
+        (0x007F_FFFF, 0x0000_0000, 0),    // largest positive subnormal
+        (0x0000_0000, 0x0000_0000, 0),
+        (0x8000_0000, 0x8000_0000, 0),
+        (0x7F80_0000, 0x7F80_0000, 0),
+        (0xFF80_0000, 0xFF80_0000, 0),
+        (0xFFC1_2345, 0xFFC1_2345, 0), // NaN with a payload
+    ];
+    let inputs: Vec<_> = cases.iter().map(|&(x, _, _)| [x, 0, 0, 0]).collect();
+    for (op, mantissa) in [(0x040, true), (0x03f, false)] {
+        let shader = build_frexp_cs(&[vop1(op, 0, vgpr(1))]);
+        run_cases(&shader, &inputs, |backend, i, [x, ..], got| {
+            let (_, mant, exp) = cases[i];
+            let want = if mantissa { mant } else { exp as u32 };
+            assert_eq!(got, want, "{backend}: VOP1 {op:#x}, input {x:#010x}");
+        });
+    }
+}
+
+#[test]
+fn v_frexp_f16_decomposes_and_preserves_the_other_destination_half() {
+    // (input bits, significand bits, signed exponent)
+    let cases: [(u16, u16, i16); 12] = [
+        (0x3C00, 0x3800, 1),   // +1.0
+        (0xC000, 0xB800, 2),   // -2.0
+        (0x3A00, 0x3A00, 0),   // +0.75
+        (0x0400, 0x3800, -13), // smallest positive normal
+        (0x0001, 0x3800, -23), // smallest positive subnormal
+        (0x8003, 0xBA00, -22), // negative subnormal with a fractional bit
+        (0x03FF, 0x3BFE, -14), // largest positive subnormal
+        (0x0000, 0x0000, 0),
+        (0x8000, 0x8000, 0),
+        (0x7C00, 0x7C00, 0),
+        (0xFC00, 0xFC00, 0),
+        (0xFE31, 0xFE31, 0), // NaN with a payload
+    ];
+    let dst = 0xA5A5_5A5A;
+    for (op, mantissa) in [(0x059, true), (0x05a, false)] {
+        let init_dst = vop1(0x001, 0, vgpr(2));
+        let [w0, w1] = vop3(op + 0x180, 0, vgpr(1), 0, 0);
+        for (mode, shift, body) in [
+            ("VOP1", 0, vec![init_dst, vop1(op, 0, vgpr(1))]),
+            // SDWA: src0 = v1 WORD_1, dst = WORD_1 with UNUSED_PRESERVE.
+            (
+                "SDWA",
+                16,
+                vec![init_dst, vop1(op, 0, 0xF9), 1 | 5 << 16 | 5 << 8 | 2 << 11],
+            ),
+            // The lowerer's VOP3 op_sel path selects the same halves.
+            ("VOP3", 16, vec![init_dst, w0 | 0b1001 << 11, w1]),
+        ] {
+            let shader = build_frexp_cs(&body);
+            let inputs: Vec<_> = cases
+                .iter()
+                .map(|&(x, _, _)| {
+                    [
+                        (u32::from(x) << shift) | (0x4C00 << (16 - shift)),
+                        dst,
+                        0,
+                        0,
+                    ]
+                })
+                .collect();
+            run_cases(&shader, &inputs, |backend, i, [x, ..], got| {
+                let (_, mant, exp) = cases[i];
+                let want = if mantissa { mant } else { exp as u16 };
+                let want = (dst & !(0xFFFF << shift)) | (u32::from(want) << shift);
+                assert_eq!(got, want, "{backend}: {mode} {op:#x}, input {x:#010x}");
+            });
+        }
+    }
+}
+
+#[test]
+fn v_frexp_vop3_applies_float_modifiers() {
+    let abs = 1 << 8;
+    let clamp = 1 << 15;
+    let neg = 1 << 29;
+    let mul2 = 1 << 27;
+    let div2 = 3 << 27;
+    let cases = [
+        (0x1c0, abs, 0, 0xBF40_0000, 0x3F40_0000),
+        (0x1c0, 0, neg | mul2, 0xBF40_0000, 0x3FC0_0000),
+        (0x1c0, abs | clamp, mul2, 0xBF40_0000, 0x3F80_0000),
+        (0x1c0, abs, neg | div2, 0xBDC0_0000, 0xBEC0_0000),
+        (0x1c0, abs, 0, 0x8000_0003, 0x0000_0000),
+        (0x1c0, 0, neg, 0x0000_0001, 0x8000_0000),
+        (0x1c0, abs, neg | div2, 0x8000_0003, 0x0000_0000),
+        (0x1c0, 0, mul2, 0x8000_0000, 0),
+        (0x1bf, abs | clamp, neg | mul2, 0xBDC0_0000, (-3i32) as u32),
+        (0x1bf, abs | clamp, neg | mul2, 0x8000_0003, 0),
+        (0x1d9, abs, 0, 0xBA00, 0xA5A5_3A00),
+        (0x1d9, 0, neg | mul2, 0xBA00, 0xA5A5_3E00),
+        (0x1d9, abs | clamp, mul2, 0xBA00, 0xA5A5_3C00),
+        (0x1d9, abs, neg | div2, 0x8003, 0xA5A5_B600),
+        (0x1d9, 0, mul2, 0x8000, 0xA5A5_0000),
+        (0x1da, abs | clamp, neg | mul2, 0x8003, 0xA5A5_FFEA),
+    ];
+    for (op, mod0, mod1, x, want) in cases {
+        let [w0, w1] = vop3(op, 0, vgpr(1), 0, 0);
+        let shader = build_frexp_cs(&[vop1(0x001, 0, vgpr(2)), w0 | mod0, w1 | mod1]);
+        run_cases(&shader, &[[x, 0xA5A5_5A5A, 0, 0]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: VOP3 {op:#x}, input {x:#010x}");
+        });
+    }
 }
 
 /// RDNA2's flt16_to_snorm16 / flt16_to_unorm16: clamp, scale by 32767 or

@@ -2082,10 +2082,18 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let op = *v.src.get(k).ok_or("a missing operand")?;
         if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
             return Err("integer operand modifiers");
         }
+        self.src_bits(inst, k)
+    }
+
+    /// Selected source bits before applying abs or neg.
+    fn src_bits(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let op = *v.src.get(k).ok_or("a missing operand")?;
         match self.src0 {
             Some(x) if k == 0 => Ok(x),
             _ => {
@@ -2683,32 +2691,33 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, old, field)
     }
 
+    fn float_output_modifiers(&mut self, mut f: V, omod: u8, clamp: bool) -> V {
+        if omod != 0 {
+            // On the flushed result; a zero or denormal product comes out
+            // +0 (measured on RDNA2 with IEEE mode off).
+            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(omod)];
+            let c = self.cur;
+            let k = self.s.m.f32(factor.to_bits());
+            let r = self.ftz(f);
+            let r = self.s.m.bin(c, Bin::Mul, r, k);
+            let x = self.as_int(r);
+            let (exp, zero) = (self.s.m.i32(0x7F80_0000), self.s.m.i32(0));
+            let e = self.s.m.bin(c, Bin::And, x, exp);
+            let tiny = self.s.m.cmp(c, pred::EQ, e, zero);
+            let x = self.s.m.select(c, tiny, zero, x);
+            f = self.as_float(x);
+        }
+        if clamp {
+            f = self.unary(7, f);
+        }
+        f
+    }
+
     fn write_f(&mut self, inst: &Inst, f: V, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let mut f = f;
-        match v.omod {
-            0 => {}
-            k => {
-                // On the flushed result; a zero or denormal product comes out
-                // +0 (measured on RDNA2 with IEEE mode off).
-                let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
-                let c = self.cur;
-                let k = self.s.m.f32(factor.to_bits());
-                let r = self.ftz(f);
-                let r = self.s.m.bin(c, Bin::Mul, r, k);
-                let x = self.as_int(r);
-                let (exp, zero) = (self.s.m.i32(0x7F80_0000), self.s.m.i32(0));
-                let e = self.s.m.bin(c, Bin::And, x, exp);
-                let tiny = self.s.m.cmp(c, pred::EQ, e, zero);
-                let x = self.s.m.select(c, tiny, zero, x);
-                f = self.as_float(x);
-            }
-        }
-        if v.clamp {
-            f = self.unary(7, f);
-        }
+        let f = self.float_output_modifiers(f, v.omod, v.clamp);
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err("a float result outside a VGPR");
         };
@@ -5733,6 +5742,10 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_frexp_mant_f32"
+            | "v_frexp_exp_i32_f32"
+            | "v_frexp_mant_f16"
+            | "v_frexp_exp_i16_f16" => self.frexp(inst, name, guard),
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
@@ -6505,6 +6518,129 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.bin(c, Bin::LShr, x, k32);
         let hi = self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32);
         (lo, hi)
+    }
+
+    /// RDNA2 ISA §12.8: split a finite nonzero input into a signed fraction
+    /// in [0.5, 1) in magnitude and a power of two. Flush f32 denormals to
+    /// signed zero and normalize f16 denormals on the bits.
+    fn frexp(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let half = name.ends_with("_f16");
+        let mantissa = name.starts_with("v_frexp_mant_");
+        let (sign_bit, fraction_bits, bias) = if half {
+            (0x8000, 10, 15)
+        } else {
+            (0x8000_0000, 23, 127)
+        };
+        let mut x = if half {
+            self.half_src(inst, 0)?
+        } else {
+            let bits = self.src_bits(inst, 0)?;
+            let f = self.as_float(bits);
+            let f = self.ftz(f);
+            self.as_int(f)
+        };
+        let c = self.cur;
+        let m = &mut self.s.m;
+        let sign_mask = m.i32(sign_bit);
+        let magnitude_mask = m.i32(sign_bit - 1);
+        if v.abs & 1 != 0 {
+            x = m.bin(c, Bin::And, x, magnitude_mask);
+        }
+        if v.neg & 1 != 0 {
+            x = m.bin(c, Bin::Xor, x, sign_mask);
+        }
+        let magnitude = m.bin(c, Bin::And, x, magnitude_mask);
+        let (zero, one) = (m.i32(0), m.i32(1));
+        let fraction_width = m.i32(fraction_bits);
+        let exponent = m.bin(c, Bin::LShr, magnitude, fraction_width);
+        let exponent_max = m.i32(2 * bias + 1);
+        let nonfinite = m.cmp(c, pred::EQ, exponent, exponent_max);
+        let is_zero = m.cmp(c, pred::EQ, magnitude, zero);
+        let special = m.bin(c, Bin::Or, is_zero, nonfinite);
+        let normalization = if half {
+            let denormal = m.cmp(c, pred::EQ, exponent, zero);
+            // Find the shift that puts the first set bit at the implicit-one
+            // position. The low bit guarantees a defined count even for zero.
+            let nonzero = m.bin(c, Bin::Or, magnitude, one);
+            let leading = self.s.op(
+                c,
+                "unaryBits.i32",
+                Attr::ReadNone,
+                self.s.t.i32,
+                33,
+                &[nonzero],
+            );
+            let m = &mut self.s.m;
+            let target = m.i32(31 - fraction_bits);
+            let shift = m.bin(c, Bin::Sub, leading, target);
+            Some((denormal, shift))
+        } else {
+            None
+        };
+        let m = &mut self.s.m;
+        if mantissa {
+            let significand = if let Some((denormal, shift)) = normalization {
+                let shift = m.select(c, denormal, shift, zero);
+                m.bin(c, Bin::Shl, magnitude, shift)
+            } else {
+                magnitude
+            };
+            let fraction_mask = m.i32((1 << fraction_bits) - 1);
+            let fraction = m.bin(c, Bin::And, significand, fraction_mask);
+            let half_exponent = m.i32((bias - 1) << fraction_bits);
+            let fraction = m.bin(c, Bin::Or, fraction, half_exponent);
+            let sign = m.bin(c, Bin::And, x, sign_mask);
+            let result = m.bin(c, Bin::Or, sign, fraction);
+            // OMOD flushes negative zero to positive zero (RDNA2 ISA §6.2.2).
+            let special_value = if v.omod != 0 {
+                m.select(c, is_zero, zero, x)
+            } else {
+                x
+            };
+            let mut result = m.select(c, special, special_value, result);
+            if !half {
+                let f = self.as_float(result);
+                return self.write_f(inst, f, guard);
+            }
+            if v.omod != 0 || v.clamp {
+                let f = self.s.op(
+                    c,
+                    "legacyF16ToF32",
+                    Attr::ReadNone,
+                    self.s.t.f32,
+                    131,
+                    &[result],
+                );
+                let f = self.float_output_modifiers(f, v.omod, v.clamp);
+                result = self
+                    .s
+                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f]);
+            }
+            self.write_half(inst, result, guard)
+        } else {
+            let exponent = if let Some((denormal, shift)) = normalization {
+                // Reduce the minimum normal exponent by the normalization shift.
+                let adjusted = m.bin(c, Bin::Sub, one, shift);
+                m.select(c, denormal, adjusted, exponent)
+            } else {
+                exponent
+            };
+            let bias_minus_one = m.i32(bias - 1);
+            let exponent = m.bin(c, Bin::Sub, exponent, bias_minus_one);
+            let result = m.select(c, special, zero, exponent);
+            if half {
+                return self.write_half(inst, result, guard);
+            }
+            // VOP3 output modifiers apply only to floating-point results.
+            let Some(Operand::Vector { reg, .. }) = v.dst else {
+                return Err("an exponent outside a VGPR");
+            };
+            self.write(inst, Reg::V(reg), result, guard);
+            Ok(())
+        }
     }
 
     /// Source `k` of a 16-bit operation in the low 16 bits (the rest 0):
