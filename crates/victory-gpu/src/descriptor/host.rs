@@ -785,9 +785,9 @@ impl HostHeap {
     /// slots had its list searched each time; 62,000 slots a frame, run
     /// evict3).
     pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
-        let slots: Vec<u32> = {
+        let title_slots: Vec<u32> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            (0..kept.len() as u32)
+            (0..self.count.min(kept.len() as u32))
                 .filter(|&i| {
                     kept[i as usize]
                         .as_ref()
@@ -796,7 +796,7 @@ impl HostHeap {
                 .collect()
         };
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        for index in slots {
+        for index in title_slots {
             let key = made.get(index as usize).copied().unwrap_or(0);
             let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
             match &view {
@@ -804,10 +804,51 @@ impl HostHeap {
                 None => null_view(self.cpu(index)),
             }
             self.keep(index, None);
-            if index < self.count {
-                self.viewed.set(index, view.as_ref(), false);
-                crate::shadow::forget_read(index);
+            self.viewed.set(index, view.as_ref(), false);
+            crate::shadow::forget_read(index);
+        }
+        drop(made);
+
+        if self.dynamic == 0 {
+            return;
+        }
+        // Dynamic slots still held by a recorded list not yet reset keep
+        // their views and references; hold `next` across inspection and
+        // clearing so `dynamic()` cannot reallocate a released slot mid-evict.
+        let retired: Vec<(u32, ID3D12Resource)> = {
+            let guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            let mut retired = Vec::new();
+            let end = (self.count + self.dynamic).min(kept.len() as u32);
+            for index in self.count..end {
+                let dyn_idx = (index - self.count) as usize;
+                if guard.1.get(dyn_idx).copied().unwrap_or(false) {
+                    continue;
+                }
+                let matches = kept[index as usize]
+                    .as_ref()
+                    .is_some_and(|k| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)));
+                if matches {
+                    null_view(self.cpu(index));
+                    if let Some((old, _)) = kept[index as usize].take() {
+                        retired.push((index, old));
+                    }
+                }
             }
+            retired
+        };
+        for (index, old) in retired {
+            #[cfg(feature = "diagnostics")]
+            if !self.sampler
+                // SAFETY: a live resource.
+                && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+            {
+                use windows::core::Interface;
+                let left = crate::resource::life::holders(&old);
+                crate::resource::life::note(old.as_raw() as usize, crate::resource::life::SLOT, u64::from(index), left);
+            }
+            let _ = index;
+            crate::host::retire(old);
         }
     }
 
@@ -2137,5 +2178,226 @@ mod tests {
         // The array's own view: a 2D array, levels 0-10.
         let words = image_words(&array, None, false);
         assert_eq!(words[1..], [3 << 30, 255 | 599 << 14, 0xFAC | 10 << 16 | 13 << 28]);
+    }
+
+    #[test]
+    fn evict_keeps_taken_dynamic_slots_until_released() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+
+        // Create a 1x1 R32_UINT texture and initialize it to 0xCAFE_BABE.
+        let tex_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32_UINT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            ..Default::default()
+        };
+        let mut tex: Option<ID3D12Resource> = None;
+        // SAFETY: plain committed 1x1 texture creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &tex_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut tex,
+                )
+                .unwrap();
+        }
+        let tex = tex.unwrap();
+        let (upload, upload_ptr) = host.upload_buffer(256).unwrap();
+        // SAFETY: upload buffer mapped for 256 bytes.
+        unsafe { upload_ptr.cast::<u32>().write_volatile(0xCAFE_BABE) };
+        let init_list = host.new_list().unwrap();
+        // SAFETY: valid 1x1 R32_UINT upload copy and barrier.
+        unsafe {
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&tex),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&upload),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R32_UINT,
+                            Width: 1,
+                            Height: 1,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            init_list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::transmute_copy(&tex),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                        StateAfter: D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    }),
+                },
+            };
+            init_list.list.ResourceBarrier(&[barrier]);
+        }
+        init_list.close();
+        host.execute(&[&init_list]);
+        init_list.reset();
+
+        let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        let bind_tex = |slot: u32| {
+            // SAFETY: valid heap slot and live texture.
+            unsafe { host.device.CreateShaderResourceView(&tex, Some(&srv_desc), heap.cpu(slot)) };
+            heap.keep(slot, Some((tex.clone(), None)));
+        };
+
+        let title_slot = 0;
+        let taken_dyn = heap.dynamic(1).unwrap();
+        let released_dyn = heap.dynamic(1).unwrap();
+        bind_tex(title_slot);
+        bind_tex(taken_dyn);
+        bind_tex(released_dyn);
+        heap.release(released_dyn, 1);
+
+        // SAFETY: live COM interface pointer query.
+        let references = |r: &ID3D12Resource| unsafe {
+            let raw = windows::core::Interface::as_raw(r);
+            let unknown = &*(raw as *const *const windows::core::IUnknown_Vtbl);
+            ((**unknown).AddRef)(raw);
+            ((**unknown).Release)(raw)
+        };
+        assert_eq!(references(&tex), 4, "ours + 3 heap slots");
+
+        let mut set = std::collections::HashSet::new();
+        set.insert(windows::core::Interface::as_raw(&tex) as usize);
+        heap.evict(&set);
+        crate::host::release_retired();
+        let since = std::time::Instant::now();
+        while references(&tex) > 2 && since.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::yield_now();
+        }
+        // Title slot and released dynamic slot were evicted; taken dynamic slot keeps its hold.
+        assert_eq!(references(&tex), 2, "ours + taken dynamic slot");
+        assert!(heap.textures_at(&[title_slot]).is_empty());
+        assert_eq!(
+            heap.textures_at(&[taken_dyn]),
+            vec![windows::core::Interface::as_raw(&tex) as usize]
+        );
+        assert!(heap.textures_at(&[released_dyn]).is_empty());
+
+        // Verify the taken dynamic slot's GPU descriptor was NOT overwritten with a null view.
+        let cs = r#"
+#define RS "UAV(u0), DescriptorTable(SRV(t0, numDescriptors=1))"
+RWByteAddressBuffer report : register(u0);
+Texture2D<uint> tex : register(t0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    report.Store(0, tex.Load(int3(0, 0, 0)));
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: static ASCII HLSL.
+        unsafe {
+            D3DCompile(
+                cs.as_ptr().cast(),
+                cs.len(),
+                windows::core::s!("evict_test"),
+                None,
+                None,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: valid compiled DXBC blob.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+        };
+        // SAFETY: valid root signature and compute PSO creation.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        let (report_buf, report_ptr) = host.shared_buffer(64).unwrap();
+        // SAFETY: live mapped report buffer.
+        let report_gpu = unsafe {
+            std::ptr::write_bytes(report_ptr, 0, 64);
+            report_buf.GetGPUVirtualAddress()
+        };
+        let read_list = host.new_list().unwrap();
+        // SAFETY: live heap, root signature, PSO, and buffers.
+        unsafe {
+            read_list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            read_list.list.SetComputeRootSignature(&root);
+            read_list.list.SetPipelineState(&pso);
+            read_list.list.SetComputeRootUnorderedAccessView(0, report_gpu);
+            read_list.list.SetComputeRootDescriptorTable(1, heap.gpu(taken_dyn));
+            read_list.list.Dispatch(1, 1, 1);
+        }
+        read_list.close();
+        host.execute(&[&read_list]);
+        read_list.reset();
+        // SAFETY: GPU execution completed.
+        let sampled = unsafe { report_ptr.cast::<u32>().read_volatile() };
+        assert_eq!(sampled, 0xCAFE_BABE, "taken dynamic slot must still view the texture");
+
+        // Once released by its list, the next eviction clears the dynamic slot too.
+        heap.release(taken_dyn, 1);
+        heap.evict(&set);
+        crate::host::release_retired();
+        let since = std::time::Instant::now();
+        while references(&tex) > 1 && since.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::yield_now();
+        }
+        assert_eq!(references(&tex), 1, "only ours remains");
+        assert!(heap.textures_at(&[taken_dyn]).is_empty());
     }
 }
