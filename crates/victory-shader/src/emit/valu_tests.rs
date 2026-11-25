@@ -225,6 +225,60 @@ fn run_cases(
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+/// `victory_formats::bcpack::nibbles`, the function the test below runs as console code.
+fn nibbles_reference(b: u8, odd_first: bool) -> [i16; 2] {
+    let half = |v: u8| (0..4).fold(0u8, |acc, k| acc | (v >> (2 * k) & 1) << k);
+    let z = |u: u8| i16::from(u >> 1) ^ -i16::from(u & 1);
+    let (even, odd) = (z(half(b)), z(half(b >> 1)));
+    if odd_first { [odd, even] } else { [even, odd] }
+}
+
+fn nibbles_body() -> Vec<u32> {
+    let vcc = sgpr(106);
+    // v1 = the byte, v2 = whether the odd bits come first. v5 and v6 gather the even and
+    // the odd bits.
+    let mut body = vec![vop1(0x001, 5, 128), vop1(0x001, 6, 128)]; // v_mov_b32 v5, 0; v6, 0
+    for k in 0u16..4 {
+        for (half, bit) in [(5, 2 * k), (6, 2 * k + 1)] {
+            body.extend(vop3(0x148, 7, vgpr(1), 128 + bit, 129)); // v_bfe_u32 v7, v1, bit, 1
+            body.extend(vop3(0x36F, half, vgpr(7), 128 + k, vgpr(half))); // v_lshl_or_b32
+        }
+    }
+    // Zigzag to signed, kept as 16 bits: v8 from the even half, v11 from the odd one.
+    for (half, out) in [(5, 8), (6, 11)] {
+        body.extend(vop3(0x116, 9, 129, vgpr(half), 128)); // v_lshrrev_b32 v9, 1, half
+        body.extend(vop3(0x148, 10, vgpr(half), 128, 129)); // v_bfe_u32 v10, half, 0, 1
+        body.extend(vop3(0x126, 10, 128, vgpr(10), 128)); // v_sub_nc_u32 v10, 0, v10
+        body.extend(vop3(0x11D, out, vgpr(9), vgpr(10), 128)); // v_xor_b32 out, v9, v10
+        body.extend(vop3(0x148, out, vgpr(out), 128, 128 + 16)); // v_bfe_u32 out, out, 0, 16
+    }
+    // The pair in the order asked for, the second in the result's high half.
+    body.extend(vop3(0x0C5, 106, 128, vgpr(2), 128)); // v_cmp_ne_u32 vcc, 0, v2
+    body.extend(vop3(0x101, 14, vgpr(8), vgpr(11), vcc)); // v_cndmask_b32 v14, v8, v11, vcc
+    body.extend(vop3(0x101, 15, vgpr(11), vgpr(8), vcc)); // v_cndmask_b32 v15, v11, v8, vcc
+    body.extend(vop3(0x36F, 0, vgpr(15), 128 + 16, vgpr(14))); // v_lshl_or_b32 v0, v15, 16, v14
+    body
+}
+
+/// BCPack's split of a byte into two signed nibbles, written as console code, matches the
+/// formats crate's function on the GPU for every byte in both orders.
+#[test]
+fn bcpack_nibble_split_matches_the_formats_function() {
+    let shader = build_valu_cs(&nibbles_body());
+    let mut cases = Vec::new();
+    let mut want = Vec::new();
+    for odd_first in [false, true] {
+        for b in 0u32..256 {
+            cases.push([b, u32::from(odd_first), 0, 0]);
+            let [first, second] = nibbles_reference(b as u8, odd_first);
+            want.push(u32::from(second as u16) << 16 | u32::from(first as u16));
+        }
+    }
+    run_cases(&shader, &cases, |backend, i, inputs, got| {
+        assert_eq!(got, want[i], "{backend}: nibbles{inputs:?}");
+    });
+}
+
 #[test]
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
