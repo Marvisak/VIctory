@@ -121,6 +121,8 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Compare two render-target capture directories and report the first difference.
+    CompareTargets { before: PathBuf, after: PathBuf },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -201,6 +203,20 @@ fn main() -> Result<()> {
             if code != 0 {
                 // Preserve all 32 bits of the Windows process status.
                 std::process::exit(code as i32);
+            }
+            Ok(())
+        }
+        Command::CompareTargets { before, after } => {
+            match victory_gpu::capture_diff::compare(&before, &after) {
+                Ok(None) => println!("All captured render targets match."),
+                Ok(Some(first)) => {
+                    println!("{first}");
+                    std::process::exit(1);
+                }
+                Err(err) => {
+                    eprintln!("{err:#}");
+                    std::process::exit(2);
+                }
             }
             Ok(())
         }

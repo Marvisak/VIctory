@@ -1219,7 +1219,9 @@ impl Host {
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
         #[cfg(feature = "diagnostics")]
-        let traced = crate::capture::listed(crate::queue::presented() + 1);
+        let capture_frame = crate::queue::presented() + 1;
+        #[cfg(feature = "diagnostics")]
+        let traced = crate::capture::listed(capture_frame);
         #[cfg(feature = "diagnostics")]
         if traced {
             for (i, r) in runs.iter().enumerate() {
@@ -1442,7 +1444,7 @@ impl Host {
                     }
                 }
             }
-            crate::capture::dump_submission(sub, &targets);
+            crate::capture::dump_submission(capture_frame, sub, &targets);
         }
     }
 
@@ -3200,7 +3202,7 @@ impl Host {
         create_compositor: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
         #[cfg(all(test, feature = "diagnostics"))] inspect: impl FnOnce(
             &ID3D12Resource,
-            &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+            &crate::capture::ReadbackLayout,
         ),
     ) -> Option<bool> {
         let &(primary, _) = planes.first()?;
@@ -3470,12 +3472,12 @@ impl Host {
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
-            if let Some((buffer, footprint)) = capture {
+            if let Some((buffer, layout)) = capture {
                 // Tests inspect the completed copy before flip-discard Present
                 // can invalidate the back buffer, with the presenter still locked.
                 #[cfg(test)]
-                inspect(&buffer, &footprint);
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+                inspect(&buffer, &layout);
+                crate::capture::save_read_back(frame, &buffer, &layout);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
@@ -4074,23 +4076,14 @@ mod present_plane_tests {
             host.present(&[(&scene, state)], 1).is_some(),
             "single-plane control"
         );
-        let first_pixel =
-            |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
-                let mut mapped = std::ptr::null_mut();
-                // SAFETY: the present copy has completed. The footprint names
-                // a live RGBA pixel inside the readback buffer.
-                let rgba = unsafe {
-                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
-                    let rgba = mapped
-                        .cast::<u8>()
-                        .add(footprint.Offset as usize)
-                        .cast::<[u8; 4]>()
-                        .read();
-                    buffer.Unmap(0, None);
-                    rgba
-                };
-                (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
-            };
+        let first_pixel = |buffer: &ID3D12Resource, layout: &crate::capture::ReadbackLayout| {
+            let rgba = layout
+                .with_rows(buffer, |rows| {
+                    *rows.first_chunk::<4>().expect("one RGBA pixel")
+                })
+                .expect("map presented pixels");
+            (layout.footprint.Width, layout.footprint.Height, rgba)
+        };
 
         let mut attempted = false;
         let mut fallback = None;
@@ -4103,7 +4096,7 @@ mod present_plane_tests {
                     windows::Win32::Foundation::E_FAIL,
                 ))
             },
-            |buffer, footprint| fallback = Some(first_pixel(buffer, footprint)),
+            |buffer, layout| fallback = Some(first_pixel(buffer, layout)),
         );
         assert!(attempted);
         assert!(
@@ -4122,7 +4115,7 @@ mod present_plane_tests {
                 &[(&scene, state), (&overlay, state)],
                 3,
                 Compositor::new,
-                |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),
+                |buffer, layout| composite = Some(first_pixel(buffer, layout)),
             )
             .is_some(),
             "compositor initialization can be retried after failure"

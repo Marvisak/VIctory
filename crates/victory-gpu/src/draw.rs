@@ -1477,7 +1477,7 @@ impl State {
                 crate::list::ensure_state(list, r as This, COPY_SOURCE);
                 let read = crate::capture::read_back(&host.device, &list.list, &t);
                 crate::list::ensure_state(list, r as This, UNORDERED);
-                let Some((buffer, f)) = read else { continue };
+                let Some((buffer, layout)) = read else { continue };
                 list.keep(&buffer);
                 struct Readback(ID3D12Resource);
                 // SAFETY: D3D12 objects are free-threaded.
@@ -1487,19 +1487,15 @@ impl State {
                 let buffer = Readback(buffer);
                 let who = format!("{} s{}+{} {r:#x} {}x{}x{} f{}", stage.shader.hash, u.slot, u.table_offset_dwords, d.Width, d.Height, d.DepthOrArraySize, d.Format.0);
                 list.defer_after(move || {
-                    let mut data = std::ptr::null_mut();
-                    // SAFETY: the list has run; the mapping spans the first slice.
-                    unsafe {
-                        if buffer.0.Map(0, None, Some(&mut data)).is_err() {
-                            return;
-                        }
-                        let n = (f.Footprint.RowPitch * f.Footprint.Height) as usize / 4;
-                        let w = std::slice::from_raw_parts(data.cast::<u32>(), n);
-                        let set = w.iter().filter(|&&x| x != 0).count();
-                        let first: Vec<f32> = w.iter().take(8).map(|&x| f32::from_bits(x)).collect();
+                    layout.with_rows(&buffer.0, |rows| {
+                        let words = layout.first_slice_rows(rows).flat_map(|row| {
+                            row.as_chunks::<4>().0.iter().map(|word| u32::from_le_bytes(*word))
+                        });
+                        let n = words.clone().count();
+                        let set = words.clone().filter(|&x| x != 0).count();
+                        let first: Vec<f32> = words.take(8).map(f32::from_bits).collect();
                         tracing::info!(target: "victory_gpu::trace", "written {who} right after the dispatch: {set} of {n} dwords set, first {first:?}");
-                        buffer.0.Unmap(0, None);
-                    }
+                    });
                 });
             }
         }

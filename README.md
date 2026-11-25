@@ -154,6 +154,7 @@ victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 victory translate [paths...] --cache [--pipelines] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
+victory compare-targets <before-dir> <after-dir>
 victory config
 ```
 
@@ -217,6 +218,19 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+
+To compare two builds, capture the same numbered frames with
+`VICTORY_CAPTURE_FRAMES` and `VICTORY_DUMP_TARGETS=1`, using a fresh
+`VICTORY_CAPTURE` directory for each run. Run
+`victory compare-targets <before-dir> <after-dir>` on those directories.
+It compares the raw bytes of subresource zero of captured single-sample
+textures, including depth-twin planes. Multisampled targets keep their
+place in the capture with an unavailable digest. A comparison that reaches
+one is inconclusive. The command pairs submissions with captured targets
+in order within each frame, and targets by first-use slot. The
+report gives both submission IDs and the recorded writers when available.
+The exit code is 0 for a match, 1 for the first difference, or 2 if the
+captures cannot be compared. Older PNG-only directories lack the raw digests.
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.

@@ -191,23 +191,19 @@ fn placed_uav_dispatch_writes_its_texture() {
         "dispatch did not record"
     );
     crate::list::ensure_state(&list, placed, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
-    let (readback, footprint) =
-        crate::capture::read_back(&host.device, &list.list, &texture).unwrap();
+    let (readback, layout) = crate::capture::read_back(&host.device, &list.list, &texture).unwrap();
     list.close();
     host.execute(&[&list]);
 
-    // SAFETY: read the two RGBA32_FLOAT texels after the synchronous submission.
-    let texels = unsafe {
-        let mut data = std::ptr::null_mut();
-        readback.Map(0, None, Some(&mut data)).unwrap();
-        let texels = data
-            .cast::<u8>()
-            .add(footprint.Offset as usize)
-            .cast::<[[f32; 4]; 2]>()
-            .read_unaligned();
-        readback.Unmap(0, None);
-        assert!(host.device.GetDeviceRemovedReason().is_ok());
-        texels
-    };
+    let texels: [[f32; 4]; 2] = layout
+        .with_rows(&readback, |rows| {
+            let (words, _) = rows.as_chunks::<4>();
+            std::array::from_fn(|texel| {
+                std::array::from_fn(|channel| f32::from_le_bytes(words[4 * texel + channel]))
+            })
+        })
+        .expect("map placed UAV texels");
+    // SAFETY: the device is live after the synchronous submission.
+    assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     assert_eq!(texels, [expected, [0.0; 4]], "placed UAV dispatch readback");
 }

@@ -122,15 +122,54 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
+/// Layout of the one subresource copied to a readback buffer. In particular,
+/// D3D12 need not allocate the padding after its last row.
+pub(crate) struct ReadbackLayout {
+    pub(crate) footprint: D3D12_SUBRESOURCE_FOOTPRINT,
+    offset: usize,
+    buffer_len: usize,
+    row_bytes: usize,
+    row_count: usize,
+}
+
+impl ReadbackLayout {
+    /// Maps the part of the buffer that starts at the placed footprint.
+    pub(crate) fn with_rows<T>(
+        &self,
+        buffer: &ID3D12Resource,
+        read: impl FnOnce(&[u8]) -> T,
+    ) -> Option<T> {
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the submitted copy has finished and the buffer is exactly
+        // buffer_len bytes long. Its footprint and offset are from D3D12.
+        unsafe {
+            buffer.Map(0, None, Some(&mut data)).ok()?;
+            let bytes = std::slice::from_raw_parts(
+                data.cast::<u8>().add(self.offset),
+                self.buffer_len - self.offset,
+            );
+            let result = read(bytes);
+            buffer.Unmap(0, None);
+            Some(result)
+        }
+    }
+
+    pub(crate) fn first_slice_rows<'a>(&self, bytes: &'a [u8]) -> impl Iterator<Item = &'a [u8]> + Clone {
+        bytes.chunks(self.footprint.RowPitch as usize)
+            .take(self.row_count)
+            .map(|row| &row[..self.row_bytes])
+    }
+}
+
 /// Records a copy of `texture` (in the copy-source state) into a
 /// readback buffer.
 pub(crate) fn read_back(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
-) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+) -> Option<(ID3D12Resource, ReadbackLayout)> {
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-    let mut total = 0;
+    let (mut row_count, mut row_bytes, mut total) = (0, 0, 0);
     // SAFETY: a live texture; outputs for one subresource.
     unsafe {
         let desc = texture.GetDesc();
@@ -140,11 +179,29 @@ pub(crate) fn read_back(
             1,
             0,
             Some(&mut footprint),
-            None,
-            None,
+            Some(&mut row_count),
+            Some(&mut row_bytes),
             Some(&mut total),
         );
     }
+    // A failed query sets total to UINT64_MAX.
+    let buffer_len = isize::try_from(total).ok()? as usize;
+    let offset = usize::try_from(footprint.Offset).ok()?;
+    let pitch = u64::from(footprint.Footprint.RowPitch);
+    let rows = u64::from(row_count) * u64::from(footprint.Footprint.Depth);
+    let end = footprint.Offset
+        .checked_add(rows.checked_sub(1)?.checked_mul(pitch)?)?
+        .checked_add(row_bytes)?;
+    if row_bytes == 0 || row_bytes > pitch || end > total {
+        return None;
+    }
+    let layout = ReadbackLayout {
+        footprint: footprint.Footprint,
+        offset,
+        buffer_len,
+        row_bytes: usize::try_from(row_bytes).ok()?,
+        row_count: row_count as usize,
+    };
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_READBACK,
         ..Default::default()
@@ -191,7 +248,7 @@ pub(crate) fn read_back(
             },
         };
         list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
-        Some((buffer, footprint))
+        Some((buffer, layout))
     }
 }
 
@@ -199,9 +256,9 @@ pub(crate) fn read_back(
 pub(crate) fn save_read_back(
     frame: u64,
     buffer: &ID3D12Resource,
-    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    layout: &ReadbackLayout,
 ) {
-    let f = footprint.Footprint;
+    let f = layout.footprint;
     let bgra = match f.Format {
         DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
         DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
@@ -210,18 +267,9 @@ pub(crate) fn save_read_back(
             return;
         }
     };
-    let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished (every submission is waited for); the
-    // mapping spans the footprint's rows.
-    unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return;
-        }
-        let len = f.RowPitch as usize * f.Height as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
+    layout.with_rows(buffer, |rows| {
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
-        buffer.Unmap(0, None);
-    }
+    });
 }
 
 /// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
@@ -354,47 +402,116 @@ pub(crate) fn dump_targets(frame: u64) {
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
         let target = (i, *resource as crate::object::This, by.as_str());
-        dump_one(host, texture, state, &format!("frame-{frame}"), target, &d);
+        dump_one(host, texture, state, &format!("frame-{frame}"), target, &d, false);
     }
 }
 
 /// After submission `sub` of a listed frame has run: the textures its lists
 /// rendered to or wrote, as `frame-<n>-s<sub>-<i>-...` (what each holds
 /// then, to follow a frame pass by pass).
-pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
+pub(crate) fn dump_submission(frame: u64, sub: u64, targets: &[(usize, String)]) {
+    peek(frame, sub);
+    // The readback lists we submit here have no targets of their own.
+    if targets.is_empty() || !dump_on() {
+        return;
+    }
+    let (Some(host), Some(dir)) = (crate::host::host(), folder()) else { return };
+    dump_submission_to(host, dir, frame, sub, targets);
+}
+
+fn dump_submission_to(
+    host: &crate::host::Host,
+    dir: &std::path::Path,
+    frame: u64,
+    sub: u64,
+    targets: &[(usize, String)],
+) {
+    use crate::capture_diff::{Target, write_submission};
     use std::sync::atomic::Ordering::Relaxed;
-    let Some(host) = crate::host::host() else { return };
-    let frame = crate::queue::presented() + 1;
-    peek(&format!("frame-{frame}-s{sub:04}"));
-    for (i, (resource, by)) in targets.iter().enumerate() {
-        let Some(copy) = crate::resource::host_copy(*resource as crate::object::This) else {
+
+    let prefix = format!("frame-{frame}-s{sub:04}");
+    let mut observations = Vec::new();
+    for (slot, (resource, writer)) in targets.iter().enumerate() {
+        let resource = *resource as crate::object::This;
+        if crate::resource::buffer_bytes(resource).is_some() {
+            continue;
+        }
+        let Some(copy) = crate::resource::host_copy(resource) else {
+            observations.push(Target {
+                slot,
+                plane: None,
+                width: 0,
+                height: 0,
+                depth: 0,
+                format: 0,
+                hash: None,
+                writer: writer.clone(),
+            });
             continue;
         };
-        let texture = &copy.texture;
-        // SAFETY: a live resource.
-        let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
-            continue;
-        }
-        let state = copy.state.load(Relaxed);
-        let target = (i, *resource as crate::object::This, by.as_str());
-        dump_one(host, texture, state, &format!("frame-{frame}-s{sub:04}"), target, &d);
-        // A depth texture's writable twin (`crate::twin`): what unordered
-        // views wrote, which reaches the depth texture at its next use.
-        for (p, plane) in copy.twin.get().and_then(Option::as_ref).iter().flat_map(|t| t.planes.iter().enumerate()) {
-            // SAFETY: a live resource.
-            let pd = unsafe { plane.texture.GetDesc() };
-            let by = format!("{by}-twin{p}");
-            let target = (i, *resource as crate::object::This, by.as_str());
-            dump_one(host, &plane.texture, plane.state.load(Relaxed), &format!("frame-{frame}-s{sub:04}"), target, &pd);
+        let target = (slot, resource, writer.as_str());
+        observations.extend(submission_target(
+            host, &prefix, target, &copy.texture, copy.state.load(Relaxed), None,
+        ));
+        // A depth texture's writable twin: keep its plane separate from its writer.
+        if let Some(Some(twin)) = copy.twin.get() {
+            for (p, plane) in twin.planes.iter().enumerate() {
+                observations.extend(submission_target(
+                    host, &prefix, target, &plane.texture, plane.state.load(Relaxed), Some(p),
+                ));
+            }
         }
     }
+    if !observations.is_empty()
+        && let Err(error) = write_submission(dir, frame, sub, &observations)
+    {
+        tracing::warn!(%error, frame, submission = sub, "target manifest not saved");
+    }
+}
+
+/// A base texture or one of its writable twin planes, in subresource zero.
+fn submission_target(
+    host: &crate::host::Host,
+    prefix: &str,
+    (slot, resource, writer): (usize, crate::object::This, &str),
+    texture: &ID3D12Resource,
+    state: u32,
+    plane: Option<usize>,
+) -> Option<crate::capture_diff::Target> {
+    // SAFETY: a live host texture.
+    let d = unsafe { texture.GetDesc() };
+    if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+        return None;
+    }
+    // A multisampled texture cannot be copied directly to the readback buffer.
+    // Keep its slot so the comparison reports where coverage ends.
+    let hash = if d.SampleDesc.Count > 1 {
+        None
+    } else {
+        let label = plane.map(|p| format!("{writer}-twin{p}"));
+        let target = (slot, resource, label.as_deref().unwrap_or(writer));
+        dump_one(host, texture, state, prefix, target, &d, true)
+    };
+    Some(crate::capture_diff::Target {
+        slot,
+        plane,
+        width: d.Width as u32,
+        height: d.Height,
+        depth: if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            u32::from(d.DepthOrArraySize)
+        } else {
+            1
+        },
+        format: d.Format.0 as u32,
+        hash,
+        writer: writer.to_owned(),
+    })
 }
 
 /// `VICTORY_PEEK=<address>[:<bytes>],...` (hex addresses, 16 bytes by
 /// default): those bytes of title memory, as dwords and floats, after each
 /// submission of a listed frame.
-fn peek(when: &str) {
+fn peek(frame: u64, sub: u64) {
     static LIST: std::sync::OnceLock<Vec<(u64, usize)>> = std::sync::OnceLock::new();
     let list = LIST.get_or_init(|| {
         std::env::var("VICTORY_PEEK")
@@ -419,7 +536,7 @@ fn peek(when: &str) {
                 format!("{w:#x}={}", f32::from_bits(w))
             })
             .collect();
-        tracing::info!("peek {when} {at:#x}: {}", words.join(" "));
+        tracing::info!("peek frame-{frame}-s{sub:04} {at:#x}: {}", words.join(" "));
     }
 }
 
@@ -521,8 +638,9 @@ fn dump_one(
     prefix: &str,
     (i, resource, by): (usize, crate::object::This, &str),
     d: &D3D12_RESOURCE_DESC,
-) {
-    let Ok(list) = host.new_list() else { return };
+    fingerprint: bool,
+) -> Option<blake3::Hash> {
+    let list = host.new_list().ok()?;
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
     // SAFETY: an open list of ours and a live texture.
@@ -540,21 +658,19 @@ fn dump_one(
     };
     list.close();
     host.execute(&[&list]);
-    let Some((buffer, footprint)) = read else { return };
-    let f = footprint.Footprint;
-    let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished; the mapping spans the footprint's rows.
-    unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return;
-        }
-        let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+    // A removed device may still map a buffer whose copy never finished.
+    // SAFETY: this only queries the host device.
+    if unsafe { host.device.GetDeviceRemovedReason() }.is_err() {
+        return None;
+    }
+    let (buffer, layout) = read?;
+    let f = layout.footprint;
+    let pitch = f.RowPitch as usize;
+    layout.with_rows(&buffer, |rows| {
         // Tiny targets (exposure, averages): their values as they are.
-        if f.Width * f.Height <= 16 {
-            let texel = crate::resource::element(f.Format.0 as u32).map_or(4, |(b, _)| b as usize);
-            let words: Vec<String> = (0..f.Height as usize)
-                .flat_map(|y| rows[y * pitch..][..f.Width as usize * texel].chunks(4))
+        if u64::from(f.Width) * u64::from(f.Height) <= 16 {
+            let words: Vec<String> = layout.first_slice_rows(rows)
+                .flat_map(|row| row.chunks(4))
                 .map(|c| {
                     let w = u32::from_le_bytes(c.try_into().unwrap_or_default());
                     format!("{w:#x}={}", f32::from_bits(w))
@@ -584,8 +700,12 @@ fn dump_one(
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
-        buffer.Unmap(0, None);
-    }
+        if fingerprint {
+            crate::capture_diff::hash_rows(rows, layout.row_bytes, pitch, layout.row_count, f.Depth as usize)
+        } else {
+            None
+        }
+    })?
 }
 
 fn half(h: u16) -> f32 {
@@ -1018,3 +1138,7 @@ mod r32_tests {
         assert_eq!(super::to_rgba(43, 2, 1, 8, &[0; 8]), expected);
     }
 }
+
+#[cfg(test)]
+#[path = "capture/tests.rs"]
+mod submission_tests;
