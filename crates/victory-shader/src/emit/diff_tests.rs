@@ -1559,3 +1559,132 @@ fn translated_compute_matches_pc() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// An `s_load_dwordx8` for a 2D SRV image followed by an `image_load` and a
+/// null-texture check: `v_cmp_gt_u32 vcc, s_dword0_in_vgpr, 0` →
+/// `s_cbranch_vccnz`.  Before the fix in `descriptor_data()`, dword 0 (the
+/// GPU base address) was left as `Val::Missing`; the branch on that VCC then
+/// failed with "a descriptor's address or format read as data".  The fix
+/// derives dword 0 from `getDimensions()` width: 0 for null/unbound slots,
+/// ≥ 1 for every live descriptor (D3D12 minimum), so null checks branch
+/// correctly.
+#[test]
+fn image_descriptor_address_read_as_data_translates() {
+    use crate::native::{
+        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, StageIo, UsedResource,
+    };
+    use crate::{io, ir, resource, structure};
+    use super::{lower, validator};
+
+    // Wave32, 1 thread.  Table at s0 (1 SGPR).
+    let layout = vec![RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    }];
+    let used = vec![
+        // 2D SRV image at heap slot 0 (byte offset 0, 8 dwords).
+        UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        },
+        // Raw UAV at heap slot 1 (byte offset 32, 4 dwords).
+        UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        },
+    ];
+
+    // Synthetic GFX10 compute shader.  The critical path:
+    //   s_load_dwordx8 s[4:11]  → 2D SRV descriptor (8 dwords)
+    //   image_load v[4:7], ...  → identifies the descriptor kind for tracking
+    //   v_mov_b32 v0, s4        → dword 0 (base address, formerly poisoned)
+    //   v_mov_b32 v1, 0
+    //   v_cmp_gt_u32 vcc_lo, v0, v1  → null check
+    //   s_cbranch_vccnz +1      → branch – the formerly failing instruction
+    let words: &[u32] = &[
+        // s1 = 0: form s[0:1] = 64-bit heap address (heap is below 4 GB).
+        0xBE81_0380, // s_mov_b32 s1, 0
+        // Load 2D SRV image descriptor into s[4:11].
+        0xF40C_0100, 0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], 0
+        // Load raw UAV descriptor into s[12:15] (byte offset 0x20 = 32).
+        0xF408_0300, 0xFA00_0020, // s_load_dwordx4 s[12:15], s[0:1], 0x20
+        // Wait for scalar memory.
+        0xBF8C_007F, // s_waitcnt lgkmcnt(0)
+        // image_load v[4:7], v[2:3], s[4:11]  dmask:0xf  dim:SQ_RSRC_IMG_2D
+        // Required: gives resource::track the usage site → identifies s[4:11]
+        // as a 2D SRV, which descriptor_data() needs to reconstruct the dwords.
+        0xF000_0F08, 0x0001_0402,
+        // Wait for the vector memory result.
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        // v0 = image descriptor dword 0 (base address).
+        // After the fix, descriptor_data() derives this from getDimensions()
+        // width: 0 for null, ≥ 1 for live (not a fixed heap-slot index).
+        0x7E00_0204, // v_mov_b32 v0, s4
+        // v1 = 0 (the other side of the comparison).
+        0x7E02_0280, // v_mov_b32 v1, 0
+        // Null-texture check: vcc = (dword_0 > 0)?
+        0x7D88_0300, // v_cmp_gt_u32 vcc_lo, v0, v1
+        // Branch on vcc – this was the failing instruction before the fix.
+        // simm16=+1: skip the next instruction if texture is non-null.
+        0xBF87_0001, // s_cbranch_vccnz +1
+        // Null case: zero the output.
+        0x7E10_0280, // v_mov_b32 v8, 0
+        // Store result to the output UAV (fixed offset, addr=v0).
+        0xE070_0000, 0x8003_0800, // buffer_store_dword v8, v0, s[12:15], 0
+        0xBF81_0000, // s_endpgm
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 16,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1, // 2 user SGPRs: s0 (table ptr) + s1 (set to 0 above)
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower: image descriptor address read as data should translate");
+
+    if let Ok(mut v) =
+        validator::Validator::load(validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut lowered.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+}

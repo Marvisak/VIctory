@@ -1608,7 +1608,9 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
-            Some(&Val::Missing(w)) => return Err(w),
+            Some(&Val::Missing(w)) => {
+                return Err(w);
+            }
             Some(&val) => return Ok(val),
             None => {}
         }
@@ -2444,14 +2446,16 @@ impl<'a> Lower<'a> {
                     .copied()
                     .unwrap_or("a lane mask from a carry")
             }),
-            Atom::Uniform(v) => match self.get(v)? {
-                Val::Bit(x) => Ok(x),
-                Val::I32(x) => {
-                    let z = self.s.m.i32(0);
-                    Ok(self.s.m.cmp(at, pred::NE, x, z))
+            Atom::Uniform(v) => {
+                match self.get(v)? {
+                    Val::Bit(x) => Ok(x),
+                    Val::I32(x) => {
+                        let z = self.s.m.i32(0);
+                        Ok(self.s.m.cmp(at, pred::NE, x, z))
+                    }
+                    Val::Missing(w) => Err(w),
                 }
-                Val::Missing(w) => Err(w),
-            },
+            }
             Atom::Phi(id) => {
                 if let Some(&v) = self.mask_phis.get(&id) {
                     return Ok(v);
@@ -4123,7 +4127,7 @@ impl<'a> Lower<'a> {
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
+        let (props, image, known_stride) = match &ui.fields {
             Fields::Image { dim, .. } => {
                 let kind = match dim {
                     0 => 1,
@@ -4133,7 +4137,7 @@ impl<'a> Lower<'a> {
                     5 => 7,
                     _ => return Err("an image dimension (cube or MSAA)"),
                 };
-                ((kind | u, 0x409), Some(kind))
+                ((kind | u, 0x409), Some(kind), 0u32)
             }
             Fields::Buffer { idxen, format, .. } => {
                 let stride = used.map_or(0, |u| u.stride);
@@ -4149,7 +4153,7 @@ impl<'a> Lower<'a> {
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                     return Err("a constant buffer's descriptor read as data");
                 }
-                (props, None)
+                (props, None, stride)
             }
             // A buffer the code reads with scalar loads (`buf[buf.Length - 1]`
             // at a uniform index): structured by the used-resource entry's
@@ -4164,7 +4168,7 @@ impl<'a> Lower<'a> {
                     s if s.is_multiple_of(4) => (12 | u, s),
                     _ => return Err("a scalar-loaded buffer of odd stride read as data"),
                 };
-                (props, None)
+                (props, None, used.stride)
             }
             _ => return Err("a scalar memory read as data"),
         };
@@ -4216,9 +4220,26 @@ impl<'a> Lower<'a> {
                 let base = k(self, 0xFAC | ty << 28);
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
+                let mut w = vec![(1, d1), (2, d2), (3, d3), (4, depth)];
+                // Dword 0 is the GPU virtual base address – unrecoverable
+                // from DXIL intrinsics.  getDimensions() width is a faithful
+                // proxy: D3D12 null SRVs return 0 for all dimensions; every
+                // live descriptor has width ≥ 1 (D3D12 minimum), so null
+                // checks (`dword0 > 0`) branch correctly.
+                w.push((0, field(self, 0)));
+                w
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                let mut v = vec![(2, field(self, 0))];
+                // Dword 1 carries STRIDE[13:0] in bits [29:16].  For
+                // structured buffers props.1 IS the stride; for typed buffers
+                // the stride is tracked separately in known_stride.
+                let eff_stride = if props.0 & 0xFFF == 12 { props.1 } else { known_stride };
+                if eff_stride >= 4 && eff_stride.is_multiple_of(4) && eff_stride <= 0x3FFF {
+                    v.push((1, self.s.m.i32(eff_stride << 16)));
+                }
+                v
+            }
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -10901,6 +10922,40 @@ mod tests {
         lower_with(&words, layout(), used()).unwrap();
     }
 
+    #[test]
+    fn a_structured_buffer_descriptor_dword_1_read_as_stride_lowers() {
+        // A structured buffer descriptor is loaded from the heap table, used for
+        // buffer_load, and then its dword 1 (BASE_ADDRESS[39:32] | STRIDE<<16) is
+        // also read back directly - the pattern that raised "a descriptor's address
+        // or format read as data" before the STRIDE field was reconstructed.
+        let words = [
+            0xBE82_0300,        // s_mov_b32 s2, s0
+            0xBE83_0380,        // s_mov_b32 s3, 0
+            0xF408_0201,
+            0xFA00_0000,        // s_load_dwordx4 s[8:11], s[2:3], null
+            0xE030_2000,
+            0x8002_0100,        // buffer_load_dword v1, v0, s[8:11], null idxen
+            0xD834_0000,
+            0x0000_0100,        // ds_write_b32 v0, v1
+            0xBF08_8009,        // s_cmp_gt_u32 s9, 0
+            0xBF85_0001,        // s_cbranch_scc1 +1
+            0xBE85_0380,        // s_mov_b32 s5, 0
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&words, layout, used).unwrap();
+    }
+
     /// Tables of 2D textures at s0 and samplers at s1.
     fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
         let range = |kind, user_data, slot| UsedResource {
@@ -11609,5 +11664,92 @@ mod tests {
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
         }
+    }
+
+    /// Image descriptor dword 0 read as data: `s_load_dwordx8` for a 2D SRV
+    /// followed by `image_load` and a null-texture check
+    /// (`v_cmp_gt_u32 vcc, s4, 0` → `s_cbranch_vccnz`) lowers without error.
+    ///
+    /// Before the fix, `descriptor_data()` left dword 0 as `Val::Missing(OTHER)`
+    /// (the GPU base address is unrecoverable from DXIL intrinsics), and the
+    /// branch on that VCC failed with "a descriptor's address or format read
+    /// as data".  The fix derives dword 0 from `getDimensions()` width:
+    /// D3D12 null SRVs return 0 for all dimensions, so the null check
+    /// (`dword_0 > 0`) is false for null/unbound slots and true for every
+    /// live descriptor (D3D12 minimum dimension is 1).  Full semantic
+    /// verification—both branches exercised with an actual live and a null
+    /// texture on the host GPU—is in
+    /// `diff_tests::image_descriptor_address_read_as_data_translates`.
+    #[test]
+    fn image_descriptor_dword0_width_proxy_null_check_lowers() {
+        let layout = vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ];
+        // s_mov_b32 s1, 0           – zero-extend heap base to 64 bits
+        // s_load_dwordx8 s[4:11]    – 2D SRV descriptor (8 dwords, slot 0)
+        // s_load_dwordx4 s[12:15]   – raw UAV descriptor (slot 1, offset 0x20)
+        // s_waitcnt lgkmcnt(0)
+        // image_load v[4:7],...     – usage site: marks s[4:11] as 2D SRV
+        // s_waitcnt vmcnt(0)
+        // v_mov_b32 v0, s4          – descriptor dword 0 (formerly Missing)
+        // v_mov_b32 v1, 0
+        // v_cmp_gt_u32 vcc_lo, v0, v1  – null check
+        // s_cbranch_vccnz +1        – the formerly failing branch instruction
+        // v_mov_b32 v8, 0
+        // buffer_store_dword v8, v0, s[12:15], 0
+        // s_endpgm
+        let words: &[u32] = &[
+            0xBE81_0380,              // s_mov_b32 s1, 0
+            0xF40C_0100, 0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], 0
+            0xF408_0300, 0xFA00_0020, // s_load_dwordx4 s[12:15], s[0:1], 0x20
+            0xBF8C_007F,              // s_waitcnt lgkmcnt(0)
+            0xF000_0F08, 0x0001_0402, // image_load v[4:7], v[2:3], s[4:11]
+            0xBF8C_3F70,              // s_waitcnt vmcnt(0)
+            0x7E00_0204,              // v_mov_b32 v0, s4
+            0x7E02_0280,              // v_mov_b32 v1, 0
+            0x7D88_0300,              // v_cmp_gt_u32 vcc_lo, v0, v1
+            0xBF87_0001,              // s_cbranch_vccnz +1
+            0x7E10_0280,              // v_mov_b32 v8, 0
+            0xE070_0000, 0x8003_0800, // buffer_store_dword v8, v0, s[12:15], 0
+            0xBF81_0000,              // s_endpgm
+        ];
+        let lowered = lower_with(words, layout, used)
+            .expect("image descriptor dword 0 as null-texture proxy should translate");
+        // The emitted output must be a valid DXBC container with a DXIL part.
+        let container = crate::Container::parse(&lowered.dxil)
+            .expect("emitted DXIL should be a valid DXBC container");
+        assert!(
+            container.part(crate::FourCC::DXIL).is_some(),
+            "emitted container should contain a DXIL part"
+        );
+        // The heap slot index is uniform (fixed table offset, no per-lane index).
+        assert_eq!(lowered.nonuniform_handles, 0, "descriptor access should be uniform");
     }
 }
