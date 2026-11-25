@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod agility;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,6 +27,13 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Download the pinned D3D12 Agility SDK NuGet package and stage
+    /// `D3D12Core.dll` under `target/<profile>/D3D12/` for Windows builds.
+    Agility {
+        /// Cargo profile directory to stage into (`debug` or `release`).
+        #[arg(long, default_value = "release")]
+        profile: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -45,6 +53,7 @@ fn main() -> Result<()> {
             println!("hooks installed: commits now run `cargo xtask policy --staged`");
             Ok(())
         }
+        Cmd::Agility { profile } => agility::run(&root, &profile),
     }
 }
 
