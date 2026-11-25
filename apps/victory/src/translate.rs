@@ -355,6 +355,8 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                 let workers: Vec<_> = (0..threads.min(jobs.len()))
                     .map(|_| {
                         s.spawn(|| {
+                            #[cfg(windows)]
+                            start_below_normal();
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 let Some(bytes) = job.bytes() else { continue };
                                 // As the title passes it: the container's own size
@@ -430,9 +432,46 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     Ok(())
 }
 
+/// Whether the warm-up prints how far it is: the `translate` command does
+/// (its user waits for it); a run's does not (its lines would fill the
+/// console the title is already playing to), it waits it out quietly.
+static PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the warm-up prints its progress lines, from now on.
+pub fn use_progress(print: bool) {
+    PROGRESS.store(print, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the warm-up's workers run below the title's threads' priority:
+/// a run's does (`run`'s warm-up thread is below normal, and a thread of
+/// its does not hand the priority on — the workers the warm-up makes are
+/// ours to lower, `translate`'s are not). The warm-up's own workers start
+/// on that level.
+static BELOW_NORMAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The warm-up's workers start below the title's threads (from now on).
+#[cfg(windows)]
+pub fn warm_below_normal() {
+    BELOW_NORMAL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A warm-up worker of ours starts below the title's threads where the
+/// run asked for it (the run itself never coexists with `translate`).
+#[cfg(windows)]
+fn start_below_normal() {
+    if BELOW_NORMAL.load(std::sync::atomic::Ordering::Relaxed) {
+        // SAFETY: a plain adjustment of our own thread's scheduling.
+        unsafe {
+            use windows_sys::Win32::System::Threading::*;
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
+    }
+}
+
 /// Shows on stderr how far `workers` are through `file`'s `jobs` (`next`
 /// hands them out) until they finish: on a terminal one line rewritten
-/// every second, else a line every 10 s; then the file's last line.
+/// every second, else a line every 10 s; then the file's last line; or
+/// quietly when the progress is asked off.
 pub(crate) fn report<T>(
     file: &Path,
     jobs: usize,
@@ -444,6 +483,12 @@ pub(crate) fn report<T>(
 ) {
     use std::io::IsTerminal;
     if workers.is_empty() {
+        return;
+    }
+    if !PROGRESS.load(std::sync::atomic::Ordering::Relaxed) {
+        while !workers.iter().all(|w| w.is_finished()) {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         return;
     }
     let terminal = std::io::stderr().is_terminal();

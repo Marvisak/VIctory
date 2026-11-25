@@ -107,6 +107,11 @@ early, it keeps what it made. Without it, a run makes the pipelines it needs
 on worker threads and keeps them, so the first runs after a translator
 change are slower and show missing draws for a while.
 
+A run starts this warm-up itself: from the title's own folder, while the
+title loads (a few threads below its own priority; its progress lines are
+left out). Set `VICTORY_PREBUILD=0` to leave it to the command above, which
+can be pointed at more folders and shows how far it is.
+
 To get into the game, press A (Enter) on each first-boot screen and again on
 the start screen. Loading the world takes about a minute; the intro cutscene
 plays, then the prologue starts.

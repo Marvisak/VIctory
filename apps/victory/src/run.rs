@@ -35,6 +35,47 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+/// Whether the run starts the pre-build itself: every value but a refusal
+/// (a `VICTORY_PREBUILD=0` or `off`) does.
+#[cfg(any(windows, test))]
+fn starts_warm_up(value: Option<&str>) -> bool {
+    !matches!(value, Some("0") | Some("off"))
+}
+
+/// The title's shader assets, made while the title loads instead of while
+/// it plays: the warm-up of `victory translate --cache --pipelines`, over
+/// the title's folder, on a few threads below the title's own priority
+/// (`VICTORY_PREBUILD=0` leaves it off; the command stays the one that
+/// shows progress). What it makes is saved as it grows, so a run stopped
+/// along the way keeps its work, and the next warm-up skips it.
+#[cfg(windows)]
+fn start_warm_up(title_dir: &Path) {
+    if !starts_warm_up(std::env::var("VICTORY_PREBUILD").ok().as_deref()) {
+        return;
+    }
+    let title_dir = title_dir.to_owned();
+    let thread = std::thread::Builder::new().name("victory-prebuild".to_owned()).spawn(move || {
+        crate::translate::use_progress(false);
+        // The workers the warm-up makes start below the title's threads
+        // too (Windows does not hand a thread's priority on to them).
+        crate::translate::warm_below_normal();
+        // SAFETY: a plain adjustment of our own thread's scheduling.
+        unsafe {
+            use windows_sys::Win32::System::Threading::*;
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
+        let threads = std::thread::available_parallelism()
+            .map_or(2, |n| n.get().div_ceil(2))
+            .clamp(1, 4);
+        if let Err(e) = crate::translate::warm(vec![title_dir], Some(threads), true) {
+            eprintln!("warm-up       failed: {e:#}");
+        }
+    });
+    if let Err(e) = thread {
+        eprintln!("warm-up       not started: {e}");
+    }
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -179,6 +220,7 @@ pub fn run(
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
+    start_warm_up(title_dir);
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {
@@ -549,6 +591,16 @@ mod cpu_check_tests {
     #[test]
     fn skip_env_var_bypasses_missing_avx2() {
         assert!(check_cpu_features_with(false, Some("1")).is_ok());
+    }
+
+    /// The run's pre-build starts unless the variable refuses it.
+    #[test]
+    fn the_warm_up_starts_unless_asked_off() {
+        use super::starts_warm_up;
+        assert!(starts_warm_up(None));
+        assert!(starts_warm_up(Some("1")));
+        assert!(!starts_warm_up(Some("0")));
+        assert!(!starts_warm_up(Some("off")));
     }
 }
 
