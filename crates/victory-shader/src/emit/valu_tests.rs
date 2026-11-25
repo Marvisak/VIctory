@@ -1135,6 +1135,124 @@ fn v_cvt_norm_i16_and_u16_f16_round_the_exact_product() {
     }
 }
 
+fn rsqrt_f64_results(
+    setup: &[u32],
+    instruction: &[u32],
+    inputs: &[u64],
+) -> Vec<(String, Vec<u64>)> {
+    let cases: Vec<_> = inputs
+        .iter()
+        .map(|&n| [n as u32, (n >> 32) as u32, 0, 0])
+        .collect();
+    let mut outputs = std::collections::BTreeMap::<String, Vec<u64>>::new();
+    for (word, shift) in [(6, 0), (7, 32)] {
+        let mut body = setup.to_vec();
+        body.extend(instruction);
+        body.push(vop1(0x001, 0, vgpr(word)));
+        let shader = try_build_valu_cs(&body).unwrap_or_else(|error| panic!("V_RSQ_F64: {error}"));
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let feature_bits = container.part(crate::FourCC::SFI0).unwrap().data;
+        assert_eq!(
+            u64::from_le_bytes(feature_bits.try_into().unwrap()) & 0x8001,
+            0
+        );
+        run_cases(&shader, &cases, |backend, index, _, value| {
+            let slots = outputs
+                .entry(backend.to_owned())
+                .or_insert_with(|| vec![0; cases.len()]);
+            slots[index] |= u64::from(value) << shift;
+        });
+    }
+    outputs.into_iter().collect()
+}
+
+#[test]
+fn rsqrt_f64_tracks_binary64_range_and_rounding() {
+    const SIGN: u64 = 1 << 63;
+    const INF: u64 = 0x7ff0_0000_0000_0000;
+    const QUIET: u64 = 1 << 51;
+    const MIN_NORMAL: u64 = 1 << 52;
+    let inputs = [
+        0,
+        SIGN,
+        1,
+        3,
+        1 << 19,
+        1 << 20,
+        1 << 21,
+        MIN_NORMAL - 1,
+        MIN_NORMAL,
+        MIN_NORMAL + 1,
+        0.125f64.to_bits(),
+        0.25f64.to_bits(),
+        1.0f64.to_bits(),
+        1.0f64.to_bits() + 1,
+        2.0f64.to_bits(),
+        3.0f64.to_bits(),
+        4.0f64.to_bits(),
+        9.0f64.to_bits(),
+        f64::MAX.to_bits(),
+        INF,
+        SIGN | INF,
+        INF | 17,
+        SIGN | INF | 17,
+        (-4.0f64).to_bits(),
+        SIGN | 1,
+    ];
+    for mode in 0..4 {
+        let setup = [0xbfa4_0000 | mode << 2]; // s_round_mode
+        for (backend, outputs) in rsqrt_f64_results(&setup, &[vop1(0x031, 6, vgpr(1))], &inputs) {
+            for (&input, got) in inputs.iter().zip(outputs) {
+                let x = f64::from_bits(input);
+                let reference = x.sqrt().recip();
+                if x.is_nan() {
+                    assert_eq!(got, input | QUIET, "{backend}: NaN {input:#018x}");
+                } else if reference.is_nan() {
+                    assert!(f64::from_bits(got).is_nan(), "{backend}: {input:#018x}");
+                } else if matches!(input, 0 | SIGN | INF) {
+                    assert_eq!(got, reference.to_bits(), "{backend}: {input:#018x}");
+                } else {
+                    let want = reference.to_bits();
+                    assert!(
+                        got.abs_diff(want) <= 1 << 29,
+                        "{backend}: {input:#018x}, mode {mode}, {got:#018x} vs {want:#018x}"
+                    );
+                    // The CPU reference rounds the square root and reciprocal separately.
+                    if mode == 1 {
+                        assert!(got + 1 >= want, "{backend}: round up for {input:#018x}");
+                    } else if mode != 0 {
+                        assert!(got <= want + 1, "{backend}: round down for {input:#018x}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rsqrt_f64_obeys_the_input_denormal_mode() {
+    const SIGN: u64 = 1 << 63;
+    let inputs = [1, SIGN | 1, 4.0f64.to_bits()];
+    for mode in 0..4 {
+        let setup = [0xbfa5_0000 | mode << 2]; // s_denorm_mode
+        for (backend, values) in rsqrt_f64_results(&setup, &vop3(0x1b1, 6, sgpr(0), 0, 0), &inputs)
+        {
+            if mode & 1 == 0 {
+                assert_eq!(values[0], f64::INFINITY.to_bits(), "{backend}");
+                assert_eq!(values[1], f64::NEG_INFINITY.to_bits(), "{backend}");
+            } else {
+                assert_eq!(
+                    values[0],
+                    f64::from_bits(1).sqrt().recip().to_bits(),
+                    "{backend}"
+                );
+                assert!(f64::from_bits(values[1]).is_nan(), "{backend}");
+            }
+            assert_eq!(values[2], 0.5f64.to_bits(), "{backend}");
+        }
+    }
+}
+
 #[test]
 fn v_sin_and_v_cos_f32_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x035, 0, vgpr(1))]);
