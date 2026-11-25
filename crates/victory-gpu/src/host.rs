@@ -2372,9 +2372,19 @@ struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Where each copy's refresh is in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
-    /// The range of each copy brought up to date since the last title
-    /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// The 64 KiB pages of each copy one refresh took whole since the last
+    /// title write, by copy (held, so that its address names no other). A
+    /// page counted by parts is not current: two partial refreshes of one
+    /// page leave it partly taken, and a later refresh of the rest must not
+    /// be skipped (the page then stays changed, and a marked write of it is
+    /// dropped, #2473).
+    current: std::collections::HashMap<
+        usize,
+        (
+            std::sync::Arc<crate::shadow::Shadow>,
+            std::collections::BTreeSet<usize>,
+        ),
+    >,
 }
 
 impl Batch {
@@ -2385,8 +2395,16 @@ impl Batch {
             return;
         }
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
-            return;
+        // Only pages one refresh took whole are current.
+        if end > address {
+            let (first, last) = (address / crate::watch::PAGE, (end - 1) / crate::watch::PAGE);
+            let whole = self
+                .current
+                .get(&key)
+                .is_some_and(|(_, pages)| pages.range(first..=last).count() == last - first + 1);
+            if whole {
+                return;
+            }
         }
         match self.pending.get(&key) {
             Some(&i) => {
@@ -2422,14 +2440,15 @@ impl Batch {
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
             total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
-            let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
+            // Whole pages only: a page one refresh took in part stays changed,
+            // and a later refresh of it must not be skipped.
+            let (first, last) = (from.div_ceil(crate::watch::PAGE), to / crate::watch::PAGE);
+            if first < last {
+                let key = std::sync::Arc::as_ptr(&shadow) as usize;
+                let (_, pages) = self.current.entry(key).or_insert_with(|| {
+                    (shadow, std::collections::BTreeSet::new())
+                });
+                pages.extend(first..last);
             }
         }
         total
@@ -3525,6 +3544,37 @@ mod batch {   // `mod tests` is already taken at the top of this file
         drop(copy);
         crate::watch::tests::free(p);
     }
+
+    /// Two partial refreshes of one page must not make it current (#2473):
+    /// the page stays changed until one refresh takes it whole, so the
+    /// whole-page refresh after them still copies it - without this the page
+    /// is never taken, and a marked write of it is dropped.
+    #[test]
+    fn partial_refreshes_do_not_make_a_page_current() {
+        let pool = crate::watch::tests::pool(1);
+        let len = crate::watch::PAGE;
+        crate::shadow::register(pool, pool as u64, len as u64);
+        let Some(copy) = crate::shadow::find(pool as u64, len as u64) else {
+            crate::shadow::unregister(pool, pool as u64);
+            return; // no host GPU here
+        };
+        copy.update(pool, len);
+        let mut batch = Batch::default();
+        // Two partial refreshes that together cover the page.
+        batch.add(&copy, pool, 4 << 10);
+        batch.flush();
+        batch.add(&copy, pool + (4 << 10), len - (4 << 10));
+        batch.flush();
+        // The title writes a byte of it.
+        // SAFETY: a byte of our pool.
+        unsafe { (pool as *mut u8).add(8).write_volatile(0x5a) };
+        batch.add(&copy, pool, len);
+        assert!(
+            batch.flush() > 0,
+            "a whole-page refresh after two partial ones still copies"
+        );
+        crate::shadow::unregister(pool, pool as u64);
+    }
 }
 
 
@@ -3579,4 +3629,5 @@ mod withholding {
             crate::watch::tests::free(p);
         }
     }
+
 }
