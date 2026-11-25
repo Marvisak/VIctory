@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use crate::ShaderError;
-use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
+use crate::gfx10::{self, Fields, Flow, Instruction, Operand, Span};
 
 /// One register dword. Scalar codes as in [`Operand::Scalar`]: 0-105 SGPRs,
 /// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC.
@@ -51,6 +51,19 @@ pub struct Program {
     /// hardware or a called fetch routine set up (user SGPRs, system values,
     /// vertex inputs).
     pub inputs: Vec<(Reg, Value)>,
+    /// Every instruction's variable-length operand lists ([`Fields`] holds
+    /// their [`Span`]s), in one allocation.
+    pub operands: Vec<Operand>,
+    /// Every instruction's reads and writes ([`Inst::reads`] and
+    /// [`Inst::writes`] hold their [`Span`]s).
+    pub effects: Vec<(Reg, Value)>,
+}
+
+impl Program {
+    /// The operands a [`Fields`] span names.
+    pub fn operands(&self, span: Span) -> &[Operand] {
+        span.of(&self.operands)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,10 +114,12 @@ pub struct Phi {
 pub struct Inst {
     pub machine: Instruction,
     pub fields: Fields,
-    /// Every register dword read, with the value it holds.
-    pub reads: Vec<(Reg, Value)>,
-    /// Every register dword written, with the value it receives.
-    pub writes: Vec<(Reg, Value)>,
+    /// Every register dword read, with the value it holds (in
+    /// [`Program::effects`]).
+    pub reads: Span,
+    /// Every register dword written, with the value it receives (in
+    /// [`Program::effects`]).
+    pub writes: Span,
 }
 
 impl Inst {
@@ -112,14 +127,24 @@ impl Inst {
         self.machine.name().unwrap_or("")
     }
 
+    /// The register dwords read, with the values they hold.
+    pub fn reads<'a>(&self, p: &'a Program) -> &'a [(Reg, Value)] {
+        self.reads.of(&p.effects)
+    }
+
+    /// The register dwords written, with the values they receive.
+    pub fn writes<'a>(&self, p: &'a Program) -> &'a [(Reg, Value)] {
+        self.writes.of(&p.effects)
+    }
+
     /// The value `reg` holds when this instruction reads it.
-    pub fn read(&self, reg: Reg) -> Option<Value> {
-        self.reads.iter().find(|r| r.0 == reg).map(|r| r.1)
+    pub fn read(&self, p: &Program, reg: Reg) -> Option<Value> {
+        self.reads(p).iter().find(|r| r.0 == reg).map(|r| r.1)
     }
 
     /// The value this instruction writes to `reg`.
-    pub fn write(&self, reg: Reg) -> Option<Value> {
-        self.writes.iter().find(|w| w.0 == reg).map(|w| w.1)
+    pub fn write(&self, p: &Program, reg: Reg) -> Option<Value> {
+        self.writes(p).iter().find(|w| w.0 == reg).map(|w| w.1)
     }
 }
 
@@ -179,13 +204,17 @@ pub fn build_bounded(
     let next_offsets: Vec<Option<usize>> = (0..list.len())
         .map(|i| list.get(i + 1).map(|n| n.offset))
         .collect();
+    let mut operands = Vec::new();
+    let mut effects_arena: Vec<(Reg, Value)> = Vec::new();
+    let mut scratch = Scratch::default();
     for ((machine, flow), next) in list.into_iter().zip(flows).zip(next_offsets) {
         let b = leaders.partition_point(|&l| l <= machine.offset) - 1;
         let name = machine.name().ok_or(ShaderError::Unsupported {
             offset: machine.offset,
             what: "unknown opcode",
         })?;
-        let fields = machine.fields(wave64);
+        let mark = operands.len();
+        let fields = machine.fields(wave64, &mut operands);
         let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
         // A conditional SOPP branch to fallthrough has no register effects
         // and contributes one edge to the join. Calls also use Flow::Branch
@@ -210,14 +239,28 @@ pub fn build_bounded(
             };
         }
         let m0 = m0_max.get(&machine.offset).copied();
-        if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, m0)? {
-            let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
+        if effects(
+            &machine,
+            &fields,
+            &operands,
+            name,
+            lanes,
+            vgprs,
+            m0,
+            &mut scratch,
+        )? {
+            let unset = |&r: &Reg| (r, NONE);
+            let reads = Span::push(&mut effects_arena, scratch.reads.iter().map(unset));
+            let writes = Span::push(&mut effects_arena, scratch.writes.iter().map(unset));
             blocks[b].insts.push(Inst {
                 machine,
                 fields,
-                reads: unset(reads),
-                writes: unset(writes),
+                reads,
+                writes,
             });
+        } else {
+            // A dropped instruction leaves no operands behind.
+            operands.truncate(mark);
         }
     }
     link(&mut blocks);
@@ -227,10 +270,10 @@ pub fn build_bounded(
             what: "a branch to the program entry",
         });
     }
-    split_irreducible(&mut blocks)?;
+    split_irreducible(&mut blocks, &mut effects_arena)?;
 
     let order = reverse_postorder(&blocks);
-    let (live_in, live_out) = liveness(&blocks, &order);
+    let (live_in, live_out) = liveness(&blocks, &effects_arena, &order);
     let mut values = 0u32;
     let mut new_value = || {
         values += 1;
@@ -263,11 +306,11 @@ pub fn build_bounded(
             };
         }
         for inst in &mut block.insts {
-            for (reg, v) in &mut inst.reads {
+            for (reg, v) in inst.reads.of_mut(&mut effects_arena) {
                 *v = current[index(*reg)];
                 debug_assert_ne!(*v, NONE, "{reg:?} read at {:#x}", inst.machine.offset);
             }
-            for (reg, v) in &mut inst.writes {
+            for (reg, v) in inst.writes.of_mut(&mut effects_arena) {
                 *v = new_value();
                 current[index(*reg)] = *v;
             }
@@ -286,12 +329,14 @@ pub fn build_bounded(
             debug_assert!(!phi.args.contains(&NONE), "{phi:?}");
         }
     }
-    remove_trivial_phis(&mut blocks, values);
+    remove_trivial_phis(&mut blocks, &mut effects_arena, values);
     Ok(Program {
         wave64,
         vgprs,
         blocks,
         inputs,
+        operands,
+        effects: effects_arena,
     })
 }
 
@@ -450,7 +495,10 @@ pub(crate) fn idoms(blocks: &[Block], order: &[usize], index: &[usize]) -> Vec<u
 /// entry's outside predecessors move to a copy of everything that entry
 /// reaches in the loop before the header. The copies run the same
 /// instructions, so behaviour is unchanged.
-fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
+fn split_irreducible(
+    blocks: &mut Vec<Block>,
+    effects: &mut Vec<(Reg, Value)>,
+) -> Result<(), ShaderError> {
     let limit = 4 * blocks.len() + 64;
     loop {
         let order = reverse_postorder(blocks);
@@ -497,6 +545,15 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
         };
         for &b in &copied {
             let mut block = blocks[b].clone();
+            // The copy renames its own reads and writes.
+            for inst in &mut block.insts {
+                for span in [&mut inst.reads, &mut inst.writes] {
+                    let start = effects.len();
+                    let from = span.start as usize;
+                    effects.extend_from_within(from..from + span.len as usize);
+                    *span = Span::since(effects, start);
+                }
+            }
             retarget(&mut block.exit, &|s| {
                 if copy[s] == usize::MAX { s } else { copy[s] }
             });
@@ -573,18 +630,22 @@ fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec
 }
 
 /// Registers live into and out of each block.
-fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
+fn liveness(
+    blocks: &[Block],
+    effects: &[(Reg, Value)],
+    order: &[usize],
+) -> (Vec<RegSet>, Vec<RegSet>) {
     let empty = [0; REGS.div_ceil(64)];
     let mut uses = vec![empty; blocks.len()];
     let mut defs = vec![empty; blocks.len()];
     for (b, block) in blocks.iter().enumerate() {
         for inst in &block.insts {
-            for &(reg, _) in &inst.reads {
+            for &(reg, _) in inst.reads.of(effects) {
                 if !contains(&defs[b], reg) {
                     insert(&mut uses[b], reg);
                 }
             }
-            for &(reg, _) in &inst.writes {
+            for &(reg, _) in inst.writes.of(effects) {
                 insert(&mut defs[b], reg);
             }
         }
@@ -616,11 +677,15 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
 
 /// Phis are placed for every live register at every join; those whose
 /// arguments are all one value (or the phi itself) are replaced by it.
-fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
-    remove_trivial_phis_steps(blocks, values);
+fn remove_trivial_phis(blocks: &mut [Block], effects: &mut [(Reg, Value)], values: u32) {
+    remove_trivial_phis_steps(blocks, effects, values);
 }
 
-fn remove_trivial_phis_steps(blocks: &mut [Block], values: u32) -> usize {
+fn remove_trivial_phis_steps(
+    blocks: &mut [Block],
+    effects: &mut [(Reg, Value)],
+    values: u32,
+) -> usize {
     fn find(replaced: &mut [Value], v: Value, steps: &mut usize) -> Value {
         let mut root = v;
         while replaced[root.0 as usize] != root {
@@ -669,7 +734,7 @@ fn remove_trivial_phis_steps(blocks: &mut [Block], values: u32) -> usize {
             }
         }
         for inst in &mut block.insts {
-            for (_, v) in &mut inst.reads {
+            for (_, v) in inst.reads.of_mut(effects) {
                 *v = find(&mut replaced, *v, &mut steps);
             }
         }
@@ -700,28 +765,42 @@ const DROPPED: &[&str] = &[
     "v_clrexcp",
 ];
 
-/// Registers read, registers written.
-type Effects = (Vec<Reg>, Vec<Reg>);
+/// Registers read and written by the last instruction passed to [`effects`];
+/// reused across instructions.
+#[derive(Default)]
+struct Scratch {
+    reads: Vec<Reg>,
+    writes: Vec<Reg>,
+}
 
-/// Registers an instruction reads and writes, one per dword, or `None` if
-/// the IR drops it.
+/// Registers an instruction reads and writes, one per dword, left in
+/// `scratch`; `false` if the IR drops it. `operands` is the arena `fields`
+/// refers to.
+#[allow(clippy::too_many_arguments)]
 fn effects(
     inst: &Instruction,
     fields: &Fields,
+    operands: &[Operand],
     name: &'static str,
     lanes: u8,
     vgprs: u16,
     m0_max: Option<u8>,
-) -> Result<Option<Effects>, ShaderError> {
+    scratch: &mut Scratch,
+) -> Result<bool, ShaderError> {
     if DROPPED.contains(&name) {
-        return Ok(None);
+        return Ok(false);
     }
     let unsupported = || ShaderError::Unsupported {
         offset: inst.offset,
         what: name,
     };
     let mask = |code: u8| (0..lanes).map(move |i| Reg::S(code + i));
-    let (mut r, mut w) = (Vec::new(), Vec::new());
+    let (mut r, mut w) = (
+        std::mem::take(&mut scratch.reads),
+        std::mem::take(&mut scratch.writes),
+    );
+    r.clear();
+    w.clear();
     let regs = |op: &Operand, out: &mut Vec<Reg>| {
         add_regs(op, lanes, out).map_err(|_| ShaderError::Isa {
             offset: inst.offset,
@@ -740,7 +819,7 @@ fn effects(
             {
                 return Err(unsupported());
             }
-            for s in src {
+            for s in src.of(operands) {
                 regs(s, &mut r)?;
             }
             if let Some(d) = dst {
@@ -820,7 +899,8 @@ fn effects(
             // (and below the proven bound).
             let indexed = |op: &Operand, out: &mut Vec<Reg>| match *op {
                 Operand::Vector { reg, .. } if u16::from(reg) < vgprs => {
-                    let end = m0_max.map_or(vgprs, |m| vgprs.min(u16::from(reg) + u16::from(m) + 1));
+                    let end =
+                        m0_max.map_or(vgprs, |m| vgprs.min(u16::from(reg) + u16::from(m) + 1));
                     out.extend((u16::from(reg)..end).map(|r| Reg::V(r as u8)));
                     Ok(())
                 }
@@ -829,7 +909,8 @@ fn effects(
                     reason: "relative VGPR base outside the program's VGPRs",
                 }),
             };
-            for (i, s) in v.src.iter().enumerate() {
+            let vsrc = v.src.of(operands);
+            for (i, s) in vsrc.iter().enumerate() {
                 if i == 0 && src_indexed {
                     indexed(s, &mut r)?;
                 } else {
@@ -851,13 +932,13 @@ fn effects(
             }
             match name {
                 "v_swap_b32" => {
-                    regs(&v.src[0], &mut w)?;
+                    regs(&vsrc[0], &mut w)?;
                     if let Some(d) = &v.dst {
                         regs(d, &mut r)?;
                     }
                 }
                 "v_swaprel_b32" => {
-                    indexed(&v.src[0], &mut w)?;
+                    indexed(&vsrc[0], &mut w)?;
                     if let Some(d) = &v.dst {
                         indexed(d, &mut r)?;
                     }
@@ -880,7 +961,7 @@ fn effects(
             gds,
             ..
         } => {
-            for o in addr.iter().chain(data) {
+            for o in addr.iter().chain(data.of(operands)) {
                 regs(o, &mut r)?;
             }
             if let Some(d) = dst {
@@ -938,7 +1019,7 @@ fn effects(
             cache,
             ..
         } => {
-            for a in addr.iter().chain([rsrc]).chain(sampler) {
+            for a in addr.of(operands).iter().chain([rsrc]).chain(sampler) {
                 regs(a, &mut r)?;
             }
             if name.contains("_store") {
@@ -977,13 +1058,18 @@ fn effects(
         // Lanes disabled in EXEC keep the old value.
         r.extend(w.iter().filter(|w| matches!(w, Reg::V(_))));
     }
-    let mut seen = Vec::with_capacity(r.len());
-    r.retain(|reg| {
-        let new = !seen.contains(reg);
-        seen.push(*reg);
-        new
-    });
-    Ok(Some((r, w)))
+    // Keep the first of each repeated read, in place.
+    let mut kept = 0;
+    for i in 0..r.len() {
+        if !r[..kept].contains(&r[i]) {
+            r[kept] = r[i];
+            kept += 1;
+        }
+    }
+    r.truncate(kept);
+    scratch.reads = r;
+    scratch.writes = w;
+    Ok(true)
 }
 
 /// Scalar ALU opcodes that set SCC (carry, overflow, comparison, or "result
@@ -1111,7 +1197,10 @@ mod tests {
             );
             assert_eq!(b1.exit, Exit::Jump(2));
             assert_eq!(b2.preds, [0, 1]);
-            assert_eq!(b0.insts[1].read(Reg::Scc), b0.insts[0].write(Reg::Scc));
+            assert_eq!(
+                b0.insts[1].read(&p, Reg::Scc),
+                b0.insts[0].write(&p, Reg::Scc)
+            );
 
             // s2 differs per path; s0, EXEC, v0 and v1 do not.
             let [phi] = &b2.phis[..] else {
@@ -1120,17 +1209,20 @@ mod tests {
             assert_eq!(phi.reg, Reg::S(2));
             assert_eq!(
                 phi.args,
-                [input(&p, Reg::S(2)), b1.insts[0].write(Reg::S(2)).unwrap()]
+                [
+                    input(&p, Reg::S(2)),
+                    b1.insts[0].write(&p, Reg::S(2)).unwrap()
+                ]
             );
             let [mov0, mov1, end] = &b2.insts[..] else {
                 panic!()
             };
-            assert_eq!(mov0.read(Reg::S(2)), Some(phi.value));
-            assert_eq!(mov1.read(Reg::S(0)), Some(input(&p, Reg::S(0))));
+            assert_eq!(mov0.read(&p, Reg::S(2)), Some(phi.value));
+            assert_eq!(mov1.read(&p, Reg::S(0)), Some(input(&p, Reg::S(0))));
             // The old v1 is read: lanes outside EXEC keep it.
-            assert_eq!(mov1.read(Reg::V(1)), Some(input(&p, Reg::V(1))));
-            assert_eq!(mov1.read(Reg::S(EXEC)), Some(input(&p, Reg::S(EXEC))));
-            assert_eq!(mov1.read(Reg::S(EXEC + 1)).is_some(), wave64);
+            assert_eq!(mov1.read(&p, Reg::V(1)), Some(input(&p, Reg::V(1))));
+            assert_eq!(mov1.read(&p, Reg::S(EXEC)), Some(input(&p, Reg::S(EXEC))));
+            assert_eq!(mov1.read(&p, Reg::S(EXEC + 1)).is_some(), wave64);
             assert_eq!((end.name(), b2.exit), ("s_endpgm", Exit::End));
         }
     }
@@ -1149,9 +1241,9 @@ mod tests {
         let [bitset, addk, mov, _] = &p.blocks[0].insts[..] else {
             panic!("{:?}", p.blocks[0].insts)
         };
-        assert_eq!(bitset.read(Reg::S(13)), Some(input(&p, Reg::S(13))));
-        assert_eq!(addk.read(Reg::S(14)), Some(input(&p, Reg::S(14))));
-        assert_eq!(mov.read(Reg::S(15)), None);
+        assert_eq!(bitset.read(&p, Reg::S(13)), Some(input(&p, Reg::S(13))));
+        assert_eq!(addk.read(&p, Reg::S(14)), Some(input(&p, Reg::S(14))));
+        assert_eq!(mov.read(&p, Reg::S(15)), None);
     }
 
     #[test]
@@ -1186,12 +1278,12 @@ mod tests {
         assert_eq!(
             phi.args,
             [
-                b0.insts[0].write(Reg::S(0)).unwrap(),
-                add.write(Reg::S(0)).unwrap()
+                b0.insts[0].write(&p, Reg::S(0)).unwrap(),
+                add.write(&p, Reg::S(0)).unwrap()
             ]
         );
-        assert_eq!(add.read(Reg::S(0)), Some(phi.value));
-        assert_eq!(b1.insts[1].read(Reg::S(0)), add.write(Reg::S(0)));
+        assert_eq!(add.read(&p, Reg::S(0)), Some(phi.value));
+        assert_eq!(b1.insts[1].read(&p, Reg::S(0)), add.write(&p, Reg::S(0)));
         assert_eq!(b2.insts[0].name(), "s_endpgm");
     }
 
@@ -1219,7 +1311,7 @@ mod tests {
         assert_eq!(p.blocks[1].offset, 28);
         // s_addc_u32 reads the carry s_add_u32 left in SCC.
         let i = &p.blocks[0].insts;
-        assert_eq!(i[2].read(Reg::Scc), i[1].write(Reg::Scc));
+        assert_eq!(i[2].read(&p, Reg::Scc), i[1].write(&p, Reg::Scc));
     }
 
     #[test]
@@ -1259,15 +1351,16 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(vgprs(&movreld.writes), [2, 3, 4, 5]);
+        assert_eq!(vgprs(movreld.writes(&p)), [2, 3, 4, 5]);
         // v1 is the source; v2-v5 are read for the lanes and indices not written.
-        assert_eq!(vgprs(&movreld.reads), [1, 2, 3, 4, 5]);
-        assert!(movreld.read(Reg::S(M0)).is_some());
-        assert_eq!(vgprs(&movrels.writes), [0]);
-        assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
-        assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
+        assert_eq!(vgprs(movreld.reads(&p)), [1, 2, 3, 4, 5]);
+        assert!(movreld.read(&p, Reg::S(M0)).is_some());
+        assert_eq!(vgprs(movrels.writes(&p)), [0]);
+        assert_eq!(vgprs(movrels.reads(&p)), [4, 5, 0]);
+        assert_eq!(movrels.read(&p, Reg::V(4)), movreld.write(&p, Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
     }
+
 
     const fn s_branch(simm16: i16) -> u32 {
         0xBF82_0000 | simm16 as u16 as u32
@@ -1322,26 +1415,28 @@ mod tests {
         assert!(fwd.blocks.iter().all(|b| b.phis.is_empty()));
         assert_eq!(rev.blocks.len(), fwd.blocks.len());
 
-        let rev_s1 = rev.blocks[0].insts[0].write(Reg::S(1)).unwrap();
-        let rev_s2 = rev.blocks[0].insts[1].write(Reg::S(2)).unwrap();
+        let rev_s1 = rev.blocks[0].insts[0].write(&rev, Reg::S(1)).unwrap();
+        let rev_s2 = rev.blocks[0].insts[1].write(&rev, Reg::S(2)).unwrap();
         let rev_exit = rev.blocks.last().unwrap();
         assert_eq!(rev_exit.insts[0].name(), "s_add_u32");
-        assert_eq!(rev_exit.insts[0].read(Reg::S(1)), Some(rev_s1));
-        assert_eq!(rev_exit.insts[0].read(Reg::S(2)), Some(rev_s2));
+        assert_eq!(rev_exit.insts[0].read(&rev, Reg::S(1)), Some(rev_s1));
+        assert_eq!(rev_exit.insts[0].read(&rev, Reg::S(2)), Some(rev_s2));
 
-        let fwd_s1 = fwd.blocks[0].insts[0].write(Reg::S(1)).unwrap();
-        let fwd_s2 = fwd.blocks[0].insts[1].write(Reg::S(2)).unwrap();
+        let fwd_s1 = fwd.blocks[0].insts[0].write(&fwd, Reg::S(1)).unwrap();
+        let fwd_s2 = fwd.blocks[0].insts[1].write(&fwd, Reg::S(2)).unwrap();
         let fwd_exit = fwd.blocks.last().unwrap();
         assert_eq!(fwd_exit.insts[0].name(), "s_add_u32");
-        assert_eq!(fwd_exit.insts[0].read(Reg::S(1)), Some(fwd_s1));
-        assert_eq!(fwd_exit.insts[0].read(Reg::S(2)), Some(fwd_s2));
+        assert_eq!(fwd_exit.insts[0].read(&fwd, Reg::S(1)), Some(fwd_s1));
+        assert_eq!(fwd_exit.insts[0].read(&fwd, Reg::S(2)), Some(fwd_s2));
     }
 
     #[test]
     fn remove_trivial_phis_compresses_reverse_chain_in_bounded_steps() {
         const CHAIN: usize = 4096;
         let mut template = build_words(&[0xBE80_0380, S_ENDPGM], false).blocks[0].insts[0].clone();
-        template.writes.clear();
+        template.writes = Span::default();
+        template.reads = Span::default();
+        let mut effects = Vec::with_capacity(2 * CHAIN);
         let mut blocks = Vec::with_capacity(CHAIN);
         for k in 0..CHAIN {
             let v1 = Value(2 + 2 * k as u32);
@@ -1352,7 +1447,7 @@ mod tests {
                 (Value(0), Value(1))
             };
             let mut inst = template.clone();
-            inst.reads = vec![(Reg::S(1), v1), (Reg::S(2), v2)];
+            inst.reads = Span::push(&mut effects, [(Reg::S(1), v1), (Reg::S(2), v2)]);
             blocks.push(Block {
                 offset: k * 4,
                 preds: vec![],
@@ -1372,13 +1467,11 @@ mod tests {
                 exit: Exit::End,
             });
         }
-        let steps = remove_trivial_phis_steps(&mut blocks, 2 + 2 * CHAIN as u32);
+        let steps = remove_trivial_phis_steps(&mut blocks, &mut effects, 2 + 2 * CHAIN as u32);
         assert!(blocks.iter().all(|b| b.phis.is_empty()));
-        assert!(
-            blocks
-                .iter()
-                .all(|b| b.insts[0].reads == [(Reg::S(1), Value(0)), (Reg::S(2), Value(1))])
-        );
+        assert!(blocks.iter().all(|b| {
+            b.insts[0].reads.of(&effects) == [(Reg::S(1), Value(0)), (Reg::S(2), Value(1))]
+        }));
         assert!(steps < 100_000, "steps = {steps}");
     }
 
@@ -1408,9 +1501,9 @@ mod tests {
         code.extend([0x8000_0201, S_ENDPGM]); // s_add_u32 s0, s1, s2
 
         let p = build_words(&code, false);
-        let entry_s1 = p.blocks[0].insts[0].write(Reg::S(1)).unwrap();
-        let entry_s2 = p.blocks[0].insts[1].write(Reg::S(2)).unwrap();
-        let arm_s1 = p.blocks[1].insts[0].write(Reg::S(1)).unwrap();
+        let entry_s1 = p.blocks[0].insts[0].write(&p, Reg::S(1)).unwrap();
+        let entry_s2 = p.blocks[0].insts[1].write(&p, Reg::S(2)).unwrap();
+        let arm_s1 = p.blocks[1].insts[0].write(&p, Reg::S(1)).unwrap();
         let merge = p.blocks.last().unwrap();
         for b in &p.blocks[..p.blocks.len() - 1] {
             assert!(b.phis.is_empty(), "{:?}", b.phis);
@@ -1420,8 +1513,8 @@ mod tests {
         };
         assert_eq!(phi.reg, Reg::S(1));
         assert_eq!(phi.args, [arm_s1, entry_s1]);
-        assert_eq!(merge.insts[0].read(Reg::S(1)), Some(phi.value));
-        assert_eq!(merge.insts[0].read(Reg::S(2)), Some(entry_s2));
+        assert_eq!(merge.insts[0].read(&p, Reg::S(1)), Some(phi.value));
+        assert_eq!(merge.insts[0].read(&p, Reg::S(2)), Some(entry_s2));
 
         let mut loop_code = vec![
             0xBE81_0381, // s_mov_b32 s1, 1
@@ -1449,8 +1542,8 @@ mod tests {
         ]);
 
         let lp = build_words(&loop_code, false);
-        let lp_s1 = lp.blocks[0].insts[0].write(Reg::S(1)).unwrap();
-        let lp_s2 = lp.blocks[0].insts[1].write(Reg::S(2)).unwrap();
+        let lp_s1 = lp.blocks[0].insts[0].write(&lp, Reg::S(1)).unwrap();
+        let lp_s2 = lp.blocks[0].insts[1].write(&lp, Reg::S(2)).unwrap();
         let header = &lp.blocks[lp.blocks.len() - 2];
         let exit = lp.blocks.last().unwrap();
         for b in &lp.blocks[..lp.blocks.len() - 2] {
@@ -1460,12 +1553,116 @@ mod tests {
         let [loop_phi] = &header.phis[..] else {
             panic!("{:?}", header.phis)
         };
-        let next_s1 = header.insts[0].write(Reg::S(1)).unwrap();
+        let next_s1 = header.insts[0].write(&lp, Reg::S(1)).unwrap();
         assert_eq!(loop_phi.reg, Reg::S(1));
         assert_eq!(loop_phi.args, [lp_s1, next_s1]);
-        assert_eq!(header.insts[0].read(Reg::S(1)), Some(loop_phi.value));
-        assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
-        assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
-        assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
+        assert_eq!(header.insts[0].read(&lp, Reg::S(1)), Some(loop_phi.value));
+        assert_eq!(header.insts[0].read(&lp, Reg::S(2)), Some(lp_s2));
+        assert_eq!(exit.insts[0].read(&lp, Reg::S(1)), Some(next_s1));
+        assert_eq!(exit.insts[0].read(&lp, Reg::S(2)), Some(lp_s2));
+    }
+
+    #[test]
+    fn split_block_copies_get_their_own_effect_spans() {
+        // The same irreducible loop as `structure::tests::irreducible_loops_are_split`.
+        let p = build_words(
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0xBF85_0001, // s_cbranch_scc1 -> 12, into the loop's middle
+                0x8002_8102, // 8: s_add_u32 s2, s2, 1
+                0xBF84_FFFE, // 12: s_cbranch_scc0 -> 8
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let adds: Vec<&Inst> = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| i.name() == "s_add_u32")
+            .collect();
+        let [first, copy] = adds[..] else {
+            panic!("{} copies of the add", adds.len())
+        };
+        // Same machine instruction and operands, but separate effects.
+        assert_eq!(first.machine, copy.machine);
+        assert_eq!(first.fields, copy.fields);
+        let ranges = |i: &Inst| [i.reads, i.writes].map(|s| s.start..s.start + s.len);
+        for a in ranges(first) {
+            for b in ranges(copy) {
+                assert!(a.end <= b.start || b.end <= a.start, "{a:?} overlaps {b:?}");
+            }
+        }
+        // Each copy renamed its own write.
+        let write = |i: &Inst| i.write(&p, Reg::S(2)).unwrap();
+        assert_ne!(write(first), write(copy));
+        // Renaming one copy's write leaves the other's alone.
+        let mut q = p.clone();
+        let (before, other) = (write(copy), first.writes.start as usize);
+        q.effects[other].1 = Value(u32::MAX - 1);
+        assert_eq!(copy.write(&q, Reg::S(2)), Some(before));
+        assert_eq!(first.write(&q, Reg::S(2)), Some(Value(u32::MAX - 1)));
+    }
+
+    #[test]
+    fn operand_and_effect_spans_slice_back_each_instructions_lists() {
+        let p = build_words(
+            &[
+                0xBE88_1F00, // s_getpc_b64 s[8:9]: no sources
+                0x8000_8100, // s_add_u32 s0, s0, 1: two
+                0x0200_0501, // v_cndmask_b32 v0, v1, v2, vcc: three, one implicit
+                0xD54B_0000, // v_fma_f32 v0, v1, v2, v3: three
+                0x040E_0501,
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let [getpc, add, cndmask, fma, _] = &p.blocks[0].insts[..] else {
+            panic!("{:?}", p.blocks[0].insts)
+        };
+        let names: Vec<_> = [getpc, add, cndmask, fma].map(|i| i.name()).into();
+        assert_eq!(
+            names,
+            ["s_getpc_b64", "s_add_u32", "v_cndmask_b32", "v_fma_f32"]
+        );
+        let sop = |i: &Inst| match &i.fields {
+            Fields::Sop { src, .. } => p.operands(*src),
+            other => panic!("{other:?}"),
+        };
+        let valu = |i: &Inst| match &i.fields {
+            Fields::Valu(v) => p.operands(v.src),
+            other => panic!("{other:?}"),
+        };
+        let s = |code| Operand::Scalar { code, dwords: 1 };
+        let v = |reg| Operand::Vector { reg, dwords: 1 };
+        assert_eq!(sop(getpc), []);
+        assert_eq!(sop(add), [s(0), Operand::Const(129)]);
+        assert_eq!(valu(cndmask), [v(1), v(2), s(VCC)]);
+        assert_eq!(valu(fma), [v(1), v(2), v(3)]);
+
+        let regs = |list: &[(Reg, Value)]| list.iter().map(|r| r.0).collect::<Vec<_>>();
+        assert_eq!(regs(getpc.reads(&p)), []);
+        assert_eq!(regs(getpc.writes(&p)), [Reg::S(8), Reg::S(9)]);
+        assert_eq!(regs(add.reads(&p)), [Reg::S(0)]);
+        assert_eq!(regs(add.writes(&p)), [Reg::S(0), Reg::Scc]);
+        // The explicit sources, VCC, EXEC, then the old v0 the write keeps.
+        assert_eq!(
+            regs(cndmask.reads(&p)),
+            [Reg::V(1), Reg::V(2), Reg::S(VCC), Reg::S(EXEC), Reg::V(0)]
+        );
+        assert_eq!(regs(cndmask.writes(&p)), [Reg::V(0)]);
+
+        // One arena holds them all, back to back, with no gaps.
+        let insts = &p.blocks[0].insts;
+        let listed = |f: fn(&Inst) -> u32| insts.iter().map(f).sum::<u32>() as usize;
+        assert_eq!(p.effects.len(), listed(|i| i.reads.len + i.writes.len));
+        assert_eq!(p.operands.len(), 2 + 3 + 3);
+        for pair in insts.windows(2) {
+            assert_eq!(
+                pair[0].writes.start + pair[0].writes.len,
+                pair[1].reads.start
+            );
+        }
+
     }
 }

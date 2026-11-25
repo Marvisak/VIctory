@@ -102,7 +102,7 @@ fn relative_bounds(p: &Program, st: &Structured) -> HashMap<usize, u32> {
             r.defs.insert(phi.value, Def::Phi(b, i));
         }
         for (i, inst) in block.insts.iter().enumerate() {
-            for w in &inst.writes {
+            for w in inst.writes(p) {
                 r.defs.insert(w.1, Def::Inst(b, i));
             }
         }
@@ -115,7 +115,7 @@ fn relative_bounds(p: &Program, st: &Structured) -> HashMap<usize, u32> {
         .flat_map(|b| &b.insts)
         .filter(|i| relative(i))
     {
-        let hi = inst.read(Reg::S(M0)).map_or(u32::MAX, |m0| r.hi(m0));
+        let hi = inst.read(p, Reg::S(M0)).map_or(u32::MAX, |m0| r.hi(m0));
         let e = out.entry(inst.machine.offset).or_insert(0);
         *e = (*e).max(hi);
     }
@@ -158,7 +158,7 @@ impl Ranges<'_> {
             }
             Some(Def::Inst(b, i)) => {
                 let inst = &p.blocks[b].insts[i];
-                let reg = inst.writes.iter().find(|w| w.1 == v).map(|w| w.0);
+                let reg = inst.writes(p).iter().find(|w| w.1 == v).map(|w| w.0);
                 // Under a guard EXEC may be empty there, and the first lane
                 // then is lane 0, which may not run there.
                 let lane0 = inst.name() == "v_readfirstlane_b32" && self.st.guards[b][i].is_some();
@@ -169,7 +169,7 @@ impl Ranges<'_> {
                 };
                 match (reg, self.st.guards[b][i]) {
                     (Some(r @ Reg::V(_)), Some(_)) => {
-                        h.max(inst.read(r).map_or(u32::MAX, |o| self.hi(o)))
+                        h.max(inst.read(p, r).map_or(u32::MAX, |o| self.hi(o)))
                     }
                     _ => h,
                 }
@@ -225,16 +225,16 @@ impl Ranges<'_> {
             Fields::Valu(v) if v.sdwa.is_none() && v.dpp.is_none() => (
                 name.strip_prefix("v_cmpx_")
                     .or_else(|| name.strip_prefix("v_cmp_"))?,
-                &v.src,
+                p.operands(v.src),
             ),
-            Fields::Sop { src, .. } if inst.write(Reg::Scc) == Some(c) => {
-                (name.strip_prefix("s_cmp_")?, src)
+            Fields::Sop { src, .. } if inst.write(p, Reg::Scc) == Some(c) => {
+                (name.strip_prefix("s_cmp_")?, p.operands(*src))
             }
             _ => return None,
         };
         let op = op.strip_suffix("_u32")?;
-        let [x, y] = &src[..] else { return None };
-        let (x, y) = (value(inst, x), value(inst, y));
+        let [x, y] = src else { return None };
+        let (x, y) = (value(p, inst, x), value(p, inst, y));
         // `a op other`, with the result as it holds.
         let (op, other) = match (x == Some(a), y == Some(a)) {
             (true, false) => (op, &src[1]),
@@ -261,6 +261,7 @@ impl Ranges<'_> {
 
     /// The largest result of `inst`, from its operands.
     fn op_hi(&mut self, inst: &Inst) -> u32 {
+        let p = self.p;
         let src = match &inst.fields {
             Fields::Valu(v)
                 if v.sdwa.is_none()
@@ -269,9 +270,9 @@ impl Ranges<'_> {
                     && v.omod == 0
                     && v.neg | v.abs | v.opsel == 0 =>
             {
-                &v.src
+                p.operands(v.src)
             }
-            Fields::Sop { src, .. } => src,
+            Fields::Sop { src, .. } => p.operands(*src),
             _ => return u32::MAX,
         };
         let s: Vec<u32> = src.iter().map(|o| self.operand_hi(inst, o)).collect();
@@ -291,16 +292,16 @@ impl Ranges<'_> {
         match *op {
             Operand::Const(c @ 128..=192) => u32::from(c - 128),
             Operand::Literal(x) => x,
-            _ => value(inst, op).map_or(u32::MAX, |v| self.hi(v)),
+            _ => value(self.p, inst, op).map_or(u32::MAX, |v| self.hi(v)),
         }
     }
 }
 
 /// The value a one-dword register operand reads.
-fn value(inst: &Inst, op: &Operand) -> Option<Value> {
+fn value(p: &Program, inst: &Inst, op: &Operand) -> Option<Value> {
     match *op {
-        Operand::Vector { reg, dwords: 1 } => inst.read(Reg::V(reg)),
-        Operand::Scalar { code, dwords: 1 } if code != EXEC => inst.read(Reg::S(code)),
+        Operand::Vector { reg, dwords: 1 } => inst.read(p, Reg::V(reg)),
+        Operand::Scalar { code, dwords: 1 } if code != EXEC => inst.read(p, Reg::S(code)),
         _ => None,
     }
 }
@@ -377,8 +378,8 @@ mod tests {
                 S_ENDPGM,
             ]);
             let i = &p.blocks[0].insts;
-            assert_eq!(vgprs(&i[4].writes), [2, 3, 4, 5]);
-            assert_eq!(vgprs(&i[7].reads), second, "index in v{n}");
+            assert_eq!(vgprs(i[4].writes(&p)), [2, 3, 4, 5]);
+            assert_eq!(vgprs(i[7].reads(&p)), second, "index in v{n}");
         }
     }
 
@@ -402,7 +403,7 @@ mod tests {
             .flat_map(|b| &b.insts)
             .find(|i| i.name() == "v_movreld_b32")
             .unwrap();
-        assert_eq!(vgprs(&movreld.writes), [2, 3, 4, 5]);
+        assert_eq!(vgprs(movreld.writes(&p)), [2, 3, 4, 5]);
         // A limit of 5 lets the index reach 4: v2-v6.
         let p = build_words(&[
             vop1(0x01, 7, 128),
@@ -420,7 +421,7 @@ mod tests {
             .flat_map(|b| &b.insts)
             .find(|i| i.name() == "v_movreld_b32")
             .unwrap();
-        assert_eq!(vgprs(&movreld.writes), [2, 3, 4, 5, 6]);
+        assert_eq!(vgprs(movreld.writes(&p)), [2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -466,7 +467,7 @@ mod tests {
                 .find(|i| i.name() == "v_movrels_b32")
                 .unwrap();
             assert_eq!(
-                vgprs(&movrels.reads)[..reads.len()],
+                vgprs(movrels.reads(&p))[..reads.len()],
                 reads[..],
                 "{narrow_first}"
             );

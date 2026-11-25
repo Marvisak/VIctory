@@ -825,7 +825,7 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
         t.vector += block
             .insts
             .iter()
-            .filter(|i| i.read(ir::Reg::S(ir::EXEC)).is_some())
+            .filter(|i| i.read(program, ir::Reg::S(ir::EXEC)).is_some())
             .count();
         for &g in guards.iter().flatten() {
             t.guarded += 1;

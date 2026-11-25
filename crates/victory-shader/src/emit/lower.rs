@@ -282,7 +282,7 @@ struct Lower<'a> {
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
 /// after `inst`, from `mode` before it (`None`: not known).
-fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
+fn round16_after(p: &Program, inst: &Inst, mode: Option<u8>) -> Option<u8> {
     match (inst.name(), &inst.fields) {
         ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
         (
@@ -295,7 +295,7 @@ fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
             if id != 1 || off >= 4 || off + size <= 2 {
                 return mode;
             }
-            match src.first() {
+            match p.operands(*src).first() {
                 Some(&Operand::Literal(x)) if off <= 2 && off + size >= 4 => {
                     Some((x >> (2 - off) & 3) as u8)
                 }
@@ -319,7 +319,7 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
         for &b in &order {
             let Some(mut m) = entry[b] else { continue };
             for inst in &p.blocks[b].insts {
-                m = round16_after(inst, m);
+                m = round16_after(p, inst, m);
             }
             for s in p.blocks[b].exit.successors() {
                 let new = match entry[s] {
@@ -356,7 +356,7 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 struct MemoryEntry {
     handle: V,
     offset: V,
-    /// Block × 4096 + page in the block.
+    /// Block Ã— 4096 + page in the block.
     entry: V,
     block: V,
     /// The level-1 index: address bits 28-39.
@@ -390,27 +390,29 @@ const LANE_MASK: Why = "a lane mask read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+fn reads_mask_as_data(p: &Program, st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
-    let ops: Vec<&Operand> = match &i.fields {
+    let ops: &[Operand] = match &i.fields {
         // A mask operation (its result a mask) is no data use.
         Fields::Sop { .. }
-            if i.writes
+            if i.writes(p)
                 .iter()
                 .any(|&(r, w)| matches!(r, Reg::S(_)) && is_mask(w)) =>
         {
             return false;
         }
-        Fields::Sop { src, .. } => src.iter().collect(),
+        Fields::Sop { src, .. } => p.operands(*src),
         Fields::Valu(v)
             if !matches!(i.name(), "v_cndmask_b32") && !i.name().contains("_co_ci_") =>
         {
-            v.src.iter().collect()
+            p.operands(v.src)
         }
         _ => return false,
     };
-    ops.into_iter().any(|op| match *op {
-        Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
+    ops.iter().any(|op| match *op {
+        Operand::Scalar { code, .. } if code != NULL => {
+            i.read(p, Reg::S(code)).is_some_and(is_mask)
+        }
         _ => false,
     })
 }
@@ -550,7 +552,7 @@ impl<'a> Lower<'a> {
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
+                    || reads_mask_as_data(p, x.st, i)
             }) || {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
@@ -690,7 +692,7 @@ impl<'a> Lower<'a> {
                     block
                         .insts
                         .iter()
-                        .flat_map(move |i| i.writes.iter().map(move |w| (w.1, b)))
+                        .flat_map(move |i| i.writes(p).iter().map(move |w| (w.1, b)))
                         .chain(block.phis.iter().map(move |phi| (phi.value, b)))
                 })
                 .collect(),
@@ -882,7 +884,7 @@ impl<'a> Lower<'a> {
             return Err(WHY);
         };
         let read = |l: &mut Self, r: Reg| -> Result<V, Why> {
-            let v = inst.read(r).ok_or(WHY)?;
+            let v = inst.read(self.x.p, r).ok_or(WHY)?;
             l.i32_of(v)
         };
         let (lo, hi) = match saddr {
@@ -1059,7 +1061,7 @@ impl<'a> Lower<'a> {
             let found = super::wave::sections(p, b);
             for (&start, sec) in &found {
                 for i in start + 1..sec.end {
-                    for &(_, w) in &p.blocks[b].insts[i].writes {
+                    for &(_, w) in p.blocks[b].insts[i].writes(self.x.p) {
                         inside.insert(w, (b, start, sec.end));
                     }
                 }
@@ -1077,7 +1079,7 @@ impl<'a> Lower<'a> {
                     .extend(phi.args.iter().filter(|a| inside.contains_key(a)));
             }
             for (i, inst) in block.insts.iter().enumerate() {
-                for &(_, r) in &inst.reads {
+                for &(_, r) in inst.reads(self.x.p) {
                     if let Some(&(sb, start, end)) = inside.get(&r)
                         && !(sb == b && i > start && i < end)
                     {
@@ -1093,7 +1095,7 @@ impl<'a> Lower<'a> {
     fn section_inst(&mut self, b: usize, i: usize, start: usize) {
         const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
         let inst = &self.x.p.blocks[b].insts[i];
-        for &(_, w) in &inst.writes {
+        for &(_, w) in inst.writes(self.x.p) {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
                 match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)) {
@@ -1342,7 +1344,7 @@ impl<'a> Lower<'a> {
                         .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
                 }
                 self.inst(b, i)?;
-                self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
+                self.mode16 = round16_after(p, &p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
@@ -1841,7 +1843,7 @@ impl<'a> Lower<'a> {
         let inst = p.blocks[b]
             .insts
             .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))
+            .find(|i| i.writes(self.x.p).iter().any(|w| w.1 == lo))
             .ok_or(ELSEWHERE)?;
         let Fields::Sop {
             dst: Some(Operand::Scalar { code, .. }),
@@ -1858,7 +1860,9 @@ impl<'a> Lower<'a> {
             .strip_prefix("s_")
             .and_then(|n| n.strip_suffix(width))
             .ok_or(ELSEWHERE)?;
-        if inst.write(Reg::S(*code)) != Some(lo) || inst.write(Reg::S(EXEC)).is_some() {
+        if inst.write(self.x.p, Reg::S(*code)) != Some(lo)
+            || inst.write(self.x.p, Reg::S(EXEC)).is_some()
+        {
             return Err(ELSEWHERE);
         }
         let at = if b == self.cur_ir {
@@ -1868,9 +1872,9 @@ impl<'a> Lower<'a> {
         };
         // Dword `h` of source `k` (inline constants sign-extend).
         let word = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
-            let x = match src.get(k) {
+            let x = match self.x.p.operands(*src).get(k) {
                 Some(&Operand::Scalar { code, .. }) if code != NULL => {
-                    let v = inst.read(Reg::S(code + h)).ok_or(ELSEWHERE)?;
+                    let v = inst.read(self.x.p, Reg::S(code + h)).ok_or(ELSEWHERE)?;
                     return l.i32_of(v);
                 }
                 Some(&Operand::Const(c)) => {
@@ -1896,7 +1900,7 @@ impl<'a> Lower<'a> {
                 "not" => self.s.m.bin(at, Bin::Xor, a, ones),
                 "cselect" => {
                     let c = word(self, 1, h)?;
-                    let scc = inst.read(Reg::Scc).ok_or(ELSEWHERE)?;
+                    let scc = inst.read(self.x.p, Reg::Scc).ok_or(ELSEWHERE)?;
                     let cond = match self.get(scc)? {
                         Val::Bit(x) => x,
                         Val::I32(x) => {
@@ -1944,11 +1948,15 @@ impl<'a> Lower<'a> {
         match *op {
             Operand::Scalar { code: NULL, .. } => Ok(self.s.m.i32(0)),
             Operand::Scalar { code, .. } => {
-                let v = inst.read(Reg::S(code)).ok_or("an unread operand")?;
+                let v = inst
+                    .read(self.x.p, Reg::S(code))
+                    .ok_or("an unread operand")?;
                 self.i32_of(v)
             }
             Operand::Vector { reg, .. } => {
-                let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
+                let v = inst
+                    .read(self.x.p, Reg::V(reg))
+                    .ok_or("an unread operand")?;
                 self.i32_of(v)
             }
             // src_scc: SCC as 0 or 1.
@@ -1985,9 +1993,9 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
         };
-        match v.src.get(k) {
+        match self.x.p.operands(v.src).get(k) {
             Some(&Operand::Vector { reg, .. }) if v.dpp.is_none() => inst
-                .read(Reg::V(reg))
+                .read(self.x.p, Reg::V(reg))
                 .and_then(|o| self.low16.get(&o).copied()),
             _ => None,
         }
@@ -2033,7 +2041,7 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let op = *self.x.p.operands(v.src).get(k).ok_or("a missing operand")?;
         let selected = Self::sdwa_src(inst, k);
         let mut f = match op {
             _ if selected.is_some() => {
@@ -2054,7 +2062,7 @@ impl<'a> Lower<'a> {
                 } else {
                     Reg::S(reg)
                 };
-                let val = inst.read(r).ok_or("an unread operand")?;
+                let val = inst.read(self.x.p, r).ok_or("an unread operand")?;
                 match self.floats.get(&val) {
                     Some(&f) => f,
                     None => {
@@ -2082,7 +2090,7 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let op = *self.x.p.operands(v.src).get(k).ok_or("a missing operand")?;
         if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
             return Err("integer operand modifiers");
         }
@@ -2357,7 +2365,7 @@ impl<'a> Lower<'a> {
     /// +0 on the hardware, where the host's function of the rounded angle
     /// gives about 1e-7. Infinities and NaN give NaN.
     /// shortcut: below 2^-12 turns the hardware scales by a slightly
-    /// different constant than 2π (a last-place difference).
+    /// different constant than 2Ï€ (a last-place difference).
     fn trig_turns(&mut self, x: V, cosine: bool) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);
@@ -2375,7 +2383,7 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, exact, zero, r)
     }
 
-    /// The high dword of a 32 × 32-bit product.
+    /// The high dword of a 32 Ã— 32-bit product.
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
         let i64t = self.s.m.int(64);
@@ -2389,7 +2397,7 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 × anything = 0`, as in D3D9.
+    /// `0 Ã— anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
@@ -2578,9 +2586,9 @@ impl<'a> Lower<'a> {
         let inst = p.blocks[b]
             .insts
             .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
-        let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
+            .find(|i| i.writes(self.x.p).iter().any(|w| w.1 == lo))?;
+        let &(reg, _) = inst.writes(self.x.p).iter().find(|w| w.1 == lo)?;
+        inst.write(self.x.p, pick(reg)?)
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -2623,10 +2631,12 @@ impl<'a> Lower<'a> {
 
     /// [`Self::write`] of a dword already placed (SDWA applied).
     fn write_placed(&mut self, inst: &Inst, reg: Reg, x: V, guard: Option<V>) {
-        let Some(new) = inst.write(reg) else { return };
+        let Some(new) = inst.write(self.x.p, reg) else {
+            return;
+        };
         let x = match (guard, reg) {
             (Some(g), Reg::V(_)) => {
-                let o = inst.read(reg);
+                let o = inst.read(self.x.p, reg);
                 let read = o.is_some_and(|o| self.read_phis.contains(&o));
                 let old = match o.map(|o| self.i32_of(o)) {
                     Some(Ok(o)) => o,
@@ -2674,7 +2684,7 @@ impl<'a> Lower<'a> {
         if unused != 2 {
             return field;
         }
-        let old = match inst.read(reg).map(|o| self.i32_of(o)) {
+        let old = match inst.read(self.x.p, reg).map(|o| self.i32_of(o)) {
             Some(Ok(o)) => o,
             _ => self.s.m.i32(0),
         };
@@ -2716,7 +2726,7 @@ impl<'a> Lower<'a> {
         self.write(inst, Reg::V(reg), x, guard);
         if guard.is_none()
             && Self::sdwa_dst(inst).is_none()
-            && let Some(new) = inst.write(Reg::V(reg))
+            && let Some(new) = inst.write(self.x.p, Reg::V(reg))
         {
             self.floats.insert(new, f);
         }
@@ -2997,7 +3007,9 @@ impl<'a> Lower<'a> {
         };
         (0..n)
             .map(|k| {
-                let v = inst.read(Reg::V(reg + k)).ok_or("an unread operand")?;
+                let v = inst
+                    .read(self.x.p, Reg::V(reg + k))
+                    .ok_or("an unread operand")?;
                 self.i32_of(v)
             })
             .collect()
@@ -3016,6 +3028,7 @@ impl<'a> Lower<'a> {
         else {
             unreachable!()
         };
+        let data = self.x.p.operands(*data);
         if *gds {
             return Err("GDS");
         }
@@ -3121,7 +3134,7 @@ impl<'a> Lower<'a> {
             _ => 1,
         };
         // (byte offset, dwords) per element; read2/write2 scale their two
-        // offsets by the element size (×64 for st64).
+        // offsets by the element size (Ã—64 for st64).
         let pair = |n: &str| -> Vec<(u32, u32)> {
             let w = width(n);
             let scale = 4 * w * if n.contains("st64") { 64 } else { 1 };
@@ -3157,7 +3170,7 @@ impl<'a> Lower<'a> {
                     .m
                     .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left);
                 let x = if rest.contains("_d16") {
-                    let old = match inst.read(Reg::V(reg)) {
+                    let old = match inst.read(self.x.p, Reg::V(reg)) {
                         Some(o) => self.i32_of(o)?,
                         None => self.s.m.i32(0),
                     };
@@ -3268,7 +3281,7 @@ impl<'a> Lower<'a> {
             Some(d) => Some(self.vgprs(inst, d, 1)?[0]),
             None => None,
         };
-        let old_reg = dst_reg.and_then(|r| inst.read(Reg::V(r)).map(|v| (r, v)));
+        let old_reg = dst_reg.and_then(|r| inst.read(self.x.p, Reg::V(r)).map(|v| (r, v)));
         let outside = match old_reg {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
@@ -3348,7 +3361,7 @@ impl<'a> Lower<'a> {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
-                for &(_, v) in &inst.writes {
+                for &(_, v) in inst.writes(self.x.p) {
                     self.vals.insert(v, Val::Missing(why));
                 }
                 Ok(())
@@ -3364,14 +3377,15 @@ impl<'a> Lower<'a> {
         let Fields::Sop { dst, src, imm } = &inst.fields else {
             unreachable!()
         };
+        let src = self.x.p.operands(*src);
         let name = inst.name();
-        let scc = inst.write(Reg::Scc);
+        let scc = inst.write(self.x.p, Reg::Scc);
         let dst_code = match dst {
             Some(Operand::Scalar { code, .. }) => Some(*code),
             _ => None,
         };
-        let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
-        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+        let lo = dst_code.and_then(|c| inst.write(self.x.p, Reg::S(c)));
+        if inst.write(self.x.p, Reg::S(EXEC)).is_some() || self.is_mask(lo) {
             return Err(LANE_MASK);
         }
         if matches!(
@@ -3398,7 +3412,9 @@ impl<'a> Lower<'a> {
         let half = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
             match src.get(k) {
                 Some(&Operand::Scalar { code, .. }) if code != NULL => {
-                    let v = inst.read(Reg::S(code + h)).ok_or("an unread operand")?;
+                    let v = inst
+                        .read(self.x.p, Reg::S(code + h))
+                        .ok_or("an unread operand")?;
                     l.i32_of(v)
                 }
                 Some(op) if h == 0 => l.operand(inst, op),
@@ -3489,7 +3505,7 @@ impl<'a> Lower<'a> {
         }
         let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64");
         if wide {
-            let hi = dst_code.and_then(|c| inst.write(Reg::S(c + 1)));
+            let hi = dst_code.and_then(|c| inst.write(self.x.p, Reg::S(c + 1)));
             let nonzero = |l: &mut Self, a: V, b: V| {
                 let o = l.s.m.bin(c, Bin::Or, a, b);
                 let z = l.s.m.i32(0);
@@ -3890,7 +3906,7 @@ impl<'a> Lower<'a> {
     }
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
-        let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
+        let v = inst.read(self.x.p, Reg::Scc).ok_or("an unread SCC")?;
         match self.get(v)? {
             Val::Bit(x) => Ok(x),
             _ => Err("SCC without a value"),
@@ -4089,10 +4105,12 @@ impl<'a> Lower<'a> {
         let lane_source = |v: Value| {
             let i = self.def_inst(v)?;
             match i.fields {
-                Fields::Valu(ref f) if i.name() == "v_readfirstlane_b32" => match f.src[..] {
-                    [Operand::Vector { reg, .. }] => i.read(Reg::V(reg)),
-                    _ => None,
-                },
+                Fields::Valu(ref f) if i.name() == "v_readfirstlane_b32" => {
+                    match self.x.p.operands(f.src)[..] {
+                        [Operand::Vector { reg, .. }] => i.read(self.x.p, Reg::V(reg)),
+                        _ => None,
+                    }
+                }
                 _ => None,
             }
         };
@@ -4225,7 +4243,7 @@ impl<'a> Lower<'a> {
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
-                    if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                    if let Some(v) = inst.write(self.x.p, Reg::S(code + k as u8)) {
                         self.vals.insert(v, Val::Missing(OTHER));
                     }
                 }
@@ -4254,7 +4272,7 @@ impl<'a> Lower<'a> {
                 Some((param, dword)) => self.user(param, dword),
                 None => Val::Missing("a root-signature dword no parameter holds"),
             };
-            if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+            if let Some(v) = inst.write(self.x.p, Reg::S(code + k as u8)) {
                 self.vals.insert(v, val);
             }
         }
@@ -4275,7 +4293,9 @@ impl<'a> Lower<'a> {
         };
         let count = smem_dwords(inst.name()).ok_or("a scalar load from title memory")?;
         let word = |l: &mut Self, k: u8| -> Result<V, Why> {
-            let v = inst.read(Reg::S(base + k)).ok_or("a scalar memory address")?;
+            let v = inst
+                .read(self.x.p, Reg::S(base + k))
+                .ok_or("a scalar memory address")?;
             l.i32_of(v)
         };
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
@@ -4600,7 +4620,7 @@ impl<'a> Lower<'a> {
             } else {
                 Val::Missing(OTHER)
             };
-            if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+            if let Some(v) = inst.write(self.x.p, Reg::S(code + k as u8)) {
                 self.vals.insert(v, val);
             }
         }
@@ -5490,11 +5510,11 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         // The low dword of the address: SGPR base plus VGPR offset, or the
         // VGPR pair's low half (heap addresses fit in 32 bits).
-        let mut at = self.i32_of(li.read(Reg::V(reg)).ok_or(WHY)?)?;
+        let mut at = self.i32_of(li.read(self.x.p, Reg::V(reg)).ok_or(WHY)?)?;
         if let Some(Operand::Scalar { code, .. }) = saddr
             && code != NULL
         {
-            let base = self.i32_of(li.read(Reg::S(code)).ok_or(WHY)?)?;
+            let base = self.i32_of(li.read(self.x.p, Reg::S(code)).ok_or(WHY)?)?;
             at = self.s.m.bin(c, Bin::Add, base, at);
         }
         let k = self
@@ -5531,7 +5551,7 @@ impl<'a> Lower<'a> {
             return Err("a descriptor load");
         };
         let c = self.cur;
-        let base = li.read(Reg::S(code)).ok_or("a descriptor load")?;
+        let base = li.read(self.x.p, Reg::S(code)).ok_or("a descriptor load")?;
         let mut addr = self.i32_of(base)?;
         let k = self
             .s
@@ -5564,7 +5584,7 @@ impl<'a> Lower<'a> {
                 self.compare(inst, rest)
             };
             if let Err(why) = r {
-                for &(_, w) in &inst.writes {
+                for &(_, w) in inst.writes(self.x.p) {
                     self.lane_fail.insert(w, why);
                 }
             }
@@ -5595,10 +5615,10 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let Some(&Operand::Vector { reg, .. }) = v.src.first() else {
+        let Some(&Operand::Vector { reg, .. }) = self.x.p.operands(v.src).first() else {
             return Err("a DPP operand");
         };
-        let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
+        let x = self.i32_of(inst.read(self.x.p, Reg::V(reg)).ok_or("a DPP operand")?)?;
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
         let mesh_quad = self.s.mesh.is_some() && quad;
@@ -5755,7 +5775,7 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_mad_u64_u32" | "v_mad_i64_i32" => {
-                // 32 × 32 → 64-bit product plus a 64-bit addend (address
+                // 32 Ã— 32 â†’ 64-bit product plus a 64-bit addend (address
                 // arithmetic); the carry out is a lane mask.
                 let signed = name == "v_mad_i64_i32";
                 let (a, bb) = (s(self, 0)?, s(self, 1)?);
@@ -5774,12 +5794,12 @@ impl<'a> Lower<'a> {
                 self.write(inst, Reg::V(reg + 1), hi, guard);
                 if !signed
                     && let Some(Operand::Scalar { code, .. }) = v.carry
-                    && let Some(w) = inst.write(Reg::S(code))
+                    && let Some(w) = inst.write(self.x.p, Reg::S(code))
                 {
                     let carry = self.s.m.cmp(c, pred::IULT, r, addend);
                     self.lane_bits.insert(w, carry);
                 }
-                for &(_, w) in &inst.writes {
+                for &(_, w) in inst.writes(self.x.p) {
                     self.vals
                         .entry(w)
                         .or_insert(Val::Missing("a lane mask read as data"));
@@ -5848,11 +5868,11 @@ impl<'a> Lower<'a> {
                 // M0 indexes the source (movrels), the destination (movreld)
                 // or both, from the encoded register up to the program's
                 // VGPR count (the registers the instruction reads or writes).
-                let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+                let m0 = self.i32_of(inst.read(self.x.p, Reg::S(crate::ir::M0)).ok_or("M0")?)?;
                 let (
                     Some(&Operand::Vector { reg: sreg, .. }),
                     Some(Operand::Vector { reg: dreg, .. }),
-                ) = (v.src.first(), v.dst)
+                ) = (self.x.p.operands(v.src).first(), v.dst)
                 else {
                     return Err("an M0-relative move");
                 };
@@ -5860,7 +5880,7 @@ impl<'a> Lower<'a> {
                 let value = if indexed_src {
                     let mut r = self.s.m.i32(0);
                     for k in 0..=255u8.saturating_sub(sreg) {
-                        let Some(x) = inst.read(Reg::V(sreg + k)) else {
+                        let Some(x) = inst.read(self.x.p, Reg::V(sreg + k)) else {
                             break;
                         };
                         let x = self.i32_of(x)?;
@@ -5876,10 +5896,10 @@ impl<'a> Lower<'a> {
                     return int(self, value);
                 }
                 for k in 0..=255u8.saturating_sub(dreg) {
-                    let Some(_) = inst.write(Reg::V(dreg + k)) else {
+                    let Some(_) = inst.write(self.x.p, Reg::V(dreg + k)) else {
                         break;
                     };
-                    let old = match inst.read(Reg::V(dreg + k)) {
+                    let old = match inst.read(self.x.p, Reg::V(dreg + k)) {
                         Some(o) => self.i32_of(o)?,
                         None => self.s.m.i32(0),
                     };
@@ -5894,12 +5914,12 @@ impl<'a> Lower<'a> {
                 let (
                     Some(&Operand::Vector { reg: sreg, .. }),
                     Some(Operand::Vector { reg: dreg, .. }),
-                ) = (v.src.first(), v.dst)
+                ) = (self.x.p.operands(v.src).first(), v.dst)
                 else {
                     return Err("v_swap_b32");
                 };
-                let a = self.i32_of(inst.read(Reg::V(dreg)).ok_or("v_swap_b32")?)?;
-                let b = self.i32_of(inst.read(Reg::V(sreg)).ok_or("v_swap_b32")?)?;
+                let a = self.i32_of(inst.read(self.x.p, Reg::V(dreg)).ok_or("v_swap_b32")?)?;
+                let b = self.i32_of(inst.read(self.x.p, Reg::V(sreg)).ok_or("v_swap_b32")?)?;
                 self.write_placed(inst, Reg::V(dreg), b, guard);
                 if dreg != sreg {
                     self.write_placed(inst, Reg::V(sreg), a, guard);
@@ -5922,7 +5942,7 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("an accumulator");
                 };
-                let acc = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
+                let acc = self.i32_of(inst.read(self.x.p, Reg::V(reg)).ok_or("an accumulator")?)?;
                 let i32_ty = self.s.t.i32;
                 let r = self.s.op(
                     c,
@@ -6003,7 +6023,7 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("an accumulator");
                 };
-                let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
+                let acc = inst.read(self.x.p, Reg::V(reg)).ok_or("an accumulator")?;
                 let acc = match self.floats.get(&acc) {
                     Some(&x) => x,
                     None => {
@@ -6153,7 +6173,7 @@ impl<'a> Lower<'a> {
                 // f16 half; neg_hi is the absolute value here.
                 let mut xs = Vec::new();
                 for i in 0..3 {
-                    let op = v.src.get(i).ok_or("a missing operand")?;
+                    let op = self.x.p.operands(v.src).get(i).ok_or("a missing operand")?;
                     let low = v.opsel_hi >> i & 1 != 0 && v.opsel >> i & 1 == 0;
                     let x = match self.low16_src(inst, i).filter(|_| low) {
                         Some(x) => x,
@@ -6194,7 +6214,7 @@ impl<'a> Lower<'a> {
                 // A high half kept from a value with no DXIL form (a first
                 // interpolation half) stays unknown: only the low half is.
                 let mut unknown = None;
-                let old = match inst.read(Reg::V(reg)) {
+                let old = match inst.read(self.x.p, Reg::V(reg)) {
                     Some(o) => match self.i32_of(o) {
                         Ok(x) => x,
                         Err(w) if name == "v_fma_mixlo_f16" && guard.is_none() => {
@@ -6216,7 +6236,7 @@ impl<'a> Lower<'a> {
                 let old = self.s.m.bin(c, Bin::And, old, keep);
                 let x = self.s.m.bin(c, Bin::Or, old, h);
                 self.write(inst, Reg::V(reg), x, guard);
-                if let (Some(w), Some(new)) = (unknown, inst.write(Reg::V(reg))) {
+                if let (Some(w), Some(new)) = (unknown, inst.write(self.x.p, Reg::V(reg))) {
                     self.vals.insert(new, Val::Missing(w));
                     self.low16.insert(new, x);
                 }
@@ -6246,7 +6266,7 @@ impl<'a> Lower<'a> {
                 // the sign bit) into the low and high half.
                 let mut halves = Vec::new();
                 for k in 0..2 {
-                    let op = v.src.get(k).ok_or("a missing operand")?;
+                    let op = self.x.p.operands(v.src).get(k).ok_or("a missing operand")?;
                     let mut x = self.operand(inst, op)?;
                     if v.opsel >> k & 1 != 0 {
                         let k16 = self.s.m.i32(16);
@@ -6274,10 +6294,11 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let cond = match v.src.get(2) {
+                let prog = self.x.p;
+                let cond = match prog.operands(v.src).get(2) {
                     Some(&Operand::Scalar { code, .. }) => {
                         let m = inst
-                            .read(Reg::S(code))
+                            .read(prog, Reg::S(code))
                             .and_then(|m| {
                                 self.x
                                     .st
@@ -6314,7 +6335,8 @@ impl<'a> Lower<'a> {
                         let mut x = match self.src0 {
                             Some(x) if k == 0 => x,
                             _ => {
-                                let op = *v.src.get(k).ok_or("a missing operand")?;
+                                let op =
+                                    *self.x.p.operands(v.src).get(k).ok_or("a missing operand")?;
                                 let x = self.operand(inst, &op)?;
                                 match Self::sdwa_src(inst, k) {
                                     Some((sel, sext)) => self.select_bits(x, sel, sext),
@@ -6347,8 +6369,8 @@ impl<'a> Lower<'a> {
                     std::mem::swap(&mut a, &mut bb);
                 }
                 let cin = if name.ends_with("_ci_u32") {
-                    let m = match v.src.get(2) {
-                        Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
+                    let m = match self.x.p.operands(v.src).get(2) {
+                        Some(&Operand::Scalar { code, .. }) => inst.read(self.x.p, Reg::S(code)),
                         _ => None,
                     };
                     let m = m
@@ -6361,11 +6383,11 @@ impl<'a> Lower<'a> {
                 let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
                 int(self, r)?;
                 if let Some(Operand::Scalar { code, .. }) = v.carry
-                    && let Some(w) = inst.write(Reg::S(code))
+                    && let Some(w) = inst.write(self.x.p, Reg::S(code))
                 {
                     self.lane_bits.insert(w, carry);
                 }
-                for &(_, w) in &inst.writes {
+                for &(_, w) in inst.writes(self.x.p) {
                     self.vals
                         .entry(w)
                         .or_insert(Val::Missing("a lane mask read as data"));
@@ -6377,16 +6399,19 @@ impl<'a> Lower<'a> {
             // no host value, a descriptor's address say).
             "v_readlane_b32"
                 if inst
-                    .writes
+                    .writes(self.x.p)
                     .first()
                     .is_some_and(|w| self.x.st.restored.contains_key(&w.1)) =>
             {
-                let a = self.i32_of(self.x.st.restored[&inst.writes[0].1])?;
+                let a = self.i32_of(self.x.st.restored[&inst.writes(self.x.p)[0].1])?;
                 int(self, a)
             }
             "v_writelane_b32"
                 if !self.console_lanes
-                    && v.src
+                    && self
+                        .x
+                        .p
+                        .operands(v.src)
                         .get(1)
                         .and_then(|&l| crate::resource::lane_of(l))
                         .is_some() =>
@@ -6411,7 +6436,7 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
                 };
-                let old = match inst.read(Reg::V(reg)) {
+                let old = match inst.read(self.x.p, Reg::V(reg)) {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
                 };
@@ -6423,7 +6448,7 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32"
                 if inst
-                    .writes
+                    .writes(self.x.p)
                     .first()
                     .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)) =>
             {
@@ -6463,10 +6488,10 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i64t = self.s.m.int(64);
         self.s.flags |= flags::INT64;
-        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let op = *self.x.p.operands(v.src).get(k).ok_or("a missing operand")?;
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
-            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
-            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            let lo = l.i32_of(inst.read(self.x.p, r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(self.x.p, r1).ok_or("an unread operand")?)?;
             let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
             let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
             let k32 = l.s.m.int_const(i64t, 32);
@@ -6514,7 +6539,7 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let op = *self.x.p.operands(v.src).get(k).ok_or("a missing operand")?;
         let mut high = v.opsel >> k & 1 != 0;
         if let Some(sd) = v.sdwa {
             match sd.src_sel.get(k).copied().unwrap_or(6) {
@@ -6586,7 +6611,7 @@ impl<'a> Lower<'a> {
             }
         }
         let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+        let old = match inst.read(self.x.p, Reg::V(reg)).map(|o| self.i32_of(o)) {
             Some(Ok(o)) if keep => o,
             _ => self.s.m.i32(0),
         };
@@ -6721,7 +6746,7 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("an accumulator");
                 };
-                let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
+                let x = self.i32_of(inst.read(self.x.p, Reg::V(reg)).ok_or("an accumulator")?)?;
                 let x = if v.opsel >> 3 & 1 != 0 {
                     let k16 = self.s.m.i32(16);
                     self.s.m.bin(c, Bin::LShr, x, k16)
@@ -6953,7 +6978,7 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let op = *self.x.p.operands(v.src).get(k).ok_or("a missing operand")?;
         let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
         let x = if float {
             self.f16_operand(inst, &op)?
@@ -6977,7 +7002,11 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let op = if k == 2 { v.dst } else { v.src.get(k).copied() };
+        let op = if k == 2 {
+            v.dst
+        } else {
+            self.x.p.operands(v.src).get(k).copied()
+        };
         let op = op.ok_or("a missing operand")?;
         if matches!(op, Operand::Const(_) | Operand::Literal(_)) {
             // shortcut: no constant operand seen; its high half is not known.
@@ -7148,7 +7177,12 @@ impl<'a> Lower<'a> {
                 let Fields::Valu(v) = &inst.fields else {
                     unreachable!()
                 };
-                let by = v.src.first().and_then(|&o| crate::resource::lane_of(o));
+                let by = self
+                    .x
+                    .p
+                    .operands(v.src)
+                    .first()
+                    .and_then(|&o| crate::resource::lane_of(o));
                 let low =
                     name == "v_lshlrev_b32" && v.sdwa.is_none() && by.is_some_and(|n| n & 31 >= 16);
                 let a = match self.low16_src(inst, 1).filter(|_| low) {
@@ -7378,7 +7412,7 @@ impl<'a> Lower<'a> {
                 let Fields::Valu(v) = &inst.fields else {
                     unreachable!()
                 };
-                let sel = match v.src.get(2) {
+                let sel = match self.x.p.operands(v.src).get(2) {
                     Some(&Operand::Literal(x)) => x,
                     Some(&Operand::Const(k)) => crate::resource::inline(k).ok_or(name)?,
                     _ => {
@@ -7503,10 +7537,10 @@ impl<'a> Lower<'a> {
                     let Fields::Valu(v) = &inst.fields else {
                         unreachable!()
                     };
-                    let host = match v.src.first() {
+                    let host = match self.x.p.operands(v.src).first() {
                         Some(&Operand::Const(193)) => true,
                         Some(&Operand::Scalar { code, .. }) => {
-                            inst.read(Reg::S(code)).is_some_and(|m| {
+                            inst.read(self.x.p, Reg::S(code)).is_some_and(|m| {
                                 self.x.st.masks.contains_key(&m) || self.x.st.highs.contains_key(&m)
                             })
                         }
@@ -7730,10 +7764,10 @@ impl<'a> Lower<'a> {
                 _ => None,
             }
         };
-        if let Some(lo) = code.and_then(|c| inst.write(Reg::S(c))) {
+        if let Some(lo) = code.and_then(|c| inst.write(self.x.p, Reg::S(c))) {
             self.lane_bits.insert(lo, r);
         }
-        for &(_, w) in &inst.writes {
+        for &(_, w) in inst.writes(self.x.p) {
             self.vals
                 .entry(w)
                 .or_insert(Val::Missing("a lane mask read as data"));
@@ -7985,7 +8019,7 @@ impl<'a> Lower<'a> {
     /// results keep the register's high half (GFX10).
     fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
         let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+        let old = match inst.read(self.x.p, Reg::V(reg)).map(|o| self.i32_of(o)) {
             Some(Ok(o)) => o,
             _ => self.s.m.i32(0),
         };
@@ -8078,6 +8112,7 @@ impl<'a> Lower<'a> {
         else {
             unreachable!()
         };
+        let addr = self.x.p.operands(*addr);
         if *tfe || *lwe {
             return Err("an image access with tfe or lwe");
         }
@@ -8129,7 +8164,7 @@ impl<'a> Lower<'a> {
             let r = *regs
                 .get(if packed { extra + (k - extra) / 2 } else { k })
                 .ok_or("an image address")?;
-            let v = inst.read(Reg::V(r)).ok_or("an image address")?;
+            let v = inst.read(self.x.p, Reg::V(r)).ok_or("an image address")?;
             let x = l.i32_of(v)?;
             if !packed {
                 return Ok(x);
@@ -8215,7 +8250,7 @@ impl<'a> Lower<'a> {
             }
             let mut old = Vec::new();
             for k in 0..n {
-                old.push(match inst.read(Reg::V(reg + k)) {
+                old.push(match inst.read(self.x.p, Reg::V(reg + k)) {
                     Some(v) if cache.glc => self.i32_of(v)?,
                     _ => self.s.m.i32(0),
                 });
@@ -8295,7 +8330,9 @@ impl<'a> Lower<'a> {
             for k in 0..4u8 {
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
-                let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
+                let v = inst
+                    .read(self.x.p, Reg::V(reg + r))
+                    .ok_or("image store data")?;
                 vals.push(if *d16 {
                     let mut x = self.i32_of(v)?;
                     if k % 2 == 1 {
@@ -8398,7 +8435,9 @@ impl<'a> Lower<'a> {
                 let a = (0..n)
                     .map(|k| addr_val(self, k))
                     .collect::<Result<Vec<_>, _>>()?;
-                let lod = inst.read(Reg::V(regs[n - 1])).ok_or("an image address")?;
+                let lod = inst
+                    .read(self.x.p, Reg::V(regs[n - 1]))
+                    .ok_or("an image address")?;
                 return self.gather_at_level(inst, h, ss, &a, lod, guard);
             }
             // Comparison: the reference value is the first address after
@@ -8562,7 +8601,7 @@ impl<'a> Lower<'a> {
                         let b = self.s.m.bin(c, Bin::Mul, g[2 * k + 1], g[2 * k + 1]);
                         *l = self.s.m.bin(c, Bin::Add, a, b);
                     }
-                    // FMax, Log (base 2): 0.5 log2(max(|dx|², |dy|²) w²).
+                    // FMax, Log (base 2): 0.5 log2(max(|dx|Â², |dy|Â²) wÂ²).
                     let m = self.binary(35, len2[0], len2[1]);
                     let w2 = self.s.m.bin(c, Bin::Mul, w, w);
                     let m = self.s.m.bin(c, Bin::Mul, m, w2);
@@ -8749,7 +8788,7 @@ impl<'a> Lower<'a> {
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
     /// host's cube sampling turns back into the same texel.
     // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
+    // operand adds 8 Ã— the slice).
     fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
@@ -8901,11 +8940,11 @@ impl<'a> Lower<'a> {
     }
 
     /// The first texel of a gather's footprint along an axis of `size`
-    /// texels at coordinate `u` (bits of a float): floor(u × size − 0.5)
+    /// texels at coordinate `u` (bits of a float): floor(u Ã— size âˆ’ 0.5)
     /// with the product exact and rounded to 1/256 of a texel, half up, as
     /// the hardware does (`gather_level_tests`), i.e.
-    /// (floor(u × size × 512) − 255) >> 9, in 64-bit integers. NaN is 0;
-    /// beyond ±2 every texel of the footprint is outside, as at ±2.
+    /// (floor(u Ã— size Ã— 512) âˆ’ 255) >> 9, in 64-bit integers. NaN is 0;
+    /// beyond Â±2 every texel of the footprint is outside, as at Â±2.
     fn gather_first(&mut self, u: V, size: V) -> V {
         let c = self.cur;
         let f = self.as_float(u);
@@ -8919,7 +8958,7 @@ impl<'a> Lower<'a> {
         let f = self.binary(35, f, lo);
         let f = self.binary(36, f, hi);
         let x = self.as_int(f);
-        // u = m × 2^(e − 150), e at least 1 (denormals).
+        // u = m Ã— 2^(e âˆ’ 150), e at least 1 (denormals).
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let (k23, kff) = (k(self, 23), k(self, 0xFF));
         let e = self.s.m.bin(c, Bin::LShr, x, k23);
@@ -8931,7 +8970,7 @@ impl<'a> Lower<'a> {
         let bit = self.s.m.select(c, normal, implicit, zero);
         let m = self.s.m.bin(c, Bin::Or, m, bit);
         let e = self.s.m.select(c, normal, e, one);
-        // u × size × 512 = m × size × 2^(e − 141); |u| ≤ 2 keeps e ≤ 128.
+        // u Ã— size Ã— 512 = m Ã— size Ã— 2^(e âˆ’ 141); |u| â‰¤ 2 keeps e â‰¤ 128.
         let k141 = k(self, 141);
         let shift = self.s.m.bin(c, Bin::Sub, k141, e);
         let k63 = k(self, 63);
@@ -8987,7 +9026,7 @@ impl<'a> Lower<'a> {
             .insts
             .iter()
             .enumerate()
-            .find(|(_, i)| i.writes.iter().any(|w| w.1 == v))?;
+            .find(|(_, i)| i.writes(self.x.p).iter().any(|w| w.1 == v))?;
         let Fields::Valu(f) = &inst.fields else {
             return None;
         };
@@ -8999,13 +9038,13 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = f.dst else {
                 return None;
             };
-            never_nan = self.whole(inst.read(Reg::V(reg))?, seen)?;
+            never_nan = self.whole(inst.read(self.x.p, Reg::V(reg))?, seen)?;
         }
         // Per source: (never NaN, a finite constant).
         let mut src = |k: usize| -> Option<(bool, bool)> {
-            let x = match *f.src.get(k)? {
+            let x = match *self.x.p.operands(f.src).get(k)? {
                 Operand::Vector { reg, .. } => {
-                    return Some((self.whole(inst.read(Reg::V(reg))?, seen)?, false));
+                    return Some((self.whole(inst.read(self.x.p, Reg::V(reg))?, seen)?, false));
                 }
                 Operand::Const(c) => crate::resource::inline(c)?,
                 Operand::Literal(x) => x,
@@ -9122,7 +9161,9 @@ impl<'a> Lower<'a> {
             return Err("a buffer address");
         };
         let vaddr = |l: &mut Self, k: u8| -> Result<V, Why> {
-            let v = inst.read(Reg::V(areg + k)).ok_or("a buffer address")?;
+            let v = inst
+                .read(self.x.p, Reg::V(areg + k))
+                .ok_or("a buffer address")?;
             l.i32_of(v)
         };
         let index = if *idxen { Some(vaddr(self, 0)?) } else { None };
@@ -9251,7 +9292,7 @@ impl<'a> Lower<'a> {
                 return Err("buffer atomic data");
             };
             let returns = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
-            let old = match inst.read(Reg::V(reg)) {
+            let old = match inst.read(self.x.p, Reg::V(reg)) {
                 Some(v) if returns => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
@@ -10044,22 +10085,22 @@ impl<'a> Lower<'a> {
                     return false;
                 }
                 // The closing branch is the lane's exit, tested below.
-                if inst.reads.iter().any(|r| regs.contains(&r.0))
+                if inst.reads(self.x.p).iter().any(|r| regs.contains(&r.0))
                     && !inst.name().starts_with("s_cbranch")
                 {
                     // Scalar arithmetic only passes the value on.
                     let pure = matches!(inst.fields, Fields::Sop { .. })
-                        && inst.write(Reg::S(EXEC)).is_none()
+                        && inst.write(self.x.p, Reg::S(EXEC)).is_none()
                         && !inst.name().starts_with("s_setreg");
                     if !pure {
                         return false;
                     }
-                    for &(r, w) in &inst.writes {
+                    for &(r, w) in inst.writes(self.x.p) {
                         regs.insert(r);
                         tainted.insert(w);
                     }
                 } else if guard.is_none() {
-                    for w in &inst.writes {
+                    for w in inst.writes(self.x.p) {
                         regs.remove(&w.0);
                     }
                 }
@@ -10167,7 +10208,7 @@ impl<'a> Lower<'a> {
         p.blocks[b]
             .insts
             .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == v))
+            .find(|i| i.writes(self.x.p).iter().any(|w| w.1 == v))
     }
 
     /// The constant `v` holds, `env` giving phi values: moves of constants.
@@ -10180,9 +10221,11 @@ impl<'a> Lower<'a> {
             Fields::Valu(w)
                 if inst.name() == "v_mov_b32" && w.sdwa.is_none() && w.dpp.is_none() =>
             {
-                w.src.first()?
+                self.x.p.operands(w.src).first()?
             }
-            Fields::Sop { src, .. } if inst.name() == "s_mov_b32" => src.first()?,
+            Fields::Sop { src, .. } if inst.name() == "s_mov_b32" => {
+                self.x.p.operands(*src).first()?
+            }
             Fields::Sop { imm, .. } if inst.name() == "s_movk_i32" => {
                 return Some(i32::from((*imm)? as i16) as u32);
             }
@@ -10196,9 +10239,9 @@ impl<'a> Lower<'a> {
             Operand::Const(c) => crate::resource::inline(c),
             Operand::Literal(x) => Some(x),
             Operand::Scalar { code, .. } if code != NULL => {
-                self.konst(env, inst.read(Reg::S(code))?)
+                self.konst(env, inst.read(self.x.p, Reg::S(code))?)
             }
-            Operand::Vector { reg, .. } => self.konst(env, inst.read(Reg::V(reg))?),
+            Operand::Vector { reg, .. } => self.konst(env, inst.read(self.x.p, Reg::V(reg))?),
             _ => None,
         }
     }
@@ -10213,10 +10256,14 @@ impl<'a> Lower<'a> {
             .find_map(|p| name.strip_prefix(p))?;
         let (op, ty) = rest.rsplit_once('_')?;
         let (a, b) = match &inst.fields {
-            Fields::Valu(w) if w.sdwa.is_none() && w.dpp.is_none() => {
-                (w.src.first()?, w.src.get(1)?)
+            Fields::Valu(w) if w.sdwa.is_none() && w.dpp.is_none() => (
+                self.x.p.operands(w.src).first()?,
+                self.x.p.operands(w.src).get(1)?,
+            ),
+            Fields::Sop { src, .. } => {
+                let src = self.x.p.operands(*src);
+                (src.first()?, src.get(1)?)
             }
-            Fields::Sop { src, .. } => (src.first()?, src.get(1)?),
             _ => return None,
         };
         let (a, b) = (

@@ -396,7 +396,7 @@ impl<'a> Tracer<'a> {
                     b.phis
                         .iter()
                         .map(|phi| phi.value)
-                        .chain(b.insts.iter().flat_map(|i| i.writes.iter().map(|w| w.1)))
+                        .chain(b.insts.iter().flat_map(|i| i.writes(p).iter().map(|w| w.1)))
                 }))
         };
         let n = all().map(|v| v.0 as usize + 1).max().unwrap_or(0);
@@ -411,7 +411,7 @@ impl<'a> Tracer<'a> {
                 phis[phi.value.0 as usize] = Some((b, i));
             }
             for (i, inst) in block.insts.iter().enumerate() {
-                for &(_, v) in &inst.writes {
+                for &(_, v) in inst.writes(p) {
                     defs[v.0 as usize] = Some((b, i));
                 }
             }
@@ -443,7 +443,7 @@ impl<'a> Tracer<'a> {
         for (site, at) in t.spill_loads() {
             t.spill_at.insert(t.inst(site).machine.offset, at);
             let Ok(at) = at else { continue };
-            for (k, &(_, v)) in t.inst(site).writes.iter().enumerate() {
+            for (k, &(_, v)) in t.inst(site).writes(t.p).iter().enumerate() {
                 if let Some(pd) = t.spilled_param(at / 4 + k as u32) {
                     t.spilled.insert(v, pd);
                     t.first_spilled.entry(pd).or_insert(v);
@@ -493,7 +493,7 @@ impl<'a> Tracer<'a> {
                 if !inst.name().starts_with("s_load_") {
                     continue;
                 }
-                let word = |k| inst.read(Reg::S(code + k)).map(|v| self.origin(v));
+                let word = |k| inst.read(self.p, Reg::S(code + k)).map(|v| self.origin(v));
                 if word(0) != Some(Term::Value(lo)) || !word(1).is_some_and(high) {
                     continue;
                 }
@@ -562,7 +562,7 @@ impl<'a> Tracer<'a> {
                     }
                 }
                 for inst in &block.insts {
-                    for (k, &(_, v)) in inst.writes.iter().enumerate() {
+                    for (k, &(_, v)) in inst.writes(self.p).iter().enumerate() {
                         let reload = self
                             .spilled
                             .get(&v)
@@ -570,7 +570,7 @@ impl<'a> Tracer<'a> {
                             .filter(|&first| first != v)
                             .map(Moved::Value);
                         let new = match reload
-                            .or_else(|| copy_source(inst, k))
+                            .or_else(|| copy_source(self.p, inst, k))
                             .or_else(|| self.restored(inst))
                         {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
@@ -614,7 +614,7 @@ impl<'a> Tracer<'a> {
     fn term(&self, inst: &Inst, op: &Operand) -> Option<Term> {
         match *op {
             Operand::Scalar { code: NULL, .. } => Some(Term::Const(0)),
-            Operand::Scalar { code, .. } => Some(self.origin(inst.read(Reg::S(code))?)),
+            Operand::Scalar { code, .. } => Some(self.origin(inst.read(self.p, Reg::S(code))?)),
             Operand::Const(c) => inline(c).map(Term::Const),
             Operand::Literal(x) => Some(Term::Const(x)),
             _ => None,
@@ -634,12 +634,13 @@ impl<'a> Tracer<'a> {
     /// The SOP2 operands of `v` if an `s_add` with one of `names` wrote it.
     fn sop2(&self, v: Value, names: &[&str]) -> Option<(&'a Inst, [Term; 2])> {
         let inst = self.def(v)?;
-        if !names.contains(&inst.name()) || inst.writes.first()?.1 != v {
+        if !names.contains(&inst.name()) || inst.writes(self.p).first()?.1 != v {
             return None;
         }
         let Fields::Sop { src, .. } = &inst.fields else {
             return None;
         };
+        let src = self.p.operands(*src);
         Some((
             inst,
             [
@@ -703,7 +704,7 @@ impl<'a> Tracer<'a> {
     /// The `s_getpc_b64` writing `lo` as its low dword.
     fn getpc(&self, lo: Value) -> Option<&'a Inst> {
         let inst = self.def(lo)?;
-        (inst.name() == "s_getpc_b64" && inst.writes.first().is_some_and(|w| w.1 == lo))
+        (inst.name() == "s_getpc_b64" && inst.writes(self.p).first().is_some_and(|w| w.1 == lo))
             .then_some(inst)
     }
 
@@ -716,10 +717,13 @@ impl<'a> Tracer<'a> {
         };
         if !matches!(inst.name(), "v_add_co_u32" | "v_add_nc_u32")
             || f.dst.is_none_or(|d| !matches!(d, Operand::Vector { .. }))
-            || inst.write(Reg::V(match f.dst? {
-                Operand::Vector { reg, .. } => reg,
-                _ => return None,
-            })) != Some(v)
+            || inst.write(
+                self.p,
+                Reg::V(match f.dst? {
+                    Operand::Vector { reg, .. } => reg,
+                    _ => return None,
+                }),
+            ) != Some(v)
             || f.abs != 0
             || f.neg != 0
             || f.sdwa.is_some()
@@ -728,15 +732,15 @@ impl<'a> Tracer<'a> {
             return None;
         }
         Some([
-            self.vterm(inst, f.src.first()?)?,
-            self.vterm(inst, f.src.get(1)?)?,
+            self.vterm(inst, self.p.operands(f.src).first()?)?,
+            self.vterm(inst, self.p.operands(f.src).get(1)?)?,
         ])
     }
 
     /// The origin of a VALU operand.
     fn vterm(&self, inst: &Inst, op: &Operand) -> Option<Term> {
         match *op {
-            Operand::Vector { reg, .. } => Some(self.vorigin(inst.read(Reg::V(reg))?)),
+            Operand::Vector { reg, .. } => Some(self.vorigin(inst.read(self.p, Reg::V(reg))?)),
             op => self.term(inst, &op),
         }
     }
@@ -750,7 +754,11 @@ impl<'a> Tracer<'a> {
             && f.neg == 0
             && f.sdwa.is_none()
             && f.dpp.is_none()
-            && let Some(t) = f.src.first().and_then(|s| self.vterm(inst, s))
+            && let Some(t) = self
+                .p
+                .operands(f.src)
+                .first()
+                .and_then(|s| self.vterm(inst, s))
         {
             return t;
         }
@@ -772,11 +780,11 @@ impl<'a> Tracer<'a> {
         let off = offset as i32 as u32;
         match saddr {
             Some(&Operand::Scalar { code, .. }) if code != NULL => {
-                let word = |k| Some(self.origin(inst.read(Reg::S(code + k))?));
+                let word = |k| Some(self.origin(inst.read(self.p, Reg::S(code + k))?));
                 let (Some(lo), Some(hi)) = (word(0), word(1)) else {
                     return Err("an address not in SGPRs");
                 };
-                let v = inst.read(Reg::V(reg)).ok_or("a global address")?;
+                let v = inst.read(self.p, Reg::V(reg)).ok_or("a global address")?;
                 let mut extra = self.sum(self.vorigin(v));
                 if extra.base.is_some() {
                     return Err("an offset from a root parameter");
@@ -785,7 +793,7 @@ impl<'a> Tracer<'a> {
                 self.address(lo, hi, extra)
             }
             _ => {
-                let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
+                let word = |k| inst.read(self.p, Reg::V(reg + k)).map(|v| self.vorigin(v));
                 let (Some(lo), Some(hi)) = (word(0), word(1)) else {
                     return Err("a global address");
                 };
@@ -873,7 +881,7 @@ impl<'a> Tracer<'a> {
                 // Not through the lane mask a vector instruction runs under.
                 let operand =
                     |r: &&(Reg, Value)| !matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1);
-                stack.extend(inst.reads.iter().filter(operand).map(|r| r.1));
+                stack.extend(inst.reads(self.p).iter().filter(operand).map(|r| r.1));
             }
         }
         false
@@ -891,7 +899,7 @@ impl<'a> Tracer<'a> {
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
-            let high = pc.writes.get(1).map(|w| w.1);
+            let high = pc.writes(self.p).get(1).map(|w| w.1);
             if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
                 return Err("an address with an untracked high half");
             }
@@ -988,7 +996,7 @@ impl<'a> Tracer<'a> {
             return false;
         };
         inst.name() == "v_add_co_ci_u32"
-            && f.src[..2.min(f.src.len())]
+            && self.p.operands(f.src)[..2.min(self.p.operands(f.src).len())]
                 .iter()
                 .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, high)))
     }
@@ -1044,7 +1052,7 @@ impl<'a> Tracer<'a> {
                 dynamic: None,
             });
         }
-        let word = |k| Some(self.origin(inst.read(Reg::S(code + k))?));
+        let word = |k| Some(self.origin(inst.read(self.p, Reg::S(code + k))?));
         let (Some(lo), Some(hi)) = (word(0), word(1)) else {
             return Err("an address not in SGPRs");
         };
@@ -1065,7 +1073,7 @@ impl<'a> Tracer<'a> {
             return Err("a descriptor not in SGPRs");
         };
         let mut words = (0..dwords)
-            .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
+            .map(|k| inst.read(self.p, Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
         // A byte access through a buffer descriptor made raw reads what the
@@ -1285,7 +1293,8 @@ impl<'a> Tracer<'a> {
         let Fields::Sop { dst, src, .. } = &inst.fields else {
             return None;
         };
-        let k = inst.writes.iter().position(|w| w.1 == v)? as u8;
+        let src = self.p.operands(*src);
+        let k = inst.writes(self.p).iter().position(|w| w.1 == v)? as u8;
         let wide = match inst.name() {
             "s_cselect_b32" | "s_cmov_b32" => false,
             "s_cselect_b64" | "s_cmov_b64" => true,
@@ -1296,7 +1305,7 @@ impl<'a> Tracer<'a> {
         // followed.
         let dword = |op: &Operand| match *op {
             Operand::Scalar { code: NULL, .. } => Some(Term::Const(0)),
-            Operand::Scalar { code, .. } => Some(self.origin(inst.read(Reg::S(code + k))?)),
+            Operand::Scalar { code, .. } => Some(self.origin(inst.read(self.p, Reg::S(code + k))?)),
             Operand::Const(c) if !wide => inline(c).map(Term::Const),
             Operand::Const(c @ 128..=208) => {
                 let low = inline(c)?;
@@ -1315,7 +1324,7 @@ impl<'a> Tracer<'a> {
         } else {
             dword(src.get(1)?)?
         };
-        Some((inst.read(Reg::Scc)?, set, clear))
+        Some((inst.read(self.p, Reg::Scc)?, set, clear))
     }
 
     /// The descriptor of `image_bvh*_intersect_ray`: no view, but the BVH's
@@ -1331,7 +1340,7 @@ impl<'a> Tracer<'a> {
             return Err("a descriptor not in SGPRs");
         };
         let word = |k| {
-            inst.read(Reg::S(code + k))
+            inst.read(self.p, Reg::S(code + k))
                 .map(|v| self.origin(v))
                 .ok_or("a descriptor not in SGPRs")
         };
@@ -1352,9 +1361,9 @@ impl<'a> Tracer<'a> {
             return Err(WHY);
         }
         let shifted = match word(0)? {
-            Term::Value(lo) => self
-                .def(lo)
-                .filter(|s| s.name() == "s_lshr_b64" && s.writes.first().map(|w| w.1) == Some(lo)),
+            Term::Value(lo) => self.def(lo).filter(|s| {
+                s.name() == "s_lshr_b64" && s.writes(self.p).first().map(|w| w.1) == Some(lo)
+            }),
             Term::Const(_) => None,
         };
         let Some(shift) = shifted else {
@@ -1363,14 +1372,16 @@ impl<'a> Tracer<'a> {
         let Fields::Sop { src, .. } = &shift.fields else {
             return Err(WHY);
         };
+        let src = self.p.operands(*src);
         let pair = match (src.first(), src.get(1).and_then(|s| self.term(shift, s))) {
             (Some(&Operand::Scalar { code, .. }), Some(Term::Const(8))) if code != NULL => {
-                let half = |k| shift.read(Reg::S(code + k)).map(|v| self.origin(v));
+                let half = |k| shift.read(self.p, Reg::S(code + k)).map(|v| self.origin(v));
                 half(0).zip(half(1))
             }
             _ => None,
         };
-        let (Some((lo, hi)), true) = (pair, high == shift.writes.get(1).map(|w| w.1)) else {
+        let (Some((lo, hi)), true) = (pair, high == shift.writes(self.p).get(1).map(|w| w.1))
+        else {
             return Err(WHY);
         };
         let at = Sum {
@@ -1405,10 +1416,14 @@ impl<'a> Tracer<'a> {
         else {
             return None;
         };
-        match (inst.name(), self.term(inst, src.first()?)?) {
-            ("s_bitset1_b32", Term::Const(bit)) => {
-                Some((self.origin(inst.read(Reg::S(*code))?), 1 << (bit & 31)))
-            }
+        match (
+            inst.name(),
+            self.term(inst, self.p.operands(*src).first()?)?,
+        ) {
+            ("s_bitset1_b32", Term::Const(bit)) => Some((
+                self.origin(inst.read(self.p, Reg::S(*code))?),
+                1 << (bit & 31),
+            )),
             _ => None,
         }
     }
@@ -1461,10 +1476,10 @@ impl<'a> Tracer<'a> {
         if inst.name() != "v_readfirstlane_b32" || f.sdwa.is_some() || f.dpp.is_some() {
             return None;
         }
-        let Some(&Operand::Vector { reg, .. }) = f.src.first() else {
+        let Some(&Operand::Vector { reg, .. }) = self.p.operands(f.src).first() else {
             return None;
         };
-        inst.read(Reg::V(reg))
+        inst.read(self.p, Reg::V(reg))
     }
 
     /// The `v_readfirstlane_b32` results the descriptor operand `op` of
@@ -1474,10 +1489,12 @@ impl<'a> Tracer<'a> {
             return None;
         };
         (0..dwords)
-            .map(|k| match self.origin(inst.read(Reg::S(code + k))?) {
-                Term::Value(v) => self.first_lane_source(v).map(|_| v),
-                Term::Const(_) => None,
-            })
+            .map(
+                |k| match self.origin(inst.read(self.p, Reg::S(code + k))?) {
+                    Term::Value(v) => self.first_lane_source(v).map(|_| v),
+                    Term::Const(_) => None,
+                },
+            )
             .collect()
     }
 
@@ -1502,7 +1519,7 @@ impl<'a> Tracer<'a> {
             (None, Some((b, i))) => Some(self.p.blocks[b].phis[i].reg),
             (None, None) => self
                 .def(v)
-                .and_then(|i| i.writes.iter().find(|w| w.1 == v))
+                .and_then(|i| i.writes(self.p).iter().find(|w| w.1 == v))
                 .map(|w| w.0),
         };
         matches!(reg, Some(Reg::V(_)))
@@ -1537,7 +1554,11 @@ impl<'a> Tracer<'a> {
             && f.neg == 0
             && f.sdwa.is_none()
             && f.dpp.is_none()
-            && let Some(t) = f.src.first().and_then(|s| self.raw(inst, s))
+            && let Some(t) = self
+                .p
+                .operands(f.src)
+                .first()
+                .and_then(|s| self.raw(inst, s))
         {
             return t;
         }
@@ -1548,7 +1569,7 @@ impl<'a> Tracer<'a> {
     /// operands' origins.
     fn raw(&self, inst: &Inst, op: &Operand) -> Option<Term> {
         match *op {
-            Operand::Vector { reg, .. } => Some(Term::Value(inst.read(Reg::V(reg))?)),
+            Operand::Vector { reg, .. } => Some(Term::Value(inst.read(self.p, Reg::V(reg))?)),
             op => self.term(inst, &op),
         }
     }
@@ -1631,7 +1652,7 @@ impl<'a> Tracer<'a> {
                 return None;
             }
             let k = inst
-                .writes
+                .writes(self.p)
                 .iter()
                 .filter(|w| matches!(w.0, Reg::V(_)))
                 .position(|w| w.1 == v)?;
@@ -1747,7 +1768,7 @@ impl<'a> Tracer<'a> {
             return None;
         };
         if inst.name() != "v_cndmask_b32"
-            || inst.write(Reg::V(reg)) != Some(v)
+            || inst.write(self.p, Reg::V(reg)) != Some(v)
             || f.abs != 0
             || f.neg != 0
             || f.clamp
@@ -1757,10 +1778,10 @@ impl<'a> Tracer<'a> {
         {
             return None;
         }
-        let [clear, set, Operand::Scalar { code, .. }] = f.src[..] else {
+        let [clear, set, Operand::Scalar { code, .. }] = self.p.operands(f.src)[..] else {
             return None;
         };
-        let mask = inst.read(Reg::S(code))?;
+        let mask = inst.read(self.p, Reg::S(code))?;
         Some((mask, self.raw(inst, &set)?, self.raw(inst, &clear)?))
     }
 
@@ -1902,7 +1923,12 @@ impl<'a> Tracer<'a> {
             let high = if self.p.wave64 { Some(high?) } else { None };
             lanes.mask_bits(low?, high)
         };
-        let exec = |inst: &Inst| mask(inst.read(Reg::S(EXEC)), inst.read(Reg::S(EXEC + 1)));
+        let exec = |inst: &Inst| {
+            mask(
+                inst.read(self.p, Reg::S(EXEC)),
+                inst.read(self.p, Reg::S(EXEC + 1)),
+            )
+        };
         // The reads belong to this loop's own block: a loop around this one
         // (one per operand, as LLVM nests them for a per-lane image and
         // sampler) is not followed.
@@ -1960,10 +1986,11 @@ impl<'a> Tracer<'a> {
                 };
                 (0..dwords)
                     .map(|k| {
-                        let Term::Value(x) = self.origin(inst.read(Reg::S(code + k))?) else {
+                        let word = inst.read(self.p, Reg::S(code + k))?;
+                        let Term::Value(x) = self.origin(word) else {
                             return None;
                         };
-                        let lane = inst.read(Reg::V(reg + k))?;
+                        let lane = inst.read(self.p, Reg::V(reg + k))?;
                         let (_, read) = self.defs[x.0 as usize]?;
                         let same = reads.contains(&x)
                             && read < i
@@ -1973,7 +2000,8 @@ impl<'a> Tracer<'a> {
                     })
                     .collect()
             };
-            let (Some(a), Some(c)) = (f.src.first(), f.src.get(1)) else {
+            let src = self.p.operands(f.src);
+            let (Some(a), Some(c)) = (src.first(), src.get(1)) else {
                 continue;
             };
             if let Some(xs) = pair(a, c).or_else(|| pair(c, a)) {
@@ -1984,7 +2012,11 @@ impl<'a> Tracer<'a> {
                 } else {
                     continue;
                 };
-                let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1))) else {
+                let pair = (
+                    inst.write(self.p, Reg::S(code)),
+                    inst.write(self.p, Reg::S(code + 1)),
+                );
+                let Some(matched) = mask(pair.0, pair.1) else {
                     continue;
                 };
                 if meet(&[reach, (selected, true), (matched, false)]) {
@@ -2030,9 +2062,9 @@ impl<'a> Tracer<'a> {
         if !inst.name().starts_with("s_load_") {
             return None;
         }
-        let first = inst.writes.iter().position(|w| w.1 == v0)?;
+        let first = inst.writes(self.p).iter().position(|w| w.1 == v0)?;
         let same = words.iter().enumerate().all(|(k, w)| {
-            inst.writes
+            inst.writes(self.p)
                 .get(first + k)
                 .is_some_and(|x| *w == Term::Value(x.1))
         });
@@ -2059,12 +2091,16 @@ impl Tracer<'_> {
         if inst.name() != "v_readlane_b32" {
             return None;
         }
-        let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
+        let [Operand::Vector { reg, .. }, lane] = self.p.operands(v.src)[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
-            .ok()
-            .flatten()
+        self.spilled(
+            inst.read(self.p, Reg::V(reg))?,
+            lane_of(lane)?,
+            &mut Vec::new(),
+        )
+        .ok()
+        .flatten()
     }
 
     /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
@@ -2090,18 +2126,19 @@ impl Tracer<'_> {
         let Fields::Valu(w) = &inst.fields else {
             return Err(());
         };
-        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+        let src = self.p.operands(w.src);
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, src) else {
             return Err(());
         };
         if inst.name() != "v_writelane_b32" {
             return Err(());
         }
         if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+            return self.spilled(inst.read(self.p, Reg::V(reg)).ok_or(())?, lane, seen);
         }
         match *value {
             Operand::Scalar { code, .. } if code != NULL => {
-                inst.read(Reg::S(code)).map(Moved::Value)
+                inst.read(self.p, Reg::S(code)).map(Moved::Value)
             }
             Operand::Literal(x) => Some(Moved::Const(x)),
             Operand::Const(c) => inline(c).map(Moved::Const),
@@ -2122,23 +2159,24 @@ pub(crate) fn lane_of(op: Operand) -> Option<u32> {
 }
 
 /// What dword `k` of a move's result copies.
-fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
+fn copy_source(p: &Program, inst: &Inst, k: usize) -> Option<Moved> {
     let Fields::Sop { src, imm, .. } = &inst.fields else {
         return None;
     };
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    let src = p.operands(*src);
     // A mask of S0 bits from bit S1, as the upscaler's compiler makes an
     // immediate sampler's word.
-    if let ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, &src[..]) {
+    if let ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, src) {
         let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
         return Some(Moved::Const(((1u32 << w) - 1) << at));
     }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
-            inst.read(Reg::S(code + k as u8)).map(Moved::Value)
+            inst.read(p, Reg::S(code + k as u8)).map(Moved::Value)
         }
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { .. }) => Some(Moved::Const(0)),
         ("s_mov_b32", Operand::Literal(x)) => Some(Moved::Const(x)),
@@ -2488,7 +2526,7 @@ pub(crate) mod tests {
         let layout = [param(Table, 4, 1)];
         let t = Tracer::new(&p, &layout, HwStage::Cs, None).unwrap();
         let block = &p.blocks[0];
-        let value = |n: usize, k: usize| t.origin(block.insts[n].writes[k].1);
+        let value = |n: usize, k: usize| t.origin(block.insts[n].writes(&p)[k].1);
         assert_eq!(value(1, 0), Term::Const(0x00FF_F000));
         assert_eq!(value(2, 0), Term::Const(0x1850_0000));
         assert_eq!(value(2, 1), Term::Const(0));

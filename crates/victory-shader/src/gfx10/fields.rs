@@ -40,6 +40,42 @@ pub const NULL: u8 = 125;
 const VCC: u8 = 106;
 const EXEC: u8 = 126;
 
+/// A run of `len` elements starting at `start` in an arena `Vec`: the
+/// variable-length operand lists of [`Fields`] live in one arena per program
+/// instead of one allocation each.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Span {
+    pub start: u32,
+    pub len: u32,
+}
+
+impl Span {
+    /// The elements pushed on `arena` since it had `start` of them.
+    pub fn since<T>(arena: &[T], start: usize) -> Span {
+        Span {
+            start: start as u32,
+            len: (arena.len() - start) as u32,
+        }
+    }
+
+    /// Appends `items` to `arena` and returns their span.
+    pub fn push<T>(arena: &mut Vec<T>, items: impl IntoIterator<Item = T>) -> Span {
+        let start = arena.len();
+        arena.extend(items);
+        Span::since(arena, start)
+    }
+
+    /// The span's elements in `arena`.
+    pub fn of<T>(self, arena: &[T]) -> &[T] {
+        &arena[self.start as usize..][..self.len as usize]
+    }
+
+    /// The span's elements in `arena`, mutably.
+    pub fn of_mut<T>(self, arena: &mut [T]) -> &mut [T] {
+        &mut arena[self.start as usize..][..self.len as usize]
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Cache {
     pub glc: bool,
@@ -52,7 +88,7 @@ pub enum Fields {
     /// SOP1, SOP2, SOPC, SOPK; `imm` is SOPK's 16-bit immediate.
     Sop {
         dst: Option<Operand>,
-        src: Vec<Operand>,
+        src: Span,
         imm: Option<u16>,
     },
     /// The 16-bit immediate: branch offset in dwords, wait counts, message...
@@ -78,7 +114,7 @@ pub enum Fields {
     Ds {
         dst: Option<Operand>,
         addr: Option<Operand>,
-        data: Vec<Operand>,
+        data: Span,
         offset0: u8,
         offset1: u8,
         gds: bool,
@@ -101,7 +137,7 @@ pub enum Fields {
     Image {
         data: Operand,
         /// One range, or one VGPR per address with the NSA form.
-        addr: Vec<Operand>,
+        addr: Span,
         rsrc: Operand,
         sampler: Option<Operand>,
         dmask: u8,
@@ -143,7 +179,7 @@ pub struct Valu {
     pub carry: Option<Operand>,
     /// In operand order, including the implicit VCC of VOP2 `v_cndmask_b32`
     /// and carry-in, and the literal of `v_madmk`/`v_madak` forms.
-    pub src: Vec<Operand>,
+    pub src: Span,
     /// Bit i applies to `src[i]`. For VOP3P, `neg` is the low half's.
     pub neg: u8,
     pub abs: u8,
@@ -185,8 +221,9 @@ pub enum Dpp {
 }
 
 impl Instruction {
-    /// Decodes the operand fields. `wave64` sizes lane masks.
-    pub fn fields(&self, wave64: bool) -> Fields {
+    /// Decodes the operand fields. `wave64` sizes lane masks. Operand lists
+    /// are appended to `arena`; the fields hold their [`Span`]s.
+    pub fn fields(&self, wave64: bool, arena: &mut Vec<Operand>) -> Fields {
         let name = self.name().unwrap_or("");
         let w = |i: usize| self.words.get(i).copied().unwrap_or(0);
         let (w0, w1) = (w(0), w(1));
@@ -198,12 +235,15 @@ impl Instruction {
                 let sdst = scalar((w0 >> 16 & 0x7F) as u8, dst);
                 let ssrc = |shift: u32, dwords| source(w0 >> shift & 0xFF, dwords, w1);
                 let (dst, src) = match self.encoding {
-                    Encoding::Sop2 => (Some(sdst), vec![ssrc(0, src0), ssrc(8, src1)]),
-                    Encoding::Sopc => (None, vec![ssrc(0, src0), ssrc(8, src1)]),
+                    Encoding::Sop2 => (
+                        Some(sdst),
+                        Span::push(arena, [ssrc(0, src0), ssrc(8, src1)]),
+                    ),
+                    Encoding::Sopc => (None, Span::push(arena, [ssrc(0, src0), ssrc(8, src1)])),
                     _ => match name {
-                        "s_getpc_b64" => (Some(sdst), vec![]),
-                        "s_setpc_b64" | "s_rfe_b64" => (None, vec![ssrc(0, src0)]),
-                        _ => (Some(sdst), vec![ssrc(0, src0)]),
+                        "s_getpc_b64" => (Some(sdst), Span::default()),
+                        "s_setpc_b64" | "s_rfe_b64" => (None, Span::push(arena, [ssrc(0, src0)])),
+                        _ => (Some(sdst), Span::push(arena, [ssrc(0, src0)])),
                     },
                 };
                 Fields::Sop {
@@ -215,15 +255,15 @@ impl Instruction {
             Encoding::Sopk => {
                 let sdst = scalar((w0 >> 16 & 0x7F) as u8, 1 + u8::from(name == "s_call_b64"));
                 let (dst, src) = match name {
-                    "s_setreg_imm32_b32" => (None, vec![Operand::Literal(w1)]),
-                    "s_version" => (None, vec![]),
+                    "s_setreg_imm32_b32" => (None, Span::push(arena, [Operand::Literal(w1)])),
+                    "s_version" => (None, Span::default()),
                     n if n.starts_with("s_cmpk_")
                         || n.starts_with("s_waitcnt_")
                         || n == "s_setreg_b32" =>
                     {
-                        (None, vec![sdst])
+                        (None, Span::push(arena, [sdst]))
                     }
-                    _ => (Some(sdst), vec![]),
+                    _ => (Some(sdst), Span::default()),
                 };
                 Fields::Sop {
                     dst,
@@ -262,7 +302,7 @@ impl Instruction {
                 }
             }
             Encoding::Vop1 | Encoding::Vop2 | Encoding::Vopc | Encoding::Vop3 | Encoding::Vop3p => {
-                Fields::Valu(self.valu(name, if wave64 { 2 } else { 1 }))
+                Fields::Valu(self.valu(name, if wave64 { 2 } else { 1 }, arena))
             }
             Encoding::Vintrp => {
                 let vsrc = (w0 & 0xFF) as u8;
@@ -319,9 +359,10 @@ impl Instruction {
                 Fields::Ds {
                     dst: returns.then(|| vector(w1 >> 24, ty * (1 + u8::from(pair)))),
                     addr: (!no_addr).then(|| vector(w1 & 0xFF, 1)),
-                    data: (0..data)
-                        .map(|i| vector(w1 >> (8 + 8 * i) & 0xFF, ty))
-                        .collect(),
+                    data: Span::push(
+                        arena,
+                        (0..data).map(|i| vector(w1 >> (8 + 8 * i) & 0xFF, ty)),
+                    ),
                     offset0: w0 as u8,
                     offset1: (w0 >> 8) as u8,
                     gds: bit(w0, 17),
@@ -363,16 +404,17 @@ impl Instruction {
                 }
                 let count = image_addr_dwords(name, dim, a16);
                 let addr = if w0 >> 1 & 3 == 0 {
-                    vec![vector(w1 & 0xFF, count)]
+                    Span::push(arena, [vector(w1 & 0xFF, count)])
                 } else {
                     // NSA: one VGPR per address, the first in dword 1, the rest
                     // in the extra dwords.
-                    (0..usize::from(count))
-                        .map(|i| match i {
+                    Span::push(
+                        arena,
+                        (0..usize::from(count)).map(|i| match i {
                             0 => vector(w1 & 0xFF, 1),
                             i => vector(w(2 + (i - 1) / 4) >> (8 * ((i - 1) % 4)) & 0xFF, 1),
-                        })
-                        .collect()
+                        }),
+                    )
                 };
                 let sampled = ["image_sample", "image_gather4", "image_get_lod"]
                     .iter()
@@ -441,7 +483,7 @@ impl Instruction {
         }
     }
 
-    fn valu(&self, name: &str, lanes: u8) -> Valu {
+    fn valu(&self, name: &str, lanes: u8, arena: &mut Vec<Operand>) -> Valu {
         // No operands; the console compiler stores a shader hash in their fields.
         if matches!(name, "v_nop" | "v_pipeflush" | "v_clrexcp") {
             return Valu::default();
@@ -524,26 +566,28 @@ impl Instruction {
                             VCC
                         };
                         v.dst = v.dst.or(Some(scalar(mask, lanes)));
-                        v.src = vec![op0, op1];
+                        v.src = Span::push(arena, [op0, op1]);
                     }
                     Encoding::Vop1 => {
                         v.dst = Some(valu_dst(name, w0 >> 17 & 0xFF, dst_n));
-                        v.src = vec![op0];
+                        v.src = Span::push(arena, [op0]);
                     }
                     _ => {
                         v.dst = Some(vector(w0 >> 17 & 0xFF, dst_n));
-                        v.src = match name {
+                        let start = arena.len();
+                        match name {
                             n if n.ends_with("mk_f32") || n.ends_with("mk_f16") => {
-                                vec![op0, Operand::Literal(ext), op1]
+                                arena.extend([op0, Operand::Literal(ext), op1]);
                             }
                             n if n.ends_with("ak_f32") || n.ends_with("ak_f16") => {
-                                vec![op0, op1, Operand::Literal(ext)]
+                                arena.extend([op0, op1, Operand::Literal(ext)]);
                             }
-                            _ => vec![op0, op1],
-                        };
-                        if carry_in {
-                            v.src.push(scalar(VCC, lanes));
+                            _ => arena.extend([op0, op1]),
                         }
+                        if carry_in {
+                            arena.push(scalar(VCC, lanes));
+                        }
+                        v.src = Span::since(arena, start);
                         if name.ends_with("_co_ci_u32") {
                             v.carry = Some(scalar(VCC, lanes));
                         }
@@ -570,8 +614,9 @@ impl Instruction {
                     _ if VOP3_TWO_SOURCES.contains(&name) => 2,
                     _ => 3,
                 };
-                v.src = (0..count)
-                    .map(|i| {
+                v.src = Span::push(
+                    arena,
+                    (0..count).map(|i| {
                         let code = field(i as u32);
                         if i == 0 && name.starts_with("v_interp_") {
                             Operand::Attr {
@@ -584,8 +629,8 @@ impl Instruction {
                         } else {
                             source(code, src_n[i], w(2))
                         }
-                    })
-                    .collect();
+                    }),
+                );
                 v.clamp = w0 >> 15 & 1 == 1;
                 v.neg = (w1 >> 29) as u8;
                 if self.encoding == Encoding::Vop3p {

@@ -87,7 +87,7 @@ impl Lower<'_> {
         }
         let wide = inst.name() == "image_bvh64_intersect_ray";
         let mut regs = Vec::new();
-        for a in addr {
+        for a in self.x.p.operands(*addr) {
             if let Operand::Vector { reg, dwords } = *a {
                 regs.extend((0..dwords).map(|k| reg + k));
             }
@@ -95,7 +95,7 @@ impl Lower<'_> {
         let word = |l: &mut Self, k: usize| -> Result<V, Why> {
             let v = regs
                 .get(k)
-                .and_then(|&r| inst.read(Reg::V(r)))
+                .and_then(|&r| inst.read(self.x.p, Reg::V(r)))
                 .ok_or("a BVH intersection operand")?;
             l.i32_of(v)
         };
@@ -154,7 +154,9 @@ impl Lower<'_> {
                 };
                 let mut d = Vec::new();
                 for k in 0..2 {
-                    let v = inst.read(Reg::S(code + k)).ok_or("a BVH descriptor")?;
+                    let v = inst
+                        .read(self.x.p, Reg::S(code + k))
+                        .ok_or("a BVH descriptor")?;
                     d.push(self.i32_of(v)?);
                 }
                 self.s.flags |= super::flags::INT64;

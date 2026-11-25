@@ -261,9 +261,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             // The group input holds the same value in every lane only as the
             // first lane reads it; a VGPR write reads its old value too.
             let per_lane = p.blocks.iter().flat_map(|b| &b.insts).find(|i| {
-                group.is_some_and(|g| i.reads.contains(&(Reg::V(5), g)))
+                group.is_some_and(|g| i.reads(p).contains(&(Reg::V(5), g)))
                     && i.name() != "v_readfirstlane_b32"
-                    && i.write(Reg::V(5)).is_none()
+                    && i.write(p, Reg::V(5)).is_none()
             });
             if let Some(i) = per_lane {
                 return Err(unsupported(
@@ -332,7 +332,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 .insts
                 .iter()
                 .enumerate()
-                .flat_map(move |(i, inst)| inst.writes.iter().map(move |w| (w.1, (b, i))))
+                .flat_map(move |(i, inst)| inst.writes(p).iter().map(move |w| (w.1, (b, i))))
         })
         .collect();
     let phis: std::collections::HashMap<Value, (usize, usize)> = p
@@ -374,8 +374,8 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             let interp = halves
                                 .pair(
                                     attr,
-                                    inst.read(Reg::V(d)),
-                                    inst.read(Reg::V(reg)),
+                                    inst.read(p, Reg::V(d)),
+                                    inst.read(p, Reg::V(reg)),
                                     &barycentric,
                                 )
                                 .map_err(|what| unsupported(at, what))?;
@@ -387,13 +387,13 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
                     "v_interp_p1ll_f16" => {}
                     "v_interp_p2_f16" => {
-                        let attribute = attribute(inst, &v.src[0])?;
-                        let read = |k: usize| match v.src.get(k) {
-                            Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
+                        let attribute = attribute(inst, &p.operands(v.src)[0])?;
+                        let read = |k: usize| match p.operands(v.src).get(k) {
+                            Some(&Operand::Vector { reg, .. }) => inst.read(p, Reg::V(reg)),
                             _ => None,
                         };
                         let interp = halves
-                            .pair(&v.src[0], read(2), read(1), &barycentric)
+                            .pair(&p.operands(v.src)[0], read(2), read(1), &barycentric)
                             .map_err(|what| unsupported(at, what))?;
                         io.interps.push((site, interp.with(attribute)));
                     }
@@ -428,7 +428,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         _ => return Err(unsupported(at, "an export target")),
                     };
                     let values = src.map(|s| match s {
-                        Some(Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
+                        Some(Operand::Vector { reg, .. }) => inst.read(p, Reg::V(reg)),
                         _ => None,
                     });
                     io.exports.push(Export {
@@ -519,11 +519,16 @@ impl Halves<'_> {
                     src: Operand::Vector { reg, .. },
                     attr,
                     ..
-                } if inst.name() == "v_interp_p1_f32" => (*attr, inst.read(Reg::V(*reg))),
-                Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => match v.src.get(1) {
-                    Some(&Operand::Vector { reg, .. }) => (v.src[0], inst.read(Reg::V(reg))),
-                    _ => return Err("an interpolation without its first half"),
-                },
+                } if inst.name() == "v_interp_p1_f32" => (*attr, inst.read(self.p, Reg::V(*reg))),
+                Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => {
+                    let src = self.p.operands(v.src);
+                    match src.get(1) {
+                        Some(&Operand::Vector { reg, .. }) => {
+                            (src[0], inst.read(self.p, Reg::V(reg)))
+                        }
+                        _ => return Err("an interpolation without its first half"),
+                    }
+                }
                 _ => return Err("an interpolation without its first half"),
             };
             if a != *attr {
@@ -575,15 +580,17 @@ impl Halves<'_> {
                 // (`v_writelane` ignores EXEC).
                 let &(b, i) = self.defs.get(&v)?;
                 let inst = &self.p.blocks[b].insts[i];
-                let &(reg, _) = inst.writes.iter().find(|w| w.1 == v)?;
+                let &(reg, _) = inst.writes(self.p).iter().find(|w| w.1 == v)?;
                 if !matches!(reg, Reg::V(_)) || inst.name() == "v_writelane_b32" {
                     return None;
                 }
                 // A plain copy of a barycentric: that one where it runs.
                 let copied = match (&inst.fields, inst.name()) {
                     (Fields::Valu(c), "v_mov_b32") if c.dpp.is_none() && c.sdwa.is_none() => {
-                        match c.src.first() {
-                            Some(&Operand::Vector { reg: from, .. }) => inst.read(Reg::V(from)),
+                        match self.p.operands(c.src).first() {
+                            Some(&Operand::Vector { reg: from, .. }) => {
+                                inst.read(self.p, Reg::V(from))
+                            }
                             _ => None,
                         }
                     }
@@ -596,7 +603,7 @@ impl Halves<'_> {
                     }
                     None => {
                         other.push(Elsewhere::Write((b, i)));
-                        stack.push(inst.read(reg)?);
+                        stack.push(inst.read(self.p, reg)?);
                     }
                 }
             }
@@ -717,7 +724,7 @@ mod tests {
             (e.target, e.done, e.compressed),
             (Target::Color(0), true, false)
         );
-        assert_eq!(e.values[0], p.blocks[0].insts[1].write(Reg::V(2)));
+        assert_eq!(e.values[0], p.blocks[0].insts[1].write(&p, Reg::V(2)));
     }
 
     #[test]

@@ -141,14 +141,14 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
             "s_nand_saveexec_b64" | "s_nand_saveexec_b32" => Some(Operand::Const(128)),
             _ => None,
         };
-        let start = all.is_some_and(
-            |k| matches!(&inst.fields, Fields::Sop { src, .. } if src.first() == Some(&k)),
-        );
+        let start = all.is_some_and(|k| {
+            matches!(&inst.fields, Fields::Sop { src, .. } if p.operands(*src).first() == Some(&k))
+        });
         let saved = match &inst.fields {
             Fields::Sop {
                 dst: Some(Operand::Scalar { code, .. }),
                 ..
-            } if start => inst.write(Reg::S(*code)),
+            } if start => inst.write(p, Reg::S(*code)),
             _ => None,
         };
         let Some(saved) = saved else {
@@ -156,13 +156,13 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
             continue;
         };
         let end = (i + 1..insts.len()).find(|&j| {
-            insts[j].write(Reg::S(EXEC)).is_some()
-                && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
+            insts[j].write(p, Reg::S(EXEC)).is_some()
+                && insts[j].read(p, Reg::S(saved_code(inst))) == Some(saved)
         });
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
+        let shapes = simulate(p, &insts[i + 1..end], wave, saved);
         out.insert(i, Section { end, shapes });
         i = end + 1;
     }
@@ -312,7 +312,7 @@ fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn simulate(p: &Program, insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -325,12 +325,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let mut masked = vec![saved];
     for inst in insts {
         let name = inst.name();
-        if inst.write(Reg::S(EXEC)).is_some() {
+        if inst.write(p, Reg::S(EXEC)).is_some() {
             // Constant lane sets (prefix sums); anything else ends what
             // the simulation can follow.
             let lo = name
                 .starts_with("s_mov_b")
-                .then(|| constant(inst))
+                .then(|| constant(p, inst))
                 .flatten();
             let Some(k) = lo else {
                 return shapes(vec, uni, wave);
@@ -342,10 +342,10 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             }) & all;
             continue;
         }
-        if inst.write(Reg::S(EXEC + 1)).is_some() {
+        if inst.write(p, Reg::S(EXEC + 1)).is_some() {
             let Some(k) = name
                 .starts_with("s_mov_b")
-                .then(|| constant(inst))
+                .then(|| constant(p, inst))
                 .flatten()
             else {
                 return shapes(vec, uni, wave);
@@ -354,19 +354,23 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             continue;
         }
         if let Fields::Sop { src, .. } = &inst.fields {
+            let reads_masked = |o: &Operand| {
+                matches!(*o, Operand::Scalar { code, .. }
+                    if inst.read(p, Reg::S(code)).is_some_and(|v| masked.contains(&v)))
+            };
             if name.starts_with("s_and_b")
-                && src.iter().any(|o| matches!(*o, Operand::Scalar { code, .. } if inst.read(Reg::S(code)).is_some_and(|v| masked.contains(&v))))
-                && let Some(&(_, w)) = inst.writes.iter().find(|w| matches!(w.0, Reg::S(_)))
+                && p.operands(*src).iter().any(reads_masked)
+                && let Some(&(_, w)) = inst.writes(p).iter().find(|w| matches!(w.0, Reg::S(_)))
             {
                 masked.push(w);
             }
-            for &(_, w) in &inst.writes {
+            for &(_, w) in inst.writes(p) {
                 uni.entry(w).or_insert(Sym::Unknown);
             }
             continue;
         }
         let Fields::Valu(v) = &inst.fields else {
-            for &(_, w) in &inst.writes {
+            for &(_, w) in inst.writes(p) {
                 vec.insert(w, vec![Sym::Unknown; wave as usize]);
             }
             continue;
@@ -377,14 +381,14 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
          -> Vec<Sym> {
             let one = |s: Sym| vec![s; wave as usize];
             match *op {
-                Operand::Vector { reg, .. } => match inst.read(Reg::V(reg)) {
+                Operand::Vector { reg, .. } => match inst.read(p, Reg::V(reg)) {
                     Some(x) => vec
                         .get(&x)
                         .cloned()
                         .unwrap_or_else(|| (0..wave).map(|_| Sym::Own(x)).collect()),
                     None => one(Sym::Unknown),
                 },
-                Operand::Scalar { code, .. } if code != NULL => match inst.read(Reg::S(code)) {
+                Operand::Scalar { code, .. } if code != NULL => match inst.read(p, Reg::S(code)) {
                     Some(x) => one(uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
                     None => one(Sym::Unknown),
                 },
@@ -396,7 +400,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
         let modifiers = v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some();
         if name == "v_readlane_b32" {
             let (Some(Operand::Scalar { code, .. }), Some(src), Some(lane)) =
-                (v.dst, v.src.first(), v.src.get(1))
+                (v.dst, p.operands(v.src).first(), p.operands(v.src).get(1))
             else {
                 continue;
             };
@@ -406,7 +410,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 _ => None,
             };
             let x = lanes(src, &vec, &uni);
-            if let Some(w) = inst.write(Reg::S(code)) {
+            if let Some(w) = inst.write(p, Reg::S(code)) {
                 let s = l
                     .and_then(|l| x.get(l as usize).copied())
                     .unwrap_or(Sym::Unknown);
@@ -415,12 +419,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             continue;
         }
         let Some(Operand::Vector { reg: dreg, .. }) = v.dst else {
-            for &(_, w) in &inst.writes {
+            for &(_, w) in inst.writes(p) {
                 uni.insert(w, Sym::Unknown);
             }
             continue;
         };
-        let Some(dst) = inst.write(Reg::V(dreg)) else {
+        let Some(dst) = inst.write(p, Reg::V(dreg)) else {
             continue;
         };
         let old = lanes(
@@ -432,7 +436,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             &uni,
         );
         // src0 as each lane fetches it (DPP), with the lanes that write.
-        let src0 = v.src.first().map(|o| lanes(o, &vec, &uni));
+        let src0 = p.operands(v.src).first().map(|o| lanes(o, &vec, &uni));
         let mut writes = exec;
         let fetched: Option<Vec<Sym>> = match (v.dpp, &src0) {
             (Some(d), Some(s)) => {
@@ -458,7 +462,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             (None, Some(s)) => Some(s.clone()),
             _ => None,
         };
-        let src = |k: usize| v.src.get(k).map(|o| lanes(o, &vec, &uni));
+        let src = |k: usize| p.operands(v.src).get(k).map(|o| lanes(o, &vec, &uni));
         let result: Vec<Sym> = match (name, fetched) {
             _ if modifiers => vec![Sym::Unknown; wave as usize],
             ("v_mov_b32", Some(a)) => a,
@@ -470,8 +474,8 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 })
                 .collect(),
             ("v_cndmask_b32", Some(a)) => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
+                let mask = match p.operands(v.src).get(2) {
+                    Some(&Operand::Scalar { code, .. }) => inst.read(p, Reg::S(code)),
                     _ => None,
                 };
                 let b = src(1).unwrap_or_default();
@@ -493,7 +497,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             ("v_permlanex16_b32", Some(a)) => {
                 // Lanes of each row read the other row of their half; lane
                 // i's pick is nibble i of {src2, src1}.
-                let sel = |k: usize| match v.src.get(k) {
+                let sel = |k: usize| match p.operands(v.src).get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
@@ -578,12 +582,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     shapes(vec, uni, wave)
 }
 
-fn constant(inst: &Inst) -> Option<u64> {
+fn constant(p: &Program, inst: &Inst) -> Option<u64> {
     let Fields::Sop { src, .. } = &inst.fields else {
         return None;
     };
     let wide = inst.name() == "s_mov_b64";
-    match *src.first()? {
+    match *p.operands(*src).first()? {
         Operand::Scalar { code: NULL, .. } => Some(0),
         Operand::Const(c @ 128..=208) => {
             let x = crate::resource::inline(c)?;
@@ -834,7 +838,7 @@ mod tests {
         let b32 = 0x03;
         let check = |words: &[u32], wave64: bool| -> Option<u64> {
             let p = build(words, wave64);
-            constant(&p.blocks[0].insts[0])
+            constant(&p, &p.blocks[0].insts[0])
         };
 
         assert_eq!(
@@ -936,14 +940,14 @@ mod tests {
 
             let p = build(&w, wave64);
             let insts = &p.blocks[0].insts;
-            let saved = insts[0].write(Reg::S(0)).unwrap();
+            let saved = insts[0].write(&p, Reg::S(0)).unwrap();
             let v0_in = p
                 .inputs
                 .iter()
                 .find_map(|&(r, v)| (r == Reg::V(0)).then_some(v))
                 .unwrap();
-            let v2_val = insts[insts.len() - 4].write(Reg::V(2)).unwrap();
-            let v4_val = insts[insts.len() - 3].write(Reg::V(4)).unwrap();
+            let v2_val = insts[insts.len() - 4].write(&p, Reg::V(2)).unwrap();
+            let v4_val = insts[insts.len() - 3].write(&p, Reg::V(4)).unwrap();
             let sec = &sections(&p, 0)[&0];
             assert_eq!(
                 sec.shapes.get(&v2_val),
@@ -968,8 +972,8 @@ mod tests {
         ];
         let p = build(&w, false);
         let insts = &p.blocks[0].insts;
-        let v2_val = insts[3].write(Reg::V(2)).unwrap();
-        let v3_val = insts[5].write(Reg::V(3)).unwrap();
+        let v2_val = insts[3].write(&p, Reg::V(2)).unwrap();
+        let v3_val = insts[5].write(&p, Reg::V(3)).unwrap();
         let sec = &sections(&p, 0)[&0];
         assert_eq!(sec.shapes.get(&v2_val), Some(&Shape::K(7)));
         assert_eq!(sec.shapes.get(&v3_val), Some(&Shape::K(7)));

@@ -18,7 +18,7 @@ mod fields;
 mod opcodes;
 mod sp3;
 
-pub use fields::{Cache, Dpp, Fields, NULL, Operand, Sdwa, Valu};
+pub use fields::{Cache, Dpp, Fields, NULL, Operand, Sdwa, Span, Valu};
 
 use std::collections::BTreeMap;
 
@@ -362,7 +362,7 @@ mod tests {
     fn flat_offsets_ignore_bit_eleven() {
         let offset = |word0: u32| {
             let code = bytes(&[word0, 0x0000_0001, S_ENDPGM]);
-            match decode(&code).unwrap()[0].fields(false) {
+            match decode(&code).unwrap()[0].fields(false, &mut Vec::new()) {
                 Fields::Flat { offset, .. } => offset,
                 fields => panic!("{fields:?}"),
             }

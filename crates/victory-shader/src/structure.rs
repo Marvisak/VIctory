@@ -594,7 +594,7 @@ impl<'a> Lanes<'a> {
                 phis.insert(phi.value, (b, i));
             }
             for (i, inst) in block.insts.iter().enumerate() {
-                for &(_, v) in &inst.writes {
+                for &(_, v) in inst.writes(p) {
                     defs.insert(v, (b, i));
                 }
             }
@@ -623,7 +623,7 @@ impl<'a> Lanes<'a> {
                 && let Some(last) = block.insts.last()
                 && l.discards(last)
                 && (l.kill_exit(taken) || l.kill_exit(not_taken))
-                && let Some(def) = last.read(Reg::Scc).and_then(|v| l.defs.get(&v))
+                && let Some(def) = last.read(p, Reg::Scc).and_then(|v| l.defs.get(&v))
             {
                 l.kills.insert(*def);
             }
@@ -631,11 +631,11 @@ impl<'a> Lanes<'a> {
         for inst in blocks.iter().flat_map(|b| &b.insts) {
             if let Fields::Valu(v) = &inst.fields
                 && inst.name() == "v_readlane_b32"
-                && let [Operand::Vector { reg, .. }, lane] = v.src[..]
+                && let [Operand::Vector { reg, .. }, lane] = p.operands(v.src)[..]
                 && let Some(lane) = lane_of(lane)
-                && let Some(spill) = inst.read(Reg::V(reg))
+                && let Some(spill) = inst.read(p, Reg::V(reg))
                 && let Ok(Some(s)) = l.spilled(spill, lane, &mut Vec::new())
-                && let Some(&(_, r)) = inst.writes.first()
+                && let Some(&(_, r)) = inst.writes(p).first()
             {
                 l.restored.insert(r, s);
             }
@@ -667,18 +667,19 @@ impl<'a> Lanes<'a> {
         let Fields::Valu(w) = &inst.fields else {
             return Err(());
         };
-        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, self.p.operands(w.src))
+        else {
             return Err(());
         };
         if inst.name() != "v_writelane_b32" {
             return Err(());
         }
         if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+            return self.spilled(inst.read(self.p, Reg::V(reg)).ok_or(())?, lane, seen);
         }
         match *value {
             Operand::Scalar { code, .. } if code != NULL => {
-                inst.read(Reg::S(code)).map(Some).ok_or(())
+                inst.read(self.p, Reg::S(code)).map(Some).ok_or(())
             }
             _ => Err(()),
         }
@@ -731,7 +732,7 @@ impl<'a> Lanes<'a> {
             // EXEC where known in this block (read or written so far).
             let mut now = None;
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
-                if inst.read(Reg::S(EXEC)).is_some() {
+                if inst.read(self.p, Reg::S(EXEC)).is_some() {
                     let e = self.exec(inst);
                     execs[b][i] = Some(e);
                     now = Some(e);
@@ -743,17 +744,17 @@ impl<'a> Lanes<'a> {
                         ..
                     } = inst.fields
                     && let (Some(old), Some(new)) = (
-                        self.key(|r| inst.read(r), code),
-                        self.key(|r| inst.write(r), code),
+                        self.key(|r| inst.read(self.p, r), code),
+                        self.key(|r| inst.write(self.p, r), code),
                     )
                 {
                     let m = self.mask(old).0;
                     self.masks.insert(new, m);
-                    if let Some(scc) = inst.write(Reg::Scc) {
+                    if let Some(scc) = inst.write(self.p, Reg::Scc) {
                         self.scc_lane.insert(scc, m);
                     }
                 }
-                if let Some(k) = self.key(|r| inst.write(r), EXEC) {
+                if let Some(k) = self.key(|r| inst.write(self.p, r), EXEC) {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
                 }
             }
@@ -764,7 +765,7 @@ impl<'a> Lanes<'a> {
                 // A discard's "no lane is left" exit: no lane takes it (the
                 // live mask keeps every lane, see `kills`).
                 if last
-                    .read(Reg::Scc)
+                    .read(self.p, Reg::Scc)
                     .and_then(|v| self.defs.get(&v))
                     .is_some_and(|d| self.kills.contains(d))
                 {
@@ -912,7 +913,7 @@ impl<'a> Lanes<'a> {
     }
 
     fn exec(&mut self, inst: &Inst) -> Bool {
-        match self.key(|r| inst.read(r), EXEC) {
+        match self.key(|r| inst.read(self.p, r), EXEC) {
             Some(k) => self.mask(k).0,
             None => Bool::TRUE,
         }
@@ -949,7 +950,9 @@ impl<'a> Lanes<'a> {
                 // What an EXEC write the pass does not follow leaves there.
                 let exec_write = |d: Option<(usize, usize)>, v: Value| {
                     def(d).is_some_and(|i| {
-                        i.write(Reg::S(EXEC)) == Some(v) || i.write(Reg::S(EXEC + 1)) == Some(v)
+                        [EXEC, EXEC + 1]
+                            .map(|c| i.write(self.p, Reg::S(c)))
+                            .contains(&Some(v))
                     })
                 };
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
@@ -1042,7 +1045,7 @@ impl<'a> Lanes<'a> {
         };
         Some(match *op {
             Operand::Scalar { code, .. } if code != NULL => {
-                let k = self.key(|r| inst.read(r), code)?;
+                let k = self.key(|r| inst.read(self.p, r), code)?;
                 self.mask(k)
             }
             Operand::Const(c @ 128..=208) => {
@@ -1063,15 +1066,16 @@ impl<'a> Lanes<'a> {
         let Fields::Sop { dst, src, .. } = &inst.fields else {
             return None;
         };
+        let src = self.p.operands(*src);
         let width = if self.p.wave64 { "_b64" } else { "_b32" };
         let op = inst.name().strip_prefix("s_")?.strip_suffix(width)?;
         let dst = match dst {
             Some(Operand::Scalar { code, .. }) if *code != NULL => {
-                self.key(|r| inst.write(r), *code)
+                self.key(|r| inst.write(self.p, r), *code)
             }
             _ => None,
         };
-        let exec_out = self.key(|r| inst.write(r), EXEC);
+        let exec_out = self.key(|r| inst.write(self.p, r), EXEC);
         let (save, f) = match (op.strip_suffix("_saveexec"), op.strip_suffix("_wrexec")) {
             (Some(f), _) => (Some(true), f),
             (_, Some(f)) => (Some(false), f),
@@ -1112,7 +1116,7 @@ impl<'a> Lanes<'a> {
             }
             "cselect" => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
-                let scc = inst.read(Reg::Scc)?;
+                let scc = inst.read(self.p, Reg::Scc)?;
                 let born = self.born(scc);
                 let u = self.b.atom(Atom::Uniform(scc), born);
                 (self.b.ite(u, a, c), None)
@@ -1175,18 +1179,18 @@ impl<'a> Lanes<'a> {
         match &inst.fields {
             Fields::Sop { src, .. } => {
                 let mut takes_mask = false;
-                for s in src {
+                for s in self.p.operands(*src) {
                     if let Operand::Scalar { code, .. } = *s
                         && code != NULL
-                        && let Some(k) = self.key(|r| inst.read(r), code)
+                        && let Some(k) = self.key(|r| inst.read(self.p, r), code)
                     {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
                         takes_mask |= self.masks.contains_key(&k)
                             || phi && !self.joins_loaded(k) && self.mask(k).1;
                     }
                 }
-                let touches_exec =
-                    inst.write(Reg::S(EXEC)).is_some() || inst.read(Reg::S(EXEC)).is_some();
+                let touches_exec = inst.write(self.p, Reg::S(EXEC)).is_some()
+                    || inst.read(self.p, Reg::S(EXEC)).is_some();
                 if (takes_mask || touches_exec)
                     && let Some(r) = self.sop(inst).filter(|r| r.derived)
                 {
@@ -1199,7 +1203,7 @@ impl<'a> Lanes<'a> {
                             self.active.insert(k.0);
                         }
                     }
-                    if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
+                    if let (Some(scc), Some(m)) = (inst.write(self.p, Reg::Scc), r.scc) {
                         self.scc_lane.insert(scc, m);
                     }
                 }
@@ -1207,11 +1211,11 @@ impl<'a> Lanes<'a> {
                 let width = if self.p.wave64 { "64" } else { "32" };
                 if takes_mask
                     && let (Some(rest), Some(scc)) =
-                        (name.strip_prefix("s_cmp_"), inst.write(Reg::Scc))
+                        (name.strip_prefix("s_cmp_"), inst.write(self.p, Reg::Scc))
                     && rest
                         .strip_suffix(width)
                         .is_some_and(|r| r == "eq_u" || r == "lg_u")
-                    && let [a, c] = &src[..]
+                    && let [a, c] = self.p.operands(*src)
                     && let (Some((a, _)), Some((c, _))) =
                         (self.operand(inst, a), self.operand(inst, c))
                 {
@@ -1236,21 +1240,21 @@ impl<'a> Lanes<'a> {
                 // A select reads a mask nothing else may: a join of compare
                 // results is resolved here, as for EXEC.
                 if name == "v_cndmask_b32"
-                    && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
+                    && let Some(&Operand::Scalar { code, .. }) = self.p.operands(v.src).get(2)
                     && code != NULL
-                    && let Some(k) = self.key(|r| inst.read(r), code)
+                    && let Some(k) = self.key(|r| inst.read(self.p, r), code)
                 {
                     self.mask(k);
                 }
                 if name.starts_with("v_cmpx") {
-                    if let Some(k) = self.key(|r| inst.write(r), EXEC) {
+                    if let Some(k) = self.key(|r| inst.write(self.p, r), EXEC) {
                         lane(self, k);
                     }
                 } else {
                     let compare = v.dst.filter(|_| name.starts_with("v_cmp"));
                     for op in compare.iter().chain(&v.carry) {
                         if let Operand::Scalar { code, .. } = *op
-                            && let Some(k) = self.key(|r| inst.write(r), code)
+                            && let Some(k) = self.key(|r| inst.write(self.p, r), code)
                         {
                             lane(self, k);
                         }
@@ -1282,7 +1286,7 @@ impl<'a> Lanes<'a> {
         if !inst.name().starts_with("s_cbranch_scc") {
             return false;
         }
-        let Some(&(db, di)) = inst.read(Reg::Scc).and_then(|v| self.defs.get(&v)) else {
+        let Some(&(db, di)) = inst.read(self.p, Reg::Scc).and_then(|v| self.defs.get(&v)) else {
             return false;
         };
         let def = &self.p.blocks[db].insts[di];
@@ -1292,6 +1296,7 @@ impl<'a> Lanes<'a> {
         else {
             return false;
         };
+        let src = self.p.operands(*src);
         matches!(def.name(), "s_andn2_b32" | "s_andn2_b64")
             && src.first() == Some(d)
             && matches!(src.get(1), Some(Operand::Scalar { code: EXEC, .. }))
@@ -1330,7 +1335,7 @@ impl<'a> Lanes<'a> {
             "s_cbranch_execz" => self.b.not(exec),
             "s_cbranch_execnz" => exec,
             n @ ("s_cbranch_vccz" | "s_cbranch_vccnz") => {
-                let vcc = match self.key(|r| inst.read(r), VCC) {
+                let vcc = match self.key(|r| inst.read(self.p, r), VCC) {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
@@ -1342,7 +1347,7 @@ impl<'a> Lanes<'a> {
                 }
             }
             n => {
-                let Some(scc) = inst.read(Reg::Scc) else {
+                let Some(scc) = inst.read(self.p, Reg::Scc) else {
                     return Bool::FALSE;
                 };
                 let set = match self.scc_lane.get(&scc) {
@@ -1458,7 +1463,7 @@ mod tests {
             panic!("{:?}", s.exits)
         };
         // Skipped exactly where the compare fails.
-        let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        let cmp = p.blocks[0].insts[0].write(&p, Reg::S(VCC)).unwrap();
         assert_eq!(
             s.bools.node(when),
             Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
@@ -1485,14 +1490,14 @@ mod tests {
         );
         let s = structure(&p).unwrap();
         let insts = &p.blocks[0].insts;
-        let saved = insts[1].write(Reg::S(0)).unwrap();
-        let restored = insts[3].write(Reg::S(5)).unwrap();
+        let saved = insts[1].write(&p, Reg::S(0)).unwrap();
+        let restored = insts[3].write(&p, Reg::S(5)).unwrap();
         assert_eq!(s.restored.get(&restored), Some(&saved));
         // Skipped exactly where the compare fails, as without the spill.
         let LaneExit::Branch { when, .. } = s.exits[0] else {
             panic!("{:?}", s.exits)
         };
-        let cmp = insts[0].write(Reg::S(VCC)).unwrap();
+        let cmp = insts[0].write(&p, Reg::S(VCC)).unwrap();
         assert_eq!(
             s.bools.node(when),
             Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
@@ -1530,7 +1535,7 @@ mod tests {
         let LaneExit::Branch { when, .. } = s.exits[join] else {
             panic!("{:?}", s.exits)
         };
-        let scc = p.blocks[join].insts[1].write(Reg::Scc).unwrap();
+        let scc = p.blocks[join].insts[1].write(&p, Reg::Scc).unwrap();
         assert_eq!(s.bools.support(when), vec![Atom::Uniform(scc)]);
     }
 
@@ -1569,7 +1574,7 @@ mod tests {
         );
         let s = structure(&p).unwrap();
         let lane = |block: usize, i: usize| {
-            Atom::Lane(p.blocks[block].insts[i].write(Reg::S(EXEC)).unwrap())
+            Atom::Lane(p.blocks[block].insts[i].write(&p, Reg::S(EXEC)).unwrap())
         };
         let a = s.guards[0][1].unwrap();
         let b = s.guards[1][2].unwrap();
