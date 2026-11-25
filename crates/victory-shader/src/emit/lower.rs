@@ -2110,16 +2110,15 @@ impl<'a> Lower<'a> {
         Ok(f)
     }
 
-    fn src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+    /// Source `k` as bits, with any SDWA selection and bitwise `abs`/`neg`
+    /// modifiers (sign-bit moves that preserve denormals and NaN payloads).
+    fn src_bits(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
-            return Err("integer operand modifiers");
-        }
-        match self.src0 {
-            Some(x) if k == 0 => Ok(x),
+        let mut x = match self.src0 {
+            Some(x) if k == 0 => x,
             _ => {
                 let sel = Self::sdwa_src(inst, k);
                 // A byte or word select within the low half.
@@ -2128,12 +2127,32 @@ impl<'a> Lower<'a> {
                     Some(x) => x,
                     None => self.operand(inst, &op)?,
                 };
-                Ok(match sel {
+                match sel {
                     Some((sel, sext)) => self.select_bits(x, sel, sext),
                     None => x,
-                })
+                }
             }
+        };
+        let c = self.cur;
+        if v.abs >> k & 1 != 0 {
+            let m = self.s.m.i32(0x7FFF_FFFF);
+            x = self.s.m.bin(c, Bin::And, x, m);
         }
+        if v.neg >> k & 1 != 0 {
+            let m = self.s.m.i32(0x8000_0000);
+            x = self.s.m.bin(c, Bin::Xor, x, m);
+        }
+        Ok(x)
+    }
+
+    fn src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
+            return Err("integer operand modifiers");
+        }
+        self.src_bits(inst, k)
     }
 
     fn unary(&mut self, op: u32, f: V) -> V {
@@ -6228,11 +6247,11 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_mov_b32" => {
-                if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
-                    let a = f(self, 0)?;
+                let a = self.src_bits(inst, 0)?;
+                if v.clamp || v.omod != 0 {
+                    let a = self.as_float(a);
                     return float(self, a);
                 }
-                let a = s(self, 0)?;
                 int(self, a)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
@@ -6560,36 +6579,9 @@ impl<'a> Lower<'a> {
                     }
                     _ => return Err("a select on an untracked mask"),
                 };
-                if v.abs != 0 || v.neg != 0 {
-                    // Sign-bit moves on the bits a select passes through
-                    // (a host `fabs`/`fneg` may flush a denormal).
-                    let mut xs = Vec::new();
-                    for k in 0..2 {
-                        let mut x = match self.src0 {
-                            Some(x) if k == 0 => x,
-                            _ => {
-                                let op = *v.src.get(k).ok_or("a missing operand")?;
-                                let x = self.operand(inst, &op)?;
-                                match Self::sdwa_src(inst, k) {
-                                    Some((sel, sext)) => self.select_bits(x, sel, sext),
-                                    None => x,
-                                }
-                            }
-                        };
-                        if v.abs >> k & 1 != 0 {
-                            let m = self.s.m.i32(0x7FFF_FFFF);
-                            x = self.s.m.bin(c, Bin::And, x, m);
-                        }
-                        if v.neg >> k & 1 != 0 {
-                            let m = self.s.m.i32(0x8000_0000);
-                            x = self.s.m.bin(c, Bin::Xor, x, m);
-                        }
-                        xs.push(x);
-                    }
-                    let r = self.s.m.select(c, cond, xs[1], xs[0]);
-                    return int(self, r);
-                }
-                let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                // Sign-bit moves on the bits a select passes through
+                // (a host `fabs`/`fneg` may flush a denormal).
+                let (a, bb) = (self.src_bits(inst, 0)?, self.src_bits(inst, 1)?);
                 let r = self.s.m.select(c, cond, bb, a);
                 int(self, r)
             }
