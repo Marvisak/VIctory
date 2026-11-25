@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod fract;
 
 type Why = &'static str;
 
@@ -6377,6 +6378,7 @@ impl<'a> Lower<'a> {
                 }
                 int(self, r)
             }
+            "v_fract_f64" => self.fract_f64(inst, guard),
             "v_cvt_f32_u32" => {
                 // WARP can misround a full-width uitofp. Each 16-bit
                 // half and the scaled high half are exact in f32, so the
