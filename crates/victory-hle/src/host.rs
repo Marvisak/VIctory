@@ -42,6 +42,9 @@ impl Default for HostPolicy {
             "api-ms-win-shcore-*",
             "msvcp_win.dll",
             "ole32.dll",
+            // BSTR and VARIANT helpers, the same on both (a title imports
+            // `SysAllocStringLen` and `SysFreeString` by ordinal).
+            "oleaut32.dll",
             "advapi32.dll",
             "iphlpapi.dll",
             // The title's crash handler writes minidumps with it (loaded by name).

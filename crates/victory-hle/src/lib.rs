@@ -121,6 +121,27 @@ mod tests {
         );
     }
 
+    /// The title imports two BSTR helpers from `oleaut32.dll` by ordinal
+    /// (4 is `SysAllocStringLen`, 6 `SysFreeString`), so the host's own
+    /// exports of them are what the import table gets.
+    #[cfg(windows)]
+    #[test]
+    fn oleaut32_bstr_ordinals_pass_through_to_host() {
+        let r = HleResolver::default();
+        for ordinal in [4, 6] {
+            assert_eq!(
+                r.classify("oleaut32.dll", &ImportSymbol::Ordinal(ordinal)),
+                Some(Provenance::Host),
+                "#{ordinal}"
+            );
+        }
+        // An ordinal the DLL does not export resolves to nothing.
+        assert_eq!(
+            r.classify("oleaut32.dll", &ImportSymbol::Ordinal(9999)),
+            None
+        );
+    }
+
     // #510: the RPC runtime's GUID calls are ours, so the DLL itself stays
     // outside the host policy (its own `ws2_32` imports would be a network
     // path `modules::net` never sees).
