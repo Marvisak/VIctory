@@ -1563,6 +1563,75 @@ fn image_atomics_of_64_bits() {
     }
 }
 
+/// XMA scales samples to signed PCM16, rounding ties away from zero.
+#[test]
+fn xma_sample_to_i16_handles_ties_and_saturation() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = the sample. v5 = it scaled, v6 = that truncated, v7 = the fraction cut off.
+    body.extend([vop1(0x001, 5, 255), 32768f32.to_bits()]); // v_mov_b32 v5, 32768.0
+    body.extend(vop3(0x108, 5, vgpr(1), vgpr(5), 128)); // v_mul_f32 v5, v1, v5
+    body.push(vop1(0x021, 6, vgpr(5))); // v_trunc_f32 v6, v5
+    body.extend(vop3(0x104, 7, vgpr(5), vgpr(6), 128)); // v_sub_f32 v7, v5, v6
+    // A fraction of a half or more moves one further from zero.
+    body.extend(vop3(0x103, 8, vgpr(6), 242, 128)); // v_add_f32 v8, v6, 1.0
+    body.extend(vop3(0x006, 106, vgpr(7), 240, 128)); // v_cmp_ge_f32 vcc, v7, 0.5
+    body.extend(vop3(0x101, 9, vgpr(6), vgpr(8), vcc)); // v_cndmask_b32 v9, v6, v8, vcc
+    body.extend(vop3(0x103, 8, vgpr(6), 243, 128)); // v_add_f32 v8, v6, -1.0
+    body.extend(vop3(0x003, 106, vgpr(7), 241, 128)); // v_cmp_le_f32 vcc, v7, -0.5
+    body.extend(vop3(0x101, 9, vgpr(9), vgpr(8), vcc)); // v_cndmask_b32 v9, v9, v8, vcc
+    // Saturate, then convert.
+    body.extend([vop1(0x001, 10, 255), (-32768f32).to_bits()]); // v_mov_b32 v10, -32768.0
+    body.extend(vop3(0x110, 9, vgpr(9), vgpr(10), 128)); // v_max_f32 v9, v9, v10
+    body.extend([vop1(0x001, 10, 255), 32767f32.to_bits()]); // v_mov_b32 v10, 32767.0
+    body.extend(vop3(0x10F, 9, vgpr(9), vgpr(10), 128)); // v_min_f32 v9, v9, v10
+    body.push(vop1(0x008, 0, vgpr(9))); // v_cvt_i32_f32 v0, v9
+    // Not a number converts to zero: `v_max_f32` alone would have saturated it.
+    body.extend(vop3(0x008, 106, vgpr(1), vgpr(1), 128)); // v_cmp_u_f32 vcc, v1, v1
+    body.extend(vop3(0x101, 0, vgpr(0), 128, vcc)); // v_cndmask_b32 v0, v0, 0, vcc
+    let shader = build_valu_cs(&body);
+    let mut samples = vec![
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        f32::MAX,
+        f32::MIN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::from_bits(1),
+        f32::from_bits(0x8000_0001),
+        f32::from_bits(0x7fc0_0001),
+        f32::from_bits(0xffc0_0001),
+        f32::from_bits(0x7f80_0001),
+        f32::from_bits(0xff80_0001),
+        1.0f32.next_down(),
+        (-1.0f32).next_up(),
+        1.0e9,
+        -1.0e9,
+    ];
+    // Immediately below, at, and above ties; the last tie is outside the PCM range.
+    for half in [0.5f32, 1.5, 2.5, 63.5, 255.5, 32766.5, 32767.5, 32768.5] {
+        let tie = half / 32768.0;
+        for v in [tie.next_down(), tie, tie.next_up()] {
+            samples.extend([v, -v]);
+        }
+    }
+    let cases: Vec<_> = samples.iter().map(|v| [v.to_bits(), 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, _, inputs, got| {
+        let sample = f32::from_bits(inputs[0]);
+        // Scaling in f64 is exact for finite f32 samples. Rust's integer cast saturates
+        // at both endpoints and maps NaN to zero.
+        let expected = (f64::from(sample) * 32768.0).round() as i16;
+        assert_eq!(
+            got as i32,
+            i32::from(expected),
+            "{backend}: sample bits {:#010x}",
+            inputs[0]
+        );
+    });
+}
+
 #[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
