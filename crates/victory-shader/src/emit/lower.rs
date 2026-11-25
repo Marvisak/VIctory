@@ -168,6 +168,32 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// Per-lane pixel survival mask tracked across `exp ... vm` instructions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VmVal {
+    False,
+    True,
+    Dyn(V),
+}
+
+/// Static fixpoint lattice for `vm_live` at IR block entry/exit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VmLat {
+    Unreached,
+    Const(bool),
+    Varying,
+}
+
+impl VmLat {
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unreached, x) | (x, Self::Unreached) => x,
+            (Self::Const(a), Self::Const(b)) if a == b => Self::Const(a),
+            _ => Self::Varying,
+        }
+    }
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -203,8 +229,16 @@ struct Lower<'a> {
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
-    /// Per IR block: a `done` export is behind every lane entering it.
-    exported: Vec<bool>,
+    /// Pixel shader: whether any export sets `VM` (when true, `vm` alone
+    /// governs pixel survival; otherwise fall back to `done`).
+    tracks_vm: bool,
+    /// Pixel shader: current block's per-lane survival state from the last
+    /// `exp ... vm` (overwritten on each `vm` export; discarded once at exit).
+    vm_live: VmVal,
+    /// Per IR block: `vm_live` leaving the block.
+    vm_out: Vec<VmVal>,
+    /// Pixel shader: `vm_live` PHIs to fill in `fill_phis`.
+    vm_phis: Vec<(V, usize)>,
     /// Reverse-postorder index per IR block.
     rpo: Vec<usize>,
     /// DXIL block each IR block ends in (guarded stores split blocks).
@@ -609,7 +643,10 @@ impl<'a> Lower<'a> {
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
             edges: HashMap::new(),
-            exported: vec![false; p.blocks.len()],
+            tracks_vm: x.native.stage == HwStage::Ps && x.io.exports.iter().any(|e| e.vm),
+            vm_live: VmVal::False,
+            vm_out: vec![VmVal::False; p.blocks.len()],
+            vm_phis: Vec::new(),
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
@@ -1249,6 +1286,7 @@ impl<'a> Lower<'a> {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
         }
+        let vm_in_lat = self.compute_vm_lattice(&order);
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
@@ -1258,7 +1296,25 @@ impl<'a> Lower<'a> {
                 .copied()
                 .filter(|&q| self.block[q].is_some())
                 .collect();
-            self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
+            if self.s.pixel {
+                self.vm_live = if b == order[0] {
+                    VmVal::False
+                } else {
+                    match vm_in_lat[b] {
+                        VmLat::Unreached | VmLat::Const(false) => VmVal::False,
+                        VmLat::Const(true) => VmVal::True,
+                        VmLat::Varying => {
+                            if preds.len() == 1 {
+                                self.vm_out[preds[0]]
+                            } else {
+                                let phi = self.s.m.phi(self.cur, self.s.t.i1);
+                                self.vm_phis.push((phi, b));
+                                VmVal::Dyn(phi)
+                            }
+                        }
+                    }
+                };
+            }
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
                 let val = match phi.reg {
                     Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
@@ -1301,6 +1357,7 @@ impl<'a> Lower<'a> {
                 i += 1;
             }
             self.mask_ok = self.mask_data == MaskData::Console;
+            self.vm_out[b] = self.vm_live;
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
         }
@@ -1337,13 +1394,59 @@ impl<'a> Lower<'a> {
         })
     }
 
-    fn exported_out(&self, b: usize) -> bool {
-        self.exported[b] || self.has_done_export(b)
+    fn updates_vm(&self, e: &Export) -> bool {
+        if self.tracks_vm { e.vm } else { e.done }
     }
 
-    fn has_done_export(&self, b: usize) -> bool {
-        (0..self.x.p.blocks[b].insts.len())
-            .any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.done))
+    /// Fixpoint over reachable IR blocks to classify `vm_live` at each block
+    /// entry as statically false, statically true, or dynamic (requiring a PHI
+    /// at multi-predecessor joins).
+    fn compute_vm_lattice(&self, order: &[usize]) -> Vec<VmLat> {
+        let n = self.x.p.blocks.len();
+        let mut in_lat = vec![VmLat::Unreached; n];
+        if !self.s.pixel || order.is_empty() {
+            return in_lat;
+        }
+        let mut out_lat = vec![VmLat::Unreached; n];
+        in_lat[order[0]] = VmLat::Const(false);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in order {
+                let entry = if b == order[0] {
+                    VmLat::Const(false)
+                } else {
+                    let mut m = VmLat::Unreached;
+                    for &q in &self.x.p.blocks[b].preds {
+                        if self.block[q].is_some() {
+                            m = m.join(out_lat[q]);
+                        }
+                    }
+                    m
+                };
+                if entry != in_lat[b] {
+                    in_lat[b] = entry;
+                    changed = true;
+                }
+                let mut cur = entry;
+                for i in 0..self.x.p.blocks[b].insts.len() {
+                    if let Some(e) = self.exports.get(&(b, i))
+                        && self.updates_vm(e)
+                    {
+                        cur = match self.x.st.guards[b][i] {
+                            None | Some(Bool::TRUE) => VmLat::Const(true),
+                            Some(Bool::FALSE) => VmLat::Const(false),
+                            Some(_) => VmLat::Varying,
+                        };
+                    }
+                }
+                if cur != out_lat[b] {
+                    out_lat[b] = cur;
+                    changed = true;
+                }
+            }
+        }
+        in_lat
     }
 
     /// Values of the program's input registers.
@@ -2536,18 +2639,83 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Whether every lane outside the guard of the export at (b, i) runs
-    /// the `done` export later in block b without its own guard holding,
-    /// i.e. is discarded there.
-    fn discarded_at_done(&self, b: usize, i: usize) -> bool {
+    /// Whether every lane outside the guard of the pixel export at `(b, i)` is
+    /// discarded by block `b`'s last `vm` export (and no reachable successor
+    /// block has another `vm` export that could widen survival): what those
+    /// lanes write is lost, so the export can store unguarded.
+    fn discarded_by_vm(&self, b: usize, i: usize) -> bool {
         let guards = &self.x.st.guards[b];
         let g = guards[i].unwrap_or(Bool::TRUE);
-        self.exports.iter().any(|(&(eb, ei), e)| {
-            e.done && eb == b && ei > i && {
-                let done = guards[ei].unwrap_or(Bool::TRUE);
-                !self.x.st.bools.meet(&[(done, true), (g, false)])
+        let Some((&(_, last_ei), _)) = self
+            .exports
+            .iter()
+            .filter(|(k, e)| k.0 == b && self.updates_vm(e))
+            .max_by_key(|(k, _)| k.1)
+        else {
+            return false;
+        };
+        let vm_g = guards[last_ei].unwrap_or(Bool::TRUE);
+        if self.x.st.bools.meet(&[(vm_g, true), (g, false)]) {
+            return false;
+        }
+        let mut seen = vec![false; self.x.p.blocks.len()];
+        let mut stack = Vec::new();
+        let push_succs = |q: usize, stack: &mut Vec<usize>| match self.x.st.exits[q] {
+            LaneExit::Jump(t) => {
+                stack.push(t);
+                true
             }
-        })
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => {
+                stack.push(taken);
+                stack.push(not_taken);
+                true
+            }
+            LaneExit::End => true,
+            LaneExit::Indirect => false,
+        };
+        if !push_succs(b, &mut stack) {
+            return false;
+        }
+        while let Some(q) = stack.pop() {
+            if std::mem::replace(&mut seen[q], true) {
+                continue;
+            }
+            if self
+                .exports
+                .iter()
+                .any(|(&(eb, _), e)| eb == q && self.updates_vm(e))
+            {
+                return false;
+            }
+            if !push_succs(q, &mut stack) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether every exported channel of `e` was already unconditionally
+    /// exported to the same target earlier in block `b` (so surviving lanes
+    /// outside `e`'s guard still have a defined output value).
+    fn overwrites_unconditional_export(&self, b: usize, i: usize, e: &Export) -> bool {
+        let guards = &self.x.st.guards[b];
+        let mut covered = [false; 4];
+        for (&(eb, ei), prev) in &self.exports {
+            if eb == b
+                && ei < i
+                && prev.target == e.target
+                && matches!(guards[ei], None | Some(Bool::TRUE))
+            {
+                for (ch, slot) in covered.iter_mut().enumerate() {
+                    if prev.values[ch].is_some() {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+        (0..4).all(|ch| e.values[ch].is_none() || covered[ch])
     }
 
     // ---- results ----
@@ -9124,21 +9292,20 @@ impl<'a> Lower<'a> {
         }
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
-        let c = self.cur;
-        // A pixel export whose lanes outside its guard the `done` export
-        // after it discards: what those lanes write is lost, so it stores in
-        // every lane.
-        if let Some(g) = guard
-            && !mesh
-            && !(self.s.pixel && !e.done && self.discarded_at_done(b, i))
-        {
-            if !(e.done && self.s.pixel) {
-                return Err("a conditional export");
-            }
-            let t = self.s.m.bool(true);
-            let kill = self.s.m.bin(c, Bin::Xor, g, t);
-            self.s
-                .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+        if guard.is_some() && !mesh && !self.s.pixel {
+            return Err("a conditional export");
+        }
+        // In pixel shaders, the EXEC mask at the last `exp ... vm` governs
+        // pixel survival (discard is deferred to `LaneExit::End` so a later
+        // `vm` export overwrites an earlier one, and `done` without `vm` does
+        // not clobber the valid mask).
+        if self.s.pixel && self.updates_vm(e) {
+            self.vm_live = match (self.x.st.guards[b][i], guard) {
+                (None, _) | (Some(Bool::TRUE), _) => VmVal::True,
+                (Some(Bool::FALSE), _) => VmVal::False,
+                (_, Some(g)) => VmVal::Dyn(g),
+                (_, None) => VmVal::True,
+            };
         }
         if mesh && e.target == Target::Primitive {
             return self.emit_indices(e, guard);
@@ -9266,7 +9433,25 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit output the stage data does not mark");
         }
         // A mesh lane writes its own vertex or primitive, where it exports.
-        let at = if mesh {
+        // In a pixel shader, a conditional export with outputs is sound when
+        // either (a) every lane outside its guard is discarded by the block's
+        // final `vm` mask (store unguarded — those lanes are discarded at exit),
+        // or (b) every channel it writes was already unconditionally exported
+        // earlier in the block (guard the store so surviving lanes keep the
+        // earlier value). Leaving a surviving lane without a store for an
+        // output target is unrepresentable in DXIL and stays refused.
+        let guard_pixel_store = if self.s.pixel && guard.is_some() && !stores.is_empty() {
+            if self.discarded_by_vm(b, i) {
+                false
+            } else if self.overwrites_unconditional_export(b, i, e) {
+                true
+            } else {
+                return Err("a conditional export");
+            }
+        } else {
+            false
+        };
+        let at = if (mesh || guard_pixel_store) && !stores.is_empty() {
             self.begin_guarded(guard)
         } else {
             None
@@ -9444,11 +9629,27 @@ impl<'a> Lower<'a> {
                 Term::CondBr(cond, t, f)
             }
             LaneExit::End => {
-                if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
-                    // A lane leaving without its final export was killed.
-                    let t = self.s.m.bool(true);
-                    self.s
-                        .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                if self.s.pixel {
+                    match self.vm_live {
+                        VmVal::True => {}
+                        VmVal::False => {
+                            let t = self.s.m.bool(true);
+                            self.s
+                                .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                        }
+                        VmVal::Dyn(live) => {
+                            let t = self.s.m.bool(true);
+                            let kill = self.s.m.bin(self.cur, Bin::Xor, live, t);
+                            self.s.op(
+                                self.cur,
+                                "discard",
+                                Attr::NoUnwind,
+                                self.s.t.void,
+                                82,
+                                &[kill],
+                            );
+                        }
+                    }
                 }
                 Term::Ret
             }
@@ -9884,6 +10085,20 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+            self.s.m.set_phi(phi, incoming);
+        }
+        for (phi, b) in std::mem::take(&mut self.vm_phis) {
+            let mut incoming = Vec::new();
+            for &q in &p.blocks[b].preds {
+                let Some(qb) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let x = match self.vm_out[q] {
+                    VmVal::False => self.s.m.bool(false),
+                    VmVal::True => self.s.m.bool(true),
+                    VmVal::Dyn(v) => v,
+                };
+                incoming.push((x, qb));
+            }
             self.s.m.set_phi(phi, incoming);
         }
         while let Some((v, b, i)) = self.pending_masks.pop() {
