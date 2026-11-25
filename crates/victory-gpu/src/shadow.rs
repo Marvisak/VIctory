@@ -90,7 +90,16 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    /// Whether its buffer sits in video memory the CPU writes write-combined
+    /// over the bus ([`crate::host::Host::loose_buffer`]): reading it is
+    /// uncached bus traffic, so every read of it counts.
+    wc: std::sync::atomic::AtomicBool,
 }
+
+/// Reads of write-combined windows (diagnostics): each is uncached bus
+/// traffic on the CPU's side.
+pub(crate) static WC_READS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
@@ -180,6 +189,27 @@ impl Shadow {
         format!("copy {:#x}+{:#x} {v:?}", self.start, self.len)
     }
 
+    /// Marks this copy's buffer as one in video memory the CPU writes
+    /// write-combined over the bus ([`crate::host::Host::loose_buffer`]):
+    /// reading it back is uncached bus traffic, so every read of it counts.
+    pub(crate) fn write_combined(&self) {
+        self.wc.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A read of this copy's bytes on the CPU (diagnostics): counted when the
+    /// buffer is write-combined, and warned of once.
+    fn wc_read(&self) {
+        if self.wc.load(std::sync::atomic::Ordering::Relaxed) {
+            WC_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    "a write-combined window was read on the CPU: uncached bus traffic, counted"
+                )
+            });
+        }
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.base
@@ -206,6 +236,7 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        self.wc_read();
         if let Some(t) = &self.tracked
             && t.changed(page / PAGE)
         {
@@ -264,6 +295,7 @@ impl Shadow {
             marks,
             base: slice.map_or(0, |s| s.offset),
             slice,
+            wc: std::sync::atomic::AtomicBool::new(false),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -336,6 +368,7 @@ impl Shadow {
         if from >= to {
             return;
         }
+        self.wc_read();
         // SAFETY: inside the mapping.
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -415,6 +448,7 @@ impl Shadow {
             && back
             && from < to
         {
+            self.wc_read();
             let before = &before[from - taken..to - taken];
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
@@ -1060,6 +1094,20 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Windows a covering window answered instead of a new copy (diagnostics).
+#[cfg(windows)]
+pub(crate) static REUSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The loose windows by count and bytes (diagnostics): the shared segment's
+/// own content; the copies are never freed, so what this reaches is what
+/// the segment carries until the process ends.
+#[cfg(windows)]
+pub(crate) fn loose_stats() -> (usize, u64) {
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = map.iter().map(|((_, len), _)| *len).sum();
+    (map.len(), bytes)
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
@@ -1067,7 +1115,29 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    // A window that already covers [start, start + len) serves it without
+    // another host copy: the title asks for runs of neighbouring windows
+    // (a mesh pass's constants, then its vertices), and one big window
+    // covers each of them; measured, most asks were covered this way and
+    // the copies they would have made were the shared segment's bulk.
+    // Candidates start at or before ours; the first whose end reaches
+    // past ours wins (nearest start first, from the map's end).
+    let covering = map
+        .range(..(start, u64::MAX))
+        .rev()
+        .find(|((at, l), _)| at + *l >= start + len);
+    if let Some((_, shadow)) = covering {
+        #[cfg(windows)]
+        REUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            start = format_args!("{start:#x}"),
+            len,
+            "loose memory covered by a wider window"
+        );
+        return Some(shadow.clone());
+    }
+    let host = host()?;
+    let (buffer, data, video) = host.loose_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1077,6 +1147,9 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
+    if video {
+        shadow.write_combined();
+    }
     map.insert((start, len), shadow.clone());
     changed();
     Some(shadow)
@@ -1413,6 +1486,77 @@ pub(crate) mod tests {
         unregister(pool, pool as u64);
         // The pages stay allocated (as the other tests' pools): a copy some
         // page table still holds must not name memory reused meanwhile.
+    }
+
+    /// A loose window wider than a later ask covers it: the narrower ask
+    /// reuses the wider copy instead of making another host buffer for
+    /// memory a copy already spans (the shared segment's bulk was these).
+    #[test]
+    fn a_wider_loose_window_covers_a_later_smaller_ask() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // One window-aligned pair of pages inside a reservation that
+        // guarantees the addresses, found free again (other tests allocate
+        // meanwhile: tried again if taken).
+        let pair = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh reservation, released at once; then the
+                // two window-aligned allocations where it was, kept (as the
+                // other tests' pools: their copies must not name memory a
+                // later test reuses).
+                unsafe {
+                    let p = VirtualAlloc(std::ptr::null(), 3 * WINDOW as usize, MEM_RESERVE, PAGE_READWRITE) as usize;
+                    if p == 0 {
+                        return None;
+                    }
+                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
+                    let aligned = p.next_multiple_of(WINDOW as usize);
+                    let at = |q: usize| {
+                        VirtualAlloc(q as *const _, WINDOW as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize
+                    };
+                    let (one, two) = (at(aligned), at(aligned + WINDOW as usize));
+                    if one == aligned && two == aligned + WINDOW as usize {
+                        return Some((one, two));
+                    }
+                    [one, two].into_iter().filter(|&q| q != 0).for_each(|q| {
+                        VirtualFree(q as *mut _, 0, MEM_RELEASE);
+                    });
+                    None
+                }
+            })
+            .expect("a window-aligned pair of pages");
+        let (one, two) = (pair.0 as u64, pair.1 as u64);
+        let Some(wide) = find(one, 2 * WINDOW) else {
+            return; // no host GPU here
+        };
+        let before = REUSES.load(std::sync::atomic::Ordering::Relaxed);
+        let narrow = find(two, WINDOW);
+        let Some(narrow) = narrow else {
+            return; // no host GPU here (the wide one already was)
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&wide, &narrow),
+            "the narrower ask reuses the covering window"
+        );
+        assert_eq!(
+            REUSES.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "the reuse is counted"
+        );
+        // An ask the wide window does not reach still gets its own copy.
+        let beyond = find(two, 2 * WINDOW);
+        if let Some(beyond) = beyond {
+            assert!(
+                !std::sync::Arc::ptr_eq(&wide, &beyond),
+                "an ask past the covering window makes its own"
+            );
+            assert_eq!(
+                REUSES.load(std::sync::atomic::Ordering::Relaxed),
+                before + 1,
+                "no reuse for an ask past the window"
+            );
+        }
     }
 
     /// Runs of the shared buffers start a whole number of elements (and of

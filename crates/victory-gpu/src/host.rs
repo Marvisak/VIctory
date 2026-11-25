@@ -3095,6 +3095,18 @@ impl Meter {
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / report_frames,
             );
+            #[cfg(windows)]
+            {
+                let reuses = crate::shadow::REUSES.load(Ordering::Relaxed);
+                let (windows, window_bytes) = crate::shadow::loose_stats();
+                let wc = crate::shadow::WC_READS.load(Ordering::Relaxed);
+                tracing::info!(
+                    "loose windows: {windows} ({:.0} MB, never freed), {} covered by a wider \
+                     one, {wc} read back from video memory since start",
+                    window_bytes as f64 / 1e6,
+                    reuses
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {
@@ -3630,6 +3642,58 @@ impl Host {
         } else {
             heap
         };
+        self.buffer_in(size, heap)
+    }
+
+    /// `VICTORY_LOOSE_IN_GPU_UPLOAD`: loose windows go to video memory the
+    /// CPU maps (a GPU upload heap, where the host has one), taking them
+    /// out of the system-memory segment - half the system's RAM, and the
+    /// ceiling every long run dies at on a small-RAM machine - into the
+    /// card's own memory. The CPU can write them (write-combined) but
+    /// reading them back is uncached bus traffic, so the shadow counts
+    /// every read of such a window; a card without the heap, or an
+    /// allocation it refuses, falls back to system memory.
+    pub(crate) fn loose_in_gpu_upload(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            if !crate::switch::on("VICTORY_LOOSE_IN_GPU_UPLOAD") {
+                return false;
+            }
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+            }
+            .is_ok()
+                && options.GPUUploadHeapSupported.as_bool();
+            tracing::warn!(on = ok, "loose windows in video memory (write-combined)");
+            ok
+        })
+    }
+
+    /// A loose window's buffer, and whether it sits in video memory: the
+    /// GPU upload heap where [`Host::loose_in_gpu_upload`] says to, else
+    /// the same system-memory buffer as [`Host::shared_buffer`].
+    pub(crate) fn loose_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8, bool)> {
+        if self.loose_in_gpu_upload() {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+                ..Default::default()
+            };
+            if let Some((buffer, data)) = self.buffer_in(size, heap) {
+                return Some((buffer, data, true));
+            }
+            tracing::warn!(size, "no video-memory loose window; back to system memory");
+        }
+        self.shared_buffer(size).map(|(buffer, data)| (buffer, data, false))
+    }
+
+    /// A committed, mapped buffer with `size` bytes in `heap`.
+    fn buffer_in(&self, size: u64, heap: D3D12_HEAP_PROPERTIES) -> Option<(ID3D12Resource, *mut u8)> {
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),
