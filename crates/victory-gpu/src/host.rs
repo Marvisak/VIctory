@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
@@ -39,10 +39,101 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+static CARD_ALLOCATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CARD_COPY_BYTES: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+static CARD_COPY_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn reserve_card_bytes(bytes: u64) -> bool {
+    let cap = crate::switch::card_copies_cap_bytes();
+    let mut used = CARD_ALLOCATED.load(Ordering::Relaxed);
+    loop {
+        if bytes > cap.saturating_sub(used) {
+            return false;
+        }
+        match CARD_ALLOCATED.compare_exchange_weak(
+            used,
+            used + bytes,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(now) => used = now,
+        }
+    }
+}
+
+pub(crate) fn release_card_bytes(bytes: u64) {
+    CARD_ALLOCATED.fetch_sub(bytes, Ordering::AcqRel);
+}
+
+struct CardCopyList {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    open: bool,
+}
+
+impl CardCopyList {
+    fn new(device: &ID3D12Device) -> windows::core::Result<Self> {
+        // SAFETY: plain object creation.
+        unsafe {
+            let allocator: ID3D12CommandAllocator =
+                device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let list: ID3D12GraphicsCommandList = device.CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &allocator,
+                None,
+            )?;
+            Ok(Self { allocator, list, open: true })
+        }
+    }
+
+    fn begin(&mut self) -> windows::core::Result<()> {
+        if self.open {
+            return Ok(());
+        }
+        // SAFETY: this list's previous execution has completed on the queue.
+        unsafe {
+            self.allocator.Reset()?;
+            self.list.Reset(&self.allocator, None)?;
+        }
+        self.open = true;
+        Ok(())
+    }
+
+    fn close(&mut self) -> Option<ID3D12CommandList> {
+        // SAFETY: all commands were recorded on this open direct list.
+        if unsafe { self.list.Close() }.is_err() {
+            return None;
+        }
+        self.open = false;
+        self.list.cast().ok()
+    }
+}
+
+struct CardCommands {
+    up: CardCopyList,
+    down: CardCopyList,
+}
+
+impl CardCommands {
+    fn new(device: &ID3D12Device) -> windows::core::Result<Self> {
+        Ok(Self {
+            up: CardCopyList::new(device)?,
+            down: CardCopyList::new(device)?,
+        })
+    }
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
+    /// Copy command lists are created only if a title copy gets a card side.
+    card_commands: Mutex<Option<CardCommands>>,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
@@ -241,6 +332,7 @@ fn create() -> windows::core::Result<Host> {
             device,
             queue,
             fence,
+            card_commands: Mutex::new(None),
             submitted: Mutex::new(0),
             event,
             rtvs,
@@ -1013,9 +1105,179 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// Per-list title-memory page-table bitmaps, read before their after
+    /// work clears them so card-side pages can be copied down first.
+    memory_bitmaps: Vec<(usize, usize, usize)>,
 }
 
 impl Host {
+    fn ensure_card_commands(&self) -> bool {
+        let mut commands = self.card_commands.lock().unwrap_or_else(|e| e.into_inner());
+        if commands.is_some() {
+            return true;
+        }
+        match CardCommands::new(&self.device) {
+            Ok(made) => {
+                *commands = Some(made);
+                true
+            }
+            Err(error) => {
+                tracing::debug!(%error, "card-side copy command lists unavailable");
+                false
+            }
+        }
+    }
+
+    /// Makes a DEFAULT-heap card side with the same backing-buffer width as
+    /// `staging`; `len` is the shadow's title range, used for the threshold.
+    pub(crate) fn card_buffer(
+        &self,
+        staging: &ID3D12Resource,
+        len: u64,
+    ) -> Option<(ID3D12Resource, u64, u64)> {
+        if len < crate::switch::card_copies_min_bytes() {
+            return None;
+        }
+        // SAFETY: `staging` is a live buffer resource.
+        let mut desc = unsafe { staging.GetDesc() };
+        let bytes = desc.Width;
+        if !reserve_card_bytes(bytes) {
+            return None;
+        }
+        if !self.ensure_card_commands() {
+            release_card_bytes(bytes);
+            return None;
+        }
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut card: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a DEFAULT-heap buffer in COMMON.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut card,
+            )
+        };
+        let Ok(()) = made else {
+            release_card_bytes(bytes);
+            tracing::debug!(size = bytes, "card-side title buffer allocation unavailable");
+            return None;
+        };
+        let Some(card) = card else {
+            release_card_bytes(bytes);
+            return None;
+        };
+        name(&card, || format!("title card side {bytes:#x}"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { card.GetGPUVirtualAddress() };
+        Some((card, gpu, bytes))
+    }
+
+    /// Records and queues staging-to-card copies. The title command lists
+    /// follow on the same direct queue, so no intermediate fence is needed.
+    /// Errors leave the card side older than what the title lists would read:
+    /// the caller ends the run ([`fail`]).
+    fn copy_up_cards(&self, copies: &[crate::shadow::CardCopy]) -> Result<u64, String> {
+        if copies.is_empty() {
+            return Ok(0);
+        }
+        let mut slot = self.card_commands.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(commands) = slot.as_mut() else {
+            return Err("up: no copy lists".into());
+        };
+        if let Err(error) = commands.up.begin() {
+            return Err(format!("up: the list did not reset: {error}"));
+        }
+        for copy in copies {
+            let Some(staging) = copy.shadow.staging.as_ref() else {
+                continue;
+            };
+            // SAFETY: buffers are live; the DEFAULT resources are COMMON
+            // after the prior ExecuteCommandLists and promote for copying.
+            unsafe {
+                commands.up.list.CopyBufferRegion(
+                    &copy.shadow.buffer,
+                    copy.offset,
+                    staging,
+                    copy.offset,
+                    copy.len,
+                );
+            }
+        }
+        let Some(list) = commands.up.close() else {
+            return Err("up: the list did not close".into());
+        };
+        // SAFETY: a closed list; later title lists run on this same queue.
+        unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+        let bytes: u64 = copies.iter().map(|copy| copy.len).sum();
+        CARD_COPY_BYTES[0].fetch_add(bytes, Ordering::Relaxed);
+        Ok(bytes)
+    }
+
+    /// Records staging-side downloads for GPU-written pages and waits before
+    /// the CPU copy-back code reads the mapped resource.
+    fn copy_down_cards(
+        &self,
+        copies: &[crate::shadow::CardCopy],
+        submitted: &mut u64,
+    ) -> Result<u64, String> {
+        if copies.is_empty() {
+            return Ok(0);
+        }
+        let mut slot = self.card_commands.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(commands) = slot.as_mut() else {
+            return Err("down: no copy lists".into());
+        };
+        if let Err(error) = commands.down.begin() {
+            return Err(format!("down: the list did not reset: {error}"));
+        }
+        for copy in copies {
+            let Some(staging) = copy.shadow.staging.as_ref() else {
+                continue;
+            };
+            // SAFETY: both buffers are COMMON after the title ExecuteCommandLists.
+            unsafe {
+                commands.down.list.CopyBufferRegion(
+                    staging,
+                    copy.offset,
+                    &copy.shadow.buffer,
+                    copy.offset,
+                    copy.len,
+                );
+            }
+        }
+        let Some(list) = commands.down.close() else {
+            return Err("down: the list did not close".into());
+        };
+        *submitted += 1;
+        // SAFETY: a closed direct list and our fence/event.
+        unsafe {
+            self.queue.ExecuteCommandLists(&[Some(list)]);
+            let waited = self
+                .queue
+                .Signal(&self.fence, *submitted)
+                .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+            // The CPU copy-back reads the system-memory side next: it must not
+            // run before the download has.
+            if let Err(error) = waited {
+                return Err(format!("down: not waited for: {error}"));
+            }
+            if WaitForSingleObject(self.event, INFINITE) != WAIT_OBJECT_0 {
+                return Err(format!("down: the wait failed: {}", std::io::Error::last_os_error()));
+            }
+        }
+        let bytes: u64 = copies.iter().map(|copy| copy.len).sum();
+        CARD_COPY_BYTES[1].fetch_add(bytes, Ordering::Relaxed);
+        Ok(bytes)
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
@@ -1247,7 +1509,19 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        let card_uploads = if crate::shadow::has_cards() {
+            crate::shadow::card_uploads()
+        } else {
+            Vec::new()
+        };
         let mut removed_in = None;
+        if !card_uploads.is_empty() {
+            // Title lists reading an older card side would compute something
+            // else than the console: the run ends, as for a removed device.
+            if let Err(error) = self.copy_up_cards(&card_uploads) {
+                fail(format_args!("card-side copy {error}"));
+            }
+        }
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1375,6 +1649,30 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        if crate::shadow::has_cards() {
+            let mut pages = crate::shadow::marked_card_pages();
+            for list in runs {
+                let deferred = list.deferred();
+                for step in &deferred.copies {
+                    // Marked ranges come down by their marked pages (above):
+                    // whole declared ranges were ~800 MB a frame in the world.
+                    if let Step::GpuWrite(shadow, address, len, false, ..) = step {
+                        pages.extend(shadow.card_pages_in(*address, *len).into_iter().map(|page| (shadow.clone(), page)));
+                    }
+                }
+                for &(key, data, words) in &deferred.memory_bitmaps {
+                    pages.extend(crate::memory::marked_card_pages(key, data, words));
+                }
+            }
+            let downloads = crate::shadow::card_downloads(pages);
+            if !downloads.is_empty() {
+                // Copy-back would put older bytes into title memory and the
+                // title be told the work is done: the run ends instead.
+                if let Err(error) = self.copy_down_cards(&downloads, &mut submitted) {
+                    fail(format_args!("card-side copy {error}"));
+                }
+            }
+        }
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
@@ -2097,6 +2395,12 @@ impl HostList {
     /// view heap `heap` (`crate::memory::prepare` at submission).
     pub(crate) fn defer_memory(&self, heap: usize) {
         self.deferred().copies.push(Step::Memory(heap));
+    }
+
+    /// Makes this list's title-memory bitmap visible to the pre-copyback
+    /// card-side download pass; the accessor only reads its bits.
+    pub(crate) fn defer_memory_bitmap(&self, heap: usize, data: usize, words: usize) {
+        self.deferred().memory_bitmaps.push((heap, data, words));
     }
 
     /// After the list has run, before its writes go back: `check` says
@@ -3024,6 +3328,9 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        if crate::switch::card_copies() {
+            CARD_COPY_FRAMES.fetch_add(1, Ordering::Relaxed);
+        }
         crate::memory::log_frame();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
@@ -3055,12 +3362,20 @@ impl Meter {
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
+            let card_line = if crate::switch::card_copies() {
+                let card_frames = CARD_COPY_FRAMES.swap(0, Ordering::Relaxed).max(1) as f64;
+                let up = CARD_COPY_BYTES[0].swap(0, Ordering::Relaxed) as f64 / 1e6 / card_frames;
+                let down = CARD_COPY_BYTES[1].swap(0, Ordering::Relaxed) as f64 / 1e6 / card_frames;
+                format!("; card copies up {up:.1} MB/frame, down {down:.1} MB/frame")
+            } else {
+                String::new()
+            };
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
+                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame{card_line}",
                 making = crate::pipeline::making()
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();

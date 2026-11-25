@@ -631,6 +631,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     let pooled = Arc::new(PooledBitmap::new(Bitmap::acquire()?));
     let dirty = pooled.gpu();
     list.defer_memory(key);
+    if crate::switch::card_copies() {
+        list.defer_memory_bitmap(key, pooled.data(), BITMAP_WORDS);
+    }
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
     let missed_bitmap = Arc::clone(&pooled);
@@ -712,9 +715,45 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     })
 }
 
+/// The card-side copy-back pass reads a list's page-table bitmap before the
+/// normal `after` closure clears it. This accessor does not mutate the map.
+pub(crate) fn marked_card_pages(
+    key: usize,
+    data: usize,
+    words: usize,
+) -> Vec<(Arc<Shadow>, usize)> {
+    let layout = layout(key);
+    // SAFETY: the bitmap's list has finished on the GPU; this is read-only
+    // and runs before the deferred closure clears its marks.
+    let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
+    let mut pages = Vec::new();
+    for (word, &mark) in marks.iter().enumerate() {
+        let mut mark = mark;
+        while mark != 0 {
+            let entry = word * 32 + mark.trailing_zeros() as usize;
+            mark &= mark - 1;
+            let (block, page) = (entry / BLOCK, entry % BLOCK);
+            let Some(&l1) = layout.blocks.get(block).filter(|_| block != 0) else {
+                continue;
+            };
+            let Some(&owner) = layout.owner.get(entry).filter(|&&k| k != NO_OWNER) else {
+                continue;
+            };
+            let Some(copy) = layout.copies.get(owner as usize) else {
+                continue;
+            };
+            if copy.has_card() {
+                pages.push((copy.clone(), l1 << 28 | page << 16));
+            }
+        }
+    }
+    pages
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shadow::{find, register, unregister};
 
     /// Writes of lists using title memory are held back from a frame with a
     /// miss through the next one, then go back again.
@@ -953,6 +992,275 @@ void main(uint3 id : SV_DispatchThreadID) {
             .pairs
             .get(&(Arc::as_ptr(copy) as usize))
             .copied()
+    }
+
+    const CARD_WRITE: &str = r#"
+#define RS "UAV(u0), RootConstants(num32BitConstants=2, b0)"
+RWByteAddressBuffer dst : register(u0);
+cbuffer c : register(b0) { uint offset; uint value; }
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { dst.Store(offset, value); }
+"#;
+
+    const CARD_READ: &str = r#"
+#define RS "SRV(t0), UAV(u0), RootConstants(num32BitConstants=1, b0)"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+cbuffer c : register(b0) { uint offset; }
+[RootSignature(RS)]
+[numthreads(2, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store(id.x * 4, src.Load(offset + id.x * 4));
+}
+"#;
+
+    /// A write-watched title pool below 2^40, which is addressable through
+    /// the runtime's title-memory page table.
+    fn card_pool(pages: usize, base: u64) -> usize {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        (0..256u64)
+            .map(|k| base + (k << 28))
+            // SAFETY: a reservation at a hint address; a refused hint gives null.
+            .map(|hint| unsafe {
+                VirtualAlloc(
+                    hint as *const _,
+                    pages * crate::watch::PAGE,
+                    MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize)
+            .find(|&p| p != 0 && (p as u64) < (1 << 40))
+            .expect("write-watched memory below 2^40")
+    }
+
+    /// First-use and subsequent title writes are copied into the card-side
+    /// buffer before a shader reads through the title-memory table.
+    #[test]
+    fn card_copy_up_supplies_first_and_later_title_reads() {
+        let _switch = crate::switch::force_card_copies_for_test(true);
+        use crate::watch::PAGE;
+        let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        let (root, pso) = pipeline(SOURCE);
+        let (out, cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: a live output buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+        let p = card_pool(32, 0x60_0000_0000);
+        let at = p + 16;
+        // SAFETY: our newly allocated title pool.
+        unsafe {
+            for i in 0..4 {
+                (at as *mut u32).add(i).write_volatile(0x100 + i as u32);
+            }
+        }
+        let len = (32 * PAGE) as u64;
+        register(p, p as u64, len);
+        let Some(copy) = find(p as u64, len) else {
+            unregister(p, p as u64);
+            return; // no host copy could be made
+        };
+        assert!(copy.has_card(), "the test switch must make a card side");
+        let list = host.new_list().unwrap();
+        let record = |address: usize| {
+            let map = bind(&list, OURS).expect("a page table");
+            let constants = [address as u32, (address >> 32) as u32, 0];
+            // SAFETY: an open list and live resources.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+                list.list.SetComputeRootShaderResourceView(1, map.table);
+                list.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+                list.list.SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+        };
+        let result = || {
+            // SAFETY: output mapping after the submission fence.
+            unsafe { std::slice::from_raw_parts(cpu.cast::<u32>(), 4).to_vec() }
+        };
+        record(at);
+        host.execute(&[&list]);
+        assert_eq!(result(), [0x100, 0x101, 0x102, 0x103]);
+
+        list.reset();
+        // SAFETY: our title pool; this faults the tracked page dirty.
+        unsafe {
+            for i in 0..4 {
+                (at as *mut u32).add(i).write_volatile(0x200 + i as u32);
+            }
+        }
+        record(at);
+        host.execute(&[&list]);
+        assert_eq!(result(), [0x200, 0x201, 0x202, 0x203]);
+        list.reset();
+        unregister(p, p as u64);
+    }
+
+    /// Declared GPU writes are downloaded to mapped title memory before the
+    /// existing snapshot merge copies them back.
+    #[test]
+    fn card_declared_gpu_writes_return_to_title_memory() {
+        let _switch = crate::switch::force_card_copies_for_test(true);
+        use crate::watch::PAGE;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (root, pso) = pipeline(CARD_WRITE);
+        let p = card_pool(32, 0x70_0000_0000);
+        // SAFETY: our newly allocated title pool.
+        unsafe { ((p + 32) as *mut u32).write_volatile(0x11) };
+        let len = (32 * PAGE) as u64;
+        register(p, p as u64, len);
+        let Some(copy) = find(p as u64, len) else {
+            unregister(p, p as u64);
+            return; // no host copy could be made
+        };
+        assert!(copy.has_card(), "the test switch must make a card side");
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, PAGE as u64);
+        let constants = [32u32, 0xfeed_beef];
+        // SAFETY: an open list and a live card-side buffer.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootUnorderedAccessView(0, copy.gpu(p as u64));
+            list.list.SetComputeRoot32BitConstants(1, 2, constants.as_ptr().cast(), 0);
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        copy.gpu_writes(&list, p as u64, PAGE as u64, false);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the title pool after the GPU fence and copy-down fence.
+        assert_eq!(unsafe { ((p + 32) as *const u32).read_volatile() }, 0xfeed_beef);
+        list.reset();
+        unregister(p, p as u64);
+    }
+
+    /// Page-table write bits are read without clearing, copied down, then
+    /// consumed by the existing `after` closure that copies the page back.
+    #[test]
+    fn card_title_memory_write_bitmap_is_downloaded() {
+        let _switch = crate::switch::force_card_copies_for_test(true);
+        // The miss tests above leave the frame withheld, and no frame is
+        // presented here to end it: start from no miss.
+        MISSED_IN.store(MISS_NEVER, std::sync::atomic::Ordering::Relaxed);
+        use crate::watch::PAGE;
+        let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        let (root, pso) = pipeline(WRITE);
+        let p = card_pool(32, 0x90_0000_0000);
+        let at = p + 16;
+        // SAFETY: our newly allocated title pool.
+        unsafe { (at as *mut u32).write_volatile(0x11) };
+        let len = (32 * PAGE) as u64;
+        register(p, p as u64, len);
+        let Some(copy) = find(p as u64, len) else {
+            unregister(p, p as u64);
+            return; // no host copy could be made
+        };
+        assert!(copy.has_card(), "the test switch must make a card side");
+        let list = host.new_list().unwrap();
+        let map = bind(&list, OURS).expect("a page table");
+        let constants = [at as u32, (at >> 32) as u32, 0x9abc, 0, 0];
+        // SAFETY: an open list and live resources.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+            list.list.SetComputeRootShaderResourceView(1, map.table);
+            list.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+            list.list.SetComputeRoot32BitConstants(3, 5, constants.as_ptr().cast(), 0);
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the title pool after the copy-down fence and deferred page copyback.
+        assert_eq!(unsafe { (at as *const u32).read_volatile() }, 0x9abc);
+        list.reset();
+        unregister(p, p as u64);
+    }
+
+    /// The title and shader change different bytes in one page. Copy-back
+    /// merges them in staging, and the next submission uploads that whole
+    /// stale page before its shader reads the card-side resource.
+    #[test]
+    fn card_copyback_merge_is_visible_to_the_next_submission() {
+        let _switch = crate::switch::force_card_copies_for_test(true);
+        use crate::watch::PAGE;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (write_root, writer) = pipeline(CARD_WRITE);
+        let (read_root, reader) = pipeline(CARD_READ);
+        let (out, cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: a live output buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+        let p = card_pool(32, 0x80_0000_0000);
+        // SAFETY: our newly allocated title pool.
+        unsafe {
+            ((p + 32) as *mut u32).write_volatile(0x11);
+            ((p + 36) as *mut u32).write_volatile(0x22);
+        }
+        let len = (32 * PAGE) as u64;
+        register(p, p as u64, len);
+        let Some(copy) = find(p as u64, len) else {
+            unregister(p, p as u64);
+            return; // no host copy could be made
+        };
+        assert!(copy.has_card(), "the test switch must make a card side");
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, PAGE as u64);
+        let title = p;
+        list.defer(move || {
+            // SAFETY: a dword in our title pool; this runs after refresh and
+            // before the declared GPU-write snapshot is taken.
+            unsafe { ((title + 36) as *mut u32).write_volatile(0x3333) };
+        });
+        let constants = [32u32, 0x2222];
+        // SAFETY: an open list and a live card-side buffer.
+        unsafe {
+            list.list.SetComputeRootSignature(&write_root);
+            list.list.SetComputeRootUnorderedAccessView(0, copy.gpu(p as u64));
+            list.list.SetComputeRoot32BitConstants(1, 2, constants.as_ptr().cast(), 0);
+            list.list.SetPipelineState(&writer);
+            list.list.Dispatch(1, 1, 1);
+        }
+        copy.gpu_writes(&list, p as u64, PAGE as u64, false);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the title pool after both fences.
+        unsafe {
+            assert_eq!(((p + 32) as *const u32).read_volatile(), 0x2222);
+            assert_eq!(((p + 36) as *const u32).read_volatile(), 0x3333);
+        }
+
+        list.reset();
+        // The next submission refreshes the range it reads, as every title
+        // submission does: the title's own write reaches the copy that way.
+        copy.refresh(&list, p as u64, PAGE as u64);
+        let offset = [32u32];
+        // SAFETY: an open list, live resource addresses and output mapping.
+        unsafe {
+            list.list.SetComputeRootSignature(&read_root);
+            list.list.SetComputeRootShaderResourceView(0, copy.gpu(p as u64));
+            list.list.SetComputeRootUnorderedAccessView(1, out_gpu);
+            list.list.SetComputeRoot32BitConstants(2, 1, offset.as_ptr().cast(), 0);
+            list.list.SetPipelineState(&reader);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: output mapping after the submission fence.
+        assert_eq!(unsafe { std::slice::from_raw_parts(cpu.cast::<u32>(), 2) }, [0x2222, 0x3333]);
+        list.reset();
+        unregister(p, p as u64);
     }
 
     /// Two lists of a submission read title memory through one page table;

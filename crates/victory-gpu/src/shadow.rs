@@ -66,6 +66,9 @@ fn writeback_merge_matches_bytewise_oracle() {
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
+    /// The write-back resource mapped by `data`, when `buffer` is the
+    /// optional GPU-local card side.
+    pub(crate) staging: Option<ID3D12Resource>,
     data: *mut u8,
     gpu: u64,
     /// Where the title buffer starts and how long it is.
@@ -90,6 +93,32 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    /// Pages where the mapped staging side has bytes newer than `buffer`.
+    stale: Option<Mutex<Vec<bool>>>,
+    /// Releases the reservation after `buffer` itself has been dropped.
+    _budget: Option<CardBudget>,
+}
+
+struct CardBudget(u64);
+
+impl Drop for CardBudget {
+    fn drop(&mut self) {
+        crate::host::release_card_bytes(self.0);
+    }
+}
+
+/// One contiguous copy between a shadow's card side and mapped staging side.
+pub(crate) struct CardCopy {
+    pub(crate) shadow: Arc<Shadow>,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+}
+
+/// Live two-sided shadows, including exact view slices that `all()` omits.
+static CARDS: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+fn cards() -> std::sync::MutexGuard<'static, Vec<std::sync::Weak<Shadow>>> {
+    CARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -144,6 +173,69 @@ impl Shadow {
         self.gpu + (address - self.start)
     }
 
+    /// Whether this shadow uses a separate GPU-local buffer.
+    pub(crate) fn has_card(&self) -> bool {
+        self.staging.is_some()
+    }
+
+    /// Marks bytes in the mapped staging range as newer than the GPU-local
+    /// side. `from..to` are offsets into this shadow's mapping.
+    fn mark_stale(&self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let Some(stale) = &self.stale else {
+            return;
+        };
+        let base_page = (self.start >> 16) as usize;
+        let first = ((self.start as usize + from) >> 16).saturating_sub(base_page);
+        let last = ((self.start as usize + to - 1) >> 16).saturating_sub(base_page);
+        let mut stale = stale.lock().unwrap_or_else(|e| e.into_inner());
+        for page in first..=last.min(stale.len().saturating_sub(1)) {
+            stale[page] = true;
+        }
+    }
+
+    /// Page starts touched by `[address, address + len)`, if this shadow has
+    /// a card side.
+    pub(crate) fn card_pages_in(&self, address: usize, len: usize) -> Vec<usize> {
+        if !self.has_card() || len == 0 {
+            return Vec::new();
+        }
+        let start = self.start as usize;
+        let end = start + self.len as usize;
+        let from = address.max(start);
+        let to = address.saturating_add(len).min(end);
+        if from >= to {
+            return Vec::new();
+        }
+        let mut page = from / PAGE * PAGE;
+        let mut pages = Vec::new();
+        while page < to {
+            pages.push(page);
+            page += PAGE;
+        }
+        pages
+    }
+
+    fn card_copy(self: &Arc<Self>, pages: std::ops::Range<usize>) -> Option<CardCopy> {
+        self.staging.as_ref()?;
+        if pages.is_empty() {
+            return None;
+        }
+        let page_start = ((self.start >> 16) as usize + pages.start) * PAGE;
+        let page_end = ((self.start >> 16) as usize + pages.end) * PAGE;
+        let start = self.start as usize;
+        let end = start + self.len as usize;
+        let from = page_start.max(start);
+        let to = page_end.min(end);
+        (from < to).then(|| CardCopy {
+            shadow: self.clone(),
+            offset: self.base + (from - start) as u64,
+            len: (to - from) as u64,
+        })
+    }
+
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)
@@ -166,6 +258,7 @@ impl Shadow {
         assert!(at + bytes.len() <= self.len as usize);
         // SAFETY: inside the mapping (checked).
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
+        self.mark_stale(at, at + bytes.len());
     }
 
     /// Up to 64 bytes of the copy at title address `address`, as floats, and
@@ -250,10 +343,25 @@ impl Shadow {
     /// [`Shadow::new`] of a copy in a run of a shared buffer (`data` and
     /// `gpu` are the run's).
     fn new_at(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, slice: Option<Slice>) -> Arc<Shadow> {
+        let base = slice.map_or(0, |s| s.offset);
+        // A run of a shared buffer stays single-sided: its card side would be
+        // the whole shared buffer, once per run.
+        let (buffer, gpu, staging, card_bytes) = if crate::switch::card_copies()
+            && slice.is_none()
+            && len >= crate::switch::card_copies_min_bytes()
+        {
+            match host().and_then(|host| host.card_buffer(&buffer, len)) {
+                Some((card, card_gpu, bytes)) => (card, card_gpu + base, Some(buffer), bytes),
+                None => (buffer, gpu, None, 0),
+            }
+        } else {
+            (buffer, gpu, None, 0)
+        };
         let tracked = crate::watch::track_copy(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
             buffer,
+            staging,
             data,
             gpu,
             start,
@@ -262,9 +370,14 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             marks,
-            base: slice.map_or(0, |s| s.offset),
+            base,
             slice,
+            stale: (card_bytes != 0).then(|| Mutex::new(vec![true; pages(start, len) as usize])),
+            _budget: (card_bytes != 0).then_some(CardBudget(card_bytes)),
         });
+        if shadow.has_card() {
+            cards().push(Arc::downgrade(&shadow));
+        }
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
@@ -448,6 +561,7 @@ impl Shadow {
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
                     }
+                    self.mark_stale(at, at + n);
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
@@ -521,6 +635,9 @@ impl Shadow {
                 merge_writeback(&mut title, host, before).then_some(title.as_ptr())
             }
         };
+        if saved.is_some() {
+            self.mark_stale(from - start, to - start);
+        }
         if let Some(bytes) = written {
             let _writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
@@ -635,6 +752,7 @@ impl Shadow {
         for (a, b) in unmapped {
             // SAFETY: inside the mapping (`take_split` cuts to the buffer).
             unsafe { self.data.add(a - start).write_bytes(0, b - a) };
+            self.mark_stale(a - start, b - start);
             sync_before(a, b);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
@@ -683,12 +801,92 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        self.mark_stale(from - start, to - start);
         if let Some(t) = &self.tracked {
             // SAFETY: `to - from` bytes inside the mapping, just copied.
             t.refreshed(from, unsafe { std::slice::from_raw_parts(at, to - from) });
         }
         to - from
     }
+}
+
+
+fn live_cards() -> Vec<Arc<Shadow>> {
+    let mut cards = cards();
+    let mut live = Vec::with_capacity(cards.len());
+    cards.retain(|weak| {
+        if let Some(shadow) = weak.upgrade() {
+            live.push(shadow);
+            true
+        } else {
+            false
+        }
+    });
+    live
+}
+
+/// Whether any live title copy has a card side.
+pub(crate) fn has_cards() -> bool {
+    !live_cards().is_empty()
+}
+
+/// Contiguous staging-new pages across all live card-side copies.
+pub(crate) fn card_uploads() -> Vec<CardCopy> {
+    let mut copies = Vec::new();
+    for shadow in live_cards() {
+        let Some(stale) = &shadow.stale else {
+            continue;
+        };
+        // Taken and cleared under one lock: a page marked after this is copied
+        // up by the next submission, never dropped between the copy and the clear.
+        let mut stale = stale.lock().unwrap_or_else(|e| e.into_inner());
+        let mut page = 0;
+        while page < stale.len() {
+            if !stale[page] {
+                page += 1;
+                continue;
+            }
+            let first = page;
+            page += 1;
+            while page < stale.len() && stale[page] {
+                page += 1;
+            }
+            stale[first..page].fill(false);
+            if let Some(copy) = shadow.card_copy(first..page) {
+                copies.push(copy);
+            }
+        }
+    }
+    copies
+}
+
+/// Contiguous pages GPU-written by this submission, merged per card-side
+/// shadow so one CopyBufferRegion handles each adjacent run.
+pub(crate) fn card_downloads(mut pages: Vec<(Arc<Shadow>, usize)>) -> Vec<CardCopy> {
+    pages.retain(|(shadow, _)| shadow.has_card());
+    pages.sort_by_key(|(shadow, page)| (Arc::as_ptr(shadow) as usize, *page));
+    pages.dedup_by(|a, b| Arc::ptr_eq(&a.0, &b.0) && a.1 == b.1);
+    let mut copies = Vec::new();
+    let mut at = 0;
+    while at < pages.len() {
+        let shadow = pages[at].0.clone();
+        let first_page = pages[at].1;
+        let mut last_page = first_page;
+        at += 1;
+        while at < pages.len()
+            && Arc::ptr_eq(&pages[at].0, &shadow)
+            && pages[at].1 == last_page + PAGE
+        {
+            last_page = pages[at].1;
+            at += 1;
+        }
+        let first = (first_page >> 16).saturating_sub((shadow.start >> 16) as usize);
+        let last = (last_page >> 16).saturating_sub((shadow.start >> 16) as usize) + 1;
+        if let Some(copy) = shadow.card_copy(first..last) {
+            copies.push(copy);
+        }
+    }
+    copies
 }
 
 impl Drop for Shadow {
@@ -781,11 +979,13 @@ unsafe impl Send for Bitmap {}
 // SAFETY: as above.
 unsafe impl Sync for Bitmap {}
 
+static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] =
+    [const { std::sync::OnceLock::new() }; 2];
+
 /// The bitmap of other shaders, or (`memory`) of shaders that use title
 /// memory, whose marks go back only while it is not withheld
 /// (`crate::memory::withholding`).
 fn bitmap(memory: bool) -> Option<&'static Bitmap> {
-    static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
     BITMAPS[usize::from(memory)]
         .get_or_init(|| {
             // Written pages, then one read mark per heap index.
@@ -962,6 +1162,49 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
     }
+}
+
+/// Reads, without clearing, the page marks in both views' write bitmaps and
+/// returns only pages whose copies have card sides.
+pub(crate) fn marked_card_pages() -> Vec<(Arc<Shadow>, usize)> {
+    let used = (marks().end as usize).min(victory_shader::emit::VIEW_WRITE_BITS as usize);
+    if used == 0 {
+        return Vec::new();
+    }
+    let words = used.div_ceil(32);
+    let mut marked = Vec::new();
+    for memory in [false, true] {
+        let Some(bitmap) = BITMAPS[usize::from(memory)].get().and_then(|bitmap| bitmap.as_ref()) else {
+            continue;
+        };
+        // SAFETY: the title submission has completed; this accessor only
+        // reads marks, before `copy_back_marks` clears them.
+        let bits = unsafe { std::slice::from_raw_parts(bitmap.data as *const u32, words) };
+        for (word, &value) in bits.iter().enumerate() {
+            let mut value = value;
+            while value != 0 {
+                let mark = word * 32 + value.trailing_zeros() as usize;
+                value &= value - 1;
+                if mark < used {
+                    marked.push(mark as u32);
+                }
+            }
+        }
+    }
+    marked.sort_unstable();
+    marked.dedup();
+    let owners = marks();
+    marked
+        .into_iter()
+        .filter_map(|mark| {
+            let (&base, owner) = owners.owners.range(..=mark).next_back()?;
+            let shadow = owner.upgrade()?;
+            let page = (mark - base) as usize;
+            (shadow.has_card() && page < pages(shadow.start, shadow.len) as usize).then(|| {
+                (shadow.clone(), (((shadow.start >> 16) as usize + page) * PAGE))
+            })
+        })
+        .collect()
 }
 
 struct Entry {
