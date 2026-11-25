@@ -435,6 +435,109 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// Parts `DeserializeComputePipelineStateX` (device slot 67 / 0x218) passes:
+/// the FidelityFX upscaler's precompiled RDNA2 compute programs as FSPX
+/// sections (packet, hash, code, metadata).
+#[repr(C)]
+pub(crate) struct DeserializeComputeHead {
+    root: This,
+    kind0: *const u8,
+    kind0_size: usize,
+    kind1: *const u8,
+    kind1_size: usize,
+    kind6: *const u8,
+    kind6_size: usize,
+    kind7: *const u8,
+    kind7_size: usize,
+}
+
+/// Device method 0x218: assemble the FSPX sections into an `ACCC` container
+/// and keep them as a compute pipeline. Translation then follows the same
+/// path as an ordinary ACCC compute shader.
+pub(crate) extern "system" fn deserialize_compute_x(
+    _: This,
+    desc: *const DeserializeComputeHead,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    // SAFETY: the title passes a description (null is tolerated).
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    let Some(fspx) = assemble_fspx(desc) else {
+        tracing::warn!("DeserializeComputePipelineStateX: incomplete FSPX parts");
+        return E_INVALIDARG;
+    };
+    if let Some([x, y, z, flags]) = packet_threads(desc) {
+        tracing::debug!(
+            threads = ?(x, y, z),
+            wave32 = flags & (1 << 4) != 0,
+            code = desc.kind6_size,
+            "DeserializeComputePipelineStateX"
+        );
+    }
+    let container = victory_shader::dxbc::build(&[(victory_shader::FourCC::ACCC, &fspx)]);
+    hand_out(
+        vec![shader("compute", &container)],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
+}
+
+/// Builds an FSPX blob from the four sections the deserialize call names.
+fn assemble_fspx(desc: &DeserializeComputeHead) -> Option<Vec<u8>> {
+    let part = |ptr: *const u8, size: usize| -> Option<&[u8]> {
+        if ptr.is_null() || size == 0 {
+            return None;
+        }
+        // SAFETY: the title names `size` bytes at `ptr`.
+        Some(unsafe { std::slice::from_raw_parts(ptr, size) })
+    };
+    let (k0, k1, k6, k7) = (
+        part(desc.kind0, desc.kind0_size)?,
+        part(desc.kind1, desc.kind1_size).unwrap_or(&[]),
+        part(desc.kind6, desc.kind6_size)?,
+        part(desc.kind7, desc.kind7_size)?,
+    );
+    let blobs: [(u32, &[u8]); 4] = [(0, k0), (1, k1), (6, k6), (7, k7)];
+    let header = 16 + 16 * blobs.len();
+    let mut out = vec![0u8; header];
+    for (i, (kind, blob)) in blobs.iter().enumerate() {
+        let at = out.len().next_multiple_of(16);
+        out.resize(at, 0);
+        let slot = 16 + 16 * i;
+        out[slot..slot + 4].copy_from_slice(&kind.to_le_bytes());
+        out[slot + 4..slot + 8].copy_from_slice(&(at as u32).to_le_bytes());
+        out[slot + 8..slot + 12].copy_from_slice(&(blob.len() as u32).to_le_bytes());
+        out.extend_from_slice(blob);
+    }
+    let words = [
+        u32::from_le_bytes(*b"FSPX"),
+        1u32,
+        4u32,
+        out.len() as u32,
+    ];
+    for (i, w) in words.into_iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    Some(out)
+}
+
+/// Thread-group size and flags from a kind-0 packet, when long enough.
+fn packet_threads(desc: &DeserializeComputeHead) -> Option<[u16; 4]> {
+    if desc.kind0.is_null() || desc.kind0_size < 0x14 {
+        return None;
+    }
+    // SAFETY: size checked above.
+    let k0 = unsafe { std::slice::from_raw_parts(desc.kind0, desc.kind0_size) };
+    let u16_at = |at: usize| -> Option<u16> {
+        Some(u16::from_le_bytes(k0.get(at..at + 2)?.try_into().ok()?))
+    };
+    Some([u16_at(0x0c)?, u16_at(0x0e)?, u16_at(0x10)?, u16_at(0x12)?])
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
@@ -695,7 +798,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::object::{S_OK, slot};
+    use crate::object::{E_INVALIDARG, S_OK, slot};
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
@@ -703,6 +806,68 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    #[test]
+    fn deserialize_compute_x_assembles_an_accc_compute_pipeline() {
+        // Kind 0 packet: thread group 8×16×1, wave32 (flag bit 4 at +0x12).
+        let mut k0 = [0u8; 0x1c];
+        k0[0x0c..0x0e].copy_from_slice(&8u16.to_le_bytes());
+        k0[0x0e..0x10].copy_from_slice(&16u16.to_le_bytes());
+        k0[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+        k0[0x12..0x14].copy_from_slice(&(1u16 << 4).to_le_bytes());
+        k0[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // rsrc1: one VGPR granule
+        k0[0x18..0x1c].copy_from_slice(&0x9cu32.to_le_bytes());
+        let k1 = [0x11u8; 0x14];
+        // One s_endpgm dword; metadata names that length.
+        let code = [0x00u8, 0x00, 0x81, 0xBF];
+        let mut k7 = [0u8; 0x18 + 32];
+        let meta_len = (k7.len() - 0x14) as u32;
+        k7[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        k7[4..8].copy_from_slice(&meta_len.to_le_bytes());
+        k7[8..12].copy_from_slice(&(code.len() as u32 / 4).to_le_bytes());
+        k7[0x14] = 0x40;
+        k7[0x18] = 0x43; // hash record ends the list
+        let desc = DeserializeComputeHead {
+            root: std::ptr::null(),
+            kind0: k0.as_ptr(),
+            kind0_size: k0.len(),
+            kind1: k1.as_ptr(),
+            kind1_size: k1.len(),
+            kind6: code.as_ptr(),
+            kind6_size: code.len(),
+            kind7: k7.as_ptr(),
+            kind7_size: k7.len(),
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(
+            deserialize_compute_x(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
+        assert!(!p.is_null());
+        let (stage, container) = &shaders(p)[0];
+        assert_eq!(*stage, "compute");
+        let c = victory_shader::Container::parse(container).unwrap();
+        let accc = c.part(victory_shader::FourCC::ACCC).unwrap().data;
+        let programs = victory_shader::native_programs(accc).unwrap();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0].code, code);
+        assert!(!programs[0].wave64);
+        assert_eq!(
+            packet_threads(&desc),
+            Some([8, 16, 1, 1 << 4])
+        );
+        object::release_boxed::<Pipeline>(p);
+    }
+
+    #[test]
+    fn deserialize_compute_x_rejects_a_null_description() {
+        let mut p = std::ptr::null();
+        assert_eq!(
+            deserialize_compute_x(std::ptr::null(), std::ptr::null(), &PIPELINE_IIDS[0], &mut p),
+            E_INVALIDARG
+        );
+        assert!(p.is_null());
     }
 
     #[test]
