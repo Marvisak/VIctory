@@ -4,7 +4,9 @@
 //! look each address up in a page table: per 64 KiB page below 2^40, the
 //! heap index of a pair of raw views (SRV, UAV) of the host copy holding
 //! the page (`crate::shadow`) and the low dword of that copy's title
-//! address. The copies are the ones draws and dispatches use through views,
+//! address, or of an in-place physical-page section and the page's address
+//! minus its offset in the section. The copies are the ones draws and
+//! dispatches use through views,
 //! so what one shader writes through a view another reads at its address,
 //! within a submission too.
 //!
@@ -32,10 +34,18 @@
 //! shortcut: a table names copies in at most [`CAPACITY`] 256 MiB regions;
 //! past that, the smallest copies read as missing (logged once).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
+    D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    D3D12_RESOURCE_STATE_COMMON, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ID3D12Device3, ID3D12Heap,
+    ID3D12Resource,
+};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
+use windows::core::Interface;
 
 use crate::descriptor::host::HostHeap;
 use crate::host::HostList;
@@ -50,6 +60,8 @@ const LEVEL1: usize = 4096;
 const CAPACITY: usize = 512;
 /// Sentinel in [`Layout::owner`] for a page with no host copy.
 const NO_OWNER: u32 = u32::MAX;
+/// Sentinel in [`Layout::owner`] for a page backed in place by an imported section.
+const IN_PLACE: u32 = u32::MAX - 1;
 /// Total dwords in a page table buffer (level-1 + `CAPACITY + 1` blocks of
 /// `BLOCK` 2-dword entries).
 const TABLE_DWORDS: usize = LEVEL1 + (CAPACITY + 1) * BLOCK * 2;
@@ -92,15 +104,204 @@ impl Map {
     }
 }
 
-/// What a heap's page table names: the copies, the level-1 index of each
-/// block (block 0 is the null one), and the copy each entry names (or [`NO_OWNER`]).
+/// What a heap's page table names: the copies, imported sections, the level-1
+/// index of each block (block 0 is the null one), and the copy each entry
+/// names (or [`IN_PLACE`] / [`NO_OWNER`]).
 #[derive(Default)]
 struct Layout {
     copies: Vec<Arc<Shadow>>,
+    _sections: Vec<Arc<Section>>,
     /// Each copy's bit in the change tracker (`crate::watch::clean_bit`).
     bits: Vec<Option<u32>>,
     blocks: Vec<usize>,
     owner: Vec<u32>,
+}
+
+/// A physical-page section imported once as a host D3D12 heap and placed buffer.
+struct Section {
+    _heap: ID3D12Heap,
+    buffer: ID3D12Resource,
+    len: u64,
+}
+
+// SAFETY: D3D12 heaps and resources are free-threaded.
+unsafe impl Send for Section {}
+// SAFETY: as above.
+unsafe impl Sync for Section {}
+
+#[derive(Clone, Copy)]
+struct SectionView {
+    len: usize,
+    section: isize,
+    section_size: usize,
+    offset: usize,
+}
+
+#[derive(Default)]
+struct Sections {
+    views: BTreeMap<usize, SectionView>,
+    imported: BTreeMap<isize, Option<Arc<Section>>>,
+    imports: u64,
+}
+
+static SECTIONS: Mutex<Sections> = Mutex::new(Sections {
+    views: BTreeMap::new(),
+    imported: BTreeMap::new(),
+    imports: 0,
+});
+
+static SECTION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn sections() -> std::sync::MutexGuard<'static, Sections> {
+    SECTIONS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn generation() -> u64 {
+    crate::shadow::generation()
+        .wrapping_add(SECTION_GENERATION.load(std::sync::atomic::Ordering::Acquire))
+}
+
+fn sections_changed() {
+    SECTION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// The runtime mapped `len` bytes at `at` from byte `offset` of committed
+/// physical-page section `section` (`section_size` bytes in all).
+pub fn title_memory_mapped(
+    at: usize,
+    len: usize,
+    section: isize,
+    section_size: usize,
+    offset: usize,
+) {
+    if len == 0 || section == 0 || section == -1 {
+        return;
+    }
+    sections().views.insert(
+        at,
+        SectionView {
+            len,
+            section,
+            section_size,
+            offset,
+        },
+    );
+    sections_changed();
+}
+
+/// The runtime unmapped or remapped `[at, at + len)`.
+pub(crate) fn unmapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut s = sections();
+    let first = s
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, v)| base.saturating_add(v.len) > at)
+        .map(|(&base, _)| base);
+    let hit: Vec<usize> = first
+        .into_iter()
+        .chain(
+            (at < end)
+                .then(|| s.views.range(at + 1..end).map(|(&b, _)| b))
+                .into_iter()
+                .flatten(),
+        )
+        .collect();
+    if hit.is_empty() {
+        return;
+    }
+    for base in hit {
+        let Some(v) = s.views.remove(&base) else {
+            continue;
+        };
+        let v_end = base.saturating_add(v.len);
+        if base < at {
+            s.views.insert(
+                base,
+                SectionView {
+                    len: at - base,
+                    ..v
+                },
+            );
+        }
+        if v_end > end {
+            s.views.insert(
+                end,
+                SectionView {
+                    len: v_end - end,
+                    offset: v.offset + (end - base),
+                    ..v
+                },
+            );
+        }
+    }
+    drop(s);
+    sections_changed();
+}
+
+/// The runtime closed physical-page section `section`.
+pub fn title_memory_section_freed(section: isize) {
+    let mut s = sections();
+    let had_import = s.imported.remove(&section).is_some();
+    let before = s.views.len();
+    s.views.retain(|_, v| v.section != section);
+    let had_views = s.views.len() != before;
+    drop(s);
+    if had_import || had_views {
+        sections_changed();
+    }
+}
+
+/// Imports a committed file-mapping section once as a cross-adapter placed buffer.
+fn import_section(handle: isize, size: usize) -> Option<Arc<Section>> {
+    if size == 0 || !size.is_multiple_of(1 << 16) || size > (1 << 27) * 4 {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let device: ID3D12Device3 = host.device.cast().ok()?;
+    // SAFETY: `handle` is a live section handle held by `xmem` until `title_memory_section_freed`.
+    let heap: ID3D12Heap =
+        unsafe { device.OpenExistingHeapFromFileMapping(HANDLE(handle as *mut _)) }.ok()?;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Alignment: 64 << 10,
+        Width: size as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_UNKNOWN,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+            | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: `heap` is a live cross-adapter heap of at least `size` bytes.
+    unsafe {
+        device.CreatePlacedResource(
+            &heap,
+            0,
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        )
+    }
+    .ok()?;
+    let buffer = buffer?;
+    crate::host::name(&buffer, || format!("title section {handle:#x}+{size:#x}"));
+    Some(Arc::new(Section {
+        _heap: heap,
+        buffer,
+        len: size as u64,
+    }))
 }
 
 /// A 256 KiB dirty-page bitmap buffer kept zeroed while in [`BITMAP_POOL`].
@@ -392,13 +593,15 @@ pub(crate) fn heap() -> Option<&'static crate::descriptor::host::HostHeap> {
 }
 
 /// Writes the page table for host copies `copies` (start, bytes), copy `k`'s
-/// view pair at heap index `pairs[k]`, and `null` for unowned pages directly into
-/// `out` (which must hold at least [`TABLE_DWORDS`] dwords). Returns
-/// `(written_dwords, blocks, owner)` where `owner` holds copy indices or
-/// [`NO_OWNER`]. At most [`CAPACITY`] blocks besides the null one.
+/// view pair at heap index `pairs[k]`, in-place section views `views`
+/// (start, bytes, pair slot, section byte offset), and `null` for unowned pages
+/// directly into `out` (which must hold at least [`TABLE_DWORDS`] dwords).
+/// Returns `(written_dwords, blocks, owner)` where `owner` holds copy indices,
+/// [`IN_PLACE`], or [`NO_OWNER`]. At most [`CAPACITY`] blocks besides the null one.
 fn write_table(
     copies: &[(u64, u64)],
     pairs: &[u32],
+    views: &[(u64, u64, u32, u64)],
     null: u32,
     out: &mut [u32],
 ) -> (usize, Vec<usize>, Vec<u32>) {
@@ -439,6 +642,35 @@ fn write_table(
             }
         }
     }
+    for &(start, len, pair, offset) in views {
+        let Some(end) = start.checked_add(len) else {
+            continue;
+        };
+        if len == 0 || end > 1 << 40 {
+            continue;
+        }
+        for page in start >> 16..=(end - 1) >> 16 {
+            let l1 = (page >> 12) as usize;
+            if level1[l1] == 0 {
+                if blocks.len() > CAPACITY {
+                    full = true;
+                    continue;
+                }
+                level1[l1] = blocks.len() as u32;
+                blocks.push(l1);
+                owner.resize(owner.len() + BLOCK, NO_OWNER);
+            }
+            let entry = level1[l1] as usize * BLOCK + (page & 0xFFF) as usize;
+            if owner[entry] == NO_OWNER || owner[entry] == IN_PLACE {
+                owner[entry] = IN_PLACE;
+                let page_va = page << 16;
+                let sec_offset = offset + (page_va - start);
+                let at = LEVEL1 + entry * 2;
+                out[at] = pair;
+                out[at + 1] = (page_va as u32).wrapping_sub(sec_offset as u32);
+            }
+        }
+    }
     if full {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(CAPACITY, "title memory copies in more 256 MiB regions than a page table has room for: the rest read as missing"));
@@ -451,7 +683,7 @@ fn write_table(
         if o == NO_OWNER {
             slot[0] = null;
             slot[1] = 0;
-        } else {
+        } else if o != IN_PLACE {
             let k = o as usize;
             slot[0] = pairs[k];
             slot[1] = copies[k].0 as u32;
@@ -467,7 +699,7 @@ fn table(
     null: u32,
 ) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
     let mut dwords = vec![0u32; TABLE_DWORDS];
-    let (len, blocks, owner) = write_table(copies, pairs, null, &mut dwords);
+    let (len, blocks, owner) = write_table(copies, pairs, &[], null, &mut dwords);
     dwords.truncate(len);
     let owner = owner
         .into_iter()
@@ -499,13 +731,40 @@ impl Shared {
         })
     }
 
-    /// Names every host copy there is now (`now`: their generation): view
-    /// pairs made for new copies, those of copies gone made null and given
-    /// back, the table rewritten. Only while no submission runs (the GPU
-    /// reads the table and the views).
+    /// Names every host copy and in-place section view there is now (`now`:
+    /// their generation): view pairs made for new copies or sections, those
+    /// of copies or sections gone made null and given back, the table
+    /// rewritten. Only while no submission runs (the GPU reads the table and
+    /// the views).
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
         let copies = crate::shadow::all();
-        let live: HashSet<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
+        let (raw_views, live_sections) = {
+            let mut s = sections();
+            let handles: Vec<(isize, usize)> =
+                s.views.values().map(|v| (v.section, v.section_size)).collect();
+            for (handle, size) in handles {
+                if !s.imported.contains_key(&handle) {
+                    let imported = import_section(handle, size);
+                    if imported.is_some() {
+                        s.imports += 1;
+                    }
+                    s.imported.insert(handle, imported);
+                }
+            }
+            let raw_views: Vec<(u64, u64, Arc<Section>, u64)> = s
+                .views
+                .iter()
+                .filter_map(|(&at, v)| {
+                    let sec = s.imported.get(&v.section)?.as_ref()?.clone();
+                    Some((at as u64, v.len as u64, sec, v.offset as u64))
+                })
+                .collect();
+            let live_sections: Vec<Arc<Section>> =
+                s.imported.values().flatten().cloned().collect();
+            (raw_views, live_sections)
+        };
+        let mut live: HashSet<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
+        live.extend(live_sections.iter().map(|s| Arc::as_ptr(s) as usize));
         self.pairs.retain(|copy, &mut slot| {
             let keep = live.contains(copy);
             if !keep {
@@ -533,15 +792,32 @@ impl Shared {
             named.push(c);
             slots.push(slot);
         }
+        let mut views = Vec::with_capacity(raw_views.len());
+        for (at, len, sec, offset) in raw_views {
+            let key = Arc::as_ptr(&sec) as usize;
+            let slot = match self.pairs.get(&key) {
+                Some(&slot) => slot,
+                None => {
+                    let Some(slot) = heap.pair() else {
+                        continue;
+                    };
+                    heap.raw_pair_at(slot, Some(&sec.buffer), sec.len.next_multiple_of(4));
+                    self.pairs.insert(key, slot);
+                    slot
+                }
+            };
+            views.push((at, len, slot, offset));
+        }
         let ranges: Vec<(u64, u64)> = named.iter().map(|c| c.range()).collect();
         // SAFETY: `self.data` is the persistent mapping of `self.table`, with room
         // for `TABLE_DWORDS` dwords; no submission runs.
         let out = unsafe { std::slice::from_raw_parts_mut(self.data as *mut u32, TABLE_DWORDS) };
-        let (_, blocks, owner) = write_table(&ranges, &slots, self.null, out);
-        tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
+        let (_, blocks, owner) = write_table(&ranges, &slots, &views, self.null, out);
+        tracing::debug!(copies = ranges.len(), views = views.len(), blocks = blocks.len() - 1, "title memory page table");
         self.layout = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
+            _sections: live_sections,
             blocks,
             owner,
         });
@@ -569,7 +845,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
         let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
-        let now = crate::shadow::generation();
+        let now = generation();
         if s.generation != now {
             s.rewrite(heap, now);
         }
@@ -649,6 +925,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             unsafe { std::slice::from_raw_parts_mut(pooled.data() as *mut u32, BITMAP_WORDS) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let mut writes = Vec::new();
+        let mut written = 0;
         for (w, mark) in marks.iter_mut().enumerate() {
             if *mark == 0 {
                 continue;
@@ -667,6 +944,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let at = (l1 << 28 | page << 16) as u64;
                 match owner.get(entry) {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
+                    Some(&IN_PLACE) => written += 1,
                     Some(&k) if k != NO_OWNER => writes.push((k as usize, at)),
                     _ => {
                         pages += 1;
@@ -685,7 +963,6 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 drop_withheld(at as usize, 1 << 16);
             }
         }
-        let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
             let n = copies[k].copy_back_page(at as usize);
             tracing::debug!(
@@ -800,6 +1077,7 @@ mod tests {
         owner[BLOCK + 5] = 0;
         let l = Layout {
             copies: Vec::new(),
+            _sections: Vec::new(),
             bits: Vec::new(),
             blocks: vec![usize::MAX, 0],
             owner,
@@ -1159,5 +1437,300 @@ void main() {
         }
         crate::shadow::unregister(p, p as u64);
         drop(copy);
+    }
+
+    #[test]
+    fn section_views_resolve_offsets_and_aliases_in_place() {
+        let copies = [(0x40_0000, 0x2_0000)];
+        let views = [
+            (0x40_0010_0000, 0x2_0000, 108, 0x5_0000),
+            (0x40_0020_0000, 0x1_0000, 108, 0x5_0000),
+        ];
+        let mut dwords = vec![0u32; TABLE_DWORDS];
+        let (len, blocks, owner) = write_table(&copies, &[102], &views, 100, &mut dwords);
+        dwords.truncate(len);
+        assert_eq!(look_up(&dwords, 0x40_0010), (102, 0x10));
+        assert_eq!(look_up(&dwords, 0x40_0010_0024), (108, 0x5_0024));
+        assert_eq!(look_up(&dwords, 0x40_0011_fffc), (108, 0x6_fffc));
+        assert_eq!(look_up(&dwords, 0x40_0020_0024), (108, 0x5_0024));
+        let entry = |a: u64| {
+            blocks.iter().position(|&l| l == (a >> 28) as usize).unwrap() * BLOCK
+                + (a >> 16 & 0xFFF) as usize
+        };
+        let in_place = entry(0x40_0010_0000);
+        assert_eq!(owner[in_place], IN_PLACE);
+        let l = Layout {
+            copies: Vec::new(),
+            _sections: Vec::new(),
+            bits: Vec::new(),
+            blocks,
+            owner,
+        };
+        let mut marks = vec![0u32; BITMAP_WORDS];
+        marks[in_place / 32] = 1 << (in_place % 32);
+        assert!(!has_missed(&marks, &l));
+    }
+
+    /// Issue #1905: a 64 MiB committed section view read and written in place
+    /// through the GPU page table survives a 16 KiB guard page, a middle
+    /// sub-range remap and restore, and a neighbouring sub-range remap with
+    /// one heap import and one placed buffer.
+    #[test]
+    fn section_views_survive_guards_and_remaps_with_one_import() {
+        let _guard = gpu_test_lock();
+        use crate::watch::PAGE;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
+            PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT, UnmapViewOfFile2, VirtualAlloc2,
+            VirtualFree, VirtualProtect,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        let ((read_root, reader), (write_root, writer)) = (pipeline(SOURCE), pipeline(WRITE));
+        let (out, out_cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: a live buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+
+        const PAGES: usize = 1024;
+        const SIZE: usize = PAGES * PAGE;
+        // SAFETY: creates a 64 MiB committed pagefile section.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: pseudo handle for the current process.
+        let process = unsafe { GetCurrentProcess() };
+        let base = (0..256u64)
+            .map(|k| 0x60_0000_0000 + (k << 28))
+            // SAFETY: reserves a 64 MiB placeholder at a free address below 2^40.
+            .map(|hint| unsafe {
+                VirtualAlloc2(
+                    process,
+                    hint as *const _,
+                    SIZE,
+                    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                    PAGE_NOACCESS,
+                    std::ptr::null_mut(),
+                    0,
+                ) as usize
+            })
+            .find(|&p| p != 0)
+            .expect("64 MiB placeholder below 2^40");
+
+        let map_piece = |at: usize, len: usize, offset: usize| {
+            // SAFETY: replaces an exact placeholder in `[base, base + SIZE)`.
+            let v = unsafe {
+                MapViewOfFile3(
+                    section,
+                    process,
+                    at as *const _,
+                    offset as u64,
+                    len,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(v.Value as usize, at);
+            title_memory_mapped(at, len, section as isize, SIZE, offset);
+        };
+        let unmap_piece = |at: usize, len: usize| {
+            crate::watch::title_memory_remapped(at, len);
+            // SAFETY: unmaps a view we mapped, restoring its placeholder.
+            let ok = unsafe {
+                UnmapViewOfFile2(
+                    process,
+                    MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: at as *mut _,
+                    },
+                    MEM_PRESERVE_PLACEHOLDER,
+                )
+            };
+            assert_ne!(ok, 0);
+        };
+
+        map_piece(base, SIZE, 0);
+        let marker = |page: usize| 0xA000_0000u32 + page as u32;
+        for p in [0, 31, 64, 95, 511, 512, 543, 544, 575, 576, 1023] {
+            // SAFETY: `base + p * PAGE` is inside the mapped 64 MiB view.
+            unsafe { ((base + p * PAGE + 16) as *mut u32).write_volatile(marker(p)) };
+        }
+
+        let imports_before = sections().imports;
+        let list = host.new_list().unwrap();
+        let read_page = |page: usize| -> u32 {
+            let at = base + page * PAGE + 16;
+            let map = bind(&list, OURS).expect("a page table");
+            let constants = [at as u32, (at >> 32) as u32, 0u32];
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+                list.list.SetComputeRootSignature(&read_root);
+                list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+                list.list.SetComputeRootShaderResourceView(1, map.table);
+                list.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+                list.list.SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&reader);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the mapped output buffer after fence wait.
+            unsafe { out_cpu.cast::<u32>().read_volatile() }
+        };
+        let check_pages = |pages: &[(usize, usize)]| {
+            for &(guest_page, backing_page) in pages {
+                assert_eq!(
+                    read_page(guest_page),
+                    marker(backing_page),
+                    "guest page {guest_page}"
+                );
+            }
+        };
+
+        // 1. Initial 64 MiB import.
+        check_pages(&[(511, 511), (512, 512), (543, 543), (544, 544), (575, 575), (576, 576)]);
+        assert_eq!(sections().imports, imports_before + 1);
+        let sec_arc = sections().imported[&(section as isize)].clone().unwrap();
+        let initial_pair = shared()
+            .iter()
+            .find(|(k, _)| *k == OURS)
+            .and_then(|(_, s)| s.pairs.get(&(Arc::as_ptr(&sec_arc) as usize)).copied())
+            .expect("section descriptor pair");
+        assert!(initial_pair >= 1 << 18);
+
+        // 2. 16 KiB guard page in the middle of the live range, then back.
+        let guard_at = (base + 512 * PAGE) as *const _;
+        let mut old = 0u32;
+        // SAFETY: 16 KiB inside page 512 of our mapped view.
+        unsafe {
+            assert_ne!(
+                VirtualProtect(guard_at, 16 << 10, PAGE_READWRITE | PAGE_GUARD, &mut old),
+                0
+            );
+            assert_ne!(
+                VirtualProtect(
+                    (base + 512 * PAGE + (16 << 10)) as *const _,
+                    16 << 10,
+                    PAGE_NOACCESS,
+                    &mut old,
+                ),
+                0
+            );
+        }
+        check_pages(&[(511, 511), (512, 512), (544, 544)]);
+        // SAFETY: restoring PAGE_READWRITE on both 16 KiB sub-ranges.
+        unsafe {
+            assert_ne!(VirtualProtect(guard_at, 32 << 10, PAGE_READWRITE, &mut old), 0);
+        }
+        check_pages(&[(511, 511), (512, 512), (544, 544)]);
+
+        // 3. Remap a 2 MiB range in the middle ([512..544)) elsewhere (pages 0..32) and back.
+        let mid_at = base + 512 * PAGE;
+        let mid_len = 32 * PAGE;
+        let tail_at = base + 544 * PAGE;
+        let tail_len = (PAGES - 544) * PAGE;
+        unmap_piece(base, SIZE);
+        // SAFETY: splits the 64 MiB placeholder into [0..512), [512..544), and [544..1024).
+        unsafe {
+            assert_ne!(
+                VirtualFree(base as *mut _, 512 * PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+                0
+            );
+            assert_ne!(
+                VirtualFree(mid_at as *mut _, mid_len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+                0
+            );
+        }
+        map_piece(base, 512 * PAGE, 0);
+        map_piece(mid_at, mid_len, 0);
+        map_piece(tail_at, tail_len, 544 * PAGE);
+        check_pages(&[(511, 511), (512, 0), (543, 31), (544, 544), (575, 575), (576, 576)]);
+
+        unmap_piece(mid_at, mid_len);
+        map_piece(mid_at, mid_len, 512 * PAGE);
+        check_pages(&[(511, 511), (512, 512), (543, 543), (544, 544)]);
+
+        // 4. Remap [512..544) again and, while it is live, remap neighbouring [544..576).
+        unmap_piece(mid_at, mid_len);
+        map_piece(mid_at, mid_len, 0);
+        let next_at = base + 576 * PAGE;
+        let next_len = (PAGES - 576) * PAGE;
+        unmap_piece(tail_at, tail_len);
+        // SAFETY: splits [544..1024) into [544..576) and [576..1024).
+        unsafe {
+            assert_ne!(
+                VirtualFree(tail_at as *mut _, mid_len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+                0
+            );
+        }
+        map_piece(tail_at, mid_len, 64 * PAGE);
+        map_piece(next_at, next_len, 576 * PAGE);
+        check_pages(&[(511, 511), (512, 0), (543, 31), (544, 64), (575, 95), (576, 576)]);
+
+        // 5. GPU UAV write through the page table to remapped page 512 (aliased to page 0).
+        let write_at = mid_at + 16;
+        let map = bind(&list, OURS).expect("a page table");
+        let constants = [write_at as u32, (write_at >> 32) as u32, 0xCAFE_BEEFu32, 0, 0];
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+            list.list.SetComputeRootSignature(&write_root);
+            list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+            list.list.SetComputeRootShaderResourceView(1, map.table);
+            list.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+            list.list.SetComputeRoot32BitConstants(3, 5, constants.as_ptr().cast(), 0);
+            list.list.SetPipelineState(&writer);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert!(!SUBMISSION_MISSED.load(std::sync::atomic::Ordering::Relaxed));
+        // SAFETY: both mapped views show page 0 of `section`.
+        unsafe {
+            assert_eq!((write_at as *const u32).read_volatile(), 0xCAFE_BEEF);
+            assert_eq!(((base + 16) as *const u32).read_volatile(), 0xCAFE_BEEF);
+        }
+        assert_eq!(read_page(0), 0xCAFE_BEEF);
+
+        // 6. Imports and descriptor pair count stayed at 1 across every guard and remap.
+        assert_eq!(sections().imports, imports_before + 1);
+        let final_pair = shared()
+            .iter()
+            .find(|(k, _)| *k == OURS)
+            .and_then(|(_, s)| s.pairs.get(&(Arc::as_ptr(&sec_arc) as usize)).copied());
+        assert_eq!(final_pair, Some(initial_pair));
+
+        unmap_piece(base, 512 * PAGE);
+        unmap_piece(mid_at, mid_len);
+        unmap_piece(tail_at, mid_len);
+        unmap_piece(next_at, next_len);
+        drop(sec_arc);
+        title_memory_section_freed(section as isize);
+        const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+        // SAFETY: coalesces our split placeholders and releases the reservation and section.
+        unsafe {
+            assert_ne!(
+                VirtualFree(base as *mut _, SIZE, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS),
+                0
+            );
+            assert_ne!(VirtualFree(base as *mut _, 0, MEM_RELEASE), 0);
+            CloseHandle(section);
+        }
     }
 }

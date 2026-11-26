@@ -362,8 +362,10 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 // mapping is a view of consecutive slices in place of a host placeholder.
 
 const PAGE: usize = 64 << 10;
+/// Largest physical-page section committed whole for in-place GPU mapping (a raw buffer view's 512 MiB limit).
+const MAX_COMMITTED_SECTION: usize = 512 * MIB;
 
-struct Section(HANDLE);
+struct Section(HANDLE, usize, bool);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -372,6 +374,7 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        victory_gpu::title_memory_section_freed(self.0 as isize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -488,21 +491,29 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    // Under Wine a committed section is a sparse file, free until touched,
+    // and committing a reserved one page by page costs a wineserver request
+    // each that scans every range committed so far; sections up to 512 MiB
+    // are committed whole on Windows too so the GPU can import them in place.
+    let mut committed = on_wine() || size <= MAX_COMMITTED_SECTION;
+    let create = |commit: bool| {
+        // SAFETY: plain section creation.
+        unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | if commit { SEC_COMMIT } else { SEC_RESERVE },
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        }
     };
+    let mut handle = create(committed);
+    if handle.is_null() && committed && !on_wine() {
+        committed = false;
+        handle = create(false);
+    }
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
@@ -515,7 +526,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section(handle, size, committed));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -583,7 +594,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        (slice.section.2 || commit(at.Value as usize, len)).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -831,13 +842,22 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if !slice.section.2 && !commit(base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
+    if slice.section.2 {
+        victory_gpu::title_memory_mapped(
+            base,
+            len,
+            slice.section.0 as isize,
+            slice.section.1,
+            slice.index * PAGE,
+        );
+    }
     for k in 0..len / PAGE {
         let shown = physical.shown.entry(slice.key(k)).or_default();
         // Pages shown elsewhere already: guarded here too if they are there.
@@ -1467,6 +1487,78 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn a_live_range_survives_a_guard_page_and_subrange_remaps() {
+        use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, VirtualProtect};
+
+        let pages = allocate(8);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            8 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let at = |page: usize| a.wrapping_byte_add(page * PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 8, pages.as_ptr()), a);
+        for p in 0..8 {
+            // SAFETY: all 8 pages are mapped read-write.
+            unsafe { at(p).cast::<u32>().write(0x100 + p as u32) };
+        }
+
+        // A 16 KiB guard inside page 2 leaves the neighbouring pages and
+        // the rest of the range intact, and restores cleanly.
+        let mut old = 0u32;
+        // SAFETY: 16 KiB inside page 2 of our mapped range.
+        unsafe {
+            assert_ne!(VirtualProtect(at(2), 16 << 10, PAGE_NOACCESS, &mut old), 0);
+            assert_eq!(at(1).cast::<u32>().read(), 0x101);
+            assert_eq!(at(3).cast::<u32>().read(), 0x103);
+            assert_ne!(VirtualProtect(at(2), 16 << 10, old, &mut old), 0);
+            assert_eq!(at(2).cast::<u32>().read(), 0x102);
+        }
+
+        // Remap middle [2..4) to pages[0..2] and back, then remap both
+        // [2..4) and neighbouring [4..6) while the first is live.
+        assert_eq!(XMemMapPhysicalPages(at(2), 2, pages.as_ptr()), at(2));
+        // SAFETY: pages 2..4 now alias pages 0..2.
+        unsafe {
+            assert_eq!(at(2).cast::<u32>().read(), 0x100);
+            assert_eq!(at(3).cast::<u32>().read(), 0x101);
+            assert_eq!(at(4).cast::<u32>().read(), 0x104);
+        }
+        assert_eq!(XMemMapPhysicalPages(at(2), 2, pages[2..].as_ptr()), at(2));
+        // SAFETY: pages 2..4 show their original slices again.
+        unsafe {
+            assert_eq!(at(2).cast::<u32>().read(), 0x102);
+            assert_eq!(at(3).cast::<u32>().read(), 0x103);
+        }
+
+        assert_eq!(XMemMapPhysicalPages(at(2), 2, pages.as_ptr()), at(2));
+        assert_eq!(XMemMapPhysicalPages(at(4), 2, pages[6..].as_ptr()), at(4));
+        let expected = [0x100, 0x101, 0x100, 0x101, 0x106, 0x107, 0x106, 0x107];
+        for (p, &val) in expected.iter().enumerate() {
+            // SAFETY: all 8 pages are mapped read-write.
+            assert_eq!(unsafe { at(p).cast::<u32>().read() }, val, "page {p}");
+        }
+        let mut linked = Vec::new();
+        aliases(at(2) as usize, PAGE, &mut linked);
+        assert_eq!(linked, [(at(2) as usize, a as usize)]);
+
+        assert_eq!(XMemMapPhysicalPages(a, 8, std::ptr::null()), a);
+        const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+        // SAFETY: coalesces the split placeholders of `a` and releases the reservation.
+        unsafe {
+            assert_ne!(
+                VirtualFree(a, 8 * PAGE, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS),
+                0
+            );
+            assert_ne!(VirtualFree(a, 0, MEM_RELEASE), 0);
+        }
+        assert_eq!(XMemFreePhysicalPages(8, pages.as_ptr()), 1);
     }
 }
 
