@@ -72,6 +72,9 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// The constant table's first byte and dwords, if the program has one.
+    #[cfg(test)]
+    pub code_table: Option<(u32, Vec<u32>)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -275,6 +278,9 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
+    /// The table's dwords, for a test to check where it starts.
+    #[cfg(test)]
+    code_words: Vec<u32>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -721,6 +727,8 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
+            #[cfg(test)]
+            code_words: Vec::new(),
             counters: HashMap::new(),
             abort: None,
             round16: round16(p),
@@ -748,6 +756,10 @@ impl<'a> Lower<'a> {
                             _ => None,
                         })
                     }))
+                    // A built descriptor's base is not the byte a load
+                    // through it reads: that is the base plus the load's own
+                    // offset, which can lie below the base.
+                    .chain(self.x.res.code_reads.iter())
                     .filter(|a| a.param == CODE)
                     .collect();
                 let lowest = addresses.iter().map(|a| a.offset & !3).min().ok_or("a code table")?;
@@ -772,6 +784,10 @@ impl<'a> Lower<'a> {
                 let g = self.s.m.constant_global("code", init);
                 let t = (g, first, words.len() as u32);
                 self.code_table = Some(t);
+                #[cfg(test)]
+                {
+                    self.code_words = words;
+                }
                 t
             }
         };
@@ -1412,6 +1428,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            code_table: self.code_table.map(|t| (t.1, self.code_words)),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -11316,6 +11334,9 @@ mod tests {
         lower_with(&words, layout(), used()).unwrap();
     }
 
+    // Where the constant table starts when a built descriptor's loads read below its base:
+    // kept in its own file (lower.rs is at the size limit).
+    mod code_table;
     /// Tables of 2D textures at s0 and samplers at s1.
     fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
         let range = |kind, user_data, slot| UsedResource {

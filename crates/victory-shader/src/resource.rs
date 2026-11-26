@@ -125,6 +125,10 @@ pub struct Resources {
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
+    /// The effective bytes of fixed loads through a built [`CODE`]
+    /// descriptor ([`Tracer::track`]'s `s_buffer_*` arm): the descriptor's
+    /// base plus the load's own byte offset, which can lie below the base.
+    pub code_reads: Vec<Address>,
     /// User SGPRs holding root parameters: value on entry (or loaded from
     /// the root signature's memory, [`USER_DATA`]), layout index, dword
     /// within the parameter.
@@ -192,7 +196,7 @@ pub fn track(
             };
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
-            let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
+            let mut descriptor = |op: &Operand, role| -> Result<Source, ShaderError> {
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
@@ -202,8 +206,12 @@ pub fn track(
                 {
                     offset.push((v, load));
                 }
-                out.descriptors.push(Descriptor { site, role, source });
-                Ok(())
+                out.descriptors.push(Descriptor {
+                    site,
+                    role,
+                    source: source.clone(),
+                });
+                Ok(source)
             };
             match &inst.fields {
                 Fields::Image { rsrc, .. } if inst.name().starts_with("image_bvh") => {
@@ -216,9 +224,9 @@ pub fn track(
                     }
                 }
                 Fields::Image { rsrc, sampler, .. } => {
-                    descriptor(rsrc, Role::Resource)?;
+                    let _ = descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {
-                        descriptor(s, Role::Sampler)?;
+                        let _ = descriptor(s, Role::Sampler)?;
                     }
                 }
                 // A cache invalidation names a buffer only to scope the
@@ -226,11 +234,31 @@ pub fn track(
                 // descriptor. Lowering one is a no-op on the host, so there
                 // is no descriptor to keep alive for it.
                 Fields::Buffer { rsrc, .. } if !inst.name().ends_with("_inv") => {
-                    descriptor(rsrc, Role::Resource)?
+                    let _ = descriptor(rsrc, Role::Resource)?;
                 }
                 Fields::Buffer { .. } => {}
-                Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
-                    descriptor(base, Role::Resource)?;
+                Fields::Smem {
+                    base,
+                    offset,
+                    soffset,
+                    ..
+                } if inst.name().starts_with("s_buffer_") => {
+                    let source = descriptor(base, Role::Resource)?;
+                    // A load through a descriptor built around the code
+                    // table reads the descriptor's base plus the load's own
+                    // byte offset, which can lie before the base (`s_sub_u32`
+                    // against `s_getpc_b64`): record the byte it reads, so
+                    // [`crate::emit::lower`] starts the table low enough.
+                    if let Source::Built { address, .. } = source
+                        && address.param == CODE
+                        && matches!(soffset, Operand::Scalar { code: NULL, .. })
+                    {
+                        out.code_reads.push(Address {
+                            param: CODE,
+                            offset: address.offset.wrapping_add(*offset as u32),
+                            dynamic: address.dynamic,
+                        });
+                    }
                 }
                 Fields::Smem {
                     base,
