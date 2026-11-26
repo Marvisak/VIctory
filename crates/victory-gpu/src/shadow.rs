@@ -521,12 +521,39 @@ impl Shadow {
                 merge_writeback(&mut title, host, before).then_some(title.as_ptr())
             }
         };
-        if let Some(bytes) = written {
+        // Into view memory, through our own view of its section where there
+        // is one (`VICTORY_BACK_OWN_VIEW`): the title's guard stays. Only for
+        // a page the title has not written since the copy took it (guarded
+        // still); one it wrote is open already and goes as before.
+        let beside = saved.is_none()
+            && written.is_some_and(|bytes| {
+                t.write_beside(from, n, |delta| {
+                    crate::host::write_mapped(from.wrapping_add(delta) as *mut u8, bytes, n)
+                })
+                .is_some()
+            });
+        if let Some(bytes) = written
+            && !beside
+        {
+            #[cfg(feature = "diagnostics")]
+            if crate::watch::own_view_on() {
+                crate::copystat::add(crate::copystat::C::BesideNone, 1);
+            }
             let _writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
         }
-        // Equal to title memory now: taken, unless it holds the page in part.
-        if from == page && to == page + PAGE {
+        if beside {
+            // The guard stayed: unless the title wrote the page meanwhile
+            // (its fault marked it changed here too) or the write failed,
+            // both of which leave it for the next refresh, the copy holds
+            // what title memory does.
+            #[cfg(feature = "diagnostics")]
+            if t.changed(page / PAGE) {
+                crate::copystat::add(crate::copystat::C::BesideChanged, 1);
+            }
+        } else if from == page && to == page + PAGE {
+            // Equal to title memory now: taken, unless it holds the page in
+            // part.
             t.taken(&[page / PAGE]);
         }
         written.map_or(0, |_| n)
@@ -1640,6 +1667,40 @@ pub(crate) mod tests {
         assert_eq!([read(PAGE + 10), read(PAGE + 20)], [0xbb, 0x77]);
         copy.copy_back(p, PAGE + 16);
         unregister(p, p as u64);
+    }
+
+    /// A marked page of view memory goes back through our own view of the
+    /// section: the shader's byte lands, the title's guard stays without
+    /// being opened, and the copy needs no take (it holds what title memory
+    /// does). A page the title wrote before the copy-back (open already)
+    /// goes as before: both bytes stay, and it is taken.
+    #[test]
+    fn marked_pages_of_view_memory_go_back_beside_the_guard() {
+        let (section, a, _) = crate::watch::tests::reported_section(2);
+        let len = 2 * PAGE;
+        register(a, a as u64, len as u64);
+        let Some(copy) = find(a as u64, len as u64) else {
+            unregister(a, a as u64);
+            crate::watch::title_memory_section_gone(section);
+            return; // no host GPU here
+        };
+        copy.update(a, len);
+        copy.writing(a, len, true);
+        copy.write_host((a + 10) as u64, &[0xaa]);
+        copy.write_host((a + PAGE + 10) as u64, &[0xbb]);
+        // SAFETY: the title's view, guarded: the handler opens it.
+        unsafe { ((a + PAGE + 40) as *mut u8).write_volatile(0x11) };
+        assert_eq!(copy.copy_back_marked(a), PAGE);
+        assert_eq!(copy.copy_back_marked(a + PAGE), PAGE);
+        // SAFETY: bytes of the title's view.
+        let read = |at: usize| unsafe { ((a + at) as *const u8).read_volatile() };
+        assert_eq!((read(10), read(PAGE + 10), read(PAGE + 40)), (0xaa, 0xbb, 0x11));
+        let t = copy.tracked.as_ref().expect("views are tracked");
+        assert!(t.guarded(a / PAGE) && !t.changed(a / PAGE), "page 0: guarded all along, nothing to take");
+        assert!(t.guarded(a / PAGE + 1) && !t.changed(a / PAGE + 1), "page 1: as before, taken");
+        copy.copy_back(a, len);
+        unregister(a, a as u64);
+        crate::watch::title_memory_section_gone(section);
     }
 
     /// Mark bits are handed out in runs and come back joined.
