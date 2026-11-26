@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,9 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    /// What its memory is like, and whether title memory opens in place
+    /// (`crate::unified`).
+    pub(crate) memory: crate::unified::Memory,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -92,6 +95,14 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// [`SUBMISSION_US`] and the copy-backs' time ([`COPY_BACK`]) since the
+/// last call, in microseconds: preparing, waiting for the GPU, copying back
+/// (tests).
+#[cfg(test)]
+pub(crate) fn take_submission_us() -> [u64; 3] {
+    [&SUBMISSION_US[0], &SUBMISSION_US[1], &COPY_BACK[0]].map(|t| t.swap(0, Ordering::Relaxed))
+}
+
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
 /// draws nothing at seconds per frame.
@@ -112,6 +123,9 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
         }
+        // Whether the GPU shares memory with the CPU: what a report from an
+        // APU or a translation layer needs first.
+        text.push_str(&format!("; host GPU memory: {}", host.memory));
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
             None if host.messages.is_none() => text.push_str(
@@ -189,6 +203,8 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some(adapter) = test_adapter() {
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             // Whether a GPU hang ends the run or freezes the PC (#1054).
@@ -236,6 +252,8 @@ fn create() -> windows::core::Result<Host> {
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
+        let memory = crate::unified::detect(&device);
+        tracing::info!("host GPU memory: {memory}");
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
@@ -250,6 +268,7 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             depth_bounds_supported,
+            memory,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -285,6 +304,28 @@ fn process_memory() -> (u64, u64) {
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
+/// Tests (benchmarks on another GPU of the machine), `VICTORY_TEST_ADAPTER`:
+/// the first adapter whose name holds that text, ignoring case.
+#[cfg(test)]
+fn test_adapter() -> Option<IDXGIAdapter1> {
+    let wanted = std::env::var("VICTORY_TEST_ADAPTER").ok()?.to_lowercase();
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        (0..).map_while(|i| factory.EnumAdapters1(i).ok()).find(|a| {
+            a.GetDesc1().is_ok_and(|d| {
+                let n = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+                String::from_utf16_lossy(&d.Description[..n]).to_lowercase().contains(&wanted)
+            })
+        })
+    }
+}
+
+#[cfg(not(test))]
+fn test_adapter() -> Option<IDXGIAdapter1> {
+    None
+}
+
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     // SAFETY: plain DXGI adapter queries.
     unsafe {
@@ -641,6 +682,93 @@ pub(crate) mod tests {
         list.close();
     }
 
+    /// Render targets, depth buffers and textures shaders write are kept
+    /// resident before textures uploaded from title memory (the textures
+    /// `crate::texture::title_written` names).
+    #[test]
+    fn textures_the_gpu_writes_are_kept_resident_first() {
+        for flags in [0x1, 0x2, 0x4, 0x1 | 0x4, 0x2 | 0x8, 0x1 | 0x20] {
+            assert_eq!(Residency::of_texture(flags), Residency::Frame, "{flags:#x}");
+        }
+        for flags in [0, 0x8, 0x10, 0x20, 0x40] {
+            assert_eq!(
+                Residency::of_texture(flags),
+                Residency::Streamed,
+                "{flags:#x}"
+            );
+        }
+        assert_eq!(Residency::Frame.priority(), D3D12_RESIDENCY_PRIORITY_HIGH);
+        assert_eq!(
+            Residency::Streamed.priority(),
+            D3D12_RESIDENCY_PRIORITY_NORMAL
+        );
+    }
+
+    /// A list's scratch chunks, read by its commands every frame, are kept
+    /// resident.
+    #[test]
+    fn list_scratch_chunks_are_kept_resident() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        list.scratch(1).unwrap();
+        let s = list.scratch.lock().unwrap();
+        assert_eq!(kept(&s.chunks[0]._buffer), Some(Residency::Frame));
+        drop(s);
+        list.close();
+    }
+
+    /// Copies in GPU upload heaps take half of what the rest of the process
+    /// leaves of the video memory budget: less as use rises, none past the
+    /// budget, at most 2 GiB (more on large budgets), and 2 GiB without a
+    /// reading.
+    #[test]
+    fn upload_copies_take_their_share_of_the_budget() {
+        const GIB: u64 = 1 << 30;
+        assert!(upload_fits(None, 0, 2 * GIB));
+        assert!(!upload_fits(None, GIB, GIB + 1));
+        let fake = crate::budget::tests::Fake::default();
+        let budget = crate::budget::tests::always_read(&fake);
+        let fits = |own, size| upload_fits(Some(&budget), own, size);
+        fake.set(8 * GIB, 2 * GIB);
+        assert!(fits(0, 2 * GIB), "2 GiB of the 6 left");
+        assert!(!fits(0, 2 * GIB + 1), "the ceiling");
+        fake.set(8 * GIB, 6 * GIB);
+        assert!(fits(0, GIB));
+        assert!(!fits(0, GIB + 1), "half of the 2 GiB left");
+        // The pool's own gigabyte is in the 6: the rest leave it 3.
+        assert!(fits(GIB, GIB / 2));
+        assert!(!fits(GIB, GIB / 2 + 1));
+        fake.set(8 * GIB, 8 * GIB);
+        assert!(!fits(0, 1), "nothing at the budget");
+        fake.set(24 * GIB, 0);
+        assert!(fits(0, 6 * GIB), "a quarter of a large budget");
+        assert!(!fits(0, 6 * GIB + 1));
+    }
+
+    /// Copies go to GPU upload heaps by default where the host has them,
+    /// written buffers' on NVIDIA only; `0` keeps them in system memory and
+    /// `1` puts written ones in video memory on any GPU; a host without the
+    /// heaps keeps every copy there, whatever the switches say.
+    #[test]
+    fn copies_are_in_video_memory_by_default_where_the_host_can() {
+        use std::ffi::OsStr;
+        let (on, off) = (Some(OsStr::new("1")), Some(OsStr::new("0")));
+        for (supported, nvidia, upload, writes, want) in [
+            (true, true, None, None, (true, true)),
+            (true, false, None, None, (true, false)),
+            (true, false, None, on, (true, true)),
+            (true, true, on, on, (true, true)),
+            (true, true, None, off, (true, false)),
+            (true, true, off, None, (false, false)),
+            (true, false, off, on, (false, false)),
+            (false, true, None, None, (false, false)),
+            (false, false, on, on, (false, false)),
+        ] {
+            let got = upload_placement(supported, nvidia, upload, writes);
+            assert_eq!(got, want, "{supported} {nvidia} {upload:?} {writes:?}");
+        }
+    }
+
     #[test]
     fn present_compositor_builds_both_pipeline_states() {
         let Some(host) = host() else {
@@ -837,6 +965,10 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With commands timed: the host copies each command binds, as (its
+    /// note, copy, bytes bound) (`crate::heat`).
+    #[cfg(feature = "diagnostics")]
+    uses: Mutex<Vec<(u32, crate::heat::Key, u64)>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; a host list is recorded by the
@@ -889,6 +1021,96 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
         // SAFETY: a plain call on a live object.
         let _ = unsafe { object.SetName(&windows::core::HSTRING::from(text())) };
     }
+}
+
+/// What a host allocation is to a frame, for the system's choice of what to
+/// demote to system memory once the process passes its video memory budget
+/// (`crate::budget`). Without priorities it picks among all of them alike,
+/// render targets used every frame included, and frames then take seconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Residency {
+    /// Read or written by most frames, and slow from system memory:
+    /// render targets, depth buffers and textures shaders write (the GPU
+    /// writes them every frame, and they hold the only copy of what it
+    /// wrote), view heaps' tables, the views' written-pages bitmap, list
+    /// scratch memory, host copies in GPU upload heaps. `HIGH`: demoted
+    /// after everything else of ours. Not `MAXIMUM`, which the system keeps
+    /// even past the budget at the cost of other processes.
+    Frame,
+    /// A texture uploaded from title memory (`crate::texture::title_written`):
+    /// the title streams most of them, each read by some frames. `NORMAL`,
+    /// what every allocation starts with: these go first, and sampling one
+    /// from system memory is slower but does not stall the frame the way a
+    /// render target there does. Not `LOW`, which would demote them before
+    /// allocations that have no priority set (depth twins, upload staging),
+    /// which frames need no more than these.
+    Streamed,
+}
+
+impl Residency {
+    /// A host texture's, from its resource flags: render target, depth
+    /// stencil or unordered access, or none of them.
+    pub(crate) fn of_texture(flags: u32) -> Self {
+        const TARGET_DEPTH_UNORDERED: u32 = 0x1 | 0x2 | 0x4;
+        if flags & TARGET_DEPTH_UNORDERED != 0 {
+            Residency::Frame
+        } else {
+            Residency::Streamed
+        }
+    }
+
+    fn priority(self) -> D3D12_RESIDENCY_PRIORITY {
+        match self {
+            Residency::Frame => D3D12_RESIDENCY_PRIORITY_HIGH,
+            Residency::Streamed => D3D12_RESIDENCY_PRIORITY_NORMAL,
+        }
+    }
+}
+
+/// Sets `object`'s (a heap or committed resource) residency priority as
+/// `residency` says. Called where such objects are made. Not for
+/// descriptor heaps: a priority on a shader-visible one removed the device
+/// at the next submission (RTX 5070 Ti, driver 621.24). Not for resources
+/// placed in a heap either: their residency is their heap's, which takes
+/// the priority instead (asked of a placed texture, the call removed the
+/// device at the next submission too).
+pub(crate) fn keep_resident(object: &impl Interface, residency: Residency) {
+    #[cfg(test)]
+    KEPT.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(object.as_raw() as usize, residency);
+    // The priority every allocation starts with: no call.
+    if residency.priority() == D3D12_RESIDENCY_PRIORITY_NORMAL {
+        return;
+    }
+    let Some(host) = host() else { return };
+    let (Ok(device), Ok(pageable)) = (
+        host.device.cast::<ID3D12Device1>(),
+        object.cast::<ID3D12Pageable>(),
+    ) else {
+        return;
+    };
+    // SAFETY: one live pageable object and its priority.
+    let set = unsafe { device.SetResidencyPriority(1, &Some(pageable), &residency.priority()) };
+    if let Err(e) = set {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::debug!(error = %e, "no residency priorities on this host"));
+    }
+}
+
+/// What [`keep_resident`] was asked for each object, by pointer (tests: the
+/// device has no getter for priorities).
+#[cfg(test)]
+static KEPT: Mutex<std::collections::BTreeMap<usize, Residency>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// What [`keep_resident`] was last asked for `object` (tests).
+#[cfg(test)]
+pub(crate) fn kept(object: &impl Interface) -> Option<Residency> {
+    KEPT.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(object.as_raw() as usize))
+        .copied()
 }
 
 /// The id of the next host list (see [`HostList::is_node`]).
@@ -1148,6 +1370,8 @@ impl Host {
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                uses: Mutex::default(),
             })
         }
     }
@@ -1237,6 +1461,24 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
+        // Snapshots of copies in video memory read their mirrors: brought up
+        // to date at once, and kept so until the copy-backs.
+        let snapshots: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = runs
+            .iter()
+            .flat_map(|l| {
+                l.deferred()
+                    .copies
+                    .iter()
+                    .filter_map(|s| match s {
+                        Step::GpuWrite(shadow, address, len, false, _) => {
+                            Some((shadow.clone(), *address, *len))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        crate::shadow::snapshots_ahead(&snapshots);
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
@@ -1292,6 +1534,8 @@ impl Host {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX));
+                let uses = runs[i].uses.lock().unwrap_or_else(|e| e.into_inner());
+                crate::heat::commands(&runs[i].command_times(frequency), &uses);
             }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
@@ -1399,17 +1643,24 @@ impl Host {
         if !read.is_empty() {
             crate::descriptor::make_read(&read);
         }
+        // What shaders wrote into copies in video memory, for the copy-backs
+        // below to read from their mirrors: in the ranges with snapshots
+        // (marked ones compare nothing; `copy_back_marks` pulled their pages).
+        crate::shadow::pull(&snapshots);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
                 let written = shadow.copy_back(address, len);
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                crate::heat::copied_back(shadow.range(), written);
             } else {
                 shadow.keep_writes(address, len);
                 crate::memory::note_withheld(len as u64);
                 crate::memory::drop_withheld(address, len);
             }
         }
+        crate::shadow::snapshots_done(&snapshots);
         for list in runs {
             for work in &list.deferred().after {
                 work();
@@ -1712,8 +1963,24 @@ impl HostList {
     /// (milliseconds, text) (diagnostics, timing on, after the list ran).
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
+        let times = self.command_times(frequency);
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+        let mut times: Vec<(f64, String)> = times
+            .into_iter()
+            .zip(notes.iter())
+            .map(|(ms, note)| (ms, note.0.chars().take(300).collect()))
+            .collect();
+        times.sort_by(|a, b| b.0.total_cmp(&a.0));
+        times.truncate(n);
+        times
+    }
+
+    /// Each noted command's GPU time in milliseconds, in order
+    /// (diagnostics, timing on, after the list ran).
+    #[cfg(feature = "diagnostics")]
+    fn command_times(&self, frequency: u64) -> Vec<f64> {
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let (Some((_, back)), count) = (self.stamps(), notes.min(STAMPS as usize - 1)) else {
             return Vec::new();
         };
         let mut data = std::ptr::null_mut();
@@ -1727,15 +1994,22 @@ impl HostList {
             back.Unmap(0, None);
             s
         };
-        let mut times: Vec<(f64, String)> = (0..count)
+        (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                ticks as f64 * 1e3 / frequency.max(1) as f64
             })
-            .collect();
-        times.sort_by(|a, b| b.0.total_cmp(&a.0));
-        times.truncate(n);
-        times
+            .collect()
+    }
+
+    /// With commands timed: the next noted command binds `bytes` of `key`
+    /// (`crate::heat`).
+    #[cfg(feature = "diagnostics")]
+    fn note_use(&self, key: crate::heat::Key, bytes: u64) {
+        if dred_on() && timing() {
+            let next = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+            self.uses.lock().unwrap_or_else(|e| e.into_inner()).push((next, key, bytes));
+        }
     }
 
     /// Whether `node` of the device-removed data (its breadcrumbs) is this
@@ -1787,6 +2061,8 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.uses.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -1903,6 +2179,12 @@ impl HostList {
         }
         self.memory_writer.store(uses, Ordering::Relaxed);
         Reset(&self.memory_writer)
+    }
+
+    /// Whether what the list's shaders write now is written by a program
+    /// using title memory ([`HostList::writer_uses_memory`]).
+    pub(crate) fn memory_writing(&self) -> bool {
+        self.memory_writer.load(Ordering::Relaxed)
     }
 
     /// A copy of ours replaced the compute root signature and pipeline.
@@ -2075,6 +2357,11 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        // A buffer in place is no copy: nothing to rank for video memory.
+        #[cfg(feature = "diagnostics")]
+        if !shadow.is_in_place() {
+            self.note_use(shadow.range(), len as u64);
+        }
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
@@ -2104,6 +2391,8 @@ impl HostList {
     /// (`crate::bindless`): what the heap's views reach is brought up to
     /// date at submission (once until a title copy intervenes).
     pub(crate) fn defer_heap(&self, viewed: &std::sync::Arc<crate::bindless::Viewed>) {
+        #[cfg(feature = "diagnostics")]
+        self.note_use(crate::heat::HEAP, 0);
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
         if deferred.refreshed.insert(key) {
@@ -2114,6 +2403,8 @@ impl HostList {
     /// Shaders of the list read title memory through the page table of
     /// view heap `heap` (`crate::memory::prepare` at submission).
     pub(crate) fn defer_memory(&self, heap: usize) {
+        #[cfg(feature = "diagnostics")]
+        self.note_use(crate::heat::MEMORY, 0);
         self.deferred().copies.push(Step::Memory(heap));
     }
 
@@ -2203,6 +2494,7 @@ impl HostList {
             let capacity = len.next_multiple_of(FIRST_SCRATCH_CHUNK).max(next).min(SCRATCH_CHUNK);
             let (buffer, data) = host.upload_buffer(capacity)?;
             name(&buffer, || format!("list scratch {capacity:#x}"));
+            keep_resident(&buffer, Residency::Frame);
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             #[cfg(feature = "diagnostics")]
@@ -2356,7 +2648,15 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len, marked, _) => {
+                Step::GpuWrite(shadow, address, len, marked, memory) => {
+                    // In place, only what a program using title memory
+                    // writes is kept, in case it is withheld.
+                    if shadow.is_in_place() {
+                        if *memory {
+                            shadow.withholdable(*address, *len);
+                        }
+                        continue;
+                    }
                     // The shaders start from the title's data, which a
                     // snapshot must hold (marked ranges keep none).
                     if !marked {
@@ -2448,6 +2748,8 @@ impl Batch {
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
+            #[cfg(feature = "diagnostics")]
+            crate::heat::copied_in(shadow.range(), copied);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
             total += copied;
@@ -3050,6 +3352,8 @@ impl Meter {
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
+        // Logs video memory use past nine tenths of the budget, once.
+        crate::budget::watch();
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
@@ -3121,6 +3425,7 @@ impl Meter {
                 let drops = crate::pipeline::take_drops();
                 crate::frame::log();
                 log_gpu_times(report_frames);
+                crate::heat::log(report_frames);
                 crate::copystat::log(report_frames);
                 crate::bindless::log(report_frames);
                 crate::shadow::log_views(report_frames);
@@ -3584,12 +3889,96 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+/// Bytes of host copies in GPU upload heaps now ([`Host::gpu_upload_buffer`]):
+/// charged when one is made, given back when D3D12 destroys it
+/// ([`give_back_upload`]).
+static UPLOAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called by D3D12 when a host copy in a GPU upload heap is destroyed (its
+/// last reference gone: the copy's, lists', and descriptor tables' clones
+/// of the resource): its `size` (the callback's data) leaves
+/// [`UPLOAD_BYTES`]. Counted for the whole run, the budget ran out after
+/// enough buffers came and went and every later copy stayed in system
+/// memory (64 copies of 32 MiB on an RTX 3050 Laptop, #2120).
+unsafe extern "system" fn give_back_upload(size: *mut std::ffi::c_void) {
+    UPLOAD_BYTES.fetch_sub(size as u64, Ordering::Relaxed);
+}
+
+/// [`UPLOAD_BYTES`] (tests, and the budget's report of what fills video
+/// memory).
+pub(crate) fn upload_bytes() -> u64 {
+    UPLOAD_BYTES.load(Ordering::Relaxed)
+}
+
+/// Video memory host copies may take in GPU upload heaps; the rest stay in
+/// system memory. Half of what the rest of the process leaves of the
+/// budget the system gives it: the title's render targets and textures
+/// come first, and past the budget the system would demote them as soon
+/// as these copies. At most 2 GiB (the fixed size of before), or a quarter
+/// of the budget on cards where that is more; 2 GiB on a host that does
+/// not report a budget.
+const UPLOAD_POOL: crate::budget::Pool = crate::budget::Pool {
+    part: (1, 2),
+    ceiling: 2 << 30,
+    large: (1, 4),
+};
+
+/// Whether a host copy of `size` bytes may go in a GPU upload heap, with
+/// `own` bytes of copies there already: within [`UPLOAD_POOL`]'s limit
+/// under `budget`.
+fn upload_fits(budget: Option<&crate::budget::Budget>, own: u64, size: u64) -> bool {
+    let limit = budget.map_or(UPLOAD_POOL.ceiling, |b| b.limit(&UPLOAD_POOL, own));
+    own.saturating_add(size) <= limit
+}
+
+/// Where host copies of title buffers go, from whether the host has GPU
+/// upload heaps (`GPUUploadHeapSupported`, resizable BAR), whether its GPU
+/// is NVIDIA's, and the values of `VICTORY_GPU_UPLOAD` and
+/// `VICTORY_GPU_UPLOAD_WRITES`: whether the copies of buffers shaders only
+/// read go to GPU upload heaps, and whether those of buffers shaders write
+/// go there too (with a mirror). Read-only copies by default where the host
+/// has the heaps: shaders read video memory 30 times as fast as system
+/// memory over PCI Express. Written copies by default on NVIDIA only, where
+/// the GPU's time saved outweighs what the mirrors cost the CPU; elsewhere
+/// the mirrors cost more than the reads save (`docs/gpu-memory.md`).
+/// `VICTORY_GPU_UPLOAD=0` keeps every copy in system memory;
+/// `VICTORY_GPU_UPLOAD_WRITES=0` keeps written copies there, and `1`
+/// puts them in video memory on any GPU.
+fn upload_placement(
+    supported: bool,
+    nvidia: bool,
+    upload: Option<&std::ffi::OsStr>,
+    writes: Option<&std::ffi::OsStr>,
+) -> (bool, bool) {
+    let read_only = supported && crate::switch::on_unless_off(upload);
+    let written = match writes {
+        None => nvidia,
+        set => crate::switch::on_unless_off(set),
+    };
+    (read_only, read_only && written)
+}
+
+/// The host gives GPU upload buffers no destruction callback (a translation
+/// layer), so their budget charge could not go back: copies stay in system
+/// memory from the first one on ([`Host::gpu_upload_buffer`]).
+static NO_UPLOAD_CALLBACKS: AtomicBool = AtomicBool::new(false);
+
+/// Tests: [`Host::copy_now`] fails, as when the device is removed.
+#[cfg(test)]
+pub(crate) static COPIES_FAIL: AtomicBool = AtomicBool::new(false);
+
+/// The PCI vendor ID of NVIDIA's GPUs (`DXGI_ADAPTER_DESC1::VendorId`).
+const NVIDIA: u32 = 0x10DE;
+
 impl Host {
-    /// Diagnostics, `VICTORY_COPIES_IN_VIDEO_MEMORY`: [`Host::shared_buffer`]s
-    /// (host copies of title memory among them) in video memory the CPU maps
-    /// (a GPU upload heap, where the host has one), to measure how much of
-    /// the GPU's time is shaders reading the copies over the bus. CPU reads
-    /// of them (snapshots, copy-backs) become slow: for that measurement only.
+    /// Diagnostics, `VICTORY_COPIES_IN_VIDEO_MEMORY`: every host copy of
+    /// title memory in video memory the CPU maps (a GPU upload heap, where
+    /// the host has one), read-only and written copies alike, whatever
+    /// [`upload_placement`] would choose: to measure how much of the GPU's
+    /// time is shaders reading the copies over the bus. Written copies keep
+    /// their mirrors, the marks bitmap and other [`Host::shared_buffer`]s
+    /// stay in system memory (the CPU reads them), and the copies count
+    /// against [`UPLOAD_POOL`] as ever.
     #[cfg(feature = "diagnostics")]
     fn copies_in_video_memory(&self) -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
@@ -3618,17 +4007,239 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_CUSTOM,
-            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-            ..Default::default()
+        self.shared_mapped_buffer(size, false)
+    }
+
+    /// A buffer in video memory that the CPU maps through the PCI BAR (a
+    /// GPU upload heap, `D3D12_OPTIONS16`): shaders read it as fast as any
+    /// video memory (on an RTX 5070 Ti ~720 GB/s against ~23 GB/s from
+    /// system memory), the CPU writes it about as fast as system memory,
+    /// and reading it from the CPU is very slow (~50 MB/s). For host copies
+    /// of title memory that shaders only read. None when the host has no
+    /// such heaps (no resizable BAR, older runtimes), `VICTORY_GPU_UPLOAD=0`
+    /// turned them off, or the copies there would pass their share of the video
+    /// memory budget ([`UPLOAD_POOL`]). Kept resident before what the title
+    /// streams ([`keep_resident`]).
+    pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if !self.gpu_upload() || NO_UPLOAD_CALLBACKS.load(Ordering::Relaxed) {
+            return None;
+        }
+        let size = size.max(1);
+        let budget = crate::budget::get();
+        let own = UPLOAD_BYTES.fetch_add(size, Ordering::Relaxed);
+        if !upload_fits(budget, own, size) {
+            UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            static FULL: std::sync::Once = std::sync::Once::new();
+            FULL.call_once(|| {
+                tracing::info!(
+                    "host copies past their share of the video memory budget go to system memory"
+                )
+            });
+            return None;
+        }
+        let Some((buffer, data)) = self.shared_mapped_buffer(size, true) else {
+            UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            return None;
         };
-        #[cfg(feature = "diagnostics")]
-        let heap = if self.copies_in_video_memory() {
-            D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() }
+        // The charge goes back when the buffer is destroyed, not when the
+        // copy drops: lists and descriptor tables may hold it longer.
+        // SAFETY: a live buffer; the callback's data is the size alone.
+        let watched = unsafe {
+            buffer
+                .cast::<windows::Win32::Graphics::Direct3D::ID3DDestructionNotifier>()
+                .and_then(|n| {
+                    n.RegisterDestructionCallback(Some(give_back_upload), size as *const _)
+                })
+        };
+        if watched.is_err() {
+            // Not given back when destroyed, it would count for good. The
+            // host has no such callbacks: no buffer is made again only to go.
+            drop(buffer);
+            UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            NO_UPLOAD_CALLBACKS.store(true, Ordering::Relaxed);
+            static UNWATCHED: std::sync::Once = std::sync::Once::new();
+            UNWATCHED.call_once(|| {
+                tracing::info!(
+                    "no destruction callback on this host: host copies stay in system memory"
+                )
+            });
+            return None;
+        }
+        if let Some(b) = budget {
+            b.charge(size);
+        }
+        keep_resident(&buffer, Residency::Frame);
+        Some((buffer, data))
+    }
+
+    /// Whether host copies that shaders only read go to GPU upload heaps
+    /// ([`upload_placement`]). Asked once.
+    pub(crate) fn gpu_upload(&self) -> bool {
+        self.upload_placement().0
+    }
+
+    /// Whether host copies that shaders write go to GPU upload heaps too,
+    /// with a system memory mirror for the CPU (`crate::shadow`;
+    /// [`upload_placement`]). Asked once.
+    pub(crate) fn gpu_upload_writes(&self) -> bool {
+        self.upload_placement().1
+    }
+
+    /// [`upload_placement`] for this host and the switches, once.
+    fn upload_placement(&self) -> (bool, bool) {
+        static ON: OnceLock<(bool, bool)> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: a feature query writing the structure of its size.
+            let known = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+            }
+            .is_ok();
+            let supported = known && o.GPUUploadHeapSupported.as_bool();
+            // SAFETY: plain device and DXGI queries.
+            let vendor = unsafe {
+                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                    .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(self.device.GetAdapterLuid()))
+                    .and_then(|a| a.GetDesc1())
+                    .map_or(0, |d| d.VendorId)
+            };
+            let (read_only, written) = upload_placement(
+                supported,
+                vendor == NVIDIA,
+                std::env::var_os("VICTORY_GPU_UPLOAD").as_deref(),
+                std::env::var_os("VICTORY_GPU_UPLOAD_WRITES").as_deref(),
+            );
+            tracing::info!(
+                supported,
+                vendor = format_args!("{vendor:#x}"),
+                read_only,
+                written,
+                "host copies of title buffers in GPU upload heaps (VICTORY_GPU_UPLOAD, _WRITES)"
+            );
+            #[cfg(feature = "diagnostics")]
+            if self.copies_in_video_memory() {
+                return (true, true);
+            }
+            (read_only, written)
+        })
+    }
+
+    /// Copies `regions` (destination, its offset, source, its offset,
+    /// bytes) between buffers on the GPU, now, and waits: for the GPU's
+    /// writes into copies in video memory to reach their system memory
+    /// mirrors before the CPU reads them (`crate::shadow::pull`). Runs in a
+    /// list of its own after whatever the queue holds; callable from inside
+    /// a submission's copy-back. Buffers start and end in the common state
+    /// (buffers enter and leave the copy states implicitly). Returns whether
+    /// the copy was seen to finish: false when there is no copier, a call
+    /// failed, or the wait did not end with the fence (then the copier is not
+    /// used again until the GPU reaches it).
+    pub(crate) fn copy_now(
+        &self,
+        regions: &[(&ID3D12Resource, u64, &ID3D12Resource, u64, u64)],
+    ) -> bool {
+        if regions.is_empty() {
+            return true;
+        }
+        #[cfg(test)]
+        if COPIES_FAIL.load(Ordering::Relaxed) {
+            return false;
+        }
+        struct Copier {
+            allocator: ID3D12CommandAllocator,
+            list: ID3D12GraphicsCommandList,
+            fence: ID3D12Fence,
+            event: HANDLE,
+            value: u64,
+        }
+        // SAFETY: D3D12 objects are free-threaded; the event is waited on
+        // under the mutex only.
+        unsafe impl Send for Copier {}
+        static COPIER: OnceLock<Option<Mutex<Copier>>> = OnceLock::new();
+        let copier = COPIER.get_or_init(|| {
+            // SAFETY: plain creation; the list is closed until used.
+            let made = unsafe {
+                (|| -> windows::core::Result<Copier> {
+                    let allocator: ID3D12CommandAllocator =
+                        self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                    list.Close()?;
+                    let fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                    let event = CreateEventW(None, false, false, None)?;
+                    Ok(Copier { allocator, list, fence, event, value: 0 })
+                })()
+            };
+            match made {
+                Ok(c) => Some(Mutex::new(c)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no host copier: copies in video memory are not read back");
+                    None
+                }
+            }
+        });
+        let Some(copier) = copier else {
+            return false;
+        };
+        let mut c = copier.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a plain query on our fence.
+        if unsafe { c.fence.GetCompletedValue() } < c.value {
+            // An earlier copy was not seen to finish: its list may still
+            // hold the allocator.
+            return false;
+        }
+        let value = c.value + 1;
+        // SAFETY: the allocator's last list finished (checked above); the
+        // buffers are live and their ranges inside them (the caller's).
+        let ran = unsafe {
+            c.allocator.Reset().and_then(|()| {
+                c.list.Reset(&c.allocator, None)?;
+                for &(dst, dst_at, src, src_at, bytes) in regions {
+                    c.list.CopyBufferRegion(dst, dst_at, src, src_at, bytes);
+                }
+                c.list.Close()?;
+                let list: ID3D12CommandList = c.list.cast()?;
+                self.queue.ExecuteCommandLists(&[Some(list)]);
+                // From here the list may run: the fence value is its own.
+                c.value = value;
+                self.queue.Signal(&c.fence, value)?;
+                if c.fence.GetCompletedValue() < value {
+                    c.fence.SetEventOnCompletion(value, c.event)?;
+                    WaitForSingleObject(c.event, INFINITE);
+                }
+                // A removed device reports every fence value reached.
+                Ok(c.fence.GetCompletedValue() >= value
+                    && self.device.GetDeviceRemovedReason().is_ok())
+            })
+        };
+        match ran {
+            Ok(done) => done,
+            Err(e) => {
+                tracing::warn!(error = %e, "a host copy did not run");
+                false
+            }
+        }
+    }
+
+    /// A [`Host::shared_buffer`] in system memory, or (`upload`) in a GPU
+    /// upload heap ([`Host::gpu_upload_buffer`]).
+    fn shared_mapped_buffer(&self, size: u64, upload: bool) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = if upload {
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+                ..Default::default()
+            }
         } else {
-            heap
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            }
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -3665,7 +4276,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
+                tracing::warn!(error = %e, size, upload, "no shared buffer");
                 None
             }
         }
@@ -4015,6 +4626,52 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+
+    /// A program using title memory writing a buffer in place: the buffer
+    /// gets a copy from its next use on, and when that submission's writes
+    /// are withheld, title memory gets its bytes back.
+    #[test]
+    fn a_program_using_title_memory_moves_a_buffer_in_place_to_a_copy() {
+        use crate::watch::PAGE;
+        const NAME: &str =
+            "host::withholding::a_program_using_title_memory_moves_a_buffer_in_place_to_a_copy";
+        if !crate::shadow::tests::rerun_in_place(NAME) {
+            return;
+        }
+        let Some(host) = super::host() else { return };
+        let p = crate::watch::tests::pool(1);
+        // SAFETY: our pool.
+        unsafe { ((p + 16) as *mut u8).write_volatile(0x11) };
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        if !copy.is_in_place() {
+            drop(copy);
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // the host cannot open title memory in place
+        }
+        let list = host.new_list().unwrap();
+        {
+            let _writer = list.writer_uses_memory(true);
+            let address = (p + 16) as u64;
+            copy.refresh(&list, address, 16);
+            copy.gpu_writes(&list, address, 16, false);
+            // The shader's write, after the step that keeps the range's bytes.
+            let copy = copy.clone();
+            list.defer_host(move || copy.write_host(address, &[0x33]));
+        }
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: a byte of our pool.
+        let title = unsafe { ((p + 16) as *const u8).read_volatile() };
+        assert_eq!(title, 0x11, "withheld: title memory keeps its bytes");
+        let again = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        assert!(!again.is_in_place(), "a copy from now on");
+        drop((copy, again, list));
+        crate::shadow::unregister(p, p as u64);
+        crate::shadow::tests::free_once_let_go(p);
     }
 }
 

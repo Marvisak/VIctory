@@ -616,6 +616,14 @@ impl Tracked {
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
     }
 
+    /// Whether a page over title addresses `[from, to)` has saved bytes
+    /// ([`Tracked::saved`]), which [`Tracked::refreshed`] would update.
+    pub(crate) fn saves(&self, from: usize, to: usize) -> bool {
+        let saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        !saved.bytes.is_empty()
+            && (from / PAGE..to.div_ceil(PAGE)).any(|page| saved.bytes.contains_key(&page))
+    }
+
     /// The copy took `bytes` at title address `from`: any saved bytes of pages
     /// it covers take them too, so marked copy-back neither takes a partial
     /// refresh for the GPU's nor drops a shader write back to the pre-fault byte.

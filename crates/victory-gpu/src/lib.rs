@@ -18,6 +18,8 @@
 
 #[cfg(windows)]
 mod bindless;
+#[cfg(windows)]
+mod budget;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -32,9 +34,13 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod heat;
 mod hold;
 #[cfg(windows)]
 mod host;
+#[cfg(windows)]
+mod in_place;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
@@ -42,6 +48,8 @@ pub mod list;
 mod memory;
 pub mod object;
 pub mod pipeline;
+#[cfg(windows)]
+mod pinned;
 #[cfg(windows)]
 mod placement;
 #[cfg(windows)]
@@ -65,12 +73,16 @@ mod texture;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
+mod unified;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use pinned::{title_memory_change, title_memory_held};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped,

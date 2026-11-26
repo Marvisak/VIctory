@@ -504,6 +504,10 @@ impl Shared {
     /// back, the table rewritten. Only while no submission runs (the GPU
     /// reads the table and the views).
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
+        // What shaders write through the table must be withheld from title
+        // memory when they miss: the table names copies, never title memory
+        // itself ([`crate::shadow::page_tables_in_use`]).
+        crate::shadow::page_tables_in_use();
         let copies = crate::shadow::all();
         let live: HashSet<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
         self.pairs.retain(|copy, &mut slot| {
@@ -684,10 +688,19 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             for &(_, at) in &writes {
                 drop_withheld(at as usize, 1 << 16);
             }
+        } else {
+            // The pages from copies in video memory, into their mirrors.
+            let pulled: Vec<_> = writes
+                .iter()
+                .map(|&(k, at)| (copies[k].clone(), at as usize, 1 << 16))
+                .collect();
+            crate::shadow::pull(&pulled);
         }
         let mut written = 0;
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
             let n = copies[k].copy_back_page(at as usize);
+            #[cfg(feature = "diagnostics")]
+            crate::heat::copied_back(copies[k].range(), n);
             tracing::debug!(
                 page = format_args!("{at:#x}"),
                 copy = format_args!("{:#x?}", copies[k].range()),
