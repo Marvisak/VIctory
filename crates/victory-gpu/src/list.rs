@@ -316,6 +316,16 @@ pub(crate) extern "system" fn create_allocator(
     object::hand_out(ALLOCATOR, allocator, iid, &ALLOCATOR_IIDS, out)
 }
 
+fn allocator_kind(allocator: This) -> Option<u32> {
+    // SAFETY: a non-null allocator argument points to a live COM object.
+    let object = unsafe { allocator.as_ref() }?;
+    if !object.uses_table(&ALLOCATOR_FUNCTIONS) {
+        return None;
+    }
+    // SAFETY: the allocator table identifies our Allocator layout.
+    Some(unsafe { (*allocator.cast::<Allocator>()).kind })
+}
+
 /// Lists start open, as in D3D12.
 pub(crate) extern "system" fn create_list(
     _: This,
@@ -363,7 +373,7 @@ fn new_list(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    if allocator.is_null() {
+    if allocator.is_null() || (!out.is_null() && allocator_kind(allocator) != Some(kind)) {
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
@@ -455,7 +465,10 @@ extern "system" fn close(this: This) -> HRESULT {
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
-    if allocator.is_null() {
+    let Some(kind) = allocator_kind(allocator) else {
+        return E_INVALIDARG;
+    };
+    if kind != list_type(this) {
         return E_INVALIDARG;
     }
     // A queue may still hold what the list recorded (`restart`, `leave`).
@@ -2045,5 +2058,62 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[test]
+    fn list_creation_and_reset_reject_the_wrong_allocator_type() {
+        type Allocate = extern "system" fn(This, u32, *const Iid, *mut This) -> HRESULT;
+        type Create =
+            extern "system" fn(This, u32, u32, This, This, *const Iid, *mut This) -> HRESULT;
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Reset = extern "system" fn(This, This, This) -> HRESULT;
+        type Release = extern "system" fn(This) -> u32;
+
+        let device = crate::device::device();
+        let allocate = slot::<Allocate>(device, 0x48);
+        let create = slot::<Create>(device, 0x60);
+        let null = std::ptr::null();
+        let allocator = |kind| {
+            let mut out = null;
+            assert_eq!(allocate(device, kind, &ALLOCATOR_IIDS[0], &mut out), S_OK);
+            assert!(!out.is_null());
+            out
+        };
+        let direct = allocator(0);
+        let copy = allocator(3);
+        let new_list = |kind, allocator| {
+            let mut out = null;
+            let hr = create(device, 0, kind, allocator, null, &LIST_IIDS[1], &mut out);
+            (hr, out)
+        };
+        let mut results = Vec::new();
+        for (kind, matching, wrong) in [(0, direct, copy), (3, copy, direct)] {
+            let (wrong_create, wrong_list) = new_list(kind, wrong);
+            let made_wrong_list = !wrong_list.is_null();
+            if made_wrong_list {
+                slot::<Release>(wrong_list, 0x10)(wrong_list);
+            }
+
+            let (created, list) = new_list(kind, matching);
+            assert_eq!(created, S_OK);
+            assert!(!list.is_null());
+            let close = slot::<Close>(list, 0x48);
+            let reset = slot::<Reset>(list, 0x50);
+            assert_eq!(close(list), S_OK);
+            let wrong_reset = reset(list, wrong, null);
+            if wrong_reset == S_OK {
+                assert_eq!(close(list), S_OK);
+            }
+            let matching_reset = reset(list, matching, null);
+            if matching_reset == S_OK {
+                assert_eq!(close(list), S_OK);
+            }
+            slot::<Release>(list, 0x10)(list);
+            results.push((wrong_create, made_wrong_list, wrong_reset, matching_reset));
+        }
+        for allocator in [direct, copy] {
+            slot::<Release>(allocator, 0x10)(allocator);
+        }
+        assert_eq!(results, [(E_INVALIDARG, false, E_INVALIDARG, S_OK); 2]);
     }
 }

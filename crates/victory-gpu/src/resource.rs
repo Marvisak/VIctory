@@ -3062,15 +3062,25 @@ mod tests {
         let queue_iid = guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]);
         let allocator_iid = guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
         let list_iid = guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
-        let (mut graphics, mut compute, mut allocator, mut drawing, mut computing) = (null, null, null, null, null);
+        let (mut graphics, mut compute) = (null, null);
         for (kind, queue) in [(0u32, &mut graphics), (2, &mut compute)] {
             let desc = [kind, 0, 0, 0];
             assert_eq!(crate::queue::create(null, desc.as_ptr().cast(), &queue_iid, queue), S_OK);
         }
-        assert_eq!(crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator), S_OK);
-        for (kind, list) in [(0u32, &mut drawing), (2, &mut computing)] {
-            assert_eq!(crate::list::create_list(null, 0, kind, allocator, null, &list_iid, list), S_OK);
-        }
+        let list_and_allocator = |kind| {
+            let (mut list, mut allocator) = (null, null);
+            assert_eq!(
+                crate::list::create_allocator(null, kind, &allocator_iid, &mut allocator),
+                S_OK
+            );
+            assert_eq!(
+                crate::list::create_list(null, 0, kind, allocator, null, &list_iid, &mut list),
+                S_OK
+            );
+            (list, allocator)
+        };
+        let (drawing, graphics_allocator) = list_and_allocator(0);
+        let (computing, compute_allocator) = list_and_allocator(2);
         #[repr(C)]
         struct Location {
             resource: This,
@@ -3108,7 +3118,7 @@ mod tests {
         // D3D12 lets the title reset a list as soon as it has submitted it:
         // the held part keeps its own host list and what it reads.
         type Reset = extern "system" fn(This, This, This) -> HRESULT;
-        assert_eq!(slot::<Reset>(computing, 0x50)(computing, allocator, null), S_OK);
+        assert_eq!(slot::<Reset>(computing, 0x50)(computing, compute_allocator, null), S_OK);
         slot::<Close>(computing, 0x48)(computing);
 
         slot::<Execute>(graphics, 0x50)(graphics, 1, &drawing);
@@ -3118,6 +3128,9 @@ mod tests {
         for row in 0..4 {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}: the texture as the graphics list filled it");
+        }
+        for allocator in [graphics_allocator, compute_allocator] {
+            slot::<extern "system" fn(This) -> u32>(allocator, 0x10)(allocator);
         }
     }
 

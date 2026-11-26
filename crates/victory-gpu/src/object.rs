@@ -57,6 +57,10 @@ impl Object {
             refs: AtomicU32::new(0),
         }
     }
+
+    pub(crate) fn uses_table<const N: usize>(&self, table: &'static Table<N>) -> bool {
+        self.functions == table.0.as_ptr()
+    }
 }
 
 pub(crate) type This = *const Object;
