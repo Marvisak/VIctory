@@ -42,6 +42,9 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    /// The adapter's vendor id: some drivers refuse a render target of a
+    /// format their support query says they take (#1952).
+    vendor: u32,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -247,9 +250,18 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
+        // The adapter's vendor, for the formats a driver refuses while its
+        // support query says it takes them (#1952). The call is already in
+        // an `unsafe` block: the queries are plain DXGI ones on a live device.
+        let vendor = device
+            .cast::<windows::Win32::Graphics::Dxgi::IDXGIDevice>()
+            .and_then(|d| d.GetAdapter())
+            .and_then(|a| a.GetDesc())
+            .map_or(0, |d| d.VendorId);
         Ok(Host {
             device,
             depth_bounds_supported,
+            vendor,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -283,6 +295,99 @@ fn process_memory() -> (u64, u64) {
     (c.PagefileUsage as u64, c.WorkingSetSize as u64)
 }
 
+/// Whether the host makes a render target view of `format`, asked once per
+/// format. A view of one it refuses is an illegal call, and D3D12 removes the
+/// device for it rather than returning.
+fn takes_render_target(format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    static KNOWN: std::sync::Mutex<Vec<(i32, bool)>> = std::sync::Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format.0) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: format,
+        ..Default::default()
+    };
+    let ok = host().is_some_and(|h| {
+        // SAFETY: a plain query into a struct of its size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0
+    });
+    known.push((format.0, ok));
+    ok
+}
+
+/// Whether to keep the view off because the driver refuses a format **its own
+/// support query says it takes**: NVIDIA answers
+/// `D3D12_FORMAT_SUPPORT1_RENDER_TARGET` for `B4G4R4A4_UNORM` (115) and then
+/// refuses `CreateRenderTargetView`, which D3D12 answers by removing the
+/// device (#1952). AMD takes that format as a target, so the refusal is by
+/// vendor and not by format.
+/// The decision `stand_in_for` takes, without a device: the stand-in of a
+/// packed format the host refuses, when it takes the stand-in and the
+/// texture's own uses survive it, `None` otherwise. Pure, so the cases are
+/// testable.
+///
+/// A texture that is written through an unordered access view does **not**
+/// stand in: `B5G5R5A1_UNORM` is not a typed-UAV format on the hosts that
+/// refuse `B4G4R4A4_UNORM` either, so a stand-in would trade a removed
+/// device for lost writes (#1952's RTX 4060 report). There the description
+/// keeps its format and the view is refused instead.
+pub(crate) fn stand_in_decision(
+    format: u32,
+    refused: bool,
+    stand_in_taken: bool,
+    unordered_use: bool,
+) -> Option<u32> {
+    const B4G4R4A4_UNORM: u32 = 115;
+    const B5G5R5A1_UNORM: u32 = 86;
+    if format == B4G4R4A4_UNORM && refused && stand_in_taken && !unordered_use {
+        Some(B5G5R5A1_UNORM)
+    } else {
+        None
+    }
+}
+
+/// The format a packed console target is made as on this host, or `None` when
+/// it is made as itself. A driver that answers yes to the format's support
+/// query and then refuses the view removes the device (#1952): the target is
+/// made as `B5G5R5A1_UNORM` when that is refused too as a view and the host
+/// takes the stand-in, so a host that renders to the format keeps it.
+pub(crate) fn stand_in_for(format: u32, flags: u32) -> Option<u32> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    if format != 115 {
+        return None;
+    }
+    let host = host()?;
+    let refused =
+        refuses_target(host.vendor, format) || !takes_render_target(DXGI_FORMAT(format as i32));
+    // The texture's own uses: with unordered access, a stand-in that cannot
+    // be a typed UAV would lose the writes it exists for.
+    const UNORDERED: u32 = 4;
+    let unordered_use = flags & UNORDERED != 0;
+    let stand_in = stand_in_decision(format, refused, takes_render_target(DXGI_FORMAT(86)), unordered_use);
+    if stand_in.is_none() && refused && unordered_use {
+        tracing::debug!(
+            format,
+            "a packed target stays as it is: it is written through unordered access and the stand-in cannot be a typed UAV"
+        );
+    }
+    stand_in
+}
+
+fn refuses_target(vendor: u32, format: u32) -> bool {
+    const NVIDIA: u32 = 0x10DE;
+    const B4G4R4A4_UNORM: u32 = 115;
+    vendor == NVIDIA && format == B4G4R4A4_UNORM
+}
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -614,6 +719,18 @@ pub(crate) mod tests {
         for &object in &objects {
             assert_eq!(crate::texture::uploads(object), 1, "unchanged: not again");
         }
+    }
+
+    /// The vendor that refuses a format its own query accepts is the one that
+    /// has to skip the view — and the card that takes the format must not.
+    #[test]
+    fn a_format_a_vendor_refuses_is_known_before_the_view_is_made() {
+        const NVIDIA: u32 = 0x10DE;
+        const AMD: u32 = 0x1002;
+        const B4G4R4A4_UNORM: u32 = 115;
+        assert!(refuses_target(NVIDIA, B4G4R4A4_UNORM), "NVIDIA refuses it");
+        assert!(!refuses_target(AMD, B4G4R4A4_UNORM), "AMD takes it");
+        assert!(!refuses_target(NVIDIA, 28), "and NVIDIA takes R8G8B8A8");
     }
 
     #[test]
@@ -1628,6 +1745,21 @@ impl Host {
         unsafe {
             let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.rtv_size) as usize;
+            // The view of a format this host refuses is an illegal call: a
+            // null view costs the target and keeps the device and the run.
+            let format = match desc.map(|d| d.Format) {
+                Some(f) if f != windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN => f,
+                _ => resource.GetDesc().Format,
+            };
+            if refuses_target(self.vendor, format.0 as u32) || !takes_render_target(format) {
+                tracing::warn!(
+                    format = format.0,
+                    vendor = %format_args!("{:#x}", self.vendor),
+                    "no render target of this format on this host: a null view"
+                );
+                self.device.CreateRenderTargetView(None, None, handle);
+                return handle;
+            }
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
             handle
@@ -4131,3 +4263,5 @@ mod present_plane_tests {
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
 }
+
+

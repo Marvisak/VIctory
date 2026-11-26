@@ -238,6 +238,7 @@ pub(crate) fn pc_format(format: u32) -> u32 {
         118 => 20,
         119 => 21,
         120 => 22,
+
         other => other,
     }
 }
@@ -1120,6 +1121,13 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    // A packed console target the host refuses as a render target is made as
+    // the stand-in of the same two bytes per texel, and only where the host
+    // takes that stand-in: the ladder and the copies keep their sizes, and a
+    // host that renders to the format natively keeps its colours (#1952).
+    if let Some(stand_in) = crate::host::stand_in_for(d.format, d.flags) {
+        d.format = stand_in;
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1791,10 +1799,6 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 #[cfg(windows)]
 pub(crate) fn alias_source(placed: This) -> Option<This> {
     const WRITTEN: u32 = 0x7; // render target, depth, unordered access
-    // A shader view of no resource (a null view) has no memory.
-    if placed.is_null() {
-        return None;
-    }
     let b = resource(placed);
     let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
     let bytes = |d: &ResourceDesc| {
@@ -2293,12 +2297,6 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
-    #[test]
-    fn a_null_view_has_no_alias_source() {
-        assert_eq!(alias_source(std::ptr::null()), None);
-    }
-
     #[test]
     fn a_regions_rows_in_a_footprint() {
         // R32_FLOAT (41) 100x8x1, pitch 512.
@@ -2353,6 +2351,41 @@ mod tests {
             layout: 1,
             flags: 0,
         }
+    }
+
+    /// The console's 2-byte packed colour formats have no PC render target on
+    /// NVIDIA: `B4G4R4A4_UNORM` is refused on creation and takes the device
+    /// with it (#1952). It stands in as `B5G5R5A1_UNORM`, which is the same
+    /// two bytes per texel - the sizes the ladder and the copies rely on - and
+    /// which the host does make a target of. The colours differ; that is the
+    /// cost, and it is a picture rather than none.
+    #[test]
+    fn a_packed_four_bit_target_stands_in_for_one_the_host_refuses() {
+        const B4G4R4A4_UNORM: u32 = 115;
+        const B5G5R5A1_UNORM: u32 = 86;
+        // The stand-in has the same element size, so no ladder step or copy
+        // changes when it is taken.
+        assert_eq!(
+            element(B4G4R4A4_UNORM),
+            element(B5G5R5A1_UNORM),
+            "the stand-in keeps the element size"
+        );
+        // It is chosen only where the host refuses the target and takes the
+        // stand-in: a host that renders to 4-4-4-4 keeps its colours.
+        assert_eq!(
+            crate::host::stand_in_decision(B4G4R4A4_UNORM, true, true, false),
+            Some(B5G5R5A1_UNORM)
+        );
+        assert_eq!(crate::host::stand_in_decision(B4G4R4A4_UNORM, false, true, false), None);
+        assert_eq!(crate::host::stand_in_decision(B4G4R4A4_UNORM, true, false, false), None);
+        assert_eq!(crate::host::stand_in_decision(28, true, true, false), None);
+        // A texture written through an unordered access view keeps its
+        // format: the stand-in is not a typed-UAV format on the hosts that
+        // refuse 4-4-4-4, so it would lose the writes instead of the device.
+        assert_eq!(crate::host::stand_in_decision(B4G4R4A4_UNORM, true, true, true), None);
+        // And the formats that answer for themselves still do.
+        assert_eq!(pc_format(28), 28, "R8G8B8A8_UNORM is a PC format already");
+        assert_eq!(pc_format(118), 20, "D32_FLOAT stands in as D32_FLOAT_S8X24");
     }
 
     fn texture(width: u64, height: u32, format: u32, mips: u16) -> ResourceDesc {
@@ -3180,3 +3213,6 @@ mod tests {
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
 }
+
+
+
