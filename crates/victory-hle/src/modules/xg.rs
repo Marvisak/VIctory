@@ -493,8 +493,11 @@ extern "system" fn tiling(
     };
     let block = l.desc.block;
     // SAFETY: each output is null or room for its value; `out` has room
-    // for `*count` entries.
+    // for `*count` entries when that count is nonzero.
     unsafe {
+        if count.as_mut().is_some_and(|n| *n > 0) && out.is_null() {
+            return E_INVALIDARG;
+        }
         if let Some(t) = tiles.as_mut() {
             *t = (l.size / TILE) as u32;
         }
@@ -768,6 +771,41 @@ mod tests {
                 null.cast()
             ),
             E_FAIL
+        );
+        assert_eq!(release(c), 0);
+    }
+
+    #[test]
+    fn tiling_rejects_null_out_when_count_nonzero() {
+        type Tiling = extern "system" fn(
+            This,
+            *mut u32,
+            *mut PackedMips,
+            *mut [u32; 3],
+            *mut u32,
+            u32,
+            *mut SubresourceTiling,
+        ) -> HRESULT;
+        let c = create(&desc(256, 256, 0, 98, 0x10a));
+        let tiling: Tiling = slot(c, 10);
+        let (mut tiles, mut shape, mut n) = (0, [0; 3], 4);
+        let mut packed = PackedMips {
+            standard: 0,
+            packed: 0,
+            tiles: 0,
+            start: 0,
+        };
+        assert_eq!(
+            tiling(
+                c,
+                &mut tiles,
+                &mut packed,
+                &mut shape,
+                &mut n,
+                0,
+                std::ptr::null_mut()
+            ),
+            E_INVALIDARG
         );
         assert_eq!(release(c), 0);
     }
