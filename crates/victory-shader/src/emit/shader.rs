@@ -119,6 +119,8 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Root UAVs among them that an operation may write ([`Shader::op`]).
+    pub written_root_uavs: Vec<u8>,
     /// The title-memory page table's handle, once read.
     pub memory: Option<V>,
     /// The written-pages bitmap's handle, once title memory is written.
@@ -195,6 +197,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
             memory: None,
             memory_dirty: None,
             view_addresses: None,
@@ -236,6 +239,16 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // A root UAV is written by any operation on its handle but a read
+        // (BufferLoad, GetDimensions, RawBufferLoad): stores, atomics and
+        // operations to come are taken as writes.
+        if !matches!(opcode, 68 | 72 | 139)
+            && let Some(first) = args.first()
+            && let Some(&(slot, _)) = self.root_uavs.iter().find(|(_, h)| h == first)
+            && !self.written_root_uavs.contains(&slot)
+        {
+            self.written_root_uavs.push(slot);
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -1042,6 +1055,28 @@ impl Shader {
 mod tests {
     use super::super::bitcode::Term;
     use super::*;
+
+    /// Of three root UAVs, the one only read (a raw load) is not written;
+    /// one stored to and one an atomic reaches are.
+    #[test]
+    fn only_root_uavs_stored_to_or_reached_by_atomics_are_written() {
+        let mut s = Shader::new(false);
+        let input = s.root_uav_handle(1);
+        let output = s.root_uav_handle(2);
+        let counter = s.root_uav_handle(3);
+        let (zero, one, mask, align) = (s.m.i32(0), s.m.i32(1), s.m.i8(1), s.m.i32(4));
+        let undef = s.m.undef(s.t.i32);
+        let (b, rr, void, i32t) = (s.entry, s.t.res_ret, s.t.void, s.t.i32);
+        for handle in [input, output] {
+            let args = [handle, zero, undef, mask, align];
+            s.op(b, "rawBufferLoad.f32", Attr::ReadOnly, rr, 139, &args);
+        }
+        let args = [output, zero, undef, one, undef, undef, undef, mask, align];
+        s.op(b, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+        let args = [counter, zero, zero, undef, undef, one];
+        s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+        assert_eq!(s.written_root_uavs, [2, 3]);
+    }
 
     /// A program that sets a bit through the write marks' UAV, or (`heap`)
     /// through a UAV indexed from the heap: a vertex (`pixel` false, no

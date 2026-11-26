@@ -302,6 +302,9 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the host binds as root descriptors:
     /// `u<index>` in [`ROOT_CBV_SPACE`] (likewise).
     pub root_uavs: Vec<u8>,
+    /// The root UAVs among `root_uavs` the shader may write: what it only
+    /// reads through the others need not go back into title memory.
+    pub written_root_uavs: Vec<u8>,
     /// Whether the shader reads title memory at addresses it computes: the
     /// host binds the page table `t0` in [`MEMORY_SPACE`] (module notes,
     /// "Title memory").
@@ -531,6 +534,7 @@ pub fn emit_with(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        written_root_uavs: l.written_root_uavs,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
@@ -1064,6 +1068,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
             memory: false,
             memory_writes: false,
             view_addresses: false,
@@ -1081,6 +1086,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                written_root_uavs: Vec::new(),
                 memory: false,
                 memory_writes: false,
                 view_addresses: false,

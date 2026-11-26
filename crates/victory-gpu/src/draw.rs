@@ -206,7 +206,10 @@ pub(crate) fn dispatched() -> u64 {
 /// to title memory after the submission.
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
-fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64> {
+/// `writes`: the shader may write through the view (a root UAV it stores
+/// to), so what it writes goes back into title memory; a root UAV it only
+/// reads needs no snapshot and no compare after.
+fn root_view(list: &HostList, address: u64, srv: bool, uav: bool, writes: bool) -> Option<u64> {
     let shadow = crate::shadow::find(address, 1)?;
     let len = shadow
         .left(address)
@@ -214,7 +217,7 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64>
     let gpu = shadow.gpu(address);
     if srv || uav || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
-        if uav {
+        if uav && writes {
             // A host root descriptor: no heap view, so its writes are not
             // marked.
             shadow.gpu_writes(list, address, len, false);
@@ -756,11 +759,13 @@ impl State {
                             self.roots_ref(compute).get(usize::from(u.slot))
                         && let Some(shadow) = crate::shadow::find(*address, 1)
                     {
-                        let uav = t.used.iter().any(|r| {
-                            r.slot == u.slot
-                                && r.root == RootType::Descriptor
-                                && r.kind == ResourceType::Uav
-                        });
+                        // A root UAV the shader writes through goes back.
+                        let uav = t.host.written_root_uavs.contains(&u.slot)
+                            && t.used.iter().any(|r| {
+                                r.slot == u.slot
+                                    && r.root == RootType::Descriptor
+                                    && r.kind == ResourceType::Uav
+                            });
                         roots.push((*address, uav.then_some(shadow)));
                     }
                     let fresh = made
@@ -833,7 +838,8 @@ impl State {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, kind == 1, kind == 2) else {
+                    let writes = kind == 2 && t.host.written_root_uavs.contains(&slot);
+                    let Some(gpu) = root_view(list, *address, kind == 1, kind == 2, writes) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
