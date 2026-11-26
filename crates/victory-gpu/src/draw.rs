@@ -108,6 +108,14 @@ struct Fixed {
     topology: bool,
 }
 
+/// `items` kept in `kept`, in the vector it already has: a list's first
+/// call allocates, the calls after it reuse that vector.
+fn keep<T: Copy>(kept: &mut Option<Vec<T>>, items: &[T]) {
+    let kept = kept.get_or_insert_default();
+    kept.clear();
+    kept.extend_from_slice(items);
+}
+
 impl Drop for State {
     fn drop(&mut self) {
         for &(heap, first, n) in &self.dynamic {
@@ -274,13 +282,13 @@ impl State {
     /// Fixed-function state, straight onto the host list (and kept for the
     /// list's next segment).
     pub(crate) fn viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
-        self.fixed.viewports = Some(viewports.to_vec());
+        keep(&mut self.fixed.viewports, viewports);
         // SAFETY: an open list.
         unsafe { list.list.RSSetViewports(viewports) };
     }
 
     pub(crate) fn scissors(&mut self, list: &HostList, rects: &[RECT]) {
-        self.fixed.scissors = Some(rects.to_vec());
+        keep(&mut self.fixed.scissors, rects);
         // SAFETY: an open list.
         unsafe { list.list.RSSetScissorRects(rects) };
     }
@@ -2174,6 +2182,43 @@ void main() {
             list.list.SetPipelineState(pso);
             list.list.Dispatch(1, 1, 1);
         }
+    }
+
+    /// The viewports and scissors a list keeps for its next segment are the
+    /// last ones set, however many each call passed, and a cut replays them.
+    #[test]
+    fn kept_viewports_and_scissors_are_the_last_set() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        let viewport = |x: f32| D3D12_VIEWPORT {
+            TopLeftX: x,
+            Width: 64.0,
+            Height: 32.0,
+            MaxDepth: 1.0,
+            ..Default::default()
+        };
+        let rect = |x: i32| RECT {
+            left: x,
+            top: 0,
+            right: x + 64,
+            bottom: 32,
+        };
+        state.viewports(&list, &[viewport(0.0), viewport(64.0), viewport(128.0)]);
+        state.scissors(&list, &[rect(0), rect(64), rect(128)]);
+        state.viewports(&list, &[viewport(8.0)]);
+        state.scissors(&list, &[rect(8), rect(72)]);
+        let kept = |s: &State| (s.fixed.viewports.clone(), s.fixed.scissors.clone());
+        let want = (Some(vec![viewport(8.0)]), Some(vec![rect(8), rect(72)]));
+        assert_eq!(kept(&state), want);
+        state.cut(&list);
+        assert_eq!(kept(&state), want, "replayed by the cut");
+        state.viewports(&list, &[]);
+        assert_eq!(state.fixed.viewports, Some(Vec::new()));
+        list.close();
+        host.execute(&[&list]);
     }
 
     /// Sub-64 KiB marked UAV writes must expand `Shadow::refresh` to the

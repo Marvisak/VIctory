@@ -563,17 +563,32 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("barrier kinds {:?}", barriers.iter().map(|b| b.kind).collect::<Vec<_>>()));
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
+        // The host barriers, and room for one more: on the stack for the
+        // few a title passes at a time, no allocation per call.
+        let mut inline = [UAV_BARRIER; 8];
+        let mut spilled = Vec::new();
+        let room: &mut [Barrier] = if barriers.len() < inline.len() {
+            &mut inline
+        } else {
+            spilled.resize(barriers.len() + 1, UAV_BARRIER);
+            &mut spilled
+        };
+        let mut len = 0;
+        for b in barriers {
+            if let Some(h) = host_barrier(list, b) {
+                room[len] = h;
+                len += 1;
+            }
+        }
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
-            host.push(UAV_BARRIER);
+            room[len] = UAV_BARRIER;
+            len += 1;
         }
+        let host = &room[..len];
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -1975,6 +1990,110 @@ mod tests {
                 state::clear_unordered_float as *const ()
             );
             assert_eq!(table.0[0x1b8 / 8], ignored_state as *const ());
+        }
+    }
+
+    /// Barriers through the title's method, a few at a time and more than
+    /// the stack room for them: every texture transition reaches the list
+    /// (its tracked state is the last one asked for), and the list runs.
+    #[cfg(windows)]
+    #[test]
+    fn barriers_beyond_the_stack_room_all_reach_the_list() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let layout = std::alloc::Layout::from_size_align(2 << 16, 1 << 16).unwrap();
+        // SAFETY: a non-zero size; leaked, as title memory outlives a test.
+        let memory = unsafe { std::alloc::alloc_zeroed(layout) } as u64;
+        // 64x64 RGBA8 textures.
+        let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 1 | 1 << 16, 28, 1, 0, 0, 0, 0];
+        let textures: Vec<This> = (0..2)
+            .map(|k| {
+                let mut out = null;
+                let made = crate::resource::create_at_address(
+                    null,
+                    memory + (k << 16),
+                    words.as_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    &iid,
+                    &mut out,
+                );
+                assert_eq!(made, S_OK);
+                out
+            })
+            .collect();
+        let buffer = crate::resource::test_buffer(256);
+        let hl = host_list(list).unwrap();
+        const SHADER_READ: u32 = 0x40 | 0x80;
+        // First uses: the prelude's, nothing recorded.
+        for &t in &textures {
+            assert!(hl.transition(t, SHADER_READ).is_none());
+        }
+        let mut states = [SHADER_READ; 2];
+        for count in [3, 7, 8, 21] {
+            let barriers: Vec<Barrier> = (0..count)
+                .map(|k| {
+                    if k % 3 == 2 {
+                        return Barrier {
+                            kind: 2,
+                            flags: 0,
+                            first: buffer,
+                            second: 0,
+                            last: 0,
+                        };
+                    }
+                    let t = k % 2;
+                    let before = states[t];
+                    states[t] = if before == SHADER_READ {
+                        COPY_DEST
+                    } else {
+                        SHADER_READ
+                    };
+                    Barrier {
+                        kind: 0,
+                        flags: 0,
+                        first: textures[t],
+                        second: 0xffff_ffff | u64::from(before) << 32,
+                        last: u64::from(states[t]),
+                    }
+                })
+                .collect();
+            assert_eq!(barrier(list, count as u32, barriers.as_ptr()), 0);
+            for (t, &state) in textures.iter().zip(&states) {
+                assert!(
+                    hl.transition(*t, state).is_none(),
+                    "{count} barriers: not the last state"
+                );
+            }
+        }
+        assert_eq!(close(list), S_OK);
+        host.execute(&[hl]);
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [buffer, list, allocator] {
+            assert_eq!(release(object), 0);
+        }
+        for t in textures {
+            release(t);
         }
     }
 
