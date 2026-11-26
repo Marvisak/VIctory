@@ -3046,33 +3046,34 @@ fn wide_shifts_match_the_hardware() {
     ]));
 }
 
-/// `v_cvt_pk_u8_f32`: a float to a byte (NaN 0, saturated; ties to even,
-/// which no public source states) into byte `S1[1:0]` of `S2` (RDNA2 ISA).
+/// `v_cvt_pk_u8_f32` rounds according to MODE.FP_ROUND32, saturates to a
+/// byte (NaN becomes zero), and replaces byte `S1[1:0]` of `S2`.
 #[test]
 fn byte_packing_matches_the_hardware() {
     let mut xs = F32_EDGES.to_vec();
     xs.extend(
         [
-            0.5f32, 1.5, 2.5, 127.5, 128.5, 254.5, 255.49, 255.5, 256.0, -0.5, 3.75,
+            0.5f32, 1.25, 1.5, 2.5, 127.5, 128.5, 254.5, 255.49, 255.5, 256.0, -0.5, 3.75,
         ]
         .map(f32::to_bits),
     );
     let inputs = triples(&xs, &[0, 1, 2, 3, 7], &[0xAABB_CCDD]);
-    assert_clean(check(&[probe(
-        vop3(0x15E, 5, [v(1), v(2), v(3)], NONE),
-        inputs,
-        INT,
-        |i| {
-            let x = fl(ftz(i[0]));
-            let byte = if x.is_nan() {
-                0
-            } else {
-                x.round_ties_even().clamp(0.0, 255.0) as u32
-            };
-            let at = 8 * (i[1] & 3);
-            vec![i[2] & !(0xFF << at) | byte << at]
-        },
-    )]));
+    let pack = |dst| vop3(0x15E, dst, [v(1), v(2), v(3)], NONE);
+    let mut body = pack(5).to_vec(); // default: nearest even
+    body.push(0xBFA4_0003); // s_round_mode: FP32 toward zero, FP16 nearest
+    body.extend(pack(8));
+    body.extend([0xBA80_0041, 0]); // clear MODE bit 1, leaving bit 0 set: up
+    body.extend(pack(6));
+    body.push(0xBFA4_0006); // s_round_mode: FP32 down, FP16 up
+    body.extend([0xBA80_0881, 0]); // clear only FP_ROUND16_64
+    body.extend(pack(7));
+    assert_clean(check(&[probe(body, inputs, INT, |i| {
+        let x = fl(ftz(i[0]));
+        let at = 8 * (i[1] & 3);
+        [x.round_ties_even(), x.ceil(), x.floor(), x.trunc()]
+            .map(|r| i[2] & !(0xFF << at) | u32::from(r as u8) << at)
+            .to_vec()
+    })]));
 }
 
 /// The other half of a branch: `s_andn2_wrexec_b32` (EXEC = S0 & ~EXEC,

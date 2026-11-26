@@ -280,59 +280,78 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
-    /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
-    /// the one in force at the instruction being lowered (see [`round16`]).
-    round16: Vec<Option<u8>>,
-    mode16: Option<u8>,
+    /// Rounding modes at each block's entry and at the current instruction.
+    block_rounding: Vec<RoundModes>,
+    rounding: RoundModes,
 }
 
-/// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
-/// after `inst`, from `mode` before it (`None`: not known).
-fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
-    match (inst.name(), &inst.fields) {
-        ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
-        (
-            "s_setreg_imm32_b32" | "s_setreg_b32",
-            Fields::Sop {
-                src, imm: Some(h), ..
-            },
-        ) => {
-            let (id, off, size) = (h & 0x3F, h >> 6 & 0x1F, (h >> 11 & 0x1F) + 1);
-            if id != 1 || off >= 4 || off + size <= 2 {
-                return mode;
-            }
-            match src.first() {
-                Some(&Operand::Literal(x)) if off <= 2 && off + size >= 4 => {
-                    Some((x >> (2 - off) & 3) as u8)
-                }
-                _ => None,
-            }
+/// The low four bits of MODE: FP32 rounding in 1:0, FP16/64 in 3:2.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct RoundModes {
+    bits: u8,
+    known: u8,
+}
+
+impl RoundModes {
+    const NEAREST: Self = Self { bits: 0, known: 15 };
+
+    fn field(self, shift: u8) -> Option<u8> {
+        (self.known >> shift & 3 == 3).then_some(self.bits >> shift & 3)
+    }
+
+    fn join(self, other: Self) -> Self {
+        let known = self.known & other.known & !(self.bits ^ other.bits);
+        Self {
+            bits: self.bits & known,
+            known,
         }
-        _ => mode,
+    }
+
+    fn after(self, inst: &Inst) -> Self {
+        match (inst.name(), &inst.fields) {
+            ("s_round_mode", Fields::Sopp { imm }) => Self {
+                bits: (imm & 15) as u8,
+                known: 15,
+            },
+            (
+                "s_setreg_imm32_b32" | "s_setreg_b32",
+                Fields::Sop {
+                    src, imm: Some(h), ..
+                },
+            ) => {
+                let (id, off, size) = (h & 0x3F, h >> 6 & 0x1F, (h >> 11 & 0x1F) + 1);
+                if id != 1 || off >= 4 {
+                    return self;
+                }
+                let mask = ((1u8 << size.min(4 - off)) - 1) << off;
+                let (bits, known) = match src.first() {
+                    Some(&Operand::Literal(x)) => ((x as u8) << off & mask, mask),
+                    _ => (0, 0),
+                };
+                Self {
+                    bits: self.bits & !mask | bits,
+                    known: self.known & !mask | known,
+                }
+            }
+            _ => self,
+        }
     }
 }
 
-/// The 16/64-bit round mode each block starts with: nearest even at the
-/// program's start, then as the MODE writes on the way set it; `None` where
-/// paths that set it differently join (or a write is not a constant).
-fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
-    // None: not reached yet; Some(m): the mode (m None: not known).
-    let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
-    entry[0] = Some(Some(0));
+/// Start in nearest-even and keep the bits on which all incoming paths agree.
+fn block_rounding(p: &crate::ir::Program) -> Vec<RoundModes> {
+    let mut entry = vec![None; p.blocks.len()];
+    entry[0] = Some(RoundModes::NEAREST);
     let order = crate::ir::reverse_postorder(&p.blocks);
     loop {
         let mut changed = false;
         for &b in &order {
             let Some(mut m) = entry[b] else { continue };
             for inst in &p.blocks[b].insts {
-                m = round16_after(inst, m);
+                m = m.after(inst);
             }
             for s in p.blocks[b].exit.successors() {
-                let new = match entry[s] {
-                    None => Some(m),
-                    Some(old) if old == m => continue,
-                    Some(_) => Some(None),
-                };
+                let new = Some(entry[s].map_or(m, |old| old.join(m)));
                 if entry[s] != new {
                     entry[s] = new;
                     changed = true;
@@ -340,7 +359,7 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
             }
         }
         if !changed {
-            return entry.into_iter().map(Option::flatten).collect();
+            return entry.into_iter().map(Option::unwrap_or_default).collect();
         }
     }
 }
@@ -723,8 +742,8 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
-            round16: round16(p),
-            mode16: Some(0),
+            block_rounding: block_rounding(p),
+            rounding: RoundModes::NEAREST,
         }
     }
 
@@ -1352,7 +1371,7 @@ impl<'a> Lower<'a> {
                 self.vals.insert(phi.value, val);
             }
             let mut i = 0;
-            self.mode16 = self.round16[b];
+            self.rounding = self.block_rounding[b];
             while i < p.blocks[b].insts.len() {
                 if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
                     // A pixel's discard: the lanes stay on as helpers.
@@ -1365,7 +1384,7 @@ impl<'a> Lower<'a> {
                         .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
                 }
                 self.inst(b, i)?;
-                self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
+                self.rounding = self.rounding.after(&p.blocks[b].insts[i]);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
@@ -2220,7 +2239,7 @@ impl<'a> Lower<'a> {
     // shortcut: rounding toward +-infinity, or a mode not known at this
     // point (paths that set it differently join), rounds to nearest even.
     fn narrow16(&mut self, f: V) -> V {
-        let rtz = self.mode16 == Some(3);
+        let rtz = self.rounding.field(2) == Some(3);
         let c = self.cur;
         let x = self.as_int(f);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -7027,7 +7046,7 @@ impl<'a> Lower<'a> {
             } else {
                 self.half_fsrc(inst, 2)?
             };
-            if name == "v_fma_f16" && self.mode16 != Some(3) {
+            if name == "v_fma_f16" && self.rounding.field(2) != Some(3) {
                 if v.omod != 0 {
                     return Err("an output modifier on a 16-bit operation");
                 }
@@ -7765,11 +7784,20 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Shl, m, b)
             }
             "v_cvt_pk_u8_f32" => {
-                // src0 rounded to nearest even and saturated to a byte, into
-                // byte src1[1:0] of src2.
+                // Round src0 in the FP32 mode and saturate it to a byte.
+                // shortcut: an unknown mode uses nearest even.
                 let f = self.fsrc(inst, 0)?;
                 let (b, d) = (s(self, 1)?, s(self, 2)?);
-                let f = self.unary(26, f);
+                let f = match self.rounding.field(0) {
+                    Some(1) => {
+                        // Only rounding upward can turn a positive denormal into a byte of 1.
+                        let f = self.ftz(f);
+                        self.unary(28, f)
+                    }
+                    Some(2) => self.unary(27, f),
+                    Some(3) => self.unary(29, f),
+                    _ => self.unary(26, f),
+                };
                 let (zero, max) = (self.s.m.f32(0), self.s.m.f32(255.0f32.to_bits()));
                 let f = self.binary(35, f, zero);
                 let f = self.binary(36, f, max);
@@ -10927,6 +10955,24 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn a_join_preserves_the_rounding_field_its_paths_agree_on() {
+        for (other, fp32, fp16) in [(2, Some(2), None), (12, None, Some(3))] {
+            let words = [
+                0xBFA4_000E, // s_round_mode: FP32 down, FP16/64 toward zero
+                0xBF06_8000, // s_cmp_eq_u32 s0, 0
+                0xBF85_0001, // s_cbranch_scc1 -> join
+                0xBFA4_0000 | other,
+                S_ENDPGM, // join
+            ];
+            let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = ir::build(&code, false, 256).unwrap();
+            let modes = super::block_rounding(&p);
+            let joined = modes.last().unwrap();
+            assert_eq!((joined.field(0), joined.field(2)), (fp32, fp16));
+        }
+    }
 
     /// A program's constant table starts after its instructions, unless a
     /// load at a fixed offset reads below that.
