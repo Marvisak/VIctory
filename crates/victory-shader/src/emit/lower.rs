@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod lighting_mul;
 
 type Why = &'static str;
 
@@ -6249,6 +6250,7 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            "v_mullit_f32" => self.lighting_mul(inst, guard),
             "v_fma_f32" | "v_fmaak_f32" | "v_fmamk_f32" => {
                 // shortcut: DXIL has no fused f32 multiply-add; FMad lets the driver fuse.
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
