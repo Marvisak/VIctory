@@ -601,6 +601,42 @@ impl Module {
             .count()
     }
 
+    /// Whether every live `dx.op.waveReadLaneAt.i32` call passes a lane index
+    /// produced by `select(_, _, dx.op.waveGetLaneIndex(...))` (never reading
+    /// an inactive lane directly), with at least one such call present.
+    #[cfg(test)]
+    pub fn wave_read_lane_clamps_inactive(&self) -> bool {
+        let plan = self.plan();
+        let mut saw = false;
+        for &b in &plan.layout {
+            for &i in &self.blocks[b].body {
+                if !plan.live[i as usize] {
+                    continue;
+                }
+                let Op::Call(f, ref args) = self.insts[i as usize].op else {
+                    continue;
+                };
+                if self.funcs[f as usize].name != "dx.op.waveReadLaneAt.i32" {
+                    continue;
+                }
+                saw = true;
+                let Some(&V::Inst(sel)) = args.get(2) else {
+                    return false;
+                };
+                let Op::Select(_, _, V::Inst(fallback)) = self.insts[sel as usize].op else {
+                    return false;
+                };
+                let Op::Call(lf, _) = self.insts[fallback as usize].op else {
+                    return false;
+                };
+                if self.funcs[lf as usize].name != "dx.op.waveGetLaneIndex" {
+                    return false;
+                }
+            }
+        }
+        saw
+    }
+
     /// The globals and functions [`Module::write`] declares, each kept
     /// one's new index and their number: functions declared and not called,
     /// and constant globals nothing reads, are left out (the validator

@@ -72,6 +72,9 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Whether every live `waveReadLaneAt.i32` clamps inactive lanes to `waveGetLaneIndex`.
+    #[cfg(test)]
+    pub wave_read_lane_clamps_inactive: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1412,6 +1415,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            wave_read_lane_clamps_inactive: self.s.m.wave_read_lane_clamps_inactive(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3251,15 +3256,14 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let lane = self.s.m.bin(c, Bin::LShr, at, two);
             let within_half = self.s.m.bin(c, Bin::And, lane, mask31);
+            let me = self.lane_index();
             let lane = if self.x.native.wave64 {
-                let me = self.lane_index();
                 let not31 = k(self, !31);
                 let base = self.s.m.bin(c, Bin::And, me, not31);
                 self.s.m.bin(c, Bin::Or, base, within_half)
             } else {
                 within_half
             };
-            let r = self.read_lane(x, lane);
             let on = guard.unwrap_or_else(|| self.s.m.bool(true));
             let i32t = self.s.t.i32;
             let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
@@ -3271,6 +3275,11 @@ impl<'a> Lower<'a> {
                 self.s.m.extract(c, ballot, 1),
             );
             let running = self.lane_bit_of(c, lane, lo, hi);
+            // `WaveReadLaneAt` from an inactive lane is undefined in DXIL:
+            // substitute our own active lane before reading, then zero out
+            // inactive sources below.
+            let safe_lane = self.s.m.select(c, running, lane, me);
+            let r = self.read_lane(x, safe_lane);
             let z = k(self, 0);
             let r = self.s.m.select(c, running, r, z);
             let reg = dst_reg.ok_or("a permute result")?;
@@ -12133,8 +12142,9 @@ mod tests {
 
     #[test]
     fn ds_bpermute_wave64_preserves_32_lane_half() {
-        // Without reading v0 (`thread_id`), only the wave64 half-wave base
-        // (`lane_index & !31`) introduces `dx.op.waveGetLaneIndex`.
+        // Wave64 masks the lane index into the caller's 32-lane half (`!31`),
+        // and both wave32 and wave64 clamp inactive source lanes to
+        // `waveGetLaneIndex` before `waveReadLaneAt`.
         let words = [
             0x7E02_02FF,
             0x0000_0104, // v_mov_b32 v1, 0x104
@@ -12179,8 +12189,12 @@ mod tests {
             })
             .unwrap();
             assert!(lowered.wave_ops);
-            assert_eq!(lowered.uses_lane_index, wave64, "wave64={wave64}");
+            assert!(lowered.uses_lane_index, "wave64={wave64}");
             assert_eq!(lowered.has_half_wave_mask, wave64, "wave64={wave64}");
+            assert!(
+                lowered.wave_read_lane_clamps_inactive,
+                "wave64={wave64}: WaveReadLaneAt must clamp inactive lanes to waveGetLaneIndex"
+            );
             #[cfg(windows)]
             if let Ok(mut v) = crate::emit::validator::Validator::load(
                 crate::emit::validator::Validator::default_path().as_deref(),
