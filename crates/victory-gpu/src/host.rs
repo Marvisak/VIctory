@@ -379,6 +379,15 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
     Some([info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?])
 }
 
+/// A host timestamp in the title's clock, [`crate::queue::TIMESTAMP_FREQUENCY`].
+///
+/// The product is taken in u128: a tick count times 100 MHz passes u64::MAX
+/// at any host clock above 0.1 Hz per tick, which every real queue is.
+fn title_ticks(at: u64, host_hz: u64) -> u64 {
+    let title_hz = u128::from(crate::queue::TIMESTAMP_FREQUENCY);
+    (u128::from(at) * title_hz / u128::from(host_hz.max(1))) as u64
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     thread_local! {
@@ -1021,6 +1030,10 @@ struct Deferred {
     /// title records with a wait after commands is cut there,
     /// `crate::list`).
     waits: Vec<crate::hold::ValueWait>,
+    /// Resolved query results waiting to be copied to title memory: the
+    /// read-back buffer, the title address, bytes, and whether the values
+    /// are timestamps (scaled to [`crate::queue::TIMESTAMP_FREQUENCY`]).
+    resolves: Vec<(ID3D12Resource, *mut u8, u64, bool)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
@@ -1099,6 +1112,82 @@ impl Host {
             tracing::info!(atomics, "host 64-bit atomics on typed heap resources");
             atomics
         })
+    }
+
+    /// The host GPU's timestamp ticks per second (the queue's).
+    #[cfg(windows)]
+    pub(crate) fn timestamp_frequency(&self) -> u64 {
+        // SAFETY: a plain query of our queue.
+        unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(0)
+    }
+
+    /// A query heap of `count` queries of the console kind: 0 occlusion, 1
+    /// binary occlusion, 2 timestamp, 3 pipeline statistics.
+    #[cfg(windows)]
+    pub(crate) fn query_heap(&self, kind: u32, count: u32) -> Option<ID3D12QueryHeap> {
+        let r#type = match kind {
+            0 | 1 => D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+            2 => D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+            3 => D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
+            _ => return None,
+        };
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        // SAFETY: plain object creation.
+        unsafe {
+            self.device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: r#type,
+                        Count: count.max(1),
+                        NodeMask: 0,
+                    },
+                    &mut heap,
+                )
+                .ok()?;
+        }
+        let heap = heap?;
+        name(&heap, || format!("query heap kind {kind} x{count}"));
+        Some(heap)
+    }
+
+    /// A read-back buffer of `size` bytes a query resolution lands in: the
+    /// host GPU writes it, the CPU reads it after the submission.
+    #[cfg(windows)]
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let readback = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(8).next_multiple_of(256),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain object creation.
+        unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &readback,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+                .ok()?;
+        }
+        let buffer = buffer?;
+        name(&buffer, || format!("query read-back {size:#x}"));
+        Some(buffer)
     }
 
     /// A new list, open for recording.
@@ -1421,6 +1510,39 @@ impl Host {
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
+            }
+            // Query results land in read-back buffers: copy them out while
+            // the buffers are alive and the GPU is done writing them.
+            #[cfg(windows)]
+            for (back, title, bytes, timestamps) in &list.deferred().resolves {
+                let mut data = std::ptr::null_mut();
+                let range = D3D12_RANGE {
+                    Begin: 0,
+                    End: *bytes as usize,
+                };
+                // SAFETY: a read-back buffer this finished list resolved into.
+                if unsafe { back.Map(0, Some(&range), Some(&mut data)) }.is_ok() {
+                    if *timestamps {
+                        let host = self.timestamp_frequency();
+                        for i in 0..*bytes / 8 {
+                            // SAFETY: the resolution wrote every piece.
+                            let at = unsafe { data.cast::<u64>().add(i as usize).read_unaligned() };
+                            let ticks = title_ticks(at, host);
+                            // SAFETY: the results go inside the buffer, checked by the caller.
+                            copy_mapped(
+                                unsafe { title.add(i as usize * 8) },
+                                (&ticks as *const u64).cast(),
+                                8,
+                                true,
+                            );
+                        }
+                    } else {
+                        // SAFETY: the results go inside the buffer, checked by the caller.
+                        copy_mapped(*title, data.cast(), *bytes as usize, true);
+                    }
+                    // SAFETY: the same read-back buffer, still mapped.
+                    unsafe { back.Unmap(0, None) };
+                }
             }
         }
         // The submission has run and the next waits for our lock. Host
@@ -2156,6 +2278,21 @@ impl HostList {
             && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
+    /// A resolved query heap's read-back buffer and the title address it
+    /// should be copied to once the list has run (`timestamps`: scale to
+    /// [`crate::queue::TIMESTAMP_FREQUENCY`]).
+    pub(crate) fn defer_resolve(
+        &self,
+        back: ID3D12Resource,
+        title: *mut u8,
+        bytes: u64,
+        timestamps: bool,
+    ) {
+        self.deferred()
+            .resolves
+            .push((back, title, bytes, timestamps));
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
@@ -4130,4 +4267,15 @@ mod present_plane_tests {
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
+}
+
+#[test]
+fn timestamps_scale_to_the_title_clock() {
+    // A 1 GHz host and a 10 MHz one, with the tick counts a reviewer read
+    // back on each: both products pass u64::MAX, and a saturating multiply
+    // would give both the same (and wrong) interval.
+    assert_eq!(title_ticks(26_509_312, 1_000_000_000), 2_650_931);
+    assert_eq!(title_ticks(254_637, 10_000_000), 2_546_370);
+    // A zero frequency, which a device without timestamps reports.
+    assert_eq!(title_ticks(1_000_000_000, 0), 100_000_000_000_000_000);
 }
