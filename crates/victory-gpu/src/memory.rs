@@ -419,23 +419,37 @@ fn write_table(
         if len == 0 || end > 1 << 40 {
             continue;
         }
-        for page in start >> 16..=(end - 1) >> 16 {
-            let l1 = (page >> 12) as usize;
-            if level1[l1] == 0 {
+        let first_page = (start >> 16) as usize;
+        let past_page = end.div_ceil(1 << 16) as usize;
+        let first_whole = start.div_ceil(1 << 16) as usize;
+        let past_whole = (end >> 16) as usize;
+        let first_block = first_page / BLOCK;
+        let last_block = (past_page - 1) / BLOCK;
+        for (region, block) in level1[first_block..=last_block].iter_mut().enumerate() {
+            if *block == 0 {
                 if blocks.len() > CAPACITY {
                     full = true;
                     continue;
                 }
-                level1[l1] = blocks.len() as u32;
-                blocks.push(l1);
+                *block = blocks.len() as u32;
+                blocks.push(first_block + region);
                 owner.resize(owner.len() + BLOCK, NO_OWNER);
             }
-            let entry = level1[l1] as usize * BLOCK + (page & 0xFFF) as usize;
+            let region_start = (first_block + region) * BLOCK;
+            let first = first_page.max(region_start);
+            let past = past_page.min(region_start + BLOCK);
+            let offset = *block as usize * BLOCK + (first - region_start);
+            let entries = &mut owner[offset..offset + (past - first)];
+            let whole_start = first_whole.clamp(first, past);
+            let whole_end = past_whole.clamp(whole_start, past);
             // Larger copies come first: a copy holding the whole page takes
             // it from them; one holding part of it only takes it if free.
-            let whole = page << 16 >= start && (page + 1) << 16 <= end;
-            if whole || owner[entry] == NO_OWNER {
-                owner[entry] = k as u32;
+            if whole_start != first && entries[0] == NO_OWNER {
+                entries[0] = k as u32;
+            }
+            entries[whole_start - first..whole_end - first].fill(k as u32);
+            if whole_end != past && entries[past - first - 1] == NO_OWNER {
+                entries[past - first - 1] = k as u32;
             }
         }
     }
@@ -447,15 +461,18 @@ fn write_table(
     let l2_dwords = owner.len() * 2;
     let l2 = &mut out[LEVEL1..LEVEL1 + l2_dwords];
     let (slots, _) = l2.as_chunks_mut::<2>();
-    for (slot, &o) in slots.iter_mut().zip(&owner) {
-        if o == NO_OWNER {
-            slot[0] = null;
-            slot[1] = 0;
+    let mut at = 0;
+    for run in owner.chunk_by(|a, b| a == b) {
+        let o = run[0];
+        let entry = if o == NO_OWNER {
+            [null, 0]
         } else {
             let k = o as usize;
-            slot[0] = pairs[k];
-            slot[1] = copies[k].0 as u32;
-        }
+            [pairs[k], copies[k].0 as u32]
+        };
+        let past = at + run.len();
+        slots[at..past].fill(entry);
+        at = past;
     }
     (LEVEL1 + l2_dwords, blocks, owner)
 }
@@ -767,6 +784,34 @@ mod tests {
         assert_eq!(blocks.len(), 3, "null, low 256 MiB, the high buffer's");
     }
 
+    #[test]
+    fn page_ownership_at_region_boundaries() {
+        const PAGE: u64 = 1 << 16;
+        const REGION: u64 = PAGE * BLOCK as u64;
+        let copies = [
+            (REGION - 3 * PAGE, 6 * PAGE),      // outer, aligned
+            (REGION - 2 * PAGE + 3, 4 * PAGE),  // inner, partial at both ends
+            (2 * REGION - 7, 14),              // two partial pages, no whole pages
+            (3 * REGION + 8, 12),              // both edges in the same page
+        ];
+        let (table, blocks, _) = table(&copies, &[10, 20, 30, 40], 100);
+        for (address, expected) in [
+            (REGION - 2 * PAGE, 10),
+            (REGION - PAGE, 20),
+            (REGION, 20),
+            (REGION + PAGE, 20),
+            (REGION + 2 * PAGE, 10),
+            (2 * REGION - 7, 30),
+            (2 * REGION, 30),
+            (2 * REGION + PAGE, 100),
+            (3 * REGION + 8, 40),
+            (3 * REGION + PAGE, 100),
+        ] {
+            assert_eq!(look_up(&table, address).0, expected, "{address:#x}");
+        }
+        assert_eq!(blocks, [usize::MAX, 0, 1, 2, 3]);
+    }
+
     /// Copies in more regions than a table has room for: the largest are
     /// named, the rest read as missing; the table fits its buffer.
     #[test]
@@ -792,6 +837,96 @@ mod tests {
         assert_eq!(look_up(&dwords, 0x40_0010), (106, 0x10));
         assert_eq!(look_up(&dwords, 0).0, 100);
         assert_eq!(owner[BLOCK + 0x40], Some(2));
+    }
+
+    /// Per-page reference for the region allocator and page ownership rules.
+    fn reference_owners(copies: &[(u64, u64)]) -> (Vec<usize>, Vec<u32>) {
+        let mut order: Vec<_> = (0..copies.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(copies[i].1));
+        let mut region_blocks = [0; LEVEL1];
+        let mut blocks = vec![usize::MAX];
+        let mut owners = vec![NO_OWNER; BLOCK];
+        for i in order {
+            let (start, len) = copies[i];
+            let Some(end) = start.checked_add(len) else {
+                continue;
+            };
+            if len == 0 || end > 1 << 40 {
+                continue;
+            }
+            for page in (start >> 16)..=((end - 1) >> 16) {
+                let region = (page as usize) / BLOCK;
+                let block = &mut region_blocks[region];
+                if *block == 0 {
+                    if blocks.len() > CAPACITY {
+                        continue;
+                    }
+                    *block = blocks.len();
+                    blocks.push(region);
+                    owners.resize(blocks.len() * BLOCK, NO_OWNER);
+                }
+                let owner = &mut owners[*block * BLOCK + page as usize % BLOCK];
+                if *owner == NO_OWNER || (page << 16 >= start && (page + 1) << 16 <= end) {
+                    *owner = i as u32;
+                }
+            }
+        }
+        (blocks, owners)
+    }
+
+    #[test]
+    fn bulk_page_table_matches_the_per_page_reference() {
+        const PAGE: u64 = 1 << 16;
+        const REGION: u64 = PAGE * BLOCK as u64;
+        let mut seed = 424_242u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            seed >> 32
+        };
+        let mut dwords = vec![0; TABLE_DWORDS];
+        let null = 1;
+        for case in 0..40 {
+            let regions = if case % 4 == 0 { LEVEL1 as u64 } else { 24 };
+            let mut copies: Vec<_> = (0..25 + 12 * case)
+                .map(|i| {
+                    let region = next() % regions * REGION;
+                    let page = next() % BLOCK as u64 * PAGE;
+                    let start = region + page + [0, 17, PAGE - 1, 2993][i % 4];
+                    let len = [0, 1, PAGE - 1, 10 * PAGE, next() % (4 * REGION)][i % 5];
+                    (start, len)
+                })
+                .collect();
+            copies.extend([(u64::MAX - 2, 32), (1 << 40, 1), ((1 << 40) - PAGE, PAGE)]);
+            if case == 39 {
+                copies.extend((0..CAPACITY as u64 + 2).map(|i| (i * REGION, PAGE)));
+            }
+            let pairs: Vec<_> = (0..copies.len() as u32).map(|i| i * 2 + 2).collect();
+            let (written, blocks, owners) = write_table(&copies, &pairs, null, &mut dwords);
+            if case == 39 {
+                assert_eq!(blocks.len(), CAPACITY + 1);
+            }
+            let (expected_blocks, expected_owners) = reference_owners(&copies);
+            assert_eq!(blocks, expected_blocks, "block mapping for case {case}");
+            assert_eq!(owners, expected_owners, "page ownership for case {case}");
+            assert_eq!(written, LEVEL1 + 2 * expected_owners.len());
+
+            let mut level1 = [0u32; LEVEL1];
+            for (block, &region) in expected_blocks.iter().enumerate().skip(1) {
+                level1[region] = block as u32;
+            }
+            assert_eq!(dwords[..LEVEL1], level1, "level one for case {case}");
+            let (entries, remainder) = dwords[LEVEL1..written].as_chunks::<2>();
+            assert!(remainder.is_empty());
+            for (entry, word) in entries.iter().zip(expected_owners) {
+                let expected = if word == NO_OWNER {
+                    [null, 0]
+                } else {
+                    let owner = word as usize;
+                    [pairs[owner], copies[owner].0 as u32]
+                };
+                assert_eq!(*entry, expected, "level two for case {case}");
+            }
+        }
     }
 
     #[test]
