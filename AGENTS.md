@@ -73,6 +73,14 @@ For every upstream issue or PR:
 
 Do not cherry-pick a large integration PR merely because it makes a title reach a scene. First isolate its dependencies and independently review each subsystem.
 
+
+### Workflow security
+
+- Never execute upstream PR/build/test code in a job that has repository write permissions, secrets, or a token capable of mutating refs/issues/PRs.
+- Keep scheduled triage read-only: fetch metadata and Git objects, compute merge trees/patch IDs, and publish reports only. Do not execute candidate code for overlap detection.
+- If a separate publisher is ever introduced, isolate it from candidate execution and independently verify pinned candidate heads, artifacts, and expected refs. Do not trust reports or bundles produced in a candidate-controlled workspace without validation.
+- Do not automate merge, approval, hold, label, issue closure, or PR closure. Human review remains mandatory.
+
 ## 5. Validation and evidence
 
 The repository CI workflow runs on Windows and checks:
