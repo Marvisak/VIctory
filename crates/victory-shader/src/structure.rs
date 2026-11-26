@@ -457,6 +457,9 @@ pub struct Structured {
     pub masks: HashMap<Value, Bool>,
     /// Lane masks not derived from EXEC or VALU results (constants, opaque
     /// values, uniform selects) resolved at uses such as `v_cndmask_b32`.
+    /// In the console flow, also what a mask join takes on an edge such a
+    /// value arrives by: a loop's exit mask starts as a constant 0 before
+    /// lanes are added.
     pub other: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
@@ -466,6 +469,11 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Per block and instruction: the lane's EXEC bit at each vector
+    /// instruction, whatever path the lane took (`None` for scalar ones).
+    /// What a program run as the console runs it, every lane through every
+    /// block, guards its vector instructions with ([`structure_console`]).
+    pub execs: Vec<Vec<Option<Bool>>>,
     /// `v_readlane_b32` results of a constant lane: the SGPR value that
     /// `v_writelane_b32` spilled to that lane, the same along every path.
     pub restored: HashMap<Value, Value>,
@@ -486,7 +494,7 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true)
+    structure_as(program, true, false)
 }
 
 /// The per-lane form with a pixel's discarded lanes taken out of the live
@@ -494,11 +502,25 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// what a program needs whose discarded lanes would read values no
 /// surviving lane does (see [`Structured::discards`]).
 pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, false)
+    structure_as(program, false, false)
 }
 
-fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
-    let mut l = Lanes::new(program)?;
+/// The same for a program run as the console runs it: every lane of the
+/// console wave through every block, the branches taken wave-wide. Masks
+/// joined at a block are never resolved from what the lanes arriving there
+/// know, since lanes outside EXEC arrive too: each join that differs
+/// between edges is a phi ([`Atom::Phi`]). Guard vector instructions with
+/// [`Structured::execs`] and ignore [`Structured::exits`]' conditions.
+pub fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, true, true)
+}
+
+fn structure_as(
+    program: &Program,
+    helpers: bool,
+    console: bool,
+) -> Result<Structured, ShaderError> {
+    let mut l = Lanes::new(program, console)?;
     if !helpers {
         l.kills.clear();
     }
@@ -520,6 +542,8 @@ type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
+    /// See [`structure_console`].
+    console: bool,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -576,7 +600,7 @@ struct SopMasks {
 const MAX_ROUNDS: usize = 256;
 
 impl<'a> Lanes<'a> {
-    fn new(p: &'a Program) -> Result<Self, ShaderError> {
+    fn new(p: &'a Program, console: bool) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
         let order = crate::ir::reverse_postorder(blocks);
         let mut index = vec![usize::MAX; blocks.len()];
@@ -601,6 +625,7 @@ impl<'a> Lanes<'a> {
         }
         let mut l = Lanes {
             p,
+            console,
             order,
             index,
             incoming,
@@ -891,6 +916,7 @@ impl<'a> Lanes<'a> {
             bools: self.b,
             exits,
             guards,
+            execs: execs.to_vec(),
             reach: cond.to_vec(),
         })
     }
@@ -1008,7 +1034,7 @@ impl<'a> Lanes<'a> {
         {
             return Some((m, derived));
         }
-        if !self.unresolved.contains(&id) {
+        if !self.console && !self.unresolved.contains(&id) {
             for value in [true, false] {
                 let b = &mut self.b;
                 let holds = forward.iter().all(|&(e, m)| {
