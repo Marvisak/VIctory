@@ -2810,6 +2810,23 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+    const READ_999E5: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u1)"
+Texture2D<float4> t : register(t0);
+RWByteAddressBuffer o : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    float4 f = t.Load(int3(id.xy, 0));
+    uint v = asuint(f).x;
+    if (v & 0x80000000u) {
+        float scale = exp2(float(int((v >> 27) & 31) - 16));
+        f = float4(float3(float(v & 511), float((v >> 9) & 511), float((v >> 18) & 511)) / 256.0 * scale, 1.0);
+    }
+    o.Store4((id.y * 64 + id.x) * 16, asuint(f));
+}
+"#;
+
     /// One texture memory written through an unordered view of a resource
     /// object in one format and read through a placed view in another: a
     /// castable pair shares one host texture (no copy), a pair of other
@@ -2821,17 +2838,17 @@ void main(uint3 id : SV_DispatchThreadID) {
             return; // no host GPU here
         };
         let slots = Slots::new(4);
-        let read = compile_cs(READ);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
-        // Format written and size, what the shader writes, format read and
-        // size, the texel expected, whether one host texture.
-        type Case = (u32, u32, &'static str, u32, u32, [f32; 4], bool);
+        // Format written and size, what the shader writes, the read shader,
+        // format read and size, the texel expected, whether one host texture.
+        type Case = (u32, u32, &'static str, &'static str, u32, u32, [f32; 4], bool);
         let cases: [Case; 2] = [
             // R32_UINT holding R9G9B9E5 (1, 0.5, 0.25): the sky's tables.
             (
                 42,
                 64,
                 "RWTexture2D<uint> o : register(u0); void put(uint2 p) { o[p] = 256u | 128u << 9 | 64u << 18 | 16u << 27; }",
+                READ_999E5,
                 67,
                 64,
                 [1.0, 0.5, 0.25, 1.0],
@@ -2842,13 +2859,15 @@ void main(uint3 id : SV_DispatchThreadID) {
                 17,
                 16,
                 "RWTexture2D<uint2> o : register(u0); void put(uint2 p) { o[p] = uint2(0xF800, 0); }",
+                READ,
                 71,
                 64,
                 [1.0, 0.0, 0.0, 1.0],
                 false,
             ),
         ];
-        for (round, (written, size, put, format, read_size, want, shared)) in cases.into_iter().enumerate() {
+        for (round, (written, size, put, read_shader, format, read_size, want, shared)) in cases.into_iter().enumerate() {
+            let read = compile_cs(read_shader);
             let address = title_memory(1 << 20);
             let object = texture_at_address(address, &texture_words(size, size, written, 0x105, 4));
             let view = placed_view(address, texture_words(read_size, read_size, format, 0x105, 0));

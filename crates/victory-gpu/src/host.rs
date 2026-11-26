@@ -55,7 +55,7 @@ pub(crate) struct Host {
     next_dsv: AtomicU32,
     /// A ring of CPU-only views, for the CPU handles of unordered access
     /// clears, used as `rtvs`.
-    cpu_views: ID3D12DescriptorHeap,
+    pub(crate) cpu_views: ID3D12DescriptorHeap,
     cpu_view_size: u32,
     next_cpu_view: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
@@ -63,6 +63,7 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    formats: Mutex<std::collections::HashMap<u32, (u32, u32)>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -265,7 +266,44 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
+            formats: Mutex::default(),
         })
+    }
+}
+
+impl Host {
+    /// The host's format support bits for DXGI `format`: `(Support1, Support2)`.
+    pub(crate) fn format_support(&self, format: u32) -> (u32, u32) {
+        use std::mem::size_of_val;
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
+        let mut formats = self.formats.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&cached) = formats.get(&format) {
+            return cached;
+        }
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT(format as i32),
+            ..Default::default()
+        };
+        // SAFETY: a plain query into a struct of its size.
+        let result = if unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+        {
+            (support.Support1.0 as u32, support.Support2.0 as u32)
+        } else {
+            (0, 0)
+        };
+        formats.insert(format, result);
+        result
     }
 }
 
