@@ -418,12 +418,12 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         .filter(|m| m.is_file())
         .map(|m| m.len())
         .sum();
-    println!("cache        {} ({} MB)", dir.display(), bytes >> 20);
-    println!(
+    crate::progress::say(format!("cache        {} ({} MB)", dir.display(), bytes >> 20));
+    crate::progress::say(format!(
         "containers   {} in {:.1} s: {cached} already cached, {translated} translated, {refused} refused",
         cached + translated + refused,
         started.elapsed().as_secs_f64()
-    );
+    ));
     if pipelines {
         crate::prebuild::run(&paths, threads)?;
     }
@@ -462,8 +462,15 @@ pub(crate) fn report<T>(
         )
     };
     let mut shown = std::time::Instant::now();
+    // The progress window's and the caption's (`crate::progress`).
+    let progress = || {
+        let busy = workers.iter().filter(|w| !w.is_finished()).count();
+        let done = next.load(Ordering::Relaxed).min(jobs).saturating_sub(busy);
+        crate::progress::update(file, what, done, jobs, started);
+    };
     while !workers.iter().all(|w| w.is_finished()) {
         std::thread::sleep(std::time::Duration::from_millis(100));
+        progress();
         if shown.elapsed() >= every {
             shown = std::time::Instant::now();
             if terminal {
@@ -473,7 +480,9 @@ pub(crate) fn report<T>(
             }
         }
     }
+    progress();
     eprintln!("{}{}", if terminal { "\r" } else { "" }, line());
+    crate::progress::note(&line());
 }
 
 fn translate(

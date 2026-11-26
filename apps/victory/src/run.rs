@@ -176,6 +176,14 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(0);
     }
+    // The title's shaders and pipelines made ahead, once (kept on disk),
+    // with a progress window (`crate::startup`, `VICTORY_PREBUILD`).
+    let dll_paths: Vec<std::path::PathBuf> =
+        dlls.iter().map(|(name, _)| title_dir.join(name)).collect();
+    let files = crate::startup::shader_files(title_dir, exe, &dll_paths);
+    if let Err(e) = crate::startup::prepare(title_dir, files) {
+        tracing::warn!(error = %format!("{e:#}"), "startup: nothing made ahead");
+    }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();

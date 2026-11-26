@@ -56,7 +56,8 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         .filter(|(_, d)| d.starts_with(shaderpack::MAGIC) || sgd5::is_sgd5(d))
         .find_map(|(p, d)| Some((p, shaderpack::find(d)?)));
     let Some((pack_path, pack)) = found else {
-        println!("pipelines    no shader pack among the files: nothing to pre-build");
+        let none = "pipelines    no shader pack among the files: nothing to pre-build";
+        crate::progress::say(none.into());
         return Ok(());
     };
     let pack = shaderpack::Pack::parse(&pack).map_err(anyhow::Error::msg)?;
@@ -248,14 +249,14 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     });
     pipeline::save_pipeline_cache();
     let (made, loaded) = counts();
-    println!(
+    crate::progress::say(format!(
         "pipelines    {} in the pack, {:.1} s: {made} made, {} already in the library",
         jobs.len(),
         started.elapsed().as_secs_f64(),
         listed + loaded as usize,
-    );
+    ));
     for (why, n) in lock(&skipped).iter() {
-        println!("  {n:>7}  skipped: {why}");
+        crate::progress::say(format!("  {n:>7}  skipped: {why}"));
     }
     Ok(())
 }

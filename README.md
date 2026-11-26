@@ -108,6 +108,17 @@ early, it keeps what it made. Without it, a run makes the pipelines it needs
 on worker threads and keeps them, so the first runs after a translator
 change are slower and show missing draws for a while.
 
+`run --execute` does this step itself before the title starts, on the
+title's `shaders.rpf`, executable and DLLs, with a progress window (what is
+being made, how far, how long is left, the last log lines). Both halves are
+kept on disk, and a stamp in the cache folder records what is done for which
+files, translator and GPU, so a start with nothing new skips it at once.
+`VICTORY_PREBUILD` chooses how long the title waits: `shaders` (the default)
+for the shaders, with the pipelines made behind the title on half the
+processor's threads (their progress in the window caption); `all` for the
+pipelines too; `off` for nothing. Esc in the progress window starts the
+title at once, and what is not done goes on behind it.
+
 To get into the game, press A (Enter) on each first-boot screen and again on
 the start screen. Loading the world takes about a minute; the intro cutscene
 plays, then the prologue starts.

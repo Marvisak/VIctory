@@ -379,6 +379,39 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
     Some([info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?])
 }
 
+/// The host GPU and its driver, as one line (name, PCI ids, driver
+/// version): what a pipeline library is good for, since it is the device's
+/// and the driver's. None without a host device.
+pub fn adapter_identity() -> Option<String> {
+    let device = &host()?.device;
+    // SAFETY: plain device and DXGI queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(device.GetAdapterLuid()).ok()?;
+        let d = adapter.GetDesc1().ok()?;
+        let driver = adapter.CheckInterfaceSupport(&IDXGIDevice::IID).unwrap_or(0);
+        let name = String::from_utf16_lossy(&d.Description);
+        Some(format!(
+            "{} {:04x}:{:04x}:{:08x}:{:x} driver {driver:#x}",
+            name.trim_end_matches('\0'),
+            d.VendorId,
+            d.DeviceId,
+            d.SubSysId,
+            d.Revision
+        ))
+    }
+}
+
+/// Text shown after the frame rate in the window's caption (`None`: none),
+/// such as work going on in the background ([`Meter`] sets the caption once
+/// a second).
+static CAPTION_STATUS: Mutex<Option<String>> = Mutex::new(None);
+
+/// Sets the caption's status text (`None` clears it).
+pub fn set_caption_status(text: Option<String>) {
+    *CAPTION_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = text;
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     thread_local! {
@@ -3149,7 +3182,11 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let mut text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        if let Some(status) = &*CAPTION_STATUS.lock().unwrap_or_else(|e| e.into_inner()) {
+            text += " | ";
+            text += status;
+        }
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,

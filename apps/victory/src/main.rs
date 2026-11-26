@@ -6,8 +6,12 @@
 mod census;
 mod inspect;
 mod prebuild;
+mod progress;
 mod run;
 mod shader;
+#[cfg(windows)]
+mod splash;
+mod startup;
 mod translate;
 
 use std::num::NonZeroUsize;
