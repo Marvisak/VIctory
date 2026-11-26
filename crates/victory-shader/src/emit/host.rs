@@ -158,6 +158,36 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
 /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
 static WARP_LOCK: Mutex<()> = Mutex::new(());
 
+/// Waits for `fence` to signal, or fails with a named error.
+///
+/// A device that neither signals the fence nor reports itself removed used to wedge the
+/// test binary forever. The deadline turns that into a failing test that says what
+/// happened; `VICTORY_WAIT_SECS` overrides the default for a deliberately long run.
+fn wait_for_fence(dev: &ID3D12Device, fence: &ID3D12Fence) -> Result<(), String> {
+    let secs: u64 = std::env::var("VICTORY_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        // SAFETY: both calls only read device state through interfaces owned by the
+        // caller for the duration of this call.
+        if unsafe { fence.GetCompletedValue() } >= 1 {
+            return Ok(());
+        }
+        // SAFETY: as above.
+        if let Err(e) = unsafe { dev.GetDeviceRemovedReason() } {
+            return Err(format!("device removed: {}", err(e)));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the GPU did not complete the work within {secs} s: no fence signal and the device is not removed (raise VICTORY_WAIT_SECS for a deliberately long run)"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 impl Host {
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
         self.warp
@@ -717,12 +747,7 @@ impl Host {
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
+            wait_for_fence(dev, &fence)?;
             let mut p = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut p)).map_err(err)?;
             let bits = p.cast::<u32>().read();
@@ -1244,15 +1269,7 @@ impl Host {
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if dev.GetDeviceRemovedReason().is_err() {
-                    return Err(format!(
-                        "device removed: {}",
-                        err(dev.GetDeviceRemovedReason().unwrap_err())
-                    ));
-                }
-                std::thread::yield_now();
-            }
+            wait_for_fence(dev, &fence)?;
             if let Err(e) = dev.GetDeviceRemovedReason() {
                 return Err(format!("device removed: {}", err(e)));
             }
@@ -1987,12 +2004,7 @@ impl Host {
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
+            wait_for_fence(dev, &fence)?;
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
                 let mut p = std::ptr::null_mut();
