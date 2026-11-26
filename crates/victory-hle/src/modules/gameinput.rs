@@ -1479,11 +1479,11 @@ mod host {
         // Long holds with a short release between them; a hold as long as the
         // period (or zero) is refused. A repeat period without a from-to span
         // is rejected rather than silently becoming a one-shot press.
-        let script = parse_script("2-20/3+2.5:Enter,2-20/1+1:A,2-20/1+0:A,7/1:Enter,7-10/1:Enter,5:Enter");
+        let script = parse_script("2-20/3+2.5:Enter,2-20/1+1:A,2-20/1+0:A,7/1:Enter,7-10/1:Enter,21:Enter");
         assert_eq!(script.len(), 3);
         assert_eq!(held_at(&script, s(4.4)), [0x0D]);
         assert_eq!(held_at(&script, s(4.6)), Vec::<u8>::new());
-        assert_eq!(held_at(&script, s(5.1)), [0x0D]);
+        assert_eq!(held_at(&script, s(21.1)), [0x0D]);
     }
 
     #[test]
@@ -1525,7 +1525,7 @@ mod host {
         assert_eq!(cursor, 0);
         let ready = first + Duration::from_millis(100);
         assert!(poll_due(ready, &mut looked));
-        let (line, next) = complete_line_at("Enter\\n", cursor).unwrap();
+        let (line, next) = complete_line_at("Enter\n", cursor).unwrap();
         assert_eq!(line, "Enter");
         cursor = next;
         assert_eq!(cursor, 1);
