@@ -899,3 +899,6 @@ mod tests {
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
     }
 }
+
+#[cfg(all(test, windows))]
+mod depth_bounds_test;
