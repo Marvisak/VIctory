@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
@@ -375,23 +376,22 @@ struct Lane {
     held: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    reads: VecDeque<(u64, QueuedRequest)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
     closed: bool,
 }
 
-// SAFETY: requests point into title memory and our own objects, which stay
-// valid until the title has seen them complete; status arrays count their
-// references atomically.
+// SAFETY: the title keeps its buffers valid until completion; queued file
+// and status array references are counted atomically.
 unsafe impl Send for Lane {}
 
 /// A read a worker runs.
 struct Job {
     lane: u64,
     seq: u64,
-    request: Request,
+    read: QueuedRequest,
     staging: u64,
 }
 
@@ -458,10 +458,10 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = execute(&job.read.request);
         lanes = scheduler.lock();
-        lanes.finish(&job, result);
         lanes.count(&job, started);
+        lanes.finish(job, result);
         if std::mem::take(&mut lanes.starved) {
             scheduler.work.notify_all();
         }
@@ -472,15 +472,16 @@ fn work(scheduler: &'static Scheduler) {
 impl Lanes {
     /// Counts a finished request; every 5 s a debug line sums them up.
     fn count(&mut self, job: &Job, started: std::time::Instant) {
+        let request = &job.read.request;
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
-        *bytes += u64::from(job.request.destination_size);
+        *bytes += u64::from(request.destination_size);
         *busy += started.elapsed();
-        if job.request.options & BCPACK != 0 {
-            self.bcpack.0 += u64::from(job.request.destination_size);
+        if request.options & BCPACK != 0 {
+            self.bcpack.0 += u64::from(request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
-        if job.request.options & PAGE_DESTINATION != 0 {
+        if request.options & PAGE_DESTINATION != 0 {
             self.pages += 1;
         }
         let since = *self.since.get_or_insert(started);
@@ -518,17 +519,18 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let (_, read) = lane.reads.front()?;
+        let request = &read.request;
+        let staging = staging_bytes(request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let size = u64::from(request.destination_size.max(request.source_size)).max(1);
+        let (seq, read) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
-        let size = u64::from(request.destination_size.max(request.source_size)).max(1);
         self.now = self.clock[class];
         self.clock[class] += size * COST[class];
         self.lane_now[class] = lane.clock;
@@ -536,17 +538,25 @@ impl Lanes {
         Some(Job {
             lane: id,
             seq,
-            request,
+            read,
             staging,
         })
     }
 
-    fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
-        self.staged -= job.staging;
-        if let Some(lane) = self.lanes.get_mut(&job.lane) {
-            lane.running.remove(&job.seq);
+    fn finish(&mut self, job: Job, result: Result<(), HRESULT>) {
+        let Job {
+            lane,
+            seq,
+            read,
+            staging,
+        } = job;
+        // Release the file before publishing completion or waking close.
+        drop(read);
+        self.staged -= staging;
+        if let Some(lane) = self.lanes.get_mut(&lane) {
+            lane.running.remove(&seq);
             if let Err(hr) = result {
-                lane.failures.insert(job.seq, hr);
+                lane.failures.insert(seq, hr);
             }
             lane.flush();
         }
@@ -589,7 +599,7 @@ impl Lanes {
         for command in commands {
             let hold = !explicit
                 && match &command {
-                    Command::Read(r) => r.options & PAGE_DESTINATION != 0,
+                    Command::Read(r) => r.request.options & PAGE_DESTINATION != 0,
                     Command::Status(_) => !lane.held.is_empty(),
                 };
             if hold {
@@ -726,10 +736,37 @@ const MEMORY_SOURCE: u64 = 1 << 22;
 const PAGE: usize = 64 * 1024;
 
 enum Command {
-    Read(Request),
+    Read(QueuedRequest),
     Status(Status),
 }
 
+/// A queued read owns a reference to its file until the read is dropped.
+struct QueuedRequest {
+    request: Request,
+    file: Option<NonNull<Instance<File>>>,
+}
+
+impl QueuedRequest {
+    fn new(request: Request) -> Self {
+        let file = if request.options & MEMORY_SOURCE == 0 {
+            NonNull::new(request.source.cast_mut().cast::<Instance<File>>())
+        } else {
+            None
+        };
+        if let Some(file) = file {
+            add_ref_instance(file.as_ptr());
+        }
+        Self { request, file }
+    }
+}
+
+impl Drop for QueuedRequest {
+    fn drop(&mut self) {
+        if let Some(file) = self.file {
+            release(file.as_ptr());
+        }
+    }
+}
 
 /// A status entry to write, holding a reference on its array.
 struct Status {
@@ -755,7 +792,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    queue(this, Command::Read(QueuedRequest::new(request)));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -783,7 +820,7 @@ fn queue(this: QueueRef, command: Command) {
     let mut lanes = scheduler.lock();
     loop {
         let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
-            return; // closed: dropped (a status releases its array)
+            return; // closed: the command drops its reference
         };
         // One slot stays free, as the console's count of empty slots says.
         if lane.entries() + 1 < lane.capacity.max(2) {
@@ -975,12 +1012,15 @@ static READING: AtomicU64 = AtomicU64::new(0);
 
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+    if request.source.is_null() {
+        return Err(E_INVALIDARG);
+    }
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
         return Ok(());
     }
-    // SAFETY: a file object we created; the title keeps it open.
+    // SAFETY: the queued request holds a reference to this file object.
     let file = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
         .file;
@@ -1082,7 +1122,10 @@ fn source_name(request: &Request) -> &str {
     if request.options & MEMORY_SOURCE != 0 {
         return "memory";
     }
-    // SAFETY: a file object we created; the title keeps it open.
+    if request.source.is_null() {
+        return "null";
+    }
+    // SAFETY: the queued request holds a reference to this file object.
     &unsafe { &*request.source.cast::<Instance<File>>() }.state.path
 }
 
@@ -1290,6 +1333,64 @@ mod tests {
     }
 
     #[test]
+    fn queued_reads_keep_the_file_open_until_completion() {
+        let contents = pattern(64);
+        let (dir, file) = file_with(&contents);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut buffers = [[0u8; 16]; 2];
+        for (i, out) in buffers.iter_mut().enumerate() {
+            enqueue(
+                queue,
+                &request(
+                    0,
+                    out.as_mut_ptr().cast(),
+                    out.len(),
+                    file,
+                    (i * out.len()) as u64,
+                    out.len(),
+                ),
+            );
+        }
+        enqueue_status(queue, array, 0);
+        // The queue is below its automatic submission threshold.
+        assert_eq!(release(file.cast::<Instance<File>>()), 2);
+
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        std::fs::remove_file(dir.path().join("data.bin")).unwrap();
+        assert_eq!(buffers[0], contents[..16]);
+        assert_eq!(buffers[1], contents[16..32]);
+        assert_eq!(release(queue.cast::<Instance<Queue>>()), 0);
+        assert_eq!(release(array.cast::<Instance<StatusArray>>()), 0);
+    }
+
+    #[test]
+    fn closing_a_queue_releases_unsubmitted_file_reads() {
+        let (dir, file) = file_with(&pattern(64));
+        let queue = new_queue(0);
+        let mut out = [0u8; 16];
+        enqueue(
+            queue,
+            &request(0, out.as_mut_ptr().cast(), out.len(), file, 0, out.len()),
+        );
+        assert_eq!(release(file.cast::<Instance<File>>()), 1);
+
+        void(queue, 0x40);
+        std::fs::remove_file(dir.path().join("data.bin")).unwrap();
+        assert_eq!(out, [0; 16]);
+        assert_eq!(release(queue.cast::<Instance<Queue>>()), 0);
+    }
+
+    #[test]
+    fn read_into_rejects_a_null_source() {
+        let mut out = [0u8; 1];
+        for options in [0, MEMORY_SOURCE] {
+            let r = request(options, out.as_mut_ptr().cast(), 1, std::ptr::null(), 0, 1);
+            assert_eq!(read_into(&r, &mut out), Err(E_INVALIDARG));
+        }
+    }
+
+    #[test]
     fn memory_sources_inflate_too() {
         let plain = pattern(70_000);
         let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
@@ -1389,7 +1490,7 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
+        lane.unsubmitted.push(Command::Read(QueuedRequest::new(r)));
     }
 
     #[test]
@@ -1408,7 +1509,7 @@ mod tests {
         for _ in 0..330 {
             let job = l.start().unwrap();
             started[job.lane as usize] += 1;
-            l.finish(&job, Ok(()));
+            l.finish(job, Ok(()));
         }
         // Normal gets about a tenth of what high and real-time get together.
         assert_eq!(started[1] + started[2], 300, "{started:?}");
@@ -1426,7 +1527,7 @@ mod tests {
         l.submit(0);
         let first = l.start().unwrap();
         assert!(l.start().is_none(), "60 + 60 > 100");
-        l.finish(&first, Ok(()));
+        l.finish(first, Ok(()));
         let second = l.start().unwrap();
         let raw = l.start().unwrap();
         assert_eq!((second.staging, raw.staging), (60, 0));
@@ -1434,7 +1535,7 @@ mod tests {
         read(&mut l, 0, ZLIB, 500);
         l.submit(0);
         assert!(l.start().is_none());
-        l.finish(&second, Ok(()));
+        l.finish(second, Ok(()));
         assert!(l.start().is_some());
     }
 
@@ -1457,13 +1558,13 @@ mod tests {
             entry.store(E_PENDING, Ordering::Release);
         }
         l.submit(0);
-        let jobs: Vec<Job> = (0..3).map(|_| l.start().unwrap()).collect();
+        let [first, second, last] = std::array::from_fn(|_| l.start().unwrap());
         // The last read and the first finish; the second then fails.
-        l.finish(&jobs[2], Ok(()));
-        l.finish(&jobs[0], Ok(()));
+        l.finish(last, Ok(()));
+        l.finish(first, Ok(()));
         let results = || (result(array.cast(), 0), result(array.cast(), 1));
         assert_eq!(results(), (E_PENDING, E_PENDING));
-        l.finish(&jobs[1], Err(INVALID_DATA));
+        l.finish(second, Err(INVALID_DATA));
         assert_eq!(results(), (INVALID_DATA, S_OK));
     }
 
@@ -1657,16 +1758,16 @@ mod tests {
         l.submit_as(0, false);
         // Only the plain read starts; the status waits behind the held one.
         let plain = l.start().unwrap();
-        assert_eq!(plain.request.options, 0);
+        assert_eq!(plain.read.request.options, 0);
         assert!(l.start().is_none());
-        l.finish(&plain, Ok(()));
+        l.finish(plain, Ok(()));
         assert_eq!(l.lanes[&0].held.len(), 2);
         l.submit(0);
         let paged = l.start().unwrap();
-        assert_eq!(paged.request.options, PAGE_DESTINATION);
+        assert_eq!(paged.read.request.options, PAGE_DESTINATION);
         assert!(l.lanes[&0].held.is_empty());
         assert!(!l.lanes[&0].statuses.is_empty());
-        l.finish(&paged, Ok(()));
+        l.finish(paged, Ok(()));
         assert!(l.lanes[&0].statuses.is_empty());
     }
 
