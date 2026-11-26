@@ -785,6 +785,12 @@ struct Resource {
     /// The creation's initial state and clear value, for the host texture.
     #[cfg(windows)]
     made_with: (u32, Option<[u32; 5]>),
+    /// [`layout_swizzle`] of this texture's description, worked out once:
+    /// [`memory_key`] and [`alias_source`] ask for it per placed texture a
+    /// draw reads and per texture view it binds, and deriving it each time
+    /// builds the console layout (three allocations, the whole mip chain).
+    #[cfg(windows)]
+    swizzle: u32,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1159,9 +1165,21 @@ pub(crate) struct MemoryKey {
     depth: bool,
 }
 
+/// The swizzle mode `desc`'s console layout uses: what [`memory_key`] and
+/// [`alias_source`] compare.
+///
+/// [`texture_layout`] answers it by building a whole texture (three
+/// allocations and the full mip chain), and a draw asks once per placed
+/// texture it reads and once per texture view it binds, so a resource
+/// keeps the answer from its creation ([`Resource::swizzle`]) instead.
+fn layout_swizzle(desc: &ResourceDesc) -> u32 {
+    texture_layout(desc).map_or(desc.layout, |t| t.planes[0].layout.desc.swizzle.0)
+}
+
 /// The texture memory `desc` describes at `address`; `None` for buffers
-/// and formats without a known element.
-pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey> {
+/// and formats without a known element. `swizzle` is [`layout_swizzle`] of
+/// the same description (its own resource's, where there is one).
+pub(crate) fn memory_key(address: u64, desc: &ResourceDesc, swizzle: u32) -> Option<MemoryKey> {
     if desc.dimension == BUFFER {
         return None;
     }
@@ -1173,7 +1191,7 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
         depth_or_array: desc.depth_or_array_size,
         mips: mip_count(desc),
         samples: desc.sample_count.max(1),
-        swizzle: texture_layout(desc).map_or(desc.layout, |t| t.planes[0].layout.desc.swizzle.0),
+        swizzle,
         element: element(desc.format)?,
         depth: desc.flags & DEPTH != 0,
     })
@@ -1210,11 +1228,12 @@ static MEMORY: std::sync::Mutex<
 fn shared_texture(
     address: u64,
     desc: &ResourceDesc,
+    swizzle: u32,
     state: u32,
     clear: *const c_void,
 ) -> Option<std::sync::Arc<HostTexture>> {
     let d = host_desc(desc)?;
-    let key = memory_key(address, desc);
+    let key = memory_key(address, desc, swizzle);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
@@ -1238,7 +1257,7 @@ fn shared_texture(
     if let Some(k) = key {
         let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         for r in at.get(&address).into_iter().flatten().map(|&r| resource(r as This)) {
-            if memory_key(address, &r.desc) == Some(k) {
+            if memory_key(address, &r.desc, r.swizzle) == Some(k) {
                 d.flags |= host_desc(&r.desc).map_or(0, |h| h.flags & USES);
             }
         }
@@ -1282,7 +1301,7 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
 fn current(this: This) -> bool {
     let r = resource(this);
     let made = r.host.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let (Some(Some(h)), Some(k)) = (made, memory_key(r.data() as u64, &r.desc)) else {
+    let (Some(Some(h)), Some(k)) = (made, memory_key(r.data() as u64, &r.desc, r.swizzle)) else {
         return true;
     };
     let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -1484,7 +1503,7 @@ impl Resource {
         // maps, which `evict` holds while it takes this lock).
         let (state, clear) = self.made_with;
         let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
-        let made = shared_texture(self.data() as u64, &self.desc, state, clear);
+        let made = shared_texture(self.data() as u64, &self.desc, self.swizzle, state, clear);
         // A texture made meanwhile by another thread is the memory's too.
         self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone()
     }
@@ -1745,6 +1764,8 @@ fn hand_out_resource(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = (state, clear);
+    #[cfg(windows)]
+    let swizzle = layout_swizzle(&desc);
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -1758,6 +1779,8 @@ fn hand_out_resource(
         #[cfg(windows)]
         // SAFETY: the title passes a whole clear value (or null).
         made_with: (state, (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() })),
+        #[cfg(windows)]
+        swizzle,
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -1797,13 +1820,12 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
     }
     let b = resource(placed);
     let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let bytes = |d: &ResourceDesc| {
+    let bytes = |d: &ResourceDesc, swizzle: u32| {
         let (size, block) = element(d.format)?;
-        let swizzle = texture_layout(d).map_or(d.layout, |t| t.planes[0].layout.desc.swizzle.0);
         let rows = u64::from(d.height).div_ceil(block);
         Some((d.dimension, d.width.div_ceil(block) * size, rows, d.depth_or_array_size, d.sample_count, swizzle))
     };
-    let want = bytes(&b.desc)?;
+    let want = bytes(&b.desc, b.swizzle)?;
     map.get(&(b.data() as u64))?
         .iter()
         .map(|&r| r as This)
@@ -1811,7 +1833,7 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         .find(|&r| {
             let a = resource(r);
             a.desc.flags & WRITTEN != 0
-                && bytes(&a.desc) == Some(want)
+                && bytes(&a.desc, a.swizzle) == Some(want)
                 && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
         })
 }
@@ -2498,16 +2520,67 @@ mod tests {
     fn one_memory_one_key_in_any_format_of_its_element() {
         let a = ResourceDesc { flags: 4, ..texture(192, 108, 42, 1) };
         let b = ResourceDesc { format: 67, flags: 0, ..a };
-        let key = memory_key(0x1_0000, &a);
+        let key = |address: u64, d: &ResourceDesc| memory_key(address, d, layout_swizzle(d));
+        let key = key(0x1_0000, &a);
         assert!(key.is_some());
-        assert_eq!(key, memory_key(0x1_0000, &b));
-        assert_eq!(key, memory_key(0x1_0000, &ResourceDesc { layout: 0x105, ..b }));
-        assert_ne!(key, memory_key(0x2_0000, &a));
-        assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { width: 96, ..a }));
-        assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { format: 10, ..a }));
-        assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { layout: 0x102, ..a }));
-        assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { flags: 2, format: 40, ..a }));
-        assert_eq!(memory_key(0x1_0000, &buffer(256)), None);
+        let b_layout = layout_swizzle(&b);
+        assert_eq!(key, memory_key(0x1_0000, &b, b_layout));
+        let picked = ResourceDesc { layout: 0x105, ..b };
+        assert_eq!(key, memory_key(0x1_0000, &picked, layout_swizzle(&picked)));
+        assert_ne!(key, memory_key(0x2_0000, &a, layout_swizzle(&a)));
+        let narrow = ResourceDesc { width: 96, ..a };
+        assert_ne!(key, memory_key(0x1_0000, &narrow, layout_swizzle(&narrow)));
+        let other = ResourceDesc { format: 10, ..a };
+        assert_ne!(key, memory_key(0x1_0000, &other, layout_swizzle(&other)));
+        let tiled = ResourceDesc { layout: 0x102, ..a };
+        assert_ne!(key, memory_key(0x1_0000, &tiled, layout_swizzle(&tiled)));
+        let depthly = ResourceDesc { flags: 2, format: 40, ..a };
+        assert_ne!(key, memory_key(0x1_0000, &depthly, layout_swizzle(&depthly)));
+        let no_element = buffer(256);
+        assert_eq!(memory_key(0x1_0000, &no_element, layout_swizzle(&no_element)), None);
+    }
+
+    /// What keeping the swizzle on the resource saves: deriving it per call
+    /// builds the whole console layout (three allocations and the full mip
+    /// chain), where [`layout_swizzle`] answers from the description alone
+    /// and a resource asks once, at creation.
+    ///
+    /// `cargo test --release -p victory-gpu --lib --locked -- --exact
+    /// --ignored --nocapture
+    /// resource::tests::a_swizzle_costs_no_layout_per_placed_texture`
+    #[test]
+    #[ignore = "timing"]
+    fn a_swizzle_costs_no_layout_per_placed_texture() {
+        const ROUNDS: u32 = 20_000;
+        let mut sum = 0u32;
+        // What a draw paid per placed texture and per texture view before:
+        // the description's swizzle, derived by building the layout.
+        let mut derived = Vec::new();
+        for (name, d) in [
+            ("2048x2048, 12 mips", texture(2048, 2048, 98, 12)),
+            ("1920x1080 render target", ResourceDesc { flags: 1, ..texture(1920, 1080, 10, 11) }),
+        ] {
+            let start = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                sum = sum.wrapping_add(layout_swizzle(std::hint::black_box(&d)));
+            }
+            derived.push((name, start.elapsed()));
+        }
+        // What it pays now: the word the resource kept, in the structure
+        // the read already has.
+        let kept = [0x105u32; 8];
+        let start = std::time::Instant::now();
+        for i in 0..ROUNDS {
+            sum = sum.wrapping_add(kept[(i % 8) as usize]);
+        }
+        let stored = start.elapsed();
+        for (name, time) in derived {
+            println!(
+                "{name}: {:.0} ns to derive it, {:.2} ns to read the kept one (sum {sum})",
+                time.as_nanos() as f64 / f64::from(ROUNDS),
+                stored.as_nanos() as f64 / f64::from(ROUNDS),
+            );
+        }
     }
 
     /// Castable formats: every format of the same element but typeless and

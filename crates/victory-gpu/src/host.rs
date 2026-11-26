@@ -997,6 +997,39 @@ enum Step {
     Memory(usize),
 }
 
+/// FxHash's multiply-rotate step, for the per-list dedup sets
+/// ([`Deferred::refreshed`], [`Deferred::textures`]): their keys are a few
+/// words each, and the default SipHash costs more than the lookup they guard.
+#[derive(Default)]
+struct Fx(u64);
+
+impl std::hash::Hasher for Fx {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(u64::from(n));
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+}
+
+/// A set with [`Fx`]: the per-list dedup sets.
+type FastSet<T> = std::collections::HashSet<T, std::hash::BuildHasherDefault<Fx>>;
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -1011,9 +1044,12 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// A list's lists refresh thousands of distinct ranges, so this is a set
+    /// with a cheap hash, not SipHash (which costs more than the lookup) and
+    /// not a `Vec` (whose scan is O(n) per refresh, O(n²) per list).
+    refreshed: FastSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: FastSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,

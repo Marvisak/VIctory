@@ -255,6 +255,11 @@ fn with_heap<R>(key: usize, f: impl FnOnce(&HostHeap) -> R) -> Option<R> {
 /// 256 MiB regions missed (no copy), and the first missed addresses.
 #[derive(Default)]
 struct Stats {
+    /// Draws and dispatches by pipeline, for the frame line to name the
+    /// busiest: diagnostics only, because filling it costs a global lock, a
+    /// `String` and a `BTreeMap` descent per draw, and nothing else reads
+    /// it. [`USES`] counts them in every build.
+    #[cfg(feature = "diagnostics")]
     uses: std::collections::BTreeMap<String, u64>,
     tables: u64,
     written: u64,
@@ -282,8 +287,16 @@ pub(crate) fn note_withheld(bytes: u64) {
 
 /// A draw or dispatch of `pipeline` uses title memory.
 pub(crate) fn note_use(pipeline: &str) {
+    USES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
     stats(|s| *s.uses.entry(pipeline.to_owned()).or_default() += 1);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = pipeline;
 }
+
+/// Draws and dispatches with shaders using title memory since the last
+/// frame line (which of them, [`Stats::uses`] names in diagnostics builds).
+static USES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Frames presented, and the last one in which a list using title memory
 /// read or wrote memory with no copy ([`MISS_NEVER`] if none has).
@@ -359,18 +372,30 @@ pub(crate) fn log_frame() {
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     retake_dropped();
     let s = stats(std::mem::take);
-    if s.uses.is_empty() && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {
+    let uses_count = USES.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if uses_count == 0 && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {
         return;
     }
-    let mut uses: Vec<(&String, &u64)> = s.uses.iter().collect();
-    uses.sort_by(|a, b| b.1.cmp(a.1));
-    let uses: Vec<String> = uses.iter().take(32).map(|(p, n)| format!("{n} {p}")).collect();
+    // The line is built before `info!` asks whether it will be written, so
+    // a run above the info level still sorted the map and formatted up to
+    // 32 strings for nothing.
+    if !tracing::enabled!(tracing::Level::INFO) {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    let uses: Vec<String> = {
+        let mut uses: Vec<(&String, &u64)> = s.uses.iter().collect();
+        uses.sort_by(|a, b| b.1.cmp(a.1));
+        uses.iter().take(32).map(|(p, n)| format!("{n} {p}")).collect()
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let uses: Vec<String> = Vec::new();
     let missed: Vec<String> = s.first_missed.iter().map(|a| format!("{a:#x}")).collect();
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
          copied back, {} withheld and {:.1} MB of views kept (their list read memory with no copy), missed {} pages \
          and {} 256 MiB regions with no copy (first: {})",
-        s.uses.values().sum::<u64>(),
+        uses_count,
         uses.join(", "),
         s.tables,
         s.written,
