@@ -233,6 +233,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 /// 24-bit depth it never tested EQUAL against a draw on the RX 6700 XT.
 /// shortcut: a depth bias on such a target counts in float steps, not
 /// 1/65535; scale it if a title's 16-bit depth biased draws show acne.
+#[cfg(windows)]
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
         118 => 20,
@@ -243,6 +244,7 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 }
 
 /// The typeless format of a format's family (itself if it has none).
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code and by tests
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
         (1, 4),
@@ -279,11 +281,13 @@ pub(crate) fn family(format: u32) -> u32 {
 }
 
 /// sRGB formats and their linear twins.
+#[cfg(windows)]
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
@@ -295,6 +299,7 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
 /// Depth formats with their typeless family: depth textures that shaders
 /// read are made typeless on the host, which only allows views of
 /// typeless depth resources.
+#[cfg(windows)]
 pub(crate) const DEPTH_FORMATS: [(u32, u32); 4] = [(20, 19), (40, 39), (45, 44), (55, 53)];
 
 /// Mip levels, the full chain for 0.
@@ -330,6 +335,7 @@ pub(crate) struct PlacedFootprint {
 
 impl PlacedFootprint {
     /// The bytes it spans in a buffer: every row pitched but the last.
+    #[cfg(windows)]
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
         let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
@@ -340,6 +346,7 @@ impl PlacedFootprint {
     /// The byte ranges (from the footprint's start) that a `size` texel
     /// region at texel `at` covers: one per row of blocks; `None` if the
     /// format has no size or the region leaves the footprint.
+    #[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
     pub(crate) fn rows(&self, at: [u32; 3], size: [u32; 3]) -> Option<Vec<(u64, u64)>> {
         let (element, block) = element(self.format)?;
         let blocks = |texels: u32| u64::from(texels).div_ceil(block);
@@ -1134,6 +1141,7 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     Some(d)
 }
 
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code and by tests
 const DEPTH: u32 = 2;
 #[cfg(windows)]
 const UNORDERED: u32 = 4;
@@ -1145,6 +1153,7 @@ const USES: u32 = 0x7;
 /// and shape (the console's layout resolved, mips counted, and the bytes
 /// and texels of an element), and whether it is a depth texture (which
 /// cannot share with colour ones on the host).
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code and by tests
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct MemoryKey {
     address: u64,
@@ -1161,6 +1170,7 @@ pub(crate) struct MemoryKey {
 
 /// The texture memory `desc` describes at `address`; `None` for buffers
 /// and formats without a known element.
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code and by tests
 pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey> {
     if desc.dimension == BUFFER {
         return None;
@@ -1185,6 +1195,7 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
 /// formats among block formats of the same block size), but depth ones
 /// (refused in lists on the RX 6700 XT and WARP alike) and typeless ones
 /// (no view takes them).
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code and by tests
 pub(crate) fn castable(format: u32) -> Vec<u32> {
     const DEPTH_FAMILIES: [u32; 10] = [19, 20, 21, 22, 40, 44, 45, 46, 47, 55];
     let Some(e) = element(format) else {
@@ -1438,6 +1449,7 @@ fn desc1_of(p: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC) -> wi
 }
 
 /// A texture's console memory and description; `None` for buffers.
+#[cfg(windows)]
 pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     if this.is_null() {
         return None;
@@ -1448,6 +1460,7 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
 
 /// A texture's description as words (the layout of placed views'
 /// resource descriptions); `None` for buffers.
+#[cfg(windows)]
 pub(crate) fn texture_desc(this: This) -> Option<[u32; 14]> {
     let (_, desc) = texture_memory(this)?;
     let mut words = [0u32; 14];
@@ -1457,6 +1470,7 @@ pub(crate) fn texture_desc(this: This) -> Option<[u32; 14]> {
 }
 
 /// A texture's format as the title gave it.
+#[cfg(windows)]
 pub(crate) fn title_format(this: This) -> Option<u32> {
     (!this.is_null()).then(|| resource(this).desc.format)
 }
@@ -1527,14 +1541,14 @@ fn now_ms() -> u64 {
 /// this long (and this many presented frames) is given up ([`evict`]).
 /// Two minutes: of the textures given up after 20 s, nine in ten were
 /// read again within a minute (run evict4).
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code and by tests
 pub(crate) const IDLE_MS: u64 = 120_000;
 /// Frames as well as time: in slow runs (seconds a frame) 20 s alone cycled
 /// the textures of a cutscene's alternating shots (run evict2), and 30
 /// frames gave up what the menus and loading made (at 30 fps) before the
 /// world read it (run evict3). At 30 fps the idle time decides; slower, the
 /// card's budget does.
-#[cfg(windows)]
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code and by tests
 pub(crate) const IDLE_FRAMES: u64 = 300;
 /// A use stamp's frame for "never" (tests).
 #[cfg(windows)]
@@ -1660,6 +1674,7 @@ fn candidates() -> Vec<Owned> {
 /// up at (`frame`, `now`): every one idle for [`IDLE_FRAMES`] and
 /// [`IDLE_MS`], then the least recently used others until `over` bytes are
 /// gone (indices).
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
     let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
     let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));

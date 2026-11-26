@@ -26,10 +26,41 @@ static IMAGE_PATHS: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
 /// own path (`GetModuleFileName`) to find its data, and must not get our
 /// cache copy.
 pub fn set_image_path(base: usize, path: &Path) {
-    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    let path = absolute_title_path(path);
     let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths.retain(|(b, _)| *b != base);
     paths.push((base, path));
+}
+
+/// Makes `path` absolute. On Windows, as `std::path::absolute` does
+/// (`GetFullPathNameW`: `/` becomes `\`, `..` is resolved), so the title
+/// gets the path Windows would give it. Elsewhere a Windows path is
+/// absolute too: `C:\title\game.exe` is a title path, not a relative one
+/// that the host would make absolute against its own root, so it and an
+/// already-absolute path are kept as stored.
+fn absolute_title_path(path: &Path) -> PathBuf {
+    #[cfg(not(windows))]
+    if path.is_absolute() || title_absolute(path) {
+        return path.to_path_buf();
+    }
+    std::path::absolute(path).unwrap_or_else(|_| path.to_owned())
+}
+
+/// Whether `path` looks like an absolute Windows path: a drive root (`C:\`),
+/// a drive-rooted path (`C:\title\game.exe`) or a UNC path (`\\server\share`).
+#[cfg(not(windows))]
+fn title_absolute(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    let bytes = s.as_bytes();
+    // A drive root: `X:` (nothing else), then a separator.
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    s.starts_with("\\\\")
 }
 
 /// Forgets a title image that was unmapped again.
@@ -51,8 +82,25 @@ pub fn image_named(file: &str) -> Option<usize> {
     let paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths
         .iter()
-        .find(|(_, p)| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(file)))
+        .find(|(_, p)| title_file_name(p).is_some_and(|n| n.eq_ignore_ascii_case(file)))
         .map(|(b, _)| *b)
+}
+
+/// The file name of a title path, as `Path::file_name` finds it: Windows
+/// splits at both `\` and `/`.
+#[cfg(windows)]
+fn title_file_name(path: &Path) -> Option<&std::ffi::OsStr> {
+    path.file_name()
+}
+
+/// The file name of a title path, whatever its separators:
+/// `C:\title\Mapped.dll` and `C:\title/Mapped.dll` both name `Mapped.dll`.
+/// Off Windows, `Path::file_name` splits only at `/`.
+#[cfg(not(windows))]
+fn title_file_name(path: &Path) -> Option<String> {
+    let s = path.to_string_lossy();
+    let name = s.rsplit(['\\', '/']).next()?;
+    Some(name.to_string())
 }
 
 /// Maps a title DLL the title loads itself (`LoadLibrary`) and returns its
@@ -250,6 +298,51 @@ pub fn use_console_timers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On Windows a title path is what `GetFullPathNameW` makes of it, as
+    /// before: separators normalized and `..` resolved.
+    #[cfg(windows)]
+    #[test]
+    fn windows_title_paths_are_normalized() {
+        let path = absolute_title_path(Path::new(r"C:/games/x/../game.exe"));
+        assert_eq!(path, PathBuf::from(r"C:\games\game.exe"));
+    }
+
+    /// Elsewhere a Windows-style absolute title path is kept as stored, not
+    /// joined to the host's current directory; a relative one is made
+    /// absolute.
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_style_title_paths_stay_absolute_on_other_hosts() {
+        for stored in [
+            r"C:\title\game.exe",
+            r"C:/title/game.exe",
+            r"C:",
+            r"\\server\share\game.exe",
+        ] {
+            assert!(title_absolute(Path::new(stored)), "{stored}");
+            assert_eq!(
+                absolute_title_path(Path::new(stored)),
+                PathBuf::from(stored)
+            );
+        }
+        assert!(!title_absolute(Path::new("game.exe")));
+        assert!(absolute_title_path(Path::new("game.exe")).is_absolute());
+    }
+
+    /// A title image is found by its file name whichever separator its path
+    /// uses, on every host.
+    #[test]
+    fn title_file_names_end_at_either_separator() {
+        for stored in [
+            r"C:\title\Mapped.dll",
+            r"C:\title/Mapped.dll",
+            "/title/Mapped.dll",
+        ] {
+            let name = title_file_name(Path::new(stored));
+            assert!(name.is_some_and(|n| n == "Mapped.dll"), "{stored}");
+        }
+    }
 
     #[test]
     fn a_quoted_angle_bracket_does_not_end_its_tag() {

@@ -139,21 +139,25 @@ pub(crate) fn set(this: This, value: u64) -> HRESULT {
 static WAITED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
 
 /// Events set since the last call and how long they waited, summed.
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) fn take_waited() -> (u64, std::time::Duration) {
     let n = WAITED.0.swap(0, Ordering::Relaxed);
     (n, std::time::Duration::from_micros(WAITED.1.swap(0, Ordering::Relaxed)))
 }
 
 /// A fence's value.
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) fn value(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
 
 /// Keeps a fence alive while a queue holds a Signal of it, until
 /// [`let_go`].
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) fn keep(this: This) {
     object::add_ref(this);
 }
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) fn let_go(this: This) {
     release(this);
 }
@@ -183,7 +187,9 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::*;
+    #[cfg(windows)]
     use crate::object::slot;
 
     #[cfg(windows)]
@@ -228,6 +234,7 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 
+    #[cfg(windows)] // creates and queries the Windows-only COM object
     #[test]
     fn fence1_interface_is_created_and_queried() {
         const FENCE1_IID: Iid = guid(

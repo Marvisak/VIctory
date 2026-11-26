@@ -125,9 +125,17 @@ fn limit(typed: &str, max: u32) -> String {
 }
 
 /// Asks the user in a modal host dialog; `None` if dismissed.
-#[cfg(not(test))]
+#[cfg(all(not(test), windows))]
 fn ask(title: &str, description: &str, default: &str, max: u32, password: bool) -> Option<String> {
     dialog::ask(title, description, default, max, password)
+}
+
+/// Asks the user in a modal host dialog; `None` if dismissed. A host
+/// without a window system can't ask, so the dialog is cancelled, which
+/// the title treats as a cancelled entry.
+#[cfg(all(not(test), not(windows)))]
+fn ask(_: &str, _: &str, _: &str, _: u32, _: bool) -> Option<String> {
+    None
 }
 
 /// Tests answer for the user: "typed" for a title starting with "Type",
@@ -138,6 +146,7 @@ fn ask(title: &str, _: &str, default: &str, _: u32, password: bool) -> Option<St
     title.starts_with("Type").then(|| format!("{default}typed"))
 }
 
+#[cfg(windows)]
 mod dialog {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -422,6 +431,7 @@ mod tests {
             .push((title.to_owned(), password));
     }
 
+    #[cfg(windows)] // read by the Windows-only test below
     fn asked_password(title: &str) -> Option<bool> {
         ASKED
             .lock()
@@ -432,6 +442,7 @@ mod tests {
             .map(|(_, p)| *p)
     }
 
+    #[cfg(windows)] // the Windows dialog's edit control
     #[test]
     fn password_scope_masks_the_edit_control() {
         use windows_sys::Win32::UI::WindowsAndMessaging as wm;

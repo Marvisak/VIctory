@@ -65,6 +65,7 @@ pub(crate) struct Heap {
     written: Option<crate::watch::Tracked>,
 }
 
+#[cfg(windows)]
 pub(crate) use host::fallback_samplers;
 
 /// A title heap's host copy.
@@ -75,6 +76,7 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
 
 impl Heap {
     /// Whether this is a sampler heap.
+    #[cfg(windows)]
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
     }
@@ -107,6 +109,7 @@ impl Heap {
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
+    #[cfg(windows)]
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
         let at = handle.checked_sub(self.start)?;
@@ -514,6 +517,7 @@ fn record(handle: u64, view: View) {
 }
 
 /// The title released `resource`: the views naming it go stale.
+#[cfg(any(windows, test))]
 pub(crate) fn forget(resource: usize) {
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
@@ -544,6 +548,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 
 /// For each record (tag, index, generation): whether it names a view that
 /// is current, as [`view_at`] would find it (one lock for them all).
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     records
@@ -555,6 +560,7 @@ fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
+#[cfg(any(windows, test))]
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
         return None;
@@ -717,15 +723,18 @@ pub(crate) extern "system" fn copy(
 }
 
 /// The view recorded at `handle`, if one is.
+#[cfg(windows)]
 pub(crate) fn rtv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, RTV_TAG)
 }
 
 /// The depth view recorded at `handle`, if one is.
+#[cfg(windows)]
 pub(crate) fn dsv_record(handle: u64) -> Option<RtvRecord> {
     tagged_record(handle, DSV_TAG)
 }
 
+#[cfg(windows)]
 fn tagged_record(handle: u64, tag: u32) -> Option<RtvRecord> {
     if handle == 0 {
         return None;
@@ -827,6 +836,7 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(test)]
+#[cfg_attr(not(windows), allow(dead_code))] // used by Windows code
 pub(crate) mod tests {
     /// Work to run while `make_read` makes the textures of a read slot (the
     /// slot), outside the heaps' lock.
@@ -861,6 +871,7 @@ pub(crate) mod tests {
     /// A released view heap takes its title memory page table with it, also
     /// when no heap is made at its address afterwards (else the table, its
     /// 16.8 MiB mapping and the copies it names live on).
+    #[cfg(windows)] // drives the Windows-only host heap and page tables
     #[test]
     fn a_released_view_heap_drops_its_page_table() {
         let Some(host) = crate::host::host() else {
