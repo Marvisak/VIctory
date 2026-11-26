@@ -1284,6 +1284,9 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         let mut removed_in = None;
+        // Clear marks forgotten while preparing this submission before its
+        // shaders can write fresh marks to the same bitmap slots.
+        crate::shadow::clear_forgotten();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
