@@ -1846,16 +1846,20 @@ impl LiveTextures {
 #[cfg(windows)]
 static TEXTURES_AT: std::sync::Mutex<LiveTextures> = std::sync::Mutex::new(LiveTextures::new());
 
-/// For a texture made for a placed view (`texture_at`): a title texture
-/// the GPU writes (render target, depth or unordered access) at the same
-/// memory, in the same layout and with the same bytes per row and rows
-/// (elements of the same size, block-compressed ones counted in blocks),
-/// that has another host texture: what the GPU wrote there lives in that
-/// one, to be copied over (`texture::alias_copy`).
+/// For a texture made for a placed view (`texture_at`): the host copy of a
+/// title texture the GPU writes (render target, depth or unordered access)
+/// at the same memory, in the same layout and with the same bytes per row
+/// and rows (elements of the same size, block-compressed ones counted in
+/// blocks), that has another host texture: what the GPU wrote there lives in
+/// that one, to be copied over (`texture::alias_copy`).
+///
+/// Clones the `Arc<HostTexture>` under `TEXTURES_AT` so a concurrent
+/// `Release()` of the source title resource cannot free it before
+/// `texture::alias_copy` records the copy.
 /// shortcut: same start only; overlapping ranges, other mips or slices of
 /// one memory, and views of buffers are not matched.
 #[cfg(windows)]
-pub(crate) fn alias_source(placed: This) -> Option<This> {
+pub(crate) fn alias_source(placed: This) -> Option<std::sync::Arc<HostTexture>> {
     const WRITTEN: u32 = 0x7; // render target, depth, unordered access
     // A shader view of no resource (a null view) has no memory.
     if placed.is_null() {
@@ -1863,11 +1867,19 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
     }
     let b = resource(placed);
     let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let b_copy = made(b)?;
     let bytes = |d: &ResourceDesc| {
         let (size, block) = element(d.format)?;
         let swizzle = texture_layout(d).map_or(d.layout, |t| t.planes[0].layout.desc.swizzle.0);
         let rows = u64::from(d.height).div_ceil(block);
-        Some((d.dimension, d.width.div_ceil(block) * size, rows, d.depth_or_array_size, d.sample_count, swizzle))
+        Some((
+            d.dimension,
+            d.width.div_ceil(block) * size,
+            rows,
+            d.depth_or_array_size,
+            d.sample_count,
+            swizzle,
+        ))
     };
     let want = bytes(&b.desc)?;
     map.by_memory
@@ -1875,11 +1887,13 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         .iter()
         .map(|&r| r as This)
         .filter(|&r| r != placed)
-        .find(|&r| {
+        .find_map(|r| {
             let a = resource(r);
-            a.desc.flags & WRITTEN != 0
-                && bytes(&a.desc) == Some(want)
-                && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
+            if a.desc.flags & WRITTEN == 0 || bytes(&a.desc) != Some(want) {
+                return None;
+            }
+            let x = made(a)?;
+            (!std::sync::Arc::ptr_eq(&x, &b_copy)).then_some(x)
         })
 }
 
@@ -2366,7 +2380,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_null_view_has_no_alias_source() {
-        assert_eq!(alias_source(std::ptr::null()), None);
+        assert!(alias_source(std::ptr::null()).is_none());
     }
 
     #[test]

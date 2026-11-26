@@ -1982,7 +1982,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
             // A view of memory the GPU writes through another title texture
             // whose host copy this one could not share reads that copy.
             if let Some(a) = crate::resource::alias_source(*resource as This) {
-                crate::texture::alias_copy(list, a, *resource as This);
+                crate::texture::alias_copy(list, &a, *resource as This);
             }
             if let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(&t)
