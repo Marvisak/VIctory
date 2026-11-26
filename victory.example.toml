@@ -10,6 +10,10 @@ game_dir = 'D:\victory-data\game'
 # Derived data. Default: %LOCALAPPDATA%\victory\cache.   env: VICTORY_CACHE_DIR
 # cache_dir = 'D:\victory-data\cache'
 
+# Windows: setting this directory opts in to sparse physical-page pools.
+# VICTORY_FILE_BACKED_PAGES=0 disables; =1 uses this or <cache_dir>\physical-pages.
+# physical_pages_dir = 'D:\victory-data\cache\physical-pages'
+
 # What titles save (persistent local storage), kept apart from the cache.
 # Default: %LOCALAPPDATA%\victory\data.   env: VICTORY_DATA_DIR
 # data_dir = 'D:\victory-data\data'

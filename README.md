@@ -79,6 +79,10 @@ and a commit limit of about 80 GB. Check **Committed** under **Task Manager →
 Performance → Memory**. If `crashes.log` reports Windows error 1455, close
 other applications or increase the Windows paging file size, then retry.
 
+On Windows with limited commit, set `[paths].physical_pages_dir` in `victory.toml`
+to a directory on a local sparse-capable volume (e.g. NTFS) with several GiB free.
+This trades pagefile commit for temporary disk space and I/O; leave it unset for the default behavior.
+
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)

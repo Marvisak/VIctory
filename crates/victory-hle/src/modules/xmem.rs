@@ -10,12 +10,20 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
+use std::fs::File;
+use std::io;
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
+use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_DELETE_ON_CLOSE;
+use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
@@ -358,12 +366,47 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 // Physical pages: on the console, 64 KiB frames a title maps into its own
 // reservations, at more than one address if it likes. Here each allocation
-// is a pagefile-backed section, its pages are 64 KiB slices of it, and a
+// is a shared section, its pages are 64 KiB slices of it, and a
 // mapping is a view of consecutive slices in place of a host placeholder.
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+static PAGE_FILES: OnceLock<PathBuf> = OnceLock::new();
+
+/// Uses temporary sparse files under this checked directory instead of
+/// charging the Windows pagefile for mapped console physical pages.
+pub fn use_page_files(dir: PathBuf) {
+    let _ = PAGE_FILES.set(dir);
+}
+
+fn page_file(dir: &Path) -> io::Result<File> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let mut options = File::options();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+    // Never open an existing path, even if a previous process used the same PID.
+    for _ in 0..64 {
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("victory-pages-{}-{id}.tmp", std::process::id()));
+        match options.open(path) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            result => return result,
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no unused page file name",
+    ))
+}
+
+struct Section {
+    handle: HANDLE,
+    reserved: bool,
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -373,7 +416,64 @@ unsafe impl Sync for Section {}
 impl Drop for Section {
     fn drop(&mut self) {
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
+impl Section {
+    fn new(size: usize, dir: Option<&Path>) -> io::Result<Self> {
+        let file = if let Some(dir) = dir {
+            let file = page_file(dir)?;
+            let mut returned = 0;
+            // SAFETY: a new writable file; no input or output buffer.
+            if unsafe {
+                DeviceIoControl(
+                    file.as_raw_handle(),
+                    FSCTL_SET_SPARSE,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            file.set_len(size as u64)?;
+            Some(file)
+        } else {
+            None
+        };
+        // Wine already implements a committed pagefile section as a sparse
+        // file. On Windows, reserve pagefile-backed sections until mapped.
+        let backing = if file.is_some() {
+            0
+        } else if on_wine() {
+            SEC_COMMIT
+        } else {
+            SEC_RESERVE
+        };
+        // SAFETY: an unnamed section of the new file (delete-on-close after
+        // the last mapping goes away), or the system pagefile as usual.
+        let handle = unsafe {
+            CreateFileMappingW(
+                file.as_ref().map_or(INVALID_HANDLE_VALUE, AsRawHandle::as_raw_handle),
+                std::ptr::null(),
+                PAGE_READWRITE | backing,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { handle, reserved: backing == SEC_RESERVE })
+    }
+
+    fn commit_view(&self, base: usize, len: usize) -> bool {
+        !self.reserved || commit(base, len)
     }
 }
 
@@ -485,37 +585,31 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    let dir = PAGE_FILES.get().map(PathBuf::as_path);
+    let section = match Section::new(size, dir) {
+        Ok(s) => Arc::new(s),
+        Err(error) => {
+            tracing::warn!(n, file_backed = dir.is_some(), %error, "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
     };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    if dir.is_some() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(
+                pages = n,
+                bytes = size,
+                "XMem physical pages backed by temporary cache files"
+            )
+        });
     }
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -572,7 +666,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -583,7 +677,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        slice.section.commit_view(at.Value as usize, len).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -811,7 +905,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -831,7 +925,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if !slice.section.commit_view(base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -850,9 +944,6 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 
 /// Commits the section pages a view shows (once per page, whichever view).
 fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
-    }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
         return true;
@@ -1368,6 +1459,44 @@ mod tests {
     fn page_bytes(page: usize) -> Vec<u8> {
         let slice = physical().pages.get(&page).cloned().expect("known page");
         View::map(&slice, 1).expect("mapped").bytes().to_vec()
+    }
+
+    #[test]
+    fn file_backed_pages_alias_across_a_placeholder_and_storage_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let section = match Section::new(2 * PAGE, Some(dir.path())) {
+            Ok(section) => section,
+            Err(e) if matches!(e.raw_os_error(), Some(1 | 50)) => {
+                eprintln!("temporary volume does not support sparse files: {e}");
+                return;
+            }
+            Err(e) => panic!("creating a file-backed section: {e}"),
+        };
+        let slice = Slice { section: Arc::new(section), index: 1 };
+        let mut storage = View::map(&slice, 1).unwrap();
+        assert_eq!(storage.bytes()[0], 0);
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        let mut physical = Physical::default();
+        assert!(map(&mut physical, base as usize, PAGE, slice));
+        storage.bytes()[0] = 37;
+        // SAFETY: a writable page at the placeholder, aliasing the storage view.
+        unsafe {
+            assert_eq!(base.cast::<u8>().read(), 37);
+            base.cast::<u8>().write(91);
+        }
+        unmap(&mut physical, base as usize, PAGE);
+        assert_eq!(storage.bytes()[0], 91, "the last open view keeps its file alive");
+        drop(storage);
+        assert_eq!(dir.path().read_dir().unwrap().count(), 0, "no backing files left");
+        // SAFETY: our single placeholder, no longer mapped.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]

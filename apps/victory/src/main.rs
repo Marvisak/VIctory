@@ -222,6 +222,7 @@ fn show_config() -> Result<()> {
             .map_or("(none)".into(), |p| p.display().to_string())
     );
     println!("game_dir    : {}", status(&cfg.game_dir));
+    println!("page files  : {}", status(&cfg.physical_pages_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
     println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
@@ -238,6 +239,7 @@ fn check_policy(cfg: &victory_core::Config) -> Result<()> {
     for p in cfg
         .game_dir
         .iter()
+        .chain(&cfg.physical_pages_dir)
         .chain(&cfg.test_titles)
         .chain([&cfg.cache_dir, &cfg.data_dir])
     {

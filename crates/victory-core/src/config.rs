@@ -15,6 +15,8 @@ use crate::policy::ensure_outside_repo;
 pub struct Config {
     /// The user's dump of Grand Theft Auto VI.
     pub game_dir: Option<PathBuf>,
+    /// Optional directory for temporary sparse physical-page pools on Windows.
+    pub physical_pages_dir: Option<PathBuf>,
     /// Root for all derived data. Always outside the repository.
     pub cache_dir: PathBuf,
     /// What titles write and must keep (persistent local storage). Never
@@ -40,6 +42,7 @@ struct FileConfig {
 #[serde(deny_unknown_fields)]
 struct FilePaths {
     game_dir: Option<PathBuf>,
+    physical_pages_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     #[serde(default)]
@@ -95,7 +98,18 @@ impl Config {
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
+        let directory = file
+            .physical_pages_dir
+            .filter(|p| !p.as_os_str().is_empty());
+        let physical_pages_dir = match env("VICTORY_FILE_BACKED_PAGES").filter(|v| !v.is_empty()) {
+            Some(v) if v == "1" => {
+                Some(directory.unwrap_or_else(|| cache_dir.join("physical-pages")))
+            }
+            Some(_) => None,
+            None => directory,
+        };
         Ok(Config {
+            physical_pages_dir,
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
             data_dir,
@@ -118,6 +132,15 @@ impl Config {
         subdir(&self.cache_dir, sub)
     }
 
+    /// Creates the configured pool directory only when a title will use it.
+    pub fn prepare_page_files(&self) -> Result<Option<PathBuf>> {
+        // The title can change the process working directory after startup.
+        self.physical_pages_dir
+            .as_ref()
+            .map(|dir| checked_dir(std::path::absolute(dir)?))
+            .transpose()
+    }
+
     /// Returns `<data>/<sub>`, creating it, after checking the asset policy.
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
@@ -133,7 +156,10 @@ fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Opt
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
-    let dir = root.join(sub);
+    checked_dir(root.join(sub))
+}
+
+fn checked_dir(dir: PathBuf) -> Result<PathBuf> {
     ensure_outside_repo(&dir)?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
@@ -153,6 +179,42 @@ fn default_dir(name: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn page_files_are_opt_in_and_respect_the_override() {
+        let resolve = |text: &str, switch: Option<&str>| {
+            let f: FileConfig = toml::from_str(text).unwrap();
+            Config::resolve(f.paths, None, |k| {
+                if k == "VICTORY_FILE_BACKED_PAGES" {
+                    switch.map(OsString::from)
+                } else {
+                    None
+                }
+            })
+            .unwrap()
+            .physical_pages_dir
+        };
+        let cache = "[paths]\ncache_dir = 'cache'";
+        let disk = "[paths]\nphysical_pages_dir = 'pool'";
+        assert_eq!(resolve(cache, None), None);
+        assert_eq!(resolve("[paths]\nphysical_pages_dir = ''", None), None);
+        assert_eq!(
+            resolve(cache, Some("1")),
+            Some(Path::new("cache").join("physical-pages"))
+        );
+        assert_eq!(resolve(disk, None), Some("pool".into()));
+        assert_eq!(resolve(disk, Some("0")), None);
+        assert_eq!(resolve(disk, Some("1")), Some("pool".into()));
+    }
+
+    #[test]
+    fn page_file_directory_inside_repo_is_refused() {
+        let cfg = Config {
+            physical_pages_dir: Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("pages")),
+            ..Default::default()
+        };
+        assert!(cfg.prepare_page_files().is_err());
+    }
 
     #[test]
     fn environment_overrides_file() {
