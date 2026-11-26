@@ -13,7 +13,7 @@ use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
 use crate::ShaderError;
-use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::gfx10::{Dpp, Encoding, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
 use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
@@ -284,6 +284,27 @@ struct Lower<'a> {
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
     mode16: Option<u8>,
+}
+
+/// The `op_sel` bits of a 16-bit VALU instruction that pick halves: none on
+/// the VOP3 forms of VOP1 and VOP2 operations, which read the low halves and
+/// write the low half whatever the bits say (gfx1036, measured for the
+/// conversions between f16 and 16-bit integers or f32, `v_rcp_f16`,
+/// `v_sqrt_f16`, `v_floor_f16`, `v_fract_f16`, `v_cvt_norm_i16_f16`,
+/// `v_add_f16`, `v_mul_f16`, `v_max_f16` and `v_fmac_f16`). The VOP3-only
+/// 16-bit operations (`v_fma_f16`, `v_med3_f16`, `v_add_nc_u16`,
+/// `v_mul_lo_u16`, `v_max_u16`, `v_lshlrev_b16`) honour them.
+fn half_opsel(inst: &Inst) -> u8 {
+    let Fields::Valu(v) = &inst.fields else {
+        return 0;
+    };
+    // VOP3 opcodes 0x100..0x13f are VOP2 operations, 0x180..0x1ff VOP1 ones.
+    let m = &inst.machine;
+    if m.encoding == Encoding::Vop3 && matches!(m.opcode, 0x100..0x140 | 0x180..0x200) {
+        0
+    } else {
+        v.opsel
+    }
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -6800,14 +6821,14 @@ impl<'a> Lower<'a> {
     }
 
     /// Source `k` of a 16-bit operation in the low 16 bits (the rest 0):
-    /// op_sel (or an SDWA word select) picks the high half; inline float
-    /// constants are f16 values here.
+    /// op_sel ([`half_opsel`]) or an SDWA word select picks the high half;
+    /// inline float constants are f16 values here.
     fn half_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        let mut high = v.opsel >> k & 1 != 0;
+        let mut high = half_opsel(inst) >> k & 1 != 0;
         if let Some(sd) = v.sdwa {
             match sd.src_sel.get(k).copied().unwrap_or(6) {
                 4 => {}
@@ -6855,8 +6876,8 @@ impl<'a> Lower<'a> {
     }
 
     /// Writes a 16-bit result (low bits of `x`) into the destination's low
-    /// half, or its high half with op_sel bit 3 (or an SDWA WORD_1 select);
-    /// the other half is kept (GFX10).
+    /// half, or its high half with op_sel bit 3 ([`half_opsel`]) or an SDWA
+    /// WORD_1 select; the other half is kept (GFX10).
     fn write_half(&mut self, inst: &Inst, x: V, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -6864,7 +6885,7 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err("a 16-bit result outside a VGPR");
         };
-        let mut high = v.opsel >> 3 & 1 != 0;
+        let mut high = half_opsel(inst) >> 3 & 1 != 0;
         // SDWA: the word written, the other one kept (preserve) or zero
         // (pad; a sign extension above the high word adds nothing).
         let mut keep = true;
@@ -7014,7 +7035,7 @@ impl<'a> Lower<'a> {
                     return Err("an accumulator");
                 };
                 let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
-                let x = if v.opsel >> 3 & 1 != 0 {
+                let x = if half_opsel(inst) >> 3 & 1 != 0 {
                     let k16 = self.s.m.i32(16);
                     self.s.m.bin(c, Bin::LShr, x, k16)
                 } else {
