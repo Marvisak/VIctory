@@ -427,6 +427,7 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
+            list.keep(&texture);
             rtvs.push(host.rtv(&texture, record.desc().as_ref()));
         }
         self.depth = 0;
@@ -435,6 +436,7 @@ impl State {
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
+            list.keep(&texture);
             Some(host.dsv(&texture, record.depth_desc().as_ref()))
         });
         // SAFETY: an open list; the views were just made.
@@ -3906,5 +3908,157 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(host.log_messages(), None, "case {case} D3D12 debug errors");
             let _ = kept_obj;
         }
+    }
+
+    /// `OMSetRenderTargets` records references to the bound render-target and
+    /// depth-stencil host textures straight onto the command list. Even when no
+    /// draw runs with them (dropped draws or later target switches) and the
+    /// title releases the resources before submission, the list must keep both
+    /// host textures alive until `reset` releases them cleanly.
+    #[test]
+    fn render_and_depth_targets_stay_alive_until_list_reset() {
+        type Release = extern "system" fn(This) -> u32;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _ = host.log_messages();
+
+        let null = std::ptr::null();
+        let heap_iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let res_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let make_cpu_heap = |kind: u32| -> This {
+            let desc: [u32; 8] = [kind, 4, 0, 0, 0, 0, 0, 0];
+            let mut heap = null;
+            assert_eq!(
+                crate::descriptor::create_heap(null, desc.as_ptr().cast(), &heap_iid, &mut heap),
+                S_OK
+            );
+            heap
+        };
+        let make_target = |format: u32, flags: u32| -> This {
+            let heap_props: [u32; 5] = [1, 0, 0, 0, 0];
+            let desc: [u32; 14] = [
+                3,
+                0,
+                0,
+                0,
+                16,
+                0,
+                16,
+                1 | (1 << 16),
+                format,
+                1,
+                0,
+                0,
+                flags,
+                0,
+            ];
+            let mut out = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    heap_props.as_ptr().cast(),
+                    0,
+                    desc.as_ptr().cast(),
+                    0,
+                    null.cast(),
+                    &res_iid,
+                    &mut out,
+                ),
+                S_OK
+            );
+            out
+        };
+        let release = |o: This| crate::object::slot::<Release>(o, 0x10)(o);
+        let com_refs = |r: &ID3D12Resource| -> u32 {
+            // SAFETY: `r` is a live COM object; one reference is added and released.
+            unsafe {
+                let raw = r.as_raw();
+                let unknown = &*(raw as *const *const windows::core::IUnknown_Vtbl);
+                ((**unknown).AddRef)(raw);
+                ((**unknown).Release)(raw)
+            }
+        };
+
+        let rtv_heap = make_cpu_heap(2);
+        let dsv_heap = make_cpu_heap(3);
+        let rtv = crate::descriptor::heap(rtv_heap).start;
+        let dsv = crate::descriptor::heap(dsv_heap).start;
+
+        // Part 1: bind RTV + DSV, release both title resources with no probe
+        // held, switch away, and submit — D3D12 debug layer flags a deleted
+        // resource on `Close` if the command list did not retain them.
+        let rt1 = make_target(28, 1); // DXGI_FORMAT_R8G8B8A8_UNORM, ALLOW_RENDER_TARGET
+        let ds1 = make_target(40, 2); // DXGI_FORMAT_D32_FLOAT, ALLOW_DEPTH_STENCIL
+        crate::descriptor::create_rtv(null, rt1, std::ptr::null(), rtv);
+        crate::descriptor::create_dsv(null, ds1, std::ptr::null(), dsv);
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_targets(&list, &[rtv], dsv);
+        state.set_targets(&list, &[], 0);
+        assert_eq!(release(rt1), 0);
+        assert_eq!(release(ds1), 0);
+        list.close();
+        assert_eq!(
+            host.log_messages(),
+            None,
+            "releasing bound render/depth targets before submission must not trigger D3D12 errors"
+        );
+        host.execute(&[&list]);
+        assert_eq!(
+            host.log_messages(),
+            None,
+            "submitting a list whose bound render/depth targets were released must stay valid"
+        );
+        list.reset();
+
+        // Part 2: verify exact COM reference retention across submission and
+        // clean release on `HostList::reset` (also fails without debug layer).
+        let rt2 = make_target(28, 1);
+        let ds2 = make_target(40, 2);
+        crate::descriptor::create_rtv(null, rt2, std::ptr::null(), rtv);
+        crate::descriptor::create_dsv(null, ds2, std::ptr::null(), dsv);
+        state.reset(null);
+        state.set_targets(&list, &[rtv], dsv);
+        let probe_rt = crate::resource::host_resource(rt2).expect("host RT");
+        let probe_ds = crate::resource::host_resource(ds2).expect("host DS");
+        assert_eq!(release(rt2), 0);
+        assert_eq!(release(ds2), 0);
+        assert!(
+            com_refs(&probe_rt) > 1,
+            "command list must keep bound render target alive until reset"
+        );
+        assert!(
+            com_refs(&probe_ds) > 1,
+            "command list must keep bound depth target alive until reset"
+        );
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None);
+        list.reset();
+        assert_eq!(
+            com_refs(&probe_rt),
+            1,
+            "list reset must release its reference to the bound render target"
+        );
+        assert_eq!(
+            com_refs(&probe_ds),
+            1,
+            "list reset must release its reference to the bound depth target"
+        );
+        drop((probe_rt, probe_ds));
+
+        assert_eq!(release(rtv_heap), 0);
+        assert_eq!(release(dsv_heap), 0);
     }
 }
