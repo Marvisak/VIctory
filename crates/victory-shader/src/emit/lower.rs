@@ -477,6 +477,28 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// A whole-wave simulation must refuse global loads that write LDS.
+/// Their ordinary lowering and error policy belong to the flat-memory path.
+fn has_whole_wave_side_effect(inst: &Inst) -> bool {
+    let name = inst.name();
+    matches!(inst.fields, Fields::Exp { .. })
+        || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
+        || matches!(inst.fields, Fields::Flat { lds: true, .. })
+        || name.contains("store")
+        || has_atomic_barrier_or_lds_effect(inst)
+}
+
+fn has_atomic_barrier_or_lds_effect(inst: &Inst) -> bool {
+    let name = inst.name();
+    matches!(inst.fields, Fields::Buffer { lds: true, .. })
+        || name.contains("atomic")
+        || name == "s_barrier"
+        || matches!(inst.fields, Fields::Ds { .. })
+            && !(name.starts_with("ds_read")
+                || name.starts_with("ds_swizzle")
+                || name.contains("permute"))
+}
+
 /// The scalar instruction defining an SSA value in this block and its operands.
 fn scalar_def<'a, const N: usize>(
     block: &'a Block,
@@ -1368,6 +1390,13 @@ impl<'a> Lower<'a> {
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
+                        let inst = &p.blocks[b].insts[j];
+                        if has_whole_wave_side_effect(inst) || self.x.st.discards.contains_key(&(b, j)) {
+                            return Err(unsupported(
+                                inst.machine.offset,
+                                "a side effect in a whole-wave section",
+                            ));
+                        }
                         self.section_inst(b, j, i);
                     }
                     i = end;
@@ -3519,12 +3548,7 @@ impl<'a> Lower<'a> {
         let effect = matches!(inst.fields, Fields::Exp { .. })
             || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
             || name.contains("store")
-            || name.contains("atomic")
-            || name == "s_barrier"
-            || matches!(inst.fields, Fields::Ds { .. })
-                && !(name.starts_with("ds_read")
-                    || name.starts_with("ds_swizzle")
-                    || name.contains("permute"));
+            || has_atomic_barrier_or_lds_effect(inst);
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -10919,6 +10943,9 @@ impl<'a> Lower<'a> {
 }
 
 #[cfg(test)]
+mod whole_wave_effect_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half};
     use crate::native::{
@@ -10954,7 +10981,15 @@ mod tests {
     }
 
     /// Whether a synthetic compute program translates with these input registers.
-    fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+    pub(super) fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lowers_structured(words, rsrc2, |_| {})
+    }
+
+    pub(super) fn lowers_structured(
+        words: &[u32],
+        rsrc2: u32,
+        prepare: impl FnOnce(&mut structure::Structured),
+    ) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -10969,7 +11004,8 @@ mod tests {
             code,
         };
         let p = ir::build(&native.code, false, 256).unwrap();
-        let st = structure::structure(&p).unwrap();
+        let mut st = structure::structure(&p).unwrap();
+        prepare(&mut st);
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
@@ -11087,7 +11123,7 @@ mod tests {
         )
     }
 
-    fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
+    pub(super) fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
     }
 
