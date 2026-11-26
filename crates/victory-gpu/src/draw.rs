@@ -421,21 +421,36 @@ impl State {
                 );
                 continue;
             };
-            let Some(texture) = crate::resource::host_resource(record.resource) else {
+            let Some(copy) = crate::resource::host_copy(record.resource) else {
+                continue;
+            };
+            let Some(rtv) = host.try_rtv(&copy.texture, &copy.castable, record.desc().as_ref())
+            else {
+                once!(
+                    handle = format_args!("{h:#x}"),
+                    "render target view does not fit its host texture"
+                );
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
+            rtvs.push(rtv);
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
+            let Some(dsv) = host.try_dsv(&texture, record.depth_desc().as_ref()) else {
+                once!(
+                    handle = format_args!("{depth:#x}"),
+                    "depth-stencil view does not fit its host texture"
+                );
+                return None;
+            };
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            Some(host.dsv(&texture, record.depth_desc().as_ref()))
+            Some(dsv)
         });
         // SAFETY: an open list; the views were just made.
         unsafe {

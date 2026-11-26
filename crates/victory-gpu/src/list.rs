@@ -1007,8 +1007,8 @@ extern "system" fn clear_rtv(
         else {
             return;
         };
-        let (Some(texture), Some(host)) = (
-            crate::resource::host_resource(record.resource),
+        let (Some(copy), Some(host)) = (
+            crate::resource::host_copy(record.resource),
             crate::host::host(),
         ) else {
             return;
@@ -1022,13 +1022,16 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
-        let rtv = host.rtv(&texture, record.desc().as_ref());
+        let Some(rtv) = host.try_rtv(&copy.texture, &copy.castable, record.desc().as_ref()) else {
+            return;
+        };
+        let texture = &copy.texture;
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
                 list.list.ResourceBarrier(&[crate::host::transition(
-                    &texture,
+                    texture,
                     State(before as i32),
                     State(RENDER_TARGET as i32),
                 )]);
@@ -1069,8 +1072,10 @@ extern "system" fn clear_dsv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
+        let Some(dsv) = host.try_dsv(&texture, record.depth_desc().as_ref()) else {
+            return;
+        };
         ensure_state(list, record.resource, DEPTH_WRITE);
-        let dsv = host.dsv(&texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list
@@ -2043,6 +2048,420 @@ mod tests {
         resolve_queries(list, null, 0, 0, 2, buffer, u64::MAX - 8);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [buffer, list, allocator] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_rtv_and_dsv_descriptions_are_refused_without_device_removal() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        let make_res = |dim: u32,
+                        w: u64,
+                        h: u32,
+                        depth_or_array: u16,
+                        mips: u16,
+                        fmt: u32,
+                        samples: u32,
+                        flags: u32|
+         -> This {
+            let mut desc = [0u32; 14];
+            desc[0] = dim;
+            desc[4] = w as u32;
+            desc[5] = (w >> 32) as u32;
+            desc[6] = h;
+            desc[7] = u32::from(depth_or_array) | (u32::from(mips) << 16);
+            desc[8] = fmt;
+            desc[9] = samples;
+            desc[12] = flags;
+            let heap_props: [u32; 5] = [1, 0, 0, 0, 0];
+            let iid = guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let mut res = null;
+            let hr = crate::resource::create_committed(
+                null,
+                heap_props.as_ptr().cast(),
+                0,
+                desc.as_ptr().cast(),
+                0,
+                null.cast(),
+                &iid,
+                &mut res,
+            );
+            assert_eq!(
+                hr, 0,
+                "CreateCommittedResource dim={dim} fmt={fmt} samples={samples} flags={flags}"
+            );
+            assert!(
+                crate::resource::host_resource(res).is_some(),
+                "host texture created for dim={dim} fmt={fmt} samples={samples}"
+            );
+            res
+        };
+
+        // Colour textures: non-RT 2D, 1D (2 slices, 2 mips, RT), 2D (2 slices, 2 mips, RT),
+        // 2D typeless (RT), 2D MSAA 4x (2 slices, RT), 3D (depth 4, 2 mips, RT).
+        let rt_none = make_res(3, 16, 16, 1, 1, 28, 1, 0);
+        let rt_1d = make_res(2, 16, 1, 2, 2, 28, 1, 1);
+        let rt_2d = make_res(3, 16, 16, 2, 2, 28, 1, 1);
+        let rt_typeless = make_res(3, 16, 16, 1, 1, 27, 1, 1);
+        let rt_ms4 = make_res(3, 16, 16, 2, 1, 28, 4, 1);
+        let rt_3d = make_res(4, 16, 16, 4, 2, 28, 1, 1);
+
+        // Depth textures: non-DS 2D, 1D D32 (2 slices, 2 mips), 2D D32 (2 slices, 2 mips),
+        // 2D D16, 2D D24S8, 2D D32S8, 2D R32_TYPELESS (DS), 2D MSAA 4x D32 (2 slices).
+        let ds_none = make_res(3, 16, 16, 1, 1, 39, 1, 0);
+        let ds_1d = make_res(2, 16, 1, 2, 2, 40, 1, 2);
+        let ds_2d = make_res(3, 16, 16, 2, 2, 40, 1, 2);
+        let ds_d16 = make_res(3, 16, 16, 1, 1, 55, 1, 2);
+        let ds_d24s8 = make_res(3, 16, 16, 1, 1, 45, 1, 2);
+        let ds_d32s8 = make_res(3, 16, 16, 1, 1, 20, 1, 2);
+        let ds_typeless = make_res(3, 16, 16, 1, 1, 39, 1, 2);
+        let ds_ms4 = make_res(3, 16, 16, 2, 1, 40, 4, 2);
+
+        let check_errors = |name: &str, before: u64| {
+            // SAFETY: plain device query.
+            let reason = unsafe { host.device.GetDeviceRemovedReason() };
+            assert!(reason.is_ok(), "{name} removed the host device: {reason:?}");
+            let Ok(queue) = host.device.cast::<ID3D12InfoQueue>() else {
+                return;
+            };
+            // SAFETY: each stored message is read into a buffer of its reported size.
+            unsafe {
+                let total = queue.GetNumStoredMessages();
+                let start = before.min(total);
+                for i in start..total {
+                    let mut size = 0;
+                    if queue.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u64; size.div_ceil(8)];
+                    let msg = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    if queue.GetMessage(i, Some(msg), &mut size).is_ok()
+                        && (*msg).Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0
+                    {
+                        let text = String::from_utf8_lossy(std::slice::from_raw_parts(
+                            (*msg).pDescription,
+                            (*msg).DescriptionByteLength,
+                        ));
+                        let text = text.trim_end_matches('\0');
+                        assert!(
+                            !text.contains("CreateRenderTargetView")
+                                && !text.contains("CreateDepthStencilView"),
+                            "{name} emitted D3D12 debug error: {text}"
+                        );
+                    }
+                }
+            }
+        };
+        let msg_count = || {
+            host.device.cast::<ID3D12InfoQueue>().map_or(0, |q| {
+                // SAFETY: plain info-queue count query.
+                unsafe { q.GetNumStoredMessages() }
+            })
+        };
+
+        // RTV desc words: [Format, ViewDimension, MipSlice/FirstArraySlice, PlaneSlice/FirstArraySlice/FirstWSlice/ArraySize, ArraySize/WSize, PlaneSlice].
+        let rtv_cases: &[(&str, This, Option<[u32; 6]>, bool)] = &[
+            // Invalid RTVs (all remove the retail device on unmodified main)
+            ("rtv_no_rt_flag", rt_none, None, false),
+            ("rtv_2d_oob_mip", rt_2d, Some([28, 4, 2, 0, 0, 0]), false),
+            ("rtv_2d_oob_plane", rt_2d, Some([28, 4, 0, 1, 0, 0]), false),
+            ("rtv_3d_on_2d", rt_2d, Some([28, 8, 0, 0, 1, 0]), false),
+            ("rtv_1d_on_2d", rt_2d, Some([28, 2, 0, 0, 0, 0]), false),
+            ("rtv_buf_on_2d", rt_2d, Some([28, 1, 0, 0, 1, 0]), false),
+            ("rtv_unk_on_2d", rt_2d, Some([28, 0, 0, 0, 0, 0]), false),
+            (
+                "rtv_2darr_oob_slice",
+                rt_2d,
+                Some([28, 5, 0, 1, 2, 0]),
+                false,
+            ),
+            (
+                "rtv_2darr_zero_slices",
+                rt_2d,
+                Some([28, 5, 0, 0, 0, 0]),
+                false,
+            ),
+            (
+                "rtv_2darr_oob_plane",
+                rt_2d,
+                Some([28, 5, 0, 0, 1, 1]),
+                false,
+            ),
+            ("rtv_2d_on_ms4", rt_ms4, Some([28, 4, 0, 0, 0, 0]), false),
+            ("rtv_2dmsarr_oob", rt_ms4, Some([28, 7, 1, 2, 0, 0]), false),
+            ("rtv_3d_mip1_oob_w", rt_3d, Some([28, 8, 1, 0, 3, 0]), false),
+            (
+                "rtv_3d_mip1_oob_first_w",
+                rt_3d,
+                Some([28, 8, 1, 2, u32::MAX, 0]),
+                false,
+            ),
+            (
+                "rtv_3d_mip1_zero_w",
+                rt_3d,
+                Some([28, 8, 1, 0, 0, 0]),
+                false,
+            ),
+            (
+                "rtv_typeless_view_fmt",
+                rt_typeless,
+                Some([27, 4, 0, 0, 0, 0]),
+                false,
+            ),
+            ("rtv_none_on_typeless", rt_typeless, None, false),
+            (
+                "rtv_depth_fmt",
+                rt_typeless,
+                Some([40, 4, 0, 0, 0, 0]),
+                false,
+            ),
+            ("rtv_incompat_fmt", rt_2d, Some([10, 4, 0, 0, 0, 0]), false),
+            // Valid boundary RTVs
+            ("rtv_2d_default", rt_2d, None, true),
+            ("rtv_1d_ok", rt_1d, Some([28, 2, 1, 0, 0, 0]), true),
+            (
+                "rtv_1darr_u32max",
+                rt_1d,
+                Some([28, 3, 0, 1, u32::MAX, 0]),
+                true,
+            ),
+            ("rtv_2d_mip1", rt_2d, Some([28, 4, 1, 0, 0, 0]), true),
+            (
+                "rtv_2darr_u32max",
+                rt_2d,
+                Some([28, 5, 1, 1, u32::MAX, 0]),
+                true,
+            ),
+            ("rtv_2dms_on_s1", rt_2d, Some([28, 6, 0, 0, 0, 0]), true),
+            ("rtv_2dms_on_ms4", rt_ms4, Some([28, 6, 0, 0, 0, 0]), true),
+            (
+                "rtv_2dmsarr_u32max",
+                rt_ms4,
+                Some([28, 7, 1, u32::MAX, 0, 0]),
+                true,
+            ),
+            (
+                "rtv_3d_mip1_exact_w",
+                rt_3d,
+                Some([28, 8, 1, 0, 2, 0]),
+                true,
+            ),
+            (
+                "rtv_3d_mip1_u32max",
+                rt_3d,
+                Some([28, 8, 1, 1, u32::MAX, 0]),
+                true,
+            ),
+            (
+                "rtv_typeless_concrete",
+                rt_typeless,
+                Some([28, 4, 0, 0, 0, 0]),
+                true,
+            ),
+        ];
+
+        // DSV desc words: [Format, ViewDimension, Flags, MipSlice/FirstArraySlice, FirstArraySlice/ArraySize, ArraySize].
+        let dsv_cases: &[(&str, This, Option<[u32; 6]>, bool)] = &[
+            // Invalid DSVs (all remove the retail device on unmodified main)
+            ("dsv_no_ds_flag", ds_none, Some([40, 3, 0, 0, 0, 0]), false),
+            ("dsv_2d_oob_mip", ds_2d, Some([40, 3, 0, 2, 0, 0]), false),
+            ("dsv_1d_on_2d", ds_2d, Some([40, 1, 0, 0, 0, 0]), false),
+            ("dsv_unk_on_2d", ds_2d, Some([40, 0, 0, 0, 0, 0]), false),
+            ("dsv_2darr_oob", ds_2d, Some([40, 4, 0, 0, 1, 2]), false),
+            ("dsv_2darr_zero", ds_2d, Some([40, 4, 0, 0, 0, 0]), false),
+            ("dsv_2d_on_ms4", ds_ms4, Some([40, 3, 0, 0, 0, 0]), false),
+            ("dsv_2dmsarr_oob", ds_ms4, Some([40, 6, 0, 1, 2, 0]), false),
+            (
+                "dsv_readonly_stencil_d32",
+                ds_2d,
+                Some([40, 3, 2, 0, 0, 0]),
+                false,
+            ),
+            (
+                "dsv_readonly_stencil_d16",
+                ds_d16,
+                Some([55, 3, 2, 0, 0, 0]),
+                false,
+            ),
+            (
+                "dsv_invalid_flag_bit",
+                ds_d24s8,
+                Some([45, 3, 4, 0, 0, 0]),
+                false,
+            ),
+            (
+                "dsv_non_depth_fmt",
+                ds_typeless,
+                Some([41, 3, 0, 0, 0, 0]),
+                false,
+            ),
+            (
+                "dsv_incompat_depth_fmt",
+                ds_typeless,
+                Some([55, 3, 0, 0, 0, 0]),
+                false,
+            ),
+            ("dsv_none_on_typeless", ds_typeless, None, false),
+            // Valid boundary DSVs
+            ("dsv_2d_default", ds_2d, None, true),
+            ("dsv_1d_ok", ds_1d, Some([40, 1, 0, 1, 0, 0]), true),
+            (
+                "dsv_1darr_u32max",
+                ds_1d,
+                Some([40, 2, 0, 0, 1, u32::MAX]),
+                true,
+            ),
+            (
+                "dsv_2d_readonly_depth",
+                ds_2d,
+                Some([40, 3, 1, 1, 0, 0]),
+                true,
+            ),
+            (
+                "dsv_2darr_u32max",
+                ds_2d,
+                Some([40, 4, 0, 0, 1, u32::MAX]),
+                true,
+            ),
+            ("dsv_2dms_on_s1", ds_2d, Some([40, 5, 0, 0, 0, 0]), true),
+            ("dsv_2dms_on_ms4", ds_ms4, Some([40, 5, 0, 0, 0, 0]), true),
+            (
+                "dsv_2dmsarr_u32max",
+                ds_ms4,
+                Some([40, 6, 0, 1, u32::MAX, 0]),
+                true,
+            ),
+            (
+                "dsv_d24s8_readonly_stencil",
+                ds_d24s8,
+                Some([45, 3, 2, 0, 0, 0]),
+                true,
+            ),
+            (
+                "dsv_d32s8_readonly_both",
+                ds_d32s8,
+                Some([20, 3, 3, 0, 0, 0]),
+                true,
+            ),
+            (
+                "dsv_typeless_d32",
+                ds_typeless,
+                Some([40, 3, 0, 0, 0, 0]),
+                true,
+            ),
+        ];
+
+        let mut slot_mem = [0u64; 16];
+        let handle = slot_mem.as_mut_ptr() as u64;
+        let color = [0.25f32, 0.5, 0.75, 1.0];
+        for &(name, res, desc, expect_ok) in rtv_cases {
+            crate::descriptor::create_rtv(
+                null,
+                res,
+                desc.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+                handle,
+            );
+            let before = msg_count();
+            let copy = crate::resource::host_copy(res).unwrap();
+            let rec = crate::descriptor::rtv_record(handle).unwrap();
+            assert_eq!(
+                host.try_rtv(&copy.texture, &copy.castable, rec.desc().as_ref())
+                    .is_some(),
+                expect_ok,
+                "{name}"
+            );
+            // Exercise both OMSetRenderTargets and ClearRenderTargetView entry points.
+            state::targets(list, 1, &handle, 0, std::ptr::null());
+            clear_rtv(list, handle, &color, 0, std::ptr::null());
+            check_errors(name, before);
+        }
+        // Castable-format RTV: when Device10 created the host texture with a
+        // castable list (e.g. R8G8B8A8_UNORM -> R8G8B8A8_UNORM_SRGB), it must
+        // stay allowed.
+        let rt_copy = crate::resource::host_copy(rt_2d).unwrap();
+        if rt_copy.castable.contains(&29) {
+            let desc = [29u32, 4, 0, 0, 0, 0];
+            crate::descriptor::create_rtv(null, rt_2d, &desc, handle);
+            let before = msg_count();
+            let rec = crate::descriptor::rtv_record(handle).unwrap();
+            assert!(
+                host.try_rtv(&rt_copy.texture, &rt_copy.castable, rec.desc().as_ref())
+                    .is_some(),
+                "rtv_castable_srgb"
+            );
+            state::targets(list, 1, &handle, 0, std::ptr::null());
+            clear_rtv(list, handle, &color, 0, std::ptr::null());
+            check_errors("rtv_castable_srgb", before);
+        }
+        for &(name, res, desc, expect_ok) in dsv_cases {
+            crate::descriptor::create_dsv(
+                null,
+                res,
+                desc.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+                handle,
+            );
+            let before = msg_count();
+            let copy = crate::resource::host_copy(res).unwrap();
+            let rec = crate::descriptor::dsv_record(handle).unwrap();
+            assert_eq!(
+                host.try_dsv(&copy.texture, rec.depth_desc().as_ref())
+                    .is_some(),
+                expect_ok,
+                "{name}"
+            );
+            // Exercise OMSetRenderTargets (and ClearDepthStencilView for writable DSVs).
+            state::targets(list, 0, std::ptr::null(), 0, &handle);
+            let flags = desc.map_or(0, |d| d[2]);
+            if flags == 0 {
+                clear_dsv(list, handle, 1, 1.0, 0, 0, std::ptr::null());
+            }
+            check_errors(name, before);
+        }
+        assert_eq!(close(list), S_OK);
+        check_errors("close", 0);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [
+            rt_none,
+            rt_1d,
+            rt_2d,
+            rt_typeless,
+            rt_ms4,
+            rt_3d,
+            ds_none,
+            ds_1d,
+            ds_2d,
+            ds_d16,
+            ds_d24s8,
+            ds_d32s8,
+            ds_typeless,
+            ds_ms4,
+            list,
+            allocator,
+        ] {
             assert_eq!(release(object), 0);
         }
     }

@@ -1634,6 +1634,22 @@ impl Host {
         }
     }
 
+    /// A host render target view of `resource` when `resource` and `desc` fit
+    /// D3D12's creation rules (`castable`: castable formats on the host texture).
+    /// Invalid descriptions permanently remove the retail device
+    /// (`DXGI_ERROR_INVALID_CALL`), so they are refused here.
+    pub(crate) fn try_rtv(
+        &self,
+        resource: &ID3D12Resource,
+        castable: &[u32],
+        desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
+    ) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        if !self.rtv_fits(resource, castable, desc) {
+            return None;
+        }
+        Some(self.rtv(resource, desc))
+    }
+
     /// A slot of CPU-only views, valid until it is recorded.
     pub(crate) fn cpu_view(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let slot = self.next_cpu_view.fetch_add(1, Ordering::Relaxed) % RTV_RING;
@@ -1659,6 +1675,218 @@ impl Host {
             handle
         }
     }
+
+    /// A host depth-stencil view of `resource` when `resource` and `desc` fit
+    /// D3D12's creation rules. Invalid descriptions permanently remove the
+    /// retail device (`DXGI_ERROR_INVALID_CALL`), so they are refused here.
+    pub(crate) fn try_dsv(
+        &self,
+        resource: &ID3D12Resource,
+        desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
+    ) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        if !self.dsv_fits(resource, desc) {
+            return None;
+        }
+        Some(self.dsv(resource, desc))
+    }
+
+    fn renders_format(&self, format: DXGI_FORMAT) -> bool {
+        static KNOWN: Mutex<Vec<(i32, bool)>> = Mutex::new(Vec::new());
+        let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format.0) {
+            return ok;
+        }
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: a plain query into a struct of its size.
+        let ok = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0;
+        known.push((format.0, ok));
+        ok
+    }
+
+    fn format_planes(&self, format: DXGI_FORMAT) -> u32 {
+        static KNOWN: Mutex<Vec<(i32, u32)>> = Mutex::new(Vec::new());
+        let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&(_, count)) = known.iter().find(|(f, _)| *f == format.0) {
+            return count;
+        }
+        let mut info = D3D12_FEATURE_DATA_FORMAT_INFO {
+            Format: format,
+            PlaneCount: 0,
+        };
+        // SAFETY: a plain query into a struct of its size.
+        let ok = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_INFO,
+                (&raw mut info).cast(),
+                size_of_val(&info) as u32,
+            )
+        };
+        let count = if ok.is_ok() {
+            u32::from(info.PlaneCount).max(1)
+        } else {
+            1
+        };
+        known.push((format.0, count));
+        count
+    }
+
+    fn rtv_fits(
+        &self,
+        resource: &ID3D12Resource,
+        castable: &[u32],
+        desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
+    ) -> bool {
+        use crate::resource::family;
+        // SAFETY: a live resource.
+        let d = unsafe { resource.GetDesc() };
+        if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0 {
+            return false;
+        }
+        let own = d.Format.0 as u32;
+        let is_typeless = |f: u32| family(f) == f && family(f + 1) == f;
+        let typeless = is_typeless(own);
+        let Some(desc) = desc else {
+            return !typeless && self.renders_format(d.Format);
+        };
+        let view = desc.Format.0 as u32;
+        let format_ok = if view == 0 {
+            !typeless && self.renders_format(d.Format)
+        } else {
+            !is_typeless(view)
+                && self.renders_format(desc.Format)
+                && (view == own
+                    || (typeless && family(view) == family(own))
+                    || castable.contains(&view))
+        };
+        if !format_ok {
+            return false;
+        }
+        let mips = u32::from(d.MipLevels);
+        let array = u32::from(d.DepthOrArraySize);
+        let msaa = d.SampleDesc.Count > 1;
+        let planes = self.format_planes(d.Format);
+        // SAFETY: each arm reads the union field matching `desc.ViewDimension`.
+        unsafe {
+            match (d.Dimension, desc.ViewDimension) {
+                (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_RTV_DIMENSION_TEXTURE1D) => {
+                    desc.Anonymous.Texture1D.MipSlice < mips
+                }
+                (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_RTV_DIMENSION_TEXTURE1DARRAY) => {
+                    let v = desc.Anonymous.Texture1DArray;
+                    v.MipSlice < mips && view_range_fits(v.FirstArraySlice, v.ArraySize, array)
+                }
+                (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RTV_DIMENSION_TEXTURE2D) if !msaa => {
+                    let v = desc.Anonymous.Texture2D;
+                    v.MipSlice < mips && v.PlaneSlice < planes
+                }
+                (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RTV_DIMENSION_TEXTURE2DARRAY)
+                    if !msaa =>
+                {
+                    let v = desc.Anonymous.Texture2DArray;
+                    v.MipSlice < mips
+                        && view_range_fits(v.FirstArraySlice, v.ArraySize, array)
+                        && v.PlaneSlice < planes
+                }
+                (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RTV_DIMENSION_TEXTURE2DMS) => true,
+                (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY) => {
+                    let v = desc.Anonymous.Texture2DMSArray;
+                    view_range_fits(v.FirstArraySlice, v.ArraySize, array)
+                }
+                (D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RTV_DIMENSION_TEXTURE3D) => {
+                    let v = desc.Anonymous.Texture3D;
+                    if v.MipSlice >= mips {
+                        false
+                    } else {
+                        let depth = array.checked_shr(v.MipSlice).unwrap_or(0).max(1);
+                        view_range_fits(v.FirstWSlice, v.WSize, depth)
+                    }
+                }
+                _ => false,
+            }
+        }
+    }
+
+    fn dsv_fits(
+        &self,
+        resource: &ID3D12Resource,
+        desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
+    ) -> bool {
+        use crate::resource::family;
+        const DEPTH_FORMATS: [u32; 4] = [20, 40, 45, 55];
+        const STENCIL_FORMATS: [u32; 2] = [20, 45];
+        // SAFETY: a live resource.
+        let d = unsafe { resource.GetDesc() };
+        if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0 {
+            return false;
+        }
+        let own = d.Format.0 as u32;
+        let Some(desc) = desc else {
+            return DEPTH_FORMATS.contains(&own);
+        };
+        let view = desc.Format.0 as u32;
+        let effective = if view == 0 { own } else { view };
+        if !DEPTH_FORMATS.contains(&effective) || (view != 0 && family(view) != family(own)) {
+            return false;
+        }
+        let valid_flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH.0 | D3D12_DSV_FLAG_READ_ONLY_STENCIL.0;
+        if desc.Flags.0 & !valid_flags != 0 {
+            return false;
+        }
+        if desc.Flags.0 & D3D12_DSV_FLAG_READ_ONLY_STENCIL.0 != 0
+            && !STENCIL_FORMATS.contains(&effective)
+        {
+            return false;
+        }
+        let mips = u32::from(d.MipLevels);
+        let array = u32::from(d.DepthOrArraySize);
+        let msaa = d.SampleDesc.Count > 1;
+        // SAFETY: each arm reads the union field matching `desc.ViewDimension`.
+        unsafe {
+            match (d.Dimension, desc.ViewDimension) {
+                (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_DSV_DIMENSION_TEXTURE1D) => {
+                    desc.Anonymous.Texture1D.MipSlice < mips
+                }
+                (D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_DSV_DIMENSION_TEXTURE1DARRAY) => {
+                    let v = desc.Anonymous.Texture1DArray;
+                    v.MipSlice < mips && view_range_fits(v.FirstArraySlice, v.ArraySize, array)
+                }
+                (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_DSV_DIMENSION_TEXTURE2D) if !msaa => {
+                    desc.Anonymous.Texture2D.MipSlice < mips
+                }
+                (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_DSV_DIMENSION_TEXTURE2DARRAY)
+                    if !msaa =>
+                {
+                    let v = desc.Anonymous.Texture2DArray;
+                    v.MipSlice < mips && view_range_fits(v.FirstArraySlice, v.ArraySize, array)
+                }
+                (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_DSV_DIMENSION_TEXTURE2DMS) => true,
+                (D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY) => {
+                    let v = desc.Anonymous.Texture2DMSArray;
+                    view_range_fits(v.FirstArraySlice, v.ArraySize, array)
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
+/// Whether `count` items from `first` (`u32::MAX`: all remaining items) fit
+/// inside `0..total`.
+fn view_range_fits(first: u32, count: u32, total: u32) -> bool {
+    first < total
+        && (count == u32::MAX
+            || (count > 0 && u64::from(first) + u64::from(count) <= u64::from(total)))
 }
 
 impl HostList {
