@@ -1165,6 +1165,9 @@ impl Host {
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
         crate::resource::evict_unused();
+        // Loose windows nothing has asked for lately go too, here where no
+        // submission is in flight.
+        crate::shadow::evict_idle();
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
@@ -3069,6 +3072,19 @@ impl Meter {
         });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            {
+                let (windows, window_bytes) = crate::shadow::loose_stats();
+                let (evicted, evicted_bytes) = (
+                    crate::shadow::EVICTED[0].load(Ordering::Relaxed),
+                    crate::shadow::EVICTED[1].load(Ordering::Relaxed),
+                );
+                tracing::info!(
+                    "loose windows: {windows} ({:.0} MB), {evicted} gone idle ({:.0} MB) since start",
+                    window_bytes as f64 / 1e6,
+                    evicted_bytes as f64 / 1e6
+                );
+            }
             let report_frames = std::mem::take(&mut self.report_frames) as f64;
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;

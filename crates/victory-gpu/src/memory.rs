@@ -223,6 +223,23 @@ unsafe impl Send for Shared {}
 /// Page tables by view heap (the title heap's address, or [`OURS`]).
 static SHARED: Mutex<Vec<(usize, Shared)>> = Mutex::new(Vec::new());
 
+/// Runs `f` with the page tables locked and a count of how many of them
+/// hold a copy: the references the map of loose windows discounts when it
+/// sends one idle away (`changed()` has the tables rebuilt without it). The
+/// lock is held throughout, so no table is rewritten or released between
+/// the count and what `f` decides from it; `f` may take the loose windows'
+/// lock (tables, then windows, the order a rewrite takes them in).
+pub(crate) fn with_shared_refs<R>(f: impl FnOnce(&dyn Fn(&Arc<Shadow>) -> usize) -> R) -> R {
+    let shared = shared();
+    let refs = |shadow: &Arc<Shadow>| {
+        shared
+            .iter()
+            .filter(|(_, table)| table.layout.copies.iter().any(|c| Arc::ptr_eq(c, shadow)))
+            .count()
+    };
+    f(&refs)
+}
+
 fn shared() -> std::sync::MutexGuard<'static, Vec<(usize, Shared)>> {
     SHARED.lock().unwrap_or_else(|e| e.into_inner())
 }

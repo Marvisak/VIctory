@@ -1057,14 +1057,104 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// allocations if memory use grows.
 const WINDOW: u64 = 4 << 20;
 
-/// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// Copies of title memory outside buffers, by (start, length): the copy,
+/// and when it was last asked for (a window nothing asks for goes:
+/// [`evict_idle`]).
+type LooseMap = BTreeMap<(u64, u64), (Arc<Shadow>, std::time::Instant)>;
+static LOOSE: Mutex<LooseMap> = Mutex::new(BTreeMap::new());
+
+/// Loose windows that went for being idle, and their bytes, since start
+/// (diagnostics): [`evict_idle`] frees what no submission has asked for.
+pub(crate) static EVICTED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The loose windows by count and bytes (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn loose_stats() -> (usize, u64) {
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    (map.len(), map.keys().map(|(_, len)| *len).sum())
+}
+
+/// `VICTORY_WINDOW_IDLE_SECS` (30 by default, 0 never): a loose window
+/// nothing has asked for that long goes, its memory with it. They used to be
+/// never freed, and a long run kept every one it had ever made: one
+/// measured world run held 1,400 of them (6.4 GB) by its end, on a machine
+/// whose RAM is the limit. A window the title comes back to is copied again.
+pub(crate) fn evict_idle() {
+    static IDLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let idle = *IDLE.get_or_init(|| {
+        std::env::var("VICTORY_WINDOW_IDLE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30)
+    });
+    if idle == 0 {
+        return;
+    }
+    // Called at each submission; the windows are looked at every 5 s.
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5)) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    evict_older_than(std::time::Duration::from_secs(idle));
+}
+
+/// Windows idle for `idle` go â€” but only those no view, list or heap still
+/// holds: one of those would keep reading the old copy while a later ask
+/// made another for the same range, two copies of one title memory. The page
+/// tables (`crate::memory::Shared`) name every copy, so their references
+/// are discounted, and `changed()` has them rebuilt without the gone ones.
+/// The copies are dropped outside the locks.
+///
+/// Called where no submission is in flight (`Host::execute`, before it
+/// prepares, under the submission lock): no list is reading or writing a
+/// copy through a page table, so none can be in use when it goes. The page
+/// tables keep their own reference until `prepare` rewrites them, so the
+/// buffer an old table names lives until then.
+fn evict_older_than(idle: std::time::Duration) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // The page tables stay locked from their count to the decision (none is
+    // rewritten or released in between), and the windows' lock is taken
+    // inside, the order a rewrite takes both in.
+    let gone: Vec<((u64, u64), Arc<Shadow>)> = crate::memory::with_shared_refs(|tables| {
+        let now = std::time::Instant::now();
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let gone: Vec<(u64, u64)> = map
+            .iter()
+            // Idle by the time stamp read under the lock (an ask in between
+            // makes it fresh), and held by the map and the page tables only:
+            // a view, list or heap makes the count higher and it stays.
+            .filter(|(_, (shadow, used))| {
+                now.saturating_duration_since(*used) >= idle
+                    && Arc::strong_count(shadow) == 1 + tables(shadow)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        gone.into_iter()
+            .filter_map(|key| map.remove(&key).map(|(shadow, _)| (key, shadow)))
+            .collect()
+    });
+    if gone.is_empty() {
+        return;
+    }
+    // Counted when they leave the map; the bytes come back once the page
+    // tables are rewritten without them, at the next submission using them.
+    let bytes: u64 = gone.iter().map(|((_, len), _)| *len).sum();
+    EVICTED[0].fetch_add(gone.len() as u64, Relaxed);
+    EVICTED[1].fetch_add(bytes, Relaxed);
+    changed();
+}
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
+    let now = std::time::Instant::now();
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
+    if let Some((shadow, used)) = map.get_mut(&(start, len)) {
+        *used = now;
         return Some(shadow.clone());
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -1077,7 +1167,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
-    map.insert((start, len), shadow.clone());
+    map.insert((start, len), (shadow.clone(), now));
     changed();
     Some(shadow)
 }
@@ -1188,7 +1278,7 @@ struct Slice {
 #[derive(Default)]
 struct Arena {
     /// Each buffer, its mapping and host address, and its free runs
-    /// (offset → bytes).
+    /// (offset â†’ bytes).
     chunks: Vec<(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)>,
 }
 
@@ -1266,7 +1356,13 @@ impl Arena {
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
     let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
-    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all.extend(
+        LOOSE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|(shadow, _)| shadow.clone()),
+    );
     all
 }
 
@@ -1282,7 +1378,7 @@ pub(crate) fn near(va: u64) -> String {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .map(|s| (s.gpu, s.start, s.len)),
+            .map(|(s, _)| (s.gpu, s.start, s.len)),
     );
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();
@@ -1656,5 +1752,84 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// A window nothing asks for goes when idle, with its memory; one asked
+    /// for stays, and a gone one is made again when the title comes back.
+    #[test]
+    #[cfg(windows)]
+    fn idle_loose_windows_go_and_fresh_ones_stay() {
+        if host().is_none() {
+            return;
+        }
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: a fresh reservation, committed and written by us.
+        let base = unsafe {
+            let at = VirtualAlloc(std::ptr::null(), 16 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            assert!(!at.is_null());
+            (at as *mut u8).write_bytes(7, 16 << 20);
+            at as *mut u8
+        };
+        // The window `loose` makes: its 4 MiB-aligned start and the length
+        // that reaches past the ask.
+        let start = (base as u64) & !(WINDOW - 1);
+        let len = (base as u64 + 16).next_multiple_of(WINDOW) - start;
+        let key = (start, len);
+        let made = loose(base as u64, base as u64 + 16);
+        assert!(made.is_some(), "the window is made on first ask");
+        // The map alone holds it from here: a window someone still holds is
+        // kept below, and the first ask's copy must not be that someone.
+        drop(made);
+        {
+            let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(map.contains_key(&key));
+            // Backdate its last use far past any idle threshold.
+            if let Some((_, used)) = map.get_mut(&key) {
+                *used -= std::time::Duration::from_secs(3600);
+            }
+        }
+        // The counters are process-wide and other tests make windows too:
+        // only this test's own key and the counter's growth are checked.
+        let before = EVICTED[0].load(std::sync::atomic::Ordering::Relaxed);
+        evict_older_than(std::time::Duration::from_secs(1800));
+        {
+            let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!map.contains_key(&key), "the idle window goes");
+            assert!(
+                EVICTED[0].load(std::sync::atomic::Ordering::Relaxed) > before,
+                "it is counted"
+            );
+        }
+        // A fresh ask makes it again, and it stays: it was just used.
+        assert!(loose(base as u64, base as u64 + 16).is_some());
+        {
+            let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(map.contains_key(&key), "the window is back");
+        }
+        evict_older_than(std::time::Duration::from_secs(1800));
+        {
+            let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(map.contains_key(&key), "a window just used stays");
+        }
+        // A copy someone still holds is not taken, even idle.
+        let held = loose(base as u64, base as u64 + 16).expect("the ask makes it again");
+        {
+            let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, used)) = map.get_mut(&key) {
+                *used -= std::time::Duration::from_secs(3600);
+            }
+        }
+        evict_older_than(std::time::Duration::from_secs(1800));
+        {
+            let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(map.contains_key(&key), "a held window stays: its holder would read it while a later ask made another copy of the same range");
+        }
+        drop(held);
+        // SAFETY: the reservation of this test.
+        assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
+        // Take it back out for the tests that count windows.
+        LOOSE.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
     }
 }
