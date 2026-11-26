@@ -5970,6 +5970,44 @@ impl<'a> Lower<'a> {
         Ok((r, enable))
     }
 
+    /// VOP3P 16-bit half selector: `lo` picks which half enters bits 0..16 and
+    /// `hi` picks which half enters bits 16..32.
+    fn vop3p_select(&mut self, c: usize, x: V, lo: bool, hi: bool) -> V {
+        if (lo, hi) == (false, true) {
+            return x;
+        }
+        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+        let top = self.s.m.bin(c, Bin::LShr, x, k16);
+        let bottom = self.s.m.bin(c, Bin::And, x, low);
+        let upper = self
+            .s
+            .m
+            .bin(c, Bin::Shl, if hi { top } else { bottom }, k16);
+        self.s
+            .m
+            .bin(c, Bin::Or, if lo { top } else { bottom }, upper)
+    }
+
+    /// Signed 32-bit saturating addition (`a + b` clamped to `[i32::MIN, i32::MAX]`)
+    /// without requiring 64-bit integer DXIL operations.
+    fn add_i32_sat(&mut self, c: usize, a: V, b: V) -> V {
+        let sum = self.s.m.bin(c, Bin::Add, a, b);
+        let (k0, k31) = (self.s.m.i32(0), self.s.m.i32(31));
+        let sa = self.s.m.bin(c, Bin::AShr, a, k31);
+        let sb = self.s.m.bin(c, Bin::AShr, b, k31);
+        let ss = self.s.m.bin(c, Bin::AShr, sum, k31);
+        let same_sign = self.s.m.cmp(c, pred::EQ, sa, sb);
+        let diff_res = self.s.m.cmp(c, pred::NE, sa, ss);
+        let ov = self.s.m.bin(c, Bin::And, same_sign, diff_res);
+        let pos = self.s.m.cmp(c, pred::SGE, sa, k0);
+        let (imin, imax) = (
+            self.s.m.i32(i32::MIN as u32),
+            self.s.m.i32(i32::MAX as u32),
+        );
+        let sat = self.s.m.select(c, pos, imax, imin);
+        self.s.m.select(c, ov, sat, sum)
+    }
+
     fn valu_op(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -6173,59 +6211,84 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_dot4c_i32_i8" => {
-                // D += the dot product of four signed bytes, wrapping: DXIL's
-                // Dot4AddI8Packed.
+                // D += the dot product of four signed bytes (wrapping or
+                // signed-saturated on `clamp`): DXIL's Dot4AddI8Packed.
+                if v.omod != 0 {
+                    return Err("integer output modifiers");
+                }
                 let (a, bb) = (s(self, 0)?, s(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("an accumulator");
                 };
                 let acc = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
                 let i32_ty = self.s.t.i32;
-                let r = self.s.op(
-                    c,
-                    "dot4AddPacked.i32",
-                    Attr::ReadNone,
-                    i32_ty,
-                    163,
-                    &[acc, a, bb],
-                );
-                int(self, r)
+                let r = if !v.clamp {
+                    self.s.op(
+                        c,
+                        "dot4AddPacked.i32",
+                        Attr::ReadNone,
+                        i32_ty,
+                        163,
+                        &[acc, a, bb],
+                    )
+                } else {
+                    // 4x i8*i8 lies in [-65024, 65536] and never overflows i32;
+                    // only the final add with `acc` can saturate [i32::MIN, i32::MAX].
+                    let zero = self.s.m.i32(0);
+                    let dot = self.s.op(
+                        c,
+                        "dot4AddPacked.i32",
+                        Attr::ReadNone,
+                        i32_ty,
+                        163,
+                        &[zero, a, bb],
+                    );
+                    self.add_i32_sat(c, acc, dot)
+                };
+                self.write(inst, Reg::V(reg), r, guard);
+                Ok(())
             }
             "v_dot4_i32_i8" => {
                 // VOP3P: op_sel picks the half each multiplicand's low half
                 // reads, op_sel_hi its high half's; the accumulator is read
                 // whole (as AMD's compilers fold constants into it).
-                if v.clamp || v.neg_hi != 0 {
-                    return Err("a saturating or negated dot product");
+                if v.omod != 0 {
+                    return Err("integer output modifiers");
                 }
-                let mut xs = Vec::new();
-                for k in 0..2 {
-                    let x = s(self, k)?;
-                    let (lo, hi) = (v.opsel >> k & 1 != 0, v.opsel_hi >> k & 1 != 0);
-                    if (lo, hi) == (false, true) {
-                        xs.push(x);
-                        continue;
-                    }
-                    let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
-                    let top = self.s.m.bin(c, Bin::LShr, x, k16);
-                    let bottom = self.s.m.bin(c, Bin::And, x, low);
-                    let hi = self
-                        .s
-                        .m
-                        .bin(c, Bin::Shl, if hi { top } else { bottom }, k16);
-                    xs.push(self.s.m.bin(c, Bin::Or, if lo { top } else { bottom }, hi));
+                if v.neg != 0 || v.neg_hi != 0 {
+                    return Err("a negated dot product");
                 }
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a result without a register");
+                };
+                let (a0, b0) = (s(self, 0)?, s(self, 1)?);
+                let a = self.vop3p_select(c, a0, v.opsel & 1 != 0, v.opsel_hi & 1 != 0);
+                let bb = self.vop3p_select(c, b0, v.opsel >> 1 & 1 != 0, v.opsel_hi >> 1 & 1 != 0);
                 let acc = s(self, 2)?;
                 let i32_ty = self.s.t.i32;
-                let r = self.s.op(
-                    c,
-                    "dot4AddPacked.i32",
-                    Attr::ReadNone,
-                    i32_ty,
-                    163,
-                    &[acc, xs[0], xs[1]],
-                );
-                int(self, r)
+                let r = if !v.clamp {
+                    self.s.op(
+                        c,
+                        "dot4AddPacked.i32",
+                        Attr::ReadNone,
+                        i32_ty,
+                        163,
+                        &[acc, a, bb],
+                    )
+                } else {
+                    let zero = self.s.m.i32(0);
+                    let dot = self.s.op(
+                        c,
+                        "dot4AddPacked.i32",
+                        Attr::ReadNone,
+                        i32_ty,
+                        163,
+                        &[zero, a, bb],
+                    );
+                    self.add_i32_sat(c, acc, dot)
+                };
+                self.write(inst, Reg::V(reg), r, guard);
+                Ok(())
             }
             "v_mov_b32" => {
                 if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
@@ -6254,6 +6317,109 @@ impl<'a> Lower<'a> {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let r = self.fmad(a, bb, cc);
                 float(self, r)
+            }
+            "v_dot2_i32_i16" | "v_dot2_u32_u16" | "v_dot4_u32_u8" | "v_dot8_u32_u4" => {
+                if v.omod != 0 {
+                    return Err("integer output modifiers");
+                }
+                if v.neg != 0 || v.neg_hi != 0 {
+                    return Err("a negated dot product");
+                }
+                let (a0, b0) = (s(self, 0)?, s(self, 1)?);
+                let a = self.vop3p_select(c, a0, v.opsel & 1 != 0, v.opsel_hi & 1 != 0);
+                let bb = self.vop3p_select(c, b0, v.opsel >> 1 & 1 != 0, v.opsel_hi >> 1 & 1 != 0);
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a result without a register");
+                };
+                let acc = s(self, 2)?;
+                let signed = name == "v_dot2_i32_i16";
+                let (lanes, width): (u32, u32) = match name {
+                    "v_dot2_i32_i16" | "v_dot2_u32_u16" => (2, 16),
+                    "v_dot4_u32_u8" => (4, 8),
+                    _ => (8, 4),
+                };
+                let extract = |l: &mut Self, x: V, lane: u32| -> V {
+                    if signed {
+                        let shl = 32 - width - lane * width;
+                        let t = if shl != 0 {
+                            let k = l.s.m.i32(shl);
+                            l.s.m.bin(c, Bin::Shl, x, k)
+                        } else {
+                            x
+                        };
+                        let shr = l.s.m.i32(32 - width);
+                        l.s.m.bin(c, Bin::AShr, t, shr)
+                    } else {
+                        let t = if lane != 0 {
+                            let k = l.s.m.i32(lane * width);
+                            l.s.m.bin(c, Bin::LShr, x, k)
+                        } else {
+                            x
+                        };
+                        let mask = l.s.m.i32((1u32 << width) - 1);
+                        l.s.m.bin(c, Bin::And, t, mask)
+                    }
+                };
+                let mut products = Vec::with_capacity(lanes as usize);
+                for lane in 0..lanes {
+                    let ea = extract(self, a, lane);
+                    let eb = extract(self, bb, lane);
+                    products.push(self.s.m.bin(c, Bin::Mul, ea, eb));
+                }
+                let r = if !v.clamp {
+                    let mut sum = acc;
+                    for p in products {
+                        sum = self.s.m.bin(c, Bin::Add, sum, p);
+                    }
+                    sum
+                } else if signed {
+                    // Exact 64-bit signed accumulation in two 32-bit halves
+                    // (no INT64 capability needed), saturated to [i32::MIN, i32::MAX].
+                    let (k0, k1, k31) = (self.s.m.i32(0), self.s.m.i32(1), self.s.m.i32(31));
+                    let mut lo = acc;
+                    let mut hi = self.s.m.bin(c, Bin::AShr, acc, k31);
+                    for t in products {
+                        let new_lo = self.s.m.bin(c, Bin::Add, lo, t);
+                        let carry_b = self.s.m.cmp(c, pred::IULT, new_lo, lo);
+                        let carry = self.s.m.select(c, carry_b, k1, k0);
+                        let t_hi = self.s.m.bin(c, Bin::AShr, t, k31);
+                        let hi1 = self.s.m.bin(c, Bin::Add, hi, t_hi);
+                        hi = self.s.m.bin(c, Bin::Add, hi1, carry);
+                        lo = new_lo;
+                    }
+                    let s_hi = self.s.m.bin(c, Bin::AShr, lo, k31);
+                    let fits = self.s.m.cmp(c, pred::EQ, hi, s_hi);
+                    let pos = self.s.m.cmp(c, pred::SGE, hi, k0);
+                    let (imin, imax) = (
+                        self.s.m.i32(i32::MIN as u32),
+                        self.s.m.i32(i32::MAX as u32),
+                    );
+                    let sat = self.s.m.select(c, pos, imax, imin);
+                    self.s.m.select(c, fits, lo, sat)
+                } else {
+                    let terms: Vec<V> = if lanes == 2 {
+                        products
+                    } else {
+                        // 4x u8*u8 (<= 260100) and 8x u4*u4 (<= 1800) never overflow u32.
+                        let mut dot = products[0];
+                        for &p in &products[1..] {
+                            dot = self.s.m.bin(c, Bin::Add, dot, p);
+                        }
+                        vec![dot]
+                    };
+                    let mut lo = acc;
+                    let mut ov = self.s.m.bool(false);
+                    for t in terms {
+                        let new_lo = self.s.m.bin(c, Bin::Add, lo, t);
+                        let carry = self.s.m.cmp(c, pred::IULT, new_lo, lo);
+                        ov = self.s.m.bin(c, Bin::Or, ov, carry);
+                        lo = new_lo;
+                    }
+                    let umax = self.s.m.i32(u32::MAX);
+                    self.s.m.select(c, ov, umax, lo)
+                };
+                self.write(inst, Reg::V(reg), r, guard);
+                Ok(())
             }
             "v_fmac_f32" | "v_mac_f32" | "v_mac_legacy_f32" => {
                 let (a, bb) = (f(self, 0)?, f(self, 1)?);
