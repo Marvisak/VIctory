@@ -3017,6 +3017,144 @@ fn constant_results_run() {
 
 // ---- more of the title's forms ----
 
+#[test]
+fn binary64_division_scale_returns_both_words_and_lane_mask() {
+    const SIGN: u64 = 1 << 63;
+    const INF: u64 = 0x7ff0_0000_0000_0000;
+    const MAX: u64 = INF - 1;
+    const INVALID: u64 = 0xfff8_0000_0000_0000;
+    const SNAN: u64 = 0x7ff0_0000_89ab_cdef;
+    const ONE: u64 = 1.0f64.to_bits();
+
+    let exp = |e: u64| e << 52;
+    let pair = |d: u64, n: u64| [d as u32, (d >> 32) as u32, n as u32, (n >> 32) as u32];
+    let build = |body, rows: &[(u64, u64, u64, u32)]| {
+        let results: Vec<_> = rows
+            .iter()
+            .map(|&(d, n, out, mask)| (pair(d, n), out, mask))
+            .collect();
+        let data = results.iter().map(|&(i, _, _)| i).collect();
+        probe(body, data, INT, move |i| {
+            let &(_, out, mask) = results
+                .iter()
+                .find(|&&(bits, _, _)| bits == i)
+                .expect("input row");
+            vec![out as u32, (out >> 32) as u32, mask]
+        })
+    };
+    let with_mask = |mut body: Vec<u32>, mask: u16| {
+        body.extend(vop3(0x101, 7, [int(0), int(1), mask], NONE));
+        body
+    };
+
+    // Both aliased input forms and VCC, based on physical RDNA2 measurements
+    // in AnyPS5 #474 and #24629. Values below are encoded exponent fields.
+    let edges = [
+        (ONE, ONE, ONE, ONE, 0),
+        (exp(1000), exp(1767), exp(1000), exp(1767), 0),
+        (exp(1000), exp(1768), exp(1128), exp(1768), 1),
+        (exp(1790), ONE, exp(1790), ONE, 0),
+        (exp(1791), ONE, exp(1791), exp(1151), 1),
+        (1, ONE, exp(77), ONE, 1),
+        (SIGN | 1, ONE, SIGN | exp(77), ONE, 1),
+        (0x000f_ffff_ffff_ffff, ONE, 0x080f_ffff_ffff_fffe, ONE, 1),
+        (1, exp(20), exp(77), exp(148), 0),
+        (exp(500), exp(53), exp(628), exp(181), 0),
+        (exp(500), exp(54), exp(500), exp(54), 0),
+        (exp(2044), exp(2044), exp(2044), exp(2044), 0),
+        (exp(2045), exp(2045), exp(1917), exp(1917), 0),
+        (exp(2045), ONE, exp(1917), ONE, 1),
+        (ONE, INF, exp(1151), INF, 1),
+        (0, ONE, INVALID, INVALID, 1),
+        (ONE, SIGN, INVALID, INVALID, 1),
+        (0, 0, INVALID, INVALID, 0),
+        (SNAN, ONE, SNAN, ONE, 1),
+        (ONE, SNAN, exp(1151), SNAN, 1),
+    ];
+    let mut probes = Vec::new();
+    for numerator in [false, true] {
+        let src0 = if numerator { v(3) } else { v(1) };
+        let words = vop3b(0x16e, 5, VCC as u8, [src0, v(1), v(3)], false);
+        let rows: Vec<_> = edges
+            .iter()
+            .map(|&(d, n, a, b, mask)| (d, n, if numerator { b } else { a }, mask))
+            .collect();
+        probes.push(build(with_mask(words.to_vec(), VCC), &rows));
+    }
+
+    // A distinct src0, as used in the measured exponent-scan cases. An
+    // exponent below 117 on the downscale path returns the overflow limit.
+    let fixed = |value: u64, round: u32| {
+        let mut body = vec![
+            0xba80_0881,
+            round,
+            vop1(0x01, 14, 255),
+            value as u32,
+            vop1(0x01, 15, 255),
+            (value >> 32) as u32,
+        ];
+        body.extend(vop3b(0x16e, 5, 20, [v(14), v(1), v(3)], false));
+        with_mask(body, s(20))
+    };
+    let huge = exp(2045);
+    for (round, pos, neg) in [
+        (0, INF, SIGN | INF),
+        (1, INF, SIGN | MAX),
+        (2, MAX, SIGN | INF),
+        (3, MAX, SIGN | MAX),
+    ] {
+        probes.push(build(fixed(exp(116), round), &[(huge, huge, pos, 0)]));
+        probes.push(build(
+            fixed(SIGN | exp(116), round),
+            &[(huge, huge, neg, 0)],
+        ));
+        probes.push(build(
+            fixed(exp(1920), round),
+            &[(exp(500), exp(53), pos, 0)],
+        ));
+
+        let low = 1 << 40;
+        let value = exp(117) | 0x801;
+        probes.push(build(
+            fixed(value, round),
+            &[(huge, huge, low + u64::from(round <= 1), 0)],
+        ));
+        probes.push(build(
+            fixed(SIGN | value, round),
+            &[(
+                huge,
+                huge,
+                SIGN | (low + u64::from(round == 0 || round == 2)),
+                0,
+            )],
+        ));
+    }
+    probes.push(build(
+        fixed(0x080f_ffff_ffff_ffff, 0),
+        &[(huge, huge, exp(1), 0)],
+    ));
+    probes.push(build(fixed(SIGN, 0), &[(huge, huge, SIGN, 0)]));
+    probes.push(build(fixed(SNAN, 0), &[(huge, huge, SNAN, 0)]));
+
+    // DX10 clamp and the ignored f64 output multiplier (AnyPS5 #663).
+    let [head, tail] = vop3b(0x16e, 5, 20, [v(1), v(1), v(3)], true);
+    probes.push(build(
+        with_mask(vec![head, tail | 2 << 27], s(20)),
+        &[
+            (exp(1022), ONE, exp(1022), 0),
+            (exp(1024), ONE, ONE, 0),
+            (SIGN | ONE, ONE, 0, 0),
+            (0, ONE, 0, 1),
+        ],
+    ));
+    let [head, tail] = vop3b(0x16e, 5, 20, [v(1), v(1), v(3)], false);
+    probes.push(build(
+        with_mask(vec![head, tail | 1 << 29], s(20)),
+        &[(ONE, ONE, SIGN | ONE, 0)],
+    ));
+    assert_clean(check(&probes));
+}
+
 /// 64-bit shifts read six bits of the count (RDNA2 ISA `V_LSHLREV_B64`).
 #[test]
 fn wide_shifts_match_the_hardware() {
