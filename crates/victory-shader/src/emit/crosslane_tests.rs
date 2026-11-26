@@ -1080,3 +1080,47 @@ fn dpp16_reverse_integer_ops_shuffle_the_second_source_on_gpu() {
         .collect();
     check_cases("DPP16rev", &items);
 }
+
+
+/// The reverse subtract shuffles src1 and keeps each lane's own borrow-in.
+/// Adapted from Andrew Pozdnakov's independent follow-up test:
+/// https://github.com/andrewpozdnakov7-jpg/VIctory/commit/f1795aa01b4b65c37b159b0b596ecdce06ac94d4
+#[test]
+fn dpp16_reverse_subtract_keeps_local_borrow_on_gpu() {
+    let mut words = vec![v_and_b32_imm(4, 1, 0), v_cmp_eq_u32_imm(0, 4)];
+    words.extend(v_add_nc_u32_lit(3, lane_v1(0), 0));
+    words.extend([
+        0x2A << 25 | 2 << 17 | 3 << 9 | 0xFA, // v_subrev_co_ci_u32 v2, v1, v3, vcc
+        dpp16_word(1, 0xB1, 0xF, 0xF, false, false),
+    ]);
+
+    let value = build_wave32_cs(MaskPattern::All, Divergence::Full, &words);
+    words.extend(v_add_nc_u32_lit(5, 1, 0));
+    words.push(0x01 << 25 | 2 << 17 | 5 << 9 | 0x80); // v_cndmask_b32 v2, 0, v5, vcc
+    let borrow = build_wave32_cs(MaskPattern::All, Divergence::Full, &words);
+    check_cases(
+        "DPP16rev borrow",
+        &[
+            (
+                "v_subrev_co_ci_u32 value",
+                value,
+                std::array::from_fn(|lane| {
+                    let lane = lane as u32;
+                    lane_v1(lane ^ 1)
+                        .wrapping_sub(lane_v1(lane) + u32::from(lane.is_multiple_of(2)))
+                }),
+            ),
+            (
+                "v_subrev_co_ci_u32 borrow out",
+                borrow,
+                std::array::from_fn(|lane| {
+                    if lane.is_multiple_of(2) {
+                        0
+                    } else {
+                        lane as u32 + 1
+                    }
+                }),
+            ),
+        ],
+    );
+}
