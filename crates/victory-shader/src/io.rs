@@ -387,6 +387,14 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
                     "v_interp_p1ll_f16" => {}
                     "v_interp_p2_f16" => {
+                        if v.abs != 0
+                            || v.neg != 0
+                            || (v.opsel & 0x7) != 0
+                            || v.sdwa.is_some()
+                            || v.dpp.is_some()
+                        {
+                            return Err(unsupported(at, "a modified interpolation"));
+                        }
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
                             Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
@@ -520,10 +528,22 @@ impl Halves<'_> {
                     attr,
                     ..
                 } if inst.name() == "v_interp_p1_f32" => (*attr, inst.read(Reg::V(*reg))),
-                Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => match v.src.get(1) {
-                    Some(&Operand::Vector { reg, .. }) => (v.src[0], inst.read(Reg::V(reg))),
-                    _ => return Err("an interpolation without its first half"),
-                },
+                Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => {
+                    if v.abs != 0
+                        || v.neg != 0
+                        || v.opsel != 0
+                        || v.clamp
+                        || v.omod != 0
+                        || v.sdwa.is_some()
+                        || v.dpp.is_some()
+                    {
+                        return Err("a modified first interpolation half");
+                    }
+                    match v.src.get(1) {
+                        Some(&Operand::Vector { reg, .. }) => (v.src[0], inst.read(Reg::V(reg))),
+                        _ => return Err("an interpolation without its first half"),
+                    }
+                }
                 _ => return Err("an interpolation without its first half"),
             };
             if a != *attr {
@@ -728,6 +748,60 @@ mod tests {
         // attr1 is not in the stage data.
         let other = program(&[0xC808_0400, S_ENDPGM]); // v_interp_p1_f32 v2, v0, attr1.x
         assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());
+    }
+
+    #[test]
+    fn modified_f16_interpolation_halves_are_rejected() {
+        let native = pixel(vec![TEXCOORD], 1 << 1);
+        let run = |p1_w0: u32, p1_w1: u32, p2_w0: u32, p2_w1: u32| {
+            let p = program(&[p1_w0, p1_w1, p2_w0, p2_w1, S_ENDPGM]);
+            raise(&p, &native)
+        };
+        let p1 = (0xD742_0002u32, 0x0002_0000u32); // v_interp_p1ll_f16 v2, attr0.x, v0
+        let p2 = (0xD75A_0003u32, 0x040A_0200u32); // v_interp_p2_f16 v3, attr0.x, v1, v2
+
+        // Plain P1 + P2 (including P2's lowered clamp, omod, and op_sel[3]) succeeds.
+        assert!(run(p1.0, p1.1, p2.0, p2.1).is_ok());
+        assert!(run(p1.0, p1.1, p2.0 | (1 << 15) | (1 << 14), p2.1 | (1 << 27)).is_ok());
+
+        // P1 modifiers are dropped during lowering and must be rejected.
+        for (p1_w0, p1_w1) in [
+            (p1.0 | (1 << 15), p1.1), // clamp
+            (p1.0, p1.1 | (1 << 27)), // omod
+            (p1.0 | (1 << 9), p1.1),  // abs on src1
+            (p1.0, p1.1 | (1 << 30)), // neg on src1
+        ] {
+            let err = run(p1_w0, p1_w1, p2.0, p2.1).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ShaderError::Unsupported {
+                        what: "a modified first interpolation half",
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+
+        // P2 input modifiers (abs/neg/src op_sel) are also unlowered and must be rejected.
+        for (p2_w0, p2_w1) in [
+            (p2.0 | (1 << 9), p2.1),  // abs on src1
+            (p2.0, p2.1 | (1 << 30)), // neg on src1
+            (p2.0 | (1 << 12), p2.1), // op_sel[1]
+        ] {
+            let err = run(p1.0, p1.1, p2_w0, p2_w1).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ShaderError::Unsupported {
+                        what: "a modified interpolation",
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]
