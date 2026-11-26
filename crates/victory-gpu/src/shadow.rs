@@ -1107,6 +1107,13 @@ pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shad
 #[cfg(feature = "diagnostics")]
 static VIEWS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Cumulative requests, new exact slices and their logical bytes, without
+/// resetting the frame diagnostics. Read in a filtered, single-test process.
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn exact_view_totals() -> [u64; 3] {
+    [0, 1, 2].map(|i| VIEWS[i].load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Logs [`VIEWS`] per frame over `frames`.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log_views(frames: f64) {

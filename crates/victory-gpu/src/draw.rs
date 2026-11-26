@@ -2027,6 +2027,9 @@ const QUAD_STRIP: u32 = 20;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "diagnostics")]
+    mod alignment_cost;
+
     use super::*;
 
     /// A root signature that indexes the heaps directly needs one of each
@@ -3605,7 +3608,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             // SAFETY: a live buffer.
             unsafe { made.GetDesc() }.Width
         };
-        assert_eq!(width(start + 456), 1 << 16, "on an element: the buffer's copy");
+        assert_eq!(width(start + 2 * 456), 1 << 16, "on a 16-byte-aligned element: the buffer's copy");
+        assert_ne!(width(start + 456), 1 << 16, "on an element not 16-byte aligned: a copy of its own bytes (in a shared buffer)");
         assert_ne!(width(start + 100), 1 << 16, "off: a copy of its own bytes (in a shared buffer)");
         let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
         assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));

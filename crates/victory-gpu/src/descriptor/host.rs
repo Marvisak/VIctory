@@ -1185,7 +1185,13 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    let stride = u64::from(view_stride(view));
+    let align = if stride > 0 && stride.is_multiple_of(4) {
+        16
+    } else {
+        stride
+    };
+    let (shadow, _) = crate::shadow::for_view(address, len, align)?;
     Some((shadow, address, len))
 }
 
@@ -1229,10 +1235,12 @@ fn buffer_srv(
         once!(len, "buffer view of elements without a size");
         return None;
     }
+    let raw_structured = buffer.StructureByteStride > 0 && element.is_multiple_of(4);
+    let align = if raw_structured { 16 } else { element };
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
     let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
+        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)
     else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
@@ -1240,15 +1248,39 @@ fn buffer_srv(
         }
         return None;
     };
-    buffer.FirstElement = shadow.offset(start) / element;
-    let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
-        #[cfg(feature = "diagnostics")]
-        if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
-            tracing::info!(start = format_args!("{start:#x}"), first, count, element, "refused buffer view: empty or past its copy");
+    let byte_offset = shadow.offset(start);
+    let (first, count) = (byte_offset / element, buffer.NumElements);
+    if raw_structured {
+        // NVIDIA multiplies `rawBufferLoad` byte offsets by `StructureByteStride`,
+        // so expose structured buffers as raw dwords (`host_raw_structured`).
+        // `align = 16` above guarantees `byte_offset` is a multiple of 16.
+        // SAFETY: a live buffer.
+        let width = unsafe { shadow.buffer.GetDesc() }.Width;
+        if !within(
+            width,
+            byte_offset / 4,
+            (u64::from(count) * (element / 4)).min(u64::from(u32::MAX)) as u32,
+            4,
+        ) {
+            once!(first, count, element, "buffer view empty or past its host copy");
+            return None;
         }
-        once!(first, count, element, "buffer view empty or past its host copy");
-        return None;
+        buffer.FirstElement = byte_offset / 4;
+        buffer.NumElements =
+            (u64::from(count) * (element / 4)).min(u64::from(u32::MAX)) as u32;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    } else {
+        buffer.FirstElement = first;
+        if !in_buffer(&shadow.buffer, first, count, element) {
+            #[cfg(feature = "diagnostics")]
+            if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+                tracing::info!(start = format_args!("{start:#x}"), first, count, element, "refused buffer view: empty or past its copy");
+            }
+            once!(first, count, element, "buffer view empty or past its host copy");
+            return None;
+        }
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -1295,20 +1327,43 @@ fn buffer_uav(
         once!(len, "unordered buffer view of elements without a size");
         return None;
     }
+    let raw_structured = buffer.StructureByteStride > 0 && element.is_multiple_of(4);
+    let align = if raw_structured { 16 } else { element };
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
-    buffer.FirstElement = shadow.offset(start) / element;
+    let byte_offset = shadow.offset(start);
     buffer.CounterOffsetInBytes = 0;
-    let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
-        once!(first, count, element, "unordered buffer view empty or past its host copy");
-        return None;
+    let (first, count) = (byte_offset / element, buffer.NumElements);
+    if raw_structured {
+        // SAFETY: a live buffer.
+        let width = unsafe { shadow.buffer.GetDesc() }.Width;
+        if !within(
+            width,
+            byte_offset / 4,
+            (u64::from(count) * (element / 4)).min(u64::from(u32::MAX)) as u32,
+            4,
+        ) {
+            once!(first, count, element, "unordered buffer view empty or past its host copy");
+            return None;
+        }
+        buffer.FirstElement = byte_offset / 4;
+        buffer.NumElements =
+            (u64::from(count) * (element / 4)).min(u64::from(u32::MAX)) as u32;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    } else {
+        buffer.FirstElement = first;
+        if !in_buffer(&shadow.buffer, first, count, element) {
+            once!(first, count, element, "unordered buffer view empty or past its host copy");
+            return None;
+        }
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -2307,6 +2362,65 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    #[test]
+    fn unaligned_structured_buffer_views_use_aligned_raw_copy() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let backing = vec![0xA5A5_5A5Au32; 128];
+        let base = backing.as_ptr() as u64;
+        let fake_resource = base as usize;
+        crate::shadow::register(fake_resource, base, 512);
+
+        let srv_at = |first_elem: u32| D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: u64::from(first_elem),
+                    NumElements: 4,
+                    StructureByteStride: 12,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                },
+            },
+        };
+        // Offsets 12, 24, 36 are not 16-byte aligned: each gets a 16-byte-aligned
+        // `exact` copy so the host view can still be `RAW`.
+        for elem in [1, 2, 3] {
+            let kept = buffer_srv(base, 512, srv_at(elem), heap.cpu(0))
+                .expect("host")
+                .expect("view");
+            assert!(kept.1.is_some(), "expected aligned own copy for elem {elem}");
+        }
+        // Offset 48 (4 * 12) is 16-byte aligned (if `base` is 16-byte aligned) and
+        // still succeeds as a raw SRV.
+        let kept = buffer_srv(base, 512, srv_at(4), heap.cpu(0))
+            .expect("host")
+            .expect("view");
+        let _ = kept;
+
+        let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 1,
+                    NumElements: 4,
+                    StructureByteStride: 12,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+                },
+            },
+        };
+        let uav_kept = buffer_uav(base, 512, uav_desc, heap.cpu(1))
+            .expect("host")
+            .expect("uav");
+        assert!(uav_kept.1.is_some());
+
+        crate::shadow::unregister(fake_resource, base);
     }
 
     /// A texture view's size words are the console image descriptor's
