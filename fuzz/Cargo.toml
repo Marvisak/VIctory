@@ -1,0 +1,38 @@
+[package]
+name = "victory-fuzz"
+version = "0.0.0"
+license = "GPL-3.0-or-later"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+victory-formats = { path = "../crates/victory-formats" }
+
+# Own workspace: the main build, tests and CI never pick this crate up.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "bcpack_tables"
+path = "fuzz_targets/bcpack_tables.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bcpack_decode"
+path = "fuzz_targets/bcpack_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xma_frames"
+path = "fuzz_targets/xma_frames.rs"
+test = false
+doc = false
+bench = false
