@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+#[cfg(test)]
+mod pops_tests;
 
 type Why = &'static str;
 
@@ -1706,7 +1708,16 @@ impl<'a> Lower<'a> {
             root: RootType::Descriptor,
             dword: if uav { super::ROOT_UAV_VIEW } else { super::ROOT_SRV_VIEW },
         });
-        let props = if uav { (11 | 0x1000, 0) } else { (11, 0) };
+        let props = if uav {
+            if self.pops {
+                self.s.flags |= flags::ROVS;
+                (11 | 0x1000 | 0x2000, 0)
+            } else {
+                (11 | 0x1000, 0)
+            }
+        } else {
+            (11, 0)
+        };
         let h = self.s.heap_handle(self.s.entry, i, false, false, props);
         self.root_views.insert(index, h);
         h
@@ -5437,27 +5448,13 @@ impl<'a> Lower<'a> {
                     .iter()
                     .find(|u| u.user_data == rp.user_data)
                     .map(|u| u.kind);
-                match (rp.root, kind, props.0) {
-                    (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
-                        Ok(self.s.root_cbv_handle(rp.slot))
-                    }
-                    (RootType::Descriptor, Some(ResourceType::Srv), 11) if !self.root_memory => {
-                        Ok(self.root_view(address.param, false))
-                    }
-                    (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
-                        Ok(self.s.root_srv_handle(rp.slot))
-                    }
-                    (RootType::Descriptor, Some(ResourceType::Uav) | None, 0x100B)
-                    | (RootType::Descriptor, Some(ResourceType::Uav), 11)
-                        if !self.root_memory =>
-                    {
-                        Ok(self.root_view(address.param, true))
-                    }
-                    (RootType::Descriptor, Some(ResourceType::Uav) | None, 0x100B)
-                    | (RootType::Descriptor, Some(ResourceType::Uav), 11) => {
-                        Ok(self.s.root_uav_handle(rp.slot))
-                    }
-                    _ => Err("a root UAV or typed root view"),
+                match classify_root_descriptor(self.root_memory, rp.root, kind, props.0) {
+                    Some(RootBinding::Cbv) => Ok(self.s.root_cbv_handle(rp.slot)),
+                    Some(RootBinding::SrvView) => Ok(self.root_view(address.param, false)),
+                    Some(RootBinding::SrvHandle) => Ok(self.s.root_srv_handle(rp.slot)),
+                    Some(RootBinding::UavView) => Ok(self.root_view(address.param, true)),
+                    Some(RootBinding::UavHandle) => Ok(self.s.root_uav_handle(rp.slot)),
+                    None => Err("a root UAV or typed root view"),
                 }
             }
             Source::Phi { block, args }
@@ -10915,6 +10912,41 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootBinding {
+    Cbv,
+    SrvView,
+    SrvHandle,
+    UavView,
+    UavHandle,
+}
+
+fn classify_root_descriptor(
+    root_memory: bool,
+    root: RootType,
+    kind: Option<ResourceType>,
+    props: u32,
+) -> Option<RootBinding> {
+    if root != RootType::Descriptor {
+        return None;
+    }
+    match (kind, props) {
+        (Some(ResourceType::Cbv) | None, 13) => Some(RootBinding::Cbv),
+        (Some(ResourceType::Srv), 11) if !root_memory => Some(RootBinding::SrvView),
+        (Some(ResourceType::Srv), 11) => Some(RootBinding::SrvHandle),
+        (Some(ResourceType::Uav) | None, p) if !root_memory && (p & !0x2000) == 0x100B => {
+            Some(RootBinding::UavView)
+        }
+        (Some(ResourceType::Uav), p) if !root_memory && (p & !0x2000) == 11 => {
+            Some(RootBinding::UavView)
+        }
+        (Some(ResourceType::Uav) | None, 0x100B) | (Some(ResourceType::Uav), 11) => {
+            Some(RootBinding::UavHandle)
+        }
+        _ => None,
     }
 }
 
