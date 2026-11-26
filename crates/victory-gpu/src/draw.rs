@@ -43,6 +43,31 @@ pub(crate) struct VertexView {
     stride: u32,
 }
 
+/// Validates and computes `(from_va, in_bytes, out_bytes)` for CPU rectangle
+/// expansion (`3` input vertices -> `6` output vertices per rectangle),
+/// rejecting `u32`/`u64` overflows, `SizeInBytes` truncation, and ranges past
+/// `v.size`.
+fn rect_vertex_range(v: VertexView, first: u32, count: u32) -> Option<(u64, u64, u32)> {
+    let stride = u64::from(v.stride);
+    if v.address == 0 || stride == 0 {
+        return None;
+    }
+    let end_vertices = u64::from(first).checked_add(u64::from(count))?;
+    let end_bytes = end_vertices.checked_mul(stride)?;
+    if end_bytes > u64::from(v.size) {
+        return None;
+    }
+    let from = v.address.checked_add(u64::from(first).checked_mul(stride)?)?;
+    let rects = u64::from(count / 3);
+    let out_vertices = rects.checked_mul(6)?;
+    let _ = u32::try_from(out_vertices).ok()?;
+    let in_bytes = rects.checked_mul(3)?.checked_mul(stride)?;
+    let out_bytes = u32::try_from(out_vertices.checked_mul(stride)?).ok()?;
+    let _ = usize::try_from(in_bytes).ok()?;
+    let _ = usize::try_from(out_bytes).ok()?;
+    Some((from, in_bytes, out_bytes))
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IndexView {
@@ -1607,6 +1632,7 @@ impl State {
             return false;
         };
         let rects = u64::from(count / 3);
+        let mut plan = Vec::new();
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
                 .inputs
@@ -1618,21 +1644,28 @@ impl State {
                 continue;
             }
             let v = self.vertex[slot as usize];
-            let stride = u64::from(v.stride);
-            let from = v.address + u64::from(first) * stride;
-            if v.address == 0
-                || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
-            {
+            let Some((from, in_bytes, out_bytes)) = rect_vertex_range(v, first, count) else {
+                once!(slot, "rectangle vertices outside their buffer");
+                return false;
+            };
+            if crate::shadow::find(from, in_bytes).is_none() {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
             }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            plan.push((slot, v.stride, from, out_bytes, elements));
+        }
+        let mut scratch = Vec::with_capacity(plan.len());
+        for &(_, _, _, out_bytes, _) in &plan {
+            let Some(alloc) = list.scratch(u64::from(out_bytes)) else {
                 return false;
             };
-            let (from, to, stride) = (from as usize, to as usize, stride as usize);
-            let n = rects as usize;
+            scratch.push(alloc);
+        }
+        let n = rects as usize;
+        for ((slot, stride_u32, from, out_bytes, elements), (gpu, to)) in
+            plan.into_iter().zip(scratch)
+        {
+            let (from, to, stride) = (from as usize, to as usize, stride_u32 as usize);
             list.defer_host(move || {
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
@@ -1646,8 +1679,8 @@ impl State {
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
-                StrideInBytes: v.stride,
+                SizeInBytes: out_bytes,
+                StrideInBytes: stride_u32,
             };
             // SAFETY: an open list; the view names live scratch memory.
             unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
@@ -3906,5 +3939,50 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(host.log_messages(), None, "case {case} D3D12 debug errors");
             let _ = kept_obj;
         }
+    }
+
+    #[test]
+    fn rect_vertex_range_rejects_overflow_and_out_of_bounds() {
+        let base = 0x1000_0000u64;
+        // Valid 2-rectangle draw starting at vertex 3.
+        let v = VertexView {
+            address: base,
+            size: 144,
+            stride: 16,
+        };
+        assert_eq!(rect_vertex_range(v, 3, 6), Some((base + 48, 96, 192)));
+        assert_eq!(rect_vertex_range(v, 3, 7), None, "past buffer size");
+
+        // `first + count` overflowing u32 must not wrap and bypass the bounds check.
+        let big_buf = VertexView {
+            address: base,
+            size: 1024,
+            stride: 16,
+        };
+        assert_eq!(rect_vertex_range(big_buf, u32::MAX - 2, 3), None);
+
+        // `address + first * stride` overflowing u64 must be rejected.
+        let high_va = VertexView {
+            address: u64::MAX - 31,
+            size: 1024,
+            stride: 16,
+        };
+        assert_eq!(rect_vertex_range(high_va, 2, 3), None);
+
+        // Expanded buffer exceeding u32::MAX must not silently truncate SizeInBytes.
+        let huge_out = VertexView {
+            address: base,
+            size: u32::MAX,
+            stride: 8,
+        };
+        assert_eq!(rect_vertex_range(huge_out, 0, 300_000_000), None);
+
+        // Expanded vertex count exceeding u32::MAX must be rejected.
+        let huge_verts = VertexView {
+            address: base,
+            size: u32::MAX,
+            stride: 1,
+        };
+        assert_eq!(rect_vertex_range(huge_verts, 0, u32::MAX), None);
     }
 }
