@@ -415,6 +415,7 @@ mod tests {
             hash: "0123456789abcdef".into(),
             container: Vec::new(),
             translated: OnceLock::new(),
+            partial: OnceLock::new(),
         });
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
         let warm = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));

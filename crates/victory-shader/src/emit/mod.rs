@@ -352,6 +352,9 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 /// names.
 pub const ROOT_VIEW_OFFSET: u32 = 4;
 
+/// Host-supplied thread count for a cut-short DispatchX, indexed by axis.
+pub const DISPATCH_THREADS: RootType = RootType::Other(0x104);
+
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
@@ -385,6 +388,22 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] made as `options` say.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    translate_variant::<false>(container, options)
+}
+
+/// Compute translation for a dispatch with an incomplete last group. The host
+/// supplies the requested dimensions through the [`DISPATCH_THREADS`] words.
+pub fn translate_partial_dispatch(
+    container: &[u8],
+    options: Options,
+) -> Result<HostShader, ShaderError> {
+    translate_variant::<true>(container, options)
+}
+
+fn translate_variant<const PARTIAL: bool>(
+    container: &[u8],
+    options: Options,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -408,7 +427,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    emit_variant::<PARTIAL>(&c, &native, &p, &st, &io, &res, options)
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.
@@ -425,6 +444,18 @@ pub fn emit(
 
 /// [`emit`] made as `options` say.
 pub fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+) -> Result<HostShader, ShaderError> {
+    emit_variant::<false>(c, native, p, st, io, res, options)
+}
+
+fn emit_variant<const PARTIAL: bool>(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -500,14 +531,14 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let l = match lower::lower_variant::<PARTIAL>(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            lower::lower_variant::<PARTIAL>(&parts(&st, &res))?
         }
         l => l?,
     };

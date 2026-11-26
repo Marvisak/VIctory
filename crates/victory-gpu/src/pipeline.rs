@@ -65,6 +65,8 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    partial: OnceLock<Option<host::HostPipeline>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -95,6 +97,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            partial: OnceLock::new(),
         }
     }
 
@@ -111,10 +115,33 @@ impl Shader {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    pub(crate) threads: Option<[u32; 3]>,
 }
 
 #[cfg(windows)]
 impl Shader {
+    /// Compile the bounded form once, on the first incomplete dispatch of
+    /// this program. The pipeline library keys it by its own DXIL and root.
+    pub(crate) fn partial_dispatch(&self) -> Option<&host::HostPipeline> {
+        self.partial
+            .get_or_init(|| {
+                let options = victory_shader::emit::Options { view_marks: true };
+                let host = victory_shader::emit::translate_partial_dispatch(
+                    &self.container,
+                    options,
+                )
+                .inspect_err(
+                    |e| tracing::warn!(hash = %self.hash, error = %e, "partial dispatch refused"),
+                )
+                .ok()?;
+                let translated = with_resources(&self.container, host).ok()?;
+                let mut shader = Shader::new(self.stage, &self.container);
+                shader.translated = OnceLock::from(Some(translated));
+                host::HostPipeline::new(&[Arc::new(shader)], None)
+            })
+            .as_ref()
+    }
+
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -189,7 +216,7 @@ fn with_resources(
 ) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
+    let program = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => victory_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -198,12 +225,19 @@ fn with_resources(
                     p.stage,
                     HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
                 )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
-        None => Vec::new(),
+            }),
+        None => None,
     };
-    Ok(Translated { host, used })
+    let threads = program.as_ref().and_then(|p| match &p.io {
+        victory_shader::native::StageIo::Cs(cs) => Some(cs.threads),
+        _ => None,
+    });
+    let used = program.map(|p| p.used).unwrap_or_default();
+    Ok(Translated {
+        host,
+        used,
+        threads,
+    })
 }
 
 #[repr(C)]

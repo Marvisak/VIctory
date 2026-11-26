@@ -95,10 +95,15 @@ enum Stop {
     Fail(ShaderError),
 }
 
+#[cfg(any(test, all(windows, feature = "host")))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_variant::<false>(parts)
+}
+
+pub(super) fn lower_variant<const PARTIAL: bool>(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad).run(PARTIAL) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -1292,7 +1297,27 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
-    fn run(mut self) -> Result<Lowered, Stop> {
+    fn run(mut self, partial: bool) -> Result<Lowered, Stop> {
+        let entry = self.s.entry;
+        if partial {
+            if !matches!(self.x.native.io, StageIo::Cs(_)) {
+                return Err(unsupported(0, "thread dimensions outside compute"));
+            }
+            // A group sync inside the active arm would be divergent in DXIL.
+            if self
+                .x
+                .p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "s_barrier")
+            {
+                return Err(unsupported(0, "a partial dispatch with a group barrier"));
+            }
+            // Guest inputs, including the first ballot of EXEC, belong in the
+            // active arm. Fill the outer entry after guest user data is known.
+            self.s.entry = self.s.m.new_block();
+        }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1380,6 +1405,9 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if partial {
+            self.dispatch_guard(entry);
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -1425,6 +1453,39 @@ impl<'a> Lower<'a> {
     fn has_done_export(&self, b: usize) -> bool {
         (0..self.x.p.blocks[b].insts.len())
             .any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.done))
+    }
+
+    /// Branch before any guest code. Compute the cutoff in the same lane
+    /// order as guest thread IDs on hosts where wave lanes are relabelled.
+    fn dispatch_guard(&mut self, entry: usize) {
+        let body = std::mem::replace(&mut self.s.entry, entry);
+        self.cur = entry;
+        self.user_data = None;
+        let mut active = self.s.m.bool(true);
+        for (axis, width) in self.s.threads.expect("compute").into_iter().enumerate() {
+            if width == 1 {
+                continue;
+            }
+            let limit = self.user_at(UserData {
+                index: self.s.user_data,
+                slot: 0,
+                root: super::DISPATCH_THREADS,
+                dword: axis as u32,
+            });
+            let Val::I32(group) = self.compute_id("groupId.i32", 94, axis as u8) else {
+                unreachable!()
+            };
+            let Val::I32(local) = self.thread_id(axis as u8) else {
+                unreachable!()
+            };
+            let width = self.s.m.i32(width);
+            let base = self.s.m.bin(entry, Bin::Mul, group, width);
+            let global = self.s.m.bin(entry, Bin::Add, base, local);
+            let inside = self.s.m.cmp(entry, pred::IULT, global, limit);
+            active = self.s.m.bin(entry, Bin::And, active, inside);
+        }
+        let done = self.abort_block();
+        self.s.m.terminate(entry, Term::CondBr(active, body, done));
     }
 
     /// Values of the program's input registers.

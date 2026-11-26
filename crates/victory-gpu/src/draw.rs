@@ -614,6 +614,16 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.bind_dispatch::<false>(list, p, compute, [0; 3])
+    }
+
+    fn bind_dispatch<const THREADS: bool>(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+        dims: [u32; 3],
+    ) -> bool {
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
@@ -750,6 +760,10 @@ impl State {
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
+                    if THREADS && u.root == victory_shader::emit::DISPATCH_THREADS {
+                        values[u.index as usize] = dims[u.dword as usize];
+                        continue;
+                    }
                     if u.root == RootType::Descriptor
                         && u.dword == 0
                         && let Some(Root::View(address)) =
@@ -1093,7 +1107,17 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch<const THREADS: bool>(
+        &mut self,
+        list: &HostList,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) {
+        let dims = [x, y, z];
+        if THREADS && dims.contains(&0) {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1114,7 +1138,36 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        let (p, [x, y, z]) = if THREADS {
+            let shader = &p.stages[0];
+            let plan = shader
+                .translated()
+                .threads
+                .and_then(|size| crate::list::thread_groups(dims, size));
+            let Some((groups, partial)) = plan else {
+                once!("thread dispatch with invalid group dimensions dropped");
+                not_run("invalid thread dispatch dimensions");
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                dropped(list, self.pipeline, "dispatch");
+                return;
+            };
+            if partial {
+                let Some(bounded) = shader.shader.partial_dispatch() else {
+                    not_run("no partial dispatch pipeline");
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    dropped(list, self.pipeline, "dispatch");
+                    return;
+                };
+                (bounded, groups)
+            } else {
+                (p, groups)
+            }
+        } else {
+            (p, dims)
+        };
+        if !self.bind_dispatch::<THREADS>(list, p, true, dims) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
@@ -3408,6 +3461,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             crate::pipeline::Translated {
                 host: host_shader,
                 used: used_entries,
+                threads: None,
             },
         );
         let hp = HostPipeline::new(&[shader], None).expect("compute host pipeline");
