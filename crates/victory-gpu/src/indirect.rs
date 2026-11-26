@@ -229,10 +229,11 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
         l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
         // One group walks every record.
         l.Dispatch(records.min(1), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
-        ]);
+        l.ResourceBarrier(&[transition(
+            &out,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )]);
     }
     Some(out)
 }
@@ -306,8 +307,13 @@ mod tests {
             for at in 0..all {
                 assert_eq!(data.add(at).read_volatile(), words[at % words.len()], "the title's copy as written");
             }
-            let mut out_data = std::ptr::null_mut();
-            out?.Map(0, None, Some(&mut out_data)).unwrap();
+            let out = out?;
+            let bytes = records as u64 * per as u64 * 4;
+            let copy_list = host.new_list().unwrap();
+            let (rb, out_data) = copy_list.readback(host, bytes.max(1)).unwrap();
+            copy_list.list.CopyBufferRegion(&rb, 0, &out, 0, bytes);
+            copy_list.close();
+            host.execute(&[&copy_list]);
             let first = |i: usize| out_data.cast::<u32>().add(i * per).read_volatile();
             Some((0..records as usize).map(first).collect())
         }
@@ -395,10 +401,13 @@ mod tests {
             assert!(run.iter().all(|t| t.0 != key(&title)), "the title's copy is never transitioned");
             assert!(states.values().all(|&s| s == 0), "all common again");
             for (out, _) in &recorded {
-                let mut p = std::ptr::null_mut();
-                // SAFETY: a mapped buffer of ours, the lists have run.
+                let copy_list = host.new_list().unwrap();
+                let (rb, p) = copy_list.readback(host, 12).unwrap();
+                // SAFETY: `out` is in COMMON (promotes to COPY_SOURCE) and `rb` is COPY_DEST.
                 let clamped = unsafe {
-                    out.Map(0, None, Some(&mut p)).unwrap();
+                    copy_list.list.CopyBufferRegion(&rb, 0, out, 0, 12);
+                    copy_list.close();
+                    host.execute(&[&copy_list]);
                     p.cast::<[u32; 3]>().read_volatile()
                 };
                 assert_eq!(clamped, [65_535, 1, 1]);
