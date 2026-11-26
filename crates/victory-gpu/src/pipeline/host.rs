@@ -218,9 +218,15 @@ impl GraphicsState {
                 }
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
-                    for f in &mut self.targets.RTFormats {
+                    let count =
+                        (self.targets.NumRenderTargets as usize).min(self.targets.RTFormats.len());
+                    self.targets.NumRenderTargets = count as u32;
+                    for f in &mut self.targets.RTFormats[..count] {
                         f.0 = crate::resource::pc_format(f.0 as u32) as i32;
                     }
+                    // D3D12 rejects pipelines with non-unknown formats past `NumRenderTargets`
+                    // (`E_INVALIDARG`), and `describe` hashes all 8 slots into the cache key.
+                    self.targets.RTFormats[count..].fill(DXGI_FORMAT_UNKNOWN);
                 }
                 16 => {
                     let f = data.cast::<u32>().read_unaligned();
@@ -1041,5 +1047,277 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    #[repr(C, align(8))]
+    struct TargetsSub(u32, D3D12_RT_FORMAT_ARRAY);
+
+    #[repr(C, align(8))]
+    struct DepthSub(u32, D3D12_DEPTH_STENCIL_DESC);
+
+    #[repr(C, align(8))]
+    struct Depth1Sub(u32, D3D12_DEPTH_STENCIL_DESC1);
+
+    fn read_targets(raw: D3D12_RT_FORMAT_ARRAY) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        let sub = TargetsSub(15, raw);
+        // SAFETY: a whole kind-15 subobject.
+        unsafe { g.read(15, std::ptr::from_ref(&sub).cast()) };
+        g
+    }
+
+    /// Unused `RTFormats` slots past `NumRenderTargets` must be cleared to
+    /// `DXGI_FORMAT_UNKNOWN`, and `NumRenderTargets` clamped to 8, so stale
+    /// formats neither fail D3D12 pipeline creation nor pollute cache keys.
+    #[test]
+    fn rt_format_array_clears_unused_slots_and_clamps_count() {
+        let mut trailing = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
+        trailing.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        trailing.RTFormats[7] = DXGI_FORMAT_R32_FLOAT;
+        let cleaned = read_targets(trailing);
+        let canonical = read_targets(targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]));
+        assert_eq!(cleaned.targets.NumRenderTargets, 1);
+        assert_eq!(cleaned.targets.RTFormats[0], DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert!(
+            cleaned.targets.RTFormats[1..]
+                .iter()
+                .all(|&f| f == DXGI_FORMAT_UNKNOWN)
+        );
+        assert_eq!(cleaned.describe(), canonical.describe());
+
+        let mut zero_with_stale = D3D12_RT_FORMAT_ARRAY::default();
+        zero_with_stale.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let zero = read_targets(zero_with_stale);
+        assert_eq!(zero.targets.NumRenderTargets, 0);
+        assert!(
+            zero.targets
+                .RTFormats
+                .iter()
+                .all(|&f| f == DXGI_FORMAT_UNKNOWN)
+        );
+        assert_eq!(
+            zero.describe(),
+            read_targets(D3D12_RT_FORMAT_ARRAY::default()).describe()
+        );
+
+        let mut sparse = targets(&[DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R8G8B8A8_UNORM]);
+        sparse.RTFormats[2] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        let sparse = read_targets(sparse);
+        assert_eq!(sparse.targets.NumRenderTargets, 2);
+        assert_eq!(sparse.targets.RTFormats[0], DXGI_FORMAT_UNKNOWN);
+        assert_eq!(sparse.targets.RTFormats[1], DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert!(
+            sparse.targets.RTFormats[2..]
+                .iter()
+                .all(|&f| f == DXGI_FORMAT_UNKNOWN)
+        );
+
+        let oversized = D3D12_RT_FORMAT_ARRAY {
+            RTFormats: [DXGI_FORMAT_R8G8B8A8_UNORM; 8],
+            NumRenderTargets: 10,
+        };
+        let clamped = read_targets(oversized);
+        assert_eq!(clamped.targets.NumRenderTargets, 8);
+        assert!(
+            clamped
+                .targets
+                .RTFormats
+                .iter()
+                .all(|&f| f == DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
+    }
+
+    fn compile_test_shader(
+        stage: &'static str,
+        hw_stage: victory_shader::HwStage,
+        profile: PCSTR,
+        source: &[u8],
+    ) -> Arc<Shader> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: live source buffer and output pointer.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                PCSTR::null(),
+                None,
+                None,
+                windows::core::s!("main"),
+                profile,
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: the blob owns these bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+        };
+        Shader::for_test(
+            stage,
+            Translated {
+                host: victory_shader::emit::HostShader {
+                    stage: hw_stage,
+                    dxil: bytes.to_vec(),
+                    user_data: Vec::new(),
+                    samplers: Vec::new(),
+                    static_samplers: Vec::new(),
+                    root_cbvs: Vec::new(),
+                    root_srvs: Vec::new(),
+                    root_uavs: Vec::new(),
+                    memory: false,
+                    memory_writes: false,
+                    view_addresses: false,
+                    heap: false,
+                    heap_writes: false,
+                    view_marks: false,
+                },
+                used: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn host_pipeline_accepts_stream_with_trailing_rt_formats() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let queue = host.device.cast::<ID3D12InfoQueue>().ok();
+        if let Some(q) = &queue {
+            // SAFETY: live info queue.
+            unsafe { q.ClearStoredMessages() };
+        }
+
+        let vs = compile_test_shader(
+            "vertex",
+            victory_shader::HwStage::Vs,
+            windows::core::s!("vs_5_1"),
+            b"float4 main(uint id : SV_VertexID) : SV_Position { return float4(0, 0, 0, 1); }",
+        );
+        let ps1 = compile_test_shader(
+            "pixel",
+            victory_shader::HwStage::Ps,
+            windows::core::s!("ps_5_1"),
+            b"float4 main() : SV_Target0 { return float4(1, 0, 0, 1); }",
+        );
+        let ps8 = compile_test_shader(
+            "pixel",
+            victory_shader::HwStage::Ps,
+            windows::core::s!("ps_5_1"),
+            b"struct Out {
+                float4 c0 : SV_Target0; float4 c1 : SV_Target1;
+                float4 c2 : SV_Target2; float4 c3 : SV_Target3;
+                float4 c4 : SV_Target4; float4 c5 : SV_Target5;
+                float4 c6 : SV_Target6; float4 c7 : SV_Target7;
+            };
+            Out main() {
+                Out o;
+                o.c0 = 0; o.c1 = 0; o.c2 = 0; o.c3 = 0;
+                o.c4 = 0; o.c5 = 0; o.c6 = 0; o.c7 = 0;
+                return o;
+            }",
+        );
+
+        let topo = [14u32, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 as u32];
+        let depth_off = DepthSub(11, D3D12_DEPTH_STENCIL_DESC::default());
+
+        // 1. Standard graphics PSO with a stale trailing RT format past NumRenderTargets.
+        let mut g1 = GraphicsState::default();
+        let mut rt1 = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
+        rt1.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        let sub1 = TargetsSub(15, rt1);
+        // SAFETY: whole subobjects.
+        unsafe {
+            g1.read(14, topo.as_ptr().cast());
+            g1.read(11, std::ptr::from_ref(&depth_off).cast());
+            g1.read(15, std::ptr::from_ref(&sub1).cast());
+        }
+        assert!(
+            HostPipeline::new(&[vs.clone(), ps1], Some(&g1)).is_some(),
+            "trailing RTFormats past NumRenderTargets must not fail CreateGraphicsPipelineState"
+        );
+
+        // 2. Depth-only PSO with NumRenderTargets = 0 and a stale format in slot 0
+        // (uses stream_pipeline / CreatePipelineState when depth bounds are supported).
+        let mut g2 = GraphicsState::default();
+        let mut rt0 = D3D12_RT_FORMAT_ARRAY::default();
+        rt0.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let sub0 = TargetsSub(15, rt0);
+        let dsv = [16u32, DXGI_FORMAT_D32_FLOAT.0 as u32];
+        let depth_bounds = Depth1Sub(
+            21,
+            D3D12_DEPTH_STENCIL_DESC1 {
+                DepthEnable: true.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+                DepthFunc: D3D12_COMPARISON_FUNC_LESS,
+                DepthBoundsTestEnable: host.depth_bounds_supported.into(),
+                ..Default::default()
+            },
+        );
+        // SAFETY: whole subobjects.
+        unsafe {
+            g2.read(14, topo.as_ptr().cast());
+            g2.read(21, std::ptr::from_ref(&depth_bounds).cast());
+            g2.read(16, dsv.as_ptr().cast());
+            g2.read(15, std::ptr::from_ref(&sub0).cast());
+        }
+        assert!(
+            HostPipeline::new(std::slice::from_ref(&vs), Some(&g2)).is_some(),
+            "stale RTFormats with NumRenderTargets = 0 must not fail pipeline creation"
+        );
+
+        // 3. Oversized NumRenderTargets > 8 clamped to 8.
+        let mut g3 = GraphicsState::default();
+        let sub8 = TargetsSub(
+            15,
+            D3D12_RT_FORMAT_ARRAY {
+                RTFormats: [DXGI_FORMAT_R8G8B8A8_UNORM; 8],
+                NumRenderTargets: 9,
+            },
+        );
+        // SAFETY: whole subobjects.
+        unsafe {
+            g3.read(14, topo.as_ptr().cast());
+            g3.read(11, std::ptr::from_ref(&depth_off).cast());
+            g3.read(15, std::ptr::from_ref(&sub8).cast());
+        }
+        assert!(
+            HostPipeline::new(&[vs, ps8], Some(&g3)).is_some(),
+            "NumRenderTargets > 8 must clamp to 8 for host pipeline creation"
+        );
+
+        if let Some(q) = &queue {
+            // SAFETY: live info queue.
+            let count = unsafe { q.GetNumStoredMessages() };
+            let mut bad = Vec::new();
+            for i in 0..count {
+                let mut len = 0usize;
+                // SAFETY: querying message size then reading into a buffer of that size.
+                unsafe {
+                    let _ = q.GetMessage(i, None, &mut len);
+                    let mut buf = vec![0u8; len];
+                    if q.GetMessage(i, Some(buf.as_mut_ptr().cast()), &mut len)
+                        .is_ok()
+                    {
+                        let m = &*buf.as_ptr().cast::<D3D12_MESSAGE>();
+                        if matches!(
+                            m.Severity,
+                            D3D12_MESSAGE_SEVERITY_CORRUPTION | D3D12_MESSAGE_SEVERITY_ERROR
+                        ) {
+                            let text = std::slice::from_raw_parts(
+                                m.pDescription.cast::<u8>(),
+                                m.DescriptionByteLength.saturating_sub(1),
+                            );
+                            bad.push(String::from_utf8_lossy(text).into_owned());
+                        }
+                    }
+                }
+            }
+            assert!(bad.is_empty(), "D3D12 debug layer errors: {bad:#?}");
+        }
     }
 }
