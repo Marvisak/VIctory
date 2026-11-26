@@ -3110,8 +3110,18 @@ void main(uint3 id : SV_DispatchThreadID) {
             return; // no host GPU here
         };
         let slots = Slots::new(2);
-        let read = compile_cs(READ);
-        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let read = compile_cs(
+            r#"
+Texture2D<float4> t : register(t0);
+RWByteAddressBuffer o : register(u1);
+[RootSignature("DescriptorTable(SRV(t0)), UAV(u1)")]
+[numthreads(1, 1, 1)]
+void main() {
+    o.Store2(0, asuint(float2(t.Load(int3(0, 0, 0)).x, t.Load(int3(0, 0, 1)).x)));
+}
+"#,
+        );
+        let (out, data) = host.shared_buffer(8).unwrap();
         // RGBA8 512x512 with two mips, linear, in memory the journal follows.
         let address = crate::watch::tests::pool(32) as u64;
         let mut words = texture_words(512, 512, 28, 0x100, 0);
@@ -3129,20 +3139,21 @@ void main(uint3 id : SV_DispatchThreadID) {
         let submit = || {
             let list = host.new_list().unwrap();
             readable(&list, &used(ResourceType::Srv), &view, false);
-            run(&list, &slots, &read, 0, Some(&out), (8, 8));
+            run(&list, &slots, &read, 0, Some(&out), (1, 1));
             list.close();
             let before = crate::texture::copied(object);
             host.execute(&[&list]);
-            // SAFETY: inside the mapped output.
-            let texel = unsafe { (data as *const [f32; 4]).read() };
-            (crate::texture::copied(object) - before, texel[0])
+            // SAFETY: two floats in the mapped output after the submission.
+            let texels = unsafe { (data as *const [f32; 2]).read() };
+            (crate::texture::copied(object) - before, texels)
         };
         assert_eq!(submit().0, 2, "both mips at first");
         // SAFETY: mip 1's bytes (256x256 texels of 4 bytes).
         unsafe { std::ptr::write_bytes((address as usize + mip1) as *mut u8, 0x80, 256 * 256 * 4) };
-        let (n, x) = submit();
+        let (n, [x, y]) = submit();
         assert_eq!(n, 1, "mip 1 alone");
         assert!((x - 64.0 / 255.0).abs() < 1e-6, "mip 0 kept: {x}");
+        assert!((y - 128.0 / 255.0).abs() < 1e-6, "mip 1 updated: {y}");
     }
 
     /// A depth texture with stencil (the console's 16-bit depth, the

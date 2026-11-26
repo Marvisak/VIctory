@@ -429,21 +429,21 @@ fn copies(
     subresources: &[u32],
     name: impl Fn() -> String,
 ) {
-    for &i in subresources {
-        let i = i as usize;
+    for (i, offset, len) in packed_subresources(&staging.footprints, staging.size, subresources) {
         let mut footprint = staging.footprints[i];
-        footprint.Offset += at;
+        footprint.Offset = at + offset;
         let footprint = &footprint;
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+            let len =
+                len.min(u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth));
             list.note_read(
                 || {
                     format!(
-                        "texture upload {} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        "texture upload {} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}: offset {:#x}+{len:#x} {}x{}x{} pitch {}",
                         name(),
                         d.Width,
                         d.Height,
@@ -451,7 +451,6 @@ fn copies(
                         d.Format.0,
                         d.MipLevels,
                         staging.footprints.len(),
-                        staging.size,
                         footprint.Offset,
                         f.Width,
                         f.Height,
@@ -668,7 +667,14 @@ impl Staging {
     /// staging buffer (`None` if none could be had or a subresource could
     /// not be read).
     fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
-        let (buffer, at, data) = staging_space(self.size)?;
+        let packed = || packed_subresources(&self.footprints, self.size, subresources);
+        let size = if subresources.len() == self.footprints.len() {
+            self.size
+        } else {
+            let (_, offset, len) = packed().last()?;
+            offset + len
+        };
+        let (buffer, at, data) = staging_space(size)?;
         #[cfg(feature = "diagnostics")]
         // Scanned only when its message is wanted: a pass over every
         // texture read, in timing runs too.
@@ -683,16 +689,15 @@ impl Staging {
                 tracing::debug!(memory = ?self.memory, desc = ?self.layout.desc, "a sampled texture detiled");
             }
         }
-        for &i in subresources {
-            let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
+        for (index, offset, span) in packed() {
+            let (footprint, rows) = (&self.footprints[index], self.rows[index]);
+            let i = index as u32;
             let (mip, slice) = (i % self.mips, i / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
-            // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
-            // keeping the slice strictly inside the mapped staging buffer even when
-            // GetCopyableFootprints does not pad the final row of the last subresource.
-            let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
+            let len = subresource_len(pitch, rows, f.Depth, span);
+            // SAFETY: this packed range is inside the allocation, including a short final row.
+            let linear = unsafe { std::slice::from_raw_parts_mut(data.add(offset as usize), len) };
             if let Err(e) =
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
@@ -703,6 +708,26 @@ impl Staging {
         }
         Some((buffer, at))
     }
+}
+
+/// Staging ranges for the changed mips/slices, in increasing subresource order.
+/// Keep each driver's footprint (including padding up to the next one) but not
+/// the gaps occupied by clean subresources. Only the texture's last span can
+/// have an unaligned end, and that span, if present, is also the last here.
+fn packed_subresources<'a>(
+    footprints: &'a [D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+    total: u64,
+    subresources: &'a [u32],
+) -> impl Iterator<Item = (usize, u64, u64)> + 'a {
+    let mut offset = 0;
+    subresources.iter().map(move |&i| {
+        let i = i as usize;
+        let end = footprints.get(i + 1).map_or(total, |next| next.Offset);
+        let len = end - footprints[i].Offset;
+        let at = offset;
+        offset += len;
+        (i, at, len)
+    })
 }
 
 /// A buffer for the title memory a refresh reads, kept by the thread for
@@ -735,15 +760,15 @@ impl Drop for Scratch {
     }
 }
 
-/// Bytes available in the staging buffer for a subresource at `offset`.
+/// Bytes available in a staging span of `span` bytes.
 /// D3D12's `GetCopyableFootprints` omits trailing row-pitch padding on the
 /// final row of the final subresource, so `pitch * rows * depth` can exceed
-/// `total - offset`.
-fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64) -> usize {
+/// the span returned by the driver.
+fn subresource_len(pitch: usize, rows: u32, depth: u32, span: u64) -> usize {
     let padded = pitch
         .saturating_mul(rows as usize)
         .saturating_mul(depth as usize);
-    let remaining = usize::try_from(total.saturating_sub(offset)).unwrap_or(usize::MAX);
+    let remaining = usize::try_from(span).unwrap_or(usize::MAX);
     padded.min(remaining)
 }
 
@@ -846,12 +871,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sparse_upload_omits_clean_slices_and_keeps_the_short_last_row() {
+        // Three 4x4 RGBA8 array slices, each at pitch 256. D3D12 omits
+        // trailing row padding only on the texture's last slice.
+        let footprints = [0, 1024, 2048].map(|offset| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: offset,
+            ..Default::default()
+        });
+        let spans =
+            |which: &[u32]| packed_subresources(&footprints, 2832, which).collect::<Vec<_>>();
+        assert_eq!(spans(&[0, 2]), [(0, 0, 1024), (2, 1024, 784)]);
+        assert_eq!(spans(&[2]), [(2, 0, 784)]);
+        assert_eq!(
+            spans(&[0, 1, 2]),
+            [(0, 0, 1024), (1, 1024, 1024), (2, 2048, 784)]
+        );
+    }
+
+    #[test]
     fn subresource_len_stays_inside_staging_total() {
         // A 4x4 RGBA8 texture has RowPitch=256, rows=4, last_row=16 -> total=784.
         // Padded size (1024) must be clamped to 784 so from_raw_parts_mut stays in bounds.
-        assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
-        assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
-        assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+        assert_eq!(subresource_len(256, 4, 1, 784), 784);
+        assert_eq!(subresource_len(256, 4, 1, 272), 272);
+        assert_eq!(subresource_len(256, 4, 1, 2048), 1024);
     }
 
     #[test]
