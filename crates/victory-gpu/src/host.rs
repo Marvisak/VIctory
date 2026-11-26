@@ -677,6 +677,64 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn compositor_srv_format_preserves_typed_formats_and_resolves_typeless() {
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R16G16B16A16_UNORM),
+            Some(DXGI_FORMAT_R16G16B16A16_UNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R16G16B16A16_SNORM),
+            Some(DXGI_FORMAT_R16G16B16A16_SNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R8G8B8A8_SNORM),
+            Some(DXGI_FORMAT_R8G8B8A8_SNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_B8G8R8X8_TYPELESS),
+            Some(DXGI_FORMAT_B8G8R8X8_UNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_B8G8R8X8_UNORM_SRGB),
+            Some(DXGI_FORMAT_B8G8R8X8_UNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R8G8B8A8_TYPELESS),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
+        assert_eq!(
+            compositor_srv_format(DXGI_FORMAT_R16G16B16A16_TYPELESS),
+            Some(DXGI_FORMAT_R16G16B16A16_FLOAT)
+        );
+        assert_eq!(compositor_srv_format(DXGI_FORMAT_R8G8B8A8_UINT), None);
+        assert_eq!(compositor_srv_format(DXGI_FORMAT_R16G16B16A16_UINT), None);
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_R16G16B16A16_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        ));
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_R16G16B16A16_SNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        ));
+        assert!(needs_format_conversion(
+            DXGI_FORMAT_R8G8B8A8_SNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        ));
+        assert!(!needs_format_conversion(
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        ));
+        assert!(!needs_format_conversion(
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        ));
+    }
+
     /// A node of the device-removed data is a list by pointer or by name.
     /// The name is what still matches when the runtime records another
     /// object than the one we hold (the debug layer wraps ours), and a
@@ -2775,6 +2833,47 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
+/// Whether copying raw texels from `src` into swap-chain format `dst` would
+/// reinterpret component encoding (e.g. `R16G16B16A16_UNORM` bits copied into
+/// `R16G16B16A16_FLOAT` become NaNs/denormals), requiring numeric conversion
+/// through [`Compositor`].
+fn needs_format_conversion(src: DXGI_FORMAT, dst: DXGI_FORMAT) -> bool {
+    matches!(
+        (src, dst),
+        (
+            DXGI_FORMAT_R16G16B16A16_UNORM | DXGI_FORMAT_R16G16B16A16_SNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        ) | (DXGI_FORMAT_R8G8B8A8_SNORM, DXGI_FORMAT_R8G8B8A8_UNORM)
+    )
+}
+
+/// The SRV format for sampling a presented plane in [`Compositor`].
+/// Typeless color textures take a concrete float/UNORM view from their family,
+/// and 8-bit sRGB textures view their raw bytes as UNORM (a cast D3D12 allows
+/// within the family) so sRGB-encoded values stay unchanged on the UNORM swap
+/// chain; other concrete float/UNORM/SNORM formats keep their own format
+/// rather than bit-casting across incompatible component types.
+fn compositor_srv_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+    Some(match format.0 {
+        1 => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        5 => DXGI_FORMAT_R32G32B32_FLOAT,
+        9 => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        15 => DXGI_FORMAT_R32G32_FLOAT,
+        23 => DXGI_FORMAT_R10G10B10A2_UNORM,
+        27 | 29 => DXGI_FORMAT_R8G8B8A8_UNORM,
+        33 => DXGI_FORMAT_R16G16_FLOAT,
+        39 => DXGI_FORMAT_R32_FLOAT,
+        48 => DXGI_FORMAT_R8G8_UNORM,
+        53 => DXGI_FORMAT_R16_FLOAT,
+        60 => DXGI_FORMAT_R8_UNORM,
+        90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        92 | 93 => DXGI_FORMAT_B8G8R8X8_UNORM,
+        2 | 6 | 10 | 11 | 13 | 16 | 24 | 26 | 28 | 31 | 34 | 35 | 37 | 41 | 49 | 51 | 54 | 56
+        | 58 | 61 | 63 | 67 | 85 | 86 | 87 | 88 | 89 => format,
+        _ => return None,
+    })
+}
+
 const BUFFERS: u32 = 2;
 const MAX_PLANES: u32 = 8;
 
@@ -3220,19 +3319,23 @@ impl Host {
             .and_then(|p| p.compositor.as_ref())
             .map(|c| c.format);
         let mut new_compositor = None;
-        let planes = if planes.len() > 1 && cached_format != Some(format) {
+        let need_compositor = compositor_srv_format(primary_desc.Format).is_some()
+            && (planes.len() > 1 || needs_format_conversion(primary_desc.Format, format));
+        let (planes, use_compositor) = if !need_compositor {
+            (&planes[..1], false)
+        } else if cached_format != Some(format) {
             match create_compositor(&self.device, format) {
                 Ok(c) => {
                     new_compositor = Some(c);
-                    planes
+                    (planes, true)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "presenting the primary plane after compositor initialization failed");
-                    &planes[..1]
+                    (&planes[..1], false)
                 }
             }
         } else {
-            planes
+            (planes, true)
         };
         let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
         for &(tex, _) in &planes[1..] {
@@ -3285,7 +3388,7 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            let (capture, probe) = if planes.len() == 1 {
+            let (capture, probe) = if !use_compositor {
                 let (texture, state) = planes[0];
                 let state = D3D12_RESOURCE_STATES(state as i32);
                 let mut before = Vec::with_capacity(2);
@@ -3298,7 +3401,21 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ));
                 list.ResourceBarrier(&before);
-                list.CopyResource(&back, texture);
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&back),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
                 #[cfg(all(test, feature = "diagnostics"))]
                 let capture = {
                     // Inspect what reached the swap chain, before Present.
@@ -3357,11 +3474,21 @@ impl Host {
                 let srv_cpu_base = comp.srv_heap.GetCPUDescriptorHandleForHeapStart();
                 let srv_gpu_base = comp.srv_heap.GetGPUDescriptorHandleForHeapStart();
                 let count = planes.len().min(MAX_PLANES as usize);
-                let mut before = Vec::with_capacity(count + 1);
-                let mut after = Vec::with_capacity(count);
-                for (i, &(tex, state)) in planes[..count].iter().enumerate() {
+                let mut sampleable = Vec::with_capacity(count);
+                for &(tex, state) in &planes[..count] {
                     let d = tex.GetDesc();
-                    let srv_fmt = swap_format(d.Format).unwrap_or(d.Format);
+                    let Some(srv_fmt) = compositor_srv_format(d.Format) else {
+                        tracing::warn!(
+                            format = d.Format.0,
+                            "skipping present plane with unsampleable format"
+                        );
+                        continue;
+                    };
+                    sampleable.push((tex, state, srv_fmt));
+                }
+                let mut before = Vec::with_capacity(sampleable.len() + 1);
+                let mut after = Vec::with_capacity(sampleable.len());
+                for (i, &(tex, state, srv_fmt)) in sampleable.iter().enumerate() {
                     let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
                         ptr: srv_cpu_base.ptr + i * comp.srv_stride as usize,
                     };
@@ -3384,9 +3511,9 @@ impl Host {
                     );
                     let state = D3D12_RESOURCE_STATES(state as i32);
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-                        && planes[..i]
+                        && sampleable[..i]
                             .iter()
-                            .all(|(earlier, _)| earlier.as_raw() != tex.as_raw())
+                            .all(|(earlier, _, _)| earlier.as_raw() != tex.as_raw())
                     {
                         before.push(transition(
                             tex,
@@ -3424,7 +3551,7 @@ impl Host {
                 }]);
                 list.OMSetRenderTargets(1, Some(&rtv), false, None);
                 list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                for i in 0..count {
+                for i in 0..sampleable.len() {
                     list.SetPipelineState(if i == 0 { &comp.opaque } else { &comp.overlay });
                     list.SetGraphicsRootDescriptorTable(
                         0,
@@ -4129,5 +4256,356 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+    }
+
+    #[test]
+    fn present_single_plane_copies_subresource_zero_of_mipmapped_and_array_textures() {
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX subresource test: no D3D12 device");
+            return;
+        };
+        let first_pixel =
+            |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: the present copy completed; footprint points into the readback buffer.
+                let rgba = unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u8; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                };
+                (footprint.Footprint.Width, footprint.Footprint.Height, rgba)
+            };
+        let make_rt = |mips: u16, array: u16, color: [f32; 4]| -> ID3D12Resource {
+            let mut texture = None;
+            // SAFETY: live device, valid 2D render target description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 32,
+                            Height: 32,
+                            DepthOrArraySize: array,
+                            MipLevels: mips,
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+                let texture = texture.unwrap();
+                let list = host.new_list().unwrap();
+                let rtv = if array > 1 {
+                    host.rtv(
+                        &texture,
+                        Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2DARRAY,
+                            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                                Texture2DArray: D3D12_TEX2D_ARRAY_RTV {
+                                    MipSlice: 0,
+                                    FirstArraySlice: 0,
+                                    ArraySize: 1,
+                                    PlaneSlice: 0,
+                                },
+                            },
+                        }),
+                    )
+                } else {
+                    host.rtv(
+                        &texture,
+                        Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                                Texture2D: D3D12_TEX2D_RTV {
+                                    MipSlice: 0,
+                                    PlaneSlice: 0,
+                                },
+                            },
+                        }),
+                    )
+                };
+                list.list.ClearRenderTargetView(rtv, &color, None);
+                list.close();
+                host.execute(&[&list]);
+                texture
+            }
+        };
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let mipmapped = make_rt(3, 1, [0.0, 1.0, 0.0, 1.0]);
+        let arrayed = make_rt(1, 2, [0.0, 0.0, 1.0, 1.0]);
+
+        let mut mip_px = None;
+        let shown =
+            host.present_with_compositor(&[(&mipmapped, state)], 1, Compositor::new, |b, f| {
+                mip_px = Some(first_pixel(b, f));
+            });
+        assert!(shown.is_some());
+        assert_eq!(mip_px, Some((32, 32, [0, 255, 0, 255])));
+
+        let mut arr_px = None;
+        let shown =
+            host.present_with_compositor(&[(&arrayed, state)], 2, Compositor::new, |b, f| {
+                arr_px = Some(first_pixel(b, f));
+            });
+        assert!(shown.is_some());
+        assert_eq!(arr_px, Some((32, 32, [0, 0, 255, 255])));
+    }
+
+    #[test]
+    fn present_converts_unorm16_planes_without_nan_or_device_removal() {
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX UNORM16 test: no D3D12 device");
+            return;
+        };
+        let read_f16 =
+            |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| -> [u16; 4] {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: the present copy completed; footprint points into the readback buffer.
+                unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let raw = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u16; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    raw
+                }
+            };
+        let make_rt = |fmt: DXGI_FORMAT, color: [f32; 4]| -> ID3D12Resource {
+            let mut texture = None;
+            // SAFETY: live device, valid 2D render target description (no castable list).
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 32,
+                            Height: 32,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: fmt,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+                let texture = texture.unwrap();
+                let list = host.new_list().unwrap();
+                let rtv = host.rtv(&texture, None);
+                list.list.ClearRenderTargetView(rtv, &color, None);
+                list.close();
+                host.execute(&[&list]);
+                texture
+            }
+        };
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let scene = make_rt(DXGI_FORMAT_R16G16B16A16_UNORM, [1.0, 0.5, 0.0, 1.0]);
+        let transparent = make_rt(DXGI_FORMAT_R8G8B8A8_UNORM, [0.0, 0.0, 0.0, 0.0]);
+        // Half-float 1.0 = 0x3c00, 0.5 = 0x3800 (or 0x37ff when 32767/65535
+        // truncates on f32->f16 RT write), 0.0 = 0x0000.
+        let check_f16 = |px: Option<[u16; 4]>, label: &str| {
+            let [r, g, b, a] = px.expect(label);
+            assert_eq!((r, b, a), (0x3c00, 0x0000, 0x3c00), "{label}: got {px:#x?}");
+            assert!(
+                matches!(g, 0x37ff | 0x3800),
+                "{label}: green channel should be ~0.5 f16, got {g:#06x}"
+            );
+        };
+
+        let mut single_px = None;
+        let shown = host.present_with_compositor(&[(&scene, state)], 1, Compositor::new, |b, f| {
+            single_px = Some(read_f16(b, f));
+        });
+        assert!(shown.is_some());
+        check_f16(
+            single_px,
+            "single-plane R16G16B16A16_UNORM must convert numerically to R16G16B16A16_FLOAT",
+        );
+
+        let mut multi_px = None;
+        assert!(
+            host.present_with_compositor(
+                &[(&scene, state), (&transparent, state)],
+                2,
+                Compositor::new,
+                |b, f| multi_px = Some(read_f16(b, f)),
+            )
+            .is_some()
+        );
+        check_f16(
+            multi_px,
+            "multi-plane R16G16B16A16_UNORM must sample as UNORM without device removal or NaN",
+        );
+    }
+
+    #[test]
+    fn present_composites_typeless_bgrx_overlay_without_device_removal() {
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX typeless overlay test: no D3D12 device");
+            return;
+        };
+        let first_pixel =
+            |buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| {
+                let mut mapped = std::ptr::null_mut();
+                // SAFETY: the present copy completed; footprint points into the readback buffer.
+                unsafe {
+                    buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                    let rgba = mapped
+                        .cast::<u8>()
+                        .add(footprint.Offset as usize)
+                        .cast::<[u8; 4]>()
+                        .read();
+                    buffer.Unmap(0, None);
+                    rgba
+                }
+            };
+        let mut primary = None;
+        let mut overlay = None;
+        // SAFETY: live device, valid 2D render target descriptions.
+        unsafe {
+            let make = |fmt: DXGI_FORMAT, out: &mut Option<ID3D12Resource>| {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 32,
+                            Height: 32,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: fmt,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        out,
+                    )
+                    .unwrap();
+            };
+            make(DXGI_FORMAT_R8G8B8A8_UNORM, &mut primary);
+            // Matches what `resource::host_desc` creates for B8G8R8X8_UNORM_SRGB + UAV.
+            make(DXGI_FORMAT_B8G8R8X8_TYPELESS, &mut overlay);
+            let (primary, overlay) = (primary.as_ref().unwrap(), overlay.as_ref().unwrap());
+            let list = host.new_list().unwrap();
+            list.list
+                .ClearRenderTargetView(host.rtv(primary, None), &[1.0, 0.0, 0.0, 1.0], None);
+            let overlay_rtv = host.rtv(
+                overlay,
+                Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                    Format: DXGI_FORMAT_B8G8R8X8_UNORM,
+                    ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_RTV {
+                            MipSlice: 0,
+                            PlaneSlice: 0,
+                        },
+                    },
+                }),
+            );
+            list.list
+                .ClearRenderTargetView(overlay_rtv, &[0.0, 1.0, 0.0, 1.0], None);
+            list.close();
+            host.execute(&[&list]);
+        }
+        let (primary, overlay) = (primary.unwrap(), overlay.unwrap());
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let mut px = None;
+        assert!(
+            host.present_with_compositor(
+                &[(&primary, state), (&overlay, state)],
+                1,
+                Compositor::new,
+                |b, f| px = Some(first_pixel(b, f)),
+            )
+            .is_some()
+        );
+        // Opaque green B8G8R8X8 overlay (X channel reads 1.0) covers red primary.
+        assert_eq!(px, Some([0, 255, 0, 255]));
+
+        // An unsampleable integer overlay plane is skipped instead of causing an
+        // invalid format cast / device removal, leaving the primary plane intact.
+        let mut uint_overlay = None;
+        // SAFETY: live device, valid 2D integer texture description.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 32,
+                        Height: 32,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R8G8B8A8_UINT,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut uint_overlay,
+                )
+                .unwrap();
+        }
+        let uint_overlay = uint_overlay.unwrap();
+        let mut primary_only = None;
+        assert!(
+            host.present_with_compositor(
+                &[(&primary, state), (&uint_overlay, state)],
+                2,
+                Compositor::new,
+                |b, f| primary_only = Some(first_pixel(b, f)),
+            )
+            .is_some()
+        );
+        assert_eq!(primary_only, Some([255, 0, 0, 255]));
     }
 }
