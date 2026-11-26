@@ -746,6 +746,12 @@ pub(crate) extern "system" fn create_heap(
     let Some(&desc) = (unsafe { desc_ptr.as_ref() }) else {
         return E_INVALIDARG;
     };
+    let shader_visible = desc.flags & SHADER_VISIBLE != 0;
+    let visible = shader_visible && matches!(desc.kind, VIEWS_KIND | SAMPLERS);
+    // The native null-output probe follows the usual S_FALSE path.
+    if shader_visible && !visible && !out.is_null() {
+        return E_INVALIDARG;
+    }
     let Some(size) = increment(desc.kind).map(|i| u64::from(i) * u64::from(desc.count.max(1)))
     else {
         return E_INVALIDARG;
@@ -770,7 +776,6 @@ pub(crate) extern "system" fn create_heap(
             Err(hr) => return hr,
         }
     };
-    let visible = desc.flags & SHADER_VISIBLE != 0 && matches!(desc.kind, VIEWS_KIND | SAMPLERS);
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
@@ -885,6 +890,52 @@ pub(crate) mod tests {
         assert!(crate::memory::has_table(key));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
         assert!(!crate::memory::has_table(key), "released with its heap");
+    }
+
+    #[test]
+    fn shader_visibility_is_rejected_for_rtv_and_dsv_heaps() {
+        type Create = extern "system" fn(This, *const HeapDesc, *const Iid, *mut This) -> HRESULT;
+        let device = crate::device::device();
+        let create = slot::<Create>(device, 0x70);
+        for (kind, supports_shader_visibility) in
+            [(VIEWS_KIND, true), (SAMPLERS, true), (2, false), (3, false)]
+        {
+            for flags in [0, SHADER_VISIBLE] {
+                let heap = Extended(
+                    HeapDesc {
+                        kind,
+                        count: 1,
+                        flags,
+                        nodes: 0,
+                    },
+                    Placement {
+                        address: 0,
+                        size: 0,
+                    },
+                );
+                let mut output = std::ptr::null();
+                let status = create(device, &heap.0, &HEAP_IIDS[0], &mut output);
+                let created = !output.is_null();
+                if created {
+                    slot::<extern "system" fn(This) -> u32>(output, 0x10)(output);
+                }
+                let expected = if flags == SHADER_VISIBLE && !supports_shader_visibility {
+                    (E_INVALIDARG, false)
+                } else {
+                    (S_OK, true)
+                };
+                assert_eq!(
+                    (status, created),
+                    expected,
+                    "heap type {kind}, flags {flags}"
+                );
+                assert_eq!(
+                    create(device, &heap.0, &HEAP_IIDS[0], std::ptr::null_mut()),
+                    crate::object::S_FALSE,
+                    "no output, heap type {kind}, flags {flags}"
+                );
+            }
+        }
     }
 
     #[test]
