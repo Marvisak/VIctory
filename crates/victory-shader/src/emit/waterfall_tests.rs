@@ -12,10 +12,11 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
-/// Lowers a wave32 compute program of 32 threads with the table of views at
-/// s0 (textures, or with `buffers` structured buffers of dwords, at entries
-/// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
-fn build(words: &[u32], buffers: bool) -> HostShader {
+/// Lowers a compute program of one wave (32 threads, or 64 with `wave64`)
+/// with the table of views at s0 (textures, or with `buffers` structured
+/// buffers of dwords, at entries 0 and 1, a raw UAV at entry 2) and the
+/// table of samplers at s1.
+fn lower_wave(words: &[u32], buffers: bool, wave64: bool) -> Result<lower::Lowered, String> {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -41,7 +42,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     };
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 32,
         layout: vec![table(0), table(1)],
         used: vec![
@@ -51,7 +52,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 2 << 1,
-            threads: [32, 1, 1],
+            threads: [if wave64 { 64 } else { 32 }, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -59,7 +60,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
+    lower::lower(&lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -71,7 +72,12 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         mesh_stride: 0,
         view_marks: false,
     })
-    .expect("lower");
+    .map_err(|e| e.to_string())
+}
+
+/// [`lower_wave`] in Wave32, checked and validated.
+fn build(words: &[u32], buffers: bool) -> HostShader {
+    let lowered = lower_wave(words, buffers, false).expect("lower");
     // One access with each lane's own heap index, no wave operation.
     assert_eq!(lowered.nonuniform_handles, 1);
     assert!(!lowered.wave_ops);
@@ -257,4 +263,28 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
     }
+}
+
+/// [`crate::resource::tests::picked_wave64`]: a descriptor picked per lane
+/// by VCC in Wave64. With `s_mov_b32 vcc_hi, 0` after the compare, the pick
+/// reads a pair that holds no tracked mask, and the lowering refuses it
+/// rather than choosing by the compare for lanes 32-63. With vcc_hi copied
+/// through s2 and back, the pick is still by the compare.
+#[test]
+fn a_wave64_descriptor_picked_after_the_high_dword_changes_is_refused() {
+    use crate::resource::tests::{VCC_HI_CLEARED, VCC_HI_COPIED, VCC_HI_KEPT, picked_wave64};
+    let lowered = |change| lower_wave(&picked_wave64(change), false, true);
+    for kept in [VCC_HI_KEPT, VCC_HI_COPIED] {
+        let lowered = lowered(kept).expect("lower");
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut lowered.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+    }
+    let Err(e) = lowered(VCC_HI_CLEARED) else {
+        panic!("a pick on vcc_lo and a cleared vcc_hi took the compare's mask");
+    };
+    assert!(e.contains("chosen per lane by an untracked mask"), "{e}");
 }

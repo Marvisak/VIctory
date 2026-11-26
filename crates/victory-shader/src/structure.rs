@@ -49,16 +49,39 @@ pub enum Atom {
     Lane(Value),
     /// An SCC value, the same in every lane.
     Uniform(Value),
-    /// A lane mask joined at a block entry, by its low dword's phi.
-    Phi(Value),
+    /// A lane mask joined at a block entry: its (low, high) dword pair, one
+    /// of them a phi there (in Wave32 the same value twice).
+    Phi(Value, Value),
     /// `s_wqm` result: some lane of the quad is in the source mask.
     Quad(Value),
     /// A mask the pass cannot see into (loaded, built from scalars, an
-    /// EXEC write it does not follow): the lane's bit of the register pair
-    /// this value is a dword of.
-    Opaque(Value),
+    /// EXEC write it does not follow): the lane's bit of this (low, high)
+    /// dword pair (in Wave32 the same value twice).
+    Opaque(Value, Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
+}
+
+impl Atom {
+    /// The value whose compare gives this atom's bit (a lane's, or SCC's):
+    /// none for a joined or opaque mask, whose bit no one compare decides.
+    pub fn compare(self) -> Option<Value> {
+        match self {
+            Atom::Lane(v) | Atom::Uniform(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The values this atom's bit depends on: both dwords of a joined or
+    /// opaque mask.
+    pub fn values(self) -> impl Iterator<Item = Value> {
+        let (v, high) = match self {
+            Atom::Lane(v) | Atom::Uniform(v) | Atom::Quad(v) => (Some(v), None),
+            Atom::Phi(v, h) | Atom::Opaque(v, h) => (Some(v), Some(h)),
+            Atom::Constant(_) => (None, None),
+        };
+        v.into_iter().chain(high)
+    }
 }
 
 /// Reduced ordered binary decision diagrams over [`Atom`]s.
@@ -171,6 +194,34 @@ impl Bools {
     pub fn node(&self, b: Bool) -> Option<(Atom, Bool, Bool)> {
         let (v, lo, hi) = self.nodes[b.0 as usize];
         (v != TERMINAL).then(|| (self.atoms[v as usize], lo, hi))
+    }
+
+    /// Whether deciding `b` may test an atom `hit` accepts: from each node,
+    /// the branch `decide` gives for its atom, or both where it gives none.
+    pub fn reaches(
+        &self,
+        b: Bool,
+        decide: impl Fn(Atom) -> Option<bool>,
+        hit: impl Fn(Atom) -> bool,
+    ) -> bool {
+        let (mut seen, mut stack) = (Seen::default(), vec![b]);
+        while let Some(b) = stack.pop() {
+            let Some((atom, lo, hi)) = self.node(b) else {
+                continue;
+            };
+            if !seen.insert(b) {
+                continue;
+            }
+            if hit(atom) {
+                return true;
+            }
+            match decide(atom) {
+                Some(true) => stack.push(hi),
+                Some(false) => stack.push(lo),
+                None => stack.extend([lo, hi]),
+            }
+        }
+        false
     }
 
     /// The atoms `b` depends on, in variable order.
@@ -460,6 +511,8 @@ pub struct Structured {
     pub other: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
+    /// Exact Wave64 pairs of `other`.
+    paired_other: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
@@ -479,6 +532,21 @@ impl Structured {
         match high {
             Some(high) => self.paired_masks.get(&(low, high)),
             None => self.masks.get(&low),
+        }
+        .copied()
+    }
+
+    /// The lane's bit of a mask a select reads: in Wave64, of the pair of
+    /// both dwords it reads, from `masks` or `other`.
+    pub(crate) fn select_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
+        match high {
+            Some(high) => {
+                let k = (low, high);
+                self.paired_masks
+                    .get(&k)
+                    .or_else(|| self.paired_other.get(&k))
+            }
+            None => self.masks.get(&low).or_else(|| self.other.get(&low)),
         }
         .copied()
     }
@@ -504,6 +572,7 @@ fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderEr
     }
     loop {
         let execs = l.masks_in_order();
+        l.join_args();
         let cond = l.paths()?;
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
@@ -880,7 +949,16 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
+            paired_other: if self.p.wave64 {
+                self.other
+            } else {
+                Map::default()
+            },
             active: self.active,
             restored: self.restored.into_iter().collect(),
             discards: self
@@ -893,6 +971,33 @@ impl<'a> Lanes<'a> {
             guards,
             reach: cond.to_vec(),
         })
+    }
+
+    /// The pair each edge brings into a join left as a phi atom, resolved
+    /// as a mask (back edges are not followed where the join is met), so
+    /// that the join's lowering finds it by both dwords. Runs before
+    /// [`Self::wrong_joins`], which checks the joins this resolves to a
+    /// constant too.
+    fn join_args(&mut self) {
+        let mut n = 0;
+        while n < self.b.atoms.len() {
+            if let Atom::Phi(lo, hi) = self.b.atoms[n]
+                && let Some(&(block, _)) = self.phis.get(&lo).or(self.phis.get(&hi))
+            {
+                let target = &self.p.blocks[block];
+                let arg = |v: Value, e: usize| match self.phis.get(&v) {
+                    Some(&(b, i)) if b == block => target.phis[i].args[e],
+                    _ => v,
+                };
+                let args: Vec<Key> = (0..target.preds.len())
+                    .map(|e| (arg(lo, e), arg(hi, e)))
+                    .collect();
+                for k in args {
+                    self.mask(k);
+                }
+            }
+            n += 1;
+        }
     }
 
     fn key(&self, value: impl Fn(Reg) -> Option<Value>, code: u8) -> Option<Key> {
@@ -928,6 +1033,24 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
+        // A scalar pair can be parked in two VGPR lanes and restored one
+        // dword at a time. The spill pass turns these into scalar moves.
+        // Copies hold the bits of what they copy: the pair is the pair of
+        // its two words' sources, in that order (swapped or mixed words
+        // make another pair, not the original mask).
+        if self.p.wave64 {
+            let source = (self.move_source(k.0), self.move_source(k.1));
+            if source != k {
+                let (m, derived) = self.mask(source);
+                let cache = if derived {
+                    &mut self.masks
+                } else {
+                    &mut self.other
+                };
+                cache.insert(k, m);
+                return (m, derived);
+            }
+        }
         let p = self.p;
         let restored = (
             self.restored.get(&k.0).copied(),
@@ -944,6 +1067,7 @@ impl<'a> Lanes<'a> {
                     (Some(at), Some(hi)) if at == hi => def(lo)
                         .and_then(|i| self.sop(i))
                         .and_then(|r| r.dst)
+                        .filter(|d| d.0 == k)
                         .map(|d| d.1),
                     _ => None,
                 };
@@ -955,8 +1079,8 @@ impl<'a> Lanes<'a> {
                 };
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
                 let m = m.unwrap_or_else(|| {
-                    let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
+                    let born = self.born(k.0).max(self.born(k.1));
+                    self.b.atom(Atom::Opaque(k.0, k.1), born)
                 });
                 (m, derived)
             }
@@ -968,6 +1092,21 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
+    }
+
+    /// The value `value` was copied from through a chain of `s_mov_b32`.
+    fn move_source(&self, mut value: Value) -> Value {
+        while let Some(&(b, i)) = self.defs.get(&value) {
+            let inst = &self.p.blocks[b].insts[i];
+            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
+                break;
+            };
+            if inst.name() != "s_mov_b32" {
+                break;
+            }
+            value = *source;
+        }
+        value
     }
 
     /// A mask joined by phis at a block entry, and whether a mask coming in
@@ -1028,7 +1167,7 @@ impl<'a> Lanes<'a> {
             }
         }
         let born = self.index[block];
-        Some((self.b.atom(Atom::Phi(id), born), derived))
+        Some((self.b.atom(Atom::Phi(k.0, k.1), born), derived))
     }
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Option<(Bool, bool)> {
@@ -1234,9 +1373,10 @@ impl<'a> Lanes<'a> {
                     l.masks.insert(k, m);
                     l.active.insert(k.0);
                 };
-                // A select reads a mask nothing else may: a join of compare
-                // results is resolved here, as for EXEC.
-                if name == "v_cndmask_b32"
+                // A select or carry-in reads a mask nothing else may: a join
+                // of compare results, or a pair of copies, is resolved here,
+                // as for EXEC.
+                if (name == "v_cndmask_b32" || name.contains("_co_ci_"))
                     && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
                     && code != NULL
                     && let Some(k) = self.key(|r| inst.read(r), code)
@@ -1579,6 +1719,135 @@ mod tests {
     }
 
     #[test]
+    fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
+        for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
+            let p = build(
+                &[
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBE84_046A, // s_mov_b64 s[4:5], vcc
+                    0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                    0xBF85_0004, // s_cbranch_scc1 -> join at 32
+                    0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                    high,        // s_mov_b32 s3, vcc_hi (or vcc_lo)
+                    0xBE84_0302, // s_mov_b32 s4, s2
+                    0xBE85_0303, // s_mov_b32 s5, s3
+                    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+            let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+            assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
+        }
+    }
+
+    /// A wave64 mask pair whose high dword is cleared (`s_mov_b32 s3, 0`)
+    /// and then copied whole (`s_mov_b64 s[4:5], s[2:3]`): a select on the
+    /// copy reads s2 and the cleared s3, so lanes 32-63 see 0, not the
+    /// compare's high dword.
+    #[test]
+    fn a_wave64_pair_copied_after_its_high_dword_changes_keeps_the_new_one() {
+        let p = build(
+            &[
+                0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
+                0xBE82_046A, // s_mov_b64 s[2:3], vcc
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xBE84_0402, // s_mov_b64 s[4:5], s[2:3]
+                0xD501_0001,
+                0x0011_0280, // v_cndmask_b32 v1, 0, 1, s[4:5]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let insts = &p.blocks[0].insts;
+        let (lo, cleared) = (insts[1].write(Reg::S(2)), insts[2].write(Reg::S(3)));
+        let select = &insts[4];
+        let (copy_lo, copy_hi) = (select.read(Reg::S(4)), select.read(Reg::S(5)));
+        let m = s.select_bits(copy_lo.unwrap(), copy_hi).unwrap();
+        assert_eq!(
+            s.bools.support(m),
+            [Atom::Opaque(lo.unwrap(), cleared.unwrap())]
+        );
+    }
+
+    /// A wave64 compare copied to s[4:5], spilled to lanes 0 and 1 of v1
+    /// and read back into s[6:7]: in order it is the compare; with the
+    /// words swapped (s6 from lane 1, s7 from lane 0) it is not.
+    #[test]
+    fn a_wave64_mask_spilled_and_read_back_swapped_is_not_the_mask() {
+        for (lo, hi, same) in [
+            (0x0001_0101, 0x0001_0301, true),
+            (0x0001_0301, 0x0001_0101, false),
+        ] {
+            let p = build(
+                &[
+                    0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
+                    0xBE84_046A, // s_mov_b64 s[4:5], vcc
+                    0xD761_0001,
+                    0x0001_0004, // v_writelane_b32 v1, s4, 0
+                    0xD761_0001,
+                    0x0001_0205, // v_writelane_b32 v1, s5, 1
+                    0xD760_0006,
+                    lo, // v_readlane_b32 s6, v1, 0 (or 1)
+                    0xD760_0007,
+                    hi, // v_readlane_b32 s7, v1, 1 (or 0)
+                    0xD501_0002,
+                    0x0019_0280, // v_cndmask_b32 v2, 0, 1, s[6:7]
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            let insts = &p.blocks[0].insts;
+            let bits = |i: &Inst, r: u8| {
+                s.select_bits(i.read(Reg::S(r)).unwrap(), i.read(Reg::S(r + 1)))
+                    .unwrap()
+            };
+            assert_eq!(bits(&insts[1], VCC) == bits(&insts[6], 6), same);
+        }
+    }
+
+    /// A uniform loop whose header joins s[2:3] (a compare on entry) as a
+    /// phi atom, its back edge bringing the mask an inner loop's header
+    /// joins: all lanes (EXEC) on the inner loop's entry, the compare from
+    /// its back edge. Nothing else reads the inner join; resolved for the
+    /// outer join's back edge, it must still be checked on its own back
+    /// edge, so it is not all lanes.
+    #[test]
+    fn a_join_resolved_for_another_join_s_back_edge_is_checked_on_its_own() {
+        let p = build(
+            &[
+                0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
+                0xBE82_046A, // s_mov_b64 s[2:3], vcc
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0xD501_0003,
+                0x0009_0280, // outer: v_cndmask_b32 v3, 0, 1, s[2:3]
+                0xBE82_047E, // s_mov_b64 s[2:3], exec
+                0xBE88_0380, // s_mov_b32 s8, 0
+                0xBF09_8208, // inner: s_cmp_ge_u32 s8, 2
+                0xBF85_0003, // s_cbranch_scc1 latch
+                0xBE82_046A, // s_mov_b64 s[2:3], vcc
+                0x8008_8108, // s_add_u32 s8, s8, 1
+                0xBF82_FFFB, // s_branch inner
+                0x8007_8107, // latch: s_add_u32 s7, s7, 1
+                0xBF0A_8207, // s_cmp_lt_u32 s7, 2
+                0xBF85_FFF4, // s_cbranch_scc1 outer
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let has = |b: &ir::Block, r| Some(b.phis.iter().find(|ph| ph.reg == Reg::S(r))?.value);
+        let inner = p.blocks.iter().find(|b| has(b, 8).is_some()).unwrap();
+        let joined = s.select_bits(has(inner, 2).unwrap(), has(inner, 3));
+        assert!(joined.is_some_and(|m| m != Bool::TRUE), "{joined:?}");
+    }
+
+    #[test]
     fn data_loaded_where_a_mask_was_is_no_mask() {
         // s1 holds a mask on one path and a loaded value on the other; the
         // bit test after the join is data (wave32: `_b32` operations would
@@ -1786,6 +2055,32 @@ mod tests {
             }
         }
         f
+    }
+
+    /// The walk of the lowering's `touches`: with the compare writing `lo`
+    /// known true, a lane's bit of that compare is decided, so the branch
+    /// where it is clear (a tainted lane bit) is not searched. A joined or
+    /// opaque mask whose low dword is `lo` is not decided by it: its high
+    /// dword may clear lanes 32-63, so that branch is searched. Its high
+    /// dword alone, tainted, counts too.
+    #[test]
+    fn only_a_compare_s_own_bit_is_decided_by_the_compare() {
+        let (lo, hi, t) = (Value(1), Value(2), Value(3));
+        let decide = |a: Atom| a.compare().filter(|&v| v == lo).map(|_| true);
+        let tainted = |v: Value| move |a: Atom| a.values().any(|x| x == v);
+        for (first, searched) in [
+            (Atom::Lane(lo), false),
+            (Atom::Opaque(lo, hi), true),
+            (Atom::Phi(lo, hi), true),
+        ] {
+            let mut b = Bools::new();
+            let x = b.atom(first, 0);
+            let y = b.atom(Atom::Lane(t), 0);
+            let f = b.or(x, y);
+            assert_eq!(b.node(f).map(|n| n.0), Some(first));
+            assert_eq!(b.reaches(f, decide, tainted(t)), searched, "{first:?}");
+            assert_eq!(b.reaches(x, |_| None, tainted(hi)), first != Atom::Lane(lo));
+        }
     }
 
     /// Atoms `0..n` of a fresh [`Bools`], in variable order.

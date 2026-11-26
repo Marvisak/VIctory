@@ -76,9 +76,13 @@ pub enum Source {
     /// descriptor that differs between lanes.
     Fetched { load: Site, first: u8 },
     /// Picked per lane by `v_cndmask_b32` reading the lane mask whose low
-    /// dword is `mask`: the source where the lane's bit is set, then where it
-    /// is clear.
-    Lanes { mask: Value, args: Vec<Source> },
+    /// dword is `mask` (and in Wave64 whose high dword is `high`): the source
+    /// where the lane's bit is set, then where it is clear.
+    Lanes {
+        mask: Value,
+        high: Option<Value>,
+        args: Vec<Source>,
+    },
     /// Per-lane dwords chosen by control flow (VGPRs joined where lanes
     /// that took different paths meet): one source per predecessor of
     /// `block`, in [`crate::ir::Block::preds`] order, `None` on an edge no
@@ -346,6 +350,9 @@ struct Tracer<'a> {
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
 /// its negation where not.
 type Known = Vec<(Bool, bool)>;
+
+/// A lane mask's low dword, and in Wave64 its high dword.
+type Mask = (Value, Option<Value>);
 
 /// Whether some lane can satisfy all of `known`. The search gives up (yes)
 /// on many large conditions, as the reach of blocks deep in a program is,
@@ -1723,7 +1730,7 @@ impl<'a> Tracer<'a> {
         }
         joins.push(usize::MAX);
         // Each side holds where the lane's bit of the mask is set, or clear.
-        let bit = self.lanes.and_then(|l| l.masks.get(&mask).copied());
+        let bit = self.lanes.and_then(|l| l.mask_bits(mask.0, mask.1));
         let side = |set: bool| -> Vec<Term> {
             words
                 .iter()
@@ -1751,13 +1758,17 @@ impl<'a> Tracer<'a> {
             })
             .collect::<Result<_, _>>();
         joins.pop();
-        Ok(Some(Source::Lanes { mask, args: args? }))
+        Ok(Some(Source::Lanes {
+            mask: mask.0,
+            high: mask.1,
+            args: args?,
+        }))
     }
 
-    /// For `v` written by a plain `v_cndmask_b32`: the low dword of the
-    /// lane mask it reads, and the dword it is where the lane's bit is set
-    /// (src1), then clear (src0).
-    fn lane_picked(&self, v: Value) -> Option<(Value, Term, Term)> {
+    /// For `v` written by a plain `v_cndmask_b32`: the lane mask it reads
+    /// (its low dword, and in Wave64 its high dword), and the dword it is
+    /// where the lane's bit is set (src1), then clear (src0).
+    fn lane_picked(&self, v: Value) -> Option<(Mask, Term, Term)> {
         let inst = self.def(v)?;
         let Fields::Valu(f) = &inst.fields else {
             return None;
@@ -1779,7 +1790,11 @@ impl<'a> Tracer<'a> {
         let [clear, set, Operand::Scalar { code, .. }] = f.src[..] else {
             return None;
         };
-        let mask = inst.read(Reg::S(code))?;
+        let high = match self.p.wave64 {
+            true => Some(inst.read(Reg::S(code + 1))?),
+            false => None,
+        };
+        let mask = (inst.read(Reg::S(code))?, high);
         Some((mask, self.raw(inst, &set)?, self.raw(inst, &clear)?))
     }
 
@@ -3448,6 +3463,67 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(offsets, [0, 0x20]);
         assert_eq!(r.waterfall.compares.len(), 4);
+    }
+
+    /// The choice of [`WATERFALL_PICKED_WAVE32`] in Wave64 (lanes below 48
+    /// take the first descriptor), `change` right after the compare, and the
+    /// waterfall loop of [`WATERFALL_FETCHED_WAVE64`]. The sample goes to the
+    /// buffer at dword 16 of the table, at lane * 4.
+    pub(crate) fn picked_wave64(change: &[u32]) -> Vec<u32> {
+        let mut words = WATERFALL_PICKED_WAVE32[..12].to_vec();
+        words.extend([
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
+        ]);
+        words.extend(change);
+        words.extend(&WATERFALL_PICKED_WAVE32[13..30]);
+        let fetched = WATERFALL_FETCHED_WAVE64;
+        words.extend(&fetched[14..fetched.len() - 3]);
+        words.extend([
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            0xBF81_0000, // s_endpgm
+        ]);
+        words
+    }
+
+    /// After the compare: nothing, vcc_hi copied through s2 and back (the
+    /// same bits, a new value), or vcc_hi cleared.
+    pub(crate) const VCC_HI_KEPT: &[u32] = &[];
+    pub(crate) const VCC_HI_COPIED: &[u32] = &[
+        0xBE82_036B, // s_mov_b32 s2, vcc_hi
+        0xBEEB_0302, // s_mov_b32 vcc_hi, s2
+    ];
+    pub(crate) const VCC_HI_CLEARED: &[u32] = &[0xBEEB_0380]; // s_mov_b32 vcc_hi, 0
+
+    /// A wave64 descriptor picked per lane by VCC: after `s_mov_b32 vcc_hi,
+    /// 0` the choice names VCC's new high dword, which holds no lane mask
+    /// the compare made; copied through s2 and back, it is the compare's.
+    #[test]
+    fn a_wave64_descriptor_picked_after_the_high_dword_changes_names_the_new_one() {
+        for (change, same) in [
+            (VCC_HI_KEPT, true),
+            (VCC_HI_COPIED, true),
+            (VCC_HI_CLEARED, false),
+        ] {
+            let words = picked_wave64(change);
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 256).unwrap();
+            let st = lanes(&p).unwrap();
+            let layout = [param(Table, 0, 1), param(Table, 1, 1)];
+            let r = track(&p, &layout, HwStage::Cs, Some(&st)).unwrap();
+            let Source::Lanes { mask, high, .. } = r.descriptors[0].source else {
+                panic!("{:?}", r.descriptors[0].source)
+            };
+            let insts = &p.blocks[0].insts;
+            let compare = insts.iter().find(|i| i.name() == "v_cmp_gt_u32").unwrap();
+            let vcc = |r| compare.write(Reg::S(crate::ir::VCC + r));
+            let picked = st.mask_bits(mask, high);
+            assert!(picked.is_some() == same, "{picked:?}");
+            assert_eq!(picked == st.mask_bits(vcc(0).unwrap(), vcc(1)), same);
+        }
     }
 
     #[test]
