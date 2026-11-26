@@ -188,8 +188,8 @@ impl<S, F> Held<S, F> {
                             }
                             true
                         }
-                        Some((Item::FenceWait(fence, value), _, fresh)) => {
-                            let ok = fence(fence) >= *value;
+                        Some((Item::FenceWait(f, value), _, fresh)) => {
+                            let ok = fence(f) >= *value;
                             if !ok {
                                 *fresh = false;
                             }
@@ -361,9 +361,43 @@ mod tests {
         assert_eq!((p.pieces, p.waited.len()), (1, 0));
     }
 
-    /// A list's second segment waits for a value the other queue writes
-    /// after reading what the first segment wrote: the cut is what lets
-    /// both make progress.
+    #[test]
+    fn a_pump_reads_each_address_and_width_once_until_work_runs() {
+        use std::cell::Cell;
+
+        let reads = Cell::new(0);
+        let read = |address: u64, _bytes: u8| {
+            reads.set(reads.get() + 1);
+            Some(u64::from(address == 0x200))
+        };
+        let fence = |_: &usize| 0;
+        let mut run = |_: usize, _: Vec<&'static str>| {};
+        let mut signal = |_: usize, _: u64| {};
+        let mut held = Held::default();
+        held.push(
+            1,
+            Item::Segment("same-word", vec![ge(0x100, 1), ge(0x100, 2)]),
+        );
+        let narrow = ValueWait {
+            address: 0x100,
+            bytes: 4,
+            comparison: GREATER_EQUAL,
+            reference: 1,
+            mask: 0xffff_ffff,
+        };
+        held.push(2, Item::Segment("different-width", vec![narrow]));
+
+        let pumped = held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        });
+
+        assert!(pumped.blocked);
+        assert_eq!(reads.get(), 2, "same address at 8 and 4 bytes is two cache keys");
+    }
+
     #[test]
     fn a_queue_unblocked_by_later_work_does_not_remain_blocked() {
         let fake = RefCell::new(Fake::default());
@@ -392,6 +426,9 @@ mod tests {
         assert!(held.holds_work(2));
     }
 
+    /// A list's second segment waits for a value the other queue writes
+    /// after reading what the first segment wrote: the cut is what lets
+    /// both make progress.
     #[test]
     fn chained_waits_across_two_queues() {
         let fake = RefCell::new(Fake::default());
