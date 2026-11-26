@@ -863,7 +863,7 @@ pub(crate) fn take_reads() -> Vec<u32> {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
     // Both bitmaps: shaders that use title memory mark their reads in theirs.
-    let mut maps: Vec<&mut [u32]> = [false, true]
+    let maps: Vec<&mut [u32]> = [false, true]
         .into_iter()
         .filter_map(bitmap)
         // SAFETY: the mapped bitmap's read marks; the GPU is done with them
