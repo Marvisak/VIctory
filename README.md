@@ -143,6 +143,19 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+Set `VICTORY_KBM_GTA=1` to use an optional GTA V PC-style keyboard and mouse layout on the stand-in pad (`VICTORY_MOUSE_SENS` scales mouse camera speed, default `1.0`; `VICTORY_MOUSE_INVERT_Y=1` inverts Y). Press `F2` or `` ` `` (`~`) to toggle mouse-look capture (starts unlocked; auto-hides the cursor inside the game window while locked, and `Esc`, `P`, or losing focus unlocks and restores it automatically):
+
+| Keys / Mouse | Pad |
+|--------------|-----|
+| W A S D | left stick (move / steer) |
+| Mouse move (`F2` / `` ` `` to lock) or I J K L | right stick (camera / aim) |
+| LMB / RMB | RT (shoot / gas) / LT (aim / brake-reverse) |
+| Shift / Enter, R / Backspace, Space, F | A (sprint / confirm), B (reload / back), X (jump), Y (enter/exit vehicle) |
+| Tab / Q | LB (weapon wheel) / RB (cover / handbrake) |
+| Ctrl, C / MMB / CapsLock | L3 (crouch / horn), R3 (look behind / special) |
+| E / Right, Up / M, Down / Z, Left / G | D-pad (interact, phone, minimap/wheel, left) |
+| Esc / P, V | Menu (pause), View (camera) |
+
 ## Commands
 
 ```
