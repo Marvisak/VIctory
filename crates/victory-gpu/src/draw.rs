@@ -1101,7 +1101,7 @@ impl State {
         float: bool,
         rects: &[RECT],
     ) {
-        let Some(view) = crate::descriptor::view(cpu) else {
+        let Some(view) = crate::descriptor::pinned_view(cpu) else {
             once!("an unordered access clear of a slot without a view");
             return;
         };
@@ -1220,7 +1220,7 @@ impl State {
                             let w: Vec<u32> =
                                 words.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                             let _ = write!(text, " (title words {w:x?}");
-                            if let Some(view) = crate::descriptor::view(at) {
+                            if let Some(view) = crate::descriptor::pinned_view(at) {
                                 let _ = write!(text, ": {}", describe(Some(&view)));
                             }
                             let _ = write!(text, ")");
@@ -1376,7 +1376,7 @@ impl State {
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
+                    if let Some(view) = crate::descriptor::pinned_view(handle) {
                         readable(list, u, &view, true);
                     }
                 }
@@ -1400,7 +1400,7 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                match crate::descriptor::pinned_view(table + u64::from(k) * 32) {
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
@@ -1475,10 +1475,12 @@ impl State {
                 else {
                     continue;
                 };
-                let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                let Some(view) =
+                    crate::descriptor::pinned_view(table + u64::from(u.table_offset_dwords) * 4)
+                else {
                     continue;
                 };
-                let range = match view {
+                let range = match *view {
                     View::Constant(address, size) => Some((address, u64::from(size))),
                     ref v => crate::descriptor::host::buffer_range(v),
                 };
@@ -1510,7 +1512,12 @@ impl State {
                 let (RootType::Table, Some(Root::Table(table))) = (u.root, self.compute.get(usize::from(u.slot))) else {
                     continue;
                 };
-                let Some(View::Unordered(r, ..)) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                let Some(view) =
+                    crate::descriptor::pinned_view(table + u64::from(u.table_offset_dwords) * 4)
+                else {
+                    continue;
+                };
+                let View::Unordered(r, ..) = *view else {
                     continue;
                 };
                 let Some(t) = crate::resource::host_resource(r as This) else { continue };
@@ -1576,11 +1583,13 @@ impl State {
                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
                     (RootType::Table, Some(Root::Table(table))) => {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
-                        let view = crate::descriptor::view(handle);
-                        let mut text = describe(view.as_ref());
+                        let view = crate::descriptor::pinned_view(handle);
+                        let mut text = describe(view.as_deref());
                         // The title's view words, and whether the host slot
                         // the shader reads was made from a view.
-                        if let Some(View::Shader(_, Some(w)) | View::Unordered(_, _, Some(w))) = &view {
+                        if let Some(View::Shader(_, Some(w)) | View::Unordered(_, _, Some(w))) =
+                            view.as_deref()
+                        {
                             text.push_str(&format!(" words {w:?}"));
                         }
                         let slot = (self.heaps[0] != 0)

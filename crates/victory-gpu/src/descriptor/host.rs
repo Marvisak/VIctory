@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, view_at, views_current};
+use super::{PinnedView, VIEW_TAG, View, view_at, views_current};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
@@ -577,7 +577,7 @@ impl HostHeap {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             for (i, &key) in made.iter().enumerate() {
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
-                write_address(data, i, view.as_ref());
+                write_address(data, i, view.as_deref());
             }
             // Dynamic slots are entered as they are made ([`Self::make_at`],
             // [`Self::make_null`], raw views).
@@ -719,7 +719,7 @@ impl HostHeap {
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
-    pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+    pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<PinnedView> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -780,6 +780,7 @@ impl HostHeap {
                 })
         };
         if made[index as usize] == key && !needs_remake() {
+            drop(made);
             return Some(view);
         }
         // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -801,9 +802,11 @@ impl HostHeap {
             // SAFETY: as above.
             if unsafe { (handle as *const [u32; 3]).read_unaligned() } != [tag, i, generation] {
                 drop(made);
+                drop(view);
                 return self.mirror(index, handle, for_draw);
             }
             if made[index as usize] == key && !needs_remake() {
+                drop(made);
                 return Some(view);
             }
         }
@@ -829,6 +832,7 @@ impl HostHeap {
             }
             self.keep(index, kept.flatten());
         }
+        drop(made);
         Some(view)
     }
 
@@ -879,13 +883,13 @@ impl HostHeap {
         for index in slots {
             let key = made.get(index as usize).copied().unwrap_or(0);
             let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
-            match &view {
+            match view.as_deref() {
                 Some(v) => null_for(v, self.cpu(index)),
                 None => null_view(self.cpu(index)),
             }
             self.keep(index, None);
             if index < self.count {
-                self.viewed.set(index, view.as_ref(), false);
+                self.viewed.set(index, view.as_deref(), false);
                 crate::shadow::forget_read(index);
             }
         }
@@ -903,7 +907,7 @@ impl HostHeap {
 
     /// The view of slot `index` if it is a placed texture's left without a
     /// host view (made when read).
-    pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
+    pub(crate) fn unmade_placed(&self, index: u32) -> Option<PinnedView> {
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
@@ -917,8 +921,9 @@ impl HostHeap {
         let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
             return;
         };
-        let view = placed_texture(&view).unwrap_or(view);
-        if let View::Shader(r, _) = view
+        let placed = placed_texture(&view);
+        let view = placed.as_ref().unwrap_or(&view);
+        if let View::Shader(r, _) = *view
             && let Some(t) = crate::resource::made_copy(r as crate::object::This)
         {
             t.stamp();
@@ -2461,5 +2466,245 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    /// A resolved view from `HostHeap::mirror` must pin the `Resource` objects
+    /// it names until dropped so a concurrent title `Release()` cannot free
+    /// them while `mirror` (or its caller) dereferences them, and dropping the
+    /// pinned view must run the final release without leaking.
+    #[test]
+    fn mirrored_view_pins_its_resource_until_dropped() {
+        let Some(host_gpu) = host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let heap_iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &heap_iid, &mut heap),
+            0
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let host_heap = title_heap.host().expect("a host view heap");
+        // Drain any host-cap probe message emitted by `HostHeap::new`.
+        let _ = host_gpu.log_messages();
+        let release = |o: crate::object::This| {
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(o, 0x10)(o)
+        };
+        let make_texture = || {
+            let desc: [u32; 14] = [3, 0, 0, 0, 4, 0, 4, 1 | (1 << 16), 28, 1, 0, 0x100, 0, 0];
+            let props = [1u32, 0, 0, 0, 0];
+            let iid = crate::object::guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let mut out = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    props.as_ptr().cast(),
+                    0,
+                    desc.as_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    &iid,
+                    &mut out,
+                ),
+                0
+            );
+            out
+        };
+
+        // 1. SRV of a texture: releasing the title's reference while the
+        //    mirrored view is held must leave the resource alive (`refs == 1`)
+        //    and drop it once the view guard drops.
+        let slot0 = title_heap.start;
+        let tex = make_texture();
+        crate::descriptor::create_srv(null, tex, std::ptr::null(), slot0);
+        let tex_view = host_heap
+            .mirror(0, slot0, true)
+            .expect("mirrored texture view");
+        assert_eq!(
+            release(tex),
+            1,
+            "mirrored SRV must pin its texture against concurrent Release"
+        );
+        assert!(crate::resource::texture_memory(tex).is_some());
+        assert!(crate::descriptor::view(slot0).is_some());
+        drop(tex_view);
+        assert_eq!(
+            crate::descriptor::view(slot0),
+            None,
+            "dropping the pinned view must complete the final Release and forget the view"
+        );
+        assert!(host_heap.mirror(0, slot0, false).is_none());
+        assert!(!host_heap.made(0) && !host_heap.kept(0));
+
+        // 2. UAV with a distinct counter resource: both resources stay pinned
+        //    and both release cleanly when the guard drops.
+        let slot1 = title_heap.start + 32;
+        let buf = crate::resource::test_buffer(256);
+        let counter = crate::resource::test_buffer(64);
+        let raw_uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_uav(null, buf, counter, &raw_uav, slot1);
+        let uav_view = host_heap.mirror(1, slot1, true).expect("mirrored UAV view");
+        assert_eq!(release(buf), 1, "UAV resource pinned");
+        assert_eq!(release(counter), 1, "UAV counter resource pinned");
+        assert!(crate::resource::buffer_bytes(buf).is_some());
+        assert!(crate::resource::buffer_bytes(counter).is_some());
+        drop(uav_view);
+        assert_eq!(crate::descriptor::view(slot1), None);
+
+        // 3. UAV where resource == counter: must pin only once (no double pin / leak).
+        let slot2 = title_heap.start + 64;
+        let same = crate::resource::test_buffer(256);
+        crate::descriptor::create_uav(null, same, same, &raw_uav, slot2);
+        let same_view = host_heap
+            .mirror(2, slot2, true)
+            .expect("mirrored self-counter UAV");
+        assert_eq!(
+            release(same),
+            1,
+            "identical resource/counter pinned exactly once"
+        );
+        drop(same_view);
+        assert_eq!(crate::descriptor::view(slot2), None);
+
+        assert_eq!(release(heap), 0);
+        assert_eq!(host_gpu.log_messages(), None);
+    }
+
+    /// Racing `HostHeap::sync_slots`, `HostHeap::mirror`, `HostHeap::stamp_read`,
+    /// `HostHeap::view_addresses`, and `descriptor::pinned_view` against concurrent
+    /// `Resource::Release()` across textures, buffers, and dual-resource UAVs must
+    /// neither dereference freed resources nor deadlock on `VIEWS`.
+    #[test]
+    fn concurrent_mirror_and_sync_survive_resource_release() {
+        use std::sync::{Arc, Barrier};
+
+        let Some(host_gpu) = host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let heap_iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &heap_iid, &mut heap),
+            0
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let start = title_heap.start;
+        let host_heap = title_heap.host().expect("a host view heap");
+        // Drain any host-cap probe message emitted by `HostHeap::new`.
+        let _ = host_gpu.log_messages();
+        let release = |o: crate::object::This| {
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(o, 0x10)(o)
+        };
+        let make_texture = || {
+            let desc: [u32; 14] = [3, 0, 0, 0, 4, 0, 4, 1 | (1 << 16), 28, 1, 0, 0x100, 0, 0];
+            let props = [1u32, 0, 0, 0, 0];
+            let iid = crate::object::guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let mut out = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    props.as_ptr().cast(),
+                    0,
+                    desc.as_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    &iid,
+                    &mut out,
+                ),
+                0
+            );
+            out
+        };
+
+        let raw_uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let mut scratch = [0u64; 8];
+        let scratch_slot0 = scratch.as_mut_ptr() as u64;
+        let scratch_slot1 = scratch_slot0 + 32;
+
+        for round in 0..64 {
+            let tex = make_texture();
+            let buf = crate::resource::test_buffer(256);
+            let counter = crate::resource::test_buffer(64);
+            // Record descriptors into non-heap scratch memory and copy them as
+            // raw bytes into the shader-visible heap so `sync_slots`/`mirror`
+            // must resolve and prepare them on the racing thread.
+            crate::descriptor::create_srv(null, tex, std::ptr::null(), scratch_slot0);
+            crate::descriptor::create_uav(null, buf, counter, &raw_uav, scratch_slot1);
+            // SAFETY: 64 bytes in `scratch` and in the 8-slot title heap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(scratch_slot0 as *const u8, start as *mut u8, 64);
+            }
+
+            let tex_addr = tex as usize;
+            let buf_addr = buf as usize;
+            let counter_addr = counter as usize;
+            let barrier = Arc::new(Barrier::new(2));
+            let b2 = Arc::clone(&barrier);
+            let releaser = std::thread::spawn(move || {
+                b2.wait();
+                // Release counter first on odd rounds to exercise partial-pin
+                // rollback when `buf` is still alive and `counter` has `refs == 0`.
+                if round % 2 == 1 {
+                    let _ = release(counter_addr as crate::object::This);
+                    let _ = release(buf_addr as crate::object::This);
+                    let _ = release(tex_addr as crate::object::This);
+                } else {
+                    let _ = release(tex_addr as crate::object::This);
+                    let _ = release(buf_addr as crate::object::This);
+                    let _ = release(counter_addr as crate::object::This);
+                }
+            });
+
+            barrier.wait();
+            host_heap.sync_slots(0, 2, start, 32);
+            let _ = host_heap.mirror(0, start, true);
+            let _ = host_heap.mirror(1, start + 32, true);
+            host_heap.stamp_read(0);
+            let _ = crate::descriptor::pinned_view(start);
+            let _ = crate::descriptor::pinned_view(start + 32);
+            if round == 0 {
+                assert!(host_heap.view_addresses().is_some());
+            }
+            releaser.join().expect("releaser thread finished");
+
+            // After both threads finish, every view must be stale (no leaked refs).
+            assert_eq!(
+                crate::descriptor::view(start),
+                None,
+                "round {round}: texture view leaked a reference"
+            );
+            assert_eq!(
+                crate::descriptor::view(start + 32),
+                None,
+                "round {round}: UAV view leaked a reference"
+            );
+        }
+
+        assert_eq!(release(heap), 0);
+        assert_eq!(host_gpu.log_messages(), None);
     }
 }

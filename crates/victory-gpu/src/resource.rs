@@ -2201,8 +2201,13 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
         out,
     )
 }
-extern "system" fn resource_release(this: This) -> u32 {
-    object::release_boxed::<Resource>(this)
+pub(crate) extern "system" fn resource_release(this: This) -> u32 {
+    object::release_boxed_with::<Resource>(this, |r| {
+        // Invalidate descriptor view entries under `VIEWS` before `Box::from_raw`
+        // creates `&mut Resource`, so concurrent view lookups calling
+        // `try_add_ref` under `VIEWS` never race `Box::from_raw` or freed memory.
+        crate::descriptor::forget(r as usize);
+    })
 }
 /// Memory is always mapped (subresources are not told apart yet); a null
 /// `out` only asks for residency.
