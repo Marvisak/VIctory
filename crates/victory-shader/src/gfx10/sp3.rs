@@ -266,31 +266,38 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
                     .into_iter()
                     .chain(sampler.map(|s| s.to_string())),
             );
-            if *dmask != 1 {
-                let _ = write!(out, " dmask:0x{dmask:x}");
-            }
-            let dims = [
-                "1D",
-                "2D",
-                "3D",
-                "CUBE",
-                "1D_ARRAY",
-                "2D_ARRAY",
-                "2D_MSAA",
-                "2D_MSAA_ARRAY",
-            ];
-            let _ = write!(out, " dim:SQ_RSRC_IMG_{}", dims[usize::from(*dim & 7)]);
-            for (on, text) in [(*r128, "r128"), (*unorm, "unorm")] {
-                if on {
-                    out.push(' ');
-                    out.push_str(text);
+            if name.starts_with("image_bvh") {
+                flags(&mut out, cache, true);
+                if *a16 {
+                    out.push_str(" a16");
                 }
-            }
-            flags(&mut out, cache, true);
-            for (on, text) in [(*a16, "a16"), (*d16, "d16"), (*tfe, "tfe"), (*lwe, "lwe")] {
-                if on {
-                    out.push(' ');
-                    out.push_str(text);
+            } else {
+                if *dmask != 1 {
+                    let _ = write!(out, " dmask:0x{dmask:x}");
+                }
+                let dims = [
+                    "1D",
+                    "2D",
+                    "3D",
+                    "CUBE",
+                    "1D_ARRAY",
+                    "2D_ARRAY",
+                    "2D_MSAA",
+                    "2D_MSAA_ARRAY",
+                ];
+                let _ = write!(out, " dim:SQ_RSRC_IMG_{}", dims[usize::from(*dim & 7)]);
+                for (on, text) in [(*r128, "r128"), (*unorm, "unorm")] {
+                    if on {
+                        out.push(' ');
+                        out.push_str(text);
+                    }
+                }
+                flags(&mut out, cache, true);
+                for (on, text) in [(*a16, "a16"), (*d16, "d16"), (*tfe, "tfe"), (*lwe, "lwe")] {
+                    if on {
+                        out.push(' ');
+                        out.push_str(text);
+                    }
                 }
             }
         }
@@ -926,5 +933,243 @@ mod tests {
         };
         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
         assert_eq!(addr.len(), 2);
+    }
+
+    #[test]
+    fn bvh_intersect_ray_uses_fixed_operands_and_omits_image_modifiers() {
+        // RDNA2 MIMG_IntersectRay always writes 4 VGPRs and reads a 4-SGPR
+        // (128-bit) BVH descriptor, and SP3 omits dmask/dim/r128/unorm/d16/tfe/lwe.
+        assert_eq!(
+            one(&[0xF198_9F01, 0x0003_1402], true),
+            "image_bvh_intersect_ray v[20:23], v[2:12], s[12:15]"
+        );
+        assert_eq!(
+            one(&[0xF198_2081, 0xC003_1402], true),
+            "image_bvh_intersect_ray v[20:23], v[2:9], s[12:15] dlc glc a16"
+        );
+        assert_eq!(
+            one(
+                &[
+                    0xF19C_9F07,
+                    0x0003_1402,
+                    0x0504_030D,
+                    0x0908_0706,
+                    0x000C_0B0A,
+                ],
+                true
+            ),
+            "image_bvh64_intersect_ray v[20:23], [v2,v13,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12], s[12:15]"
+        );
+
+        // Even with dmask=0, r128=0, tfe=1, lwe=1, and d16=1 in raw encoding bits,
+        // `Fields::Image` keeps 4-VGPR `data` and 4-SGPR `rsrc`.
+        let raw: [u32; 3] = [0xF198_0001 | (3 << 16), 0x8003_1402, 0xBF81_0000];
+        let code: Vec<u8> = raw.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let Fields::Image {
+            data,
+            rsrc,
+            sampler,
+            ..
+        } = decode(&code).unwrap()[0].fields(true)
+        else {
+            panic!("not an image instruction");
+        };
+        assert_eq!(data, Operand::Vector { reg: 20, dwords: 4 });
+        assert_eq!(rsrc, Operand::Scalar { code: 12, dwords: 4 });
+        assert_eq!(sampler, None);
+    }
+
+    #[cfg(all(windows, feature = "host", test))]
+    #[test]
+    fn bvh_intersect_ray_without_r128_or_dmask_bits_executes_on_gpu() {
+        use crate::dxbc::Container;
+        use crate::emit::host::{Dispatch, Host, Root, View};
+        use crate::native::{
+            ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo,
+            UsedResource,
+        };
+        use crate::{emit, io, ir, resource, structure};
+
+        let global_load_x4 =
+            |vdst: u32, offset: u32| [0x37 << 26 | 0x0E << 18 | 2 << 14 | offset, 1 | vdst << 24];
+        let s_mov =
+            |dst: u8, src: u8| 0xBE80_0000 | u32::from(dst) << 16 | 0x03 << 8 | u32::from(src);
+        let sop2 = |op: u32, dst: u8, s0: u8, s1: u8| {
+            0x8000_0000
+                | op << 23
+                | u32::from(dst) << 16
+                | u32::from(s1) << 8
+                | u32::from(s0)
+        };
+        let mut words: Vec<u32> = vec![
+            s_mov(3, 0x80),
+            0x3D << 26 | 0x02 << 18 | 8 << 6 | 2 >> 1,
+            125 << 25,
+            0x1A << 25 | 1 << 17 | 256 << 9 | (128 + 6),
+        ];
+        for (k, v) in [2, 6, 10].into_iter().enumerate() {
+            words.extend(global_load_x4(v, 16 * k as u32));
+        }
+        words.extend([
+            sop2(0x21, 12, 0, 128 + 8),
+            sop2(0x10, 13, 13, 255),
+            0x8000_0000,
+            s_mov(14, 193),
+            s_mov(15, 255),
+            8 << 28 | 1 << 24 | 1 << 27 | 0x3FF,
+            // Clobber s16..s19 so an 8-SGPR srsrc read would break descriptor tracking.
+            s_mov(16, 255),
+            0xDEAD_BEEF,
+            // `image_bvh_intersect_ray v[20:23], v[2:12], s[12:15]` with dmask=0, r128=0!
+            0xF198_0001,
+            20 << 8 | (12 >> 2) << 16 | 2,
+            0x1A << 25 | 1 << 17 | 256 << 9 | (128 + 4),
+            0x38 << 26 | 0x1E << 18 | 1 << 12,
+            0x80 << 24 | (8 >> 2) << 16 | 20 << 8 | 1,
+            0xBF81_0000,
+        ]);
+
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 32,
+            layout: vec![
+                RootParam {
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 2,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                },
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 2,
+                    slot: 1,
+                },
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, &native).expect("io");
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let shader = emit::emit(&c, &native, &p, &st, &io, &res).expect("emit");
+        assert!(shader.memory);
+        if let Ok(mut v) =
+            emit::validator::Validator::load(emit::validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil.clone()).expect("DXIL validation");
+        }
+
+        const TITLE: u64 = 0x12_3450_0000;
+        let (hi, lo) = ((TITLE >> 32) as u32, TITLE as u32);
+        let mut pt = vec![0u32; 4096];
+        pt[(hi << 4 | lo >> 28) as usize] = 1;
+        for _ in 0..2 * 4096 {
+            pt.extend([3, 0]);
+        }
+        let entry = 4096 + 2 * (4096 + (lo >> 16 & 0xFFF) as usize);
+        pt[entry..entry + 2].copy_from_slice(&[1, lo]);
+
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Table, 1) => 0,
+                (RootType::Descriptor, 0) => (TITLE >> (32 * u.dword)) as u32,
+                _ => panic!("{u:?}"),
+            };
+        }
+
+        // Ray at bytes 0..64 pointing at a 16-dword float32 box node at byte 128 (`ptr = (128 >> 3) | 5 = 21`).
+        let mut srv = vec![0u32; 64];
+        let f = f32::to_bits;
+        srv[0..11].copy_from_slice(&[
+            (128 >> 3) | 5,
+            f(100.0),
+            f(0.0),
+            f(0.0),
+            f(0.0),
+            f(1.0),
+            f(0.0),
+            f(0.0),
+            f(1.0),
+            f(f32::INFINITY),
+            f(f32::INFINITY),
+        ]);
+        // Box 0 at [2, -1, -1]..[4, 1, 1] (child id 0x42), boxes 1..3 empty (`min > max`).
+        let node = &mut srv[32..64];
+        node[0..4].copy_from_slice(&[0x42, u32::MAX, u32::MAX, u32::MAX]);
+        node[4..10].copy_from_slice(&[f(2.0), f(-1.0), f(-1.0), f(4.0), f(1.0), f(1.0)]);
+        for b in 1..4 {
+            let at = 4 + 6 * b;
+            node[at..at + 6].copy_from_slice(&[f(1.0), f(1.0), f(1.0), f(-1.0), f(-1.0), f(-1.0)]);
+        }
+
+        let mut ran = 0;
+        for warp in [false, true] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+            let views = [
+                View::RawUav(4),
+                View::Memory(&srv),
+                View::Pair,
+                View::NullPair,
+                View::Pair,
+            ];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud.clone())),
+                            (1, Root::View { srv: true, data: pt.clone() }),
+                            (2, Root::Uav(2 * 4096 / 32)),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("dispatch");
+            assert_eq!(out[0], [0x42, u32::MAX, u32::MAX, u32::MAX], "warp {warp}");
+            ran += 1;
+        }
+        assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
     }
 }
