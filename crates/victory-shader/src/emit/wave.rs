@@ -618,7 +618,22 @@ fn shapes(
         u64::from(u32::MAX)
     };
     let mut out = HashMap::new();
-    let single = |s: Sym| match s {
+    for (v, s) in uni {
+        if let Some(sh) = single(s, all) {
+            out.insert(v, sh);
+        }
+    }
+    for (v, lanes) in vec {
+        if let Some(sh) = per_lane(&lanes, all) {
+            out.insert(v, sh);
+        }
+    }
+    out
+}
+
+/// A scalar result, or one symbolic value shared by all vector lanes.
+fn single(s: Sym, all: u64) -> Option<Shape> {
+    match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
@@ -637,18 +652,7 @@ fn shapes(
             hi,
         } if lanes == all => Some(Shape::Half(op, src, mask, ident, hi)),
         _ => None,
-    };
-    for (v, s) in uni {
-        if let Some(sh) = single(s) {
-            out.insert(v, sh);
-        }
     }
-    for (v, lanes) in vec {
-        if let Some(sh) = per_lane(&lanes, all) {
-            out.insert(v, sh);
-        }
-    }
-    out
 }
 
 fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
@@ -669,18 +673,7 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
         return Some(Shape::Masked(m.0, m.1, m.2));
     }
     if lanes.iter().all(|&s| s == first) {
-        return match first {
-            Sym::K(k) => Some(Shape::K(k)),
-            Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
-            Sym::Red {
-                op: Some(op),
-                src,
-                mask,
-                ident,
-                lanes,
-            } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
-            _ => None,
-        };
+        return single(first, all);
     }
     // Prefixes: lane l holds lanes 0..l (exclusive) or 0..=l (inclusive).
     let mut meta: Option<(Value, Value, u32, bool)> = None;
@@ -1048,6 +1041,25 @@ mod tests {
                 .collect();
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
+        }
+    }
+
+    #[test]
+    fn vector_half_reductions_require_every_term_and_the_same_high_half() {
+        for width in [32, 64] {
+            let all = u64::MAX >> (64 - width);
+            let half = |lanes, hi| Sym::Half {
+                op: Op::AddH,
+                src: Value(1),
+                mask: Value(2),
+                ident: 0,
+                lanes,
+                hi,
+            };
+            assert_eq!(per_lane(&vec![half(all ^ 1, 0); width], all), None);
+            let mut mixed = vec![half(all, 0); width];
+            mixed[1] = half(all, 1);
+            assert_eq!(per_lane(&mixed, all), None);
         }
     }
 
