@@ -1,243 +1,276 @@
-# VIctory
+# SeriesBridge
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+**A research-driven Xbox Series X|S to Windows compatibility project**
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can (shaders and pipelines too, see Getting started) and on first use
-otherwise. See [docs/architecture.md](docs/architecture.md).
+> **Project status: Planning / early architecture.** This repository description is a project starting point, not a claim that a working Xbox compatibility runtime or GTA VI PC port exists.
 
-## Status (2026-11-25)
+SeriesBridge is a proposed Windows application made of two separate components:
 
-**Not playable yet, because of the framerate: about 1 frame per second in the
-world.** Nothing else keeps the game from working: the title boots, runs its
-menus at its own 30 fps, loads the world, plays the intro cutscene and
-reaches the **prologue**, the mission after it, with the graphics fully
-displayed. 
+1. A C++ desktop launcher for game selection, hardware detection, configuration, shader preparation, cache management, diagnostics, and launch control.
+2. A C++ compatibility runtime that loads supported, lawfully obtained Xbox Series X|S title files and implements the Xbox-facing services required by a title.
 
-| Stage | State |
-|-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about a minute) | works |
-| The intro cutscene | plays at about 1 fps (0.9-1.0 s a frame, warm cache, quiet machine): textured and lit characters with whole hair, buildings, sky, depth of field, the title card, credits and interface. Missing: ray-traced shadows and indirect light, the local-light shadow mask. Seen in some shots: a pink band over nearer bodies, a stand-in head on a secondary character for a few frames |
-| The prologue | reached; the graphics are fully displayed, at about 1 fps |
+The project is intended to investigate a practical Windows compatibility architecture, with GTA VI as a possible research target where the user already has lawful access to the required files. Compatibility must be demonstrated through testing; it must never be assumed from the fact that an executable can be loaded.
 
-In the intro cutscene at 1 fps the opening credits land over other shots than
-on a console: they follow the frame count, the shots follow the clock.
+![image](https://github.com/ozqari/SeriesBridge/blob/main/Neon%20Purple%20GTA%20VI%20Game%20Launcher.png)
 
-Tested on one machine: Windows 11, AMD RX 6700 XT (12 GB).
+## Project goals
 
-> **Warning.** Entering the world on a real GPU hung it in earlier builds,
-> and Windows then reset the display driver (every monitor goes black for a
-> moment). The latest runs, several minutes each in the world, did not, but
-> it is not ruled out; a run can also end on a GPU fault (`crashes.log`). A
-> diagnostics build with `VICTORY_D3D12_WARP=1` renders on the software
-> adapter instead (too slow to reach the world in minutes).
+- Build a clean Windows launcher that opens before the game.
+- Use C++20 for the launcher and runtime.
+- Run compatible x64 title code natively where possible, rather than adding an unnecessary CPU instruction emulator.
+- Implement Xbox-facing system services incrementally and report unsupported behavior clearly.
+- Translate supported Xbox RDNA2 shader programs into a host-supported representation.
+- Precompile shaders and pipeline states that can be discovered before launch, then compile newly encountered items at runtime.
+- Preserve Xbox guest-memory semantics while mapping memory efficiently to discrete and integrated PC GPUs.
+- Measure memory use, GPU budgets, transfer volume, shader preparation time, frame pacing, and compatibility failures.
+- Make security, reproducible builds, and dependency provenance part of the design from the beginning.
 
-What each part does today and what it still needs:
+## Non-goals and boundaries
 
-| Subsystem | Today | Needs |
-|-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
-| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address, depth written from compute, lists that wait for values other queues write, textures made when a shader first reads them, pipelines pre-built or made by worker threads and kept on disk, depth bounds on supporting adapters (synthetic tests) | The title's ray-tracing structures are never built (no ray-traced shadows or indirect light in the intro cutscene); about 1 s a frame; draws of untranslated shaders are dropped; real queries, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: all but under 300 of 24,387 programs | Merged geometry stages (195 programs) and under 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Menus, loading and the world run with the PC upscaler (`VICTORY_FIDELITYFX_DIR`, about 1 s a frame) | The title's own upscaler DLLs: six of their passes are untranslated, so their picture is wrong |
+- No decryption, DRM circumvention, entitlement bypass, or extraction of protected console packages.
+- No distribution of game executables, copyrighted game assets, firmware, private keys, or proprietary SDK components.
+- No bypassing of anti-cheat, online protections, or server-side game logic.
+- No promise that every Xbox title or every game version will work.
+- No claim that all shaders can be compiled before the game runs.
+- No assumption that a PC with 16 GB of VRAM is equivalent to an Xbox with 16 GB of unified memory.
 
-## Getting started
+The runtime should accept only files the user is legally entitled to use and has made available through an authorized process. Game files should remain separate from the SeriesBridge source and release packages.
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+## Design overview
 
-To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
-the installer from https://rustup.rs). The first `cargo` command in this
-repository then fetches the pinned toolchain. Building needs the MSVC C++
-build tools: Visual Studio or its Build Tools with the "Desktop development
-with C++" workload.
-
-Keep the build paths short. From a checkout about 170 characters deep, the
-`blake3` dependency's build script fails in `ml64.exe` with
-`A1009: line too long`, even with long paths enabled in Windows, because
-its object files land under `target`. Set `CARGO_TARGET_DIR` to a short
-absolute path (`$env:CARGO_TARGET_DIR = 'C:\vt'`; `victory.exe` is then
-in `C:\vt\release` instead of `target\release`), or check out the
-repository nearer the drive's root.
-
-A run in the world takes about 33 GB of Windows commit (RAM plus paging
-file) and about 10 GB of video memory. The tested machine has 32 GB of RAM
-and a commit limit of about 80 GB. Check **Committed** under **Task Manager →
-Performance → Memory**. If `crashes.log` reports Windows error 1455, close
-other applications or increase the Windows paging file size, then retry.
-
-```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
+```text
+┌───────────────────────────────────────────────┐
+│             SeriesBridge Launcher             │
+│                   C++ / Qt 6                  │
+│                                               │
+│  Library · Profiles · Hardware · Settings     │
+│  Shader Preparation · Cache · Diagnostics     │
+└──────────────────────┬────────────────────────┘
+                       │ Versioned local IPC
+                       ▼
+┌───────────────────────────────────────────────┐
+│              SeriesBridge Runtime             │
+│                  C++20 / Win32                │
+│                                               │
+│  PE Loader & Import Router                     │
+│  Xbox API Compatibility Services              │
+│  Guest Memory Manager                          │
+│  Graphics Compatibility Layer                 │
+│  RDNA2 Shader Translation                      │
+│  D3D12 Backend                                 │
+└──────────────────────┬────────────────────────┘
+                       ▼
+┌───────────────────────────────────────────────┐
+│             Windows / GPU Platform            │
+│       WDDM · DXGI · Direct3D 12 · DXC          │
+└───────────────────────────────────────────────┘
 ```
 
-Run the title:
+The launcher and runtime are separate processes. The launcher is responsible for the user experience and preparation workflow; the runtime owns executable loading, compatibility services, memory mappings, graphics execution, and game process state.
 
-```powershell
-cargo build --release -p victory
-target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+## Key engineering principles
+
+### 1. Unified memory is a guest behavior to preserve
+
+Xbox Series consoles use a unified physical memory architecture. A typical PC with a discrete GPU instead has system RAM and dedicated VRAM. SeriesBridge should preserve the game's expected guest addresses, page mappings, aliases, visibility rules, and synchronization behavior without forcing the host to reproduce the console's physical layout.
+
+The memory manager should support:
+
+- A guest address space independent of host pointers and D3D12 resource objects.
+- Lazy page commitment rather than eager reservation of the entire guest range.
+- Explicit page and alias tracking.
+- CPU/GPU visibility and coherency tracking.
+- UMA and discrete-GPU backing strategies.
+- DXGI local/non-local memory budget monitoring.
+- Residency, streaming, eviction, and safe resource lifetime management.
+- Accounting for committed bytes, duplicated backing, transfers, and fence waits.
+
+### 2. Shader preparation is both offline and runtime
+
+The pre-launch pipeline should scan supported shader inputs, decode and translate known programs, compile generated HLSL with DXC, and store versioned cache entries. It should use bounded parallel workers, progress reporting, cancellation, and safe cache writes.
+
+Some shaders and pipeline states may only be discovered after the game begins executing. The runtime therefore needs an on-demand compilation path that shares the same cache format and records misses for later preparation.
+
+DXC compiles HLSL; it does not itself decode Xbox RDNA2 shader machine code. A separate decoder, semantic representation, and translator are required before DXC can be used.
+
+### 3. C++ is an implementation choice, not a shortcut
+
+C++20 is selected for its integration with Win32, Direct3D 12, Qt, and low-level Windows development. Rewriting another project from Rust to C++ does not automatically improve correctness, performance, or security. Every subsystem must be justified by tests and profiling.
+
+### 4. Treat game and shader inputs as untrusted
+
+Parsers for executable images, shaders, archives, textures, and command streams must validate bounds and reject malformed inputs. The runtime should not require administrator privileges. The shader worker should have narrowly scoped access where practical. Crash reporting and external network activity should be disabled by default.
+
+## Proposed technology stack
+
+| Area | Planned technology | Purpose |
+|---|---|---|
+| Language | C++20 | Launcher and runtime |
+| Compiler | MSVC; `clang-cl` in CI | Windows build and additional diagnostics |
+| Build | CMake + Ninja | Reproducible project configuration |
+| Launcher UI | Qt 6 Widgets | Desktop interface and settings |
+| OS integration | Win32 + Windows SDK | Process, memory, file, and synchronization APIs |
+| Graphics backend | Direct3D 12 | Host graphics execution |
+| Shader compiler | DirectX Shader Compiler (DXC) | Compile generated HLSL to DXIL |
+| Tests | CTest + GoogleTest or Catch2 | Unit and integration tests |
+| Fuzzing | libFuzzer or equivalent | Parser robustness testing |
+| Dependencies | Locked manifest / pinned versions | Dependency review and repeatable builds |
+
+The initial implementation should avoid adding a CPU JIT unless a measured compatibility requirement establishes a need for one. Compatible x64 title code should run natively where possible, with missing Xbox services supplied by the compatibility layer.
+
+## Planned application features
+
+### Launcher
+
+- Game-library view and manual folder selection.
+- Read-only file validation and executable/import inspection.
+- CPU, GPU, driver, RAM, and adapter capability detection.
+- Per-title profiles and supported settings.
+- Fast-launch and full-preparation modes.
+- Shader and pipeline preparation queue with progress, pause, and cancellation.
+- Persistent cache status, cleanup, and repair.
+- Runtime logs, compatibility warnings, and local diagnostic export.
+- Runtime start, stop, restart, and crash detection.
+
+### Runtime
+
+- PE loader and import routing.
+- Xbox kernel and system-service compatibility modules.
+- Filesystem overlay with strict path containment.
+- Guest memory address, page, and alias model.
+- D3D12 resource, descriptor, queue, fence, and barrier translation.
+- RDNA2 shader decoder and translation pipeline.
+- Audio, input, storage, and presentation compatibility modules as required by the selected title.
+- Clear reporting for unsupported APIs and incomplete features.
+
+## Repository structure (proposed)
+
+```text
+SeriesBridge/
+├── CMakeLists.txt
+├── CMakePresets.json
+├── README.md
+├── LICENSE
+├── SECURITY.md
+├── CONTRIBUTING.md
+├── docs/
+│   ├── architecture.md
+│   ├── memory-model.md
+│   ├── graphics-and-shaders.md
+│   ├── security-model.md
+│   └── compatibility-matrix.md
+├── apps/
+│   └── launcher/
+├── runtime/
+│   ├── loader/
+│   ├── services/
+│   ├── memory/
+│   ├── graphics/
+│   ├── shaders/
+│   ├── storage/
+│   ├── audio/
+│   └── input/
+├── tools/
+│   ├── pe-inspect/
+│   ├── shader-inspect/
+│   └── cache-inspect/
+├── tests/
+│   ├── fixtures/
+│   ├── unit/
+│   ├── integration/
+│   ├── graphics/
+│   ├── memory/
+│   └── fuzz/
+├── cmake/
+└── .github/
+    └── workflows/
 ```
 
-The `translate --cache` step (minutes; again after a change of the shader
-translator) translates every shader the title can ask for into the cache
-(about 1.3 GB), so a run does not translate them while it plays; without it
-they are translated at first use, and their draws wait. With `--pipelines`
-it then makes every pipeline in the title's shader pack (inside
-`shaders.rpf`) into the host pipeline library (about 27,000 pipelines, 4 MB;
-estimated at 20 minutes on 16 threads, but about 2 pipelines a second after a
-translator change that touches most programs, which is hours), so a run
-compiles none of those either; the library belongs to the GPU and driver it
-was made on. Run again, it skips what is there in seconds; stopped
-early, it keeps what it made. Without it, a run makes the pipelines it needs
-on worker threads and keeps them, so the first runs after a translator
-change are slower and show missing draws for a while.
+This is a proposed layout. Directories and build instructions should be updated as implementation is added; this README does not imply that these targets already exist.
 
-To get into the game, press A (Enter) on each first-boot screen and again on
-the start screen. Loading the world takes about a minute; the intro cutscene
-plays, then the prologue starts.
+## Development roadmap
 
-Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
-it with the PC build on your GPU instead of the console build, get the
-[FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
-and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
-`Kits/FidelityFX/signedbin` folder, which holds
-`amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
-upscaler for your GPU (the log says so), the title's own DLLs run.
+| Milestone | Focus | Completion evidence |
+|---|---|---|
+| M0 | Target discovery, legal review, threat model | Exact test target and lawful input requirements documented |
+| M1 | CMake workspace, CI, launcher/runtime shells | Both apps build; versioned local IPC works |
+| M2 | Read-only PE inspection and minimal loader | Synthetic executable fixtures pass loader tests |
+| M3 | Guest memory and host mapping | Aliasing, CPU/GPU visibility, and budget tests pass |
+| M4 | D3D12 path and shader translation | Validated shader tests render correctly on supported GPUs |
+| M5 | Pre-launch shader/PSO manager | Repeatable cold/warm cache measurements and safe cancellation |
+| M6 | Xbox service compatibility and title integration | Measured API coverage and defined title smoke-test checkpoint |
+| M7 | Launcher completion and diagnostics | A non-developer can configure, prepare, launch, and diagnose |
+| M8 | Security, performance, and release candidate | Audits pass; known limitations and reproducible build instructions are published |
 
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
+## Testing and performance measurements
 
-Set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit the title's
-top-level window to that bounding box. Smaller windows keep their size,
-larger windows keep their proportions, and the monitor's work area still
-limits them. This scales the displayed image; it does not change the
-console render resolution or the swap-chain buffers. With the variable
-unset, window sizing is unchanged.
+Compatibility claims should be based on repeatable tests, not a single successful launch or FPS figure.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Track at least:
 
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
+- Executable loading and import-resolution coverage.
+- Xbox API calls implemented, unsupported, or partially implemented.
+- Shader translation correctness and cache hit/miss rates.
+- Cold-cache and warm-cache preparation duration.
+- Time to first frame and time to interactive menu.
+- p50, p95, and p99 frame times over a documented test interval.
+- Peak process commit and working set.
+- DXGI local and non-local memory usage and budget.
+- Guest pages mapped, alias count, backing duplication, bytes transferred, and fence waits.
+- GPU device-removal events, runtime crashes, and reproducibility of failures.
 
-## Commands
+Test discrete and UMA GPUs where available. Test multiple vendors and driver versions before making broad compatibility claims. Record title build, hardware, driver, resolution, settings, and cache state alongside every published benchmark.
 
-```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm] [--effects]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory translate [paths...] --cache [--pipelines] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
-victory config
-```
+## Security
 
-`translate --jobs N` requires a positive worker count. Omit it to use the
-default worker count.
+SeriesBridge should assume that game files and shader inputs can be malformed or hostile.
 
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
+Required controls include:
 
-### Windows shader-test validator
+- No administrator requirement for normal launch.
+- Strict path canonicalization and overlay containment, including symlink/junction/reparse-point tests.
+- Bounds-checked parsers and fuzzing for PE, shader, texture, archive, and command-stream formats.
+- Versioned, validated local IPC with restrictive access controls.
+- A separate shader-worker process where practical.
+- Minimal GitHub Actions permissions and pinned third-party actions.
+- Locked and reviewed dependencies.
+- Release hashes, signed artifacts, and an SBOM.
+- No silent crash-dump upload or telemetry; external diagnostics are opt-in and previewable.
+- A public security policy and private vulnerability-reporting route.
 
-The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.
-An older Windows SDK validator can load successfully but reject them with
-`Unknown shader model 'ps_6_6'`. If this happens, use a current x64 validator
-from [Microsoft's DirectX Shader Compiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
-or a current Windows SDK. Set its path for the test session:
+**Important runtime limitation:** Running a game executable in the same security context as the user is not sandboxing it. Process separation alone does not make untrusted code safe. Any sandbox claim must be backed by an explicit Windows isolation design and security testing.
 
-```powershell
-$env:VICTORY_DXIL = 'C:\tools\dxc\bin\x64\dxil.dll'
-cargo test -p victory-shader --lib --locked -- --test-threads=1
-```
+See [`SECURITY.md`](SECURITY.md) for the intended disclosure process once that file is created.
 
-Without this override, the validator loader selects the newest installed
-Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
-path when no SDK copy is found. This is a test/offline-validation dependency;
-the translated shaders do not require it at runtime.
+## Legal and project integrity
 
-## Debugging
+This is an independent compatibility research project. It is not affiliated with or endorsed by Microsoft, Xbox, Rockstar Games, or Take-Two Interactive. Product and game names are used only to identify compatibility research targets.
 
-A release build has no debugging aids. Build them in with
+Do not commit third-party game files, proprietary SDK material, console firmware, private keys, or other restricted content. Review licenses before borrowing or adapting code from existing compatibility projects. In particular, source-code reuse may carry obligations that differ from independently implementing documented behavior.
 
-```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
-```
+## Research references
 
-The on/off switches below (`...=1`) are off when unset or set to `0`.
+These public sources informed the proposed architecture. Re-check the exact repository revision and documentation before implementation because upstream projects and APIs can change.
 
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_CAPTURE_WORLD=<list>` | with `VICTORY_CAPTURE`, also saves (and with `VICTORY_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
-| `VICTORY_DUMP_WRITERS=<hash>,...` | with the two above, also the textures a pipeline containing a listed shader hash writes, the first frame it runs, and for its buffers a log line (dwords changed, dwords not zero) |
-| `VICTORY_PEEK=<hex address>[:<bytes>],...` | in listed frames, those bytes of title memory logged after each submission. Listed frames also log targets of 16 texels or fewer as values, each table view's view words and whether its host slot is null, the host copy of every buffer of 64 bytes or fewer a draw reads (at submission and after its list), and each 1D or 3D texture a dispatch writes, read back right after it |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | skip host pipeline creation and omit draws and dispatches, including indirect ones, when the pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
-| `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
-| `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+- [XCL repository](https://github.com/xcl-dev/xcl)
+- [XCL README](https://github.com/xcl-dev/xcl/blob/main/README.md)
+- [XCL implementation handoff](https://github.com/xcl-dev/xcl/blob/main/HANDOFF.md)
+- [XCL security policy](https://github.com/xcl-dev/xcl/blob/main/SECURITY.md)
+- [Xbox Series X specifications](https://www.xbox.com/en-us/consoles/xbox-series-x)
+- [Direct3D 12 memory management](https://learn.microsoft.com/en-us/windows/win32/direct3d12/memory-management)
+- [Direct3D 12 residency](https://learn.microsoft.com/en-us/windows/win32/direct3d12/residency)
+- [DXGI video-memory budget information](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/ns-dxgi1_4-dxgi_query_video_memory_info)
+- [Microsoft DirectX specifications: D3D12 Resource Heaps](https://microsoft.github.io/DirectX-Specs/d3d/ResourceHeaps.html)
+- [DirectX Shader Compiler (DXC)](https://github.com/microsoft/DirectXShaderCompiler)
+- [Qt 6 and CMake](https://doc.qt.io/qt-6/cmake-get-started.html)
+- [GitHub Actions security hardening](https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions)
+- [LLVM libFuzzer](https://llvm.org/docs/LibFuzzer.html)
+- [MSVC AddressSanitizer](https://learn.microsoft.com/en-us/cpp/sanitizers/asan)
 
-Every build appends unhandled exceptions, panics, and host GPU failures to
-`crashes.log` in the title's data folder.
+## Related documentation
 
-For a startup breakpoint (`0x80000003`), run the diagnostics build with
-`VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
-`crashes.log` entries. A host DLL refusal includes the caller stack in the
-console output. The refusal is expected for DLLs outside the host policy,
-including `rpcrt4.dll`.
+- [Full development plan](Xbox_Series_to_Windows_Development_Plan.md)
 
-On Series 1.0.2.1, a missing `appdata0.rpf` reproduced the breakpoint at
-`+0x2237178` before the first window. Restore the archive from the same
-package beside the title executable. `run --execute` checks that it can
-read the RPF9 header before starting this build.
+---
 
-To compare hardware and software rendering, repeat with
-`VICTORY_D3D12_WARP=1` and check the console for
-`host device on the software adapter (WARP)` to confirm the WARP device was
-created. Compare the exception's module and offset, stack frames, and
-preceding messages across the two runs.
-
-## License
-
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+**Current next step:** create the C++20/CMake workspace, add CI and the security policy, then implement a synthetic PE-inspection and D3D12 test-renderer vertical slice before attempting title-specific compatibility.
