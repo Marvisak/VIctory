@@ -304,6 +304,7 @@ mod tests {
         assert_eq!(t.store_id, "9&C");
         assert_eq!(t.storage_bytes, 1024 << 20);
     }
+
     #[cfg(windows)]
     #[test]
     fn efficiency_mode_controls_power_throttling_state() {
@@ -325,5 +326,4 @@ mod tests {
         assert_eq!(power_throttling_state("true").StateMask, 0);
         assert_eq!(power_throttling_state("0").StateMask, 0);
     }
-
 }
