@@ -3382,12 +3382,125 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
-    #[test]
-    fn compute_view_marks_rebind_after_depth_twin_conversion() {
+    /// Build a one-thread compute pipeline reading one descriptor table.
+    fn table_compute(
+        code: &[u32], used_entries: Vec<UsedResource>, view_marks: bool,
+    ) -> HostPipeline {
         use victory_shader::emit::{Options, emit_with};
         use victory_shader::native::{ComputeIo, HwStage, NativeProgram, RootParam, StageIo};
         use victory_shader::{Container, io, ir, resource, structure};
 
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: used_entries,
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let host_shader = emit_with(
+            &Container {
+                digest: [0; 16],
+                version: (1, 0),
+                parts: Vec::new(),
+            },
+            &native,
+            &p,
+            &st,
+            &io,
+            &res,
+            Options { view_marks },
+        )
+        .unwrap();
+        assert_eq!(host_shader.view_marks, view_marks);
+        let shader = crate::pipeline::Shader::for_test(
+            "compute",
+            crate::pipeline::Translated {
+                host: host_shader,
+                used: native.used,
+            },
+        );
+        HostPipeline::new(&[shader], None).expect("compute host pipeline")
+    }
+
+    #[test]
+    fn compute_reads_a_buffer_view_address_after_rebinding() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        // Copy the first two dwords of the SRV at table + 32 to the UAV at table + 0.
+        let code = [
+            0xBE84_0300, 0xBE85_0380, // s[4:5] = table at s0
+            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xF404_0402, 0xFA00_0020, // s_load_dwordx2 s[16:17], s[4:5], 32
+            0xBF8C_0000,              // s_waitcnt 0
+            0x7E00_0210, 0x7E02_0211, // v_mov_b32 v0, s16; v_mov_b32 v1, s17
+            0xE070_0000, 0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0xE070_0004, 0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0 offset:4
+            0xBF81_0000,              // s_endpgm
+        ];
+        let entries = vec![
+            UsedResource { dwords: 4, ..used(ResourceType::Uav) },
+            UsedResource { table_offset_dwords: 8, dwords: 4, ..used(ResourceType::Srv) },
+        ];
+        let pipeline = table_compute(&code, entries, false);
+        assert!(pipeline.stages[0].view_addresses.is_some());
+
+        let (heap, title, _) = view_heap(8);
+        let (input, output) = (buffer(256), buffer(256));
+        let base = crate::resource::buffer_bytes(input).unwrap().0 as u64;
+        let result = crate::resource::buffer_bytes(output).unwrap().0 as u64;
+        let shadow = crate::shadow::find(result, 256).unwrap();
+        let null = std::ptr::null();
+        let uav = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0]; // raw buffer UAV
+        crate::descriptor::create_uav(null, output, null, &uav, title.start);
+
+        for (resource, first, expected) in [
+            (input, 7, base + 7 * 16),
+            (null, 0, 0),
+            (input, 2, base + 2 * 16),
+        ] {
+            // The same title slot is rewritten only after the previous GPU read finished.
+            let srv = [0, 1, 0x1688, 0, first, 0, 4, 16, 0, 0];
+            crate::descriptor::create_srv(null, resource, &srv, title.start + 32);
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            state.set_table(true, 0, title.start);
+            assert!(state.bind(&list, &pipeline, true));
+            // SAFETY: the open list has the pipeline and its resources bound.
+            unsafe { list.list.Dispatch(1, 1, 1) };
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(
+                shadow.read_host(result, 2),
+                [expected as u32, (expected >> 32) as u32 & 0xffff],
+                "address of the view starting at element {first}"
+            );
+        }
+        type Release = extern "system" fn(This) -> u32;
+        for object in [heap, input, output] {
+            crate::object::slot::<Release>(object, 0x10)(object);
+        }
+    }
+
+    #[test]
+    fn compute_view_marks_rebind_after_depth_twin_conversion() {
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -3437,52 +3550,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 slot: 0,
             },
         ];
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64: false,
-            vgprs: 8,
-            layout: vec![RootParam {
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 0,
-                slot: 0,
-            }],
-            used: used_entries.clone(),
-            io: StageIo::Cs(ComputeIo {
-                rsrc2: 3 << 1,
-                threads: [1, 1, 1],
-            }),
-            code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
-        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-        let io = io::raise(&p, &native).unwrap();
-        let host_shader = emit_with(
-            &Container {
-                digest: [0; 16],
-                version: (1, 0),
-                parts: Vec::new(),
-            },
-            &native,
-            &p,
-            &st,
-            &io,
-            &res,
-            Options { view_marks: true },
-        )
-        .unwrap();
-        assert!(host_shader.view_marks);
-        let shader = crate::pipeline::Shader::for_test(
-            "compute",
-            crate::pipeline::Translated {
-                host: host_shader,
-                used: used_entries,
-            },
-        );
-        let hp = HostPipeline::new(&[shader], None).expect("compute host pipeline");
+        let hp = table_compute(code, used_entries, true);
         assert!(hp.marks.is_some());
 
         // 16-bit console depth-stencil texture (`format = 118`) whose twin
