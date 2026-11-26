@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod norm16;
 
 type Why = &'static str;
 
@@ -284,6 +285,8 @@ struct Lower<'a> {
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
     mode16: Option<u8>,
+    /// Normalized conversions that read a flushed half input, when known.
+    flush_half_input: Option<HashSet<usize>>,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -315,17 +318,25 @@ fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
 /// The 16/64-bit round mode each block starts with: nearest even at the
 /// program's start, then as the MODE writes on the way set it; `None` where
 /// paths that set it differently join (or a write is not a constant).
-fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
+fn round16(p: &Program) -> Vec<Option<u8>> {
+    mode_at_blocks(p, Some(0), round16_after)
+}
+
+fn mode_at_blocks<T: Copy + Eq>(
+    p: &Program,
+    initial: Option<T>,
+    after: fn(&Inst, Option<T>) -> Option<T>,
+) -> Vec<Option<T>> {
     // None: not reached yet; Some(m): the mode (m None: not known).
-    let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
-    entry[0] = Some(Some(0));
+    let mut entry = vec![None; p.blocks.len()];
+    entry[0] = Some(initial);
     let order = crate::ir::reverse_postorder(&p.blocks);
     loop {
         let mut changed = false;
         for &b in &order {
             let Some(mut m) = entry[b] else { continue };
             for inst in &p.blocks[b].insts {
-                m = round16_after(inst, m);
+                m = after(inst, m);
             }
             for s in p.blocks[b].exit.successors() {
                 let new = match entry[s] {
@@ -725,6 +736,7 @@ impl<'a> Lower<'a> {
             abort: None,
             round16: round16(p),
             mode16: Some(0),
+            flush_half_input: None,
         }
     }
 
@@ -7170,78 +7182,6 @@ impl<'a> Lower<'a> {
             }
         };
         self.write_half(inst, r, guard)
-    }
-
-    /// `v_cvt_norm_i16_f16` / `v_cvt_norm_u16_f16`: the f16 source (with its
-    /// abs/neg modifiers) clamped to [-1, 1] or [0, 1], times 32767 or 65535,
-    /// rounded to nearest even once from the exact product; NaN gives 0.
-    /// Worked on the f16's bits in integers, because in f32 the product
-    /// (up to 26 significant bits) would round before the rounding to an
-    /// integer.
-    fn cvt_norm16(&mut self, inst: &Inst, signed: bool) -> Result<V, Why> {
-        let Fields::Valu(v) = &inst.fields else {
-            unreachable!()
-        };
-        let c = self.cur;
-        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
-        let mut h = self.half_src(inst, 0)?;
-        if v.abs & 1 != 0 {
-            let m = k(self, 0x7FFF);
-            h = self.s.m.bin(c, Bin::And, h, m);
-        }
-        if v.neg & 1 != 0 {
-            let m = k(self, 0x8000);
-            h = self.s.m.bin(c, Bin::Xor, h, m);
-        }
-        let scale = if signed { 0x7FFF } else { 0xFFFF };
-        let (k0, k1, k10) = (k(self, 0), k(self, 1), k(self, 10));
-        let mag_mask = k(self, 0x7FFF);
-        let mag = self.s.m.bin(c, Bin::And, h, mag_mask);
-        let k15 = k(self, 15);
-        let neg = self.s.m.bin(c, Bin::LShr, h, k15);
-        let neg = self.s.m.cmp(c, pred::NE, neg, k0);
-        // |x| < 1: x = m * 2^-s with m < 2^11 and 11 <= s <= 24.
-        let exp = self.s.m.bin(c, Bin::LShr, mag, k10);
-        let man_mask = k(self, 0x3FF);
-        let man = self.s.m.bin(c, Bin::And, mag, man_mask);
-        let implicit = k(self, 0x400);
-        let normal = self.s.m.bin(c, Bin::Or, man, implicit);
-        let sub = self.s.m.cmp(c, pred::EQ, exp, k0);
-        let m = self.s.m.select(c, sub, man, normal);
-        let k25 = k(self, 25);
-        let s_norm = self.s.m.bin(c, Bin::Sub, k25, exp);
-        let k24 = k(self, 24);
-        let sh = self.s.m.select(c, sub, k24, s_norm);
-        let ks = k(self, scale);
-        let p = self.s.m.bin(c, Bin::Mul, m, ks);
-        let q = self.s.m.bin(c, Bin::LShr, p, sh);
-        let one_s = self.s.m.bin(c, Bin::Shl, k1, sh);
-        let low_mask = self.s.m.bin(c, Bin::Sub, one_s, k1);
-        let rem = self.s.m.bin(c, Bin::And, p, low_mask);
-        let half = self.s.m.bin(c, Bin::LShr, one_s, k1);
-        let above = self.s.m.cmp(c, pred::IUGT, rem, half);
-        let tie = self.s.m.cmp(c, pred::EQ, rem, half);
-        let odd = self.s.m.bin(c, Bin::And, q, k1);
-        let odd = self.s.m.cmp(c, pred::NE, odd, k0);
-        let tie_up = self.s.m.bin(c, Bin::And, tie, odd);
-        let up = self.s.m.bin(c, Bin::Or, above, tie_up);
-        let r = self.s.m.select(c, up, k1, k0);
-        let r = self.s.m.bin(c, Bin::Add, q, r);
-        // |x| >= 1 (and infinity) saturates; NaN gives 0.
-        let one_h = k(self, 0x3C00);
-        let big = self.s.m.cmp(c, pred::IUGE, mag, one_h);
-        let r = self.s.m.select(c, big, ks, r);
-        let inf = k(self, 0x7C00);
-        let nan = self.s.m.cmp(c, pred::IUGT, mag, inf);
-        let r = self.s.m.select(c, nan, k0, r);
-        let r = if signed {
-            let n = self.s.m.bin(c, Bin::Sub, k0, r);
-            self.s.m.select(c, neg, n, r)
-        } else {
-            self.s.m.select(c, neg, k0, r)
-        };
-        let m16 = k(self, 0xFFFF);
-        Ok(self.s.m.bin(c, Bin::And, r, m16))
     }
 
     /// Half `high` of source `k` of a packed (VOP3P) operation, in the low
