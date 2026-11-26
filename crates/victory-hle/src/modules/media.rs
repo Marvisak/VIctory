@@ -60,11 +60,14 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
         text.clone()
     } else if let Some(rest) = text.strip_prefix(r"\??\") {
         // The same prefix as the object manager spells it; the host's file
-        // calls take it too.
+        // calls take it too, but the drive behind it is virtual and has to be
+        // translated like any other title path. A host drive stays as the
+        // title spelled it, prefix included.
         if !drive(rest) {
             return Err(("unc".into(), host_of(rest.trim_start_matches("UNC\\"))));
         }
-        return Ok(with_nul(url));
+        let wide: Vec<u16> = rest.encode_utf16().collect();
+        return Ok(files::translate(&wide).unwrap_or_else(|| with_nul(url)));
     } else if share(&text) {
         return Err(("unc".into(), host_of(&text[2..])));
     } else if drive(&text) {
@@ -538,6 +541,15 @@ mod tests {
             std::fs::read(&host).ok().as_deref(),
             Some(&b"1"[..]),
             "{host}"
+        );
+        // The object manager spells the same path with `\??\`; the drive is
+        // still virtual.
+        let object_manager =
+            text(&local(&wide(&format!(r"\??\{letter}:\movies\intro.mp4"))).unwrap());
+        assert_eq!(
+            std::fs::read(&object_manager).ok().as_deref(),
+            Some(&b"1"[..]),
+            "{object_manager}"
         );
         let from_url =
             text(&local(&wide(&format!("file:///{letter}:/movies/intro%20a.mp4"))).unwrap());
