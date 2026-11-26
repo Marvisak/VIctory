@@ -6834,6 +6834,27 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
+    /// `x`, 16-bit integer source `k` in the low bits, with its abs and neg
+    /// modifiers. RDNA2 applies them to bit 15, as to a sign bit: abs clears
+    /// it, neg flips it, both set it (measured on gfx1036 for the 16-bit
+    /// integer operations, their compares and v_cvt_f16_u16/i16).
+    fn int16_mods(&mut self, inst: &Inst, k: usize, x: V) -> V {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let c = self.cur;
+        let mut x = x;
+        if v.abs >> k & 1 != 0 {
+            let m = self.s.m.i32(0x7FFF);
+            x = self.s.m.bin(c, Bin::And, x, m);
+        }
+        if v.neg >> k & 1 != 0 {
+            let m = self.s.m.i32(0x8000);
+            x = self.s.m.bin(c, Bin::Xor, x, m);
+        }
+        x
+    }
+
     /// An f16 source as an f32 (exact), with its abs/neg modifiers.
     fn half_fsrc(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
@@ -7053,7 +7074,8 @@ impl<'a> Lower<'a> {
         if float1.contains(&name) {
             let r = match name {
                 "v_cvt_f16_u16" | "v_cvt_f16_i16" => {
-                    let mut x = self.half_src(inst, 0)?;
+                    let x = self.half_src(inst, 0)?;
+                    let mut x = self.int16_mods(inst, 0, x);
                     let op = if name == "v_cvt_f16_i16" {
                         let k16 = self.s.m.i32(16);
                         let t = self.s.m.bin(c, Bin::Shl, x, k16);
@@ -7102,7 +7124,11 @@ impl<'a> Lower<'a> {
             return self.write_half(inst, r, guard);
         }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
-        if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        // abs and neg of an integer source act on its bit 15
+        // ([`Self::int16_mods`]); those of the f16 source of the conversions
+        // below are not modelled.
+        let float_source = matches!(name, "v_cvt_u16_f16" | "v_cvt_i16_f16");
+        if v.clamp || v.omod != 0 || float_source && (v.abs != 0 || v.neg != 0) {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = match name {
@@ -7125,7 +7151,8 @@ impl<'a> Lower<'a> {
                 self.s.m.select(c, nan, z, r)
             }
             _ => {
-                let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                let (a, b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                let (mut a, mut b) = (self.int16_mods(inst, 0, a), self.int16_mods(inst, 1, b));
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {
                     let t = l.s.m.bin(c, Bin::Shl, x, k16);
@@ -7998,7 +8025,8 @@ impl<'a> Lower<'a> {
             }
             "u32" | "i32" | "u16" | "i16" => {
                 let (a, b) = if ty.ends_with("16") {
-                    let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                    let (a, b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                    let (mut a, mut b) = (self.int16_mods(inst, 0, a), self.int16_mods(inst, 1, b));
                     if ty == "i16" {
                         let k16 = self.s.m.i32(16);
                         for x in [&mut a, &mut b] {
