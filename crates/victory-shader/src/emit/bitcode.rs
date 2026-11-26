@@ -73,6 +73,10 @@ pub(crate) enum Bin {
 pub(crate) enum Rmw {
     Xchg = 0,
     Add = 1,
+    /// Kept to keep the indices aligned with LLVM's `atomicrmw` table. No arm
+    /// constructs it: `atomicrmw sub` removes the WARP device, so a console
+    /// subtract is lowered as an add of the wrapping negation in `lower.rs`.
+    #[allow(dead_code)]
     Sub = 2,
     And = 3,
     Or = 5,

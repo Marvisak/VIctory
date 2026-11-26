@@ -3450,7 +3450,10 @@ impl<'a> Lower<'a> {
         use super::bitcode::Rmw;
         let rmw = match op.as_str() {
             "add_u32" => Some(Rmw::Add),
-            "sub_u32" => Some(Rmw::Sub),
+            // A subtract is an add of the wrapping negation: bit-identical on the
+            // console, and it avoids `atomicrmw sub`, which removes the WARP device
+            // (the shader validates and hardware is exact; WARP is not).
+            "sub_u32" => Some(Rmw::Add),
             "and_b32" => Some(Rmw::And),
             "or_b32" => Some(Rmw::Or),
             "xor_b32" => Some(Rmw::Xor),
@@ -3463,6 +3466,13 @@ impl<'a> Lower<'a> {
             _ => return Err("an LDS operation"),
         };
         let v0 = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?[0];
+        // The subtract arm adds the negation instead; see the `sub_u32` mapping above.
+        let v0 = if op == "sub_u32" {
+            let z = self.s.m.i32(0);
+            self.s.m.bin(self.cur, Bin::Sub, z, v0)
+        } else {
+            v0
+        };
         let v1 = match data.get(1) {
             Some(d) => Some(self.vgprs(inst, d, 1)?[0]),
             None => None,
