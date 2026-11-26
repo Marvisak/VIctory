@@ -106,7 +106,10 @@ pub fn load_title_dlls(
 ) -> Result<Vec<(String, LoadedImage)>> {
     let mut loaded = Vec::new();
     let dirs = (title_dir, cache_dir);
-    map_imports(main, dirs, wanted, &mut HashSet::new(), &mut loaded)?;
+    if let Err(err) = map_imports(main, dirs, wanted, &mut HashSet::new(), &mut loaded) {
+        unload_all(loaded);
+        return Err(err);
+    }
     Ok(loaded)
 }
 
@@ -122,8 +125,18 @@ pub fn load_title_dll(
 ) -> Result<Vec<(String, LoadedImage)>> {
     let mut loaded = Vec::new();
     let dirs = (title_dir, cache_dir);
-    map_dll(name, dirs, wanted, &mut HashSet::new(), &mut loaded)?;
+    if let Err(err) = map_dll(name, dirs, wanted, &mut HashSet::new(), &mut loaded) {
+        unload_all(loaded);
+        return Err(err);
+    }
     Ok(loaded)
+}
+
+fn unload_all(loaded: Vec<(String, LoadedImage)>) {
+    for (_, image) in loaded.into_iter().rev() {
+        // SAFETY: none of these DLLs have had imports bound or entry points run.
+        unsafe { image.unload() };
+    }
 }
 
 fn map_imports(
@@ -154,7 +167,11 @@ fn map_dll(
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
     let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
-    map_imports(&image.info, dirs, wanted, seen, loaded)?;
+    if let Err(err) = map_imports(&image.info, dirs, wanted, seen, loaded) {
+        // SAFETY: this DLL has not had imports bound or its entry point run.
+        unsafe { image.unload() };
+        return Err(err);
+    }
     loaded.push((name, image));
     Ok(())
 }
