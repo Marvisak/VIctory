@@ -12,6 +12,13 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+mod pages;
+
+/// Whether view heaps are paged on this host (`host::view_pages`).
+pub(crate) fn view_pages() -> bool {
+    host::view_pages()
+}
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -195,6 +202,65 @@ pub(crate) fn sync_heaps() {
                 );
                 host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
             }
+        }
+    }
+    // Pages of paged heaps placed again since (title threads wrote them):
+    // all their slots, before a shader reads them.
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        remake_pages(heap, start);
+    }
+}
+
+/// After a submission ran (the GPU idle until the next): the view heap
+/// pages its shaders read (`crate::shadow::take_page_reads`) are in use,
+/// and placed again where they were taken back; where room runs low, pages
+/// unused lately are taken back (`host::HostHeap::take_back_pages`). A page
+/// placed again has all its slots made from the title's records here, so a
+/// page taken back too early reads null for the submission that read it.
+/// Runs before [`make_read`], which makes the placed textures read there.
+#[cfg(windows)]
+pub(crate) fn turn_pages(read: &[u32], at: std::time::Instant) {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(start, _, at_heap) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at_heap as *const Heap) };
+        let (Some(Some(host)), VIEWS_KIND) = (heap.host.get(), heap.desc.kind) else {
+            continue;
+        };
+        let again = host.pages_read(read);
+        host.take_back_pages(at);
+        for page in again {
+            host.place_page(page);
+        }
+        remake_pages(heap, start);
+    }
+}
+
+/// Makes every slot of the pages `heap`'s paged host heap placed again
+/// ([`host::HostHeap::remakes`]) from the title's records at `start`; a
+/// page of title memory with nothing mapped holds none.
+#[cfg(windows)]
+fn remake_pages(heap: &Heap, start: u64) {
+    let kind = heap.desc.kind;
+    let (Some(Some(host)), VIEWS_KIND, Some(step)) = (heap.host.get(), kind, increment(kind)) else {
+        return;
+    };
+    let step = u64::from(step);
+    let page_size = crate::watch::PAGE as u64;
+    for (first, last) in host.remakes() {
+        let last = last.min(heap.desc.count);
+        let mut i = first;
+        while i < last {
+            // The slots in this page of title memory.
+            let at = start + u64::from(i) * step;
+            let end = ((at & !(page_size - 1)) + page_size - start).div_ceil(step);
+            let end = (end as u32).clamp(i + 1, last);
+            if crate::host::read_into(at as *const u8, &mut [0u8; 4]) {
+                host.sync_slots(i, end, start, step);
+            }
+            i = end;
         }
     }
 }

@@ -53,7 +53,8 @@ pub fn counts() -> (u64, u64) {
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
 /// the compiler), the entry's encoding (this file's text) and the
 /// translation settings (the loop limit, which a diagnostics build can
-/// change at run time).
+/// change at run time, and whether view heaps are paged, which the host
+/// decides: [`options`]).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -64,27 +65,43 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        key(
+            victory_shader::SOURCE_HASH,
+            ENCODING,
+            limit,
+            options().view_pages,
+        )
     })
+}
+
+/// How shaders are translated for this host: writes through views mark
+/// their pages (copy-backs compare only those,
+/// `crate::shadow::copy_back_marks`), and view heap indices go through the
+/// page table where the host's view heaps are paged
+/// (`crate::descriptor::host::view_pages`).
+pub fn options() -> victory_shader::emit::Options {
+    victory_shader::emit::Options {
+        view_marks: true,
+        view_pages: crate::descriptor::view_pages(),
+    }
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, view_pages: bool) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&[u8::from(view_pages)]);
     *h.finalize().as_bytes()
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    // Writes through views mark their pages: copy-backs compare only those
-    // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true };
+    let options = options();
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
@@ -480,17 +497,19 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, false);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                options().view_pages
             )
         );
         // The encoding part is this file as built.

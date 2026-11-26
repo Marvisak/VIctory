@@ -1394,6 +1394,31 @@ pub struct Dispatch<'a> {
 
 #[cfg(test)]
 impl Host {
+    /// Where [`View::NullBuffers`] puts the null buffer views on a device
+    /// that refuses a view heap of [`super::HEAP_VIEWS`] slots (NVIDIA
+    /// takes at most 1,000,000): the host page, of
+    /// [`super::VIEW_PAGE_SLOTS`] slots, after the dispatch's `views`
+    /// others, at their offsets in [`super::NULL_BUFFER_VIEW`]'s page. A
+    /// program translated with view pages reads them there through a page
+    /// table entry for that page, as the runtime pages such heaps. None
+    /// where the device takes the whole heap (the views are at their own
+    /// slots).
+    pub fn null_buffer_page(&self, views: usize) -> Option<u32> {
+        // SAFETY: a plain heap creation, released at once.
+        let whole: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+            self.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: super::HEAP_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+        };
+        whole
+            .is_err()
+            .then(|| (views.saturating_sub(1) as u32).div_ceil(super::VIEW_PAGE_SLOTS))
+    }
+
     /// Runs a compute pipeline and returns each UAV's contents in heap
     /// order (texels as float bits, row by row).
     pub fn dispatch(
@@ -1541,8 +1566,24 @@ impl Host {
                 )]);
                 Ok::<_, String>(zeros)
             };
+            // The null buffer views' slot: their own, or the paged one.
+            let null_page = match d.views.last() {
+                Some(View::NullBuffers) => self.null_buffer_page(d.views.len()),
+                _ => None,
+            };
+            let null_at = match null_page {
+                Some(page) => {
+                    (page * super::VIEW_PAGE_SLOTS
+                        + super::NULL_BUFFER_VIEW % super::VIEW_PAGE_SLOTS)
+                        as usize
+                }
+                None => super::NULL_BUFFER_VIEW as usize,
+            };
             let slots = match d.views.last() {
-                Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
+                Some(View::NullBuffers) => match null_page {
+                    Some(page) => ((page + 1) * super::VIEW_PAGE_SLOTS) as usize,
+                    None => super::HEAP_VIEWS as usize,
+                },
                 _ => d.views.len(),
             };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
@@ -1878,7 +1919,7 @@ impl Host {
                     }
                     View::Pair => {}
                     View::NullBuffers => {
-                        let null = super::NULL_BUFFER_VIEW as usize;
+                        let null = null_at;
                         let (mut srv_at, mut uav_at) = (at, at);
                         srv_at.ptr += (null - i) * view_size;
                         uav_at.ptr += (null - 1 - i) * view_size;

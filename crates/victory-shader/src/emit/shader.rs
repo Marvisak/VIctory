@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -37,6 +37,30 @@ pub const HEAP_SAMPLERS: u32 = 2048;
 /// holds no buffer view where a shader reads one at an index it computes
 /// (`emit`, "Buffer views at computed heap indices").
 pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+/// View heap pages ([`super::Options::view_pages`]): view slots go in pages
+/// of this many, each placed anywhere in the host's heap.
+pub const VIEW_PAGE_SLOTS: u32 = 256;
+/// Where the view-page table is in the view-stride table (`t`[`VIEW_STRIDES`]),
+/// in bytes: past a dword per heap index, a dword per page of
+/// [`VIEW_PAGE_SLOTS`] slots, the host heap's page that holds it.
+pub const VIEW_PAGE_TABLE: u32 = HEAP_VIEWS * 4;
+
+thread_local! {
+    /// [`super::Options::view_pages`] for the translation on this thread.
+    static VIEW_PAGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`super::Options::view_pages`] for this thread's translations
+/// until the guard drops.
+pub(crate) fn view_pages(on: bool) -> impl Drop {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            VIEW_PAGES.with(|v| v.set(self.0));
+        }
+    }
+    Restore(VIEW_PAGES.with(|v| v.replace(on)))
+}
 /// The view-mark table's register: `t2` (a raw root SRV) in
 /// [`MEMORY_SPACE`] (`emit`, "Write marks").
 pub const VIEW_MARKS: u32 = 2;
@@ -52,6 +76,10 @@ pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// marks"), after the written pages in the same bitmap: one bit per
 /// resource-heap index, [`HEAP_VIEWS`] of them.
 pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
+/// The first bit of the read marks of view heap pages (`emit`, "Read
+/// marks"; with [`super::Options::view_pages`]), after the slots' read
+/// marks: one bit per page of [`VIEW_PAGE_SLOTS`] heap indices.
+pub const VIEW_PAGE_READS: u32 = VIEW_READS + HEAP_VIEWS;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -149,6 +177,21 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// View heap indices go through the view-page table
+    /// ([`super::Options::view_pages`]).
+    view_pages: bool,
+    /// Paged view heaps: per heap handle, the heap page it is in and the
+    /// block that computed it (`emit`, "Read marks").
+    pub page_index: std::collections::HashMap<V, (V, usize)>,
+    /// The pages of the handles the instruction being lowered reads, marked
+    /// once it is (`Lower::inst`).
+    pub page_reads: Vec<V>,
+    /// Pages marked so far, by console block: a page marked in a block is
+    /// not marked again later in it.
+    pub pages_marked: std::collections::HashSet<(usize, V)>,
+    /// Guarded code open where lowering is (`Lower::begin_guarded`): values
+    /// made inside are not seen past it.
+    pub guards: u32,
 }
 
 impl Shader {
@@ -209,6 +252,11 @@ impl Shader {
             wave_size: None,
             lds_dwords: 0,
             lds: None,
+            view_pages: VIEW_PAGES.with(std::cell::Cell::get),
+            page_index: std::collections::HashMap::new(),
+            page_reads: Vec::new(),
+            pages_marked: std::collections::HashSet::new(),
+            guards: 0,
             main,
             entry,
         }
@@ -545,6 +593,36 @@ impl Shader {
         let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
+        // Paged view heaps: the host slot is the slot's page's place in the
+        // host heap, from the page table, and its offset in the page.
+        let mut page_of = None;
+        let host_index = if self.view_pages && !sampler {
+            let table = self.root_srv_handle(VIEW_STRIDES);
+            let shift = self.m.i32(VIEW_PAGE_SLOTS.trailing_zeros());
+            let page = self.m.bin(block, Bin::LShr, index, shift);
+            page_of = Some(page);
+            let four = self.m.i32(4);
+            let at = self.m.bin(block, Bin::Mul, page, four);
+            let base = self.m.i32(VIEW_PAGE_TABLE);
+            let at = self.m.bin(block, Bin::Add, at, base);
+            let (u, mask, align) = (self.m.undef(self.t.i32), self.m.i8(1), self.m.i32(4));
+            let r = self.op(
+                block,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.t.res_ret,
+                139,
+                &[table, at, u, mask, align],
+            );
+            let placed = self.m.extract(block, r, 0);
+            let placed = self.m.cast(block, Cast::Bitcast, placed, self.t.i32);
+            let placed = self.m.bin(block, Bin::Shl, placed, shift);
+            let within = self.m.i32(VIEW_PAGE_SLOTS - 1);
+            let within = self.m.bin(block, Bin::And, index, within);
+            self.m.bin(block, Bin::Or, placed, within)
+        } else {
+            index
+        };
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -552,7 +630,7 @@ impl Shader {
             Attr::ReadNone,
             self.t.handle,
             218,
-            &[index, s, n],
+            &[host_index, s, n],
         );
         let h = self.annotate(block, h, props.0, props.1);
         // Unordered typed, raw and structured buffers (kinds 10-12), and
@@ -564,6 +642,9 @@ impl Shader {
         // Texture shader views (kinds 1-9).
         if !sampler && props.0 & 0x1000 == 0 && (1..=9).contains(&kind) {
             self.texture_index.insert(h, index);
+        }
+        if let Some(page) = page_of {
+            self.page_index.insert(h, (page, block));
         }
         h
     }

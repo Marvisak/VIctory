@@ -173,7 +173,16 @@
 //!   the host makes for the draw) also sets bit
 //!   [`VIEW_READS`] + the view's heap index in the same bitmap, after the
 //!   written pages, where still clear: the host makes views it left null
-//!   until a shader reads them (textures the title placed itself).
+//!   until a shader reads them (textures the title placed itself). With
+//!   [`Options::view_pages`] too, every instruction that reads or writes
+//!   through a view it takes from the heap (the heap itself or a table)
+//!   also sets bit [`VIEW_PAGE_READS`] + the index's page (index /
+//!   [`VIEW_PAGE_SLOTS`]), after the slots' read marks, where still clear:
+//!   the host takes back pages no shader used lately and places them again
+//!   when read. A page is marked once per console block, at the end of the
+//!   first instruction there using a handle of it; a handle first used
+//!   inside guarded code made for an instruction is marked there, with an
+//!   atomic and no test.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -237,8 +246,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS,
-    VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_PAGE_SLOTS, VIEW_PAGE_TABLE,
+    VIEW_PAGE_READS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS,
+    VIEW_WRITES,
 };
 
 /// The loop limit without an override: 2^20.
@@ -375,6 +385,12 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// View heap indices go through the host's view-page table
+    /// ([`VIEW_PAGE_TABLE`] in the view-stride table): for a host whose view
+    /// heaps are smaller than [`HEAP_VIEWS`] (NVIDIA takes 1,000,000), which
+    /// places the pages of slots in use anywhere in its heap. The host must
+    /// then bind the view-stride table to every program using the view heap.
+    pub view_pages: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -500,6 +516,7 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
+    let _pages = shader::view_pages(options.view_pages);
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a

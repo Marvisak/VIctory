@@ -788,8 +788,9 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
     static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
     BITMAPS[usize::from(memory)]
         .get_or_init(|| {
-            // Written pages, then one read mark per heap index.
-            let bits = victory_shader::emit::VIEW_READS + victory_shader::emit::HEAP_VIEWS;
+            // Written pages, one read mark per heap index, then one per
+            // view heap page.
+            let bits = victory_shader::emit::VIEW_PAGE_READS + PAGE_MARKS;
             let bytes = u64::from(bits / 8);
             let (buffer, data) = host()?.shared_buffer(bytes)?;
             crate::host::name(&buffer, || "views' written pages and read slots".into());
@@ -815,36 +816,80 @@ pub(crate) fn view_writes(memory: bool) -> Option<u64> {
 
 /// Heap slots whose texture views shaders read: the marks seen so far (a
 /// slot's stays set in the bitmap until [`forget_read`]), and the slots to
-/// clear at the next [`take_reads`].
+/// clear before the next submission ([`forget_reads_now`]) or at the next
+/// [`take_reads`].
 static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()));
+
+/// Both bitmaps' read marks (shaders that use title memory mark their reads
+/// in theirs).
+///
+/// # Safety
+/// The GPU is done with them (one submission runs at a time), and no other
+/// caller holds them.
+unsafe fn read_maps<'a>() -> Vec<&'a mut [u32]> {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
+    [false, true]
+        .into_iter()
+        .filter_map(bitmap)
+        // SAFETY: the mapped bitmap's read marks, as the caller says.
+        .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
+        .collect()
+}
+
+/// Read marks cleared by [`clear_forgotten`] before [`reads_since`] took
+/// them, a bit per slot: still reads since its last call.
+static CLEARED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Clears the read marks of the slots forgotten ([`forget_read`]) since
+/// the last call. Marks are by slot, whatever the heap: one set is kept for
+/// [`reads_since`] (another heap's shader may have read the slot).
+fn clear_forgotten(maps: &mut [&mut [u32]], seen: &mut Vec<u32>, forgotten: &mut Vec<u32>) {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    seen.resize(words, 0);
+    if forgotten.is_empty() {
+        return;
+    }
+    let mut cleared = CLEARED.lock().unwrap_or_else(|e| e.into_inner());
+    cleared.resize(words, 0);
+    for slot in forgotten.drain(..) {
+        let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
+        if w < words {
+            for bits in maps.iter_mut() {
+                cleared[w] |= bits[w] & bit;
+                bits[w] &= !bit;
+            }
+            seen[w] &= !bit;
+        }
+    }
+}
+
+/// Before a submission runs (the last one has): the read marks of slots
+/// forgotten since are cleared now, so that the submission's reads of them
+/// are taken after it ([`take_reads`]).
+pub(crate) fn forget_reads_now() {
+    // SAFETY: no submission runs.
+    let mut maps = unsafe { read_maps() };
+    if maps.is_empty() {
+        return;
+    }
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    let (seen, forgotten) = &mut *reads;
+    clear_forgotten(&mut maps, seen, forgotten);
+}
 
 /// After a submission: the heap slots its shaders first read texture views
 /// at (`victory_shader::emit`, "Read marks"), each once until
 /// [`forget_read`]. Clears the slots forgotten since first.
 pub(crate) fn take_reads() -> Vec<u32> {
-    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
-    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
-    // Both bitmaps: shaders that use title memory mark their reads in theirs.
-    let mut maps: Vec<&mut [u32]> = [false, true]
-        .into_iter()
-        .filter_map(bitmap)
-        // SAFETY: the mapped bitmap's read marks; the GPU is done with them
-        // (one submission runs at a time).
-        .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
-        .collect();
+    // SAFETY: the submission has run.
+    let mut maps = unsafe { read_maps() };
     if maps.is_empty() {
         return Vec::new();
     }
     let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
     let (seen, forgotten) = &mut *reads;
-    seen.resize(words, 0);
-    for slot in forgotten.drain(..) {
-        let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
-        if w < words {
-            maps.iter_mut().for_each(|bits| bits[w] &= !bit);
-            seen[w] &= !bit;
-        }
-    }
+    clear_forgotten(&mut maps, seen, forgotten);
     let mut new = Vec::new();
     for (w, s) in seen.iter_mut().enumerate() {
         let mut fresh = maps.iter().fold(0, |x, bits| x | bits[w]) & !*s;
@@ -858,7 +903,8 @@ pub(crate) fn take_reads() -> Vec<u32> {
 }
 
 /// The heap slots shaders read texture views at since the last call (both
-/// bitmaps), whose marks are cleared: what the title used (eviction stamps,
+/// bitmaps, and marks forgotten meanwhile), whose marks are cleared: what
+/// the title used (eviction stamps,
 /// `crate::resource::evict`). Between submissions, after [`take_reads`]
 /// has seen every mark: its own record of slots seen keeps a slot read
 /// again from being reported as new.
@@ -866,11 +912,12 @@ pub(crate) fn reads_since() -> Vec<u32> {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
     let mut slots = Vec::new();
+    let cleared = std::mem::take(&mut *CLEARED.lock().unwrap_or_else(|e| e.into_inner()));
     for b in [false, true].into_iter().filter_map(bitmap) {
         // SAFETY: the mapped bitmap's read marks; no submission runs.
         let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
         for (w, word) in bits.iter_mut().enumerate() {
-            let mut x = std::mem::take(word);
+            let mut x = std::mem::take(word) | cleared.get(w).copied().unwrap_or(0);
             while x != 0 {
                 slots.push(w as u32 * 32 + x.trailing_zeros());
                 x &= x - 1;
@@ -886,6 +933,35 @@ pub(crate) fn reads_since() -> Vec<u32> {
 /// marked again.
 pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
+}
+
+/// Read marks of view heap pages: one per page of heap indices.
+const PAGE_MARKS: u32 = victory_shader::emit::HEAP_VIEWS / victory_shader::emit::VIEW_PAGE_SLOTS;
+
+/// After a submission: the view heap pages its shaders read through views
+/// (`victory_shader::emit`, "Read marks"; paged heaps only), from both
+/// bitmaps, whose marks are cleared.
+pub(crate) fn take_page_reads() -> Vec<u32> {
+    let words = (PAGE_MARKS / 32) as usize;
+    let first = (victory_shader::emit::VIEW_PAGE_READS / 32) as usize;
+    let mut pages = Vec::new();
+    let mut read = vec![0u32; words];
+    for b in [false, true].into_iter().filter_map(bitmap) {
+        // SAFETY: the mapped bitmap's page read marks; the GPU is done with
+        // them (one submission runs at a time).
+        let bits =
+            unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
+        for (r, word) in read.iter_mut().zip(bits) {
+            *r |= std::mem::take(word);
+        }
+    }
+    for (w, mut x) in read.into_iter().enumerate() {
+        while x != 0 {
+            pages.push(w as u32 * 32 + x.trailing_zeros());
+            x &= x - 1;
+        }
+    }
+    pages
 }
 
 /// After a submission: every page its shaders marked as written through
@@ -1313,6 +1389,14 @@ pub(crate) mod tests {
         let bit = victory_shader::emit::VIEW_READS + slot;
         // SAFETY: a bit of the mapped bitmap; no submission runs (the caller
         // holds the submission lock).
+        unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
+
+    /// A shader's read mark of view heap page `page`, as [`mark_read`].
+    pub(crate) fn mark_page_read(memory: bool, page: u32) {
+        let b = bitmap(memory).expect("a host GPU");
+        let bit = victory_shader::emit::VIEW_PAGE_READS + page;
+        // SAFETY: as in `mark_read`.
         unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
     }
 

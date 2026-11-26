@@ -172,6 +172,17 @@ fn build(
     used: Vec<UsedResource>,
     threads: u32,
 ) -> HostShader {
+    build_with(words, layout, used, threads, false)
+}
+
+/// [`build`], with read and write marks (`view_marks`).
+fn build_with(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    threads: u32,
+    view_marks: bool,
+) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -198,7 +209,7 @@ fn build(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        view_marks: false,
+        view_marks,
     })
     .expect("lower");
     let shader = HostShader {
@@ -303,24 +314,146 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
-/// A buffer read at a heap index from data whose slot holds no buffer view
-/// (the view-stride table holds 0 there; a texture here) reads the host's
-/// null buffer view instead (`emit`, "Buffer views at computed heap
-/// indices"): a texture descriptor read as a buffer one is a wild address.
+/// With view heap pages (`Options::view_pages`, for hosts whose heaps are
+/// smaller than `HEAP_VIEWS`), a heap index goes through the page table past
+/// the view-stride table: the same program reads its buffer at virtual slot
+/// 1,099,777 (page 4,296, slot 1 in it) from the host heap's page 0, where
+/// the table places that page, and its UAV at slot 0 (page 0, placed at 0),
+/// exactly as the program without pages reads slot 1 (on an NVIDIA host the
+/// test host's structured view reads differently from WARP, #1835: both
+/// forms read the same there), and as on the console on WARP.
 #[test]
-fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
-    let shader = build(
-        HEAP_ELEMENT_WAVE32,
+fn a_heap_index_in_a_paged_view_heap_reads_where_its_page_is() {
+    let layout = || {
         vec![
             param(RootType::Constants, 0),
             param(RootType::ResourceHeap, 1),
             param(RootType::Table, 2),
-        ],
-        vec![entry(ResourceType::Uav, 4, 2)],
-        32,
+        ]
+    };
+    let used = || vec![entry(ResourceType::Uav, 4, 2)];
+    let plain = build(HEAP_ELEMENT_WAVE32, layout(), used(), 32);
+    let paged = {
+        let _paged = super::shader::view_pages(true);
+        build(HEAP_ELEMENT_WAVE32, layout(), used(), 32)
+    };
+    assert_ne!(plain.dxil, paged.dxil, "the page lookup is made");
+    assert_eq!(
+        paged.root_srvs,
+        [VIEW_STRIDES],
+        "the stride and page tables"
     );
-    let texel = [[1.0f32, 2.0, 3.0, 4.0]];
-    let views = [View::RawUav(32), View::Texture(1, 1, &texel), View::NullBuffers];
+    let page = super::VIEW_PAGE_SLOTS;
+    let slot = 4296 * page + 1;
+    let mut tables = vec![0u32; (super::HEAP_VIEWS + super::HEAP_VIEWS / page) as usize];
+    tables[..2].copy_from_slice(&[4, 12]);
+    tables[slot as usize] = 12;
+    // Page 4,296 at host page 0 (page 0 is there too: entries are 0).
+    let pages = (super::VIEW_PAGE_TABLE / 4) as usize;
+    tables[pages + 4296] = 0;
+    tables[pages + 1] = 7; // a page no slot here is in
+    let data: Vec<u32> = (0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
+    let views = [
+        View::RawUav(32),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Structured(12),
+        },
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let run = |shader: &HostShader, index: u32| {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match u.root {
+                    RootType::Constants => index,
+                    RootType::Table => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            host.dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: tables.clone(),
+                            },
+                        ),
+                    ],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"))
+        };
+        let direct = run(&plain, 1);
+        let through_pages = run(&paged, slot);
+        assert_eq!(
+            through_pages[0], direct[0],
+            "{label}: as slot 1 without pages"
+        );
+        if warp {
+            let want: Vec<u32> = (0..32).map(|l| 200 + l).collect();
+            assert_eq!(through_pages[0], want, "{label}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// With view pages and marks, the views a program takes from the heap mark
+/// their pages read (`emit`, "Read marks"): the buffer at virtual slot
+/// 1,099,777 sets bit `VIEW_PAGE_READS` + 4,296, the table's UAV at slot 0
+/// bit `VIEW_PAGE_READS`, and nothing else is set (no texture read, no
+/// write marked).
+#[test]
+fn views_read_in_a_paged_view_heap_mark_their_pages() {
+    let shader = {
+        let _paged = super::shader::view_pages(true);
+        build_with(
+            HEAP_ELEMENT_WAVE32,
+            vec![
+                param(RootType::Constants, 0),
+                param(RootType::ResourceHeap, 1),
+                param(RootType::Table, 2),
+            ],
+            vec![entry(ResourceType::Uav, 4, 2)],
+            32,
+            true,
+        )
+    };
+    assert!(shader.view_marks, "the bitmap is bound");
+    let page = super::VIEW_PAGE_SLOTS;
+    let slot = 4296 * page + 1;
+    let mut tables = vec![0u32; (super::HEAP_VIEWS + super::HEAP_VIEWS / page) as usize];
+    tables[..2].copy_from_slice(&[4, 12]);
+    tables[slot as usize] = 12;
+    // Pages 0 and 4,296 at host page 0 (entries are 0).
+    let data: Vec<u32> = (0..32).flat_map(|e| [100 + e, 200 + e, 300 + e]).collect();
+    let views = [
+        View::RawUav(32),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Structured(12),
+        },
+    ];
+    let words = (super::VIEW_PAGE_READS + super::HEAP_VIEWS / page) / 32;
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -335,12 +468,107 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
+            ud[u.index as usize] = if u.root == RootType::Constants { slot } else { 0 };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: tables.clone() }),
+                        (2, Root::View { srv: true, data: vec![super::VIEW_MARK_NONE, 0] }),
+                        (3, Root::Uav(words)),
+                    ],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let bits = &out[1];
+        let set: Vec<u32> = (0..bits.len() as u32 * 32)
+            .filter(|&b| bits[(b / 32) as usize] >> (b % 32) & 1 != 0)
+            .collect();
+        let pages = super::VIEW_PAGE_READS;
+        assert_eq!(set, [pages, pages + 4296], "{label}: the pages read");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A buffer read at a heap index from data whose slot holds no buffer view
+/// (the view-stride table holds 0 there; a texture here) reads the host's
+/// null buffer view instead (`emit`, "Buffer views at computed heap
+/// indices"): a texture descriptor read as a buffer one is a wild address.
+/// On a device that refuses a heap of every index shaders take (NVIDIA),
+/// the program is translated with view pages and the null views' page is
+/// mapped where the test host puts them, as the runtime pages such heaps.
+#[test]
+fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
+    let program = || {
+        build(
+            HEAP_ELEMENT_WAVE32,
+            vec![
+                param(RootType::Constants, 0),
+                param(RootType::ResourceHeap, 1),
+                param(RootType::Table, 2),
+            ],
+            vec![entry(ResourceType::Uav, 4, 2)],
+            32,
+        )
+    };
+    let plain = program();
+    let paged = {
+        let _paged = super::shader::view_pages(true);
+        program()
+    };
+    let texel = [[1.0f32, 2.0, 3.0, 4.0]];
+    let views = [View::RawUav(32), View::Texture(1, 1, &texel), View::NullBuffers];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        // Heap index 1 holds no buffer view: stride 0.
+        let (shader, tables) = match host.null_buffer_page(views.len()) {
+            None => (&plain, vec![4, 0]),
+            Some(page) => {
+                // The strides, then a page per entry: the null views' page
+                // where the test host put them; the others at host page 0.
+                let pages = super::HEAP_VIEWS / super::VIEW_PAGE_SLOTS;
+                let mut tables = vec![0u32; (super::HEAP_VIEWS + pages) as usize];
+                tables[0] = 4;
+                let at =
+                    super::VIEW_PAGE_TABLE / 4 + super::NULL_BUFFER_VIEW / super::VIEW_PAGE_SLOTS;
+                tables[at as usize] = page;
+                (&paged, tables)
+            }
+        };
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
             // The texture at heap index 1, the UAV's table at 0.
             ud[u.index as usize] = u32::from(u.root == RootType::Constants);
         }
         let dispatch = Dispatch {
-            // Heap index 1 holds no buffer view: stride 0.
-            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0] })],
+            roots: vec![
+                (0, Root::Constants(ud)),
+                (
+                    1,
+                    Root::View {
+                        srv: true,
+                        data: tables,
+                    },
+                ),
+            ],
             views: &views,
             samplers: &[],
             groups: [1, 1, 1],

@@ -2866,6 +2866,7 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(self.cur, Term::CondBr(g, then, join));
         let head = self.cur;
         self.cur = then;
+        self.s.guards += 1;
         Some((head, join))
     }
 
@@ -2877,6 +2878,7 @@ impl<'a> Lower<'a> {
         let then = self.cur;
         self.s.m.terminate(then, Term::Br(join));
         self.cur = join;
+        self.s.guards = self.s.guards.saturating_sub(1);
         values
             .iter()
             .map(|&(inside, outside)| {
@@ -3551,6 +3553,12 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        // The view heap pages it read, each once per console block.
+        for page in std::mem::take(&mut self.s.page_reads) {
+            if r.is_ok() && self.s.pages_marked.insert((b, page)) {
+                self.mark_read_bit(super::VIEW_PAGE_READS, page, true);
+            }
+        }
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
@@ -5337,6 +5345,17 @@ impl<'a> Lower<'a> {
             && self.is_heap_direct(src)
         {
             self.s.texture_reads.push(index);
+        }
+        // Its page's read mark: at the instruction's end, which values made
+        // inside guarded code do not reach (marked there instead).
+        if let Some(&(page, made)) = self.s.page_index.get(&h)
+            && self.x.view_marks
+        {
+            if self.s.guards == 0 || made == self.s.entry {
+                self.s.page_reads.push(page);
+            } else {
+                self.mark_read_bit(super::VIEW_PAGE_READS, page, false);
+            }
         }
         Ok(h)
     }
@@ -8347,24 +8366,34 @@ impl<'a> Lower<'a> {
     /// "Read marks") where it is still clear. Nothing without
     /// [`Parts::view_marks`].
     fn mark_view_read(&mut self, index: V) {
-        if !self.x.view_marks {
-            return;
+        if self.x.view_marks {
+            self.mark_read_bit(super::VIEW_READS, index, true);
         }
+    }
+
+    /// Sets bit `base` + `n` of the view-writes bitmap: where still clear
+    /// (`tested`), else with an atomic alone (inside guarded code, which
+    /// cannot branch on).
+    fn mark_read_bit(&mut self, base: u32, n: V, tested: bool) {
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let bitmap = self.s.view_writes_handle();
         let c = self.cur;
         let (base, k5, k2, k31, one, zero) =
-            (k(self, super::VIEW_READS), k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
-        let n = self.s.m.bin(c, Bin::Add, index, base);
+            (k(self, base), k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
+        let n = self.s.m.bin(c, Bin::Add, n, base);
         let word = self.s.m.bin(c, Bin::LShr, n, k5);
         let word = self.s.m.bin(c, Bin::Shl, word, k2);
         let bit = self.s.m.bin(c, Bin::And, n, k31);
         let bit = self.s.m.bin(c, Bin::Shl, one, bit);
-        // Most reads find their slot marked: a load, not an atomic.
-        let old = self.raw_dword(bitmap, word);
-        let set = self.s.m.bin(c, Bin::And, old, bit);
-        let clear = self.s.m.cmp(c, pred::EQ, set, zero);
-        let at = self.begin_guarded(Some(clear));
+        // Most reads find their bit set: a load, not an atomic.
+        let at = if tested {
+            let old = self.raw_dword(bitmap, word);
+            let set = self.s.m.bin(c, Bin::And, old, bit);
+            let clear = self.s.m.cmp(c, pred::EQ, set, zero);
+            self.begin_guarded(Some(clear))
+        } else {
+            None
+        };
         let iu = self.s.m.undef(self.s.t.i32);
         // Operation 2 is OR.
         self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
