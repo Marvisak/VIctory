@@ -34,8 +34,8 @@ struct NotificationState {
     running: Vec<(usize, ThreadId)>,
 }
 
-/// A notification list whose unregistration waits for any in-flight invocation
-/// of that registration on another thread to return, matching Windows PSM.
+/// A notification list that keeps callback context safe until any in-flight
+/// invocation on another thread has returned after unregistration.
 struct Notifications {
     state: Mutex<NotificationState>,
     done: Condvar,
