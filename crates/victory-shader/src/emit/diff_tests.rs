@@ -815,8 +815,20 @@ fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
     data
 }
 
+/// The lock every GPU test module takes: WARP can end the process with an
+/// access violation, and one test's dispatch running beside another's
+/// readback is what made `memory_tests`' title-memory test fail now and then
+/// in a full workspace run (#1882). The three tests here that make a host
+/// are the ones that were not taking it.
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn translated_shaders_draw_as_pc_ones() {
+    let _one = one_at_a_time();
     let Some((console, pc)) = tools() else {
         eprintln!("no console or PC compiler; skipped");
         return;
@@ -974,6 +986,7 @@ fn translated_shaders_draw_as_pc_ones() {
 
 #[test]
 fn translated_mesh_shaders_draw_as_pc_ones() {
+    let _one = one_at_a_time();
     let Some((console, pc)) = tools() else {
         eprintln!("no console or PC compiler; skipped");
         return;
@@ -1091,6 +1104,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
 /// angles cannot be tried from here.
 #[test]
 fn float_semantics_are_the_consoles() {
+    let _one = one_at_a_time();
     use super::host::{Dispatch, View};
     let Some((console, _)) = tools() else {
         eprintln!("no console compiler; skipped");
@@ -1187,6 +1201,7 @@ fn float_semantics_are_the_consoles() {
 /// the same `SampleGrad` (the host's own projection) is printed alongside.
 #[test]
 fn cube_gradients_pick_the_level() {
+    let _one = one_at_a_time();
     use super::host::{Dispatch, View};
     let Some((console, pc)) = tools() else {
         eprintln!("no console or PC compiler; skipped");
@@ -1332,6 +1347,7 @@ fn close(a: u32, b: u32) -> bool {
 
 #[test]
 fn translated_compute_matches_pc() {
+    let _one = one_at_a_time();
     use super::host::{Dispatch, Stride, View};
     let Some((console, pc)) = tools() else {
         eprintln!("no console or PC compiler; skipped");
@@ -1553,3 +1569,4 @@ fn translated_compute_matches_pc() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
 }
+

@@ -232,6 +232,9 @@ mod tests {
     /// line draw nothing.
     #[test]
     fn rectangles_get_their_fourth_corner() {
+        let _one = super::super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (vs, ps) = (shader(false), shader(true));
         let gs = super::rectangle_gs(&vs).unwrap();
         if let Ok(mut v) =
@@ -272,3 +275,4 @@ mod tests {
         }
     }
 }
+
