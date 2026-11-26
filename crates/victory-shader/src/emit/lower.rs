@@ -272,6 +272,9 @@ struct Lower<'a> {
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
     section_out: HashSet<Value>,
+    /// Values whole-wave sections leave whose lanes differ: the block and
+    /// start of the section (see [`super::wave::Section::lanes`]).
+    section_lanes: HashMap<Value, (usize, usize)>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -720,6 +723,7 @@ impl<'a> Lower<'a> {
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
+            section_lanes: HashMap::new(),
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1118,7 +1122,11 @@ impl<'a> Lower<'a> {
         let inst = &self.x.p.blocks[b].insts[i];
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
-                let shape = self.sections[&b][&start].shapes.get(&w).copied();
+                let sec = &self.sections[&b][&start];
+                let shape = sec.shapes.get(&w).copied();
+                if shape.is_none() && sec.lanes.contains_key(&w) {
+                    self.section_lanes.insert(w, (b, start));
+                }
                 match shape.ok_or(UNKNOWN).and_then(|sh| self.shape(sh)) {
                     Ok(x) => Val::I32(x),
                     Err(why) => Val::Missing(why),
@@ -1128,6 +1136,28 @@ impl<'a> Lower<'a> {
             };
             self.vals.insert(w, val);
         }
+    }
+
+    /// The shape of the lane a `v_readlane_b32` reads at a constant lane, of
+    /// a value a whole-wave section leaves whose lanes differ.
+    fn section_lane(&self, inst: &Inst) -> Option<super::wave::Shape> {
+        let Fields::Valu(v) = &inst.fields else {
+            return None;
+        };
+        let Some(&Operand::Vector { reg, .. }) = v.src.first() else {
+            return None;
+        };
+        let src = inst.read(Reg::V(reg))?;
+        let &(b, start) = self.section_lanes.get(&src)?;
+        let lane = match *v.src.get(1)? {
+            Operand::Const(c) => crate::resource::inline(c)?,
+            Operand::Literal(x) => x,
+            _ => return None,
+        };
+        *self.sections[&b][&start]
+            .lanes
+            .get(&src)?
+            .get(lane as usize)?
     }
 
     /// A value a whole-wave section leaves, as DXIL wave operations over the
@@ -6646,6 +6676,13 @@ impl<'a> Lower<'a> {
                         .is_some() =>
             {
                 Err("a VGPR of spilled SGPRs read per lane")
+            }
+            // One lane of a value a whole-wave section leaves, its lanes
+            // differing: what that lane holds, seen from any lane.
+            "v_readlane_b32" if self.section_lane(inst).is_some() => {
+                let shape = self.section_lane(inst).expect("checked");
+                let r = self.shape(shape)?;
+                int(self, r)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
