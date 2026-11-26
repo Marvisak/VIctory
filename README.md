@@ -94,6 +94,12 @@ target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf 
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+If the executable is not in the same folder as the rest of the dump (a
+patched or extracted exe elsewhere), keep the title's own DLLs beside the
+executable or in `game_dir`: both are searched, the executable's folder
+first. `MicrosoftGame.config` is read from the executable's folder, else from
+`game_dir`, and `G:` is mounted where it is found.
+
 The `translate --cache` step (minutes; again after a change of the shader
 translator) translates every shader the title can ask for into the cache
 (about 1.3 GB), so a run does not translate them while it plays; without it

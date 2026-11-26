@@ -94,41 +94,43 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     Ok(loaded)
 }
 
-/// Maps the DLLs the title ships in `title_dir` that `main` imports,
+/// Maps the DLLs the title ships in `title_dirs` that `main` imports,
 /// directly or through each other, in initialisation order (dependencies
-/// first). Only DLL names `wanted` accepts are considered, so DLLs the host
-/// or our runtime provide stay with them. Imports are not bound.
+/// first). Each DLL comes from the first of the folders, in search order,
+/// that has it (see [`crate::find_title_dll`]). Only DLL names `wanted`
+/// accepts are considered, so DLLs the host or our runtime provide stay with
+/// them. Imports are not bound.
 pub fn load_title_dlls(
     main: &ImageInfo,
-    title_dir: &Path,
+    title_dirs: &[&Path],
     cache_dir: &Path,
     wanted: &dyn Fn(&str) -> bool,
 ) -> Result<Vec<(String, LoadedImage)>> {
     let mut loaded = Vec::new();
-    let dirs = (title_dir, cache_dir);
+    let dirs = (title_dirs, cache_dir);
     map_imports(main, dirs, wanted, &mut HashSet::new(), &mut loaded)?;
     Ok(loaded)
 }
 
-/// Maps the DLL `name` from `title_dir` like [`load_title_dlls`] does, with
+/// Maps the DLL `name` from `title_dirs` like [`load_title_dlls`] does, with
 /// the title DLLs it imports (dependencies first, `name` last); empty if
-/// `wanted` refuses it or the folder has no such file. For DLLs a title
+/// `wanted` refuses it or no folder has such a file. For DLLs a title
 /// loads itself; `wanted` must refuse those already mapped.
 pub fn load_title_dll(
     name: &str,
-    title_dir: &Path,
+    title_dirs: &[&Path],
     cache_dir: &Path,
     wanted: &dyn Fn(&str) -> bool,
 ) -> Result<Vec<(String, LoadedImage)>> {
     let mut loaded = Vec::new();
-    let dirs = (title_dir, cache_dir);
+    let dirs = (title_dirs, cache_dir);
     map_dll(name, dirs, wanted, &mut HashSet::new(), &mut loaded)?;
     Ok(loaded)
 }
 
 fn map_imports(
     info: &ImageInfo,
-    dirs: (&Path, &Path),
+    dirs: (&[&Path], &Path),
     wanted: &dyn Fn(&str) -> bool,
     seen: &mut HashSet<String>,
     loaded: &mut Vec<(String, LoadedImage)>,
@@ -141,16 +143,18 @@ fn map_imports(
 
 fn map_dll(
     name: &str,
-    dirs: (&Path, &Path),
+    dirs: (&[&Path], &Path),
     wanted: &dyn Fn(&str) -> bool,
     seen: &mut HashSet<String>,
     loaded: &mut Vec<(String, LoadedImage)>,
 ) -> Result<()> {
     let name = name.to_ascii_lowercase();
-    let path = dirs.0.join(&name);
-    if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
+    if !seen.insert(name.clone()) || !wanted(&name) {
         return Ok(());
     }
+    let Some(path) = crate::search::find_title_dll(dirs.0, &name) else {
+        return Ok(());
+    };
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
     let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;

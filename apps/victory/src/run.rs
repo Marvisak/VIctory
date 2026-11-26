@@ -35,6 +35,70 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+/// Where a title's files are: its executable's folder, and the content
+/// folder (`game_dir`) when the dump is laid out separately from the
+/// executable (a patched or extracted exe beside neither `MicrosoftGame.config`
+/// nor the data). Title DLLs, the manifest and the package files are looked
+/// for in that order, the executable's folder first.
+#[cfg(any(windows, test))]
+struct TitleLayout {
+    /// The executable's folder, then the content folder if it is another one.
+    dirs: Vec<std::path::PathBuf>,
+}
+
+#[cfg(any(windows, test))]
+impl TitleLayout {
+    fn new(exe_dir: &Path, game_dir: Option<&Path>) -> Self {
+        let mut dirs = vec![exe_dir.to_owned()];
+        if let Some(game_dir) = game_dir
+            && !same_dir(exe_dir, game_dir)
+        {
+            dirs.push(game_dir.to_owned());
+        }
+        Self { dirs }
+    }
+
+    fn exe_dir(&self) -> &Path {
+        &self.dirs[0]
+    }
+
+    /// The folders in search order, for the loader.
+    fn search(&self) -> Vec<&Path> {
+        self.dirs.iter().map(|d| d.as_path()).collect()
+    }
+
+    /// The first folder holding `file`; the executable's if none does.
+    fn dir_with(&self, file: &Path) -> &Path {
+        self.dirs
+            .iter()
+            .find(|dir| dir.join(file).is_file())
+            .map_or_else(|| self.exe_dir(), |dir| dir.as_path())
+    }
+
+    /// The package's content folder, where `MicrosoftGame.config` is: it is
+    /// read from there and `G:` is mounted there.
+    fn content_dir(&self) -> &Path {
+        self.dir_with(Path::new("MicrosoftGame.config"))
+    }
+
+    /// Where the loader found the title's DLL `name`.
+    fn dll_path(&self, name: &str) -> std::path::PathBuf {
+        victory_loader::find_title_dll(&self.search(), name)
+            .unwrap_or_else(|| self.exe_dir().join(name))
+    }
+}
+
+/// Whether two paths are the same folder (the same path, or the same
+/// folder through links or other spellings).
+#[cfg(any(windows, test))]
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -65,12 +129,16 @@ pub fn run(
         &std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?,
     )?;
     let hash = prepared.original_hash.to_hex();
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
+    let layout = TitleLayout::new(
+        exe.parent().unwrap_or(Path::new(".")),
+        cfg.game_dir.as_deref(),
+    );
     match victory_game::identify(&hash) {
         Some(build) => {
             println!("build          {} ({hash})", build.label);
             if execute {
-                check_startup_archive(&title_dir.join(build.startup_archive))?;
+                let archive = Path::new(build.startup_archive);
+                check_startup_archive(&layout.dir_with(archive).join(archive))?;
             }
         }
         None => println!("build          unknown ({hash})"),
@@ -95,8 +163,9 @@ pub fn run(
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     // A missing manifest leaves id 0 and no storage quota.
+    let content_dir = layout.content_dir();
     let manifest =
-        std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
+        std::fs::read_to_string(content_dir.join("MicrosoftGame.config")).unwrap_or_default();
     let title = victory_hle::runtime::Title::from_manifest(&manifest);
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
     println!(
@@ -106,7 +175,7 @@ pub fn run(
         title.storage_bytes >> 20
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
-    victory_hle::modules::files::mount_at('G', title_dir);
+    victory_hle::modules::files::mount_at('G', content_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
@@ -115,10 +184,10 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
-    let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
+    let dlls = victory_loader::load_title_dlls(image.info(), &layout.search(), &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
-        victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+        victory_hle::runtime::set_image_path(dll.base(), &layout.dll_path(name));
     }
     let imported: Vec<&str> = image
         .info()
@@ -131,9 +200,14 @@ pub fn run(
     if !absent.is_empty() {
         let message = format!(
             "{} not in {}, and neither the host nor VIctory provides {}: the package is \
-             incomplete; copy every file of the package next to the executable",
+             incomplete; copy every file of the package next to the executable or into the game directory",
             absent.join(", "),
-            title_dir.display(),
+            layout
+                .dirs
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" or "),
             if absent.len() == 1 { "it" } else { "them" },
         );
         println!("missing dlls   {message}");
@@ -183,7 +257,7 @@ pub fn run(
     diagnostics(&image, &cfg);
     let late = LateDlls {
         host: resolver.host.clone(),
-        title_dir: title_dir.to_owned(),
+        layout,
         cache_dir: images,
         policy,
         mapped: std::sync::Mutex::new(dlls.clone()),
@@ -335,7 +409,7 @@ fn absent_title_dlls(
 #[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,
-    title_dir: std::path::PathBuf,
+    layout: TitleLayout,
     cache_dir: std::path::PathBuf,
     policy: victory_loader::UnimplementedPolicy,
     /// Every title DLL mapped so far, to bind new ones against.
@@ -366,7 +440,7 @@ impl LateDlls {
                 let wanted = |dll: &str| title_dll(&self.host, dll) && image_named(dll).is_none();
                 let new = victory_loader::load_title_dll(
                     file,
-                    &self.title_dir,
+                    &self.layout.search(),
                     &self.cache_dir,
                     &wanted,
                 )?;
@@ -385,7 +459,7 @@ impl LateDlls {
                         dll.base()
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
-                    set_image_path(dll.base(), &self.title_dir.join(name));
+                    set_image_path(dll.base(), &self.layout.dll_path(name));
                 }
                 // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());
@@ -555,4 +629,66 @@ mod cpu_check_tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<u32> {
     anyhow::bail!("running titles requires Windows")
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::TitleLayout;
+
+    fn touch(dir: &std::path::Path, file: &str) {
+        std::fs::write(dir.join(file), b"x").unwrap();
+    }
+
+    #[test]
+    fn one_folder_is_searched_once_and_holds_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), "MicrosoftGame.config");
+        touch(dir.path(), "a.dll");
+        for game_dir in [None, Some(dir.path())] {
+            let layout = TitleLayout::new(dir.path(), game_dir);
+            assert_eq!(layout.search(), [dir.path()]);
+            assert_eq!(layout.content_dir(), dir.path());
+            assert_eq!(layout.dll_path("A.dll"), dir.path().join("a.dll"));
+        }
+        // Another spelling of the same folder is the same folder.
+        let dotted = dir.path().join(".");
+        assert_eq!(
+            TitleLayout::new(dir.path(), Some(&dotted)).search().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_separated_layout_finds_dlls_beside_the_exe_and_the_manifest_in_the_data() {
+        let exe = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        touch(exe.path(), "bink.dll");
+        touch(exe.path(), "both.dll");
+        touch(data.path(), "both.dll");
+        touch(data.path(), "in-data.dll");
+        touch(data.path(), "MicrosoftGame.config");
+        let layout = TitleLayout::new(exe.path(), Some(data.path()));
+
+        assert_eq!(layout.search(), [exe.path(), data.path()]);
+        // The manifest and `G:` come from the data folder...
+        assert_eq!(layout.content_dir(), data.path());
+        // ...the DLLs from where they are, the executable's folder first.
+        assert_eq!(layout.dll_path("bink.dll"), exe.path().join("bink.dll"));
+        assert_eq!(layout.dll_path("both.dll"), exe.path().join("both.dll"));
+        assert_eq!(
+            layout.dll_path("in-data.dll"),
+            data.path().join("in-data.dll")
+        );
+    }
+
+    #[test]
+    fn a_manifest_beside_the_exe_wins_and_a_missing_one_leaves_the_exe_folder() {
+        let exe = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let layout = TitleLayout::new(exe.path(), Some(data.path()));
+        assert_eq!(layout.content_dir(), exe.path());
+        touch(data.path(), "MicrosoftGame.config");
+        touch(exe.path(), "MicrosoftGame.config");
+        assert_eq!(layout.content_dir(), exe.path());
+    }
 }
