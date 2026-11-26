@@ -539,6 +539,19 @@ impl Module {
                     u.sampler_heap |= sampler;
                 }
                 u.wave |= name.starts_with("dx.op.wave") || name.starts_with("dx.op.quad");
+                // Validators before 1.8 reject gradient operations
+                // outside the pixel stage. This set matches DXC's
+                // gradient classification: the implicit-derivative
+                // samples (60/61/64) and the LOD query (81), plus the
+                // explicit derivatives (83..=86). Bfi and the dot
+                // products (53..=56) are arithmetic, and
+                // SampleGrad/SampleLevel (62/63) take explicit
+                // gradients, so the validator accepts those in compute
+                // already. A dx.op's first argument is its opcode.
+                if name.starts_with("dx.op.") {
+                    let opcode = args.first().and_then(|&a| self.int_value(a));
+                    u.derivatives |= matches!(opcode, Some(60 | 61 | 64 | 81 | 83..=86));
+                }
             }
         }
         u
@@ -1033,6 +1046,9 @@ pub struct Uses {
     pub wave: bool,
     /// 64-bit integers.
     pub int64: bool,
+    /// Gradient operations: the implicit-derivative samples, the LOD
+    /// query, and the explicit derivatives.
+    pub derivatives: bool,
 }
 
 /// What [`Module::write`] writes ([`Module::plan`]).

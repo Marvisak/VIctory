@@ -1,6 +1,7 @@
 //! A DXIL vertex, pixel, compute or mesh shader under construction: the module,
 //! the `dx.op` declarations it calls, its signatures and bound resources,
-//! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
+//! and the metadata and container that wrap it up (SM 6.6; validator 1.6,
+//! or 1.8 for compute derivatives).
 
 use super::bitcode::{Attr, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
@@ -144,6 +145,10 @@ pub(crate) struct Shader {
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
+    /// Forces the validator-1.8 decision (tests only): `finish`
+    /// otherwise derives it from the module's live calls, a dead call
+    /// declaring nothing.
+    force_validator18: Option<bool>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
@@ -207,6 +212,7 @@ impl Shader {
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
+            force_validator18: None,
             lds_dwords: 0,
             lds: None,
             main,
@@ -902,7 +908,30 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        // Validators before 1.8 reject gradient operations outside the
+        // pixel stage, so a non-mesh compute shader whose written calls
+        // include one declares 1.8. Anything else declares 1.6 with the
+        // version node itself: such a shader's module is byte-identical
+        // to before this knob existed.
+        //
+        // Declaring 1.8 only makes such a program *accepted*; the host's
+        // derivative semantics are not the console's. Console compute
+        // lanes are x-major, so a quad of a multi-row group is four lanes
+        // of one row, while the host forms 2x2 tiles — an implicit level
+        // (and DerivCoarseY/FineY) of a multi-row group therefore comes
+        // from the host's tiling, not the console's row. One-row groups
+        // agree either way. Reproducing the console's quad layout is
+        // future work and does not gate this declaration.
+        let validator18 = self
+            .force_validator18
+            .unwrap_or(uses.derivatives && self.threads.is_some() && self.mesh.is_none());
+        if validator18 {
+            let eight = i32c(&mut self, 8);
+            let val8 = self.m.md_node(vec![Some(one), Some(eight)]);
+            self.m.named_md("dx.valver", vec![val8]);
+        } else {
+            self.m.named_md("dx.valver", vec![version]);
+        }
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
@@ -976,6 +1005,7 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
+            validator18,
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);
@@ -1041,6 +1071,7 @@ impl Shader {
 #[cfg(all(test, windows))]
 mod tests {
     use super::super::bitcode::Term;
+    use super::super::validator;
     use super::*;
 
     /// A program that sets a bit through the write marks' UAV, or (`heap`)
@@ -1087,5 +1118,188 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
             }
         }
+    }
+
+    /// Builds a compute shader calling `opcode` and returns its container
+    /// plus whether the module's live calls include a gradient operation.
+    /// `Some(v)` forces the validator-1.8 decision before the container is
+    /// written. The result feeds a branch condition: a call nothing reads
+    /// is dead and the writer drops it.
+    fn compute_with_op(
+        opcode: u32,
+        name: &str,
+        attr: Attr,
+        args: usize,
+        validator18: Option<bool>,
+    ) -> (Vec<u8>, bool) {
+        let mut s = Shader::new(false);
+        s.threads = Some([32, 1, 1]);
+        s.wave_size = Some(32);
+        let block = s.entry;
+        let zero = s.m.f32(0);
+        let args = vec![zero; args];
+        let ret = s.t.f32;
+        let r = s.op(block, name, attr, ret, opcode, &args);
+        s.force_validator18 = validator18;
+        let c = s.m.cmp(block, pred::OGT, r, zero);
+        let (t, f) = (s.m.new_block(), s.m.new_block());
+        s.m.terminate(block, Term::CondBr(c, t, f));
+        s.m.terminate(t, Term::Ret);
+        s.m.terminate(f, Term::Ret);
+        let detected = s.m.uses().derivatives;
+        (s.finish(), detected)
+    }
+
+    #[test]
+    fn compute_implicit_sample_validates() {
+        let mut s = Shader::new(false);
+        s.threads = Some([32, 1, 1]);
+        s.wave_size = Some(32);
+        s.samplers = 1;
+        let block = s.entry;
+        let index = s.m.i32(0);
+        let texture = s.heap_handle(block, index, false, false, (2, 1033));
+        let sampler = s.sampler_handle(block, 0);
+        let zero = s.m.f32(0);
+        let fu = s.m.undef(s.t.f32);
+        let iu = s.m.undef(s.t.i32);
+        let args = [texture, sampler, zero, zero, fu, fu, iu, iu, iu, fu];
+        let ret = s.t.res_ret;
+        let r = s.op(block, "sample.f32", Attr::ReadOnly, ret, 60, &args);
+        // Read the result so the writer keeps the call (see above).
+        let x = s.m.extract(block, r, 0);
+        let c = s.m.cmp(block, pred::OGT, x, zero);
+        let (t, f) = (s.m.new_block(), s.m.new_block());
+        s.m.terminate(block, Term::CondBr(c, t, f));
+        s.m.terminate(t, Term::Ret);
+        s.m.terminate(f, Term::Ret);
+        assert!(s.m.uses().derivatives);
+        let mut dxil = s.finish();
+        let path = validator::Validator::default_path();
+        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        validator.validate(&mut dxil).unwrap();
+
+        // The same module declared as validator 1.6 must be rejected.
+        let mut legacy = {
+            let mut s = Shader::new(false);
+            s.threads = Some([32, 1, 1]);
+            s.wave_size = Some(32);
+            s.samplers = 1;
+            let block = s.entry;
+            let index = s.m.i32(0);
+            let texture = s.heap_handle(block, index, false, false, (2, 1033));
+            let sampler = s.sampler_handle(block, 0);
+            let zero = s.m.f32(0);
+            let fu = s.m.undef(s.t.f32);
+            let iu = s.m.undef(s.t.i32);
+            let args = [texture, sampler, zero, zero, fu, fu, iu, iu, iu, fu];
+            let ret = s.t.res_ret;
+            let r = s.op(block, "sample.f32", Attr::ReadOnly, ret, 60, &args);
+            s.force_validator18 = Some(false);
+            let x = s.m.extract(block, r, 0);
+            let c = s.m.cmp(block, pred::OGT, x, zero);
+            let (t, f) = (s.m.new_block(), s.m.new_block());
+            s.m.terminate(block, Term::CondBr(c, t, f));
+            s.m.terminate(t, Term::Ret);
+            s.m.terminate(f, Term::Ret);
+            s.finish()
+        };
+        assert!(validator.validate(&mut legacy).is_err());
+    }
+
+    #[test]
+    fn compute_explicit_derivative_validates() {
+        // DerivCoarseX (83): rejected before validator 1.8 like the
+        // implicit-derivative samples.
+        let (mut dxil, detected) = compute_with_op(83, "unary.f32", Attr::ReadNone, 1, Some(true));
+        assert!(detected);
+        let (mut legacy, _) = compute_with_op(83, "unary.f32", Attr::ReadNone, 1, Some(false));
+        let path = validator::Validator::default_path();
+        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        validator.validate(&mut dxil).unwrap();
+        assert!(validator.validate(&mut legacy).is_err());
+    }
+
+    #[test]
+    fn compute_dot3_stays_on_validator_1_6() {
+        // Dot3 (55) is arithmetic, not a gradient op: it must not bump the
+        // validator version, and the resulting 1.6 module validates.
+        let (mut dxil, detected) = compute_with_op(55, "dot3.f32", Attr::ReadNone, 6, None);
+        assert!(!detected);
+        let path = validator::Validator::default_path();
+        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        validator.validate(&mut dxil).unwrap();
+    }
+
+    #[test]
+    fn a_dead_sample_stays_on_validator_1_6() {
+        // A sample whose result nothing reads is dead code: the writer
+        // drops the call, so it must not declare validator 1.8 either —
+        // the written calls, not the ones `op` saw, decide.
+        let mut s = Shader::new(false);
+        s.threads = Some([32, 1, 1]);
+        s.wave_size = Some(32);
+        s.samplers = 1;
+        let block = s.entry;
+        let index = s.m.i32(0);
+        let texture = s.heap_handle(block, index, false, false, (2, 1033));
+        let sampler = s.sampler_handle(block, 0);
+        let zero = s.m.f32(0);
+        let fu = s.m.undef(s.t.f32);
+        let iu = s.m.undef(s.t.i32);
+        let args = [texture, sampler, zero, zero, fu, fu, iu, iu, iu, fu];
+        let ret = s.t.res_ret;
+        let _ = s.op(block, "sample.f32", Attr::ReadOnly, ret, 60, &args);
+        s.m.terminate(block, Term::Ret);
+        assert!(!s.m.uses().derivatives);
+        let mut dxil = s.finish();
+        let path = validator::Validator::default_path();
+        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        validator.validate(&mut dxil).unwrap();
+    }
+
+    /// FNV-1a, for pinning a container's bytes.
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    #[test]
+    fn a_shader_without_derivatives_reuses_the_version_node() {
+        // The validator-1.6 declaration reuses the `dx.version` metadata
+        // node: a derivative-free shader's container is byte-identical to
+        // before the 1.8 knob existed (a separate 1.6 node once added
+        // eight bytes to a pixel shader here, four to a compute one).
+        let minimal = |pixel: bool, threads: Option<[u32; 3]>| {
+            let mut s = Shader::new(pixel);
+            s.threads = threads;
+            s.m.terminate(s.entry, Term::Ret);
+            s.finish()
+        };
+        let pixel = minimal(true, None);
+        assert_eq!(
+            (pixel.len(), fnv(&pixel)),
+            (1268, 0x0cf4_762f_4d36_4c15),
+            "pixel container changed"
+        );
+        let compute = minimal(false, Some([32, 1, 1]));
+        assert_eq!(
+            (compute.len(), fnv(&compute)),
+            (1252, 0xe811_e254_6d1c_9513),
+            "compute container changed"
+        );
     }
 }
