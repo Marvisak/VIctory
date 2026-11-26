@@ -420,21 +420,25 @@ impl Drop for Tracked {
     /// here went unseen there.
     fn drop(&mut self) {
         let mut g = guards();
-        let mut free = Vec::new();
+        let mut free = BTreeSet::new();
         for page in self.start / PAGE..self.end.div_ceil(PAGE) {
             if let Some(holders) = g.holders.get_mut(&page) {
                 holders.retain(|c| !Arc::ptr_eq(c, &self.changed));
                 if holders.is_empty() {
                     g.holders.remove(&page);
-                    free.push(page);
+                    free.insert(page);
+                    // A mapping kept guarded for this tracker alone, when its
+                    // own last tracker went, has nobody left either.
+                    free.extend(g.alias_of.get(&page).into_iter().flatten().copied());
                 }
             }
         }
+        let held = |g: &Guards, p: usize| {
+            g.holders.contains_key(&p) || g.alias_of.get(&p).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)))
+        };
+        let free: Vec<usize> = free.into_iter().filter(|&p| !held(&g, p)).collect();
         for page in free {
-            let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
-            if !watched_elsewhere {
-                open(&mut g, page);
-            }
+            open(&mut g, page);
         }
     }
 }
@@ -1341,6 +1345,23 @@ pub(crate) mod tests {
         // SAFETY: the second view, guarded for `t`'s page too.
         unsafe { ((b + 4) as *mut u32).write_volatile(7) };
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+    }
+
+    /// Once neither tracker of two mappings of a page lives, both mappings
+    /// get write access back: the one kept guarded for the other tracker
+    /// when its own went is not left in the guard set.
+    #[test]
+    fn the_last_tracker_of_twin_mappings_opens_both() {
+        let (a, b) = twin_views(1);
+        let t = track(a, PAGE, true).expect("views are tracked");
+        let u = track(b, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(u.take(b, b + PAGE), [(b, b + PAGE)]);
+        drop(t);
+        assert!(guards().protected.contains(&(a / PAGE)), "kept for `u`");
+        drop(u);
+        let g = guards();
+        assert!(!g.protected.contains(&(a / PAGE)) && !g.protected.contains(&(b / PAGE)), "nothing holds either");
     }
 
     /// A retake has every copy of the memory, and of its other mappings,

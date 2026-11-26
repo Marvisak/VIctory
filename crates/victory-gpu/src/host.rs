@@ -2411,6 +2411,11 @@ impl Batch {
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
         if shadow.clean() {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, len as u64);
+            }
             return;
         }
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
@@ -3958,6 +3963,47 @@ mod batch {   // `mod tests` is already taken at the top of this file
         batch.title_written();
         batch.add(&copy, p, len);
         assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// A copy whose memory nothing wrote since it was taken is left out of
+    /// the batch (no refresh queued, none remembered); a write the guard
+    /// takes or one that is reported brings it back, for the pages written.
+    #[test]
+    fn a_copy_nothing_wrote_is_not_asked_for() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        assert_eq!((batch.refreshes.len(), batch.flush()), (1, len), "all of it at first");
+        // Later lists and submissions: nothing queued, nothing kept.
+        batch.add(&copy, p, len);
+        batch.title_written();
+        batch.add(&copy, p + PAGE, 100);
+        let mut next = Batch::default();
+        next.add(&copy, p, len);
+        assert!(batch.refreshes.is_empty() && next.refreshes.is_empty());
+        assert_eq!(next.flush(), 0);
+        // SAFETY: our pool, guarded since the copy took it.
+        unsafe { ((p + 2 * PAGE + 8) as *mut u8).write_volatile(7) };
+        next.add(&copy, p, len);
+        assert_eq!((next.refreshes.len(), next.flush()), (1, PAGE), "the page written");
+        assert_eq!(copy.read_host((p + 2 * PAGE + 8) as u64, 1)[0], 7);
+        // A write of our own or the kernel's, reported.
+        drop(crate::watch::writing(p + 3 * PAGE, 16));
+        next.title_written();
+        next.add(&copy, p, len);
+        assert_eq!(next.flush(), PAGE, "the page reported");
+        next.add(&copy, p, len);
+        assert!(next.refreshes.is_empty());
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
