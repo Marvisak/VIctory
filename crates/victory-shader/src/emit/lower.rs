@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod trig_preop;
 
 type Why = &'static str;
 
@@ -275,6 +276,7 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
+    trig_preop_table: Option<V>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -721,6 +723,7 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
+            trig_preop_table: None,
             counters: HashMap::new(),
             abort: None,
             round16: round16(p),
@@ -6313,6 +6316,7 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::SDiv, one, a);
                 float(self, r)
             }
+            "v_trig_preop_f64" => self.trig_preop_f64(inst, guard),
             "v_rsq_f32" | "v_sqrt_f32" | "v_log_f32" | "v_exp_f32" | "v_fract_f32"
             | "v_trunc_f32" | "v_floor_f32" | "v_ceil_f32" | "v_rndne_f32" | "v_sin_f32"
             | "v_cos_f32" => {
@@ -6762,13 +6766,21 @@ impl<'a> Lower<'a> {
             return Err("64-bit operand modifiers");
         }
         let op = *v.src.get(k).ok_or("a missing operand")?;
+        self.operand64_dwords(inst, op)
+    }
+
+    /// Read the encoded pair before applying any floating-point modifiers.
+    fn operand64_dwords(&mut self, inst: &Inst, op: Operand) -> Result<(V, V), Why> {
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
             let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
             let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
             Ok((lo, hi))
         };
         match op {
-            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1)),
+            Operand::Vector { reg, .. } => {
+                let next = reg.checked_add(1).ok_or("a missing operand high word")?;
+                pair(self, Reg::V(reg), Reg::V(next))
+            }
             Operand::Scalar { code, .. } if code != NULL => {
                 pair(self, Reg::S(code), Reg::S(code + 1))
             }

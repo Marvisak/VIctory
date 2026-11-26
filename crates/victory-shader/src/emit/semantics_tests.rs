@@ -3019,6 +3019,107 @@ fn constant_results_run() {
 
 /// 64-bit shifts read six bits of the count (RDNA2 ISA `V_LSHLREV_B64`).
 #[test]
+fn binary64_trig_preop_returns_the_argument_reduction_segment() {
+    // The measured rows are from AnyPS5 #22688, with f64 denormals kept.
+    let rows: &[(u64, u32, u64)] = &[
+        (0x3ff0_0000_0000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0x3ff0_0000_0000_0000, 0x13, 0x00ff_17b3_d073_9f78),
+        (0xbff0_0000_0000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0xbff0_0000_0000_0000, 0x15, 0x0000_0000_0000_0000),
+        (0x0000_0000_0000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0x0000_0000_0000_0000, 0x0, 0x3fe4_5f30_6dc9_c882),
+        (0x4008_0000_0000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0x4008_0000_0000_0000, 0x12, 0x0446_ba93_dd63_f5f2),
+        (0x4202_a05f_2000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0x4202_a05f_2000_0000, 0x1, 0x3c94_a7f0_9d5f_47d4),
+        (0x4630_0000_0000_0000, 0x13, 0x0000_0000_001e_294a),
+        (0x4630_0000_0000_0000, 0x14, 0x0000_0000_0000_0000),
+        (0x4630_0000_0000_0000, 0x12, 0x016c_be2f_67a0_e73e),
+        (0x4630_0000_0000_0000, 0x15, 0x0000_0000_0000_0000),
+        (0x0000_0000_0000_0001, 0x14, 0x0000_0000_0000_294a),
+        (0x0000_0000_0000_0001, 0x3, 0x35f3_c439_041f_e516),
+        (0x0010_0000_0000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0x0010_0000_0000_0000, 0x13, 0x00ff_17b3_d073_9f78),
+        (0x7fe0_0000_0000_0000, 0x0, 0x0b43_dd63_f5f2_f8bc),
+        (0x7fe0_0000_0000_0000, 0x1, 0x0809_e839_cfbc_5294),
+        (0x7fe0_0000_0000_0000, 0x14, 0x0000_0000_0000_0000),
+        (0x7fe0_0000_0000_0000, 0x1e, 0x0000_0000_0000_0000),
+        (0x7e37_e43c_8800_759c, 0x13, 0x0000_0000_0000_0000),
+        (0x7e37_e43c_8800_759c, 0x14, 0x0000_0000_0000_0000),
+        (0x7ff0_0000_0000_0000, 0x14, 0x0000_0000_0000_0000),
+        (0x7ff0_0000_0000_0000, 0x0, 0x0b43_dd63_f5f2_f8bd),
+        (0xfff0_0000_0000_0000, 0x14, 0x0000_0000_0000_0000),
+        (0xfff0_0000_0000_0000, 0x1, 0x07f3_d073_9f78_a529),
+        (0x7ff8_0000_0000_0000, 0x14, 0x0000_0000_0000_0000),
+        (0x7ff8_0000_0000_0000, 0x2, 0x0487_535f_dafd_88fc),
+        (0x7ff0_0000_0000_0001, 0x14, 0x0000_0000_0000_0000),
+        (0x7ff0_0000_0000_0001, 0x0, 0x0b43_dd63_f5f2_f8bd),
+        (0x8000_0000_0000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0x8000_0000_0000_0000, 0x13, 0x00ff_17b3_d073_9f78),
+        (0x3fe0_0000_0000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0x3fe0_0000_0000_0000, 0x1f, 0x0000_0000_0000_0000),
+        (0x4093_4a45_6d5c_faad, 0x14, 0x0000_0000_0000_294a),
+        (0x4093_4a45_6d5c_faad, 0x11, 0x079d_18fd_9a79_7fa8),
+        (0x3ff0_0000_0000_0000, 0xffffffff, 0x0000_0000_0000_0000),
+        (0x3ff0_0000_0000_0000, 0x20, 0x3fe4_5f30_6dc9_c882),
+        // The exact endpoints of the exponent offset and large-input scale.
+        (0x4350_0000_0000_0000, 0x0, 0x3fe4_5f30_6dc9_c882),
+        (0x4350_0000_0000_0000, 0x1, 0x3c94_a7f0_9d5f_47d4),
+        (0x4360_0000_0000_0000, 0x0, 0x3fc1_7cc1_b727_220a),
+        (0x4360_0000_0000_0000, 0x1, 0x3c72_9fc2_757d_1f52),
+        (0x7af0_0000_0000_0000, 0x0, 0x084b_a7a3_1fb3_4f2f),
+        (0x7af0_0000_0000_0000, 0x1, 0x04fe_a2d7_527b_ac7e),
+        (0x7b00_0000_0000_0000, 0x0, 0x1037_4f46_3f66_9e5f),
+        (0x7b00_0000_0000_0000, 0x1, 0x0ced_45ae_a4f7_58fd),
+        // Model rows distinguish the measured 1184-bit table length
+        // from using all 1201 bits in the ISA pseudocode.
+        (0x7b00_0000_0000_0000, 0x5, 0x0000_180c_c118_0000),
+        (0x7d00_0000_0000_0000, 0x4, 0x00f5_d085_6033_0460),
+        (0x7ff0_0000_0000_0000, 0x4, 0x0000_0000_0008_0000),
+    ];
+
+    let build = |body, rows: &[(u64, u32, u64)]| {
+        let pairs: Vec<_> = rows
+            .iter()
+            .map(|&(x, selector, result)| ([x as u32, (x >> 32) as u32, selector, 0], result))
+            .collect();
+        let inputs = pairs.iter().map(|&(input, _)| input).collect();
+        probe(body, inputs, INT, move |input| {
+            let &(_, expected) = pairs
+                .iter()
+                .find(|&&(row, _)| row == input)
+                .expect("input row");
+            vec![expected as u32, (expected >> 32) as u32]
+        })
+    };
+    let g =
+        |input, selector, modifier| vop3(0x174, 5, [input, selector, int(0)], modifier).to_vec();
+    let modifier = M {
+        abs: 1,
+        neg: 1,
+        clamp: true,
+        omod: 2,
+        ..NONE
+    };
+    let mut literal = g(255, int(0), NONE);
+    literal.push(0x7b00_0000);
+    let mut scalar = build(
+        g(s(16), v(3), NONE),
+        &[(0x7fe0_0000_0000_0000, 1, 0x0809_e839_cfbc_5294)],
+    );
+    scalar.scalar = true;
+    let failures = check(&[
+        build(g(v(1), v(3), NONE), rows),
+        build(g(v(1), v(3), modifier), rows),
+        build(g(v(1), int(20), NONE), &[(1.0f64.to_bits(), 0, 0x294a)]),
+        build(g(193, int(0), NONE), &[(0, 0, 0x3fe4_5f30_6dc9_c882)]),
+        build(literal, &[(0, 0, 0x1037_4f46_3f66_9e5f)]),
+        scalar,
+    ]);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
 fn wide_shifts_match_the_hardware() {
     let counts = [0u32, 1, 31, 32, 33, 63, 64, 65, 0xFFFF_FFC1];
     let inputs: Vec<[u32; 4]> = counts
