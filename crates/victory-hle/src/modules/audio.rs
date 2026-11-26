@@ -19,6 +19,7 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
@@ -415,16 +416,26 @@ fn xma() -> RwLockReadGuard<'static, Xma> {
 #[derive(Clone, Copy)]
 struct Context(*mut u32);
 
+const _: () = assert!(
+    size_of::<AtomicU32>() == size_of::<u32>() && align_of::<AtomicU32>() == align_of::<u32>()
+);
+
 impl Context {
-    fn get(self, word: usize) -> u32 {
-        // SAFETY: inside the context array; the title reads and writes it
-        // concurrently, like the hardware's.
-        unsafe { self.0.add(word).read_volatile() }
+    fn word(&self, word: usize) -> &AtomicU32 {
+        // SAFETY: `self.0` points at 16 aligned `u32` words in the live XMA
+        // context array (256-byte aligned, 64-byte stride) pinned by the
+        // caller's `XMA` read guard (or a test context array); the title reads
+        // and writes these words concurrently, like the hardware's.
+        unsafe { &*self.0.add(word).cast::<AtomicU32>() }
     }
 
+    fn get(self, word: usize) -> u32 {
+        self.word(word).load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     fn set(self, word: usize, value: u32) {
-        // SAFETY: as above.
-        unsafe { self.0.add(word).write_volatile(value) }
+        self.word(word).store(value, Ordering::Release);
     }
 
     fn field(self, word: usize, shift: u32, bits: u32) -> u32 {
@@ -433,7 +444,12 @@ impl Context {
 
     fn set_field(self, word: usize, shift: u32, bits: u32, value: u32) {
         let mask = ((1u32 << bits) - 1) << shift;
-        self.set(word, (self.get(word) & !mask) | ((value << shift) & mask));
+        let value = (value << shift) & mask;
+        let _ = self
+            .word(word)
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some((current & !mask) | value)
+            });
     }
 
     fn channels(self) -> usize {
@@ -671,10 +687,12 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         // this one, its last.
         voice.skip = context.field(1, 17, 3) as usize * xma::SUBFRAME_SAMPLES;
     }
+    context.set_field(2, 0, 26, next as u32);
     if next == 0 {
+        // Clearing the bank's valid bit hands it back to the title, so publish
+        // the reset read cursor before clearing valid.
         context.set_field(0, 20 + current, 1, 0);
     }
-    context.set_field(2, 0, 26, next as u32);
     true
 }
 
@@ -1446,5 +1464,315 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    /// Hardware field updates on words 0 and 1 must be atomic against a title
+    /// thread updating the inactive bank's size and valid bits in the same words.
+    #[test]
+    fn xma_set_field_preserves_concurrent_atomic_updates_to_shared_words() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let mut words = [0u32; 16];
+        // Bank 0 active with 2 packets, ring of 4 blocks, 48 kHz mono.
+        words[0] = 2 | (1 << 20) | (4 << 22);
+        words[1] = (1 << 31) | (3 << 27);
+        let context = Context(words.as_mut_ptr());
+        // SAFETY: `words` is a live, 4-byte-aligned 16-word array for this scope.
+        let word0 = unsafe { &*words.as_ptr().cast::<AtomicU32>() };
+        // SAFETY: `words[1]` is live and 4-byte aligned for this scope.
+        let word1 = unsafe { &*words.as_ptr().add(1).cast::<AtomicU32>() };
+
+        let start = Barrier::new(2);
+        let done = AtomicBool::new(false);
+        let lost_valid1 = AtomicUsize::new(0);
+        let lost_size1 = AtomicUsize::new(0);
+        let base_ptr = words.as_mut_ptr() as usize;
+
+        std::thread::scope(|s| {
+            let start = &start;
+            let done = &done;
+            let hw = s.spawn(move || {
+                let ctx = Context(base_ptr as *mut u32);
+                start.wait();
+                for i in 0..50_000u32 {
+                    ctx.set_field(0, 27, 5, i & 3);
+                    ctx.set_field(1, 31, 1, i & 1);
+                }
+                done.store(true, Ordering::Release);
+            });
+
+            start.wait();
+            let mut round = 0u32;
+            while !done.load(Ordering::Acquire) || round < 5_000 {
+                let packets = 1 + (round % 15);
+                let _ = word1.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                    Some((cur & !0xfff) | packets)
+                });
+                word0.fetch_or(1 << 21, Ordering::AcqRel);
+
+                if (word0.load(Ordering::Acquire) & (1 << 21)) == 0 {
+                    lost_valid1.fetch_add(1, Ordering::Relaxed);
+                }
+                if (word1.load(Ordering::Acquire) & 0xfff) != packets {
+                    lost_size1.fetch_add(1, Ordering::Relaxed);
+                }
+                word0.fetch_and(!(1 << 21), Ordering::AcqRel);
+                round = round.wrapping_add(1);
+            }
+            hw.join().unwrap();
+        });
+
+        let lost_v = lost_valid1.load(Ordering::Relaxed);
+        let lost_s = lost_size1.load(Ordering::Relaxed);
+        assert_eq!(
+            (lost_v, lost_s),
+            (0, 0),
+            "non-atomic set_field clobbered concurrent title updates (lost valid1={lost_v}, lost input1 size={lost_s})"
+        );
+        assert_eq!(context.field(0, 20, 1), 1);
+    }
+
+    /// Streaming XMA playback through AcpHal must preserve concurrent atomic
+    /// refills of the inactive bank's size (word 1) and valid bit (word 0)
+    /// while the decoder updates the write block and output-writable bit.
+    #[test]
+    fn xma_double_buffered_streaming_preserves_concurrent_bank_refills() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 4, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let ctx_ptr = request.arrays[4].cast::<u32>().wrapping_add(16);
+        let context = Context(ctx_ptr);
+
+        let stream = silent_stream();
+        let (mut input0, mut apu0) = (std::ptr::null_mut(), 0);
+        let (mut input1, mut apu1) = (std::ptr::null_mut(), 0);
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input0, &mut apu0, 0x1000, 0x800, 1), S_OK);
+        assert_eq!(ApuAlloc(&mut input1, &mut apu1, 0x1000, 0x800, 1), S_OK);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2),
+            S_OK
+        );
+        // SAFETY: two-packet buffers were allocated above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(stream.as_ptr(), input0.cast(), stream.len());
+            std::ptr::copy_nonoverlapping(stream.as_ptr(), input1.cast(), stream.len());
+        }
+
+        // Loop bank 0 forever so the hardware updates word 0 (write block) and
+        // word 1 (writable) continuously without ever consuming bank 1.
+        context.set(0, 2 | (255 << 12) | (1 << 20) | (4 << 22));
+        context.set(1, (1 << 31) | (3 << 27));
+        context.set(2, 32);
+        context.set(3, 32);
+        context.set(4, (xma::PACKET_BYTES * 8 + 32 + 2 * 31) as u32);
+        context.set(5, apu0);
+        context.set(6, apu1);
+        context.set(7, output_apu);
+        context.set(9, 0);
+
+        let mut acp = std::ptr::null_mut();
+        assert_eq!(AcpHalCreate(&mut acp), S_OK);
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        assert_eq!((m.connect)(acp, 0x1000, 0x1000), S_OK);
+        let submit = |command: u32, words: &[u32]| {
+            assert_eq!(
+                (m.submit)(acp, command, 0, u32::MAX, words.as_ptr().cast(), 0),
+                S_OK
+            );
+        };
+        submit(ENABLE_XMA, &[1]);
+
+        // SAFETY: `ctx_ptr` points inside the live XMA context array until
+        // `AcpHalReleaseShapeContexts` below.
+        let word0 = unsafe { &*ctx_ptr.cast::<AtomicU32>() };
+        // SAFETY: word 1 of the same live context.
+        let word1 = unsafe { &*ctx_ptr.add(1).cast::<AtomicU32>() };
+
+        let start = Barrier::new(2);
+        let done = AtomicBool::new(false);
+        let lost_valid1 = AtomicUsize::new(0);
+        let lost_size1 = AtomicUsize::new(0);
+        let acp_addr = acp as usize;
+
+        std::thread::scope(|s| {
+            let start = &start;
+            let done = &done;
+            let pumper = s.spawn(move || {
+                let acp = acp_addr as *mut Acp;
+                // SAFETY: `acp` stays live until after `scope` returns.
+                let m = unsafe { (*acp).vtable };
+                let advance = [1u32, 4];
+                start.wait();
+                for _ in 0..1_500 {
+                    xma().pump();
+                    (m.submit)(
+                        acp,
+                        ADVANCE_XMA_READ,
+                        0,
+                        u32::MAX,
+                        advance.as_ptr().cast(),
+                        0,
+                    );
+                }
+                done.store(true, Ordering::Release);
+            });
+
+            start.wait();
+            let mut round = 0u32;
+            while !done.load(Ordering::Acquire) {
+                let packets = 1 + (round % 7);
+                let _ = word1.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                    Some((cur & !0xfff) | packets)
+                });
+                word0.fetch_or(1 << 21, Ordering::AcqRel);
+                std::hint::spin_loop();
+                if (word0.load(Ordering::Acquire) & (1 << 21)) == 0 {
+                    lost_valid1.fetch_add(1, Ordering::Relaxed);
+                }
+                if (word1.load(Ordering::Acquire) & 0xfff) != packets {
+                    lost_size1.fetch_add(1, Ordering::Relaxed);
+                }
+                word0.fetch_and(!(1 << 21), Ordering::AcqRel);
+                round = round.wrapping_add(1);
+            }
+            pumper.join().unwrap();
+        });
+
+        let error_bit = context.field(2, 31, 1);
+        submit(DISABLE_XMA, &[1]);
+        (m.release)(acp);
+        ApuFree(input0);
+        ApuFree(input1);
+        ApuFree(output);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+
+        let lost_v = lost_valid1.load(Ordering::Relaxed);
+        let lost_s = lost_size1.load(Ordering::Relaxed);
+        assert_eq!(
+            error_bit, 0,
+            "looping bank 0 should never hit INPUT_INVALID"
+        );
+        assert_eq!(
+            (lost_v, lost_s),
+            (0, 0),
+            "concurrent AcpHal pump/advance clobbered title refill bits (lost valid1={lost_v}, lost input1 size={lost_s})"
+        );
+    }
+
+    /// Clearing a finished bank's valid bit is the release handoff to the title:
+    /// word 2's read bit offset must already be reset to 0 before valid clears.
+    #[test]
+    fn xma_end_of_input_updates_read_bit_before_clearing_valid() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated above.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+
+        // Start directly at the last frame of packet 1 so every `decode` hits
+        // `next == 0` and finishes bank 0.
+        let last_frame_bit = (xma::PACKET_BYTES * 8 + 32 + 2 * 31) as u32;
+        let mut words = [0u32; 16];
+        words[0] = 2 | (1 << 20) | (4 << 22);
+        words[1] = (1 << 31) | (3 << 27);
+        words[2] = last_frame_bit;
+        words[5] = input_apu;
+        let context = Context(words.as_mut_ptr());
+        // SAFETY: `words` is live and 4-byte aligned for this scope.
+        let word0 = unsafe { &*words.as_ptr().cast::<AtomicU32>() };
+        // SAFETY: `words[2]` is live and 4-byte aligned for this scope.
+        let word2 = unsafe { &*words.as_ptr().add(2).cast::<AtomicU32>() };
+
+        let mut voice = Voice {
+            decoder: None,
+            pcm: VecDeque::new(),
+            skip: 0,
+            ended: false,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                taken: 0,
+                takes: 0,
+                partial_takes: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        };
+
+        let start = Barrier::new(2);
+        let armed = AtomicBool::new(false);
+        let stop = AtomicBool::new(false);
+        let stale_read_bit = AtomicUsize::new(0);
+        let observed = AtomicUsize::new(0);
+
+        std::thread::scope(|s| {
+            let start = &start;
+            let armed = &armed;
+            let stop = &stop;
+            let stale = &stale_read_bit;
+            let seen = &observed;
+            let observer = s.spawn(move || {
+                start.wait();
+                loop {
+                    while !armed.load(Ordering::Acquire) {
+                        if stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        std::hint::spin_loop();
+                    }
+                    // Spin until `decode` clears valid0; the producer will not
+                    // touch `word2` again until we clear `armed`.
+                    while (word0.load(Ordering::Acquire) & (1 << 20)) != 0 {
+                        std::hint::spin_loop();
+                    }
+                    let read_bit = word2.load(Ordering::Acquire) & 0x03ff_ffff;
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    if read_bit != 0 {
+                        stale.fetch_add(1, Ordering::Relaxed);
+                    }
+                    armed.store(false, Ordering::Release);
+                }
+            });
+
+            start.wait();
+            for _ in 0..4_000 {
+                // Re-arm bank 0 with non-zero read bit before letting observer poll.
+                word2.store(last_frame_bit, Ordering::Release);
+                word0.fetch_or(1 << 20, Ordering::AcqRel);
+                voice.pcm.clear();
+                voice.ended = false;
+                armed.store(true, Ordering::Release);
+                assert!(decode(context, &mut voice));
+                while armed.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+            }
+            stop.store(true, Ordering::Release);
+            observer.join().unwrap();
+        });
+
+        ApuFree(input);
+        assert_eq!(observed.load(Ordering::Relaxed), 4_000);
+        assert_eq!(
+            stale_read_bit.load(Ordering::Relaxed),
+            0,
+            "observer saw valid0 cleared before word 2 read_bit was reset to 0"
+        );
     }
 }
