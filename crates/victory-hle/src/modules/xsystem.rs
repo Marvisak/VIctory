@@ -231,6 +231,9 @@ mod device_type {
                 Key, *const u16, *mut u32, *mut u32, *mut u8, *mut u32,
             ) -> u32)(key, name, reserved, kind, data, size);
         }
+        if !reserved.is_null() {
+            return INVALID_PARAMETER;
+        }
         if !is(name, VALUE) {
             return FILE_NOT_FOUND;
         }
@@ -337,6 +340,41 @@ mod device_type {
                 SUCCESS
             );
             assert_eq!(again, oem());
+        }
+
+        #[test]
+        fn oem_queries_require_null_reserved() {
+            let mut key = std::ptr::null_mut();
+            let path = w(&KEY.to_ascii_lowercase());
+            assert_eq!(RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key), SUCCESS);
+            let mut reserved = 0u32;
+            let (mut kind, mut value, mut size) = (u32::MAX, 0u32, 4);
+            let value_name = w(VALUE);
+            assert_eq!(
+                RegQueryValueExW(
+                    key,
+                    value_name.as_ptr(),
+                    &mut reserved,
+                    &mut kind,
+                    (&mut value as *mut u32).cast(),
+                    &mut size,
+                ),
+                INVALID_PARAMETER,
+            );
+            let unknown = w("Other");
+            assert_eq!(
+                RegQueryValueExW(
+                    key,
+                    unknown.as_ptr(),
+                    &mut reserved,
+                    &mut kind,
+                    (&mut value as *mut u32).cast(),
+                    &mut size,
+                ),
+                INVALID_PARAMETER,
+            );
+            assert_eq!((kind, value, size), (u32::MAX, 0, 4));
+            assert_eq!(RegCloseKey(key), SUCCESS);
         }
 
         #[test]
