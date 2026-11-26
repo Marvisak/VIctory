@@ -850,16 +850,17 @@ impl State {
                 }
             }
             if let Some(param) = stage.view_addresses {
-                let gpu = (self.heaps[0] != 0)
+                let table = (self.heaps[0] != 0)
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                     .flatten()
                     .and_then(|h| h.view_addresses());
-                let Some(gpu) = gpu else {
+                let Some((table, gpu)) = table else {
                     once!("a shader reading a view's address dropped: no view heap");
                     not_run("view addresses without a view heap");
                     return false;
                 };
-                // SAFETY: an open list; the heap's buffer lives with the heap.
+                list.keep(table);
+                // SAFETY: an open list; the table lives while the list holds it.
                 unsafe {
                     if compute {
                         l.SetComputeRootShaderResourceView(param, gpu);
