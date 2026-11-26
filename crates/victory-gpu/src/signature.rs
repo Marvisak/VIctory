@@ -35,19 +35,34 @@ struct Signature {
     arguments: Vec<[u32; 4]>,
 }
 
+/// Indirect argument types (`D3D12_INDIRECT_ARGUMENT_TYPE`) that update
+/// root-signature bindings on the pipeline (`CONSTANT`, `CONSTANT_BUFFER_VIEW`,
+/// `SHADER_RESOURCE_VIEW`, `UNORDERED_ACCESS_VIEW`, `INCREMENTING_CONSTANT`).
+fn binds_root(kind: u32) -> bool {
+    matches!(kind, 5..=8 | 11)
+}
+
 /// Device method.
 pub(crate) extern "system" fn create(
     _: This,
     desc: *const Desc,
-    _root: This,
+    root: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    let clear_out = || {
+        if !out.is_null() {
+            // SAFETY: caller-supplied `_COM_Outptr_opt_` slot.
+            unsafe { out.write(std::ptr::null()) };
+        }
+    };
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
+        clear_out();
         return E_INVALIDARG;
     };
-    if desc.arguments.is_null() && desc.count > 0 {
+    if !desc.stride.is_multiple_of(4) || (desc.arguments.is_null() && desc.count > 0) {
+        clear_out();
         return E_INVALIDARG;
     }
     let arguments = if desc.count == 0 {
@@ -56,6 +71,10 @@ pub(crate) extern "system" fn create(
         // SAFETY: the title passes `count` argument descriptions.
         unsafe { std::slice::from_raw_parts(desc.arguments, desc.count as usize) }.to_vec()
     };
+    if root.is_null() && arguments.iter().any(|a| binds_root(a[0])) {
+        clear_out();
+        return E_INVALIDARG;
+    }
     tracing::debug!(stride = desc.stride, ?arguments, "command signature");
     let signature = Box::new(Signature {
         object: Object::new(&FUNCTIONS),
@@ -292,5 +311,154 @@ mod tests {
             E_NOINTERFACE
         );
         assert!(signature.is_null());
+    }
+
+    #[test]
+    fn misaligned_strides_and_rootless_binding_arguments_are_rejected_and_clear_out() {
+        let null = std::ptr::null();
+        let sentinel = std::ptr::dangling::<Object>();
+        let dispatch = [[2u32, 4, 1, 1]];
+
+        // Early `E_INVALIDARG` paths clear a non-null `_COM_Outptr_opt_` slot.
+        let mut out = sentinel;
+        assert_eq!(
+            create(null, std::ptr::null(), null, &SIGNATURE_IIDS[0], &mut out),
+            E_INVALIDARG
+        );
+        assert!(out.is_null());
+
+        let mut out = sentinel;
+        let missing_args = Desc {
+            stride: 16,
+            count: 1,
+            arguments: std::ptr::null(),
+            nodes: 0,
+        };
+        assert_eq!(
+            create(null, &missing_args, null, &SIGNATURE_IIDS[0], &mut out),
+            E_INVALIDARG
+        );
+        assert!(out.is_null());
+
+        // `ByteStride` must be 4-byte aligned.
+        for bad_stride in [1u32, 2, 3, 6, 18] {
+            let mut out = sentinel;
+            let desc = Desc {
+                stride: bad_stride,
+                count: 1,
+                arguments: dispatch.as_ptr(),
+                nodes: 0,
+            };
+            assert_eq!(
+                create(null, &desc, null, &SIGNATURE_IIDS[0], &mut out),
+                E_INVALIDARG,
+                "stride {bad_stride}"
+            );
+            assert!(out.is_null(), "stride {bad_stride}");
+        }
+
+        // Root-binding arguments (`CONSTANT` 5, `CBV` 6, `SRV` 7, `UAV` 8,
+        // `INCREMENTING_CONSTANT` 11) require a non-null root signature.
+        let blob = [1u8, 2, 3, 4];
+        let root_iid = guid(
+            0xc54a6b66,
+            0x72df,
+            0x4ee8,
+            [0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14],
+        );
+        let mut root = null;
+        assert_eq!(
+            crate::root::create(null, 0, blob.as_ptr(), blob.len(), &root_iid, &mut root),
+            S_OK
+        );
+        for kind in [5u32, 6, 7, 8, 11] {
+            let args = [[kind, 0, 0, 1]];
+            let desc = Desc {
+                stride: 16,
+                count: 1,
+                arguments: args.as_ptr(),
+                nodes: 0,
+            };
+            let mut out = sentinel;
+            assert_eq!(
+                create(null, &desc, null, &SIGNATURE_IIDS[0], &mut out),
+                E_INVALIDARG,
+                "kind {kind} without root"
+            );
+            assert!(out.is_null(), "kind {kind}");
+
+            let mut out = null;
+            assert_eq!(
+                create(null, &desc, root, &SIGNATURE_IIDS[0], &mut out),
+                S_OK,
+                "kind {kind} with root"
+            );
+            assert_eq!(object::release(out), 0);
+        }
+        assert_eq!(object::release(root), 0);
+
+        // Non-binding argument types succeed with a null root signature.
+        for kind in [0u32, 1, 2, 3, 4, 9, 10] {
+            let args = [[kind, 0, 0, 0]];
+            let desc = Desc {
+                stride: 68,
+                count: 1,
+                arguments: args.as_ptr(),
+                nodes: 0,
+            };
+            let mut out = null;
+            assert_eq!(
+                create(null, &desc, null, &SIGNATURE_IIDS[0], &mut out),
+                S_OK,
+                "non-binding kind {kind}"
+            );
+            assert_eq!(object::release(out), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_device_agrees_on_stride_alignment_and_root_requirement() {
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let dispatch_arg = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let misaligned = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 18,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &dispatch_arg,
+            NodeMask: 0,
+        };
+        let mut sig: Option<ID3D12CommandSignature> = None;
+        // SAFETY: valid stack description and out pointer.
+        let err = unsafe { host.device.CreateCommandSignature(&misaligned, None, &mut sig) }
+            .expect_err("misaligned ByteStride must fail on D3D12");
+        assert_eq!(err.code().0, E_INVALIDARG);
+        assert!(sig.is_none());
+
+        let cbv_arg = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                ConstantBufferView: D3D12_INDIRECT_ARGUMENT_DESC_0_2 {
+                    RootParameterIndex: 0,
+                },
+            },
+        };
+        let rootless_cbv = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 8,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &cbv_arg,
+            NodeMask: 0,
+        };
+        // SAFETY: valid stack description and out pointer.
+        let err = unsafe { host.device.CreateCommandSignature(&rootless_cbv, None, &mut sig) }
+            .expect_err("root-binding argument without pRootSignature must fail on D3D12");
+        assert_eq!(err.code().0, E_INVALIDARG);
+        assert!(sig.is_none());
     }
 }
