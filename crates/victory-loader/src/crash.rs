@@ -10,9 +10,13 @@
 //! and appended to the crash log, with the title's last debug output, which
 //! often states the reason. Diagnostics builds can also append first-chance
 //! breakpoints with `VICTORY_CRASH_BREAKPOINTS=1`. Panics of ours go to the
-//! crash log too.
+//! crash log too. On hosts without the console's AMD-only instructions the
+//! exception handler emulates them; `VICTORY_CLZERO_LOOP15=0` keeps its
+//! 15-byte `clzero` loop short.
 
+use std::ffi::OsStr;
 use std::ptr::null_mut;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
@@ -32,6 +36,9 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.
 pub(crate) const MAX_FRAMES: usize = 40;
+
+const PAGE_SIZE: u64 = 0x1000;
+const CLZERO_PAGE_CACHE_ENTRIES: usize = 16;
 
 /// Memory saved to files when a crash is reported: (address, length, file).
 #[cfg(feature = "diagnostics")]
@@ -372,6 +379,82 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
     (limit != base).then_some(ClwbLoop { base, limit, len })
 }
 
+/// `VICTORY_CLZERO_LOOP15=0` turns off the 15-byte loop short-cut.
+fn loop15_enabled(value: Option<&OsStr>) -> bool {
+    value != Some(OsStr::new("0"))
+}
+
+fn clzero_loop15_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| loop15_enabled(std::env::var_os("VICTORY_CLZERO_LOOP15").as_deref()))
+}
+
+/// Recently checked pages whose lines `clzero` may write. Kept per thread so
+/// a loop spanning thousands of lines asks Windows once per page, not once
+/// per line; cleared on entry so a recycled address cannot use a stale answer.
+#[derive(Clone, Copy)]
+struct PageCache {
+    entries: [(usize, bool); CLZERO_PAGE_CACHE_ENTRIES],
+    next: usize,
+}
+
+impl PageCache {
+    const fn new() -> Self {
+        Self {
+            entries: [(usize::MAX, false); CLZERO_PAGE_CACHE_ENTRIES],
+            next: 0,
+        }
+    }
+
+    fn get(&self, page: usize) -> Option<bool> {
+        self.entries
+            .iter()
+            .find_map(|(at, committed)| (*at == page).then_some(*committed))
+    }
+
+    fn put(&mut self, page: usize, committed: bool) {
+        self.entries[self.next] = (page, committed);
+        self.next = (self.next + 1) % CLZERO_PAGE_CACHE_ENTRIES;
+    }
+
+    fn clear(&mut self) {
+        self.entries.fill((usize::MAX, false));
+        self.next = 0;
+    }
+}
+
+thread_local! {
+    static CLZERO_PAGES: std::cell::RefCell<PageCache> =
+        const { std::cell::RefCell::new(PageCache::new()) };
+}
+
+/// Whether the page holding `address` is committed. Protection is not consulted:
+/// a write to a guarded page must fault so the GPU write watch can mark it dirty.
+fn clzero_page_committed(address: u64) -> bool {
+    let page = (address & !(PAGE_SIZE - 1)) as usize;
+    if let Some(committed) = CLZERO_PAGES
+        .try_with(|cache| cache.borrow().get(page))
+        .ok()
+        .flatten()
+    {
+        return committed;
+    }
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: a zeroed information block is valid; `VirtualQuery` fills it.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: queries the address space's bookkeeping, not the page itself.
+    let queried = unsafe { VirtualQuery(page as *const _, &mut info, size_of_val(&info)) };
+    let committed = queried != 0 && info.State == MEM_COMMIT;
+    let _ = CLZERO_PAGES.try_with(|cache| {
+        if let Ok(mut cache) = cache.try_borrow_mut() {
+            cache.put(page, committed);
+        }
+    });
+    committed
+}
+
 /// `clzero` at `context.Rip`. An exception costs about a microsecond and
 /// titles clear tens of kilobytes at a time, a line per pass, so the two
 /// loops compilers build around the instruction are done whole in one
@@ -386,14 +469,25 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
 ///                                  jb  top
 /// ```
 ///
-/// Anything else around it is one line and the next instruction.
+/// Anything else around it is one line and the next instruction. The 15-byte
+/// form is skipped with `VICTORY_CLZERO_LOOP15=0`.
 ///
 /// # Safety
 /// `context` is the state of a thread that faulted at a `clzero`; the
 /// lines its registers name are the title's to zero.
 unsafe fn clzero(context: &mut CONTEXT) -> bool {
-    // SAFETY: (every use) a line the title asked to zero.
-    let zero = |rax: u64| unsafe { ((rax & !63) as *mut u8).write_bytes(0, 64) };
+    let _ = CLZERO_PAGES.try_with(|cache| {
+        if let Ok(mut cache) = cache.try_borrow_mut() {
+            cache.clear();
+        }
+    });
+    let zero = |rax: u64| {
+        if clzero_page_committed(rax) {
+            // SAFETY: the line is the one the title asked to zero; a guarded
+            // page's write fault is the GPU watch's cue to mark it dirty.
+            unsafe { ((rax & !63) as *mut u8).write_bytes(0, 64) };
+        }
+    };
     let at = context.Rip as usize;
     // The loops' other instructions are read only where that stays inside
     // the faulting instruction's page (the next one may not be mapped).
@@ -418,7 +512,7 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
             return true;
         }
     }
-    if (7..=0x1000 - 8).contains(&page) {
+    if clzero_loop15_enabled() && (7..=0x1000 - 8).contains(&page) {
         // SAFETY: inside the page the CPU fetched the instruction from.
         let (before, after) =
             unsafe { (&*((at - 7) as *const [u8; 7]), &*((at + 3) as *const [u8; 5])) };
@@ -1660,6 +1754,135 @@ mod tests {
             emulate_as(EXCEPTION_ACCESS_VIOLATION, &clzero, 0, &mut xmm),
             None
         );
+    }
+
+    #[test]
+    fn clzero_loop15_switch_is_off_only_for_zero() {
+        assert!(loop15_enabled(None));
+        assert!(loop15_enabled(Some(OsStr::new("1"))));
+        assert!(!loop15_enabled(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn clzero_page_cache_remembers_recent_pages() {
+        let mut cache = PageCache::new();
+        assert_eq!(cache.get(0x1000), None);
+        cache.put(0x1000, true);
+        assert_eq!(cache.get(0x1000), Some(true));
+        cache.put(0x2000, false);
+        assert_eq!(cache.get(0x1000), Some(true));
+        assert_eq!(cache.get(0x2000), Some(false));
+        cache.clear();
+        assert_eq!(cache.get(0x1000), None);
+    }
+
+    #[test]
+    fn clzero_faults_on_a_read_only_page_for_the_write_watch() {
+        use windows_sys::Win32::Foundation::NTSTATUS;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+        };
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree, VirtualProtect,
+        };
+        static GUARDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static FAULTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        unsafe extern "system" fn unprotect(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: the system passes the exception being dispatched.
+            unsafe {
+                let record = &*(*info).ExceptionRecord;
+                if record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+                    && record.NumberParameters >= 2
+                    && record.ExceptionInformation[0] == 1
+                {
+                    let page = record.ExceptionInformation[1] & !0xfff;
+                    if page == GUARDED.load(Ordering::Relaxed) {
+                        FAULTS.fetch_add(1, Ordering::Relaxed);
+                        let mut old = 0;
+                        VirtualProtect(page as *const _, 0x1000, PAGE_READWRITE, &mut old);
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+            }
+            EXCEPTION_CONTINUE_SEARCH
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // SAFETY: the handler only touches our own guard state and pages.
+            unsafe { AddVectoredExceptionHandler(0, Some(unprotect)); }
+        });
+        // SAFETY: commits a page of ours, fills it, then guards it; the
+        // handler above unguards it when the emulated write faults.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!base.is_null());
+            assert!(!VirtualAlloc(base, 0x1000, MEM_COMMIT, PAGE_READWRITE).is_null());
+            base.cast::<u8>().write_bytes(0xff, 64);
+            let mut old = 0;
+            assert!(VirtualProtect(base, 0x1000, PAGE_READONLY, &mut old) != 0);
+            GUARDED.store(base as usize, Ordering::Relaxed);
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rax = base.cast::<u8>().add(5) as u64;
+            assert!(emulate_in(&[0x0f, 0x01, 0xfc], 0, &mut context));
+            assert_eq!(FAULTS.load(Ordering::Relaxed), 1);
+            assert!(std::slice::from_raw_parts(base.cast::<u8>(), 64).iter().all(|&b| b == 0));
+            GUARDED.store(0, Ordering::Relaxed);
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn clzero_does_not_write_an_unmapped_page() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        // SAFETY: reserves two pages and commits only the first; nothing
+        // reads or writes the reserved one.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!base.is_null());
+            assert!(!VirtualAlloc(base, 0x1000, MEM_COMMIT, PAGE_READWRITE).is_null());
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rax = base.cast::<u8>().add(0x1000) as u64;
+            assert!(emulate_in(&[0x0f, 0x01, 0xfc], 0, &mut context));
+            assert_eq!(context.Rip, 3);
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn emulated_clzero_loop15_skips_unmapped_pages_without_panicking() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        // SAFETY: reserves three pages and commits only the first; the loop
+        // tries to clear lines across the reserved page but never writes one.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x3000, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!base.is_null());
+            assert!(!VirtualAlloc(base, 0x1000, MEM_COMMIT, PAGE_READWRITE).is_null());
+            let start = base as u64;
+            let mut context: CONTEXT = std::mem::zeroed();
+            context.Rax = start;
+            context.Rdx = start + 0x40;
+            context.R8 = start + 0x1080;
+            // mov rax, rdx; add rdx, 0x40; clzero; cmp rdx, r8; jb top.
+            let code = [
+                0x48, 0x89, 0xd0, 0x48, 0x83, 0xc2, 0x40, 0x0f, 0x01, 0xfc, 0x4c, 0x39, 0xc2, 0x72,
+                0xf1,
+            ];
+            assert!(emulate_in(&code, 7, &mut context));
+            assert_eq!(
+                (context.Rip, context.Rax, context.Rdx),
+                (15, start + 0x1040, start + 0x1080)
+            );
+            let first = std::slice::from_raw_parts(base.cast::<u8>(), 0x1000);
+            assert!(first.iter().all(|&b| b == 0));
+            VirtualFree(base.cast(), 0, MEM_RELEASE);
+        }
     }
 
     #[test]
