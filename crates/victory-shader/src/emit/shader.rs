@@ -55,6 +55,7 @@ pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    pub const DOUBLES: u64 = 1 << 2;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -74,6 +75,7 @@ pub(crate) struct Types {
     pub i1: Ty,
     pub i32: Ty,
     pub f32: Ty,
+    pub f64: Ty,
     pub handle: Ty,
     pub props: Ty,
     pub bind: Ty,
@@ -159,6 +161,7 @@ impl Shader {
         let i8 = m.int(8);
         let i32 = m.int(32);
         let f32 = m.float();
+        let f64 = m.double();
         let i8p = m.ptr(i8);
         let handle = m.named_struct("dx.types.Handle", vec![i8p]);
         let props = m.named_struct("dx.types.ResourceProperties", vec![i32, i32]);
@@ -176,6 +179,7 @@ impl Shader {
                 i1,
                 i32,
                 f32,
+                f64,
                 handle,
                 props,
                 bind,
@@ -950,6 +954,9 @@ impl Shader {
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
             features |= 0x400_0000;
+        }
+        if self.flags & flags::DOUBLES != 0 {
+            features |= 0x01;
         }
         if self.flags & flags::ATOMIC64_TYPED != 0 {
             features |= 0x40_0000;

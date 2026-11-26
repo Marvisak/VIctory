@@ -375,6 +375,9 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// Emulates fused `f32` multiply-add in `f64` (Boldo-Melquiond
+    /// round-to-odd) on hosts whose DXIL `FMad` is unfused.
+    pub emulate_fma: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -499,6 +502,7 @@ pub fn emit_with(
         prims: prims.clone(),
         mesh_stride,
         view_marks: options.view_marks,
+        emulate_fma: options.emulate_fma,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving

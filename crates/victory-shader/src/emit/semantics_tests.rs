@@ -247,7 +247,7 @@ fn program(body: &[u32], scalar: bool) -> Vec<u32> {
 /// Lowers a probe's program: a 64-thread group of two waves of 32, 512
 /// bytes of LDS; one view table at s4 (the input buffer, then the output
 /// UAV), the group id in s6.
-fn lower_program(words: &[u32]) -> Result<HostShader, String> {
+fn lower_program_with(words: &[u32], emulate_fma: bool) -> Result<HostShader, String> {
     let used = |kind, table_offset_dwords| UsedResource {
         kind,
         root: RootType::Table,
@@ -293,6 +293,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        emulate_fma,
     })
     .map_err(e)?;
     Ok(HostShader {
@@ -547,6 +548,11 @@ fn defective(probes: Vec<Probe>, defect: &str) -> Vec<Probe> {
 /// Runs probes on the hardware adapter and WARP; returns the failures
 /// (each with its first differing inputs).
 fn check(probes: &[Probe]) -> Vec<String> {
+    check_with(probes, false)
+}
+
+/// `check` with the f64 emulation of fused multiply-adds forced on or off.
+fn check_with(probes: &[Probe], emulate_fma: bool) -> Vec<String> {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut hosts: Vec<(&str, bool, Host)> = [("hardware", false), ("warp", true)]
         .into_iter()
@@ -558,7 +564,7 @@ fn check(probes: &[Probe]) -> Vec<String> {
     let mut failures = Vec::new();
     for p in probes {
         let what = disassembly(&p.body, p.scalar);
-        let shader = match lower_program(&program(&p.body, p.scalar)) {
+        let shader = match lower_program_with(&program(&p.body, p.scalar), emulate_fma) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("{what}: not lowered: {e}");
@@ -874,7 +880,19 @@ fn mul_legacy(a: u32, b: u32) -> u32 {
 }
 
 fn fma(a: u32, b: u32, c: u32) -> u32 {
-    out64(d(a).mul_add(d(b), d(c)))
+    let (a, b, c) = (d(a), d(b), d(c));
+    let p = a * b;
+    let s = p + c;
+    let ap = s - c;
+    let bp = s - ap;
+    let t = (p - ap) + (c - bp);
+    let bits = s.to_bits();
+    let r = if s.is_finite() && (bits & 1) == 0 && t != 0.0 {
+        f64::from_bits(if (s > 0.0) == (t > 0.0) { bits + 1 } else { bits - 1 })
+    } else {
+        s
+    };
+    out64(r)
 }
 
 /// `v_mad_f32`: the product rounded (and flushed) before the add.
@@ -1267,6 +1285,20 @@ fn arithmetic_probes() -> Vec<Probe> {
 #[test]
 fn arithmetic_matches_the_hardware() {
     assert_clean(check(&passing(arithmetic_probes())));
+}
+
+/// The f64 emulation of fused multiply-adds, forced on (it is off on hosts
+/// that fuse, where the native `FMad` is used), gives the model's results
+/// on the hardware adapter and on WARP.
+#[test]
+fn emulated_multiply_adds_match_the_hardware() {
+    let probes = || {
+        let mut p = arithmetic_probes();
+        p.extend(mix_probes());
+        p
+    };
+    assert_clean(check_with(&defective(probes(), FMA), true));
+    assert_clean(check_with(&passing(probes()), true));
 }
 
 /// Minimum, maximum, median, and `v_max_f32 x, x clamp` (the title's
@@ -2870,12 +2902,15 @@ fn defect(probes: Vec<Probe>, which: &str) {
 /// overflows first), +inf for `fma(1.5, MAX, -MAX)`, 0 for
 /// `fma(1 - ulp, 1 + ulp, -1)`, +0 for a tiny negative product plus +0.
 /// The RX 6700 XT fuses, and `victory-gpu` warns once at device creation
-/// on a host that does not. DXIL has no f32 fused multiply-add, so fixing
-/// it means computing the 6.6 M instances in f64 (`Fma` on doubles, where
-/// the host has them: exact product, one rounding to f64, then to f32) or
-/// with an error-free product in f32.
+/// on a host that does not. DXIL has no f32 fused multiply-add, so the
+/// lowering can compute it in f64 (`Options::emulate_fma`: exact product,
+/// round-to-odd sum, one rounding to f32); `victory-gpu` turns that on only
+/// where the host does not fuse and has double and int64 shader operations.
+/// This test checks the stock lowering (emulation off), so it stays ignored
+/// on hosts that do not fuse; the emulated path is checked by
+/// `emulated_multiply_adds_match_the_hardware`.
 #[test]
-#[ignore = "defect: multiply-adds are fused only where the host fuses"]
+#[ignore = "defect: stock lowering is unfused where the host does not fuse (emulate_fma is off); see emulated_multiply_adds_match_the_hardware"]
 fn defect_multiply_adds_fused_only_where_the_host_fuses() {
     let mut p = arithmetic_probes();
     p.extend(mix_probes());
@@ -2996,6 +3031,28 @@ fn hosts_that_do_not_fuse_are_named() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     if let Ok(warp) = Host::new(true) {
         assert_eq!(warp.fuses_fmad(), Ok(false), "WARP");
+        let mut p = vec![probe(
+            vop3(0x14B, 5, [v(1), v(2), v(3)], M::default()),
+            vec![
+                [0x3F80_0001, 0x3F7F_FFFF, 0x2800_0001, 0],
+                [0x0080_0000, 0x0080_0000, 0x0000_0000, 0],
+                [0x0080_0000, 0x0080_0000, 0x8000_0000, 0],
+                [0x8080_0000, 0x3F7F_FFFF, 0x0000_0000, 0],
+            ],
+            Kind::F32 { ulps: 0, any_zero: false },
+            |i| vec![fma(i[0], i[1], i[2])],
+        )];
+        p.extend(defective(arithmetic_probes(), FMA));
+        p.extend(defective(mix_probes(), FMA));
+        for probe in &p {
+            let shader = lower_program_with(&program(&probe.body, probe.scalar), true)
+                .expect("emulated fma lowers");
+            let got = run(&warp, &shader, &probe.inputs, probe.scalar).expect("runs on warp");
+            for (i, &inp) in probe.inputs.iter().enumerate() {
+                let want = (probe.model.as_ref().unwrap())(inp);
+                assert!(same(probe.kind, want[0], got[i][0]), "in {:08x?}: want {:08x?}, got {:08x?}", inp, want[0], got[i][0]);
+            }
+        }
     }
     if let Ok(hardware) = Host::new(false) {
         let fuses = hardware.fuses_fmad().expect("the check runs");

@@ -601,6 +601,8 @@ impl Host {
     /// product meets an infinity, 0 where the fused result is tiny). Runs
     /// the lowered `v_fma_f32` of (1 - 2^-24, 1 + 2^-23, -1) once: 2^-24 -
     /// 2^-47 fused, 0 not.
+    /// The probe is lowered with `emulate_fma` off, so this reports the host's
+    /// own `FMad`, not the emulation that `victory-gpu` turns on where it is false.
     pub fn fuses_fmad(&self) -> Result<bool, String> {
         let shader = fmad_probe().map_err(|e| e.to_string())?;
         let (root, pso) = self.compute_pipeline(&shader)?;
@@ -798,6 +800,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        emulate_fma: false,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,
