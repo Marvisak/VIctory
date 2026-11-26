@@ -659,14 +659,29 @@ impl Prebuild {
     /// Makes the host pipeline, or finds it in the library; why not if it
     /// gets none.
     pub fn make(&self) -> Result<(), String> {
+        self.make_timed().0
+    }
+
+    /// [`Prebuild::make`], with the time translating its shaders (or
+    /// finding them in the cache) and the time making the host pipeline (the
+    /// driver's compilation, or the library's lookup).
+    pub fn make_timed(&self) -> (Result<(), String>, std::time::Duration, std::time::Duration) {
         let key = self.key();
         library::keep_early_list();
         // Without the run's log lines per shader and pipeline: tens of
         // thousands of them would bury the pre-build's own report.
         let quiet = tracing::Dispatch::none();
+        let started = std::time::Instant::now();
+        tracing::dispatcher::with_default(&quiet, || {
+            for s in &self.shaders {
+                let _ = s.translated();
+            }
+        });
+        let translated = started.elapsed();
         let made = tracing::dispatcher::with_default(&quiet, || {
             host::HostPipeline::new(&self.shaders, self.graphics.as_deref())
         });
+        let created = started.elapsed() - translated;
         #[cfg(feature = "diagnostics")]
         make::log_built(&key);
         if made.is_some() {
@@ -675,14 +690,25 @@ impl Prebuild {
             library::note_prebuilt(key);
         }
         library::save(false);
-        match made {
+        let result = match made {
             Some(_) => Ok(()),
             None => Err(match self.shaders.iter().find(|s| s.translated().is_none()) {
                 Some(s) => format!("{} shader does not translate", s.stage),
                 None => "the host refuses it".into(),
             }),
-        }
+        };
+        (result, translated, created)
     }
+}
+
+/// Pipeline library saves since the start: how many, their time, and of
+/// that the time serialising it with its lock held (pipelines being made
+/// wait to be stored meanwhile).
+#[cfg(windows)]
+pub fn library_saves() -> (u64, std::time::Duration, std::time::Duration) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let us = |k: usize| std::time::Duration::from_micros(library::SAVES[k].load(Relaxed));
+    (library::SAVES[0].load(Relaxed), us(1), us(2))
 }
 
 /// Host pipelines made, and loaded from the library, since the start.

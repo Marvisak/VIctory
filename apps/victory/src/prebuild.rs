@@ -224,6 +224,11 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
 
     let next = AtomicUsize::new(0);
     let (made0, loaded0) = pipeline::pipeline_counts();
+    let saves0 = pipeline::library_saves();
+    // Where the time goes: translating shaders (or finding them in the
+    // cache), and making host pipelines (the driver, or the library).
+    let translating = crate::slowest::Slowest::default();
+    let creating = crate::slowest::Slowest::default();
     let counts = || {
         let (made, loaded) = pipeline::pipeline_counts();
         (made - made0, loaded - loaded0)
@@ -233,7 +238,18 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
             .map(|_| {
                 s.spawn(|| {
                     while let Some(&job) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        if let Err(why) = prepare(job).and_then(|p| p.make()) {
+                        let p = match prepare(job) {
+                            Ok(p) => p,
+                            Err(why) => {
+                                skip(why);
+                                continue;
+                            }
+                        };
+                        let (made, translate, create) = p.make_timed();
+                        let name = || format!("{} {}", p.key(), shaders_of(job));
+                        translating.add(translate, name);
+                        creating.add(create, name);
+                        if let Err(why) = made {
                             skip(why);
                         }
                     }
@@ -256,6 +272,23 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     );
     for (why, n) in lock(&skipped).iter() {
         println!("  {n:>7}  skipped: {why}");
+    }
+    if !todo.is_empty() {
+        let (saves, saved, locked) = pipeline::library_saves();
+        let (saves, saved, locked) = (saves - saves0.0, saved - saves0.1, locked - saves0.2);
+        println!("time");
+        for line in translating.lines("translating pipelines' shaders") {
+            println!("{line}");
+        }
+        for line in creating.lines("making host pipelines (driver or library)") {
+            println!("{line}");
+        }
+        println!(
+            "  library saves: {saves} in {:.1} s, {:.1} s of it serialising with the library \
+             locked (pipelines being made wait to be stored)",
+            saved.as_secs_f64(),
+            locked.as_secs_f64()
+        );
     }
     Ok(())
 }

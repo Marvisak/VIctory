@@ -8,6 +8,7 @@ mod inspect;
 mod prebuild;
 mod run;
 mod shader;
+mod slowest;
 mod translate;
 
 use std::num::NonZeroUsize;

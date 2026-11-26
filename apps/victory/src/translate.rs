@@ -336,6 +336,8 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     }
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
+    // The translations' times, and the slowest by hash.
+    let slow = crate::slowest::Slowest::default();
     // Containers already cached, translated now, refused now.
     let counts = [const { AtomicUsize::new(0) }; 3];
     for root in &paths {
@@ -370,6 +372,12 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 let one = std::time::Instant::now();
                                 let (done, cached) =
                                     victory_gpu::shader_cache::host_shader(container);
+                                if !cached {
+                                    let ok = if done.is_ok() { "" } else { " (refused)" };
+                                    slow.add(one.elapsed(), || {
+                                        format!("{}{ok}", &hash.to_hex()[..16])
+                                    });
+                                }
                                 let k = if cached {
                                     0
                                 } else if done.is_ok() {
@@ -424,6 +432,12 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         cached + translated + refused,
         started.elapsed().as_secs_f64()
     );
+    if translated + refused > 0 {
+        println!("time");
+        for line in slow.lines("translations (containers by hash)") {
+            println!("{line}");
+        }
+    }
     if pipelines {
         crate::prebuild::run(&paths, threads)?;
     }
