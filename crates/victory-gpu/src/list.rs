@@ -687,9 +687,9 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
-/// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission; texture to buffer through readback memory
-/// ([`read_back`]).
+/// Texture to texture on the GPU; buffer to texture from its host buffer
+/// copy when GPU-backed, else through an upload buffer filled at
+/// submission; texture to buffer through readback memory ([`read_back`]).
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -729,20 +729,88 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
+            let shadow = if crate::resource::buffer_unordered(src.resource) {
+                crate::shadow::find(data as u64, bytes)
+            } else {
+                crate::shadow::existing(data as u64, bytes)
             };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
-            from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
-            #[cfg(feature = "diagnostics")]
-            {
-                // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+            let shadow = shadow.and_then(|shadow| {
+                let offset = shadow.offset(data as u64);
+                // SAFETY: a live host buffer.
+                let width = unsafe { shadow.buffer.GetDesc() }.Width;
+                offset
+                    .checked_add(bytes)
+                    .is_some_and(|end| end <= width)
+                    .then_some((shadow, offset))
+            });
+            if let Some((shadow, offset)) = shadow {
+                use windows::Win32::Graphics::Direct3D12::{
+                    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                };
+                const PLACEMENT: u64 = 512;
+                shadow.refresh(list, data as u64, bytes);
+                // Wait for earlier GPU writes to the buffer copy before reading it.
+                // SAFETY: the same layout; no resource named.
+                let uav =
+                    unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+                // SAFETY: an open list.
+                unsafe { list.list.ResourceBarrier(&[uav]) };
+                if offset.is_multiple_of(PLACEMENT) {
+                    with_state(this, |_, s| {
+                        s.note_copy_source(shadow.buffer.as_raw() as usize);
+                    });
+                    from.resource = shadow.buffer.as_raw().cast_const().cast();
+                    from.footprint.offset = offset;
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        read = Some((shadow.gpu(data as u64), bytes));
+                    }
+                    _upload = shadow.buffer.clone();
+                } else {
+                    let Some(staged) = host.default_buffer(bytes) else {
+                        return;
+                    };
+                    // SAFETY: an open list and live buffers; `staged` starts in COPY_DEST.
+                    unsafe {
+                        list.list
+                            .CopyBufferRegion(&staged, 0, &shadow.buffer, offset, bytes);
+                        let barrier = crate::host::transition(
+                            &staged,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        );
+                        list.list.ResourceBarrier(&[barrier]);
+                    }
+                    with_state(this, |_, s| {
+                        s.note_copy_source(shadow.buffer.as_raw() as usize);
+                    });
+                    list.keep(&staged);
+                    from.resource = staged.as_raw().cast_const().cast();
+                    from.footprint.offset = 0;
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        // SAFETY: a live buffer.
+                        read = Some((unsafe { staged.GetGPUVirtualAddress() }, bytes));
+                    }
+                    _upload = staged;
+                }
+            } else {
+                let Some((buffer, staging)) = list.upload(host, bytes) else {
+                    return;
+                };
+                // The list owns this mapped D3D12 upload buffer. Wine can report
+                // its address as MEM_FREE, so use the host-upload path.
+                list.defer_fill(staging, data, bytes as usize);
+                from.resource = buffer.as_raw().cast_const().cast();
+                from.footprint.offset = 0;
+                #[cfg(feature = "diagnostics")]
+                {
+                    // SAFETY: a live buffer.
+                    read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                }
+                _upload = buffer;
             }
-            _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
@@ -2044,6 +2112,817 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    mod copy_texture_from_gpu_buffer {
+        use super::*;
+        use crate::resource::PlacedFootprint;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::s;
+
+        const RESOURCE_IID: Iid = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        const HEAP_IID: Iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
+        const DXGI_FORMAT_R32_TYPELESS: u32 = 39;
+        const DXGI_FORMAT_R32_UINT: u32 = 42;
+        const ALLOW_UNORDERED_ACCESS: u32 = 4;
+
+        fn release(o: This) {
+            if !o.is_null() {
+                slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+            }
+        }
+
+        fn make_buffer(bytes: u64, heap_kind: u32, flags: u32) -> This {
+            let heap = [heap_kind, 0, 0, 0, 0];
+            let desc: [u32; 14] = [
+                1,
+                0,
+                0,
+                0,
+                bytes as u32,
+                (bytes >> 32) as u32,
+                1,
+                1 | (1 << 16),
+                0,
+                1,
+                0,
+                1,
+                flags,
+                0,
+            ];
+            let mut out = std::ptr::null();
+            let hr = crate::resource::create_committed(
+                std::ptr::null(),
+                heap.as_ptr().cast(),
+                0,
+                desc.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IID,
+                &mut out,
+            );
+            assert_eq!(hr, S_OK);
+            out
+        }
+
+        fn make_texture_2d(width: u32, height: u32) -> This {
+            let heap = [1u32, 0, 0, 0, 0];
+            let desc: [u32; 14] = [
+                3,
+                0,
+                0,
+                0,
+                width,
+                0,
+                height,
+                1 | (1 << 16),
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                1,
+                0,
+                0,
+                0,
+                0,
+            ];
+            let mut out = std::ptr::null();
+            let hr = crate::resource::create_committed(
+                std::ptr::null(),
+                heap.as_ptr().cast(),
+                0,
+                desc.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &RESOURCE_IID,
+                &mut out,
+            );
+            assert_eq!(hr, S_OK);
+            out
+        }
+
+        fn make_list() -> (This, This) {
+            let null = std::ptr::null();
+            let mut allocator = null;
+            assert_eq!(
+                create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+                S_OK
+            );
+            let mut list = null;
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            (allocator, list)
+        }
+
+        fn make_view_heap(count: u32) -> This {
+            let desc: [u32; 8] = [0, count, 1, 0, 0, 0, 0, 0];
+            let mut heap = std::ptr::null();
+            assert_eq!(
+                crate::descriptor::create_heap(
+                    std::ptr::null(),
+                    desc.as_ptr().cast(),
+                    &HEAP_IID,
+                    &mut heap
+                ),
+                S_OK
+            );
+            // Realize the host view heap during setup (before draining setup
+            // probe messages) so NVIDIA's 2M->1M fallback probe does not show up
+            // as a command-execution message.
+            assert!(crate::descriptor::heap(heap).host().is_some());
+            heap
+        }
+
+        fn footprint_loc(
+            resource: This,
+            offset: u64,
+            width: u32,
+            height: u32,
+            pitch: u32,
+        ) -> CopyLocation {
+            CopyLocation {
+                resource,
+                kind: 1,
+                footprint: PlacedFootprint {
+                    offset,
+                    format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    width,
+                    height,
+                    depth: 1,
+                    row_pitch: pitch,
+                },
+            }
+        }
+
+        fn subresource_loc(resource: This, subresource: u32) -> CopyLocation {
+            CopyLocation {
+                resource,
+                kind: 0,
+                footprint: PlacedFootprint {
+                    offset: u64::from(subresource),
+                    format: 0,
+                    width: 0,
+                    height: 0,
+                    depth: 0,
+                    row_pitch: 0,
+                },
+            }
+        }
+
+        fn compile_cs(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
+            let device = &crate::host::host().unwrap().device;
+            let mut code: Option<ID3DBlob> = None;
+            let mut errors: Option<ID3DBlob> = None;
+            // SAFETY: valid HLSL source and output pointers.
+            let compiled = unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    s!("copy_tex_test"),
+                    None,
+                    None,
+                    s!("main"),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    Some(&mut errors),
+                )
+            };
+            if let Err(e) = compiled {
+                if let Some(err) = errors {
+                    // SAFETY: error blob buffer.
+                    let msg = unsafe {
+                        std::slice::from_raw_parts(
+                            err.GetBufferPointer().cast::<u8>(),
+                            err.GetBufferSize(),
+                        )
+                    };
+                    panic!("D3DCompile failed ({e}): {}", String::from_utf8_lossy(msg));
+                }
+                panic!("D3DCompile failed: {e}");
+            }
+            let code = code.unwrap();
+            // SAFETY: compiled DXBC blob with embedded root signature.
+            unsafe {
+                let bytes = std::slice::from_raw_parts(
+                    code.GetBufferPointer().cast::<u8>(),
+                    code.GetBufferSize(),
+                );
+                let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                };
+                let pso = device.CreateComputePipelineState(&desc).unwrap();
+                let _ = std::mem::ManuallyDrop::into_inner(desc.pRootSignature);
+                (root, pso)
+            }
+        }
+
+        struct D3d12Messages(Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl Subscriber for D3d12Messages {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                metadata.is_event()
+                    && metadata.target().starts_with("victory_gpu::host")
+                    && metadata.fields().field("id").is_some()
+                    && metadata.fields().field("severity").is_some()
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                unreachable!()
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                if !self.enabled(event.metadata()) {
+                    return;
+                }
+                struct Msg {
+                    severity: i64,
+                    text: String,
+                }
+                impl tracing::field::Visit for Msg {
+                    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+                        if field.name() == "severity" {
+                            self.severity = value;
+                        }
+                        self.push(field.name(), &value);
+                    }
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.push(field.name(), value);
+                    }
+                }
+                impl Msg {
+                    fn push(&mut self, name: &str, value: &dyn std::fmt::Debug) {
+                        if !self.text.is_empty() {
+                            self.text.push_str(", ");
+                        }
+                        use std::fmt::Write;
+                        let _ = write!(self.text, "{name}={value:?}");
+                    }
+                }
+                let mut m = Msg {
+                    severity: i64::MAX,
+                    text: String::new(),
+                };
+                event.record(&mut m);
+                // Capture all D3D12 errors/corruptions (severity 0 or 1).
+                if m.severity <= 1 {
+                    self.0.lock().unwrap().push(m.text);
+                }
+            }
+        }
+
+        /// Drains setup-time D3D12 probe messages (e.g. host heap size fallback)
+        /// before recording the commands under test.
+        fn drain_setup_messages(host: &crate::host::Host) {
+            let _ = host.log_messages();
+        }
+
+        fn execute_lists(host: &crate::host::Host, lists: &[This]) {
+            let segs: Vec<_> = lists.iter().flat_map(|&l| segments(l)).collect();
+            let refs: Vec<&crate::host::HostList> = segs.iter().map(|s| s.as_ref()).collect();
+            let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sub = tracing::Dispatch::new(D3d12Messages(captured.clone()));
+            tracing::dispatcher::with_default(&sub, || {
+                host.execute(&refs);
+            });
+            let msgs = captured.lock().unwrap();
+            assert!(msgs.is_empty(), "unexpected D3D12 debug errors: {msgs:#?}");
+        }
+
+        fn read_u32(buf: This, byte_offset: usize) -> u32 {
+            let (ptr, len) = crate::resource::buffer_bytes(buf).unwrap();
+            assert!(byte_offset + 4 <= len as usize);
+            // SAFETY: inside the title buffer's backing memory.
+            unsafe { ptr.add(byte_offset).cast::<u32>().read_unaligned() }
+        }
+
+        fn write_u32(buf: This, byte_offset: usize, value: u32) {
+            let (ptr, len) = crate::resource::buffer_bytes(buf).unwrap();
+            assert!(byte_offset + 4 <= len as usize);
+            // SAFETY: inside the title buffer's backing memory.
+            unsafe { ptr.add(byte_offset).cast::<u32>().write_unaligned(value) }
+        }
+
+        /// A compute shader writes RGBA8 texel rows into a UAV buffer, then
+        /// `CopyTextureRegion` copies that buffer into a texture in the same
+        /// command list: the texture must receive the GPU-written texels, not
+        /// stale pre-GPU CPU memory.
+        #[test]
+        fn copy_texture_region_reads_compute_shader_uav_writes() {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            let src = make_buffer(4096, 1, ALLOW_UNORDERED_ACCESS);
+            let dst = make_texture_2d(4, 4);
+            let rb = make_buffer(4096, 3, 0);
+            // Distinct sentinel in CPU memory at footprint offset 512 so stale
+            // uploads fail unmistakably and non-zero footprint offsets are covered.
+            const OFFSET: usize = 512;
+            for row in 0..4usize {
+                for col in 0..4usize {
+                    write_u32(src, OFFSET + row * 256 + col * 4, 0x1122_3344);
+                }
+            }
+            let heap = make_view_heap(4);
+            let title_heap = crate::descriptor::heap(heap);
+            // Raw UAV over the 4096-byte buffer (1024 dwords).
+            let uav_desc: [u32; 10] = [DXGI_FORMAT_R32_TYPELESS, 1, 0, 0, 1024, 0, 0, 0, 1, 0];
+            crate::descriptor::create_uav(
+                std::ptr::null(),
+                src,
+                std::ptr::null(),
+                &uav_desc,
+                title_heap.start,
+            );
+            let heap_host = title_heap.host().expect("host view heap");
+            assert!(heap_host.mirror(0, title_heap.start, true).is_some());
+
+            let (root, pso) = compile_cs(
+                r#"
+    #define RS "DescriptorTable(UAV(u0))"
+    RWByteAddressBuffer dst : register(u0);
+    [RootSignature(RS)]
+    [numthreads(4, 4, 1)]
+    void main(uint3 id : SV_DispatchThreadID) {
+    uint val = 0xA0000000u | (id.y << 8) | id.x;
+    dst.Store(512u + id.y * 256u + id.x * 4u, val);
+    }
+    "#,
+            );
+
+            drain_setup_messages(host);
+            let (alloc, list) = make_list();
+            let (src_ptr, _) = crate::resource::buffer_bytes(src).unwrap();
+            let shadow = crate::shadow::find(src_ptr as u64, 4096).expect("src shadow");
+            let hl = host_list(list).unwrap();
+            shadow.refresh(hl, src_ptr as u64, 4096);
+            shadow.gpu_writes(hl, src_ptr as u64, 4096, false);
+            // SAFETY: open host list, valid compute pipeline and heap slot 0.
+            unsafe {
+                hl.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                hl.list.SetComputeRootSignature(&root);
+                hl.list.SetPipelineState(&pso);
+                hl.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+                hl.list.Dispatch(1, 1, 1);
+            }
+            let src_loc = footprint_loc(src, OFFSET as u64, 4, 4, 256);
+            let dst_loc = subresource_loc(dst, 0);
+            let rb_loc = footprint_loc(rb, 0, 4, 4, 256);
+            copy_texture_region(list, &dst_loc, 0, 0, 0, &src_loc, std::ptr::null());
+            copy_texture_region(list, &rb_loc, 0, 0, 0, &dst_loc, std::ptr::null());
+            assert_eq!(close(list), S_OK);
+            // Release source buffer before submission to verify host copy lifetime.
+            release(src);
+            execute_lists(host, &[list]);
+
+            for row in 0..4u32 {
+                for col in 0..4u32 {
+                    let want = 0xA000_0000 | (row << 8) | col;
+                    let got = read_u32(rb, (row as usize) * 256 + (col as usize) * 4);
+                    assert_eq!(
+                        got, want,
+                        "texel ({col}, {row}) got {got:#x}, expected {want:#x}"
+                    );
+                }
+            }
+            for o in [list, alloc, heap, rb, dst] {
+                release(o);
+            }
+        }
+
+        /// `ClearUnorderedAccessViewUint` -> `CopyTextureRegion` ->
+        /// `ClearUnorderedAccessViewUint` -> `CopyTextureRegion` in one list:
+        /// both textures must see their respective cleared values with zero
+        /// D3D12 debug layer state errors.
+        #[test]
+        fn copy_texture_region_reads_clear_uav_and_allows_subsequent_clear() {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            let src = make_buffer(4096, 1, ALLOW_UNORDERED_ACCESS);
+            let dst1 = make_texture_2d(4, 4);
+            let dst2 = make_texture_2d(4, 4);
+            let rb1 = make_buffer(4096, 3, 0);
+            let rb2 = make_buffer(4096, 3, 0);
+            let heap = make_view_heap(4);
+            let title_heap = crate::descriptor::heap(heap);
+            let uav_desc: [u32; 10] = [DXGI_FORMAT_R32_UINT, 1, 0, 0, 1024, 0, 0, 0, 0, 0];
+            crate::descriptor::create_uav(
+                std::ptr::null(),
+                src,
+                std::ptr::null(),
+                &uav_desc,
+                title_heap.start,
+            );
+
+            drain_setup_messages(host);
+            let (alloc, list) = make_list();
+            state::heaps(list, 1, &heap);
+            let v1 = [0x1234_5678u32; 4];
+            let v2 = [0x9ABC_DEF0u32; 4];
+            state::clear_unordered_uint(list, 0, title_heap.start, src, &v1, 0, std::ptr::null());
+            let src_loc = footprint_loc(src, 0, 4, 4, 256);
+            let d1_loc = subresource_loc(dst1, 0);
+            let d2_loc = subresource_loc(dst2, 0);
+            let rb1_loc = footprint_loc(rb1, 0, 4, 4, 256);
+            let rb2_loc = footprint_loc(rb2, 0, 4, 4, 256);
+            copy_texture_region(list, &d1_loc, 0, 0, 0, &src_loc, std::ptr::null());
+            state::clear_unordered_uint(list, 0, title_heap.start, src, &v2, 0, std::ptr::null());
+            copy_texture_region(list, &d2_loc, 0, 0, 0, &src_loc, std::ptr::null());
+            copy_texture_region(list, &rb1_loc, 0, 0, 0, &d1_loc, std::ptr::null());
+            copy_texture_region(list, &rb2_loc, 0, 0, 0, &d2_loc, std::ptr::null());
+            assert_eq!(close(list), S_OK);
+            execute_lists(host, &[list]);
+
+            for row in 0..4usize {
+                for col in 0..4usize {
+                    let off = row * 256 + col * 4;
+                    assert_eq!(read_u32(rb1, off), 0x1234_5678, "dst1 ({col}, {row})");
+                    assert_eq!(read_u32(rb2, off), 0x9ABC_DEF0, "dst2 ({col}, {row})");
+                }
+            }
+            for o in [list, alloc, heap, rb2, rb1, dst2, dst1, src] {
+                release(o);
+            }
+        }
+
+        /// List B (`CopyTextureRegion`) recorded BEFORE List A (`ClearUAV`) on
+        /// a fresh UAV buffer that has no shadow yet, then submitted in order
+        /// `[A, B]` in one `ExecuteCommandLists`: List B must still copy from
+        /// the shared GPU shadow buffer.
+        #[test]
+        fn copy_texture_region_reads_uav_writes_across_out_of_order_lists() {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            let src = make_buffer(4096, 1, ALLOW_UNORDERED_ACCESS);
+            let dst = make_texture_2d(4, 4);
+            let rb = make_buffer(4096, 3, 0);
+            let heap = make_view_heap(4);
+            let title_heap = crate::descriptor::heap(heap);
+            let uav_desc: [u32; 10] = [DXGI_FORMAT_R32_UINT, 1, 0, 0, 1024, 0, 0, 0, 0, 0];
+            crate::descriptor::create_uav(
+                std::ptr::null(),
+                src,
+                std::ptr::null(),
+                &uav_desc,
+                title_heap.start,
+            );
+
+            drain_setup_messages(host);
+            let (alloc_b, list_b) = make_list();
+            let src_loc = footprint_loc(src, 0, 4, 4, 256);
+            let dst_loc = subresource_loc(dst, 0);
+            let rb_loc = footprint_loc(rb, 0, 4, 4, 256);
+            copy_texture_region(list_b, &dst_loc, 0, 0, 0, &src_loc, std::ptr::null());
+            copy_texture_region(list_b, &rb_loc, 0, 0, 0, &dst_loc, std::ptr::null());
+            assert_eq!(close(list_b), S_OK);
+
+            let (alloc_a, list_a) = make_list();
+            state::heaps(list_a, 1, &heap);
+            let val = [0xCAFE_BABEu32; 4];
+            state::clear_unordered_uint(
+                list_a,
+                0,
+                title_heap.start,
+                src,
+                &val,
+                0,
+                std::ptr::null(),
+            );
+            assert_eq!(close(list_a), S_OK);
+
+            execute_lists(host, &[list_a, list_b]);
+
+            for row in 0..4usize {
+                for col in 0..4usize {
+                    assert_eq!(
+                        read_u32(rb, row * 256 + col * 4),
+                        0xCAFE_BABE,
+                        "({col}, {row})"
+                    );
+                }
+            }
+            for o in [list_a, alloc_a, list_b, alloc_b, heap, rb, dst, src] {
+                release(o);
+            }
+        }
+
+        /// A sub-buffer placed at a non-512-byte offset (+256) inside a larger
+        /// GPU-written buffer has legal `footprint.offset = 0` relative to the
+        /// sub-buffer, yet an unaligned offset inside the enclosing shadow
+        /// buffer: `CopyTextureRegion` must stage it cleanly with zero debug
+        /// layer errors.
+        #[test]
+        fn copy_texture_region_handles_non_512_aligned_shadow_offset() {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            let outer = make_buffer(4096, 1, ALLOW_UNORDERED_ACCESS);
+            let (outer_ptr, _) = crate::resource::buffer_bytes(outer).unwrap();
+            let inner_desc: [u32; 14] = [1, 0, 0, 0, 2048, 0, 1, 1 | (1 << 16), 0, 1, 0, 1, 0, 0];
+            let mut inner = std::ptr::null();
+            assert_eq!(
+                crate::resource::create_at_address(
+                    std::ptr::null(),
+                    outer_ptr as u64 + 256,
+                    inner_desc.as_ptr().cast(),
+                    0,
+                    std::ptr::null(),
+                    &RESOURCE_IID,
+                    &mut inner,
+                ),
+                S_OK
+            );
+            let dst = make_texture_2d(4, 4);
+            let rb = make_buffer(4096, 3, 0);
+            let heap = make_view_heap(4);
+            let title_heap = crate::descriptor::heap(heap);
+            let uav_desc: [u32; 10] = [DXGI_FORMAT_R32_UINT, 1, 0, 0, 1024, 0, 0, 0, 0, 0];
+            crate::descriptor::create_uav(
+                std::ptr::null(),
+                outer,
+                std::ptr::null(),
+                &uav_desc,
+                title_heap.start,
+            );
+
+            drain_setup_messages(host);
+            let (alloc, list) = make_list();
+            state::heaps(list, 1, &heap);
+            let val = [0x55AA_33CCu32; 4];
+            state::clear_unordered_uint(
+                list,
+                0,
+                title_heap.start,
+                outer,
+                &val,
+                0,
+                std::ptr::null(),
+            );
+            let inner_loc = footprint_loc(inner, 0, 4, 4, 256);
+            let dst_loc = subresource_loc(dst, 0);
+            let rb_loc = footprint_loc(rb, 0, 4, 4, 256);
+            copy_texture_region(list, &dst_loc, 0, 0, 0, &inner_loc, std::ptr::null());
+            copy_texture_region(list, &rb_loc, 0, 0, 0, &dst_loc, std::ptr::null());
+            assert_eq!(close(list), S_OK);
+            execute_lists(host, &[list]);
+
+            for row in 0..4usize {
+                for col in 0..4usize {
+                    assert_eq!(
+                        read_u32(rb, row * 256 + col * 4),
+                        0x55AA_33CC,
+                        "({col}, {row})"
+                    );
+                }
+            }
+            for o in [list, alloc, heap, rb, dst, inner, outer] {
+                release(o);
+            }
+        }
+
+        /// Mixed CPU + GPU writes to one buffer in the same submission with a
+        /// sub-rectangle `source_box` and non-zero destination `(x, y, z)`:
+        /// row 0 (CPU-written before submit) and row 1 (GPU-written in the
+        /// list) must both land in the target rectangle while surrounding
+        /// destination texels stay intact.
+        #[test]
+        fn copy_texture_region_preserves_mixed_cpu_and_gpu_writes_with_source_box() {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            let bg = make_buffer(4096, 2, 0);
+            let src = make_buffer(4096, 1, ALLOW_UNORDERED_ACCESS);
+            let dst = make_texture_2d(8, 4);
+            let rb = make_buffer(4096, 3, 0);
+            for row in 0..4usize {
+                for col in 0..8usize {
+                    write_u32(bg, row * 256 + col * 4, 0x0102_0304);
+                }
+            }
+            // CPU writes row 0 before submission; row 1 stays zero on CPU.
+            for col in 0..4usize {
+                write_u32(src, col * 4, 0xAABB_CCDD);
+            }
+            let heap = make_view_heap(4);
+            let title_heap = crate::descriptor::heap(heap);
+            let uav_desc: [u32; 10] = [DXGI_FORMAT_R32_TYPELESS, 1, 0, 0, 1024, 0, 0, 0, 1, 0];
+            crate::descriptor::create_uav(
+                std::ptr::null(),
+                src,
+                std::ptr::null(),
+                &uav_desc,
+                title_heap.start,
+            );
+            let heap_host = title_heap.host().expect("host view heap");
+            assert!(heap_host.mirror(0, title_heap.start, true).is_some());
+
+            let (root, pso) = compile_cs(
+                r#"
+    #define RS "DescriptorTable(UAV(u0))"
+    RWByteAddressBuffer dst : register(u0);
+    [RootSignature(RS)]
+    [numthreads(4, 1, 1)]
+    void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store(256u + id.x * 4u, 0x11223344u);
+    }
+    "#,
+            );
+
+            drain_setup_messages(host);
+            let (alloc, list) = make_list();
+            let bg_loc = footprint_loc(bg, 0, 8, 4, 256);
+            let dst_loc = subresource_loc(dst, 0);
+            let src_loc = footprint_loc(src, 0, 4, 2, 256);
+            let rb_loc = footprint_loc(rb, 0, 8, 4, 256);
+            copy_texture_region(list, &dst_loc, 0, 0, 0, &bg_loc, std::ptr::null());
+
+            let (src_ptr, _) = crate::resource::buffer_bytes(src).unwrap();
+            let shadow = crate::shadow::find(src_ptr as u64, 4096).expect("src shadow");
+            let hl = host_list(list).unwrap();
+            shadow.refresh(hl, src_ptr as u64, 4096);
+            shadow.gpu_writes(hl, src_ptr as u64, 4096, false);
+            // SAFETY: open host list, valid compute pipeline and heap slot 0.
+            unsafe {
+                hl.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                hl.list.SetComputeRootSignature(&root);
+                hl.list.SetPipelineState(&pso);
+                hl.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+                hl.list.Dispatch(1, 1, 1);
+            }
+            let src_box = [0u32, 0, 0, 4, 2, 1];
+            copy_texture_region(list, &dst_loc, 2, 1, 0, &src_loc, &src_box);
+            copy_texture_region(list, &rb_loc, 0, 0, 0, &dst_loc, std::ptr::null());
+            assert_eq!(close(list), S_OK);
+            execute_lists(host, &[list]);
+
+            for row in 0..4usize {
+                for col in 0..8usize {
+                    let want = if (2..6).contains(&col) && row == 1 {
+                        0xAABB_CCDD
+                    } else if (2..6).contains(&col) && row == 2 {
+                        0x1122_3344
+                    } else {
+                        0x0102_0304
+                    };
+                    assert_eq!(read_u32(rb, row * 256 + col * 4), want, "({col}, {row})");
+                }
+            }
+            for o in [list, alloc, heap, rb, dst, src, bg] {
+                release(o);
+            }
+        }
+
+        /// Pure CPU upload buffers without a shadow stay on the upload-fill
+        /// path, preserving per-call `CopyBufferRegion` snapshots.
+        #[test]
+        fn copy_texture_region_keeps_pure_cpu_upload_buffers_ordered() {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            let upload = make_buffer(4096, 2, 0);
+            let other = make_buffer(4096, 2, 0);
+            let dst1 = make_texture_2d(4, 4);
+            let dst2 = make_texture_2d(4, 4);
+            let rb1 = make_buffer(4096, 3, 0);
+            let rb2 = make_buffer(4096, 3, 0);
+            for row in 0..4usize {
+                for col in 0..4usize {
+                    write_u32(upload, row * 256 + col * 4, 0x1111_1111);
+                    write_u32(other, row * 256 + col * 4, 0x2222_2222);
+                }
+            }
+            drain_setup_messages(host);
+            let (alloc, list) = make_list();
+            let up_loc = footprint_loc(upload, 0, 4, 4, 256);
+            let d1_loc = subresource_loc(dst1, 0);
+            let d2_loc = subresource_loc(dst2, 0);
+            let rb1_loc = footprint_loc(rb1, 0, 4, 4, 256);
+            let rb2_loc = footprint_loc(rb2, 0, 4, 4, 256);
+            copy_texture_region(list, &d1_loc, 0, 0, 0, &up_loc, std::ptr::null());
+            copy_buffer_region(list, upload, 0, other, 0, 1024);
+            copy_texture_region(list, &d2_loc, 0, 0, 0, &up_loc, std::ptr::null());
+            copy_texture_region(list, &rb1_loc, 0, 0, 0, &d1_loc, std::ptr::null());
+            copy_texture_region(list, &rb2_loc, 0, 0, 0, &d2_loc, std::ptr::null());
+            assert_eq!(close(list), S_OK);
+            let (upload_ptr, _) = crate::resource::buffer_bytes(upload).unwrap();
+            assert!(
+                crate::shadow::existing(upload_ptr as u64, 4096).is_none(),
+                "pure CPU upload buffer must not allocate a shadow copy"
+            );
+            execute_lists(host, &[list]);
+
+            for row in 0..4usize {
+                for col in 0..4usize {
+                    let off = row * 256 + col * 4;
+                    assert_eq!(read_u32(rb1, off), 0x1111_1111, "dst1 ({col}, {row})");
+                    assert_eq!(read_u32(rb2, off), 0x2222_2222, "dst2 ({col}, {row})");
+                }
+            }
+            for o in [list, alloc, rb2, rb1, dst2, dst1, other, upload] {
+                release(o);
+            }
+        }
+
+        /// Reading a shared buffer through a root SRV (`NON_PIXEL_SHADER_RESOURCE`)
+        /// before `CopyTextureRegion` in the same command list must not trigger a
+        /// D3D12 debug layer state-transition mismatch.
+        #[test]
+        fn copy_texture_region_after_root_srv_read_on_same_buffer() {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            let shared = make_buffer(4096, 1, ALLOW_UNORDERED_ACCESS);
+            let out = make_buffer(256, 1, ALLOW_UNORDERED_ACCESS);
+            let dst = make_texture_2d(4, 4);
+            let rb = make_buffer(4096, 3, 0);
+            for row in 0..4usize {
+                for col in 0..4usize {
+                    write_u32(shared, row * 256 + col * 4, 0x3344_5566);
+                }
+            }
+            let (root, pso) = compile_cs(
+                r#"
+    #define RS "SRV(t0), UAV(u0)"
+    ByteAddressBuffer src : register(t0);
+    RWByteAddressBuffer dst : register(u0);
+    [RootSignature(RS)]
+    [numthreads(1, 1, 1)]
+    void main() {
+    dst.Store(0, src.Load(0));
+    }
+    "#,
+            );
+            drain_setup_messages(host);
+            let (alloc, list) = make_list();
+            let (shared_ptr, _) = crate::resource::buffer_bytes(shared).unwrap();
+            let (out_ptr, _) = crate::resource::buffer_bytes(out).unwrap();
+            let shared_shadow =
+                crate::shadow::find(shared_ptr as u64, 4096).expect("shared shadow");
+            let out_shadow = crate::shadow::find(out_ptr as u64, 256).expect("out shadow");
+            let hl = host_list(list).unwrap();
+            shared_shadow.refresh(hl, shared_ptr as u64, 4096);
+            out_shadow.refresh(hl, out_ptr as u64, 256);
+            out_shadow.gpu_writes(hl, out_ptr as u64, 256, false);
+            // SAFETY: open host list, valid compute pipeline and live shadow addresses.
+            unsafe {
+                hl.list.SetComputeRootSignature(&root);
+                hl.list.SetPipelineState(&pso);
+                hl.list
+                    .SetComputeRootShaderResourceView(0, shared_shadow.gpu(shared_ptr as u64));
+                hl.list
+                    .SetComputeRootUnorderedAccessView(1, out_shadow.gpu(out_ptr as u64));
+                hl.list.Dispatch(1, 1, 1);
+            }
+            let src_loc = footprint_loc(shared, 0, 4, 4, 256);
+            let dst_loc = subresource_loc(dst, 0);
+            let rb_loc = footprint_loc(rb, 0, 4, 4, 256);
+            copy_texture_region(list, &dst_loc, 0, 0, 0, &src_loc, std::ptr::null());
+            copy_texture_region(list, &rb_loc, 0, 0, 0, &dst_loc, std::ptr::null());
+            assert_eq!(close(list), S_OK);
+            execute_lists(host, &[list]);
+
+            assert_eq!(read_u32(out, 0), 0x3344_5566);
+            for row in 0..4usize {
+                for col in 0..4usize {
+                    assert_eq!(
+                        read_u32(rb, row * 256 + col * 4),
+                        0x3344_5566,
+                        "({col}, {row})"
+                    );
+                }
+            }
+            for o in [list, alloc, rb, dst, out, shared] {
+                release(o);
+            }
         }
     }
 }

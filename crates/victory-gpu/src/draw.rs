@@ -94,6 +94,9 @@ pub(crate) struct State {
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
+    /// Host buffer copies promoted to `COPY_SOURCE` by `CopyTextureRegion`
+    /// in this segment, so a later buffer UAV clear transitions them out.
+    copy_sources: std::collections::HashSet<usize>,
 }
 
 /// Fixed-function state the title set, as it set it.
@@ -271,6 +274,10 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    pub(crate) fn note_copy_source(&mut self, resource: usize) {
+        self.copy_sources.insert(resource);
+    }
+
     /// Fixed-function state, straight onto the host list (and kept for the
     /// list's next segment).
     pub(crate) fn viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
@@ -316,6 +323,7 @@ impl State {
         self.host_state_lost();
         self.fresh_tables.clear();
         self.root_slots.clear();
+        self.copy_sources.clear();
         self.memory = None;
         let fixed = std::mem::take(&mut self.fixed);
         if fixed.topology {
@@ -1079,8 +1087,19 @@ impl State {
         self.bind_heaps(list, false);
         list.keep(&resource);
         let gpu = visible.gpu(slot);
+        // SAFETY: a live host resource.
+        let is_buffer =
+            unsafe { resource.GetDesc() }.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
         // SAFETY: an open list; both slots view the live resource.
         unsafe {
+            if is_buffer && self.copy_sources.remove(&(resource.as_raw() as usize)) {
+                let to_uav = crate::host::transition(
+                    &resource,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                );
+                list.list.ResourceBarrier(&[to_uav]);
+            }
             if float {
                 let values = values.map(f32::from_bits);
                 list.list
@@ -1088,6 +1107,16 @@ impl State {
             } else {
                 list.list
                     .ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
+            }
+            // Buffer copies stay in COMMON between commands so subsequent
+            // copies or reads can promote them cleanly.
+            if is_buffer {
+                let back = crate::host::transition(
+                    &resource,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COMMON,
+                );
+                list.list.ResourceBarrier(&[back]);
             }
         }
     }

@@ -1050,6 +1050,29 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
+/// The host copy already made for a title buffer or loose window covering
+/// `[address, address + len)`, without creating a new copy.
+pub(crate) fn existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    if let Some(shadow) = buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find_map(|(_, e)| (e.end >= end).then_some(e.shadow.as_ref()).flatten())
+        .cloned()
+    {
+        return Some(shadow);
+    }
+    LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..=(address, u64::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, s)| s.start + s.len >= end)
+        .map(|(_, s)| s.clone())
+}
+
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.

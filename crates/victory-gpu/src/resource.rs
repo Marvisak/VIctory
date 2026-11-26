@@ -1470,6 +1470,15 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     (r.desc.dimension == BUFFER).then(|| (r.data(), r.desc.width))
 }
 
+/// Whether `this` is a buffer with `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`.
+#[cfg(windows)]
+pub(crate) fn buffer_unordered(this: This) -> bool {
+    !this.is_null() && {
+        let r = resource(this);
+        r.desc.dimension == BUFFER && r.desc.flags & UNORDERED != 0
+    }
+}
+
 impl Resource {
     /// Its host texture, made the first time it is asked for: a list uses
     /// the texture, a heap slot views it, a copy or upload reaches it. Most
