@@ -1868,21 +1868,24 @@ impl HostList {
 
     /// A use of the depth texture `depth` (with a twin) needing `side`
     /// (`crate::twin::DEPTH` or `TWIN`): whether a copy must be recorded
-    /// now (true: into the depth texture). The list's first use is the
-    /// prelude's to prepare.
+    /// now (true: into the depth texture) and which planes. The list's
+    /// first use is the prelude's to prepare.
     pub(crate) fn twin_use(
         &self,
         depth: &std::sync::Arc<crate::resource::HostTexture>,
         side: u8,
         writes: bool,
-    ) -> Option<bool> {
+        active: u8,
+    ) -> Option<(bool, u8)> {
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         match twins.entry(std::sync::Arc::as_ptr(depth) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(crate::twin::Use::new(depth, side, writes));
+                v.insert(crate::twin::Use::new(depth, active, side, writes));
                 None
             }
-            std::collections::hash_map::Entry::Occupied(mut o) => o.get_mut().again(side, writes),
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                o.get_mut().again(active, side, writes)
+            }
         }
     }
 
@@ -1954,11 +1957,11 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                for (depth, to_depth) in &copies {
+                for (depth, to_depth, mask) in &copies {
                     let Some(Some(twin)) = depth.twin.get() else { continue };
                     // From each texture's real state to the copy's and back.
                     let mut back = Vec::new();
-                    twin.copy(list, depth, *to_depth, &mut |t, wanted| {
+                    twin.copy(list, depth, *to_depth, *mask, &mut |t, wanted| {
                         let real = t.state.load(Ordering::Relaxed);
                         let wanted = legal_state(&t.texture, wanted);
                         (real != wanted).then(|| {
