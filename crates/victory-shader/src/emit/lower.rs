@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1405,6 +1408,8 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
             #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
+            #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
@@ -2489,15 +2494,18 @@ impl<'a> Lower<'a> {
     /// The high dword of a 32 × 32-bit product.
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
-        let i64t = self.s.m.int(64);
-        let ext = if signed { Cast::SExt } else { Cast::ZExt };
-        let a = self.s.m.cast(c, ext, a, i64t);
-        let b = self.s.m.cast(c, ext, b, i64t);
-        let m = self.s.m.bin(c, Bin::Mul, a, b);
-        let k32 = self.s.m.int_const(i64t, 32);
-        let hi = self.s.m.bin(c, Bin::LShr, m, k32);
-        self.s.flags |= flags::INT64;
-        self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
+        let product = self.s.m.named_struct("dx.types.twoi32", vec![self.s.t.i32; 2]);
+        let opcode = if signed { 41 } else { 42 };
+        let result = self.s.op(
+            c,
+            "binaryWithTwoOuts.i32",
+            Attr::ReadNone,
+            product,
+            opcode,
+            &[a, b],
+        );
+        // IMul and UMul return the high dword first.
+        self.s.m.extract(c, result, 0)
     }
 
     /// `0 × anything = 0`, as in D3D9. As on RDNA2, a denormal operand counts
@@ -11115,6 +11123,34 @@ mod tests {
                 vop3(first, second),
                 "VOP3 {modifier} was dropped for op {op:#x}"
             );
+        }
+    }
+
+    #[test]
+    fn mul_hi_has_a_short_lowering_without_int64() {
+        // Vector inputs are v1/v2. The scalar forms use s0/s1 and move s6 to v0.
+        // All inputs come from root constants. On 63bcca4 the 32-bit forms
+        // emitted 21 instructions and the 24-bit forms emitted 25.
+        let cases: [(&str, &[u32], usize); 6] = [
+            ("v_mul_hi_u32", &[0xD56A_0000, 0x0002_0501], 18),
+            ("v_mul_hi_i32", &[0xD56C_0000, 0x0002_0501], 18),
+            ("s_mul_hi_u32", &[0x9A86_0100, 0x7E00_0206], 18),
+            ("s_mul_hi_i32", &[0x9B06_0100, 0x7E00_0206], 18),
+            ("v_mul_hi_u32_u24", &[0x1800_0501], 22),
+            ("v_mul_hi_i32_i24", &[0x1400_0501], 22),
+        ];
+        for (name, body, max_instructions) in cases {
+            let l = lower_valu(body).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                l.instructions <= max_instructions,
+                "{name}: emitted {} DXIL instructions, expected at most {max_instructions}",
+                l.instructions
+            );
+            let container = crate::Container::parse(&l.dxil).unwrap();
+            let features = container.part(crate::FourCC::SFI0).unwrap();
+            let features = u64::from_le_bytes(features.data.try_into().unwrap());
+            assert_eq!(features & 0x8000, 0, "{name} must not require INT64");
+            eprintln!("{name}: {} DXIL instructions", l.instructions);
         }
     }
 
