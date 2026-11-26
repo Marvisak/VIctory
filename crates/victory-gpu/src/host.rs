@@ -803,6 +803,8 @@ pub(crate) struct HostList {
     /// by host copy: the side its first use needs and the side it leaves
     /// newer.
     twins: Mutex<std::collections::HashMap<usize, crate::twin::Use>>,
+    /// Its uses of textures placed in host heaps (`crate::alias`).
+    aliases: Mutex<crate::alias::ListAliases>,
     /// A copy of ours replaced the list's compute root signature and
     /// pipeline: draws and dispatches set theirs again.
     rebind: std::sync::atomic::AtomicBool,
@@ -1134,6 +1136,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                aliases: Mutex::default(),
                 rebind: false.into(),
                 ours: false.into(),
                 memory_writer: false.into(),
@@ -1784,6 +1787,10 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.aliases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1832,22 +1839,36 @@ impl HostList {
     /// The list's state for host texture `copy` becomes `wanted` (a legal
     /// one): the state it leaves, if that is a change. Nothing for the
     /// list's first use (its prelude moves the texture there).
+    /// A texture in a host heap that takes memory another texture the list
+    /// used holds gets its aliasing barrier and discard here
+    /// (`crate::alias`).
     fn track(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
+        let (left, now) = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 copy.note_used();
                 if !self.ours.load(Ordering::Relaxed) {
                     copy.stamp();
                 }
                 v.insert((wanted, wanted, copy.clone()));
-                None
+                (None, wanted)
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some(before)
+                ((before != wanted).then_some(before), before)
             }
+        };
+        drop(states);
+        if copy.aliased.is_some()
+            && self
+                .aliases
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .use_texture(copy)
+        {
+            crate::alias::initialize(&self.list, copy, now, true);
         }
+        left
     }
 
     /// [`HostList::transition`] for a host texture of ours (a twin's
@@ -1925,6 +1946,17 @@ impl HostList {
         let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         let copies = crate::twin::at_submission(twins.values());
         drop(twins);
+        // Textures in host heaps taking memory other textures held after
+        // the lists before (`crate::alias`), from their real states.
+        let (alias, discards) =
+            crate::alias::at_submission(&self.aliases.lock().unwrap_or_else(|e| e.into_inner()));
+        let discards: Vec<_> = discards
+            .into_iter()
+            .map(|t| {
+                let real = t.state.load(Ordering::Relaxed);
+                (t, real)
+            })
+            .collect();
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies start from the real states, then the list's moves from
         // them; only after both do they become the states the list leaves.
@@ -1944,7 +1976,11 @@ impl HostList {
                 copy.state.store(*last, Ordering::Relaxed);
             }
         };
-        if copies.is_empty() && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first) {
+        if copies.is_empty()
+            && !alias
+            && discards.is_empty()
+            && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first)
+        {
             left();
             return None;
         }
@@ -1954,6 +1990,12 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                if alias && discards.is_empty() {
+                    list.ResourceBarrier(&[crate::alias::any_alias()]);
+                }
+                for (i, (t, real)) in discards.iter().enumerate() {
+                    crate::alias::initialize(list, t, *real, alias && i == 0);
+                }
                 for (depth, to_depth) in &copies {
                     let Some(Some(twin)) = depth.twin.get() else { continue };
                     // From each texture's real state to the copy's and back.
@@ -3081,6 +3123,7 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
+            crate::alias::log();
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(
