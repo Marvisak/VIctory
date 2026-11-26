@@ -431,9 +431,28 @@ impl Drop for Tracked {
             }
         }
         for page in free {
-            let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
+            let watched_elsewhere = g
+                .alias_of
+                .get(&page)
+                .is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
             if !watched_elsewhere {
                 open(&mut g, page);
+                let aliases: Vec<usize> = g
+                    .alias_of
+                    .get(&page)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .collect();
+                for other in aliases {
+                    let other_watched = g.holders.contains_key(&other)
+                        || g.alias_of
+                            .get(&other)
+                            .is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
+                    if !other_watched {
+                        open(&mut g, other);
+                    }
+                }
             }
         }
     }
@@ -1341,6 +1360,31 @@ pub(crate) mod tests {
         // SAFETY: the second view, guarded for `t`'s page too.
         unsafe { ((b + 4) as *mut u32).write_volatile(7) };
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+    }
+
+    /// Dropping the last tracker watching a page also unprotects any alias
+    /// mappings that `guard_aliases` marked read-only on its behalf.
+    #[test]
+    fn dropping_the_last_tracker_unprotects_guarded_aliases() {
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+        };
+        let protection = |at: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        let (a, b) = twin_views(1);
+        let t = track(a, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(guards().protected.contains(&(b / PAGE)));
+        drop(t);
+        assert!(!guards().protected.contains(&(a / PAGE)));
+        assert!(!guards().protected.contains(&(b / PAGE)));
+        assert_eq!(protection(a), PAGE_READWRITE);
+        assert_eq!(protection(b), PAGE_READWRITE);
     }
 
     /// A retake has every copy of the memory, and of its other mappings,
