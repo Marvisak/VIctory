@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+#[cfg(test)]
+mod subdword_tests;
 
 type Why = &'static str;
 
@@ -72,6 +74,18 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Number of `atomicCompareExchange.i32` CAS loops emitted.
+    #[cfg(test)]
+    pub cas_loops: usize,
+    /// Number of `dx.op.atomicBinOp.i32` calls emitted.
+    #[cfg(test)]
+    pub atomic_bin_ops: usize,
+    /// Number of `dx.op.atomicCompareExchange.i32` calls emitted.
+    #[cfg(test)]
+    pub atomic_cas_ops: usize,
+    /// Number of `dx.op.rawBufferLoad.f32` calls emitted.
+    #[cfg(test)]
+    pub raw_buffer_loads: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1412,6 +1426,14 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            cas_loops: self.s.m.cas_loop_count(),
+            #[cfg(test)]
+            atomic_bin_ops: self.s.m.call_count("dx.op.atomicBinOp.i32"),
+            #[cfg(test)]
+            atomic_cas_ops: self.s.m.call_count("dx.op.atomicCompareExchange.i32"),
+            #[cfg(test)]
+            raw_buffer_loads: self.s.m.call_count("dx.op.rawBufferLoad.f32"),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -9594,8 +9616,10 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let (true, Some((width, _))) = (store, sub) {
-            // The field of the dword holding it, by two atomics on that dword
-            // (clear, then set): other lanes' fields in it are left alone.
+            // The field of the dword holding it, updated by a compare-exchange
+            // loop so concurrent stores to the same byte or half never race
+            // between a separate clear and set while other lanes' fields stay
+            // intact.
             // shortcut: the field is taken not to cross a dword.
             if index.is_some() {
                 return Err("a byte or half buffer store by index");
@@ -9614,12 +9638,27 @@ impl<'a> Lower<'a> {
             let keep = self.s.m.bin(c, Bin::Xor, mask, all);
             let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
             let begin = self.begin_guarded(guard);
+            let pre = self.cur;
+            let old0 = self.raw_dword(h, at);
+            let cas = self.s.m.new_block();
+            let exit = self.s.m.new_block();
+            self.s.m.terminate(pre, Term::Br(cas));
             let i32t = self.s.t.i32;
-            for (op, v) in [(1, keep), (2, x)] {
-                let args = [h, self.s.m.i32(op), at, iu, iu, v];
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
-            }
+            let old = self.s.m.phi(cas, i32t);
+            let kept = self.s.m.bin(cas, Bin::And, old, keep);
+            let next = self.s.m.bin(cas, Bin::Or, kept, x);
+            let prev = self.s.op(
+                cas,
+                "atomicCompareExchange.i32",
+                Attr::NoUnwind,
+                i32t,
+                79,
+                &[h, at, iu, iu, old, next],
+            );
+            self.s.m.set_phi(old, vec![(old0, pre), (prev, cas)]);
+            let done = self.s.m.cmp(cas, pred::EQ, prev, old);
+            self.s.m.terminate(cas, Term::CondBr(done, exit, cas));
+            self.cur = exit;
             self.mark_view_write(h, at, 4, None);
             self.end_guarded(begin, &[]);
             return Ok(());
