@@ -147,7 +147,10 @@ impl<S, F> Held<S, F> {
         let reads = std::cell::RefCell::new(Vec::new());
         let read = |address: u64, bytes: u8| {
             let mut cache = reads.borrow_mut();
-            if let Some((_, _, value)) = cache.iter().find(|(a, b, _)| *a == address && *b == bytes) {
+            if let Some((_, _, value)) = cache
+                .iter()
+                .find(|(a, b, _)| *a == address && *b == bytes)
+            {
                 return *value;
             }
             let value = read(address, bytes);
@@ -395,7 +398,11 @@ mod tests {
         });
 
         assert!(pumped.blocked);
-        assert_eq!(reads.get(), 2, "same address at 8 and 4 bytes is two cache keys");
+        assert_eq!(
+            reads.get(),
+            2,
+            "same address at 8 and 4 bytes is two cache keys"
+        );
     }
 
     #[test]
@@ -409,7 +416,10 @@ mod tests {
 
         let p = pump(&mut held, &fake);
 
-        assert_eq!(fake.borrow().log, ["q2: release", "q1: waiting"]);
+        assert_eq!(
+            fake.borrow().log,
+            ["q2: release", "q1: waiting"]
+        );
         assert!(!p.blocked, "all queues drained during the later pump pass");
         assert!(held.is_empty());
     }
