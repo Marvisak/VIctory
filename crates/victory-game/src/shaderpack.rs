@@ -297,6 +297,22 @@ impl<'a> Pack<'a> {
     }
 }
 
+/// The zlib stream `input` starts with, inflated into `chunk` (`None`: not
+/// one, or more than `chunk` holds): its output and the bytes it took.
+fn inflate_one(input: &[u8], chunk: &mut [u8]) -> Option<(Vec<u8>, usize)> {
+    use zlib_rs::{Inflate, InflateFlush, Status};
+    let mut stream = Inflate::new(true, 15);
+    let status = stream
+        .decompress(input, chunk, InflateFlush::NoFlush)
+        .ok()?;
+    (status == Status::StreamEnd).then(|| {
+        (
+            chunk[..stream.total_out() as usize].to_vec(),
+            stream.total_in() as usize,
+        )
+    })
+}
+
 /// The pack in `file`: the file itself, or the pack an archive holds as a
 /// run of zlib streams (each starting at a multiple of 16 bytes and
 /// inflating to at most 64 KiB), found by its magic.
@@ -306,15 +322,7 @@ pub fn find(file: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
     }
     let mut chunk = vec![0u8; 0x20000];
     // One zlib stream at `at`: its output and the bytes it took.
-    let mut inflate = |at: usize| {
-        use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
-        use miniz_oxide::inflate::TINFLStatus;
-        let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
-            | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
-        let (status, used, out) =
-            decompress(&mut DecompressorOxide::new(), file.get(at..)?, &mut chunk, 0, flags);
-        (status == TINFLStatus::Done).then(|| (chunk[..out].to_vec(), used))
-    };
+    let mut inflate = |at: usize| inflate_one(file.get(at..)?, &mut chunk);
     let zlib = |at: usize| {
         file[at] == 0x78 && u16::from_be_bytes([file[at], file[at + 1]]).is_multiple_of(31)
     };
@@ -483,6 +491,68 @@ mod tests {
         assert_eq!(find(&archive).as_deref(), Some(&pack[..]));
         assert_eq!(find(&pack).as_deref(), Some(&pack[..]));
         assert!(find(&archive[..archive.len() - 200]).is_none());
+    }
+
+    /// A stream inflates to what was compressed and takes its own bytes,
+    /// whatever follows; a truncated stream, one larger than the chunk, and
+    /// bytes that are no stream give nothing.
+    #[test]
+    fn one_stream_inflates_alone() {
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let stream = miniz_oxide::deflate::compress_to_vec_zlib(&data, 6);
+        let mut followed = stream.clone();
+        followed.extend([0x78, 0x9C, 1, 2, 3]);
+        let mut chunk = vec![0; 0x20000];
+        assert_eq!(
+            inflate_one(&followed, &mut chunk),
+            Some((data.clone(), stream.len()))
+        );
+        assert_eq!(inflate_one(&stream[..stream.len() - 4], &mut chunk), None);
+        assert_eq!(inflate_one(&stream, &mut chunk[..1000]), None);
+        assert_eq!(inflate_one(b"not a zlib stream", &mut chunk), None);
+    }
+
+    /// Time to inflate 600 streams of 64 KiB (an archive's worth of pack)
+    /// through miniz_oxide, as `find` did, and through zlib-rs. Run with
+    /// `--ignored --nocapture` in a release build.
+    #[test]
+    #[ignore]
+    fn inflate_bench() {
+        let streams: Vec<Vec<u8>> = (0..600u32)
+            .map(|k| {
+                let part: Vec<u8> = (0..0x1_0000u32)
+                    .map(|i| ((i ^ k).wrapping_mul(2_654_435_761) >> 27) as u8)
+                    .collect();
+                miniz_oxide::deflate::compress_to_vec_zlib(&part, 6)
+            })
+            .collect();
+        let mut chunk = vec![0; 0x20000];
+        let miniz = |input: &[u8], chunk: &mut [u8]| {
+            use miniz_oxide::inflate::TINFLStatus;
+            use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
+            let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
+                | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+            let (status, used, out) =
+                decompress(&mut DecompressorOxide::new(), input, chunk, 0, flags);
+            (status == TINFLStatus::Done).then(|| (chunk[..out].to_vec(), used))
+        };
+        let mut times = [Vec::new(), Vec::new()];
+        for round in 0..10 {
+            let started = std::time::Instant::now();
+            for s in &streams {
+                let out = if round % 2 == 0 {
+                    miniz(s, &mut chunk)
+                } else {
+                    inflate_one(s, &mut chunk)
+                };
+                assert_eq!(out.map(|(o, _)| o.len()), Some(0x1_0000));
+            }
+            times[round % 2].push(started.elapsed().as_secs_f64() * 1e3);
+        }
+        for (how, mut t) in ["miniz_oxide", "zlib-rs"].into_iter().zip(times) {
+            t.sort_by(f64::total_cmp);
+            eprintln!("{how}: median {:.1} ms", t[t.len() / 2]);
+        }
     }
 
     #[test]
