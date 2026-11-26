@@ -23,7 +23,7 @@ use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
 
@@ -219,9 +219,10 @@ extern "system" fn create_queue(
 /// Grand Theft Auto VI asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
-    if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
-    }
+    let Some(scheduler) = scheduler() else {
+        return E_OUTOFMEMORY;
+    };
+    scheduler.lock().staging = u64::from(size);
     S_OK
 }
 
@@ -401,55 +402,62 @@ unsafe impl Send for Job {}
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
-    static SCHEDULER: OnceLock<Option<Scheduler>> = OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    let scheduler = SCHEDULER
+    static SCHEDULER: OnceLock<Option<Arc<Scheduler>>> = OnceLock::new();
+    SCHEDULER
         .get_or_init(|| {
-            Some(Scheduler {
-                lanes: Mutex::new(Lanes {
-                    lanes: HashMap::new(),
-                    next_id: 0,
-                    next_seq: 0,
-                    staged: 0,
-                    staging: STAGING,
-                    starved: false,
-                    clock: [0; 3],
-                    now: 0,
-                    lane_now: [0; 3],
-                    done: Default::default(),
-                    refused: 0,
-                    bcpack: Default::default(),
-                    pages: 0,
-                    since: None,
-                }),
-                work: Condvar::new(),
-                finished: Condvar::new(),
-            })
-        })
-        .as_ref()?;
-    STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let started = (0..workers)
-            .filter(|i| {
+            let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+            Scheduler::start(workers, |i, scheduler| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(move || work(&scheduler))
                     .is_ok()
             })
-            .count();
-        tracing::info!(workers = started, "dstorage: workers");
-    });
-    Some(scheduler)
+        })
+        .as_deref()
 }
 
 impl Scheduler {
+    /// Workers receive the scheduler directly. They must not call
+    /// `scheduler()` while its `OnceLock` is still initializing.
+    fn start(workers: usize, mut spawn: impl FnMut(usize, Arc<Self>) -> bool) -> Option<Arc<Self>> {
+        let scheduler = Arc::new(Self {
+            lanes: Mutex::new(Lanes {
+                lanes: HashMap::new(),
+                next_id: 0,
+                next_seq: 0,
+                staged: 0,
+                staging: STAGING,
+                starved: false,
+                clock: [0; 3],
+                now: 0,
+                lane_now: [0; 3],
+                done: Default::default(),
+                refused: 0,
+                bcpack: Default::default(),
+                pages: 0,
+                since: None,
+            }),
+            work: Condvar::new(),
+            finished: Condvar::new(),
+        });
+        let started = (0..workers)
+            .filter(|&i| spawn(i, Arc::clone(&scheduler)))
+            .count();
+        if started == 0 {
+            tracing::warn!("dstorage: no worker thread could start");
+            return None;
+        }
+        tracing::info!(workers = started, "dstorage: workers");
+        Some(scheduler)
+    }
+
     fn lock(&self) -> MutexGuard<'_, Lanes> {
         self.lanes.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 /// A worker: runs the next read of the most deserving queue.
-fn work(scheduler: &'static Scheduler) {
+fn work(scheduler: &Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -1126,6 +1134,12 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn a_scheduler_requires_at_least_one_worker() {
+        assert!(Scheduler::start(3, |_, _| false).is_none());
+        assert!(Scheduler::start(3, |index, _| index == 1).is_some());
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
