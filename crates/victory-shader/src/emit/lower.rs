@@ -2158,21 +2158,45 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Whether `bits` is a zero or a denormal: its exponent field is empty.
+    /// From the bits, never a float compare, because the host's own denormal
+    /// mode varies.
+    fn exponent_is_zero(&mut self, bits: V) -> V {
+        let c = self.cur;
+        let exp = self.s.m.i32(0x7F80_0000);
+        let zero = self.s.m.i32(0);
+        let e = self.s.m.bin(c, Bin::And, bits, exp);
+        self.s.m.cmp(c, pred::EQ, e, zero)
+    }
+
     /// A 32-bit denormal as the console's float mode reads it: a zero of its
-    /// sign, decided on the bits (the host's own denormal mode varies).
-    fn ftz(&mut self, f: V) -> V {
+    /// sign, or with `positive_zero` a `+0` (what a MAD's product flush
+    /// does). Decided on the bits, because the host's own denormal mode
+    /// varies. A product that is already a zero keeps its sign either way:
+    /// `positive_zero` flushes denormals only, which is where this differs
+    /// from the output multipliers, whose zero is always `+0`.
+    fn ftz_of(&mut self, f: V, positive_zero: bool) -> V {
         let c = self.cur;
         let x = self.as_int(f);
-        let (exp, sign, zero) = (
-            self.s.m.i32(0x7F80_0000),
-            self.s.m.i32(0x8000_0000),
-            self.s.m.i32(0),
-        );
-        let e = self.s.m.bin(c, Bin::And, x, exp);
-        let den = self.s.m.cmp(c, pred::EQ, e, zero);
-        let s = self.s.m.bin(c, Bin::And, x, sign);
-        let r = self.s.m.select(c, den, s, x);
+        let mut den = self.exponent_is_zero(x);
+        let zero = if positive_zero {
+            let mant = self.s.m.i32(0x007F_FFFF);
+            let izero = self.s.m.i32(0);
+            let mantissa = self.s.m.bin(c, Bin::And, x, mant);
+            let has = self.s.m.cmp(c, pred::NE, mantissa, izero);
+            den = self.s.m.bin(c, Bin::And, den, has);
+            self.s.m.i32(0)
+        } else {
+            let sign = self.s.m.i32(0x8000_0000);
+            self.s.m.bin(c, Bin::And, x, sign)
+        };
+        let r = self.s.m.select(c, den, zero, x);
         self.as_float(r)
+    }
+
+    /// [`Self::ftz_of`] keeping the sign of the zero.
+    fn ftz(&mut self, f: V) -> V {
+        self.ftz_of(f, false)
     }
 
     /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
@@ -2506,15 +2530,9 @@ impl<'a> Lower<'a> {
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
-        let exp = self.s.m.i32(0x7F80_0000);
-        let izero = self.s.m.i32(0);
-        let is_zero = |l: &mut Self, v: V| {
-            let bits = l.as_int(v);
-            let e = l.s.m.bin(c, Bin::And, bits, exp);
-            l.s.m.cmp(c, pred::EQ, e, izero)
-        };
-        let az = is_zero(self, a);
-        let bz = is_zero(self, b);
+        let (ia, ib) = (self.as_int(a), self.as_int(b));
+        let az = self.exponent_is_zero(ia);
+        let bz = self.exponent_is_zero(ib);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
         let zero = self.s.m.f32(0);
         self.s.m.select(c, z, zero, m)
@@ -6272,6 +6290,7 @@ impl<'a> Lower<'a> {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
+                        let m = self.ftz_of(m, true);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
                     _ => {
@@ -6286,7 +6305,8 @@ impl<'a> Lower<'a> {
                 let m = if name == "v_mad_legacy_f32" {
                     self.legacy_mul(a, bb)
                 } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
+                    let m = self.s.m.bin(c, Bin::Mul, a, bb);
+                    self.ftz_of(m, true)
                 };
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
                 float(self, r)
