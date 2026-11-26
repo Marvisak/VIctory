@@ -1,9 +1,28 @@
-//! Query heaps. Nothing runs on a GPU yet, so no query ever produces a
-//! result; the heap only remembers its description.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+//! Query heaps. An occlusion heap measures on the host GPU (the draws that
+//! mark it run there), so the title's own culling and dynamic resolution
+//! read real counts; the other heap types are still answered at resolve
+//! time.
+
+use std::sync::Mutex;
+
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_QUERY_HEAP_DESC, D3D12_QUERY_HEAP_TYPE_OCCLUSION, D3D12_QUERY_TYPE,
+    D3D12_QUERY_TYPE_BINARY_OCCLUSION, D3D12_QUERY_TYPE_OCCLUSION, ID3D12QueryHeap,
+};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
+
+/// `D3D12_QUERY_HEAP_TYPE_OCCLUSION`: the heap type the host measures. Its
+/// own kinds are not query types — a heap of type `TIMESTAMP` (1) takes no
+/// occlusion query, and an occlusion heap answers both the count and the
+/// pass/fail query types.
+const HEAP_OCCLUSION: u32 = 0;
+
+/// Query types, as `BeginQuery`, `EndQuery` and `ResolveQueryData` name
+/// them: samples that passed, or (binary) whether any did.
+const QUERY_OCCLUSION: u32 = 0;
+const QUERY_BINARY: u32 = 1;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -29,6 +48,45 @@ pub(crate) struct Desc {
 struct Heap {
     object: Object,
     desc: Desc,
+    /// The host's own heap for an occlusion heap, made with the same count
+    /// so every index the title marks exists.
+    host: Option<ID3D12QueryHeap>,
+    /// Which queries are open or ended but not yet resolved, one flag per
+    /// index: D3D12 refuses a resolve of a query that is open, and the
+    /// values of one never ended are undefined.
+    state: Mutex<Vec<State>>,
+}
+
+/// A query's state, as the marks move it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// Never marked, or resolved already.
+    Idle,
+    Open,
+    Ended,
+}
+
+/// The host heap for a description: only an occlusion heap measures there.
+fn host_heap(desc: &Desc) -> Option<ID3D12QueryHeap> {
+    if desc.kind != HEAP_OCCLUSION || desc.count == 0 {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let mut heap: Option<ID3D12QueryHeap> = None;
+    // SAFETY: plain object creation.
+    unsafe {
+        host.device
+            .CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+                    Count: desc.count,
+                    NodeMask: 0,
+                },
+                &mut heap,
+            )
+            .ok()?;
+    }
+    heap
 }
 
 /// Device method.
@@ -42,12 +100,110 @@ pub(crate) extern "system" fn create(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    tracing::debug!(?desc, "query heap");
+    let host = host_heap(&desc);
+    tracing::debug!(?desc, measuring = host.is_some(), "query heap");
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
+        host,
+        state: Mutex::new(vec![State::Idle; desc.count as usize]),
     });
     object::hand_out(QUERY_HEAP, heap, iid, &HEAP_IIDS, out)
+}
+
+/// What a mark or a resolve of `query_kind` on this heap may ask the host:
+/// the host heap and the D3D12 query type, which comes from the title's own
+/// argument and not from the heap's type. `None` for a heap that does not
+/// measure on the host, a query type it cannot answer, or an index outside
+/// its count.
+pub(crate) fn host(
+    this: This,
+    query_kind: u32,
+    index: u32,
+) -> Option<(ID3D12QueryHeap, D3D12_QUERY_TYPE)> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes a heap it created here.
+    let heap = unsafe { &*this.cast::<Heap>() };
+    let query = match query_kind {
+        QUERY_OCCLUSION => D3D12_QUERY_TYPE_OCCLUSION,
+        QUERY_BINARY => D3D12_QUERY_TYPE_BINARY_OCCLUSION,
+        _ => return None,
+    };
+    if index >= heap.desc.count {
+        return None;
+    }
+    Some((heap.host.clone()?, query))
+}
+
+/// How many queries the heap holds; `None` if it is not one of ours.
+pub(crate) fn count(this: This) -> Option<u32> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes a heap it created here.
+    Some(unsafe { &*this.cast::<Heap>() }.desc.count)
+}
+
+/// Tracks a mark: `begin` opens a query, and `end` closes it. Returns
+/// whether the mark is one D3D12 allows, so the caller records nothing
+/// else.
+///
+/// The state moves in **recording** order. A list recorded from one thread
+/// records its marks in submission order, and that is the assumption here;
+/// a list recorded from several threads can record a mark before another
+/// one it follows in submission, and this does not order them. Moving the
+/// decision to submission is the fix if a title does that, and it is a
+/// different shape: the state would have to travel with the list.
+pub(crate) fn mark(this: This, index: u32, begin: bool) -> Option<()> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes a heap it created here.
+    let heap = unsafe { &*this.cast::<Heap>() };
+    let mut state = heap.state.lock().unwrap_or_else(|e| e.into_inner());
+    let at = state.get_mut(index as usize)?;
+    match (begin, *at) {
+        // D3D12 lets a query index be reused without a resolve in between:
+        // a begin on an ended (or already resolved) one opens it again,
+        // which is how a title that recycles indices measures itself a
+        // second time. Only an end without a begin is the title's mistake.
+        (true, State::Idle | State::Ended) => *at = State::Open,
+        (false, State::Open) => *at = State::Ended,
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Whether queries `first .. first + count` are all ended, so they may be
+/// resolved: D3D12 refuses to resolve one that is open, and one that was
+/// never marked has no value.
+pub(crate) fn resolved(this: This, first: u32, count: u32) -> Option<()> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes a heap it created here.
+    let heap = unsafe { &*this.cast::<Heap>() };
+    let mut state = heap.state.lock().unwrap_or_else(|e| e.into_inner());
+    let end = first.checked_add(count)?;
+    if end > heap.desc.count {
+        return None;
+    }
+    // Every index is checked before any is reset: a range that fails part
+    // way would otherwise be left half reset, and the queries that were
+    // fine would read as never marked.
+    for index in first..end {
+        if state.get(index as usize)? != &State::Ended {
+            return None;
+        }
+    }
+    for index in first..end {
+        if let Some(at) = state.get_mut(index as usize) {
+            *at = State::Idle;
+        }
+    }
+    Some(())
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -60,6 +216,20 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 }
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
+}
+
+/// An occlusion heap made the way the device makes one, for the tests:
+/// `None` when the host refuses it (no GPU, or no heap of that kind).
+#[cfg(test)]
+pub(crate) fn occlusion_for_test(kind: u32, count: u32) -> Option<This> {
+    let desc = Desc {
+        kind,
+        count,
+        nodes: 0,
+    };
+    let mut out: This = std::ptr::null_mut();
+    let hr = create(std::ptr::null(), &desc, &HEAP_IIDS[0], &mut out);
+    (hr == object::S_OK && !out.is_null()).then_some(out)
 }
 
 /// IUnknown 3, object 4, device child 1.
@@ -157,3 +327,4 @@ mod tests {
         }
     }
 }
+
