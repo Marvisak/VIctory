@@ -361,14 +361,19 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
     w.push(v_lshlrev_b32_imm(5, 2, 0));
     w.extend_from_slice(&buffer_store_dword_offen(2, 5, 4));
     w.push(S_ENDPGM);
+    shader_of(&w, false)
+}
 
+/// The host shader of a synthetic compute program of one wave (32 lanes, or
+/// a wave64 program of 64 translated for a host of 32-lane waves).
+fn shader_of(w: &[u32], wave64: bool) -> HostShader {
     let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
     let decoded = gfx10::decode(&code).expect("decode synthetic RDNA2 program");
     assert_eq!(decoded.last().and_then(|i| i.name()), Some("s_endpgm"));
 
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 8,
         layout: vec![RootParam {
             root: RootType::Table,
@@ -390,7 +395,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 1,
-            threads: [32, 1, 1],
+            threads: [if wave64 { 64 } else { 32 }, 1, 1],
         }),
         code,
     };
@@ -411,6 +416,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        host_wave32: wave64,
     })
     .expect("lower");
 
@@ -506,6 +512,12 @@ fn wave32_hardware_info(host: &Host) -> Option<String> {
 }
 
 fn dispatch_wave32(shader: &HostShader) -> Option<(String, [u32; 32])> {
+    dispatch_lanes(shader)
+}
+
+/// One group of `N` threads on a hardware device that runs 32-lane waves;
+/// the first `N` dwords of the output buffer.
+fn dispatch_lanes<const N: usize>(shader: &HostShader) -> Option<(String, [u32; N])> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -531,14 +543,14 @@ fn dispatch_wave32(shader: &HostShader) -> Option<(String, [u32; 32])> {
             &pso,
             &Dispatch {
                 roots: vec![(0, Root::Constants(ud))],
-                views: &[View::RawUav(32)],
+                views: &[View::RawUav(N as u32)],
                 samplers: &[],
                 groups: [1, 1, 1],
             },
         )
         .unwrap_or_else(|e| panic!("dispatch failed on {info}: {e}"));
-    let mut got = [0u32; 32];
-    got.copy_from_slice(&out[0][..32]);
+    let mut got = [0u32; N];
+    got.copy_from_slice(&out[0][..N]);
     Some((info, got))
 }
 
@@ -1022,4 +1034,144 @@ fn pixel_quad_swizzle_and_dpp_validate_and_create_pipeline() {
             .pipeline(&vs, &ps)
             .unwrap_or_else(|e| panic!("{label}: graphics pipeline creation failed: {e}"));
     }
+}
+
+const fn ds_bpermute_b32(vdst: u8, vaddr: u8, vdata: u8, offset: u16) -> [u32; 2] {
+    [
+        (0x36 << 26) | (0xB3 << 18) | offset as u32,
+        (vdst as u32) << 24 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+const fn s_mov_b64(sdst: u8, src0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | 0x04 << 8 | src0 as u32
+}
+
+/// A wave64 program translated for a host of 32-lane waves: `v1` =
+/// `0x1000_0001` + lane, `v2` = `0xDEAD_0000` + lane, `v3` = lane * 4, then
+/// `op_words` (with `even`, under `v_cmpx` leaving the even lanes active),
+/// then `v2` stored at the lane.
+fn build_wave64_on_wave32_cs(op_words: &[u32], even: bool) -> HostShader {
+    let mut w = Vec::new();
+    w.push(s_mov_b32(1, 0x80)); // s1 = 0
+    w.extend_from_slice(&s_load_dwordx4(4, 0));
+    w.extend_from_slice(&v_add_nc_u32_lit(1, 0x1000_0001, 0));
+    w.extend_from_slice(&v_add_nc_u32_lit(2, 0xDEAD_0000, 0));
+    w.push(v_lshlrev_b32_imm(3, 2, 0));
+    if even {
+        w.push(v_and_b32_imm(4, 1, 0));
+        w.push(s_mov_b64(12, EXEC_LO));
+        w.push(v_cmpx_eq_u32_imm(0, 4));
+        w.extend_from_slice(op_words);
+        w.push(s_mov_b64(EXEC_LO, 12));
+    } else {
+        w.extend_from_slice(op_words);
+    }
+    w.push(v_lshlrev_b32_imm(5, 2, 0));
+    w.extend_from_slice(&buffer_store_dword_offen(2, 5, 4));
+    w.push(S_ENDPGM);
+    shader_of(&w, true)
+}
+
+/// RDNA2 in wave64, every lane active: the lane each of the 64 reads.
+fn ref_wave64(src: impl Fn(u32) -> u32) -> [u32; 64] {
+    std::array::from_fn(|lane| lane_v1(src(lane as u32)))
+}
+
+/// RDNA2 in wave64 with only the even lanes active: an odd lane keeps its
+/// old value; an even lane gets `active` of the lane it reads when that lane
+/// is even (active), else `inactive`.
+fn ref_wave64_even(src: impl Fn(u32) -> u32, inactive: impl Fn(u32) -> u32) -> [u32; 64] {
+    std::array::from_fn(|lane| {
+        let lane = lane as u32;
+        if lane & 1 != 0 {
+            return lane_v2_old(lane);
+        }
+        let s = src(lane);
+        if s & 1 == 0 { lane_v1(s) } else { inactive(lane) }
+    })
+}
+
+/// Operations that read only lanes of their own 32-lane half (DPP rows,
+/// DPP8, `ds_swizzle_b32` in its group-of-32 mode, `ds_bpermute_b32`) run
+/// for a wave64 program on a host of 32-lane waves, with the console's
+/// results in both halves (FIND-7).
+#[test]
+fn half_local_cross_lane_ops_of_wave64_match_rdna2_on_a_wave32_host() {
+    let row = |ctrl: u16| Dpp::Row {
+        ctrl,
+        row_mask: 0xF,
+        bank_mask: 0xF,
+        bound_ctrl: false,
+        fi: true,
+    };
+    let rev = [7, 6, 5, 4, 3, 2, 1, 0];
+    let ror4_fi0 = Dpp::Row {
+        ctrl: 0x124,
+        row_mask: 0xF,
+        bank_mask: 0xF,
+        bound_ctrl: false,
+        fi: false,
+    };
+    let items: Vec<(&str, HostShader, [u32; 64])> = vec![
+        (
+            "dpp16 row_ror:4",
+            build_wave64_on_wave32_cs(&encode_dpp16(2, 1, None, row(0x124)), false),
+            ref_wave64(|l| l & !15 | (l + 12) & 15),
+        ),
+        (
+            "dpp16 row_mirror",
+            build_wave64_on_wave32_cs(&encode_dpp16(2, 1, None, row(0x140)), false),
+            ref_wave64(|l| l ^ 15),
+        ),
+        (
+            "dpp16 row_share:3",
+            build_wave64_on_wave32_cs(&encode_dpp16(2, 1, None, row(0x153)), false),
+            ref_wave64(|l| l & !15 | 3),
+        ),
+        (
+            "dpp8 [7,6,5,4,3,2,1,0]",
+            build_wave64_on_wave32_cs(&v_mov_b32_dpp8(2, 1, rev, false), false),
+            ref_wave64(|l| l ^ 7),
+        ),
+        (
+            "ds_swizzle_b32 bitmode SWAP(16)",
+            build_wave64_on_wave32_cs(&ds_swizzle_b32(2, 1, 0x401F), false),
+            ref_wave64(|l| l ^ 16),
+        ),
+        (
+            "ds_bpermute_b32 lane + 1 within the half",
+            build_wave64_on_wave32_cs(&ds_bpermute_b32(2, 3, 1, 4), false),
+            ref_wave64(|l| l & 32 | (l + 1) & 31),
+        ),
+        (
+            "dpp16 row_ror:4 fi:0, even lanes active",
+            build_wave64_on_wave32_cs(&encode_dpp16(2, 1, None, ror4_fi0), true),
+            ref_wave64_even(|l| l & !15 | (l + 12) & 15, lane_v2_old),
+        ),
+        (
+            "ds_bpermute_b32 lane + 1, even lanes active (odd sources read 0)",
+            build_wave64_on_wave32_cs(&ds_bpermute_b32(2, 3, 1, 4), true),
+            ref_wave64_even(|l| l & 32 | (l + 1) & 31, |_| 0),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, shader, expected) in &items {
+        let Some((info, got)) = dispatch_lanes::<64>(shader) else {
+            return;
+        };
+        let bad: Vec<_> = (0..64).filter(|&l| got[l] != expected[l]).collect();
+        if bad.is_empty() {
+            eprintln!("[PASS] {label}");
+        } else {
+            let l = bad[0];
+            failures.push(format!(
+                "{label}: {}/64 lanes wrong (lane {l}: got {:#010x}, want {:#010x}) on {info}",
+                bad.len(),
+                got[l],
+                expected[l]
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

@@ -141,6 +141,41 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// Whether the host GPU runs compute waves of 32 lanes only (no
+/// `WaveSize(64)`: NVIDIA, Intel), so wave64 console programs must be
+/// translated for 32-lane waves (`victory_shader::emit::host_wave32`).
+/// `VICTORY_HOST_WAVE32=1` or `=0` overrides the query. Logged once.
+pub(crate) fn host_wave32() -> bool {
+    static WAVE32: OnceLock<bool> = OnceLock::new();
+    *WAVE32.get_or_init(|| {
+        if let Ok(v) = std::env::var("VICTORY_HOST_WAVE32") {
+            let on = !matches!(v.trim(), "" | "0" | "false" | "off");
+            tracing::info!(on, "VICTORY_HOST_WAVE32 override");
+            return on;
+        }
+        let Some(host) = host() else { return false };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes its own structure of the given size.
+        let ok = unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .is_ok()
+        };
+        let wave32 = ok && options.WaveOps.as_bool() && options.WaveLaneCountMax < 64;
+        tracing::info!(
+            min = options.WaveLaneCountMin,
+            max = options.WaveLaneCountMax,
+            wave32,
+            "host wave lanes"
+        );
+        wave32
+    })
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {

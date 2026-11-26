@@ -87,6 +87,7 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    pub host_wave32: bool,
 }
 
 enum Stop {
@@ -601,7 +602,9 @@ impl<'a> Lower<'a> {
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
+                // A host of 32-lane waves runs each console wave as two
+                // halves (`x.host_wave32`).
+                s.wave_size = Some(if x.host_wave32 { 32 } else { wave });
             }
         }
         let mut no_barrier = HashSet::new();
@@ -1195,6 +1198,9 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::And, r, low);
                 // Lane `hi` runs the section on the console even where it is
                 // elsewhere on the host; there it holds the identity.
+                if self.host_wave() < self.wave() {
+                    return Err("a cross-half wave scan on a 32-lane host");
+                }
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let b = self
@@ -1293,6 +1299,17 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
+        if let Some(threads) = self.s.threads
+            && self.x.native.wave64
+            && self.x.host_wave32
+            && threads.iter().product::<u32>() <= 64
+            && self.s.lds_dwords > 0
+        {
+            return Err(unsupported(
+                0,
+                "wave64 compute shader sharing LDS within one wave on a 32-lane host",
+            ));
+        }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1836,6 +1853,9 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
+                if self.host_wave() < self.wave() {
+                    return Err("a 64-bit wave mask read as data on a 32-lane host");
+                }
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -2892,6 +2912,15 @@ impl<'a> Lower<'a> {
     /// the console's wave size (lanes are thread ids in group order there).
     /// Pixel lanes match only within a quad.
     fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
+        let lanes = self.wave();
+        self.cross_lanes_within(quad, lanes)
+    }
+
+    /// [`Self::cross_lane`] for an operation that reads only lanes of its own
+    /// aligned group of `lanes` (16 for a DPP row, 8 for DPP8, 32 for
+    /// `ds_bpermute_b32`): a host wave of at least that many lanes holds the
+    /// whole group, so a 32-lane host can run these for a wave64 program.
+    fn cross_lanes_within(&mut self, quad: bool, lanes: u32) -> Result<(), Why> {
         if self.s.mesh.is_some() {
             // shortcut: no wave size for mesh shaders in SM 6.6, so host
             // lanes cannot follow the console's; emulate through group-shared
@@ -2900,6 +2929,11 @@ impl<'a> Lower<'a> {
         }
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
             return Err("a cross-lane operation outside compute");
+        }
+        // Quad operations reach their quad, but a DPP row write mask still
+        // numbers the wave's rows: their caller says how far that goes.
+        if self.host_wave() < lanes.min(self.wave()) {
+            return Err("a cross-half operation on a 32-lane host");
         }
         debug_assert!(self.s.threads.is_none() || self.console_lanes);
         self.s.flags |= flags::WAVE_OPS;
@@ -3015,6 +3049,23 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 { 64 } else { 32 }
     }
 
+    /// The lanes of a host wave running this program: the console's, or
+    /// 32 on a host of 32-lane waves (`self.x.host_wave32`).
+    fn host_wave(&self) -> u32 {
+        if self.x.host_wave32 { 32 } else { self.wave() }
+    }
+
+    /// A lane number as the host wave can take it: on a host of 32-lane
+    /// waves a console lane 32-63 names the same lane of the other half,
+    /// which this host wave stands for.
+    fn host_lane(&mut self, lane: V) -> V {
+        if self.host_wave() == self.wave() {
+            return lane;
+        }
+        let m = self.s.m.i32(self.host_wave() - 1);
+        self.s.m.bin(self.cur, Bin::And, lane, m)
+    }
+
     fn lane_index(&mut self) -> V {
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
@@ -3091,6 +3142,7 @@ impl<'a> Lower<'a> {
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
+        let lane = self.host_lane(lane);
         self.s.op(
             self.cur,
             "waveReadLaneAt.i32",
@@ -3195,7 +3247,7 @@ impl<'a> Lower<'a> {
             // console's, so quad-local swizzles read through quad operations.
             let mesh_quad = self.s.mesh.is_some() && quad;
             if !mesh_quad {
-                self.cross_lane(quad)?;
+                self.cross_lanes_within(quad, 32)?;
             }
             // The source sits in the address field.
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
@@ -3243,7 +3295,7 @@ impl<'a> Lower<'a> {
             // names in dwords within its own 32-lane half (RDNA 2 ISA,
             // section 10.4.4: wave64 permutes lanes 0..31 and 32..63
             // independently); 0 from a lane EXEC leaves out.
-            self.cross_lane(false)?;
+            self.cross_lanes_within(false, 32)?;
             let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -5840,9 +5892,17 @@ impl<'a> Lower<'a> {
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        // Rows (16 lanes) and DPP8 (8 lanes) read inside their group. The row
+        // write mask numbers the wave's four rows; a 32-lane host wave sees
+        // rows 0 and 1 of its half, right only when both halves' bits match.
+        let reach = match dpp {
+            Dpp::Lanes { .. } => 8,
+            Dpp::Row { row_mask, .. } if row_mask & 3 == row_mask >> 2 => 16,
+            Dpp::Row { .. } => self.wave(),
+        };
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
-            self.cross_lane(quad)?;
+            self.cross_lanes_within(quad, reach)?;
         }
         let use_quad = mesh_quad || self.helpers_read(quad);
         let c = self.cur;
@@ -6671,6 +6731,7 @@ impl<'a> Lower<'a> {
                 };
                 self.cross_lane(false)?;
                 let me = self.lane_index();
+                let lane = self.host_lane(lane);
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
@@ -10983,6 +11044,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_wave32: false,
         })
         .map(|_| ())
     }
@@ -11034,6 +11096,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_wave32: false,
         })
     }
 
@@ -11254,6 +11317,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_wave32: false,
         })
         .unwrap();
 
@@ -12176,6 +12240,7 @@ mod tests {
                 prims: vec![],
                 mesh_stride: 0,
                 view_marks: false,
+                host_wave32: false,
             })
             .unwrap();
             assert!(lowered.wave_ops);
