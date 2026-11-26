@@ -240,15 +240,11 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
-        let name = if e.kind == 0 {
-            let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            match find(&strings, &needle) {
-                Some(at) => at,
-                None => {
-                    strings.extend(&needle);
-                    strings.len() - needle.len()
-                }
-            }
+        let name = if e.kind == 0 && !e.name.is_empty() {
+            let at = strings.len();
+            strings.extend(e.name.bytes());
+            strings.push(0);
+            at
         } else {
             0
         };
@@ -305,10 +301,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     out
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The container: parts in order, hashed.
@@ -439,5 +431,80 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn psv_appends_repeated_semantic_names_like_dxc() {
+        // First 164 bytes of PSV0 (before the 32-byte input-output dependency
+        // table) emitted by dxc.exe 1.9.2602.17 with
+        // `dxc -T vs_6_6 -E main -validator-version 1.6` for:
+        //   struct I { float4 p : POSITION; float4 t : TEXCOORD0; };
+        //   struct O { float4 p : SV_Position; float4 t : TEXCOORD0; };
+        //   O main(I i) { O o; o.p = i.p; o.t = i.t; return o; }
+        #[rustfmt::skip]
+        const EXPECTED: [u8; 164] = [
+            0x30, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+            0x01, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x1c, 0x00, 0x00, 0x00,
+            0x00, 0x50, 0x4f, 0x53, 0x49, 0x54, 0x49, 0x4f, 0x4e, 0x00, 0x54, 0x45,
+            0x58, 0x43, 0x4f, 0x4f, 0x52, 0x44, 0x00, 0x54, 0x45, 0x58, 0x43, 0x4f,
+            0x4f, 0x52, 0x44, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x10, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x44, 0x00, 0x03, 0x00, 0x00, 0x00,
+            0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x44, 0x00, 0x03, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x44, 0x03, 0x03, 0x04, 0x00, 0x00,
+            0x13, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x44, 0x00, 0x03, 0x02, 0x00, 0x00,
+        ];
+        let el = |name: &str, kind, interp, row| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let inputs = [el("POSITION", 0, 0, 0), el("TEXCOORD", 0, 0, 1)];
+        let outputs = [el("SV_Position", 3, 4, 0), el("TEXCOORD", 0, 2, 1)];
+        let got = psv(&Psv {
+            stage: 1,
+            flag: true,
+            inputs: &inputs,
+            outputs: &outputs,
+            prims: &[],
+            mesh: None,
+            gs: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        assert_eq!(got.len(), 196);
+        assert_eq!(&got[..164], &EXPECTED[..]);
+
+        // An empty arbitrary semantic name still uses offset 0, matching DXC.
+        let empty = [el("", 0, 0, 0)];
+        let got_empty = psv(&Psv {
+            stage: 1,
+            flag: false,
+            inputs: &empty,
+            outputs: &[],
+            prims: &[],
+            mesh: None,
+            gs: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        // Header (4+48) + bindings count (4) + string table len (4) + padded "\0\0\0\0" (4)
+        // + index count (4) + 1 index (4) + element size (4) = 76; first u32 of element 0 is name offset.
+        assert_eq!(u32::from_le_bytes(got_empty[76..80].try_into().unwrap()), 0);
     }
 }
