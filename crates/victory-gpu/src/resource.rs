@@ -807,6 +807,9 @@ pub(crate) struct HostTexture {
     /// A host copy or resolve wrote it: its contents are the host's, not
     /// title memory's (`crate::texture`).
     pub(crate) host_written: std::sync::atomic::AtomicBool,
+    /// Where title memory stood at that host copy or resolve, so uploads
+    /// resume once the title writes the texture's memory again.
+    pub(crate) host_write: std::sync::Mutex<Option<crate::texture::HostWrite>>,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
@@ -847,6 +850,7 @@ impl HostTexture {
             state: state.into(),
             castable,
             host_written: false.into(),
+            host_write: std::sync::Mutex::new(None),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,

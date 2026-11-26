@@ -212,23 +212,138 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
+/// Where a host-written texture's title memory stood at the host copy or
+/// resolve, so [`still_host_written`] can tell when the title writes its
+/// memory again.
+pub(crate) enum HostWrite {
+    /// Render target, depth, UAV, or memory without a console layout:
+    /// never uploaded from title memory.
+    Fixed,
+    /// Runtime-tracked memory (pools and physical-page views). The hash
+    /// confirms actual byte changes on a 64 KiB page hit so writes to
+    /// unrelated data on the same page do not discard host texels.
+    Tracked {
+        memory: usize,
+        size: usize,
+        tracked: crate::watch::Tracked,
+        hash: blake3::Hash,
+    },
+    /// Untracked memory: content hash at the host copy (`None` if not
+    /// committed then).
+    Hashed {
+        memory: usize,
+        size: usize,
+        hash: Option<blake3::Hash>,
+    },
+}
+
+fn hash_tracked(memory: *const u8, size: usize) -> blake3::Hash {
+    let mut scratch = Scratch::take(size);
+    let buf = &mut scratch.0[..size];
+    crate::host::copy_mapped(buf.as_mut_ptr(), memory, size, false);
+    blake3::hash(buf)
+}
+
+fn committed_hash(memory: *const u8, size: usize) -> Option<blake3::Hash> {
+    committed(memory, size).then(|| {
+        // SAFETY: `committed` checked that `[memory, memory + size)` is committed and readable.
+        blake3::hash(unsafe { std::slice::from_raw_parts(memory, size) })
+    })
+}
+
+impl HostWrite {
+    fn snapshot(memory: *const u8, size: usize) -> Self {
+        let start = memory as usize;
+        if let Some(tracked) = crate::watch::track(start, size, true) {
+            // Drain initial dirty pages so `clean()` reflects writes after this point.
+            let _ = tracked.take(start, start.saturating_add(size));
+            let hash = hash_tracked(memory, size);
+            Self::Tracked { memory: start, size, tracked, hash }
+        } else {
+            Self::Hashed { memory: start, size, hash: committed_hash(memory, size) }
+        }
+    }
+
+    fn unchanged(&self) -> bool {
+        match self {
+            Self::Fixed => true,
+            Self::Tracked { memory, size, tracked, hash } => {
+                if tracked.clean() {
+                    return true;
+                }
+                if tracked.take(*memory, memory.saturating_add(*size)).is_empty() {
+                    return true;
+                }
+                hash_tracked(*memory as *const u8, *size) == *hash
+            }
+            Self::Hashed { memory, size, hash } => {
+                committed_hash(*memory as *const u8, *size) == *hash
+            }
+        }
+    }
+}
+
 /// A host copy or resolve that `list` records writes `resource`: from the
 /// submission that runs `list` on, its host texture's contents are the
-/// host's, not title memory's, which stays as it was. Marked when that
+/// host's until the title writes its memory again. Snapshotted when that
 /// submission is made, not when `list` is recorded: a list recorded before
 /// it but run after it must not upload title memory over the host's texels
 /// (submissions run in the order they are made, which need not be the
 /// order their lists were recorded in), and one run before it must still
 /// get its upload.
 pub(crate) fn host_writes(list: &HostList, resource: This) {
-    if let Some(copy) = crate::resource::host_copy(resource) {
-        list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
-    }
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    let span = title_written(&copy.texture)
+        .then(|| {
+            crate::resource::texture_memory(resource).and_then(|(memory, desc)| {
+                let layout = crate::resource::texture_layout(&desc)?.planes[0]
+                    .layout
+                    .clone();
+                (!layout.desc.swizzle.xor()).then_some((memory as usize, layout.size as usize))
+            })
+        })
+        .flatten();
+    list.defer_host(move || {
+        let state = match span {
+            Some((memory, size)) => HostWrite::snapshot(memory as *const u8, size),
+            None => HostWrite::Fixed,
+        };
+        *copy.host_write.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
+        copy.host_written
+            .store(true, std::sync::atomic::Ordering::Release);
+    });
 }
 
-fn is_host_written(resource: This) -> bool {
-    crate::resource::host_copy(resource)
-        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Relaxed))
+/// Whether `copy` still keeps the contents of a host copy or resolve:
+/// `false` once the title has written its memory since that submission,
+/// clearing the marker and resetting staging's last-detiled state so the
+/// next refresh uploads the new title bytes.
+pub(crate) fn still_host_written(copy: &crate::resource::HostTexture) -> bool {
+    use std::sync::atomic::Ordering;
+    if !copy.host_written.load(Ordering::Acquire) {
+        return false;
+    }
+    let unchanged = {
+        let mut guard = copy.host_write.lock().unwrap_or_else(|e| e.into_inner());
+        let unchanged = guard.as_ref().is_some_and(HostWrite::unchanged);
+        if !unchanged {
+            *guard = None;
+            copy.host_written.store(false, Ordering::Release);
+        }
+        unchanged
+    };
+    if !unchanged
+        && let Some(s) = copy
+            .staging
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    {
+        s.reset_last();
+    }
+    unchanged
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -347,23 +462,9 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
     // Once per list for each host texture, however many title textures of
-    // its memory the list samples.
-    if is_host_written(resource) {
-        #[cfg(feature = "diagnostics")]
-        {
-            static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
-            if SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(resource as usize) {
-                let memory = crate::resource::texture_memory(resource).map(|(m, _)| m);
-                // SAFETY: a live resource.
-                let desc = unsafe { texture.GetDesc() };
-                tracing::debug!(?resource, ?memory, ?desc, "a sampled texture keeps what the host copied into it: not uploaded from title memory");
-            }
-        }
-        return;
-    }
+    // its memory the list samples. Host-written textures are checked once
+    // per submission in `bindless::uploads` via `still_host_written`.
     if !list.first_use(texture.as_raw() as usize) {
         return;
     }
@@ -532,6 +633,14 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
 }
 
 impl Staging {
+    /// Clears the last-detiled hashes so the next refresh uploads title
+    /// memory again after a host copy or resolve overwrote the host texture.
+    fn reset_last(&self) {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        last.hash = None;
+        last.hashes.clear();
+    }
+
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {
@@ -877,5 +986,57 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn host_write_clears_after_non_watched_memory_changes() {
+        let mut buf = vec![0x11u8; 256];
+        let state = HostWrite::snapshot(buf.as_ptr(), buf.len());
+        assert!(matches!(state, HostWrite::Hashed { hash: Some(_), .. }));
+        assert!(state.unchanged(), "unchanged bytes stay host-written");
+        buf[0] = 0x22;
+        assert!(
+            !state.unchanged(),
+            "changed title bytes clear host-written state"
+        );
+    }
+
+    #[test]
+    fn host_write_tracked_ignores_false_sharing_and_clears_on_own_write() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let len = crate::watch::PAGE;
+        // SAFETY: a fresh write-watched 64 KiB page, freed after `state` is dropped.
+        let ptr = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as *mut u8;
+        assert!(!ptr.is_null());
+        let state = HostWrite::snapshot(ptr, 256);
+        assert!(matches!(state, HostWrite::Tracked { .. }));
+        assert!(state.unchanged(), "untouched page stays host-written");
+        // Write to the same 64 KiB page outside the texture's 256-byte range.
+        // SAFETY: within our committed 64 KiB page.
+        unsafe { ptr.add(512).write_volatile(0x77) };
+        assert!(
+            state.unchanged(),
+            "false sharing on the same page keeps host-written state"
+        );
+        // Write inside the texture's own bytes.
+        // SAFETY: within our committed 64 KiB page.
+        unsafe { ptr.add(16).write_volatile(0x42) };
+        assert!(
+            !state.unchanged(),
+            "writing the texture's own bytes clears host-written state"
+        );
+        drop(state);
+        // SAFETY: our allocation, no longer tracked.
+        unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) };
     }
 }
