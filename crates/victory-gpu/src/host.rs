@@ -243,10 +243,20 @@ mod submission_completion_tests {
 
     #[test]
     fn device_removed_submission_failure_keeps_rich_diagnostics() {
-        let error = Error::from(DXGI_ERROR_DEVICE_REMOVED);
-        let removal_reason: windows::core::Result<()> =
+        let removed_hresult = Error::from(DXGI_ERROR_DEVICE_REMOVED);
+        let healthy_reason: windows::core::Result<()> = Ok(());
+        assert!(submission_failure_is_device_removed(
+            &removed_hresult,
+            &healthy_reason
+        ));
+
+        let ordinary_error = Error::new(E_FAIL, "event wait failed");
+        let removed_reason: windows::core::Result<()> =
             Err(Error::from(DXGI_ERROR_DEVICE_REMOVED));
-        assert!(submission_failure_is_device_removed(&error, &removal_reason));
+        assert!(submission_failure_is_device_removed(
+            &ordinary_error,
+            &removed_reason
+        ));
 
         let report = submission_failure_report(
             SUBMITTED,
