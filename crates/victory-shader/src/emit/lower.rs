@@ -7088,6 +7088,15 @@ impl<'a> Lower<'a> {
                         12 | 13 => self.trig_turns(a, op == 12),
                         // Any f16 in (-2^-11, 0) has fract >= 1 - 2^-12; clamp to 0x3bff (1 - 2^-11).
                         22 => self.fract(a, 1.0 - 1.0 / 4096.0, 1.0 - 1.0 / 2048.0),
+                        // RDNA2 gives 0xfe00 for negative nonzero inputs,
+                        // including -infinity. The host chooses the NaN bits.
+                        23 => {
+                            let log = self.unary(op, a);
+                            let zero = self.s.m.f32(0);
+                            let negative = self.s.m.cmp(c, pred::OLT, a, zero);
+                            let nan = self.s.m.f32(0xFFC0_0000);
+                            self.s.m.select(c, negative, nan, log)
+                        }
                         _ => self.unary(op, a),
                     }
                 }

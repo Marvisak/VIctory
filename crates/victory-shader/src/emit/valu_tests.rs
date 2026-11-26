@@ -2281,3 +2281,40 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+#[test]
+fn v_log_f16_matches_rdna2_special_values() {
+    let cases = [
+        (0xFC00u16, 0xFE00u16),
+        (0xBC00, 0xFE00),
+        (0x8400, 0xFE00),
+        (0x8001, 0xFE00),
+        (0x8000, 0xFC00),
+        (0x0000, 0xFC00),
+        (0x0001, 0xCE00),
+        (0x3C00, 0x0000),
+        (0x4000, 0x3C00),
+        (0x4400, 0x4000),
+        (0x7C00, 0x7C00),
+    ];
+    let inputs: Vec<_> = cases
+        .iter()
+        .map(|&(input, _)| [u32::from(input), 0, 0, 0xABCD_1234])
+        .collect();
+    let shader = build_valu_cs(&[
+        0xBFA5_000F,             // s_denorm_mode 15
+        vop1(0x001, 0, vgpr(4)), // v_mov_b32 v0, v4
+        vop1(0x057, 0, vgpr(1)), // v_log_f16 v0, v1
+    ]);
+    let mut failures = Vec::new();
+    run_cases(&shader, &inputs, |backend, i, input, got| {
+        let want = 0xABCD_0000 | u32::from(cases[i].1);
+        if got != want {
+            failures.push(format!(
+                "{backend}: input {:#06x}, got {got:#010x}, want {want:#010x}",
+                input[0]
+            ));
+        }
+    });
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
