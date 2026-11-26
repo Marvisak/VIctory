@@ -277,6 +277,18 @@ struct Account {
 }
 
 #[cfg(windows)]
+impl Account {
+    fn should_report(&self, has_blocked_work: bool, fence_waits: u64) -> bool {
+        !self.released.is_empty()
+            || has_blocked_work
+            || self.forced != 0
+            || self.unknown != 0
+            || self.mappings != 0
+            || fence_waits != 0
+    }
+}
+
+#[cfg(windows)]
 fn account() -> std::sync::MutexGuard<'static, Account> {
     static ACCOUNT: std::sync::OnceLock<std::sync::Mutex<Account>> = std::sync::OnceLock::new();
     ACCOUNT.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
@@ -290,7 +302,7 @@ fn account_frame(frame: u64) {
     let (fence_waits, fence_waited) = crate::fence::take_waited();
     let a = std::mem::take(&mut *account());
     let blocked = held().blocked(&read_value);
-    if a.released.is_empty() && blocked.is_empty() && a.forced == 0 && a.unknown == 0 && a.mappings == 0 {
+    if !a.should_report(!blocked.is_empty(), fence_waits) {
         return;
     }
     let longest = a.released.iter().map(|r| r.1).max().unwrap_or_default();
@@ -756,6 +768,21 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn reports_frames_with_completed_fence_waits_only() {
+        let a = Account::default();
+        assert!(!a.should_report(false, 0));
+        assert!(a.should_report(false, 1));
+        assert!(a.should_report(true, 0));
+
+        let a = Account {
+            released: vec![(0, std::time::Duration::from_millis(1), Why::Signal)],
+            ..Account::default()
+        };
+        assert!(a.should_report(false, 0));
+    }
 
     /// Distinct title resources can name the same host texture. Presenting
     /// both planes must preserve that texture's original rendering state.
