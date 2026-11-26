@@ -1138,7 +1138,7 @@ mod tests {
     /// primitive `prim` and, as vertex `lane`, the position
     /// (lane & 1 ? 3 : -1, lane & 2 ? 3 : -1, 0.5, 1): triangle (0, 1, 2)
     /// covers the whole target.
-    fn triangle_mesh(prim: u32) -> Result<HostShader, ShaderError> {
+    fn triangle_mesh(prim: u32, max_vertices: u32) -> Result<HostShader, ShaderError> {
         let words = [
             0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
             0x0001_00C1,
@@ -1170,7 +1170,7 @@ mod tests {
                 outputs: vec![],
                 clip_cntl: 0,
                 threads: 32,
-                max_vertices: 32,
+                max_vertices,
                 max_primitives: 32,
                 topology: 2,
                 lds_bytes: 0,
@@ -1217,7 +1217,7 @@ mod tests {
             TRIANGLE | EDGE_FLAGS,
             TRIANGLE | EDGE_FLAGS | CULL,
         ] {
-            let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            let ms = triangle_mesh(prim, 32).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
             #[cfg(windows)]
             if let Some(v) = validator.as_mut() {
                 v.validate(&mut ms.dxil.clone())
@@ -1228,7 +1228,9 @@ mod tests {
 
     /// A triangle mesh program on the host GPU and on WARP (where they have
     /// mesh shaders): triangle (0, 1, 2) covers the target with its corners'
-    /// edge flags set as without them; with the culling bit, nothing is lit.
+    /// edge flags set as without them, and with 64 vertices declared; with
+    /// the culling bit, or a corner naming a vertex no lane writes (40 of
+    /// the 32 lanes' with 64 declared, 33 with 32), nothing is lit.
     #[test]
     #[cfg(windows)]
     fn edge_flagged_triangles_draw_as_unflagged_ones() {
@@ -1260,12 +1262,15 @@ mod tests {
                 eprintln!("no mesh shaders on the {label} device; skipped");
                 continue;
             }
-            for (prim, culled) in [
-                (TRIANGLE, false),
-                (TRIANGLE | EDGE_FLAGS, false),
-                (TRIANGLE | EDGE_FLAGS | CULL, true),
+            for (prim, max_vertices, culled) in [
+                (TRIANGLE, 32, false),
+                (TRIANGLE | EDGE_FLAGS, 32, false),
+                (TRIANGLE | EDGE_FLAGS | CULL, 32, true),
+                (TRIANGLE, 64, false),
+                (1 << 10 | 40 << 20, 64, true),
+                (1 << 10 | 33 << 20, 32, true),
             ] {
-                let ms = triangle_mesh(prim).unwrap();
+                let ms = triangle_mesh(prim, max_vertices).unwrap();
                 let root = host
                     .root_signature_for(&[(&ms, D3D12_SHADER_VISIBILITY_MESH)])
                     .unwrap();

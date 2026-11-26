@@ -10107,12 +10107,26 @@ impl<'a> Lower<'a> {
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
+        // A corner naming a vertex no lane writes (at or past the declared
+        // vertices, or past the group's threads, each writing its own)
+        // culls the primitive: that vertex's outputs are undefined.
+        let threads = self.s.threads.map_or(u32::MAX, |[x, y, z]| x * y * z);
+        let written = self.s.mesh.as_ref().map(|m| m.max_vertices.min(threads));
+        let mut corners = Vec::new();
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
+            if let Some(n) = written {
+                let n = self.s.m.i32(n);
+                let past = self.s.m.cmp(c, pred::IUGE, i, n);
+                culled = self.s.m.bin(c, Bin::Or, culled, past);
+            }
+            corners.push(i);
+        }
+        let mut args = vec![self.mesh_thread()];
+        for i in corners {
             args.push(self.s.m.select(c, culled, z, i));
         }
         let void = self.s.t.void;
