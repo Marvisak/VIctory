@@ -1890,7 +1890,9 @@ impl<'a> Lower<'a> {
             .strip_prefix("s_")
             .and_then(|n| n.strip_suffix(width))
             .ok_or(ELSEWHERE)?;
-        if inst.write(Reg::S(*code)) != Some(lo) || inst.write(Reg::S(EXEC)).is_some() {
+        if inst.write(Reg::S(*code)) != Some(lo)
+            || (*code != EXEC && inst.write(Reg::S(EXEC)).is_some())
+        {
             return Err(ELSEWHERE);
         }
         let at = if b == self.cur_ir {
@@ -11812,6 +11814,52 @@ mod tests {
         words[6] = 0xBF80_0000; // s_nop 0
         words[7] = 0xBF85_FFFB; // s_cbranch_scc1 header
         lowers(&words, 1 << 7).expect("a uniform loop's mask join");
+    }
+
+    #[test]
+    fn widened_exec_read_as_data_reconstructs_scalar_ops_and_refuses_valu_cmp() {
+        // Pure scalar EXEC widening (`s_or_b32` / `s_xor_b32`) inside a
+        // divergent block is excluded from `Structured::active`, so reading it
+        // as data must reconstruct it in `mask_number` from operand ballots
+        // instead of refusing or balloting inside the divergent block.
+        for widen in [
+            0x887E_007E, // s_or_b32 exec_lo, exec_lo, s0
+            0x897E_007E, // s_xor_b32 exec_lo, exec_lo, s0
+        ] {
+            let words = [
+                0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+                0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+                0xBF88_0005, // s_cbranch_execz -> end
+                widen,       // widen EXEC past Block 1's reachability
+                0xBE82_0F7E, // s_bcnt1_i32_b32 s2, exec_lo
+                0xBF07_8002, // s_cmp_lg_u32 s2, 0
+                0xBF85_0001, // s_cbranch_scc1 -> end
+                0xBE84_0380, // s_mov_b32 s4, 0
+                S_ENDPGM,
+            ];
+            lowers(&words, 0)
+                .unwrap_or_else(|e| panic!("widened EXEC ({widen:#x}) failed to lower: {e}"));
+        }
+
+        // A `v_cmp` executed under widened EXEC cannot be reconstructed from
+        // scalar ops and must still be refused when read as data.
+        let cmp_under_widened = [
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+            0xBF88_0006, // s_cbranch_execz -> end
+            0x887E_007E, // s_or_b32 exec_lo, exec_lo, s0
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE82_0F6A, // s_bcnt1_i32_b32 s2, vcc_lo
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> end
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let Err(crate::ShaderError::Unsupported { what, .. }) = lowers(&cmp_under_widened, 0)
+        else {
+            panic!("v_cmp under widened EXEC translated as data");
+        };
+        assert_eq!(what, "a lane mask holding lanes elsewhere read as data");
     }
 
     #[test]

@@ -1027,3 +1027,119 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
     // never spinning to LOOP_LIMIT (1 << 20).
     assert_eq!(pixels, vec![[0.0; 4], [0.0; 4], [1.0; 4], [1.0; 4]]);
 }
+
+#[test]
+fn widened_exec_in_divergent_block_counts_all_lanes() {
+    // Only lanes 0..15 enter Block 1 (`s_cbranch_execz` skips lanes 16..31).
+    // Widening EXEC inside Block 1 with `s_or_b32` (all 32 lanes) or
+    // `s_xor_b32` (lanes 16..31) must not use a ballot in Block 1 (which
+    // would drop lanes 16..31 and produce 16 or 0 instead of 32 or 16).
+    let make = |widen_op: u32| {
+        build(&[
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            0xBF88_0006, // s_cbranch_execz +6 -> s_endpgm
+            widen_op,    // s_or_b32 / s_xor_b32 exec_lo, exec_lo, s20
+            0xBE82_0F7E, // s_bcnt1_i32_b32 s2, exec_lo
+            0xBEFE_036A, // s_mov_b32 exec_lo, vcc_lo
+            0x7E06_0202, // v_mov_b32 v3, s2
+            0xE070_1000,
+            0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+            0xBF81_0000, // s_endpgm
+        ])
+        .expect("lower")
+    };
+    let cases = [
+        ("or", 0x887E_147E, 32u32),
+        ("xor", 0x897E_147E, 16u32),
+    ];
+    let shaders: Vec<_> = cases
+        .iter()
+        .map(|&(name, op, expected)| {
+            let shader = make(op);
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut shader.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{name}: DXIL validation failed: {e}"));
+            }
+            (name, shader, expected)
+        })
+        .collect();
+
+    // A `v_cmp` executed under a widened EXEC inside a divergent block holds
+    // lanes outside the block and cannot be reconstructed from scalar ops, so
+    // reading it as data must be refused rather than balloted in Block 1.
+    let Err(crate::ShaderError::Unsupported { what, .. }) = build(&[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        0xBF88_0007, // s_cbranch_execz +7 -> s_endpgm
+        0x887E_147E, // s_or_b32 exec_lo, exec_lo, s20
+        0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+        0xBE82_0F6A, // s_bcnt1_i32_b32 s2, vcc_lo
+        0xBEFE_0314, // s_mov_b32 exec_lo, s20
+        0x7E06_0202, // v_mov_b32 v3, s2
+        0xE070_1000,
+        0x800A_0310, // buffer_store_dword v3, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]) else {
+        panic!("translated a divergent-block v_cmp under widened EXEC as data");
+    };
+    assert_eq!(what, "a lane mask holding lanes elsewhere read as data");
+
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(32),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        if !warp && warp_only {
+            continue;
+        }
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (name, shader, expected) in &shaders {
+            let Ok((root, pso)) = host.compute_pipeline(shader) else {
+                assert!(warp, "{label}/{name}: no pipeline for a wave of 32");
+                eprintln!("{label}/{name}: no pipeline for a wave of 32; skipped");
+                continue;
+            };
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}/{name}: dispatch failed: {e}"));
+            let want: Vec<u32> = (0..32).map(|l| if l < 16 { *expected } else { 0 }).collect();
+            assert_eq!(out[0], want, "{label}/{name}");
+        }
+    }
+}
