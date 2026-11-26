@@ -6011,10 +6011,19 @@ impl<'a> Lower<'a> {
             "v_mad_u64_u32" | "v_mad_i64_i32" => {
                 // 32 × 32 → 64-bit product plus a 64-bit addend (address
                 // arithmetic); the carry out is a lane mask.
+                if v.clamp || v.omod != 0 {
+                    return Err("integer output modifiers");
+                }
                 let signed = name == "v_mad_i64_i32";
                 let (a, bb) = (s(self, 0)?, s(self, 1)?);
-                let addend = self.src64(inst, 2)?;
+                let (add_lo, add_hi) = self.src64_dwords(inst, 2)?;
                 let i64t = self.s.m.int(64);
+                self.s.flags |= flags::INT64;
+                let k32 = self.s.m.int_const(i64t, 32);
+                let add_lo64 = self.s.m.cast(c, Cast::ZExt, add_lo, i64t);
+                let add_hi64 = self.s.m.cast(c, Cast::ZExt, add_hi, i64t);
+                let add_hi64 = self.s.m.bin(c, Bin::Shl, add_hi64, k32);
+                let addend = self.s.m.bin(c, Bin::Or, add_lo64, add_hi64);
                 let ext = if signed { Cast::SExt } else { Cast::ZExt };
                 let a = self.s.m.cast(c, ext, a, i64t);
                 let bb = self.s.m.cast(c, ext, bb, i64t);
@@ -6030,7 +6039,13 @@ impl<'a> Lower<'a> {
                     && let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
                 {
-                    let carry = self.s.m.cmp(c, pred::IULT, r, addend);
+                    // Unsigned 64-bit `r < addend` on the two dwords, avoiding
+                    // AMD D3D12's swapped-dword `icmp ult i64`.
+                    let hi_lt = self.s.m.cmp(c, pred::IULT, hi, add_hi);
+                    let hi_eq = self.s.m.cmp(c, pred::EQ, hi, add_hi);
+                    let lo_lt = self.s.m.cmp(c, pred::IULT, lo, add_lo);
+                    let lo_carry = self.s.m.bin(c, Bin::And, hi_eq, lo_lt);
+                    let carry = self.s.m.bin(c, Bin::Or, hi_lt, lo_carry);
                     self.lane_bits.insert(w, carry);
                 }
                 for &(_, w) in &inst.writes {
@@ -6738,7 +6753,9 @@ impl<'a> Lower<'a> {
             }
             // A signed 64-bit operand sign-extends its 32-bit literal, as
             // the hardware does (LLVM's AMDGPU operand rules).
-            Operand::Literal(x) if inst.name().ends_with("_i64") => {
+            Operand::Literal(x)
+                if inst.name().ends_with("_i64") || inst.name() == "v_mad_i64_i32" =>
+            {
                 Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
             _ => {
@@ -6777,7 +6794,9 @@ impl<'a> Lower<'a> {
                 let hi = if (x as i32) < 0 { u32::MAX } else { 0 };
                 Ok((self.s.m.i32(x), self.s.m.i32(hi)))
             }
-            Operand::Literal(x) if inst.name().ends_with("_i64") => {
+            Operand::Literal(x)
+                if inst.name().ends_with("_i64") || inst.name() == "v_mad_i64_i32" =>
+            {
                 let hi = if (x as i32) < 0 { u32::MAX } else { 0 };
                 Ok((self.s.m.i32(x), self.s.m.i32(hi)))
             }

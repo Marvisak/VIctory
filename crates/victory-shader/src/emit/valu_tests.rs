@@ -2281,3 +2281,96 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+#[test]
+fn v_mad_i64_i32_and_v_mad_u64_u32_literal_modifiers_and_carry() {
+    const fn vop3b(op: u16, vdst: u8, sdst: u8, clamp: bool, omod: u8, src: [u16; 3]) -> [u32; 2] {
+        [
+            0x35 << 26
+                | (op as u32 & 0x3FF) << 16
+                | (clamp as u32) << 15
+                | (sdst as u32 & 0x7F) << 8
+                | vdst as u32,
+            (omod as u32 & 3) << 27
+                | (src[0] as u32 & 0x1FF)
+                | (src[1] as u32 & 0x1FF) << 9
+                | (src[2] as u32 & 0x1FF) << 18,
+        ]
+    }
+
+    // 1. Unmodeled output modifiers (`clamp`, `omod`) must be refused on both
+    //    `v_mad_u64_u32` (0x176) and `v_mad_i64_i32` (0x177), matching `write_i`.
+    for op in [0x176u16, 0x177] {
+        for (clamp, omod) in [(true, 0u8), (false, 1), (true, 2)] {
+            let [w0, w1] = vop3b(op, 6, 12, clamp, omod, [vgpr(1), vgpr(2), vgpr(3)]);
+            let res = try_build_valu_cs(&[w0, w1, vop1(0x001, 0, vgpr(6))]);
+            assert!(
+                matches!(
+                    res,
+                    Err(crate::ShaderError::Unsupported {
+                        what: "integer output modifiers",
+                        ..
+                    })
+                ),
+                "op {op:#x} clamp={clamp} omod={omod} should be refused, got {:?}",
+                res.err()
+            );
+        }
+    }
+
+    // 2. `v_mad_i64_i32` has a signed 64-bit `src2`, so a 32-bit literal
+    //    (e.g. -100 = 0xFFFF_FF9C) must sign-extend to 64 bits rather than
+    //    zero-extending to +4_294_967_196.
+    const MINUS_100: u32 = -100_i32 as u32;
+    let [m0, m1] = vop3b(0x177, 6, 12, false, 0, [vgpr(1), vgpr(2), 255]);
+    let mad_i64_lo = build_valu_cs(&[m0, m1, MINUS_100, vop1(0x001, 0, vgpr(6))]);
+    let mad_i64_hi = build_valu_cs(&[m0, m1, MINUS_100, vop1(0x001, 0, vgpr(7))]);
+    let i64_cases: &[(i32, i32)] = &[
+        (0, 0),
+        (10, 20),
+        (-10, 20),
+        (i32::MIN, -1),
+        (i32::MAX, 2),
+    ];
+    let i64_inputs: Vec<[u32; 4]> = i64_cases
+        .iter()
+        .map(|&(a, b)| [a as u32, b as u32, 0, 0])
+        .collect();
+    run_cases(&mad_i64_lo, &i64_inputs, |backend, i, _, got| {
+        let (a, b) = i64_cases[i];
+        let want = (i64::from(a) * i64::from(b)).wrapping_add(-100) as u32;
+        assert_eq!(got, want, "{backend}: v_mad_i64_i32 lo ({a}, {b})");
+    });
+    run_cases(&mad_i64_hi, &i64_inputs, |backend, i, _, got| {
+        let (a, b) = i64_cases[i];
+        let want = ((i64::from(a) * i64::from(b)).wrapping_add(-100) >> 32) as u32;
+        assert_eq!(got, want, "{backend}: v_mad_i64_i32 hi ({a}, {b})");
+    });
+
+    // 3. `v_mad_u64_u32` carry-out computed via 32-bit dword comparisons
+    //    (avoiding AMD D3D12's swapped-dword `icmp ult i64`), including cases
+    //    where the low dword wraps without 64-bit overflow and where the high
+    //    dword wraps while the low dword increases.
+    let [u0, u1] = vop3b(0x176, 6, 12, false, 0, [vgpr(1), vgpr(2), vgpr(3)]);
+    let [c0, c1] = vop3(0x101, 0, 0x80, 0x81, sgpr(12));
+    let mad_u64_carry = build_valu_cs(&[u0, u1, c0, c1]);
+    let carry_cases: &[([u32; 4], u32)] = &[
+        // 1*1 + 0x0000_0001_FFFF_FFFF = 0x0000_0002_0000_0000 (lo wraps, no 64-bit carry)
+        ([1, 1, u32::MAX, 1], 0),
+        // 1*1 + 0xFFFF_FFFF_FFFF_FFFF = 0 (64-bit carry, lo wraps)
+        ([1, 1, u32::MAX, u32::MAX], 1),
+        // (2^64 - 2^33 + 1) + 0x0000_0002_0000_0000 = 2^64 + 1 (64-bit carry, lo > add_lo)
+        ([u32::MAX, u32::MAX, 0, 2], 1),
+        // (2^64 - 2^33 + 1) + (2^33 - 1) = 2^64 (exact carry boundary)
+        ([u32::MAX, u32::MAX, u32::MAX, 1], 1),
+        // (2^64 - 2^33 + 1) + (2^33 - 2) = 2^64 - 1 (exact no-carry boundary)
+        ([u32::MAX, u32::MAX, u32::MAX - 1, 1], 0),
+        // 0*0 + u64::MAX = u64::MAX (no carry)
+        ([0, 0, u32::MAX, u32::MAX], 0),
+    ];
+    let carry_inputs: Vec<[u32; 4]> = carry_cases.iter().map(|c| c.0).collect();
+    run_cases(&mad_u64_carry, &carry_inputs, |backend, i, inp, got| {
+        let want = carry_cases[i].1;
+        assert_eq!(got, want, "{backend}: v_mad_u64_u32 carry {inp:x?}");
+    });
+}
