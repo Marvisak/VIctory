@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod vcc;
 
 type Why = &'static str;
 
@@ -595,7 +596,16 @@ impl<'a> Lower<'a> {
                     x.st.bools
                         .support(g)
                         .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                        .any(|a| match a {
+                            Atom::Opaque(_) | Atom::Constant(_) => true,
+                            Atom::VccNonzero(lo, hi) => {
+                                cs.threads != [1, 1, 1]
+                                    && [lo, hi].iter().any(|v| {
+                                        x.st.masks.contains_key(v) || x.st.highs.contains_key(v)
+                                    })
+                            }
+                            _ => false,
+                        })
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
@@ -1837,12 +1847,17 @@ impl<'a> Lower<'a> {
                 self.balloting.remove(&lo);
                 let bit = bit?;
                 let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let xy = if matches!(&self.x.native.io, StageIo::Cs(cs) if cs.threads == [1, 1, 1]) {
+                    // This group contains only guest lane zero.
+                    (self.s.m.cast(at, Cast::ZExt, bit, i32t), self.s.m.i32(0))
+                } else {
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let r = self
+                        .s
+                        .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+                    self.s.flags |= flags::WAVE_OPS;
+                    (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1))
+                };
                 self.ballots.insert(lo, xy);
                 xy
             }
@@ -2572,6 +2587,7 @@ impl<'a> Lower<'a> {
                 }
                 Val::Missing(w) => Err(w),
             },
+            Atom::VccNonzero(lo, hi) => self.vcc_nonzero(lo, hi, at),
             Atom::Phi(id) => {
                 if let Some(&v) = self.mask_phis.get(&id) {
                     return Ok(v);
@@ -10424,6 +10440,12 @@ impl<'a> Lower<'a> {
                 continue;
             }
             let v = match atom {
+                Atom::VccNonzero(lo, hi) => {
+                    if tainted.contains(&lo) || tainted.contains(&hi) {
+                        return true;
+                    }
+                    None
+                }
                 Atom::Lane(v)
                 | Atom::Uniform(v)
                 | Atom::Phi(v)
@@ -10459,6 +10481,18 @@ impl<'a> Lower<'a> {
         let (atom, lo, hi) = self.x.st.bools.node(b).expect("not a constant");
         let v = match atom {
             Atom::Lane(v) | Atom::Uniform(v) => Some(v),
+            Atom::VccNonzero(low, high)
+                if matches!(&self.x.native.io, StageIo::Cs(cs) if cs.threads == [1, 1, 1]) =>
+            {
+                // Only a compare with no remaining EXEC guard in a one-lane
+                // group has exactly its lane's value as the whole VCC result.
+                self.x.st.mask_bits(low, (low != high).then_some(high))
+                    .and_then(|m| self.x.st.bools.node(m))
+                    .and_then(|n| match n {
+                        (Atom::Lane(v), Bool::FALSE, Bool::TRUE) => Some(v),
+                        _ => None,
+                    })
+            }
             _ => None,
         };
         let r = match v.and_then(|v| self.compared(env, v)) {
