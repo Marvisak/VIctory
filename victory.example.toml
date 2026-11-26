@@ -3,6 +3,10 @@
 # Environment variables (shown below) take precedence over this file.
 # VICTORY_CONFIG selects a different config file.
 
+# Optional cap in MiB for DirectStorage work buffers and loose GPU shadow
+# windows during title execution. Zero disables. Env: VICTORY_HOST_RAM_BUDGET_MIB
+# host_ram_budget_mib = 1024
+
 [paths]
 # Your own dump of Grand Theft Auto VI.     env: VICTORY_GAME_DIR
 game_dir = 'D:\victory-data\game'

@@ -25,6 +25,8 @@ pub struct Config {
     /// The user's copy of AMD FidelityFX for PC (the folder with its
     /// upscaler DLL), which replaces a title's console build.
     pub fidelityfx_dir: Option<PathBuf>,
+    /// Bytes available to budgeted host buffers during title execution (zero disables).
+    pub host_ram_budget: u64,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -32,6 +34,7 @@ pub struct Config {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
+    host_ram_budget_mib: Option<u64>,
     #[serde(default)]
     paths: FilePaths,
 }
@@ -74,14 +77,27 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        Self::resolve(parsed.paths, parsed.host_ram_budget_mib, source, |k| {
+            std::env::var_os(k)
+        })
     }
 
     fn resolve(
         file: FilePaths,
+        file_budget: Option<u64>,
         source: Option<PathBuf>,
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
+        let mib = match env("VICTORY_HOST_RAM_BUDGET_MIB").filter(|v| !v.is_empty()) {
+            Some(value) => value
+                .to_str()
+                .and_then(|v| v.parse::<u64>().ok())
+                .context("VICTORY_HOST_RAM_BUDGET_MIB must be a non-negative integer")?,
+            None => file_budget.unwrap_or(0),
+        };
+        let host_ram_budget = mib
+            .checked_mul(1 << 20)
+            .context("host RAM budget exceeds u64 bytes")?;
         let env_path = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
         let test_titles = match env("VICTORY_TEST_TITLES") {
             Some(v) if !v.is_empty() => std::env::split_paths(&v)
@@ -96,6 +112,7 @@ impl Config {
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
         Ok(Config {
+            host_ram_budget,
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
             data_dir,
@@ -162,7 +179,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, None, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
     }
@@ -174,7 +191,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, None, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
     }
 
@@ -185,7 +202,7 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, None, None, env).unwrap();
         assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
     }
 
@@ -194,7 +211,7 @@ mod tests {
         let value = std::env::join_paths(["first", "second"]).unwrap();
         let file = FilePaths::default();
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(file, None, None, env).unwrap();
         assert_eq!(
             cfg.test_titles,
             vec![PathBuf::from("first"), PathBuf::from("second")]
@@ -210,6 +227,26 @@ mod tests {
             explicit_config_path(set),
             Some(PathBuf::from("custom.toml"))
         );
+    }
+
+    #[test]
+    fn host_ram_budget_is_opt_in_and_checked() {
+        let resolve = |file, value: Option<&str>| {
+            Config::resolve(FilePaths::default(), file, None, |k| {
+                (k == "VICTORY_HOST_RAM_BUDGET_MIB")
+                    .then(|| value.map(OsString::from))
+                    .flatten()
+            })
+            .map(|c| c.host_ram_budget)
+        };
+        let parsed: FileConfig = toml::from_str("host_ram_budget_mib = 20").unwrap();
+        assert_eq!(resolve(parsed.host_ram_budget_mib, None).unwrap(), 20 << 20);
+        assert_eq!(resolve(None, None).unwrap(), 0);
+        assert_eq!(resolve(Some(20), Some("")).unwrap(), 20 << 20);
+        assert_eq!(resolve(Some(20), Some("0")).unwrap(), 0);
+        assert_eq!(resolve(None, Some("7")).unwrap(), 7 << 20);
+        assert!(resolve(None, Some("invalid")).is_err());
+        assert!(resolve(Some(u64::MAX), None).is_err());
     }
 
     #[test]

@@ -265,6 +265,9 @@ fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
         let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        // The driver does not expose a per-compile byte cost. Limit its
+        // simultaneous working sets without ever parking a claimed job.
+        let n = if victory_core::host_ram::configured().is_some() { 1 } else { n };
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()

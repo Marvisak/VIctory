@@ -25,6 +25,7 @@ use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
+use victory_core::host_ram::{self, Budget, Owner, Reservation};
 use victory_formats::bcpack::{self, Tables};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
@@ -336,6 +337,7 @@ const COST: [u64; 3] = [100, 10, 1];
 const STAGING: u64 = 32 << 20;
 
 struct Lanes {
+    host_budget: Option<std::sync::Arc<Budget>>,
     lanes: HashMap<u64, Lane>,
     next_id: u64,
     /// Submission order over all queues.
@@ -355,6 +357,7 @@ struct Lanes {
     /// running them.
     done: (u64, u64, std::time::Duration),
     refused: u64,
+    host_waits: u64,
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
     /// Requests into physical pages.
@@ -389,6 +392,7 @@ unsafe impl Send for Lane {}
 
 /// A read a worker runs.
 struct Job {
+    memory: Result<Option<Reservation>, HRESULT>,
     lane: u64,
     seq: u64,
     request: Request,
@@ -407,6 +411,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         .get_or_init(|| {
             Some(Scheduler {
                 lanes: Mutex::new(Lanes {
+                    host_budget: host_ram::configured().cloned(),
                     lanes: HashMap::new(),
                     next_id: 0,
                     next_seq: 0,
@@ -418,6 +423,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     lane_now: [0; 3],
                     done: Default::default(),
                     refused: 0,
+                    host_waits: 0,
                     bcpack: Default::default(),
                     pages: 0,
                     since: None,
@@ -458,20 +464,36 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = job.execute();
         lanes = scheduler.lock();
-        lanes.finish(&job, result);
-        lanes.count(&job, started);
+        let waits = lanes.count(&job, started);
+        lanes.finish(job, result);
         if std::mem::take(&mut lanes.starved) {
             scheduler.work.notify_all();
         }
         scheduler.finished.notify_all();
+        if let Some(waits) = waits
+            && let Some(budget) = &lanes.host_budget
+        {
+            let (limit, used) = (budget.limit, budget.usage());
+            drop(lanes);
+            let (working_set, available) = super::xmem::host_ram_sample();
+            tracing::info!(limit, ?used, waits, ?working_set, ?available, "host RAM budget (bytes)");
+            lanes = scheduler.lock();
+        }
+    }
+}
+
+impl Job {
+    fn execute(&self) -> Result<(), HRESULT> {
+        self.memory.as_ref().map_err(|hr| *hr)?;
+        execute(&self.request)
     }
 }
 
 impl Lanes {
     /// Counts a finished request; every 5 s a debug line sums them up.
-    fn count(&mut self, job: &Job, started: std::time::Instant) {
+    fn count(&mut self, job: &Job, started: std::time::Instant) -> Option<u64> {
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
         *bytes += u64::from(job.request.destination_size);
@@ -504,7 +526,12 @@ impl Lanes {
             self.done = Default::default();
             self.bcpack = Default::default();
             self.since = None;
+            let waits = std::mem::take(&mut self.host_waits);
+            if tracing::enabled!(tracing::Level::INFO) && self.host_budget.is_some() {
+                return Some(waits);
+            }
         }
+        None
     }
 
     /// Starts the next read of the class with the least virtual time, from
@@ -525,6 +552,25 @@ impl Lanes {
             self.refused += 1;
             return None;
         }
+        let memory = if let Some(budget) = &self.host_budget {
+            let bytes = host_bytes(&request);
+            match budget.reserve(Owner::DirectStorage, bytes) {
+                Ok(r) => Ok(Some(r)),
+                Err(used) if bytes <= budget.limit - used.loose_shadows => {
+                    // Only running reads hold the missing bytes. They release
+                    // their whole reservation in finish, before the wakeup.
+                    self.starved = true;
+                    self.host_waits += 1;
+                    return None;
+                }
+                Err(used) => {
+                    tracing::warn!(bytes, limit = budget.limit, ?used, "dstorage: request cannot fit host RAM budget");
+                    Err(E_OUTOFMEMORY)
+                }
+            }
+        } else {
+            Ok(None)
+        };
         lane.reads.pop_front();
         lane.running.insert(seq);
         self.staged += staging;
@@ -534,6 +580,7 @@ impl Lanes {
         self.lane_now[class] = lane.clock;
         lane.clock += size;
         Some(Job {
+            memory,
             lane: id,
             seq,
             request,
@@ -541,7 +588,7 @@ impl Lanes {
         })
     }
 
-    fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
+    fn finish(&mut self, job: Job, result: Result<(), HRESULT>) {
         self.staged -= job.staging;
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
@@ -665,6 +712,21 @@ fn staging_bytes(request: &Request) -> u64 {
     }
 }
 
+/// Upper bound on simultaneously allocated work buffers. Raw page reads
+/// fill the bounce buffer directly. A page list's contiguity is only known
+/// during execution, so reserve for the scattered case before dispatch.
+fn host_bytes(r: &Request) -> u64 {
+    let zlib = r.options & ZLIB != 0;
+    let bc = ((r.options & BCPACK) >> 1) as u8;
+    let compressed = zlib || bc != 0;
+    let source = if compressed && r.options & MEMORY_SOURCE == 0 { r.source_size } else { 0 };
+    let intermediate = if zlib && bc != 0 { r.intermediate_size } else { 0 };
+    let bounce = if r.options & PAGE_DESTINATION == 0 { 0 }
+        else if compressed { r.destination_size } else { r.source_size };
+    u64::from(source) + u64::from(intermediate) + u64::from(bounce)
+        + bcpack::scratch_bytes(bc, r.destination_size)
+}
+
 /// Ends a queue: what was not started is dropped, and this waits for the
 /// reads already running (they write title memory).
 fn close_lane(id: u64) {
@@ -706,7 +768,7 @@ struct Request {
     source: *const c_void,
     offset: u64,
     source_size: u32,
-    /// Compressed size between two decompression stages; unused here.
+    /// Capacity of the inflated stream passed to BCPack in a combined request.
     intermediate_size: u32,
     /// Matched by cancellation; Grand Theft Auto VI leaves it 0.
     tag: u64,
@@ -1368,6 +1430,7 @@ mod tests {
     /// Lanes without workers: what `start` picks, and when statuses land.
     fn lanes(staging: u64) -> Lanes {
         Lanes {
+            host_budget: None,
             lanes: HashMap::new(),
             next_id: 0,
             next_seq: 0,
@@ -1379,6 +1442,7 @@ mod tests {
             lane_now: [0; 3],
             done: Default::default(),
             refused: 0,
+            host_waits: 0,
             bcpack: Default::default(),
             pages: 0,
             since: None,
@@ -1408,7 +1472,7 @@ mod tests {
         for _ in 0..330 {
             let job = l.start().unwrap();
             started[job.lane as usize] += 1;
-            l.finish(&job, Ok(()));
+            l.finish(job, Ok(()));
         }
         // Normal gets about a tenth of what high and real-time get together.
         assert_eq!(started[1] + started[2], 300, "{started:?}");
@@ -1426,7 +1490,7 @@ mod tests {
         l.submit(0);
         let first = l.start().unwrap();
         assert!(l.start().is_none(), "60 + 60 > 100");
-        l.finish(&first, Ok(()));
+        l.finish(first, Ok(()));
         let second = l.start().unwrap();
         let raw = l.start().unwrap();
         assert_eq!((second.staging, raw.staging), (60, 0));
@@ -1434,8 +1498,47 @@ mod tests {
         read(&mut l, 0, ZLIB, 500);
         l.submit(0);
         assert!(l.start().is_none());
-        l.finish(&second, Ok(()));
+        l.finish(second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn combined_request_reserves_both_stages_and_scattered_output() {
+        let mut r = request(ZLIB | (4 << 1) | PAGE_DESTINATION, std::ptr::null_mut(), 16,
+            std::ptr::null(), 0, 9);
+        r.intermediate_size = u32::MAX;
+        let scratch = bcpack::scratch_bytes(4, 16);
+        assert!(scratch >= 24);
+        assert_eq!(host_bytes(&r), 9 + u64::from(u32::MAX) + 16 + scratch);
+        r.options |= MEMORY_SOURCE;
+        assert_eq!(host_bytes(&r), u64::from(u32::MAX) + 16 + scratch);
+        r.options = ZLIB | MEMORY_SOURCE;
+        assert_eq!(host_bytes(&r), 0);
+        r.options = PAGE_DESTINATION;
+        assert_eq!(host_bytes(&r), 9);
+    }
+
+    #[test]
+    fn host_budget_waits_only_for_running_reads_and_reports_oversize_in_order() {
+        let mut l = lanes(STAGING);
+        let budget = Budget::new(100);
+        let _pinned = budget.reserve(Owner::LooseShadow, 20).unwrap();
+        l.host_budget = Some(budget);
+        l.lanes.insert(0, Lane::new(0, 64));
+        for size in [50, 40, 81, 10] { read(&mut l, 0, ZLIB, size); }
+        l.submit(0);
+        let first = l.start().unwrap();
+        assert!(l.start().is_none());
+        assert!(l.starved);
+        l.finish(first, Err(INVALID_DATA));
+        let next = l.start().unwrap();
+        assert!(next.memory.is_ok());
+        let oversized = l.start().unwrap();
+        assert_eq!(oversized.execute(), Err(E_OUTOFMEMORY));
+        let seq = oversized.seq;
+        l.finish(oversized, Err(E_OUTOFMEMORY));
+        assert_eq!(l.lanes[&0].failures[&seq], E_OUTOFMEMORY);
+        assert!(l.start().unwrap().memory.is_ok());
     }
 
     #[test]
@@ -1457,13 +1560,13 @@ mod tests {
             entry.store(E_PENDING, Ordering::Release);
         }
         l.submit(0);
-        let jobs: Vec<Job> = (0..3).map(|_| l.start().unwrap()).collect();
+        let [first, second, last] = std::array::from_fn(|_| l.start().unwrap());
         // The last read and the first finish; the second then fails.
-        l.finish(&jobs[2], Ok(()));
-        l.finish(&jobs[0], Ok(()));
+        l.finish(last, Ok(()));
+        l.finish(first, Ok(()));
         let results = || (result(array.cast(), 0), result(array.cast(), 1));
         assert_eq!(results(), (E_PENDING, E_PENDING));
-        l.finish(&jobs[1], Err(INVALID_DATA));
+        l.finish(second, Err(INVALID_DATA));
         assert_eq!(results(), (INVALID_DATA, S_OK));
     }
 
@@ -1482,6 +1585,37 @@ mod tests {
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(out, bc4_blocks());
+    }
+
+    #[test]
+    fn two_combined_memory_reads_share_the_budget_and_preserve_data() {
+        with_test_tables();
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&BC4_STREAM, 6);
+        let mut outputs = [[0u8; 16]; 2];
+        let intermediate = BC4_STREAM.len() as u32;
+        // The two decoder workspaces fit; the second intermediate does not.
+        let per_read = bcpack::scratch_bytes(4, 16) + u64::from(intermediate);
+        let budget = Budget::new(2 * per_read - 1);
+        let mut lanes = lanes(STAGING);
+        lanes.host_budget = Some(budget.clone());
+        lanes.lanes.insert(0, Lane::new(0, 64));
+        for out in &mut outputs {
+            let mut r = request(ZLIB | (4 << 1) | MEMORY_SOURCE, out.as_mut_ptr().cast(),
+                out.len(), packed.as_ptr().cast(), 0, packed.len());
+            r.intermediate_size = intermediate;
+            lanes.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Read(r));
+        }
+        lanes.submit(0);
+        let first = lanes.start().unwrap();
+        assert_eq!(budget.usage().direct_storage, per_read);
+        assert!(lanes.start().is_none());
+        assert_eq!(first.execute(), Ok(()));
+        lanes.finish(first, Ok(()));
+        let second = lanes.start().unwrap();
+        assert_eq!(second.execute(), Ok(()));
+        lanes.finish(second, Ok(()));
+        assert_eq!(outputs, [bc4_blocks(), bc4_blocks()]);
+        assert_eq!(budget.usage().direct_storage, 0);
     }
 
     /// BCPack tables we made (uniform models; BC4 index pairs: low 3 bits,
@@ -1659,14 +1793,14 @@ mod tests {
         let plain = l.start().unwrap();
         assert_eq!(plain.request.options, 0);
         assert!(l.start().is_none());
-        l.finish(&plain, Ok(()));
+        l.finish(plain, Ok(()));
         assert_eq!(l.lanes[&0].held.len(), 2);
         l.submit(0);
         let paged = l.start().unwrap();
         assert_eq!(paged.request.options, PAGE_DESTINATION);
         assert!(l.lanes[&0].held.is_empty());
         assert!(!l.lanes[&0].statuses.is_empty());
-        l.finish(&paged, Ok(()));
+        l.finish(paged, Ok(()));
         assert!(l.lanes[&0].statuses.is_empty());
     }
 

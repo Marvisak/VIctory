@@ -160,6 +160,10 @@ victory config
 `translate --jobs N` requires a positive worker count. Omit it to use the
 default worker count.
 
+To cap DirectStorage and loose GPU shadow buffers on memory-constrained hosts,
+set `host_ram_budget_mib` in `victory.toml` (see `victory.example.toml`) or
+`VICTORY_HOST_RAM_BUDGET_MIB`.
+
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 

@@ -344,6 +344,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        victory_gpu::release_loose_windows(address as usize, size - align);
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -895,6 +896,19 @@ fn system_commit() -> Option<PERFORMANCE_INFORMATION> {
     };
     // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
     (unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0).then_some(info)
+}
+
+/// Windows' view of process working set and system-wide available physical
+/// bytes. Wine's process figures and a Linux cgroup's charged bytes differ.
+pub(super) fn host_ram_sample() -> (Option<usize>, Option<usize>) {
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: querying our process with a sized output buffer.
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    ((ok != 0).then_some(counters.WorkingSetSize),
+        system_commit().map(|s| s.PhysicalAvailable.saturating_mul(s.PageSize)))
 }
 
 fn commit_limit_message(

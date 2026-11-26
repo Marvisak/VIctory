@@ -695,10 +695,12 @@ dependencies = [
  "miniz_oxide",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",
  "windows",
+ "windows-core",
  "windows-sys",
 ]
 
@@ -710,6 +712,7 @@ dependencies = [
  "opus-pure",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-gpu",
  "victory-loader",

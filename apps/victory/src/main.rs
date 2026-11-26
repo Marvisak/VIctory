@@ -225,6 +225,7 @@ fn show_config() -> Result<()> {
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
     println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
+    println!("host RAM budget: {} MiB (0 disables)", cfg.host_ram_budget >> 20);
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

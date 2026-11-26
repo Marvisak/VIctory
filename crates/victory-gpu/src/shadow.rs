@@ -19,6 +19,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use victory_core::host_ram::{self, Owner, Reservation};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
@@ -119,6 +120,9 @@ fn pooled(n: usize) -> Vec<u8> {
 /// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
 /// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
 fn give_back(v: Vec<u8>) {
+    if host_ram::configured().is_some() {
+        return; // Budgeted runs return idle snapshot capacity immediately.
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
@@ -1010,6 +1014,12 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_with_owner(address, len).map(|(shadow, _)| shadow)
+}
+
+/// Whether an aligned view must keep a reference of its own. Registered
+/// buffers have their usual resource owner; a budgeted loose window can retire.
+fn find_with_owner(address: u64, len: u64) -> Option<(Arc<Shadow>, bool)> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -1020,7 +1030,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end);
+        return loose(address, end).map(|s| (s, host_ram::configured().is_some()));
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -1047,27 +1057,100 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
         changed();
     }
-    entry.shadow.clone()
+    entry.shadow.clone().map(|s| (s, false))
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
-/// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
+/// Under a host budget, unused windows over freed guest memory can be retired.
 const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+// A descriptor or a submitted list can hold the D3D resource after its
+// Shadow is gone. D3D releases this private object with the actual buffer.
+#[windows::core::implement()]
+struct WindowCharge {
+    _reservation: Reservation,
+}
+
+fn attach_charge(buffer: &ID3D12Resource, reservation: Reservation) -> windows::core::Result<()> {
+    use windows::core::{ComObject, GUID, IUnknown};
+    const KEY: GUID = GUID::from_u128(0x2c6cdf4f_b991_4217_998b_271d4179161e);
+    let charge = ComObject::new(WindowCharge { _reservation: reservation }).into_interface::<IUnknown>();
+    // SAFETY: a live buffer and interface; D3D takes its own reference.
+    unsafe { buffer.SetPrivateDataInterface(&KEY, &charge) }
+}
+
+/// Only a whole window in free virtual address space is stale. Merely
+/// being the last Arc is insufficient: a recorded shader can look up live
+/// title memory by address at submission. Never discard a retained window.
+fn free_window(start: u64, len: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: querying the region containing start; no title bytes are read.
+    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_FREE
+        && (info.BaseAddress as u64).saturating_add(info.RegionSize as u64) >= start + len
+}
+
+/// A title allocation is about to be freed. Windows straddling its boundary
+/// also cover other allocations. Lists, the page table, and views can still
+/// own a copy; leave those copies available until they are done.
+pub fn release_loose_windows(at: usize, bytes: usize) {
+    if (bytes as u64) < WINDOW || host_ram::configured().is_none() {
+        return;
+    }
+    let end = at.saturating_add(bytes) as u64;
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let keys = map.range((at as u64, 0)..(end, 0))
+        .filter(|&(&(start, len), s)| len <= end - start && Arc::strong_count(s) == 1)
+        .map(|(&key, _)| key).collect();
+    retire_unused(&mut map, keys);
+}
+
+fn retire_unused(map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, keys: Vec<(u64, u64)>) {
+    for key in keys {
+        let Some(shadow) = map.remove(&key) else { continue };
+        // A lookup by write-mark can upgrade a Weak independently of LOOSE.
+        // Claim the last Arc atomically before retiring its tracker.
+        match Arc::try_unwrap(shadow) {
+            Ok(_unused) => changed(),
+            Err(live) => { map.insert(key, live); }
+        }
+    }
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let len = end.checked_next_multiple_of(WINDOW)? - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
+    let reservation = if let Some(budget) = host_ram::configured() {
+        let reserve = || budget.reserve(Owner::LooseShadow, len);
+        Some(match reserve() {
+            Ok(r) => r,
+            Err(_) => {
+                let unused = map.iter()
+                    .filter(|&(&(at, n), s)| Arc::strong_count(s) == 1 && free_window(at, n))
+                    .map(|(&key, _)| key).collect();
+                retire_unused(&mut map, unused);
+                reserve().map_err(|used| {
+                    tracing::warn!(start, len, limit = budget.limit, ?used, "loose shadow cannot fit host RAM budget");
+                }).ok()?
+            }
+        })
+    } else {
+        None
+    };
     let (buffer, data) = host()?.shared_buffer(len)?;
+    if let Some(r) = reservation {
+        attach_charge(&buffer, r).map_err(|e| tracing::warn!(%e, "could not account loose shadow")).ok()?;
+    }
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1091,11 +1174,12 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// bakes' parameter blocks: refused, their slots read zeros, every meshlet
 /// culled). Such a view gets a copy of its own bytes, starting at its
 /// address (`true` with it), which lives while a heap slot made from the
-/// view or a list holds it.
+/// view or a list holds it. An aligned view over a budgeted loose window
+/// also returns true so its descriptor keeps the window available for refresh.
 pub(crate) fn for_view(address: u64, len: u64, element: u64) -> Option<(Arc<Shadow>, bool)> {
-    let shadow = find(address, len)?;
+    let (shadow, keep) = find_with_owner(address, len)?;
     if element == 0 || shadow.offset(address).is_multiple_of(element) {
-        return Some((shadow, false));
+        return Some((shadow, keep));
     }
     #[cfg(feature = "diagnostics")]
     VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1314,6 +1398,33 @@ pub(crate) mod tests {
         // SAFETY: a bit of the mapped bitmap; no submission runs (the caller
         // holds the submission lock).
         unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
+
+    #[test]
+    fn retiring_a_window_preserves_list_data_and_charges_until_the_resource_drops() {
+        let Some(host) = host() else { return };
+        let budget = victory_core::host_ram::Budget::new(WINDOW);
+        let (buffer, data) = host.shared_buffer(WINDOW).unwrap();
+        attach_charge(&buffer, budget.reserve(Owner::LooseShadow, WINDOW).unwrap()).unwrap();
+        // A retired descriptor can retain just the D3D resource.
+        let descriptor = buffer.clone();
+        let at = crate::watch::tests::pool((WINDOW as usize) / PAGE);
+        let key = (at as u64, WINDOW);
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let list = Shadow::new(buffer, data, gpu, key.0, key.1);
+        let mut map = BTreeMap::from([(key, list.clone())]);
+        list.write_host(key.0, &[1, 2, 3, 4]);
+        retire_unused(&mut map, vec![key]);
+        assert!(Arc::ptr_eq(&map[&key], &list));
+        assert_eq!(list.read_host(key.0, 1), [0x04030201]);
+        drop(list);
+        retire_unused(&mut map, vec![key]);
+        assert!(map.is_empty());
+        assert!(budget.reserve(Owner::LooseShadow, WINDOW).is_err());
+        drop(descriptor);
+        assert!(budget.reserve(Owner::LooseShadow, WINDOW).is_ok());
+        crate::watch::tests::free(at);
     }
 
     /// The title writes a constant under a range an earlier list of the

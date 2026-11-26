@@ -249,27 +249,50 @@ impl Tables {
     }
 }
 
+struct Layout {
+    widths: &'static [u8],
+    per: usize,
+    block: usize,
+    blocks: usize,
+}
+
+impl Layout {
+    fn new(bc: u8, bytes: usize) -> Result<Self, Error> {
+        let (widths, per): (&[u8], usize) = match bc {
+            1 => (&[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
+            3 => (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
+            4 => (&[7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 1),
+            5 => (&[3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 2),
+            6 => (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
+            7 => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
+            _ => return Err(Error("unsupported BC format")),
+        };
+        let block = if matches!(bc, 1 | 4) { 8 } else { 16 };
+        if bytes == 0 || !bytes.is_multiple_of(block) {
+            return Err(Error("destination is not a whole number of blocks"));
+        }
+        Ok(Self { widths, per, block, blocks: bytes / block })
+    }
+}
+
+/// Heap bytes for the record buffer and back-reference history while
+/// decoding into a destination of this size. Invalid layouts allocate neither.
+pub fn scratch_bytes(bc: u8, bytes: u32) -> u64 {
+    let Ok(layout) = Layout::new(bc, bytes as usize) else { return 0 };
+    let entry = match bc {
+        6 => size_of::<(Bc6Ep, Bc6Ix)>(),
+        7 => size_of::<(Bc7Ep, Bc7Ix)>(),
+        _ => size_of::<Plain>(),
+    };
+    layout.blocks as u64 * (layout.widths.len() * layout.per) as u64 + (HISTORY * entry) as u64
+}
+
 /// Unpacks `src` (BC number `bc`, 1 and 3-7) into `dst`, whose length gives
 /// the block count. The stream carries no size: bytes after the last one the
 /// lanes need are ignored, a stream that runs out is an error.
 pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(), Error> {
-    let block = match bc {
-        1 | 4 => 8,
-        3 | 5 | 6 | 7 => 16,
-        _ => return Err(Error("unsupported BC format")),
-    };
-    if dst.is_empty() || !dst.len().is_multiple_of(block) {
-        return Err(Error("destination is not a whole number of blocks"));
-    }
-    let blocks = dst.len() / block;
-    let (widths, per): (&[u8], usize) = match bc {
-        1 => (&[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
-        3 => (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
-        4 => (&[7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 1),
-        5 => (&[3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 2),
-        6 => (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
-        _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
-    };
+    let layout = Layout::new(bc, dst.len())?;
+    let Layout { widths, per, block, blocks } = layout;
     let stride = widths.len() * per;
     let mut records = vec![0u8; blocks * stride];
     let mut next = src.iter().copied();

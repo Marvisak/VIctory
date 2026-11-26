@@ -58,6 +58,7 @@ pub fn run(
         victory_hle::modules::xmem::low_guards::install();
     }
     let cfg = victory_core::Config::load()?;
+    victory_core::host_ram::configure(cfg.host_ram_budget);
     // Before the import registry is first used: it holds the module only
     // when the host's FidelityFX serves.
     victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
