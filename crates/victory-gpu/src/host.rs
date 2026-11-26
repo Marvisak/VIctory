@@ -1339,7 +1339,8 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
+        type CopyBack = (std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool);
+        let mut back: Vec<CopyBack> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
         // Shaders that read memory with no copy computed something else than
         // the console's: it stays out of title memory, where it broke the
@@ -1377,23 +1378,34 @@ impl Host {
         // A range overlapping a withheld one of the same copy is withheld
         // too: its copy-back would take the other's bytes along (pages a
         // program using title memory and another both wrote).
-        let held: Vec<(usize, usize, usize)> = back
-            .iter()
-            .filter(|b| !b.3)
-            .map(|(s, a, n, _)| (std::sync::Arc::as_ptr(s) as usize, *a, *n))
-            .collect();
-        for b in back.iter_mut().filter(|b| b.3) {
-            let copy = std::sync::Arc::as_ptr(&b.0) as usize;
-            b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
+        // The entries in back keep every indexed shadow alive.
+        let withheld = |back: &[CopyBack]| {
+            crate::shadow::Withheld::new(back.iter().filter(|entry| !entry.3).map(
+                |(shadow, address, len, _)| {
+                    (std::sync::Arc::as_ptr(shadow) as usize, *address, address + len)
+                },
+            ))
+        };
+        let mut held = withheld(&back);
+        if !held.is_empty() {
+            let mut grew = false;
+            for (shadow, address, len, goes_back) in &mut back {
+                if *goes_back
+                    && held.overlaps(std::sync::Arc::as_ptr(shadow) as usize, *address, *address + *len)
+                {
+                    *goes_back = false;
+                    grew = true;
+                }
+            }
+            if grew {
+                // Marked pages must also see the declared ranges suppressed
+                // above. Do not propagate that suppression to more ranges.
+                held = withheld(&back);
+            }
         }
         // Pages shaders marked first: the copy-backs below end what the
         // copies keep for them.
-        let withheld: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = back
-            .iter()
-            .filter(|b| !b.3)
-            .map(|(s, a, n, _)| (s.clone(), *a, *n))
-            .collect();
-        crate::shadow::copy_back_marks(&withheld, withholding);
+        crate::shadow::copy_back_marks(&held, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
