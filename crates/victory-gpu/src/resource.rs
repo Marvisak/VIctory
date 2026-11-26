@@ -1668,10 +1668,13 @@ impl Resource {
             REFUSED_FOR_MEMORY.set(true);
             return None;
         }
+        // A texture made meanwhile by another thread is the memory's too.
+        let made = self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone();
+        // Clear retry state after publishing the cached result, so a racing
+        // OOM caller cannot leave a future deadline behind a successful copy.
         self.out_of_memory.store(0, Relaxed);
         self.refused_until.store(0, Relaxed);
-        // A texture made meanwhile by another thread is the memory's too.
-        self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone()
+        made
     }
 
     fn data(&self) -> *mut u8 {
