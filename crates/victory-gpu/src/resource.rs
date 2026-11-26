@@ -782,6 +782,13 @@ struct Resource {
     /// given up by [`evict`]); `Some(None)`: the host refused it.
     #[cfg(windows)]
     host: std::sync::Mutex<Option<Option<std::sync::Arc<HostTexture>>>>,
+    /// Changes with every write of [`Resource::host`] (made under its
+    /// lock, [`Resource::set_host`]) to a value no write ever stored
+    /// before ([`HOST_GENERATIONS`]); 0 until its first. A list that read
+    /// the host copy at a generation still reads it while the generation
+    /// is the same, without the lock ([`crate::host::HostList::with_host_copy`]).
+    #[cfg(windows)]
+    host_generation: std::sync::atomic::AtomicU64,
     /// The creation's initial state and clear value, for the host texture.
     #[cfg(windows)]
     made_with: (u32, Option<[u32; 5]>),
@@ -800,6 +807,10 @@ struct Resource {
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    /// The host texture's resource flags (render target, depth, unordered
+    /// access, denied shader resource), read once: a texture's description
+    /// never changes, and each use asked the driver for it again.
+    pub(crate) flags: u32,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// Formats views may take besides the texture's own family: the host
     /// took them as castable formats when it made the texture.
@@ -836,14 +847,17 @@ impl HostTexture {
         state: u32,
         castable: Vec<u32>,
     ) -> Self {
+        // SAFETY: a plain query on a live resource.
+        let desc = unsafe { texture.GetDesc() };
         let bytes = crate::host::host().map_or(0, |h| {
-            // SAFETY: plain queries on a live resource.
-            unsafe { h.device.GetResourceAllocationInfo(0, &[texture.GetDesc()]) }.SizeInBytes
+            // SAFETY: a plain query.
+            unsafe { h.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes
         });
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
             texture,
+            flags: desc.Flags.0 as u32,
             state: state.into(),
             castable,
             host_written: false.into(),
@@ -856,6 +870,16 @@ impl HostTexture {
             placement: None,
             last: [crate::queue::presented().into(), now_ms().into()],
         }
+    }
+
+    /// [`crate::host::legal_state`] of `state` for this texture.
+    pub(crate) fn legal(&self, state: u32) -> u32 {
+        crate::host::legal_for(self.flags, state)
+    }
+
+    /// [`crate::texture::title_written`] of this texture.
+    pub(crate) fn title_written(&self) -> bool {
+        crate::texture::title_written_flags(self.flags)
     }
 
     /// The title used it now: a list of the title's names it, or a shader
@@ -1099,6 +1123,33 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     }
     resource(this).host()
 }
+
+/// [`host_copy`] with the generation of `this`'s host copy it was read at
+/// ([`Resource::host_generation`]).
+#[cfg(windows)]
+pub(crate) fn host_copy_at(this: This) -> Option<(u64, std::sync::Arc<HostTexture>)> {
+    if this.is_null() {
+        return None;
+    }
+    let (generation, copy) = resource(this).host_at();
+    copy.map(|c| (generation, c))
+}
+
+/// The generation of `this`'s host copy now (0 for a null resource): the
+/// same as a [`host_copy_at`] read, the same host copy.
+#[cfg(windows)]
+pub(crate) fn host_generation(this: This) -> u64 {
+    if this.is_null() {
+        return 0;
+    }
+    resource(this)
+        .host_generation
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The generations [`Resource::set_host`] hands out: each once.
+#[cfg(windows)]
+static HOST_GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// The host description of a title texture: the same, without the
 /// console's layout and flags, in a format the host takes for its use.
@@ -1477,8 +1528,18 @@ impl Resource {
     /// textures made on first use").
     #[cfg(windows)]
     fn host(&self) -> Option<std::sync::Arc<HostTexture>> {
-        if let Some(made) = self.host.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-            return made;
+        self.host_at().1
+    }
+
+    /// [`Resource::host`] with its generation, both read under the lock.
+    #[cfg(windows)]
+    fn host_at(&self) -> (u64, Option<std::sync::Arc<HostTexture>>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        {
+            let h = self.host.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(made) = h.clone() {
+                return (self.host_generation.load(Relaxed), made);
+            }
         }
         // Made without the lock held (`shared_texture` takes the memory
         // maps, which `evict` holds while it takes this lock).
@@ -1486,7 +1547,25 @@ impl Resource {
         let clear = clear.as_ref().map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast());
         let made = shared_texture(self.data() as u64, &self.desc, state, clear);
         // A texture made meanwhile by another thread is the memory's too.
-        self.host.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(made).clone()
+        let mut h = self.host.lock().unwrap_or_else(|e| e.into_inner());
+        if h.is_none() {
+            self.set_host(&mut h, Some(made));
+        }
+        (self.host_generation.load(Relaxed), h.clone().flatten())
+    }
+
+    /// Writes [`Resource::host`] (`slot`, its lock held) and gives it a new
+    /// generation: every write goes through here.
+    #[cfg(windows)]
+    fn set_host(
+        &self,
+        slot: &mut Option<Option<std::sync::Arc<HostTexture>>>,
+        value: Option<Option<std::sync::Arc<HostTexture>>>,
+    ) {
+        use std::sync::atomic::Ordering;
+        *slot = value;
+        let generation = HOST_GENERATIONS.fetch_add(1, Ordering::Relaxed);
+        self.host_generation.store(generation, Ordering::Release);
     }
 
     fn data(&self) -> *mut u8 {
@@ -1702,9 +1781,10 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     let bytes = gone.iter().map(|(t, _)| t.bytes).sum();
     for (t, owners) in gone {
         for &r in owners.iter().filter(|r| live.contains(r)) {
-            let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
+            let r = resource(r as This);
+            let mut h = r.host.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, t)) {
-                *h = None;
+                r.set_host(&mut h, None);
             }
         }
         if let Some(k) = t.key {
@@ -1753,6 +1833,8 @@ fn hand_out_resource(
         backing,
         #[cfg(windows)]
         host: std::sync::Mutex::new(None),
+        #[cfg(windows)]
+        host_generation: std::sync::atomic::AtomicU64::new(0),
         // The clear value names the format too: format, then color or
         // depth and stencil (5 words), kept for when the texture is made.
         #[cfg(windows)]

@@ -803,6 +803,13 @@ pub(crate) struct HostList {
     /// by host copy: the side its first use needs and the side it leaves
     /// newer.
     twins: Mutex<std::collections::HashMap<usize, crate::twin::Use>>,
+    /// The host copies of title textures the list read, by title texture,
+    /// with the generation each was read at
+    /// ([`crate::resource::host_generation`]): a read while the generation
+    /// is the same borrows the list's (no lock or count shared with the
+    /// threads reading the same textures). Held until reset, as `states`
+    /// holds them.
+    read_copies: Mutex<ReadCopies>,
     /// A copy of ours replaced the list's compute root signature and
     /// pipeline: draws and dispatches set theirs again.
     rebind: std::sync::atomic::AtomicBool,
@@ -858,6 +865,16 @@ const STAMPS: u32 = 4096;
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
+
+/// [`HostList::read_copies`]: by title texture, the generation and copy
+/// read last; the copies read before it (a texture given up or replaced
+/// meanwhile), kept until the reset too.
+#[derive(Default)]
+struct ReadCopies {
+    by_texture:
+        std::collections::HashMap<usize, (u64, std::sync::Arc<crate::resource::HostTexture>)>,
+    before: Vec<std::sync::Arc<crate::resource::HostTexture>>,
+}
 
 type States = std::collections::HashMap<
     usize,
@@ -1134,6 +1151,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                read_copies: Mutex::default(),
                 rebind: false.into(),
                 ours: false.into(),
                 memory_writer: false.into(),
@@ -1784,6 +1802,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.read_copies.lock().unwrap_or_else(|e| e.into_inner()) = ReadCopies::default();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1804,6 +1823,48 @@ impl HostList {
         }
     }
 
+    /// `f` of title texture `resource`'s host copy, if it has one: the copy
+    /// the list read before while `resource`'s host copy is the same one
+    /// (its generation unchanged), lent from the list's own; else looked up
+    /// and kept for the next read. A texture given up or replaced, or a
+    /// title texture released and another made at its address, has a new
+    /// generation, so a list never borrows a copy that is not `resource`'s
+    /// now. The copy lent stays alive: the list holds it until it is reset,
+    /// after its last submission finished.
+    ///
+    /// A call inside `f` (another read through the same list) takes the
+    /// shared path rather than waiting on the list's own lock.
+    pub(crate) fn with_host_copy<R>(
+        &self,
+        resource: crate::object::This,
+        f: impl FnOnce(&std::sync::Arc<crate::resource::HostTexture>) -> R,
+    ) -> Option<R> {
+        let mut copies = match self.read_copies.try_lock() {
+            Ok(c) => c,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return crate::resource::host_copy(resource).map(|c| f(&c));
+            }
+        };
+        let generation = crate::resource::host_generation(resource);
+        let copies = &mut *copies;
+        if let Some((seen, copy)) = copies.by_texture.get(&(resource as usize))
+            && *seen == generation
+        {
+            return Some(f(copy));
+        }
+        let (generation, copy) = crate::resource::host_copy_at(resource)?;
+        let (_, copy) = match copies.by_texture.entry(resource as usize) {
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let (_, before) = o.insert((generation, copy));
+                copies.before.push(before);
+                o.into_mut()
+            }
+            std::collections::hash_map::Entry::Vacant(v) => v.insert((generation, copy)),
+        };
+        Some(f(copy))
+    }
+
     /// Moves a title texture's host copy to `wanted` (a host state) in this
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
@@ -1819,14 +1880,24 @@ impl HostList {
         // One host texture for the whole move (`crate::resource::evict` may
         // give it up meanwhile; this list then holds it).
         let copy = crate::resource::host_copy(resource)?;
-        let texture = copy.texture.clone();
+        self.transition_held(&copy, wanted)
+            .map(|(before, _)| (copy.texture.clone(), before))
+    }
+
+    /// [`HostList::transition`] of a host copy the caller holds: the state
+    /// it leaves and the (legal) state it takes, if that is a change.
+    pub(crate) fn transition_held(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<(u32, u32)> {
         if let Some(Some(twin)) = copy.twin.get()
-            && crate::twin::route(self, &copy, twin, wanted)
+            && crate::twin::route(self, copy, twin, wanted)
         {
             return None;
         }
-        let wanted = legal_state(&texture, wanted);
-        self.track(&copy, wanted).map(|before| (texture, before))
+        let wanted = copy.legal(wanted);
+        self.track(copy, wanted).map(|before| (before, wanted))
     }
 
     /// The list's state for host texture `copy` becomes `wanted` (a legal
@@ -1857,7 +1928,7 @@ impl HostList {
         copy: &std::sync::Arc<crate::resource::HostTexture>,
         wanted: u32,
     ) -> Option<D3D12_RESOURCE_BARRIER> {
-        let wanted = legal_state(&copy.texture, wanted);
+        let wanted = copy.legal(wanted);
         let before = self.track(copy, wanted)?;
         Some(transition(
             &copy.texture,
