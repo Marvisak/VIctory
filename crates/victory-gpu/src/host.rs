@@ -2577,7 +2577,7 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     // SAFETY: the destination is `len` bytes the caller may write, host
     // memory or title memory; the kernel checks both ranges, and a page it
     // cannot read or write fails the call instead of faulting.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 && done == len }
 }
 
 /// Copies host memory into title memory after a submission (what shaders
@@ -2663,6 +2663,10 @@ mod title_copies {
         // SAFETY: the middle block is reserved but not committed; the kernel
         // checks the source range and reports the failed read.
         assert!(!read_into_uninit(unsafe { source.add(BLOCK) }, &mut unreadable));
+
+        // SAFETY: this range starts in the committed first block and crosses
+        // into the reserved middle block; a partial copy is not a full read.
+        assert!(!read_into_uninit(unsafe { source.add(BLOCK / 2) }, &mut unreadable));
 
         let mut readable = Box::<[u8]>::new_uninit_slice(BLOCK);
         assert!(read_into_uninit(source, &mut readable));
