@@ -1657,4 +1657,79 @@ pub(crate) mod tests {
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
     }
+
+    /// A 64 KiB page whose leading 4 KiB OS page is reserved while the rest is
+    /// committed must still have its committed bytes copied into the shadow
+    /// buffer and pick up later title writes rather than being zero-filled and
+    /// marked clean.
+    #[test]
+    fn partially_committed_page_copies_committed_tail_and_tracks_updates() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        const OS_PAGE: usize = 4096;
+        // SAFETY: fresh write-watched reservation with [4 KiB, 64 KiB) committed.
+        let p = unsafe {
+            let p = VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | crate::watch::tests::MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize;
+            assert_ne!(p, 0);
+            assert_ne!(
+                VirtualAlloc(
+                    (p + OS_PAGE) as *const _,
+                    PAGE - OS_PAGE,
+                    MEM_COMMIT,
+                    PAGE_READWRITE,
+                ) as usize,
+                0
+            );
+            p
+        };
+        let first_committed = (p + OS_PAGE) as *mut u32;
+        let last_committed = (p + PAGE - 4) as *mut u32;
+        // SAFETY: both dwords lie inside the committed [4 KiB, 64 KiB) range.
+        unsafe {
+            first_committed.write_volatile(0xDEAD_BEEF);
+            last_committed.write_volatile(0x1234_5678);
+        }
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, PAGE);
+        assert_eq!(
+            copy.read_host(p as u64, 1),
+            [0],
+            "reserved prefix reads as zero"
+        );
+        assert_eq!(
+            copy.read_host((p + OS_PAGE) as u64, 1),
+            [0xDEAD_BEEF],
+            "committed sub-page must not be zeroed as unmapped"
+        );
+        assert_eq!(
+            copy.read_host((p + PAGE - 4) as u64, 1),
+            [0x1234_5678],
+            "end of committed tail must be copied"
+        );
+        assert!(
+            !copy.clean(),
+            "partially committed page cannot be guarded and must stay dirty"
+        );
+        // SAFETY: inside the committed [4 KiB, 64 KiB) range.
+        unsafe { first_committed.write_volatile(0xCAFE_BABE) };
+        copy.update(p, PAGE);
+        assert_eq!(
+            copy.read_host((p + OS_PAGE) as u64, 1),
+            [0xCAFE_BABE],
+            "subsequent title writes into the committed tail must reach the copy"
+        );
+        unregister(p, p as u64);
+        // The reservation stays allocated (as the other tests' pools): a copy
+        // some page table still holds must not name memory reused meanwhile.
+    }
 }
