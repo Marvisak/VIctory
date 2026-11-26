@@ -2241,6 +2241,14 @@ impl HostList {
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
+    /// The list's indirect work so far, after it has run.
+    #[cfg(test)]
+    pub(crate) fn budget_spent(&self) -> Option<u32> {
+        let &(_, data) = self.budget.get()?.as_ref()?;
+        // SAFETY: the list's own mapped word; the list has run.
+        Some(unsafe { (data as *const u32).read_volatile() })
+    }
+
     /// The list's argument buffer, at least `bytes` long, common between
     /// its uses (`crate::indirect`).
     pub(crate) fn arguments(&self, bytes: u64) -> Option<ID3D12Resource> {

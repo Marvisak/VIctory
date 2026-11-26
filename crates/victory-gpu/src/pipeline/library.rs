@@ -598,51 +598,34 @@ mod tests {
     /// stored and the library is serialised.
     #[test]
     fn pipelines_load_on_many_threads_at_once() {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::core::s;
         const N: usize = 48;
-        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
-        else {
+        let Some(host) = crate::host::host() else {
             return; // no host GPU here
+        };
+        let Ok(device) = host.device.cast::<ID3D12Device1>() else {
+            return; // no pipeline libraries here
         };
         let shader = |i: usize| {
             let source = format!(
-                "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n\
-                 [RootSignature(RS)] [numthreads(1, 1, 1)] void main() {{ b.Store(0, b.Load(4) * {i} + {i}); }}"
+                "RWStructuredBuffer<uint> b : register(u0);\n\
+                 [numthreads(1, 1, 1)] void main() {{ b[0] = b[1] * {i} + {i}; }}"
             );
-            let mut blob = None;
-            // SAFETY: the source outlives the call; the blob is read within it.
-            unsafe {
-                D3DCompile(
-                    source.as_ptr().cast(),
-                    source.len(),
-                    None,
-                    None,
-                    None,
-                    s!("main"),
-                    s!("cs_5_1"),
-                    0,
-                    0,
-                    &mut blob,
-                    None,
-                )
+            let code = crate::compute::compile(&source, s!("library"), s!("main"), s!("cs_5_1"), 0)
                 .ok()?;
-                let blob = blob?;
-                Some(
-                    std::slice::from_raw_parts(
-                        blob.GetBufferPointer().cast::<u8>(),
-                        blob.GetBufferSize(),
-                    )
-                    .to_vec(),
-                )
-            }
+            Some(crate::compute::bytes(&code).to_vec())
         };
         let Some(codes) = (0..2 * N).map(shader).collect::<Option<Vec<_>>>() else {
             return; // no shader compiler here
         };
-        // SAFETY: the code holds its root signature.
-        let root: ID3D12RootSignature =
-            unsafe { device.CreateRootSignature(0, &codes[0]) }.unwrap();
+        let params = [crate::compute::root_view(
+            D3D12_ROOT_PARAMETER_TYPE_UAV,
+            0,
+            0,
+        )];
+        let root =
+            crate::compute::root_signature(&host.device, &params, D3D12_ROOT_SIGNATURE_FLAG_NONE)
+                .unwrap();
         struct Shared(ID3D12Device1, ID3D12RootSignature, ID3D12PipelineLibrary1);
         // SAFETY: D3D12 objects are free-threaded.
         unsafe impl Sync for Shared {}
