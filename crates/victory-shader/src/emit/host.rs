@@ -2,7 +2,7 @@
 //! tests, drawing a full-screen triangle and reading the target back.
 
 use std::ffi::CString;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, Once, OnceLock};
 
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -64,6 +64,75 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// Whether `VICTORY_D3D12_DEBUG` asks for the debug layer (diagnostics builds
+/// only, as for the title's own host device: `0` is off, any other value on).
+fn debug_requested() -> bool {
+    cfg!(feature = "diagnostics")
+        && std::env::var_os("VICTORY_D3D12_DEBUG").is_some_and(|v| v != "0")
+}
+
+/// Enables the debug layer if [`debug_requested`], once per process and
+/// before this module's first device: the layer cannot be added to a device
+/// that exists, and enabling it after one does can remove that device.
+fn enable_debug_layer() {
+    static ENABLE: Once = Once::new();
+    ENABLE.call_once(|| {
+        if !debug_requested() {
+            return;
+        }
+        let mut layer: Option<ID3D12Debug> = None;
+        // SAFETY: a plain call with a valid out pointer.
+        if unsafe { D3D12GetDebugInterface(&mut layer) }.is_ok()
+            && let Some(layer) = layer
+        {
+            // SAFETY: this runs before creating this module's first device.
+            unsafe { layer.EnableDebugLayer() };
+        } else {
+            eprintln!(
+                "warning: VICTORY_D3D12_DEBUG requested the D3D12 debug layer, but it is unavailable. \
+                 Install Graphics Tools in Windows Optional Features and rerun. \
+                 Continuing without debug-layer messages."
+            );
+        }
+    });
+}
+
+/// Devices of one adapter are one device: `D3D12CreateDevice` returns the same
+/// object, so every [`Host`] of a process shares one `ID3D12InfoQueue`. Object
+/// creation and the read of what it reported go through this lock in debug
+/// mode, or a worker's reads and clears take another worker's messages.
+static CREATION: Mutex<()> = Mutex::new(());
+
+/// What the debug layer reported (errors and warnings, as `id N: text`), and
+/// the queue emptied.
+fn drain_messages(queue: &ID3D12InfoQueue) -> Vec<String> {
+    let mut found = Vec::new();
+    // SAFETY: each message is read into a buffer of the size the queue
+    // reports, then the queue is emptied.
+    unsafe {
+        for i in 0..queue.GetNumStoredMessages() {
+            let mut size = 0;
+            if queue.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                continue;
+            }
+            let mut buffer = vec![0u64; size.div_ceil(8)];
+            let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+            if queue.GetMessage(i, Some(message), &mut size).is_err() {
+                continue;
+            }
+            let m = &*message;
+            if m.Severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                continue;
+            }
+            let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+            let text = String::from_utf8_lossy(text);
+            found.push(format!("id {}: {}", m.ID.0, text.trim_end_matches('\0')));
+        }
+        queue.ClearStoredMessages();
+    }
+    found
+}
+
 /// A D3D12 device kept alive for the process so concurrent callers do not
 /// race creating and tearing down the same singleton adapter device.
 struct SharedDevice(ID3D12Device);
@@ -75,6 +144,7 @@ unsafe impl Send for SharedDevice {}
 unsafe impl Sync for SharedDevice {}
 
 fn create_device(warp: bool) -> Result<ID3D12Device, String> {
+    enable_debug_layer();
     // SAFETY: plain D3D12/DXGI calls with valid out pointers.
     unsafe {
         let mut device: Option<ID3D12Device> = None;
@@ -194,6 +264,32 @@ impl Host {
     pub fn from_device(device: ID3D12Device) -> Self {
         let warp = on_software_adapter(&device);
         Host { device, warp }
+    }
+
+    /// Makes an object, naming the debug layer's reasons if it is refused:
+    /// with the layer on (`VICTORY_D3D12_DEBUG=1` in a diagnostics build) the
+    /// error carries what the layer said, not only the bare code. Creations
+    /// are then one at a time (the queue is shared, see [`CREATION`]); without
+    /// the layer they run in parallel. Callers take [`WARP_LOCK`] (if at all)
+    /// before this, never after.
+    fn made<T>(&self, make: impl FnOnce() -> windows::core::Result<T>) -> Result<T, String> {
+        if !cfg!(feature = "diagnostics") {
+            return make().map_err(err);
+        }
+        let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {
+            return make().map_err(err);
+        };
+        let _one_at_a_time = CREATION.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a plain call; the lock keeps others' messages out of ours.
+        unsafe { queue.ClearStoredMessages() };
+        make().map_err(|e| {
+            let reasons = drain_messages(&queue);
+            if reasons.is_empty() {
+                err(e)
+            } else {
+                format!("{}; debug layer: {}", err(e), reasons.join("; "))
+            }
+        })
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -344,7 +440,7 @@ impl Host {
     pub fn root_signature_bytes(&self, bytes: &[u8]) -> Result<ID3D12RootSignature, String> {
         let _guard = self.lock_warp();
         // SAFETY: `bytes` is a live slice of root-signature or container bytes.
-        unsafe { self.device.CreateRootSignature(0, bytes) }.map_err(err)
+        self.made(|| unsafe { self.device.CreateRootSignature(0, bytes) })
     }
 
     /// A compute pipeline; user data is root parameter 0.
@@ -373,7 +469,7 @@ impl Host {
         };
         let _guard = self.lock_warp();
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err)
+        self.made(|| unsafe { self.device.CreateComputePipelineState(&desc) })
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or
@@ -480,8 +576,7 @@ impl Host {
         }
         let _guard = self.lock_warp();
         // SAFETY: the description points at live data.
-        let pso = unsafe { self.device.CreateGraphicsPipelineState(&desc) };
-        pso.map_err(err)
+        self.made(|| unsafe { self.device.CreateGraphicsPipelineState(&desc) })
     }
 
     /// A mesh pipeline from a mesh and a pixel shader (user data of the mesh
@@ -592,7 +687,7 @@ impl Host {
         let _guard = self.lock_warp();
         let device: ID3D12Device2 = self.device.cast().map_err(err)?;
         // SAFETY: the stream points at live data and outlives the call.
-        unsafe { device.CreatePipelineState(&desc) }.map_err(err)
+        self.made(|| unsafe { device.CreatePipelineState(&desc) })
     }
 
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for

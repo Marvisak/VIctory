@@ -89,6 +89,18 @@ enum Command {
         /// driver; a second time only what is not there yet).
         #[arg(long)]
         pipelines: bool,
+        /// With `--pipelines`: make pipelines for these stages only (vs, ps,
+        /// cs, ms; every stage is still emitted and validated). With
+        /// `VICTORY_D3D12_DEBUG=1` creation is slow, and `--only cs` covers
+        /// the compute programs in a fraction of the time.
+        #[arg(
+            long,
+            value_enum,
+            value_delimiter = ',',
+            requires = "pipelines",
+            conflicts_with = "cache"
+        )]
+        only: Vec<translate::Only>,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
@@ -179,6 +191,7 @@ fn main() -> Result<()> {
             paths,
             validate,
             pipelines,
+            only,
             list,
             jobs,
             cache: false,
@@ -186,6 +199,7 @@ fn main() -> Result<()> {
             paths,
             validate,
             pipelines,
+            &only,
             list,
             jobs.map(NonZeroUsize::get),
         ),

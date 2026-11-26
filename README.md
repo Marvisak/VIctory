@@ -150,7 +150,7 @@ victory inspect <exe|dll> [--imports] [--exports]
 victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm] [--effects]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+victory translate [paths...] [--validate] [--pipelines [--only vs,ps,cs,ms]] [--list] [--jobs N]
 victory translate [paths...] --cache [--pipelines] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
@@ -205,7 +205,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_CAPTURE_WORLD=<list>` | with `VICTORY_CAPTURE`, also saves (and with `VICTORY_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
 | `VICTORY_DUMP_WRITERS=<hash>,...` | with the two above, also the textures a pipeline containing a listed shader hash writes, the first frame it runs, and for its buffers a log line (dwords changed, dwords not zero) |
 | `VICTORY_PEEK=<hex address>[:<bytes>],...` | in listed frames, those bytes of title memory logged after each submission. Listed frames also log targets of 16 texels or fewer as values, each table view's view words and whether its host slot is null, the host copy of every buffer of 64 bytes or fewer a draw reads (at submission and after its list), and each 1D or 3D texture a dispatch writes, read back right after it |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
+| `VICTORY_D3D12_DEBUG=1` | host debug layer; `translate --pipelines` refusals then carry its messages (pipelines are made one at a time, and slowly: `--only cs` limits them to the compute programs) |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | skip host pipeline creation and omit draws and dispatches, including indirect ones, when the pipeline contains a listed 16-digit shader hash |
