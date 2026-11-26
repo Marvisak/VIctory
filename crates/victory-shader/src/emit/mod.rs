@@ -264,6 +264,14 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// With `VICTORY_NAN_SCRUB=1` (off by default), pixel colour exports and float
+/// image stores replace NaN and +/-infinity with `0.0` so bad values do not
+/// spread into black or blown-out patches across bloom, blur, or temporal passes.
+pub fn nan_scrub() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1"))
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
