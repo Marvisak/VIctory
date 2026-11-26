@@ -210,10 +210,10 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     };
     let depth = resource(&depth_desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     let readback = resource(&buffer_desc, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
-    let dsv = host.dsv(&depth, None);
+    let dsv = host.dsv(&depth, None).unwrap();
     let bind = || {
         // SAFETY: an open list and the live depth buffer's descriptor.
-        unsafe { l.OMSetRenderTargets(0, None, false, Some(&dsv)) };
+        unsafe { l.OMSetRenderTargets(0, None, false, Some(&dsv.handle)) };
         slot::<extern "system" fn(This, This)>(list, 0xc8)(list, pso);
         if !mesh {
             slot::<extern "system" fn(This, u32)>(list, 0xa0)(list, 4); // triangle list
@@ -227,7 +227,7 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
         host.execute(&[commands]);
     };
     // SAFETY: the list is open; the depth buffer is in DEPTH_WRITE.
-    unsafe { l.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None) };
+    unsafe { l.ClearDepthStencilView(dsv.handle, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None) };
     bind();
     draw_pixel(0); // Default bounds on a fresh list.
     bounds(list, 0.0, 0.25);

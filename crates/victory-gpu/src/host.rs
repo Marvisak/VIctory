@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -35,9 +35,98 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
-/// Render target views live only until their command is recorded, so a
-/// ring of host descriptors is enough.
-const RTV_RING: u32 = 1024;
+/// CPU-only slots held until their descriptors are consumed by recording.
+const CPU_VIEW_SLOTS: u32 = 1024;
+
+struct CpuViews {
+    _heap: ID3D12DescriptorHeap,
+    kind: D3D12_DESCRIPTOR_HEAP_TYPE,
+    start: usize,
+    stride: usize,
+    available: Mutex<Vec<u32>>,
+}
+
+enum CpuViewStorage<'a> {
+    Pooled(&'a CpuViews, u32),
+    Standalone { _heap: ID3D12DescriptorHeap },
+}
+
+pub(crate) struct CpuView<'a> {
+    pub(crate) handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+    storage: CpuViewStorage<'a>,
+}
+
+impl Drop for CpuView<'_> {
+    fn drop(&mut self) {
+        if let CpuViewStorage::Pooled(pool, slot) = self.storage {
+            pool.available
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(slot);
+        }
+    }
+}
+
+impl CpuViews {
+    fn heap(
+        device: &ID3D12Device,
+        kind: D3D12_DESCRIPTOR_HEAP_TYPE,
+        count: u32,
+    ) -> windows::core::Result<ID3D12DescriptorHeap> {
+        // SAFETY: a plain description of a CPU-only heap.
+        unsafe {
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: kind,
+                NumDescriptors: count,
+                ..Default::default()
+            })
+        }
+    }
+
+    fn new(
+        device: &ID3D12Device,
+        kind: D3D12_DESCRIPTOR_HEAP_TYPE,
+    ) -> windows::core::Result<Self> {
+        let heap = Self::heap(device, kind, CPU_VIEW_SLOTS)?;
+        // SAFETY: the device and its newly made heap are live.
+        let (start, stride) = unsafe {
+            (
+                heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                device.GetDescriptorHandleIncrementSize(kind) as usize,
+            )
+        };
+        Ok(Self {
+            _heap: heap,
+            kind,
+            start,
+            stride,
+            available: Mutex::new((0..CPU_VIEW_SLOTS).rev().collect()),
+        })
+    }
+
+    fn take(&self, device: &ID3D12Device) -> Option<CpuView<'_>> {
+        if let Some(slot) = self.available.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+            return Some(CpuView {
+                handle: D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: self.start + slot as usize * self.stride,
+                },
+                storage: CpuViewStorage::Pooled(self, slot),
+            });
+        }
+
+        // A recorder may already hold other slots for one render-target bind.
+        // Use a temporary heap instead of waiting for those slots to return.
+        let heap = Self::heap(device, self.kind, 1)
+            .inspect_err(|error| tracing::warn!(?self.kind, %error, "no CPU descriptor slot"))
+            .ok()?;
+        // SAFETY: the heap stays live in the returned view.
+        let handle = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        Some(CpuView {
+            handle,
+            storage: CpuViewStorage::Standalone { _heap: heap },
+        })
+    }
+}
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -47,21 +136,13 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
-    rtvs: ID3D12DescriptorHeap,
-    rtv_size: u32,
-    /// A ring of depth views, used as `rtvs`.
-    dsvs: ID3D12DescriptorHeap,
-    dsv_size: u32,
-    next_dsv: AtomicU32,
-    /// A ring of CPU-only views, for the CPU handles of unordered access
-    /// clears, used as `rtvs`.
-    cpu_views: ID3D12DescriptorHeap,
-    cpu_view_size: u32,
-    next_cpu_view: AtomicU32,
+    rtvs: CpuViews,
+    dsvs: CpuViews,
+    /// CPU handles for unordered access clears.
+    cpu_views: CpuViews,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
-    next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
 }
 
@@ -213,28 +294,9 @@ fn create() -> windows::core::Result<Host> {
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
-        let rtvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        let dsvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        let cpu_views: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let cpu_view_size =
-            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        let rtvs = CpuViews::new(&device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV)?;
+        let dsvs = CpuViews::new(&device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV)?;
+        let cpu_views = CpuViews::new(&device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)?;
         tracing::info!("host D3D12 device ready");
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
@@ -255,15 +317,9 @@ fn create() -> windows::core::Result<Host> {
             submitted: Mutex::new(0),
             event,
             rtvs,
-            rtv_size,
             dsvs,
-            dsv_size,
-            next_dsv: AtomicU32::new(0),
             cpu_views,
-            cpu_view_size,
-            next_cpu_view: AtomicU32::new(0),
             messages,
-            next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
         })
     }
@@ -381,6 +437,98 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn pending_rtv_survives_other_recorders() {
+        let Some(host) = host() else {
+            eprintln!("no D3D12 host; skipped");
+            return;
+        };
+        let make_target = || {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut texture = None;
+            // SAFETY: these descriptions and the output pointer are live.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut texture,
+                )
+            }
+            .unwrap();
+            texture.unwrap()
+        };
+        let left = make_target();
+        let right = make_target();
+        let list = host.new_list().unwrap();
+        let clear = |rtv, color: [f32; 4]| {
+            // SAFETY: the list is open and the view names a live render target.
+            unsafe { list.list.ClearRenderTargetView(rtv, &color, None) };
+        };
+        let first = host.rtv(&left, None).unwrap();
+        clear(first.handle, [0.0, 0.0, 0.0, 1.0]);
+        let second = host.rtv(&right, None).unwrap();
+        clear(second.handle, [0.0, 0.0, 1.0, 1.0]);
+
+        let pending = host.rtv(&left, None).unwrap();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    // One full lap of the old global CPU descriptor ring.
+                    for _ in 0..1024 {
+                        let _view = host.rtv(&right, None).unwrap();
+                    }
+                })
+                .join()
+                .unwrap();
+        });
+        clear(pending.handle, [1.0, 0.0, 0.0, 1.0]);
+
+        let read = |texture| {
+            // SAFETY: this list has recorded each texture in the render target state.
+            unsafe {
+                list.list.ResourceBarrier(&[transition(
+                    texture,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+            }
+            crate::capture::read_back(&host.device, &list.list, texture).unwrap()
+        };
+        let copies = [read(&left), read(&right)];
+        list.close();
+        host.execute(&[&list]);
+        let pixels = copies.map(|(buffer, footprint)| {
+            // SAFETY: the submission completed and a 1x1 RGBA8 readback has four bytes at Offset.
+            unsafe {
+                let mut ptr = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut ptr)).unwrap();
+                let pixel = ptr.cast::<u8>().add(footprint.Offset as usize)
+                    .cast::<[u8; 4]>().read_unaligned();
+                buffer.Unmap(0, None);
+                pixel
+            }
+        });
+        assert_eq!(pixels, [[255, 0, 0, 255], [0, 0, 255, 255]]);
+    }
+
     thread_local! {
         /// Every transition barrier built on this thread (resource, before,
         /// after), in order.
@@ -1622,42 +1770,34 @@ impl Host {
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a slot of our heap and a live resource.
+    ) -> Option<CpuView<'_>> {
+        let view = self.rtvs.take(&self.device)?;
+        // SAFETY: the requested slot is reserved and the resource is live.
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
             self.device
-                .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
+                .CreateRenderTargetView(resource, desc.map(std::ptr::from_ref), view.handle);
         }
+        Some(view)
     }
 
-    /// A slot of CPU-only views, valid until it is recorded.
-    pub(crate) fn cpu_view(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_cpu_view.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a live heap.
-        let mut handle = unsafe { self.cpu_views.GetCPUDescriptorHandleForHeapStart() };
-        handle.ptr += (slot * self.cpu_view_size) as usize;
-        handle
+    /// A CPU-only view slot for the duration of command recording.
+    pub(crate) fn cpu_view(&self) -> Option<CpuView<'_>> {
+        self.cpu_views.take(&self.device)
     }
 
-    /// A host depth view of `resource`, valid until it is recorded.
+    /// A host depth view held until its command is recorded.
     pub(crate) fn dsv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a slot of our heap and a live resource.
+    ) -> Option<CpuView<'_>> {
+        let view = self.dsvs.take(&self.device)?;
+        // SAFETY: the requested slot is reserved and the resource is live.
         unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
             self.device
-                .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
-            handle
+                .CreateDepthStencilView(resource, desc.map(std::ptr::from_ref), view.handle);
         }
+        Some(view)
     }
 }
 
@@ -4061,7 +4201,7 @@ mod present_plane_tests {
                     .unwrap();
                 let texture = texture.unwrap();
                 list.list
-                    .ClearRenderTargetView(host.rtv(&texture, None), color, None);
+                    .ClearRenderTargetView(host.rtv(&texture, None).unwrap().handle, color, None);
                 texture
             }
         };

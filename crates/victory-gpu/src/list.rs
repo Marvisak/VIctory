@@ -1022,7 +1022,9 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
-        let rtv = host.rtv(&texture, record.desc().as_ref());
+        let Some(rtv) = host.rtv(&texture, record.desc().as_ref()) else {
+            return;
+        };
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
@@ -1033,7 +1035,7 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
-            list.list.ClearRenderTargetView(rtv, color, rects);
+            list.list.ClearRenderTargetView(rtv.handle, color, rects);
         }
     }
     #[cfg(not(windows))]
@@ -1070,11 +1072,13 @@ extern "system" fn clear_dsv(
         });
         const DEPTH_WRITE: u32 = 0x10;
         ensure_state(list, record.resource, DEPTH_WRITE);
-        let dsv = host.dsv(&texture, record.depth_desc().as_ref());
+        let Some(dsv) = host.dsv(&texture, record.depth_desc().as_ref()) else {
+            return;
+        };
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+                .ClearDepthStencilView(dsv.handle, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         };
     }
     #[cfg(not(windows))]

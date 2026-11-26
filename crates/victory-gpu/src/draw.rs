@@ -412,8 +412,11 @@ impl State {
             return;
         };
         self.targets.clear();
-        let mut rtvs = Vec::new();
-        for &h in handles {
+        const MAX_TARGETS: usize = D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize;
+        let mut views = [const { None }; MAX_TARGETS];
+        let mut rtvs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); MAX_TARGETS];
+        let mut count = 0;
+        for &h in handles.iter().take(MAX_TARGETS) {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
@@ -424,28 +427,35 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
+            let Some(view) = host.rtv(&texture, record.desc().as_ref()) else {
+                continue;
+            };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
+            rtvs[count] = view.handle;
+            views[count] = Some(view);
+            count += 1;
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
+            let view = host.dsv(&texture, record.depth_desc().as_ref())?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            Some(host.dsv(&texture, record.depth_desc().as_ref()))
+            Some(view)
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
-                rtvs.len() as u32,
-                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                count as u32,
+                (count != 0).then_some(rtvs.as_ptr()),
                 false,
-                dsv.as_ref().map(std::ptr::from_ref),
+                dsv.as_ref().map(|view| &raw const view.handle),
             )
         };
+        drop(views);
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -1054,13 +1064,16 @@ impl State {
             return;
         };
         let Some(visible) = heap.host() else { return };
+        let Some(cpu_view) = host.cpu_view() else {
+            return;
+        };
         let Some(slot) = visible.dynamic(1) else {
             return;
         };
         self.dynamic
             .push((std::ptr::from_ref(heap) as usize, slot, 1));
         visible.make_at(slot, &view);
-        let at = host.cpu_view();
+        let at = cpu_view.handle;
         let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
             once!("an unordered access clear of a view the host cannot make");
             return;
@@ -2571,13 +2584,14 @@ uint ps() : SV_Target { return 1; }
             ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
-        let (rtv, dsv) = (host.rtv(&target, None), host.dsv(texture, Some(&dsv)));
+        let rtv = host.rtv(&target, None).unwrap();
+        let dsv = host.dsv(texture, Some(&dsv)).unwrap();
         // SAFETY: an open list; the target in the render target state, the
         // depth texture in the depth write state; copies into our buffer.
         unsafe {
             let l = &list.list;
-            l.ClearRenderTargetView(rtv, &[0.0; 4], None);
-            l.OMSetRenderTargets(1, Some(&rtv), false, Some(&dsv));
+            l.ClearRenderTargetView(rtv.handle, &[0.0; 4], None);
+            l.OMSetRenderTargets(1, Some(&rtv.handle), false, Some(&dsv.handle));
             l.RSSetViewports(&[D3D12_VIEWPORT { Width: 64.0, Height: 64.0, MaxDepth: 1.0, ..Default::default() }]);
             l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { right: 64, bottom: 64, ..Default::default() }]);
             l.SetGraphicsRootSignature(&root);
@@ -3272,10 +3286,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
-        let handle = host.dsv(&copy.texture, Some(&dsv));
+        let view = host.dsv(&copy.texture, Some(&dsv)).unwrap();
         // SAFETY: an open list, the texture in the depth write state.
         unsafe {
-            list.list.ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.5, 0x11, None)
+            list.list.ClearDepthStencilView(view.handle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.5, 0x11, None)
         };
         readable(&list, &used(ResourceType::Uav), &planes[0], false);
         let twin = copy.twin.get().and_then(Option::as_ref).expect("a twin");
