@@ -410,6 +410,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave_max: 64,
         view_marks: false,
     })
     .expect("lower");

@@ -103,6 +103,18 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
                 sm.HighestShaderModel.0
             ));
         }
+        // Translations from now on target this device's widest wave.
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+            .is_ok()
+        {
+            super::set_host_wave_max(options.WaveLaneCountMax);
+        }
         Ok(device)
     }
 }
@@ -797,6 +809,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave_max: 64,
         view_marks: false,
     })?;
     Ok(HostShader {
