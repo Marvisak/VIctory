@@ -342,13 +342,29 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// The render target view description words in the host's layout (with the
+    /// format mapped for the host), or `None` when the host's default view of
+    /// the resource is used.
+    #[cfg(windows)]
+    pub(crate) fn rtv_words(&self) -> Option<[u32; 6]> {
+        const TEXTURE_2D: u32 = 4;
+        self.host_words(TEXTURE_2D)
+    }
+
+    /// The depth view description words in the host's layout, or `None` for
+    /// the host's default view of the resource.
+    #[cfg(windows)]
+    pub(crate) fn dsv_words(&self) -> Option<[u32; 6]> {
+        const TEXTURE_2D: u32 = 3;
+        self.host_words(TEXTURE_2D)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 4;
-        self.host_desc(TEXTURE_2D)
+        self.rtv_words().map(Self::cast_desc)
     }
 
     /// The depth view description in the host's type (the same layout).
@@ -356,16 +372,14 @@ impl RtvRecord {
     pub(crate) fn depth_desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 3;
-        self.host_desc(TEXTURE_2D)
+        self.dsv_words().map(Self::cast_desc)
     }
 
-    /// The description words as a host type, the format as the host has it.
-    /// Without one, a typeless host copy gets a 2D view (`dimension`) in
+    /// The description words in the host's layout, the format as the host has
+    /// it. Without one, a typeless host copy gets a 2D view (`dimension`) in
     /// the title's format, which the host needs spelled out.
     #[cfg(windows)]
-    fn host_desc<T>(&self, dimension: u32) -> Option<T> {
-        assert!(size_of::<T>() <= size_of::<[u32; 6]>());
+    fn host_words(&self, dimension: u32) -> Option<[u32; 6]> {
         let mut words = if self.described != 0 {
             self.desc
         } else {
@@ -379,8 +393,16 @@ impl RtvRecord {
             ]
         };
         words[0] = crate::resource::pc_format(words[0]);
+        Some(words)
+    }
+
+    /// Reinterprets description words as the matching host D3D12 view
+    /// description (both are 24 bytes in this layout).
+    #[cfg(windows)]
+    pub(crate) fn cast_desc<T>(words: [u32; 6]) -> T {
+        assert!(size_of::<T>() <= size_of::<[u32; 6]>());
         // SAFETY: both host view descriptions are 24 bytes in this layout.
-        Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+        unsafe { (&raw const words).cast::<T>().read_unaligned() }
     }
 }
 
