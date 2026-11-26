@@ -56,6 +56,16 @@ pub(crate) struct ComputeHead {
     stage: Bytecode,
 }
 
+/// Dependency-tracking state for worker scheduling before `translated` completes.
+#[cfg(windows)]
+#[derive(Default)]
+struct ShaderDeps {
+    done: Option<bool>,
+    queued_early: bool,
+    queued_demand: bool,
+    waiters: Vec<std::sync::Weak<make::Pending>>,
+}
+
 /// A shader container a title passed, shared by every pipeline with the
 /// same bytes.
 pub(crate) struct Shader {
@@ -65,6 +75,10 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    scheduled: std::sync::atomic::AtomicBool,
+    #[cfg(windows)]
+    deps: Mutex<ShaderDeps>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -95,6 +109,10 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            scheduled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(windows)]
+            deps: std::sync::Mutex::new(ShaderDeps::default()),
         }
     }
 
@@ -103,6 +121,23 @@ impl Shader {
         let shader = Shader::new(stage, b"");
         let _ = shader.translated.set(Some(translated));
         Arc::new(shader)
+    }
+
+    #[cfg(all(test, windows, feature = "diagnostics"))]
+    pub(crate) fn from_parts(
+        stage: &'static str,
+        hash: String,
+        container: Vec<u8>,
+        translated: Option<Translated>,
+    ) -> Arc<Shader> {
+        Arc::new(Shader {
+            stage,
+            hash,
+            container,
+            translated: OnceLock::from(translated),
+            scheduled: std::sync::atomic::AtomicBool::new(false),
+            deps: std::sync::Mutex::new(ShaderDeps::default()),
+        })
     }
 }
 
@@ -115,10 +150,20 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    #[cfg(test)]
+    pub(crate) fn test_only(stage: &'static str, name: &str) -> Arc<Self> {
+        Arc::new(Self::new(stage, name.as_bytes()))
+    }
+
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
+        if let Some(t) = self.translated.get() {
+            self.finish_translation(t.is_some());
+            return t.as_ref();
+        }
+        let out = self
+            .translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
                 let (done, cached) = translate(&self.container);
@@ -149,7 +194,77 @@ impl Shader {
                 }
                 done.ok()
             })
-            .as_ref()
+            .as_ref();
+        self.finish_translation(out.is_some());
+        out
+    }
+
+    /// Records `pending` as waiting for this shader unless already translated.
+    /// Returns `(done_result, enqueue_as_demand)`.
+    pub(crate) fn register_waiter(
+        &self,
+        pending: &Arc<make::Pending>,
+        demand: bool,
+    ) -> (Option<bool>, Option<bool>) {
+        let mut deps = self.deps.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ok) = deps.done {
+            return (Some(ok), None);
+        }
+        if let Some(t) = self.translated.get() {
+            let ok = t.is_some();
+            deps.done = Some(ok);
+            return (Some(ok), None);
+        }
+        deps.waiters.push(Arc::downgrade(pending));
+        let enqueue = if demand {
+            if deps.queued_demand {
+                None
+            } else {
+                deps.queued_demand = true;
+                Some(true)
+            }
+        } else if deps.queued_early || deps.queued_demand {
+            None
+        } else {
+            deps.queued_early = true;
+            Some(false)
+        };
+        (None, enqueue)
+    }
+
+    /// Marks an untranslated shader for immediate demand scheduling if not yet
+    /// queued at demand priority.
+    pub(crate) fn promote_to_demand(&self) -> bool {
+        let mut deps = self.deps.lock().unwrap_or_else(|e| e.into_inner());
+        if deps.done.is_some() || deps.queued_demand {
+            return false;
+        }
+        deps.queued_demand = true;
+        true
+    }
+
+    /// Claims one-time worker execution for this shader's translation task.
+    pub(crate) fn claim_scheduled(&self) -> bool {
+        !self
+            .scheduled
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Publishes completion of this shader and notifies any dependent pipelines.
+    pub(crate) fn finish_translation(&self, ok: bool) {
+        let waiters = {
+            let mut deps = self.deps.lock().unwrap_or_else(|e| e.into_inner());
+            if deps.done.is_some() {
+                return;
+            }
+            deps.done = Some(ok);
+            std::mem::take(&mut deps.waiters)
+        };
+        for weak in waiters {
+            if let Some(pending) = weak.upgrade() {
+                make::on_shader_done(&pending, ok);
+            }
+        }
     }
 }
 

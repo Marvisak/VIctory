@@ -395,39 +395,75 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// The shader stages a pipeline compiles, or why it gets no host pipeline.
+fn select_stages(
+    shaders: &[Arc<Shader>],
+    has_mesh: bool,
+) -> Result<Vec<(&Arc<Shader>, D3D12_SHADER_VISIBILITY)>, &'static str> {
+    let find = |stage| shaders.iter().find(|s| s.stage == stage);
+    let compute = match shaders {
+        [cs] if cs.stage == "compute" => Some(cs),
+        _ => None,
+    };
+    if compute.is_none()
+        && shaders
+            .iter()
+            .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+    {
+        return Err("only vertex, mesh, pixel and compute stages are translated");
+    }
+    let mesh = find("mesh");
+    let stages = if let Some(cs) = compute {
+        vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
+    } else {
+        let first = match (mesh, find("vertex")) {
+            (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
+            (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
+            (None, None) => return Err("no vertex or mesh shader"),
+        };
+        let mut stages = vec![first];
+        stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+        stages
+    };
+    if mesh.is_some() && !has_mesh {
+        return Err("the host GPU has no mesh shaders (or no shader model 6.6)");
+    }
+    Ok(stages)
+}
+
+/// Unique shader containers needed before building a host pipeline.
+/// Empty when the pipeline will be refused before shader translation
+/// (unsupported stages, missing required stage, or host without mesh).
+pub(crate) fn required_shaders(shaders: &[Arc<Shader>]) -> Vec<Arc<Shader>> {
+    let needs_mesh = shaders.iter().any(|s| s.stage == "mesh");
+    let has_mesh = if needs_mesh {
+        host().is_some_and(|h| h.mesh_shaders())
+    } else {
+        true
+    };
+    let Ok(stages) = select_stages(shaders, has_mesh) else {
+        return Vec::new();
+    };
+    let mut deps: Vec<Arc<Shader>> = Vec::with_capacity(stages.len());
+    for (s, _) in stages {
+        if !deps.iter().any(|existing| Arc::ptr_eq(existing, s)) {
+            deps.push(s.clone());
+        }
+    }
+    deps
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
-        let find = |stage| shaders.iter().find(|s| s.stage == stage);
-        let compute = match shaders {
-            [cs] if cs.stage == "compute" => Some(cs),
-            _ => None,
+        let stages = match select_stages(shaders, true) {
+            Ok(stages) => stages,
+            Err(reason) => return refuse(reason, shaders),
         };
-        if compute.is_none()
-            && shaders
-                .iter()
-                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
-        {
-            return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
-                shaders,
-            );
-        }
-        let mesh = find("mesh");
-        let stages = if let Some(cs) = compute {
-            vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
-        } else {
-            let first = match (mesh, find("vertex")) {
-                (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
-                (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
-                (None, None) => return refuse("no vertex or mesh shader", shaders),
-            };
-            let mut stages = vec![first];
-            stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
-            stages
-        };
-        if mesh.is_some() && !host()?.mesh_shaders() {
+        let is_compute = stages.len() == 1 && stages[0].0.stage == "compute";
+        let is_mesh = stages.iter().any(|(s, _)| s.stage == "mesh");
+        if is_mesh && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         for (s, _) in &stages {
@@ -585,7 +621,7 @@ impl HostPipeline {
                 }
                 (first, first + 1)
             });
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, is_compute) {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
@@ -601,7 +637,7 @@ impl HostPipeline {
                 },
             )
         };
-        if compute.is_some() {
+        if is_compute {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -644,7 +680,7 @@ impl HostPipeline {
         };
         let state = g.describe();
         let depth_with_bounds = g.depth_with_bounds(host);
-        if mesh.is_some() {
+        if is_mesh {
             let name = super::library::name(
                 "mesh",
                 &root_blob,

@@ -1,6 +1,6 @@
 use super::{PIPELINE_IIDS, Shader, Translated, hand_out, host_pipeline};
 use crate::object::{S_OK, This, guid, slot};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use victory_shader::native::{ComputeIo, StageIo};
 use victory_shader::{
     Container, HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, emit, io,
@@ -75,15 +75,15 @@ fn store_shader() -> Arc<Shader> {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
     let host = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
-    Arc::new(Shader {
-        stage: "compute",
-        hash: blake3::hash(&native.code).to_hex()[..16].to_owned(),
+    Shader::from_parts(
+        "compute",
+        blake3::hash(&native.code).to_hex()[..16].to_owned(),
         container,
-        translated: OnceLock::from(Some(Translated {
+        Some(Translated {
             host,
             used: native.used,
-        })),
-    })
+        }),
+    )
 }
 
 struct Guest(This);
