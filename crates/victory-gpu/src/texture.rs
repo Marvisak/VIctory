@@ -65,8 +65,17 @@ pub(crate) struct Staging {
 /// subresource's bytes (tracked).
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
-    hashes: Vec<Option<blake3::Hash>>,
+    hash: Option<Digest>,
+    hashes: Vec<Option<Digest>>,
+}
+
+/// A texture memory's fingerprint, compared with the last one to see whether it
+/// changed. Never kept across runs, so a fast hash (xxh3) does: it is taken
+/// over every sampled texture's bytes at each refresh.
+type Digest = u128;
+
+fn digest(bytes: &[u8]) -> Digest {
+    xxhash_rust::xxh3::xxh3_128(bytes)
 }
 
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
@@ -611,7 +620,7 @@ impl Staging {
                         last.hashes[i] = None;
                         return true;
                     }
-                    let hash = blake3::hash(&read[a..b]);
+                    let hash = digest(&read[a..b]);
                     last.hashes[i].replace(hash) != Some(hash)
                 })
                 .map(|i| i as u32)
@@ -645,12 +654,12 @@ impl Staging {
             let zeros = vec![0u8; size];
             let every = all();
             let buffer = self.detile(&zeros, &every);
-            last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
+            last.hash = buffer.is_some().then(|| digest(&zeros));
             return (0, buffer.map(|(b, at)| (b, at, every)));
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = digest(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
