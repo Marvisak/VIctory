@@ -120,7 +120,12 @@ impl HeapRefusal {
                 align,
                 "no free APU device-address range fits the request"
             ),
-            Self::HostAllocator { len_bytes } => super::xmem::report_allocator_refusal(len_bytes),
+            Self::HostAllocator { len_bytes } => {
+                #[cfg(windows)]
+                super::xmem::report_allocator_refusal(len_bytes);
+                #[cfg(not(windows))]
+                tracing::warn!(len_bytes, "the host allocator refused the block");
+            }
         }
     }
 }
