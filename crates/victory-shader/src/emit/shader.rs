@@ -109,10 +109,9 @@ pub(crate) struct Shader {
     pub samplers: u32,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
-    /// Immediate samplers uniform control flow chooses between: handles
-    /// `a` and `b` and when `a` is taken. An operation on `a` runs on both,
-    /// and the result is chosen.
-    pub sampler_choices: Vec<(V, V, V)>,
+    /// Primary handle, i32 selector, and alternate handles in selector order.
+    /// An operation on the primary runs on every handle.
+    pub sampler_choices: Vec<(V, V, Vec<V>)>,
     /// Root CBVs read, by root parameter index, with their handles.
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
@@ -248,25 +247,28 @@ impl Shader {
         let choice = self
             .sampler_choices
             .iter()
-            .copied()
-            .find(|&(a, _, _)| args.contains(&a));
-        let r = self.m.call(block, f, all.clone());
-        let Some((a, b, cond)) = choice else {
-            return r;
+            .find(|(a, _, _)| args.contains(a));
+        let Some((primary, selector, handles)) = choice else {
+            return self.m.call(block, f, all);
         };
-        for x in &mut all {
-            if *x == a {
-                *x = b;
-            }
-        }
-        let other = self.m.call(block, f, all);
+        let r = self.m.call(block, f, all.clone());
+        let others = handles
+            .iter()
+            .map(|&handle| {
+                let args = all
+                    .iter()
+                    .map(|&arg| if arg == *primary { handle } else { arg })
+                    .collect();
+                self.m.call(block, f, args)
+            })
+            .collect::<Vec<_>>();
         if ret == self.t.res_ret {
             // Drivers miscompile a select of the result structure (AMD
             // read zeros): its fields are chosen where they are read.
-            self.m.chosen.insert(r, (cond, other));
+            self.m.chosen.insert(r, (*selector, others));
             return r;
         }
-        self.m.select(block, cond, r, other)
+        self.m.select_indexed(block, *selector, r, &others)
     }
 
     /// The handle of the user-data constant buffer, made in the entry block.

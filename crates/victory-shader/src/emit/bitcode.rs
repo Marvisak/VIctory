@@ -208,9 +208,9 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
-    /// Structures chosen between by a condition: `(cond, other)` by the
-    /// one taken where `cond` holds. [`Module::extract`] chooses the field.
-    pub chosen: HashMap<V, (V, V)>,
+    /// Primary structure to (i32 selector, alternate structures).
+    /// [`Module::extract`] applies the selector to each field.
+    pub chosen: HashMap<V, (V, Vec<V>)>,
 }
 
 impl Module {
@@ -414,6 +414,16 @@ impl Module {
         let ty = self.type_of(t);
         self.push(block, ty, Op::Select(c, t, f))
     }
+    pub fn select_indexed(&mut self, block: usize, selector: V, primary: V, others: &[V]) -> V {
+        let mut value = primary;
+        for (i, &other) in others.iter().enumerate() {
+            let index = self.i32(i as u32 + 1);
+            let matches = self.cmp(block, pred::EQ, selector, index);
+            value = self.select(block, matches, other, value);
+        }
+        value
+    }
+
     pub fn extract(&mut self, block: usize, agg: V, index: u32) -> V {
         let ty = match &self.types[self.type_of(agg).0 as usize] {
             TypeDef::Struct(_, f) => f[index as usize],
@@ -421,10 +431,12 @@ impl Module {
             t => panic!("extractvalue from {t:?}"),
         };
         let x = self.push(block, ty, Op::Extract(agg, index));
-        match self.chosen.get(&agg).copied() {
-            Some((cond, other)) => {
-                let y = self.push(block, ty, Op::Extract(other, index));
-                self.select(block, cond, x, y)
+        match self.chosen.get(&agg).cloned() {
+            Some((selector, mut others)) => {
+                for other in &mut others {
+                    *other = self.push(block, ty, Op::Extract(*other, index));
+                }
+                self.select_indexed(block, selector, x, &others)
             }
             None => x,
         }

@@ -24,6 +24,31 @@ mod bvh;
 
 type Why = &'static str;
 
+enum SamplerSelector {
+    Slot(u32),
+    Phi {
+        join: usize,
+        incoming: Vec<(Self, usize)>,
+    },
+}
+
+impl SamplerSelector {
+    fn emit(self, s: &mut Shader) -> V {
+        match self {
+            Self::Slot(n) => s.m.i32(n),
+            Self::Phi { join, incoming } => {
+                let incoming = incoming
+                    .into_iter()
+                    .map(|(arg, edge)| (arg.emit(s), edge))
+                    .collect();
+                let phi = s.m.phi(join, s.t.i32);
+                s.m.set_phi(phi, incoming);
+                phi
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -5396,29 +5421,10 @@ impl<'a> Lower<'a> {
                 self.handles.insert(key, h);
                 Ok(h)
             }
-            Source::Constant(words) if sampler => {
-                let words: [u32; 4] = words
-                    .get(..4)
-                    .and_then(|w| w.try_into().ok())
-                    .ok_or("a sampler constant")?;
-                let comparison = props.0 & 0x8000 != 0;
-                let slot = self.samplers.iter().enumerate().position(|(n, w)| {
-                    *w == words && (self.s.cmp_samplers >> n & 1 != 0) == comparison
-                });
-                let n = match slot {
-                    Some(n) => n,
-                    None => {
-                        let n = self.samplers.len();
-                        if n >= u64::BITS as usize {
-                            return Err("more than 64 immediate sampler slots");
-                        }
-                        self.samplers.push(words);
-                        self.s.cmp_samplers |= u64::from(comparison) << n;
-                        n
-                    }
-                };
-                Ok(self.s.sampler_handle(self.cur, n as u32))
-            }
+            Source::Constant(words) if sampler => self.immediate_sampler(
+                *words.first_chunk().ok_or("a sampler constant")?,
+                props.0 & 0x8000 != 0,
+            ),
             Source::Constant(_) => Err("a constant resource descriptor"),
             Source::Built { address, .. } if address.param == MEMORY => {
                 Err("a buffer descriptor built around a computed address")
@@ -5460,33 +5466,12 @@ impl<'a> Lower<'a> {
                     _ => Err("a root UAV or typed root view"),
                 }
             }
-            Source::Phi { block, args }
-                if sampler && matches!(args[..], [Source::Constant(_), Source::Constant(_)]) =>
-            {
-                // One of two immediate samplers, chosen by uniform control
-                // flow: what reads it runs with both, the edge taken picks
-                // the result (static samplers cannot be indexed).
-                let [a, b] = &args[..] else {
-                    unreachable!()
-                };
-                let ha = self.handle(site, a, sampler, props)?;
-                let hb = self.handle(site, b, sampler, props)?;
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let mut incoming = Vec::new();
-                for (j, &q) in self.x.p.blocks[*block].preds.iter().enumerate() {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    incoming.push((self.s.m.bool(j == 0), at));
-                }
-                let phi = self.s.m.phi(join, self.s.t.i1);
-                self.s.m.set_phi(phi, incoming);
-                self.s.sampler_choices.push((ha, hb, phi));
-                Ok(ha)
-            }
             Source::Phi { block, .. } => {
+                if sampler
+                    && let Some(h) = self.immediate_sampler_phi(src, props.0 & 0x8000 != 0)?
+                {
+                    return Ok(h);
+                }
                 // One handle at the join for every access the choice reaches
                 // (each is in a block the join dominates).
                 let _ = site;
@@ -5533,6 +5518,96 @@ impl<'a> Lower<'a> {
                 let index = self.buffer_guard(src, index, sampler, props);
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
+        }
+    }
+
+    fn immediate_sampler(&mut self, words: [u32; 4], comparison: bool) -> Result<V, Why> {
+        let slot =
+            self.samplers.iter().enumerate().position(|(n, w)| {
+                *w == words && (self.s.cmp_samplers >> n & 1 != 0) == comparison
+            });
+        let n = match slot {
+            Some(n) => n,
+            None => {
+                let n = self.samplers.len();
+                if n >= u64::BITS as usize {
+                    return Err("more than 64 immediate sampler slots");
+                }
+                self.samplers.push(words);
+                self.s.cmp_samplers |= u64::from(comparison) << n;
+                n
+            }
+        };
+        Ok(self.s.sampler_handle(self.cur, n as u32))
+    }
+
+    fn immediate_sampler_phi(&mut self, src: &Source, comparison: bool) -> Result<Option<V>, Why> {
+        let mut samplers = Vec::new();
+        let Some(selector) = self.sampler_selector(src, &mut samplers)? else {
+            return Ok(None);
+        };
+        if samplers.is_empty() {
+            return Ok(None);
+        }
+        let mut handles = samplers
+            .into_iter()
+            .map(|words| self.immediate_sampler(words, comparison))
+            .collect::<Result<Vec<_>, _>>()?;
+        let primary = handles.remove(0);
+        if !handles.is_empty() {
+            let selector = selector.emit(&mut self.s);
+            self.s.sampler_choices.push((primary, selector, handles));
+        }
+        Ok(Some(primary))
+    }
+
+    /// Plan a selector before emitting anything, so mixed sources can use
+    /// the heap path. All leaves share the sampling operation's comparison mode.
+    fn sampler_selector(
+        &self,
+        src: &Source,
+        samplers: &mut Vec<[u32; 4]>,
+    ) -> Result<Option<SamplerSelector>, Why> {
+        const WHY: Why = "a descriptor chosen by control flow";
+        match src {
+            Source::Constant(words) => {
+                let words = *words.first_chunk().ok_or("a sampler constant")?;
+                let slot = if let Some(slot) = samplers.iter().position(|w| *w == words) {
+                    slot
+                } else {
+                    let slot = samplers.len();
+                    samplers.push(words);
+                    slot
+                };
+                Ok(Some(SamplerSelector::Slot(slot as u32)))
+            }
+            Source::Phi { block, args } => {
+                let join = self.block[*block].ok_or(WHY)?;
+                let mut incoming = Vec::new();
+                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                    if self.block[q].is_none() {
+                        continue;
+                    }
+                    let tail = self.tail[q].ok_or(WHY)?;
+                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let value = if self.never_taken(q, *block) {
+                        // Keep the CFG edge without counting its sampler.
+                        SamplerSelector::Slot(0)
+                    } else {
+                        let Some(value) = self.sampler_selector(arg, samplers)? else {
+                            return Ok(None);
+                        };
+                        value
+                    };
+                    incoming.push((value, at));
+                }
+                Ok(Some(if incoming.is_empty() {
+                    SamplerSelector::Slot(0)
+                } else {
+                    SamplerSelector::Phi { join, incoming }
+                }))
+            }
+            _ => Ok(None),
         }
     }
 

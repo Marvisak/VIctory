@@ -1299,6 +1299,9 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// An R32_FLOAT texture SRV (width, height, texels), e.g. for comparison
+    /// sampling.
+    FloatTexture(u32, u32, &'a [f32]),
     /// An RGBA32F texture SRV with mips (width, height, levels, texels of
     /// each level in turn).
     Mipped(u32, u32, u32, &'a [[f32; 4]]),
@@ -1633,6 +1636,57 @@ impl Host {
                             (faces == 6).then_some(&cube as *const _),
                             at,
                         );
+                        keep.push(tex);
+                    }
+                    View::FloatTexture(w, h, texels) => {
+                        let desc =
+                            texture_as(w, h, D3D12_RESOURCE_FLAG_NONE, DXGI_FORMAT_R32_FLOAT);
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let pitch = (w as usize * 4).next_multiple_of(256);
+                        let up = make(
+                            D3D12_HEAP_TYPE_UPLOAD,
+                            &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_GENERIC_READ,
+                        )?;
+                        let mut p = std::ptr::null_mut();
+                        up.Map(0, None, Some(&mut p)).map_err(err)?;
+                        for y in 0..h as usize {
+                            let row = &texels[y * w as usize..(y + 1) * w as usize];
+                            std::ptr::copy_nonoverlapping(
+                                row.as_ptr().cast::<u8>(),
+                                p.cast::<u8>().add(y * pitch),
+                                row.len() * 4,
+                            );
+                        }
+                        up.Unmap(0, None);
+                        let from = D3D12_TEXTURE_COPY_LOCATION {
+                            pResource: std::mem::transmute_copy(&up),
+                            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                    Offset: 0,
+                                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                        Format: DXGI_FORMAT_R32_FLOAT,
+                                        Width: w,
+                                        Height: h,
+                                        Depth: 1,
+                                        RowPitch: pitch as u32,
+                                    },
+                                },
+                            },
+                        };
+                        list.CopyTextureRegion(&subresource(&tex), 0, 0, 0, &from, None);
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        dev.CreateShaderResourceView(&tex, None, at);
+                        keep.push(up);
                         keep.push(tex);
                     }
                     View::Levels(w, levels) => {

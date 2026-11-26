@@ -24,9 +24,9 @@
 //!   [`HostShader::static_samplers`] (the same decoded into a D3D12 static
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
-//!   a heap sampler it uses must be a comparison sampler on the host. One
-//!   of two immediate samplers chosen by uniform control flow takes two
-//!   entries; the sampling runs with both and the result is chosen.
+//!   a heap sampler it uses must be a comparison sampler on the host.
+//!   When uniform control flow chooses an immediate sampler, sampling runs
+//!   with each distinct sampler and the incoming edge selects the result.
 //! * **Root CBVs** as root descriptors `b<i>` in [`ROOT_CBV_SPACE`], `i`
 //!   the title's root parameter index ([`HostShader::root_cbvs`]); the
 //!   address the title sets is the buffer's.
