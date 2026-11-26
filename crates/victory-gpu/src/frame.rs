@@ -228,17 +228,27 @@ mod tests {
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
         assert!(second > first);
         assert!(before.elapsed() <= Duration::from_millis(50));
-        assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
+        // A zero-time-out wait only times out while the next tick is not
+        // due: the 2 ms tick may land between two asks on a busy host (a
+        // thread woke a whole tick late, seen in CI). Ask again until one
+        // really does; each hit takes its tick, so the next ask then sees
+        // the following tick a whole interval out.
+        let timed_out = |flags: u32, token: &mut u64| {
+            for _ in 0..10 {
+                if wait(null, 0, 0, std::ptr::null(), flags, token) == TIMEOUT {
+                    return;
+                }
+            }
+            panic!("ten zero-time-out waits each met a due tick");
+        };
+        timed_out(0, &mut second);
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
-        let flags = TOKEN_ON_TIMEOUT;
-        assert_eq!(
-            wait(null, 0, 0, std::ptr::null(), flags, &mut early),
-            TIMEOUT
-        );
+        timed_out(TOKEN_ON_TIMEOUT, &mut early);
         let mut next = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut next), S_OK);
-        assert!(early == second + 1 && next == early + 1);
+        // Each ask that met a due tick took a frame token too.
+        assert!(early > second && next == early + 1);
         assert!(LAST[0].load(Ordering::Relaxed) >= 2);
 
         // The title's loop (the clock is global, so in the same test): an
