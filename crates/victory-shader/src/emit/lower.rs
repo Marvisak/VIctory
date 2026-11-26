@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod scalar_bits;
 
 type Why = &'static str;
 
@@ -3752,6 +3753,15 @@ impl<'a> Lower<'a> {
                     self.set(lo, Val::I32(r));
                     Ok(())
                 }
+                "s_bcnt0_i32_b64" | "s_ff0_i32_b64" | "s_flbit_i32_b64" | "s_flbit_i32_i64" => {
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let (r, s) = self.pair_bits(name, a, b);
+                    self.set(lo, Val::I32(r));
+                    if let Some(s) = s {
+                        self.set(scc, Val::Bit(s));
+                    }
+                    Ok(())
+                }
                 "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" | "s_orn2_b64"
                 | "s_nand_b64" | "s_nor_b64" | "s_xnor_b64" | "s_not_b64" => {
                     let ones = self.s.m.i32(u32::MAX);
@@ -3925,6 +3935,18 @@ impl<'a> Lower<'a> {
                 // First set bit (-1 for zero, as DXIL's), or the bit count.
                 let a = src32(self, 0)?;
                 let op = if name == "s_ff1_i32_b32" { 32 } else { 31 };
+                let r = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
+                (r, None)
+            }
+            "s_ff0_i32_b32" | "s_bcnt0_i32_b32" => {
+                // The same of the complement: the first clear bit (-1 for
+                // none), or the count of clear bits.
+                let a = src32(self, 0)?;
+                let ones = self.s.m.i32(u32::MAX);
+                let a = self.s.m.bin(c, Bin::Xor, a, ones);
+                let op = if name == "s_ff0_i32_b32" { 32 } else { 31 };
                 let r = self
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
@@ -11506,6 +11528,24 @@ mod tests {
             // One image handle, from the join's per-lane heap index.
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
+        }
+    }
+
+    #[test]
+    fn scalar_zero_counts_and_bit_scans_lower() {
+        // s_bcnt0_i32_b32/_b64, s_ff0_i32_b32/_b64, s_flbit_i32_b64/_i64 of
+        // s0 (or s[0:1]), then a branch on the result or, with `scc`, on the
+        // SCC the zero counts leave.
+        let ops = [0x0D, 0x0E, 0x11, 0x12, 0x16, 0x18, 0x0D, 0x0E];
+        for (op, scc) in ops.into_iter().zip(0..) {
+            let mut words = vec![0xBE80_03C1, 0xBE81_0380]; // s_mov_b32 s0, -1; s1, 0
+            words.push(0xBE82_0000 | op << 8); // <op> s2, s0
+            if scc < 6 {
+                words.push(0xBF07_8002); // s_cmp_lg_u32 s2, 0
+            }
+            // s_cbranch_scc1 -> s_endpgm; s_mov_b32 s3, 0
+            words.extend([0xBF85_0001, 0xBE83_0380, S_ENDPGM]);
+            lowers(&words, 0).unwrap_or_else(|e| panic!("SOP1 {op:#x} ({scc}): {e}"));
         }
     }
 
