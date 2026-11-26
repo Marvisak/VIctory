@@ -923,30 +923,11 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
     marked.sort_unstable();
     marked.dedup();
-    let page_of = |m: &Marks, n: u32| {
-        let (&base, copy) = m.owners.range(..=n).next_back()?;
-        let copy = copy.upgrade()?;
-        let k = n - base;
-        (k < pages(copy.start, copy.len)).then(|| {
-            let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
-            (copy, page)
-        })
-    };
     // Held back: dropped from the copies (`crate::memory::drop_withheld`).
-    if !held.is_empty() {
-        let m = marks();
-        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
-            crate::memory::drop_withheld(page, PAGE);
-        }
+    for (_, page) in marked_pages(&MARKS, &held) {
+        crate::memory::drop_withheld(page, PAGE);
     }
-    if marked.is_empty() {
-        return;
-    }
-    let pages: Vec<(Arc<Shadow>, usize)> = {
-        let m = marks();
-        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
-    };
-    for (copy, page) in pages {
+    for (copy, page) in marked_pages(&MARKS, &marked) {
         if withheld
             .iter()
             .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
@@ -962,6 +943,29 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
     }
+}
+
+fn marked_pages(
+    registry: &Mutex<Marks>,
+    numbers: &[u32],
+) -> impl Iterator<Item = (Arc<Shadow>, usize)> {
+    let owners: Vec<_> = if numbers.is_empty() {
+        Vec::new()
+    } else {
+        let marks = registry.lock().unwrap_or_else(|e| e.into_inner());
+        numbers.iter().filter_map(|&n| {
+            let (&base, copy) = marks.owners.range(..=n).next_back()?;
+            Some((copy.upgrade()?, n - base))
+        }).collect()
+    };
+    // Even a rejected index can hold the last reference. Release it
+    // outside the registry lock so Shadow::drop can reclaim its mark bits.
+    owners.into_iter().filter_map(|(copy, offset)| {
+        (offset < pages(copy.start, copy.len)).then(|| {
+            let page = (((copy.start >> 16) + u64::from(offset)) << 16) as usize;
+            (copy, page)
+        })
+    })
 }
 
 struct Entry {
@@ -1474,6 +1478,46 @@ pub(crate) mod tests {
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
         unregister(p, p as u64);
+    }
+
+    #[test]
+    fn a_rejected_mark_keeps_its_copy_until_after_the_lookup() {
+        let address = crate::watch::tests::pool(1);
+        struct Pool(usize);
+        impl Drop for Pool {
+            fn drop(&mut self) {
+                crate::watch::tests::free(self.0);
+            }
+        }
+        let _pool = Pool(address);
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let (buffer, data) = host.shared_buffer(PAGE as u64).expect("a one-page shadow");
+        // SAFETY: a live buffer on the host device.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let copy = Shadow::new(buffer, data, gpu, address as u64, PAGE as u64);
+        assert!(copy.marks.is_some(), "tracked copy owns mark bits");
+        let weak = Arc::downgrade(&copy);
+        let mut registry = Marks::default();
+        registry.owners.insert(0, weak.clone());
+        let registry = Mutex::new(registry);
+
+        let valid = marked_pages(&registry, &[0]).collect::<Vec<_>>();
+        assert_eq!(valid.len(), 1);
+        assert!(Arc::ptr_eq(&valid[0].0, &copy));
+        assert_eq!(valid[0].1, address);
+        drop(valid);
+
+        // Index 1 follows the registered copy's single page. Hold the
+        // snapshot while simulating the last outside reference going away.
+        let mut rejected = marked_pages(&registry, &[1]);
+        drop(copy);
+        let retained = weak.strong_count();
+        println!("strong references after lookup and caller drop: {retained}");
+        assert_eq!(retained, 1, "the lookup must carry the copy out of the marks lock");
+        assert!(rejected.next().is_none(), "outside the owner's page range");
+        assert_eq!(weak.strong_count(), 0, "the rejected page does not retain its copy");
     }
 
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
