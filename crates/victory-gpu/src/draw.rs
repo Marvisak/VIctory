@@ -1048,6 +1048,10 @@ impl State {
             once!("an unordered access clear of a slot without a view");
             return;
         };
+        if !crate::descriptor::host::is_clearable_uav(&view) {
+            once!("an unordered access clear of a non-UAV or structured buffer view");
+            return;
+        }
         let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
         let (Some(heap), Some(host)) = (heap, crate::host::host()) else {
             once!("an unordered access clear without a bound view heap");
@@ -3906,5 +3910,212 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(host.log_messages(), None, "case {case} D3D12 debug errors");
             let _ = kept_obj;
         }
+    }
+
+    #[test]
+    fn clear_unordered_skips_invalid_views_and_clears_valid_ones() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+
+        let p = crate::watch::tests::pool(1);
+        // SAFETY: committed 64 KiB write-watched page.
+        unsafe { std::ptr::write_bytes(p as *mut u8, 0, crate::watch::PAGE) };
+        let buf = buffer_at_address(p as u64, crate::watch::PAGE as u64);
+
+        let tex_mem = vec![0u8; 1 << 16];
+        let tex_va = tex_mem.as_ptr() as u64;
+        // 4x4 2D texture with ALLOW_UNORDERED_ACCESS (flag 4).
+        let tex_desc = |format: u32| -> [u32; 14] {
+            [3, 0, 0, 0, 4, 0, 4, 1 | (1 << 16), format, 1, 0, 0, 4, 0]
+        };
+        let uint_tex = texture_at_address(tex_va, &tex_desc(42)); // R32_UINT
+        let unorm_tex = texture_at_address(tex_va + 0x4000, &tex_desc(28)); // R8G8B8A8_UNORM
+
+        let (heap_obj, title_heap, _) = view_heap(16);
+        let _ = crate::descriptor::fallback_samplers();
+        let _ = crate::descriptor::heap(heap_obj).host();
+        let _ = host.log_messages();
+
+        let null = std::ptr::null();
+        let slot = |i: u64| title_heap.start + i * 32;
+
+        // Slot 0: Buffer SRV (not a UAV).
+        let srv_buf: [u32; 10] = [
+            42,
+            1,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            0,
+            0,
+            0,
+            16,
+            0,
+            0,
+            0,
+        ];
+        crate::descriptor::create_srv(null, buf, &srv_buf, slot(0));
+        // Slot 1: Constant buffer view (not a UAV).
+        let cbv_desc: [u32; 4] = [p as u32, (p >> 32) as u32, 256, 0];
+        crate::descriptor::create_cbv(null, &cbv_desc, slot(1));
+        // Slot 2: Texture SRV (not a UAV).
+        let srv_tex: [u32; 10] = [
+            28,
+            4,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+        ];
+        crate::descriptor::create_srv(null, unorm_tex, &srv_tex, slot(2));
+        // Slot 3: Structured buffer UAV (stride = 16, format = UNKNOWN).
+        let structured_uav: [u32; 10] = [0, 1, 0, 0, 16, 16, 0, 0, 0, 0];
+        crate::descriptor::create_uav(null, buf, null, &structured_uav, slot(3));
+        // Slot 4: Placed structured buffer UAV.
+        let mut placed_res = [0u32; 14];
+        placed_res[0] = 1; // BUFFER
+        placed_res[4] = crate::watch::PAGE as u32;
+        let mut placed_structured = [0u32; 16];
+        placed_structured[..10].copy_from_slice(&structured_uav);
+        placed_structured[10] = p as u32;
+        placed_structured[11] = (p >> 32) as u32;
+        crate::descriptor::create_placed_uav(null, &placed_res, &placed_structured, slot(4));
+        // Slot 5: Placed buffer SRV (not a UAV).
+        let mut placed_srv = [0u32; 16];
+        placed_srv[..10].copy_from_slice(&srv_buf);
+        placed_srv[10] = p as u32;
+        placed_srv[11] = (p >> 32) as u32;
+        crate::descriptor::create_placed_srv(null, &placed_res, &placed_srv, slot(5));
+        // Slot 6: Raw buffer UAV (R32_TYPELESS, RAW flag).
+        let raw_uav: [u32; 10] = [39, 1, 0, 0, 16, 0, 0, 0, 1, 0];
+        crate::descriptor::create_uav(null, buf, null, &raw_uav, slot(6));
+        // Slot 7: Typed integer buffer UAV (R32_UINT).
+        let uint_buf_uav: [u32; 10] = [42, 1, 0, 0, 16, 0, 0, 0, 0, 0];
+        crate::descriptor::create_uav(null, buf, null, &uint_buf_uav, slot(7));
+        // Slot 8: Typed float buffer UAV (R32_FLOAT).
+        let float_buf_uav: [u32; 10] = [41, 1, 0, 0, 16, 0, 0, 0, 0, 0];
+        crate::descriptor::create_uav(null, buf, null, &float_buf_uav, slot(8));
+        // Slot 9: Placed raw buffer UAV.
+        let mut placed_raw = [0u32; 16];
+        placed_raw[..10].copy_from_slice(&raw_uav);
+        placed_raw[10] = p as u32;
+        placed_raw[11] = (p >> 32) as u32;
+        crate::descriptor::create_placed_uav(null, &placed_res, &placed_raw, slot(9));
+        // Slot 10: Normalized texture UAV (R8G8B8A8_UNORM, default/null desc).
+        crate::descriptor::create_uav(null, unorm_tex, null, std::ptr::null(), slot(10));
+        // Slot 11: Integer texture UAV (R32_UINT, default/null desc).
+        crate::descriptor::create_uav(null, uint_tex, null, std::ptr::null(), slot(11));
+
+        // Non-UAV descriptors and structured buffer UAVs must be ignored without
+        // allocating dynamic slots or emitting illegal D3D12 clear commands.
+        let invalid_cases = [
+            ("buffer SRV with uint clear", slot(0), false),
+            ("CBV with float clear", slot(1), true),
+            ("texture SRV with float clear", slot(2), true),
+            ("structured buffer UAV with uint clear", slot(3), false),
+            ("structured buffer UAV with float clear", slot(3), true),
+            (
+                "placed structured buffer UAV with uint clear",
+                slot(4),
+                false,
+            ),
+            (
+                "placed structured buffer UAV with float clear",
+                slot(4),
+                true,
+            ),
+            ("placed buffer SRV with uint clear", slot(5), false),
+        ];
+        for (label, handle, float) in invalid_cases {
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap_obj]);
+            state.clear_unordered(&list, handle, [1, 2, 3, 4], float, &[]);
+            // SAFETY: open command list; check Close() directly instead of aborting via `list.close()`.
+            let closed = unsafe { list.list.Close() };
+            let debug_err = host.log_messages();
+            assert!(
+                closed.is_ok() && debug_err.is_none(),
+                "{label}: Close={closed:?}, D3D12 debug={debug_err:?}"
+            );
+            assert!(
+                list.is_empty() && state.dynamic.is_empty(),
+                "{label}: invalid clear must not record GPU work or allocate dynamic slots"
+            );
+        }
+
+        // Valid UAV clears must still execute cleanly and write expected values.
+        // 1. Uint clear on raw buffer UAV.
+        {
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap_obj]);
+            state.clear_unordered(&list, slot(6), [0x1234_5678; 4], false, &[]);
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(host.log_messages(), None, "raw buffer uint clear");
+            // SAFETY: inside our mapped buffer page.
+            assert_eq!(unsafe { (p as *const u32).read_volatile() }, 0x1234_5678);
+        }
+        // 2. Uint clear on typed integer buffer UAV.
+        {
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap_obj]);
+            state.clear_unordered(&list, slot(7), [0xCAFE_BABE; 4], false, &[]);
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(host.log_messages(), None, "typed uint buffer uint clear");
+            // SAFETY: inside our mapped buffer page.
+            assert_eq!(unsafe { (p as *const u32).read_volatile() }, 0xCAFE_BABE);
+        }
+        // 3. Float clear on typed float buffer UAV.
+        {
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap_obj]);
+            state.clear_unordered(&list, slot(8), [1.5f32.to_bits(); 4], true, &[]);
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(host.log_messages(), None, "typed float buffer float clear");
+            // SAFETY: inside our mapped buffer page.
+            let got = unsafe { (p as *const u32).read_volatile() };
+            assert_eq!(got, 1.5f32.to_bits());
+        }
+        // 4. Uint clear on placed raw buffer UAV.
+        {
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap_obj]);
+            state.clear_unordered(&list, slot(9), [0x55AA_33CC; 4], false, &[]);
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(host.log_messages(), None, "placed raw buffer uint clear");
+            // SAFETY: inside our mapped buffer page.
+            assert_eq!(unsafe { (p as *const u32).read_volatile() }, 0x55AA_33CC);
+        }
+        // 5. Float and uint clears on texture UAVs (default descriptors).
+        for (label, handle, values, float) in [
+            (
+                "unorm texture float clear",
+                slot(10),
+                [0.5f32.to_bits(); 4],
+                true,
+            ),
+            ("uint texture uint clear", slot(11), [7; 4], false),
+        ] {
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap_obj]);
+            state.clear_unordered(&list, handle, values, float, &[]);
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(host.log_messages(), None, "{label}");
+        }
+
+        crate::shadow::unregister(buf as usize, p as u64);
     }
 }

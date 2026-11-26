@@ -1456,6 +1456,56 @@ fn typed_store(format: u32) -> bool {
     ok
 }
 
+/// Whether `view` can be cleared with `ClearUnorderedAccessViewUint` or
+/// `ClearUnorderedAccessViewFloat`: it must be an unordered access view and
+/// not a structured buffer (`StructureByteStride == 0`). Non-UAV descriptors
+/// are invalid for UAV clears (crashing WARP or triggering D3D12 error 646),
+/// and structured buffer UAVs fail validation (D3D12 error 1156).
+pub(crate) fn is_clearable_uav(view: &View) -> bool {
+    let buffer_desc = match view {
+        View::Unordered(resource, _, desc) => {
+            let resource = *resource as crate::object::This;
+            if crate::resource::buffer_bytes(resource).is_some() {
+                let Some(words) = desc else {
+                    return false;
+                };
+                Some(words)
+            } else if crate::resource::texture_memory(resource).is_some() {
+                if desc.is_some_and(|w| w[1] == D3D12_UAV_DIMENSION_BUFFER.0 as u32) {
+                    return false;
+                }
+                None
+            } else {
+                return false;
+            }
+        }
+        View::Placed(true, resource, desc) => {
+            const BUFFER: u32 = 1;
+            if resource[0] == BUFFER {
+                let Ok(words) = <&[u32; 10]>::try_from(&desc[..10]) else {
+                    return false;
+                };
+                Some(words)
+            } else {
+                if desc[1] == D3D12_UAV_DIMENSION_BUFFER.0 as u32 {
+                    return false;
+                }
+                None
+            }
+        }
+        _ => return false,
+    };
+    let Some(words) = buffer_desc else {
+        return true;
+    };
+    let desc = uav_desc(words);
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return false;
+    }
+    // SAFETY: `ViewDimension` is `D3D12_UAV_DIMENSION_BUFFER`.
+    unsafe { desc.Anonymous.Buffer }.StructureByteStride == 0
+}
+
 /// Makes the host descriptor for `view` at `at` (in any host view heap):
 /// the host resource it views, if it can.
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
@@ -2461,5 +2511,63 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn clearable_uav_rejects_non_uavs_and_structured_buffers() {
+        let mut buf_res = [0u32; 14];
+        buf_res[0] = 1; // BUFFER
+        buf_res[4] = 256;
+        let tex_res = placed_tex_desc(4, 4, 28, 4);
+
+        let raw_uav = [39, 1, 0, 0, 16, 0, 0, 0, 1, 0];
+        let typed_uav = [42, 1, 0, 0, 16, 0, 0, 0, 0, 0];
+        let structured_uav = [0, 1, 0, 0, 16, 16, 0, 0, 0, 0];
+        let tex2d_uav = [28, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        let placed = |uav: bool, res: [u32; 14], words: [u32; 10]| {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&words);
+            View::Placed(uav, res, desc)
+        };
+
+        assert!(!is_clearable_uav(&View::Constant(0x1000, 256)));
+        assert!(!is_clearable_uav(&View::Shader(0, Some(raw_uav))));
+        assert!(!is_clearable_uav(&View::Sampler([0; 13])));
+        assert!(!is_clearable_uav(&View::ConsoleSampler([0; 27])));
+        assert!(!is_clearable_uav(&placed(false, buf_res, raw_uav)));
+        assert!(!is_clearable_uav(&placed(false, tex_res, tex2d_uav)));
+        assert!(!is_clearable_uav(&View::Unordered(0, 0, Some(raw_uav))));
+
+        assert!(!is_clearable_uav(&placed(true, buf_res, structured_uav)));
+        assert!(!is_clearable_uav(&placed(true, buf_res, tex2d_uav)));
+        assert!(!is_clearable_uav(&placed(true, tex_res, raw_uav)));
+        assert!(is_clearable_uav(&placed(true, buf_res, raw_uav)));
+        assert!(is_clearable_uav(&placed(true, buf_res, typed_uav)));
+        assert!(is_clearable_uav(&placed(true, tex_res, tex2d_uav)));
+
+        let buf = crate::resource::test_buffer(256);
+        assert!(!is_clearable_uav(&View::Unordered(buf as usize, 0, None)));
+        assert!(!is_clearable_uav(&View::Unordered(
+            buf as usize,
+            0,
+            Some(structured_uav)
+        )));
+        assert!(!is_clearable_uav(&View::Unordered(
+            buf as usize,
+            0,
+            Some(tex2d_uav)
+        )));
+        assert!(is_clearable_uav(&View::Unordered(
+            buf as usize,
+            0,
+            Some(raw_uav)
+        )));
+        assert!(is_clearable_uav(&View::Unordered(
+            buf as usize,
+            0,
+            Some(typed_uav)
+        )));
+        assert_eq!(crate::object::release(buf), 0);
     }
 }
