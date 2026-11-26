@@ -642,6 +642,23 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+/// Brings a copy source texture up to date: from a GPU-written alias of
+/// the same memory when its host texture is separate (`alias_source`), and
+/// from title memory if it is title-written.
+#[cfg(windows)]
+fn sync_copy_source(
+    list: &crate::host::HostList,
+    src: This,
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    if let Some(a) = crate::resource::alias_source(src) {
+        crate::texture::alias_copy(list, a, src);
+    }
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src, texture);
+    }
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -652,9 +669,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if crate::texture::title_written(&from) {
-                crate::texture::upload(list, src, &from);
-            }
+            sync_copy_source(list, src, &from);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_writes(list, dst);
@@ -747,9 +762,7 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
-            if crate::texture::title_written(&texture) {
-                crate::texture::upload(list, src.resource, &texture);
-            }
+            sync_copy_source(list, src.resource, &texture);
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
@@ -856,9 +869,7 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     let (Some(title), Some((buffer, data))) = (buffer_range(dst.resource, dst.footprint.offset, len), list.readback(host, len)) else {
         return;
     };
-    if crate::texture::title_written(&texture) {
-        crate::texture::upload(list, src.resource, &texture);
-    }
+    sync_copy_source(list, src.resource, &texture);
     ensure_state(list, src.resource, COPY_SOURCE);
     let (mut to, mut from) = (*dst, *src);
     to.resource = buffer.as_raw().cast_const().cast();
@@ -2043,6 +2054,347 @@ mod tests {
         resolve_queries(list, null, 0, 0, 2, buffer, u64::MAX - 8);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [buffer, list, allocator] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// Copy commands (`CopyResource`, texture-to-texture `CopyTextureRegion`,
+    /// and texture-to-buffer read-back) reading a texture whose memory is
+    /// written on the GPU through an incompatible alias (e.g. a render target
+    /// aliased as BC3) must sync from the alias's host texture rather than
+    /// copying stale title memory.
+    #[cfg(windows)]
+    #[test]
+    fn copy_commands_sync_aliased_texture_sources() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct HeapProps {
+            kind: u32,
+            cpu_pages: u32,
+            pool: u32,
+            creation_nodes: u32,
+            visible_nodes: u32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct HeapDesc {
+            size: u64,
+            properties: HeapProps,
+            alignment: u64,
+            flags: u32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct ResDesc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_count: u32,
+            sample_quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        const _: () = assert!(size_of::<HeapDesc>() == size_of::<crate::resource::HeapDesc>());
+        const _: () = assert!(size_of::<ResDesc>() == size_of::<crate::resource::ResourceDesc>());
+
+        const PROPS: HeapProps = HeapProps {
+            kind: 1,
+            cpu_pages: 0,
+            pool: 0,
+            creation_nodes: 0,
+            visible_nodes: 0,
+        };
+        const RENDER_TARGET: u32 = 1;
+        const R32G32B32A32_FLOAT: u32 = 2;
+        const BC3_UNORM: u32 = 77;
+        let tex_desc = |width, height, format, flags| ResDesc {
+            dimension: 3,
+            alignment: 0,
+            width,
+            height,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0x105,
+            flags,
+        };
+        let buf_desc = |width| ResDesc {
+            dimension: 1,
+            alignment: 0,
+            width,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 0,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 1,
+            flags: 0,
+        };
+        let null = std::ptr::null();
+        let heap_iid = crate::object::guid(
+            0x6b3b2502,
+            0x6e51,
+            0x45b3,
+            [0x90, 0xee, 0x98, 0x84, 0x26, 0x5e, 0x8d, 0xf3],
+        );
+        let res_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let queue_iid = crate::object::guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let (mut queue, mut allocator) = (null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let execute = slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50);
+        let close = |l: This| {
+            assert_eq!(
+                slot::<extern "system" fn(This) -> HRESULT>(l, 0x48)(l),
+                S_OK
+            )
+        };
+        let bc_footprint = crate::resource::PlacedFootprint {
+            offset: 0,
+            format: BC3_UNORM,
+            width: 16,
+            height: 16,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let sub = |resource| CopyLocation {
+            resource,
+            kind: 0,
+            footprint: crate::resource::PlacedFootprint {
+                offset: 0,
+                format: 0,
+                width: 0,
+                height: 0,
+                depth: 0,
+                row_pitch: 0,
+            },
+        };
+        let fp = |resource| CopyLocation {
+            resource,
+            kind: 1,
+            footprint: bc_footprint,
+        };
+        let expected_row = |color: [f32; 4]| {
+            let mut row = Vec::with_capacity(64);
+            for _ in 0..4 {
+                for f in color {
+                    row.extend_from_slice(&f.to_le_bytes());
+                }
+            }
+            row
+        };
+
+        let make_pair = || {
+            let mut heap = null;
+            let hdesc = HeapDesc {
+                size: 1 << 20,
+                properties: PROPS,
+                alignment: 0,
+                flags: 0,
+            };
+            assert_eq!(
+                crate::resource::create_heap(
+                    null,
+                    std::ptr::from_ref(&hdesc).cast(),
+                    &heap_iid,
+                    &mut heap,
+                ),
+                S_OK
+            );
+            let (mut writer, mut alias, mut dst_tex, mut out_buf, mut list) =
+                (null, null, null, null, null);
+            let writer_desc = tex_desc(4, 4, R32G32B32A32_FLOAT, RENDER_TARGET);
+            let alias_desc = tex_desc(16, 16, BC3_UNORM, 0);
+            let out_desc = buf_desc(4096);
+            assert_eq!(
+                crate::resource::create_placed(
+                    null,
+                    heap,
+                    0,
+                    std::ptr::from_ref(&writer_desc).cast(),
+                    0,
+                    null.cast(),
+                    &res_iid,
+                    &mut writer,
+                ),
+                S_OK
+            );
+            assert_eq!(
+                crate::resource::create_placed(
+                    null,
+                    heap,
+                    0,
+                    std::ptr::from_ref(&alias_desc).cast(),
+                    0,
+                    null.cast(),
+                    &res_iid,
+                    &mut alias,
+                ),
+                S_OK
+            );
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    std::ptr::from_ref(&PROPS).cast(),
+                    0,
+                    std::ptr::from_ref(&alias_desc).cast(),
+                    0,
+                    null.cast(),
+                    &res_iid,
+                    &mut dst_tex,
+                ),
+                S_OK
+            );
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    std::ptr::from_ref(&PROPS).cast(),
+                    0,
+                    std::ptr::from_ref(&out_desc).cast(),
+                    0,
+                    null.cast(),
+                    &res_iid,
+                    &mut out_buf,
+                ),
+                S_OK
+            );
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            (heap, writer, alias, dst_tex, out_buf, list)
+        };
+
+        // Run each copy path against its own independent aliased pair so none
+        // can mask another via `alias_copy`'s per-list `first_use` guard.
+        for (mode, color) in [
+            ("copy_resource", [1.0f32, 2.0, 3.0, 4.0]),
+            ("copy_texture_region", [5.0f32, 6.0, 7.0, 8.0]),
+            ("read_back", [9.0f32, 10.0, 11.0, 12.0]),
+        ] {
+            let (heap, writer, alias, dst_tex, out_buf, list) = make_pair();
+            let (out_ptr, _) = crate::resource::buffer_bytes(out_buf).unwrap();
+            // SAFETY: `out_buf` holds 4096 bytes.
+            unsafe { std::ptr::write_bytes(out_ptr, 0xEE, 4096) };
+
+            let mut rtv_mem = [0u64; 16];
+            let rtv = rtv_mem.as_mut_ptr() as u64;
+            crate::descriptor::create_rtv(null, writer, null.cast(), rtv);
+            clear_rtv(list, rtv, &color, 0, null.cast());
+
+            match mode {
+                "copy_resource" => {
+                    copy_resource(list, dst_tex, alias);
+                    copy_texture_region(list, &fp(out_buf), 0, 0, 0, &sub(dst_tex), null.cast());
+                }
+                "copy_texture_region" => {
+                    copy_texture_region(list, &sub(dst_tex), 0, 0, 0, &sub(alias), null.cast());
+                    copy_texture_region(list, &fp(out_buf), 0, 0, 0, &sub(dst_tex), null.cast());
+                }
+                "read_back" => {
+                    copy_texture_region(list, &fp(out_buf), 0, 0, 0, &sub(alias), null.cast());
+                }
+                _ => unreachable!(),
+            }
+            close(list);
+            execute(queue, 1, &list);
+            assert_eq!(crate::resource::alias_source(alias), Some(writer));
+
+            // SAFETY: `out_buf` holds 4096 bytes and the submission has completed.
+            let got = unsafe { std::slice::from_raw_parts(out_ptr, 4096) };
+            let want = expected_row(color);
+            for row in 0..4 {
+                let at = row * 256;
+                assert_eq!(
+                    &got[at..at + 64],
+                    want.as_slice(),
+                    "{mode}: row {row} must match GPU-written alias source"
+                );
+            }
+
+            for object in [list, out_buf, dst_tex, alias, writer, heap] {
+                assert_eq!(release(object), 0);
+            }
+        }
+
+        // Cross-submission sync: submission 1 writes `writer`, submission 2
+        // reads back `alias`, and submission 3 updates `writer` again and
+        // copies `alias` through `copy_resource`.
+        let (heap, writer, alias, dst_tex, out_buf, list) = make_pair();
+        let (out_ptr, _) = crate::resource::buffer_bytes(out_buf).unwrap();
+        let mut rtv_mem = [0u64; 16];
+        let rtv = rtv_mem.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(null, writer, null.cast(), rtv);
+
+        // Submission 1: write `writer` only.
+        let first = [1.5f32, 2.5, 3.5, 4.5];
+        clear_rtv(list, rtv, &first, 0, null.cast());
+        close(list);
+        execute(queue, 1, &list);
+
+        // Submission 2: read back `alias` in a new submission.
+        // SAFETY: `out_buf` holds 4096 bytes.
+        unsafe { std::ptr::write_bytes(out_ptr, 0xEE, 4096) };
+        assert_eq!(reset(list, allocator, null), S_OK);
+        copy_texture_region(list, &fp(out_buf), 0, 0, 0, &sub(alias), null.cast());
+        close(list);
+        execute(queue, 1, &list);
+        // SAFETY: `out_buf` holds 4096 bytes and submission 2 has completed.
+        let got = unsafe { std::slice::from_raw_parts(out_ptr, 4096) };
+        let want = expected_row(first);
+        for row in 0..4 {
+            assert_eq!(&got[row * 256..row * 256 + 64], want.as_slice());
+        }
+
+        // Submission 3: overwrite `writer` and copy via `alias` again.
+        let second = [13.0f32, 14.0, 15.0, 16.0];
+        // SAFETY: `out_buf` holds 4096 bytes.
+        unsafe { std::ptr::write_bytes(out_ptr, 0xEE, 4096) };
+        assert_eq!(reset(list, allocator, null), S_OK);
+        clear_rtv(list, rtv, &second, 0, null.cast());
+        copy_resource(list, dst_tex, alias);
+        copy_texture_region(list, &fp(out_buf), 0, 0, 0, &sub(dst_tex), null.cast());
+        close(list);
+        execute(queue, 1, &list);
+        // SAFETY: `out_buf` holds 4096 bytes and submission 3 has completed.
+        let got = unsafe { std::slice::from_raw_parts(out_ptr, 4096) };
+        let want = expected_row(second);
+        for row in 0..4 {
+            assert_eq!(&got[row * 256..row * 256 + 64], want.as_slice());
+        }
+
+        for object in [
+            list, out_buf, dst_tex, alias, writer, heap, allocator, queue,
+        ] {
             assert_eq!(release(object), 0);
         }
     }
