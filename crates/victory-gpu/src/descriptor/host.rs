@@ -33,7 +33,7 @@ pub(crate) struct HostHeap {
     kept: Mutex<Vec<Kept>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Mutex<DynamicSlots>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -196,7 +196,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new(DynamicSlots::new(extra)),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
                 null if !sampler && null > count + extra && null < total => null - 1,
@@ -309,6 +309,155 @@ pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
     .as_ref()
 }
 
+/// Dynamic-slot bitmap (`1` = taken, `0` = free, 64 slots per word) with a
+/// next-fit cursor and the smallest run size that failed since a slot was
+/// last freed.
+struct DynamicSlots {
+    len: u32,
+    next: u32,
+    min_failed: u32,
+    words: Vec<u64>,
+}
+
+impl DynamicSlots {
+    fn new(len: u32) -> Self {
+        let mut words = vec![0u64; (len as usize).div_ceil(64)];
+        let rem = len as usize % 64;
+        if rem != 0
+            && let Some(last) = words.last_mut()
+        {
+            *last = !0u64 << rem;
+        }
+        Self {
+            len,
+            next: 0,
+            min_failed: u32::MAX,
+            words,
+        }
+    }
+
+    fn take(&mut self, n: u32) -> Option<u32> {
+        if n == 0 || n > self.len || n >= self.min_failed {
+            return None;
+        }
+        let (need, end, cursor) = (n as usize, self.len as usize, self.next as usize);
+        // Search from `next` on, then from the start (extending past cursor by
+        // n - 1 so contiguous runs crossing the cursor are not missed).
+        let second_end = cursor.saturating_add(need - 1).min(end);
+        let found = find_free_run(&self.words, cursor, end, need).or_else(|| {
+            (cursor > 0)
+                .then(|| find_free_run(&self.words, 0, second_end, need))
+                .flatten()
+        });
+        let Some(first) = found else {
+            self.min_failed = self.min_failed.min(n);
+            return None;
+        };
+        set_bits(&mut self.words, first, need);
+        self.next = ((first + need) % end) as u32;
+        Some(first as u32)
+    }
+
+    fn release(&mut self, at: u32, n: u32) {
+        let start = (at as usize).min(self.len as usize);
+        let end = (at as usize).saturating_add(n as usize).min(self.len as usize);
+        if start < end && clear_bits(&mut self.words, start, end - start) {
+            self.min_failed = u32::MAX;
+        }
+    }
+}
+
+/// Earliest run of `need` zero bits wholly inside `[from, to)`.
+fn find_free_run(words: &[u64], from: usize, to: usize, need: usize) -> Option<usize> {
+    if need == 0 || to.saturating_sub(from) < need {
+        return None;
+    }
+    let (first_word, last_word) = (from / 64, (to - 1) / 64);
+    let mut run = 0usize;
+    for (offset, &raw) in words[first_word..=last_word].iter().enumerate() {
+        let w = first_word + offset;
+        let mut word = raw;
+        if w == first_word && !from.is_multiple_of(64) {
+            word |= (1u64 << (from % 64)) - 1;
+        }
+        if w == last_word && !to.is_multiple_of(64) {
+            word |= !0u64 << (to % 64);
+        }
+        if word == u64::MAX {
+            run = 0;
+            continue;
+        }
+        if word == 0 {
+            if run + 64 >= need {
+                return Some(w * 64 - run);
+            }
+            run += 64;
+            continue;
+        }
+        let low = word.trailing_zeros() as usize;
+        if run + low >= need {
+            return Some(w * 64 - run);
+        }
+        if need < 64
+            && let Some(bit) = first_zero_run(word, need)
+        {
+            return Some(w * 64 + bit);
+        }
+        run = word.leading_zeros() as usize;
+    }
+    None
+}
+
+/// Bit index of the earliest run of `need` (`1..64`) zero bits in `word`.
+#[inline]
+fn first_zero_run(word: u64, need: usize) -> Option<usize> {
+    let mut free = !word;
+    let mut span = 1usize;
+    while span * 2 <= need {
+        free &= free >> span;
+        span *= 2;
+    }
+    free &= free >> (need - span);
+    (free != 0).then(|| free.trailing_zeros() as usize)
+}
+
+fn set_bits(words: &mut [u64], first: usize, len: usize) {
+    let end = first + len;
+    let (w0, w1) = (first / 64, (end - 1) / 64);
+    let lo = !0u64 << (first % 64);
+    let hi = !0u64 >> (63 - (end - 1) % 64);
+    if w0 == w1 {
+        words[w0] |= lo & hi;
+    } else {
+        words[w0] |= lo;
+        words[w0 + 1..w1].fill(u64::MAX);
+        words[w1] |= hi;
+    }
+}
+
+/// Clears `len` (`> 0`) bits from `first`; true if any bit was set.
+fn clear_bits(words: &mut [u64], first: usize, len: usize) -> bool {
+    let end = first + len;
+    let (w0, w1) = (first / 64, (end - 1) / 64);
+    let lo = !0u64 << (first % 64);
+    let hi = !0u64 >> (63 - (end - 1) % 64);
+    if w0 == w1 {
+        let mask = lo & hi;
+        let freed = words[w0] & mask != 0;
+        words[w0] &= !mask;
+        freed
+    } else {
+        let mut freed = (words[w0] & lo) | (words[w1] & hi) != 0;
+        words[w0] &= !lo;
+        for word in &mut words[w0 + 1..w1] {
+            freed |= *word != 0;
+            *word = 0;
+        }
+        words[w1] &= !hi;
+        freed
+    }
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -317,37 +466,12 @@ impl HostHeap {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
-        let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let Some(first) = guard.take(n) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             return None;
         };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
-        Some(self.count + first as u32)
+        Some(self.count + first)
     }
 
     /// Two consecutive slots (view heaps only) kept until
@@ -394,11 +518,10 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
-        }
+        self.next
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(at, n);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -2461,5 +2584,273 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    /// Reference byte-per-slot allocator matching the original `(u32, Vec<bool>)`
+    /// behaviour, used to prove `DynamicSlots` returns identical offsets.
+    struct RefDynamicSlots {
+        next: u32,
+        taken: Vec<bool>,
+    }
+
+    impl RefDynamicSlots {
+        fn new(len: u32) -> Self {
+            Self {
+                next: 0,
+                taken: vec![false; len as usize],
+            }
+        }
+
+        fn take(&mut self, n: u32) -> Option<u32> {
+            let end = self.taken.len();
+            let n = n as usize;
+            if n == 0 || n > end {
+                return None;
+            }
+            let cursor = self.next as usize;
+            let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+            let starts = (cursor..end).chain(0..second_end);
+            let (mut run, mut found, mut last) = (0, None, usize::MAX);
+            for at in starts {
+                if at != last.wrapping_add(1) {
+                    run = 0;
+                }
+                last = at;
+                run = if self.taken[at] { 0 } else { run + 1 };
+                if run == n {
+                    found = Some(at + 1 - n);
+                    break;
+                }
+            }
+            let first = found?;
+            self.taken[first..first + n].fill(true);
+            self.next = ((first + n) % end) as u32;
+            Some(first as u32)
+        }
+
+        fn release(&mut self, at: u32, n: u32) {
+            let start = (at as usize).min(self.taken.len());
+            let end = (at as usize).saturating_add(n as usize).min(self.taken.len());
+            if start < end {
+                self.taken[start..end].fill(false);
+            }
+        }
+    }
+
+    /// Word boundaries, partial tail words, multi-word runs (`ROOT_VIEW_RUN`),
+    /// cursor wrap-around without end wrap, and `min_failed` fast rejection.
+    #[test]
+    fn dynamic_slot_bitmap_handles_word_boundaries_and_failed_watermark() {
+        let mut empty = DynamicSlots::new(0);
+        assert_eq!(empty.take(0), None);
+        assert_eq!(empty.take(1), None);
+        empty.release(0, 10);
+
+        // Partial tail word (len = 130 => 2 full words + 2 tail bits; bits 2..64
+        // of word 2 stay masked out and never join free runs).
+        let mut s = DynamicSlots::new(130);
+        assert_eq!(s.take(63), Some(0));
+        assert_eq!(s.take(3), Some(63), "crosses word 0 -> word 1");
+        assert_eq!(s.take(62), Some(66), "reaches slot 128 across word 1 -> word 2");
+        assert_eq!(s.take(3), None, "only 2 tail bits remain; padding bits stay taken");
+        assert_eq!(s.min_failed, 3);
+        assert_eq!(s.take(4), None, "rejected by min_failed without scanning");
+        assert_eq!(s.take(2), Some(128), "smaller request below min_failed still succeeds");
+        assert_eq!(s.take(1), None);
+        assert_eq!(s.min_failed, 1);
+
+        // Releasing an already-free or out-of-range slice keeps min_failed intact;
+        // freeing a taken slot resets it.
+        s.release(130, 8);
+        assert_eq!(s.min_failed, 1);
+        s.release(62, 4); // frees 62..66 across the 64-bit boundary
+        assert_eq!(s.min_failed, u32::MAX);
+        s.release(62, 4); // already free now
+        assert_eq!(s.take(5), None);
+        assert_eq!(s.min_failed, 5);
+        s.release(62, 4); // still free: min_failed must stay 5
+        assert_eq!(s.min_failed, 5);
+        assert_eq!(s.take(4), Some(62));
+
+        // Multi-word runs (256-slot root view blocks) across fragmented words.
+        let mut big = DynamicSlots::new(600);
+        assert_eq!(big.take(60), Some(0));
+        assert_eq!(big.take(256), Some(60));
+        assert_eq!(big.take(256), Some(316));
+        assert_eq!(big.take(256), None);
+        big.release(60, 256);
+        assert_eq!(big.take(256), Some(60), "found on wrap-around pass");
+    }
+
+    /// Differential check: `DynamicSlots` matches the byte-per-slot reference
+    /// allocator step for step across capacities and fragmented churn.
+    #[test]
+    fn dynamic_slot_bitmap_matches_reference_allocator() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next_rand = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        for len in [1u32, 2, 63, 64, 65, 127, 128, 129, 511, 512, 520, 4096] {
+            let mut bitmap = DynamicSlots::new(len);
+            let mut reference = RefDynamicSlots::new(len);
+            let mut live: Vec<(u32, u32)> = Vec::new();
+
+            for step in 0..2_500 {
+                let r = next_rand();
+                if !live.is_empty() && (r & 3 == 0 || live.len() > 96) {
+                    let idx = (r as usize >> 4) % live.len();
+                    let (at, count) = live.swap_remove(idx);
+                    // Occasionally release in two halves to fragment runs across word edges.
+                    if count > 2 && (r & 4 != 0) {
+                        let half = count / 2;
+                        bitmap.release(at, half);
+                        reference.release(at, half);
+                        live.push((at + half, count - half));
+                    } else {
+                        bitmap.release(at, count);
+                        reference.release(at, count);
+                    }
+                } else {
+                    let n = match (r >> 8) % 8 {
+                        0 => 0,
+                        1 => 1,
+                        2 => 2,
+                        3 => ((r >> 16) % 16 + 1) as u32,
+                        4 => ((r >> 16) % 64 + 1) as u32,
+                        5 => 64,
+                        6 => 256.min(len.saturating_add(4)),
+                        _ => ((r >> 16) % (u64::from(len) + 8)) as u32,
+                    };
+                    let got = bitmap.take(n);
+                    let want = reference.take(n);
+                    assert_eq!(got, want, "len={len} step={step} n={n}");
+                    if let Some(at) = got {
+                        live.push((at, n));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "microbenchmark: cargo test --release -p victory-gpu dynamic_slot_bitmap_bench -- --ignored --nocapture"]
+    fn dynamic_slot_bitmap_bench() {
+        fn run_workload<A>(
+            len: u32,
+            mut make: impl FnMut(u32) -> A,
+            mut take: impl FnMut(&mut A, u32) -> Option<u32>,
+            mut release: impl FnMut(&mut A, u32, u32),
+        ) -> (std::time::Duration, std::time::Duration, u64) {
+            let mut alloc = make(len);
+            // Scatter long-lived 2-slot shadow pairs across ~75% of the dynamic
+            // range so `ROOT_VIEW_RUN` (256) and medium tables must skip past
+            // fragmented regions rather than landing immediately at the cursor.
+            let stride = 96u32;
+            let mut cursor_fill = Vec::new();
+            let pinned_limit = (len * 3 / 4) / stride;
+            for i in 0..pinned_limit {
+                let _ = take(&mut alloc, 2);
+                let gap = stride - 2 - (i % 7);
+                if let Some(at) = take(&mut alloc, gap) {
+                    cursor_fill.push((at, gap));
+                }
+            }
+            for (at, gap) in cursor_fill {
+                release(&mut alloc, at, gap);
+            }
+
+            let mut checksum = 0u64;
+            let mut batches: std::collections::VecDeque<Vec<(u32, u32)>> =
+                std::collections::VecDeque::with_capacity(4);
+
+            // Part 1: 20 frames with 3 in-flight batches held simultaneously
+            // (all allocations succeed; exercises pure bitmap vs bool scanning).
+            let calls_per_frame = if len <= MIN_DYNAMIC { 450u32 } else { 1_800u32 };
+            let t_churn = std::time::Instant::now();
+            for frame in 0..20u32 {
+                if batches.len() == 3
+                    && let Some(done) = batches.pop_front()
+                {
+                    for (at, n) in done {
+                        release(&mut alloc, at, n);
+                    }
+                }
+                let mut cur = Vec::with_capacity(calls_per_frame as usize);
+                for call in 0..calls_per_frame {
+                    let n = if call % 32 == 0 {
+                        256
+                    } else {
+                        2 + ((call.wrapping_mul(11) + frame) % 28)
+                    };
+                    if let Some(at) = take(&mut alloc, n) {
+                        checksum = checksum.wrapping_add(u64::from(at));
+                        cur.push((at, n));
+                    }
+                }
+                batches.push_back(cur);
+            }
+            let churn_elapsed = t_churn.elapsed();
+
+            // Part 2: fill remaining dynamic slots and simulate 2,500 draws
+            // asking for fresh tables / root views in a saturated frame.
+            let mut extra = Vec::new();
+            while let Some(at) = take(&mut alloc, 4) {
+                extra.push((at, 4));
+            }
+            let t_sat = std::time::Instant::now();
+            for call in 0..2_500u32 {
+                let n = if call % 32 == 0 { 256 } else { 4 + (call % 16) };
+                if let Some(at) = take(&mut alloc, n) {
+                    checksum = checksum.wrapping_add(u64::from(at));
+                }
+            }
+            let sat_elapsed = t_sat.elapsed();
+            let _ = (batches, extra);
+            (churn_elapsed, sat_elapsed, checksum)
+        }
+
+        for (label, len) in [("capped_64k (NVIDIA)", MIN_DYNAMIC), ("uncapped_256k", DYNAMIC)] {
+            let mut old_churn = Vec::new();
+            let mut old_sat = Vec::new();
+            let mut new_churn = Vec::new();
+            let mut new_sat = Vec::new();
+            for _ in 0..7 {
+                let (c1, s1, ck1) = run_workload(
+                    len,
+                    RefDynamicSlots::new,
+                    RefDynamicSlots::take,
+                    RefDynamicSlots::release,
+                );
+                let (c2, s2, ck2) = run_workload(
+                    len,
+                    DynamicSlots::new,
+                    DynamicSlots::take,
+                    DynamicSlots::release,
+                );
+                assert_eq!(ck1, ck2);
+                old_churn.push(c1);
+                old_sat.push(s1);
+                new_churn.push(c2);
+                new_sat.push(s2);
+            }
+            old_churn.sort_unstable();
+            old_sat.sort_unstable();
+            new_churn.sort_unstable();
+            new_sat.sort_unstable();
+            let (oc, nc) = (
+                old_churn[3].as_secs_f64() * 1e3 / 20.0,
+                new_churn[3].as_secs_f64() * 1e3 / 20.0,
+            );
+            let (os, ns) = (old_sat[3].as_secs_f64() * 1e3, new_sat[3].as_secs_f64() * 1e3);
+            println!(
+                "{label}: fragmented churn/frame {oc:.3} ms -> {nc:.3} ms ({:.1}x), saturated 2500 asks {os:.3} ms -> {ns:.4} ms ({:.0}x)",
+                oc / nc,
+                os / ns
+            );
+        }
     }
 }
