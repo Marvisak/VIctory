@@ -3084,7 +3084,7 @@ impl Meter {
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(
-                "host textures: {textures} ({:.0} MB, {:.0} MB of them used by lists), title textures sharing one {shared} (saving {:.0} MB), replacing one {replaced}; \
+                "live host textures: {textures} ({:.0} MB, {:.0} MB of them used by lists), title textures sharing one {shared} (saving {:.0} MB), replacing one {replaced}; \
                  heaps of textures {heaps} ({:.0} MB used, {:.0} MB free); \
                  copies between textures of one memory {:.1}/frame, depth twin copies {:.1}/frame",
                 bytes as f64 / 1e6,
@@ -3111,9 +3111,11 @@ impl Meter {
                         crate::list::UPLOADS[1].load(Ordering::Relaxed) as f64 / 1e6,
                     );
                 }
-                let [gpu, title] = crate::resource::texture_census().map(|r| r.map(|b| b as f64 / 1e6));
+                let census = crate::resource::texture_census();
+                let indexed_mb = census.iter().flatten().sum::<u64>() as f64 / 1e6;
+                let [gpu, title] = census.map(|r| r.map(|b| b as f64 / 1e6));
                 tracing::info!(
-                    "host texture MB (used by lists, viewed by heap slots only, neither): GPU-written {:.0} {:.0} {:.0}, \
+                    "host textures in the title-memory index: {indexed_mb:.0} MB (used by lists, viewed by heap slots only, neither): GPU-written {:.0} {:.0} {:.0}, \
                      from title memory {:.0} {:.0} {:.0}",
                     gpu[0], gpu[1], gpu[2], title[0], title[1], title[2]
                 );

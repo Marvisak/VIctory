@@ -933,10 +933,11 @@ pub(crate) fn texture_counts() -> (u64, u64, u64, u64, u64, u64) {
     (TEXTURES.load(Relaxed), TEXTURE_BYTES.load(Relaxed), USED.load(Relaxed), shared.0, shared.1, shared.2)
 }
 
-/// Bytes of the live host textures of title textures by what wrote them
+/// Bytes of host textures in the title-memory index, grouped by what wrote them
 /// (index 0 the GPU: render target, depth or unordered access; 1 title
 /// memory) and how they were reached (0 by lists, 1 only by heap slots, 2
-/// neither).
+/// neither). Depth twins and replaced textures still held by callers are
+/// outside this index but count toward the live total in [`texture_counts`].
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn texture_census() -> [[u64; 3]; 2] {
     use std::sync::atomic::Ordering::Relaxed;
