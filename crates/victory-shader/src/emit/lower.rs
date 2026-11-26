@@ -6980,10 +6980,10 @@ impl<'a> Lower<'a> {
             let f = self.half_fsrc(inst, 0)?;
             return self.write_f(inst, f, guard);
         }
+        // The clamp on the result in f32, then one rounding to a half. The
+        // output modifier is ignored: f16 output denormals are kept, and with
+        // them RDNA2 ignores it (RDNA2 ISA 6.2.2).
         let float_result = |l: &mut Self, mut f: V| -> Result<(), Why> {
-            if v.omod != 0 {
-                return Err("an output modifier on a 16-bit operation");
-            }
             if v.clamp {
                 f = l.unary(7, f);
             }
@@ -7028,9 +7028,6 @@ impl<'a> Lower<'a> {
                 self.half_fsrc(inst, 2)?
             };
             if name == "v_fma_f16" && self.mode16 != Some(3) {
-                if v.omod != 0 {
-                    return Err("an output modifier on a 16-bit operation");
-                }
                 let half = self.fma_f16(a, b, acc, v.clamp);
                 return self.write_half(inst, half, guard);
             }
@@ -8149,8 +8146,8 @@ impl<'a> Lower<'a> {
                 if f16 {
                     let lo = half(self, h + u8::from(attribute.high))?
                         .ok_or("a packed input half no element holds")?;
-                    // omod and clamp are part of the f16 instruction; op_sel[3]
-                    // picks the destination half.
+                    // clamp is part of the f16 instruction; op_sel[3] picks
+                    // the destination half.
                     let lo = self.half_modifiers(inst, lo);
                     return self.write_half(inst, lo, None);
                 } else if mode == 1 {
@@ -8304,28 +8301,21 @@ impl<'a> Lower<'a> {
         false
     }
 
-    /// VOP3 f16 output modifiers: omod, then clamp, applied in f32 so the
-    /// half conversion rounds once (the order `write_f` uses).
+    /// VOP3 f16 output modifiers: the clamp, applied in f32. The output
+    /// modifier is ignored, as for other f16 results (RDNA2 ISA 6.2.2).
     fn half_modifiers(&mut self, inst: &Inst, h: V) -> V {
         let Fields::Valu(v) = &inst.fields else {
             return h;
         };
-        if v.omod == 0 && !v.clamp {
+        if !v.clamp {
             return h;
         }
         let c = self.cur;
         let f32t = self.s.t.f32;
-        let mut f = self
+        let f = self
             .s
             .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
-        if v.omod != 0 {
-            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
-            let k = self.s.m.f32(factor.to_bits());
-            f = self.s.m.bin(c, Bin::Mul, f, k);
-        }
-        if v.clamp {
-            f = self.unary(7, f);
-        }
+        let f = self.unary(7, f);
         self.s
             .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f])
     }

@@ -1729,8 +1729,8 @@ mod tests {
         assert!(low.contains("-65536"), "low write keeps the high half");
         // The high-half write shifts the result up by 16.
         assert!(high.contains("shl i32"), "op_sel[3] writes the high half");
-        // omod mul:2 and clamp (dx.op.unary.f32, opcode 7) are applied.
-        assert!(high.contains("2.000000e+00"), "omod multiplies by two");
+        // omod mul:2 is ignored; clamp (dx.op.unary.f32, opcode 7) applies.
+        assert!(!high.contains("2.000000e+00"), "omod is ignored");
         assert!(
             high.contains("dx.op.unary.f32(i32 7"),
             "clamp saturates the result"

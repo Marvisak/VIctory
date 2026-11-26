@@ -2281,3 +2281,30 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+/// An f16 result ignores its output modifier (times 2, 4 or 0.5) and takes
+/// its clamp: 1.5 + 0.25 = 1.75 with each modifier, and 1.0 clamped (not
+/// 0.875 halved); 1.5 x 0.25 = 0.375 and fma(1.5, 0.25, 0) = 0.375 times 2.
+#[test]
+fn f16_results_ignore_their_output_modifier() {
+    const V_ADD_F16: u16 = 0x132;
+    const V_MUL_F16: u16 = 0x135;
+    const V_FMA_F16: u16 = 0x34B;
+    let op = |op: u16, omod: u32, clamp: bool| {
+        let [w0, w1] = vop3(op, 0, vgpr(1), vgpr(2), vgpr(3));
+        build_valu_cs(&[w0 | u32::from(clamp) << 15, w1 | omod << 27])
+    };
+    let cases = [[0x3E00, 0x3400, 0, 0]]; // 1.5, 0.25, 0
+    for (shader, want) in [
+        (op(V_ADD_F16, 1, false), 0x3F00), // 1.75
+        (op(V_ADD_F16, 2, false), 0x3F00),
+        (op(V_ADD_F16, 3, false), 0x3F00),
+        (op(V_ADD_F16, 3, true), 0x3C00),  // 1.75 clamped: 1.0
+        (op(V_MUL_F16, 1, false), 0x3600), // 0.375
+        (op(V_FMA_F16, 1, false), 0x3600),
+    ] {
+        run_cases(&shader, &cases, |backend, _, _, got| {
+            assert_eq!(got & 0xFFFF, want, "{backend}");
+        });
+    }
+}
