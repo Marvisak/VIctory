@@ -43,10 +43,207 @@ use std::sync::{Arc, Mutex};
 /// they saved.
 pub(crate) const PAGE: usize = 64 << 10;
 
+/// Dense bitset of changed 64 KiB pages for a [`Tracked`] range `[base, base + words.len() * 64)`.
+struct PageBits {
+    base: usize,
+    words: Box<[u64]>,
+    count: usize,
+}
+
+impl PageBits {
+    fn from_pages(start_page: usize, end_page: usize, pages: &[usize]) -> Self {
+        let len = end_page.saturating_sub(start_page).div_ceil(64);
+        let mut bits = Self {
+            base: start_page,
+            words: vec![0u64; len].into_boxed_slice(),
+            count: 0,
+        };
+        for &p in pages {
+            bits.insert(p);
+        }
+        bits
+    }
+
+    fn insert(&mut self, page: usize) -> bool {
+        let Some(rel) = page.checked_sub(self.base) else {
+            return false;
+        };
+        let word = rel / 64;
+        let Some(slot) = self.words.get_mut(word) else {
+            return false;
+        };
+        let mask = 1u64 << (rel % 64);
+        if *slot & mask == 0 {
+            *slot |= mask;
+            self.count += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remove(&mut self, page: usize) -> bool {
+        let Some(rel) = page.checked_sub(self.base) else {
+            return false;
+        };
+        let word = rel / 64;
+        let Some(slot) = self.words.get_mut(word) else {
+            return false;
+        };
+        let mask = 1u64 << (rel % 64);
+        if *slot & mask != 0 {
+            *slot &= !mask;
+            self.count -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn contains(&self, page: usize) -> bool {
+        let Some(rel) = page.checked_sub(self.base) else {
+            return false;
+        };
+        let word = rel / 64;
+        self.words
+            .get(word)
+            .is_some_and(|&w| w & (1u64 << (rel % 64)) != 0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn range_pages(&self, from: usize, to: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let start = from.max(self.base);
+        let limit = self.base + self.words.len() * 64;
+        let end = to.min(limit);
+        if self.is_empty() || start >= end {
+            return out;
+        }
+        let first_rel = start - self.base;
+        let last_rel = end - self.base;
+        let first_word = first_rel / 64;
+        let last_word = (last_rel - 1) / 64;
+        for wi in first_word..=last_word {
+            let mut w = self.words[wi];
+            if wi == first_word {
+                w &= !0u64 << (first_rel % 64);
+            }
+            if wi == last_word && !last_rel.is_multiple_of(64) {
+                w &= (1u64 << (last_rel % 64)) - 1;
+            }
+            let word_base = self.base + wi * 64;
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                out.push(word_base + bit);
+                w &= w - 1;
+            }
+        }
+        out
+    }
+}
+
+/// Inline single-element storage before spilling to a heap `Vec`.
+enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> OneOrMany<T> {
+    fn iter(&self) -> std::slice::Iter<'_, T> {
+        match self {
+            OneOrMany::One(x) => std::slice::from_ref(x).iter(),
+            OneOrMany::Many(v) => v.iter(),
+        }
+    }
+
+    fn push(&mut self, val: T) {
+        match self {
+            OneOrMany::One(_) => {
+                // Temporarily swap out `One` into `Many`.
+                let prev = std::mem::replace(self, OneOrMany::Many(Vec::new()));
+                if let OneOrMany::One(first) = prev {
+                    *self = OneOrMany::Many(vec![first, val]);
+                }
+            }
+            OneOrMany::Many(v) => v.push(val),
+        }
+    }
+
+    fn retain_and_check_empty(&mut self, mut f: impl FnMut(&T) -> bool) -> bool {
+        match self {
+            OneOrMany::One(x) => !f(x),
+            OneOrMany::Many(v) => {
+                v.retain(|x| f(x));
+                match v.len() {
+                    0 => true,
+                    1 => {
+                        let only = v.pop().unwrap();
+                        *self = OneOrMany::One(only);
+                        false
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+}
+
+impl<T> IntoIterator for OneOrMany<T> {
+    type Item = T;
+    type IntoIter = OneOrManyIter<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            OneOrMany::One(x) => OneOrManyIter::One(Some(x)),
+            OneOrMany::Many(v) => OneOrManyIter::Many(v.into_iter()),
+        }
+    }
+}
+
+enum OneOrManyIter<T> {
+    One(Option<T>),
+    Many(std::vec::IntoIter<T>),
+}
+
+impl<T> Iterator for OneOrManyIter<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        match self {
+            OneOrManyIter::One(opt) => opt.take(),
+            OneOrManyIter::Many(iter) => iter.next(),
+        }
+    }
+}
+
+fn map_push<T>(map: &mut BTreeMap<usize, OneOrMany<T>>, key: usize, val: T) {
+    match map.entry(key) {
+        std::collections::btree_map::Entry::Vacant(v) => {
+            v.insert(OneOrMany::One(val));
+        }
+        std::collections::btree_map::Entry::Occupied(mut o) => {
+            o.get_mut().push(val);
+        }
+    }
+}
+
+fn map_retain<T>(map: &mut BTreeMap<usize, OneOrMany<T>>, key: usize, f: impl FnMut(&T) -> bool) -> bool {
+    let Some(entry) = map.get_mut(&key) else {
+        return false;
+    };
+    if entry.retain_and_check_empty(f) {
+        map.remove(&key);
+        true
+    } else {
+        false
+    }
+}
+
 /// The pages a tracker has not taken since they changed, what it saves of
 /// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
 /// whether it is a host buffer copy's (the only trackers [`retake`] marks).
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>, bool);
+struct Changed(Mutex<PageBits>, Mutex<Saved>, Option<u32>, bool);
 
 /// A bit per tracker, set while it holds changed pages: set and cleared
 /// under the tracker's lock, read without one ([`Tracked::clean`]). Dense,
@@ -188,7 +385,7 @@ struct Guards {
     /// Blocks (pages) we made read-only.
     protected: BTreeSet<usize>,
     /// The trackers holding each page.
-    holders: BTreeMap<usize, Vec<Arc<Changed>>>,
+    holders: BTreeMap<usize, OneOrMany<Arc<Changed>>>,
     /// Pages `[first, last)` of writes the guards do not see that are under
     /// way ([`Writing`]): not guarded until they end, or the write fails.
     busy: Vec<(usize, usize)>,
@@ -196,7 +393,7 @@ struct Guards {
     /// runtime told when it mapped them: a write at one marks the others,
     /// with no question to the runtime (whose lock its page mappings hold
     /// for long).
-    alias_of: BTreeMap<usize, Vec<usize>>,
+    alias_of: BTreeMap<usize, OneOrMany<usize>>,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -290,7 +487,7 @@ pub(crate) fn held_times() -> Vec<(u64, f64, f64)> {
 fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
     pages
         .iter()
-        .flat_map(|&p| g.alias_of.get(&p).into_iter().flatten().map(move |&a| (p, a)))
+        .flat_map(|&p| g.alias_of.get(&p).into_iter().flat_map(|o| o.iter()).map(move |&a| (p, a)))
         .collect()
 }
 
@@ -351,10 +548,15 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     // A tracker with untracked parts is never clean: no bit.
     let bit = if untracked.is_empty() { dirty_bit() } else { None };
     set_dirty(bit, true);
-    let changed = Arc::new(Changed(Mutex::new(pages.iter().copied().collect()), Mutex::default(), bit, copy));
+    let changed = Arc::new(Changed(
+        Mutex::new(PageBits::from_pages(start / PAGE, end.div_ceil(PAGE), &pages)),
+        Mutex::default(),
+        bit,
+        copy,
+    ));
     let mut g = guards();
     for &page in &pages {
-        g.holders.entry(page).or_default().push(changed.clone());
+        map_push(&mut g.holders, page, changed.clone());
     }
     drop(g);
     Some(Tracked {
@@ -422,12 +624,8 @@ impl Drop for Tracked {
         let mut g = guards();
         let mut free = Vec::new();
         for page in self.start / PAGE..self.end.div_ceil(PAGE) {
-            if let Some(holders) = g.holders.get_mut(&page) {
-                holders.retain(|c| !Arc::ptr_eq(c, &self.changed));
-                if holders.is_empty() {
-                    g.holders.remove(&page);
-                    free.push(page);
-                }
+            if map_retain(&mut g.holders, page, |c| !Arc::ptr_eq(c, &self.changed)) {
+                free.push(page);
             }
         }
         for page in free {
@@ -486,7 +684,7 @@ impl Tracked {
             let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
             #[cfg(feature = "diagnostics")]
             drop(waited);
-            changed.range(from / PAGE..to.div_ceil(PAGE)).copied().collect()
+            changed.range_pages(from / PAGE, to.div_ceil(PAGE))
         };
         if pages.is_empty() {
             return (Vec::new(), Vec::new());
@@ -513,7 +711,7 @@ impl Tracked {
         whole.retain(|p| !unguarded.contains(p));
         let mut unmapped = Vec::new();
         for page in protect_noting(&mut g, &whole, &mut unmapped) {
-            changed.remove(&page);
+            changed.remove(page);
             self.changed.taken(page);
         }
         set_dirty(self.changed.2, !changed.is_empty());
@@ -537,7 +735,7 @@ impl Tracked {
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(&page)
+            .contains(page)
     }
 
     /// The caller made pages (page numbers) of its copy equal to title
@@ -553,7 +751,7 @@ impl Tracked {
             .filter(|p| !unguarded.contains(p))
             .collect();
         for page in protect(&mut g, &pages) {
-            changed.remove(&page);
+            changed.remove(page);
             self.changed.taken(page);
         }
         set_dirty(self.changed.2, !changed.is_empty());
@@ -605,8 +803,14 @@ impl Tracked {
     pub(crate) fn disarm(&self) {
         let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
         saved.armed.clear();
+        if saved.armed.capacity() > 64 {
+            saved.armed.shrink_to(16);
+        }
         saved.unarmed.clear();
         saved.bytes.clear();
+        if saved.bytes.capacity() > 16 {
+            saved.bytes.shrink_to(0);
+        }
     }
 
     /// The bytes page `page` (a page number) held when it was first written
@@ -746,7 +950,7 @@ fn open_guarded(g: &mut Guards, first: usize, last: usize) {
 /// keep its bytes.
 fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
     for (&page, holders) in g.holders.range(first..last) {
-        for c in holders {
+        for c in holders.iter() {
             let first_write = {
                 let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
                 set_dirty(c.2, true);
@@ -818,12 +1022,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
-        for other in g.alias_of.remove(&page).unwrap_or_default() {
-            if let Some(links) = g.alias_of.get_mut(&other) {
-                links.retain(|&p| p != page);
-                if links.is_empty() {
-                    g.alias_of.remove(&other);
-                }
+        if let Some(others) = g.alias_of.remove(&page) {
+            for other in others {
+                map_retain(&mut g.alias_of, other, |&p| p != page);
             }
         }
     }
@@ -868,9 +1069,8 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     let page = at / PAGE;
     for &other in others {
         for (x, y) in [(other / PAGE, page), (page, other / PAGE)] {
-            let links = g.alias_of.entry(x).or_default();
-            if !links.contains(&y) {
-                links.push(y);
+            if !g.alias_of.get(&x).is_some_and(|l| l.iter().any(|&p| p == y)) {
+                map_push(&mut g.alias_of, x, y);
             }
         }
     }
@@ -1445,5 +1645,32 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    #[test]
+    fn page_bits_tracks_multi_word_ranges() {
+        let mut bits = PageBits::from_pages(10, 145, &[10, 73, 74, 144]);
+        assert!(!bits.is_empty());
+        assert!(bits.contains(10) && bits.contains(73) && bits.contains(144));
+        assert!(!bits.contains(9) && !bits.contains(72) && !bits.contains(145));
+        assert_eq!(bits.range_pages(0, 200), vec![10, 73, 74, 144]);
+        assert_eq!(bits.range_pages(73, 75), vec![73, 74]);
+        assert!(!bits.insert(73));
+        assert!(bits.insert(75));
+        assert!(bits.remove(10) && bits.remove(73) && bits.remove(74) && bits.remove(75) && bits.remove(144));
+        assert!(bits.is_empty());
+        assert!(bits.range_pages(0, 200).is_empty());
+    }
+
+    #[test]
+    fn one_or_many_spills_and_collapses() {
+        let mut v = OneOrMany::One(10u32);
+        assert_eq!(v.iter().copied().collect::<Vec<_>>(), vec![10]);
+        v.push(20);
+        v.push(30);
+        assert_eq!(v.iter().copied().collect::<Vec<_>>(), vec![10, 20, 30]);
+        assert!(!v.retain_and_check_empty(|&x| x == 20));
+        assert!(matches!(v, OneOrMany::One(20)));
+        assert!(v.retain_and_check_empty(|_| false));
     }
 }
