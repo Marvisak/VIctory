@@ -923,6 +923,12 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
     marked.sort_unstable();
     marked.dedup();
+    // A bit identifies one copy and page in both bitmaps. A held mark
+    // wins for that bit, while other copies of the same address can write back.
+    // The single held bitmap was scanned in ascending bit order.
+    if !held.is_empty() {
+        marked.retain(|n| held.binary_search(n).is_err());
+    }
     let page_of = |m: &Marks, n: u32| {
         let (&base, copy) = m.owners.range(..=n).next_back()?;
         let copy = copy.upgrade()?;
@@ -932,14 +938,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             (copy, page)
         })
     };
-    // Held back: dropped from the copies (`crate::memory::drop_withheld`).
-    if !held.is_empty() {
-        let m = marks();
-        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
-            crate::memory::drop_withheld(page, PAGE);
-        }
-    }
-    if marked.is_empty() {
+    if marked.is_empty() && held.is_empty() {
         return;
     }
     let pages: Vec<(Arc<Shadow>, usize)> = {
@@ -961,6 +960,14 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         }
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
+    }
+    // A missed submission retakes the page immediately across all its copies.
+    // Let ordinary marked writes in other copies reach title memory first.
+    if !held.is_empty() {
+        let m = marks();
+        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+            crate::memory::drop_withheld(page, PAGE);
+        }
     }
 }
 
@@ -1484,6 +1491,8 @@ pub(crate) mod tests {
     /// byte there (no mark) is not put back. The bits are cleared.
     #[test]
     fn marked_pages_go_back_by_the_bytes_the_gpu_changed() {
+        // No submission takes the marks set below meanwhile.
+        let _quiet = crate::host::tests::no_submissions();
         let p = crate::watch::tests::pool(3);
         let len = 3 * PAGE;
         register(p, p as u64, len as u64);
@@ -1531,6 +1540,8 @@ pub(crate) mod tests {
     /// marks of the same submission go back.
     #[test]
     fn marks_of_shaders_using_title_memory_are_held_back() {
+        // No submission takes the marks set below meanwhile.
+        let _quiet = crate::host::tests::no_submissions();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -1600,12 +1611,91 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
+    #[test]
+    fn held_mark_preserves_title_bytes_when_both_bitmaps_mark_one_copy_page() {
+        let Some(host) = crate::host::host() else { return };
+        let p = crate::watch::tests::pool(2);
+        let address = p as u64;
+        register(p, address, (2 * PAGE) as u64);
+        let copy = find(address, (2 * PAGE) as u64).unwrap();
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, address, (2 * PAGE) as u64);
+        let writer = copy.clone();
+        list.defer(move || {
+            // Simulate writes through indexed views without a declared withheld range.
+            writer.write_host(address + 16, &[0xaa]);
+            writer.write_host(address + PAGE as u64 + 16, &[0xbb]);
+            let base = writer.marks.unwrap() as usize;
+            for (memory, n) in [(true, base), (false, base), (false, base + 1)] {
+                let b = bitmap(memory).unwrap();
+                // SAFETY: both page indices belong to this copy in the mapped bitmap.
+                unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
+            }
+        });
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: both bytes are inside the live, initially zeroed pool.
+        let bytes = unsafe { (((p + 16) as *const u8).read_volatile(), ((p + PAGE + 16) as *const u8).read_volatile()) };
+        unregister(p, address);
+        drop(copy);
+        crate::watch::tests::free(p);
+        assert_eq!(bytes, (0, 0xbb));
+    }
+
+    #[test]
+    fn held_mark_preserves_an_ordinary_write_in_a_shared_page() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let p = crate::watch::tests::pool(2);
+        let address = p as u64;
+        // SAFETY: two bytes in the newly allocated, unguarded pool.
+        unsafe {
+            ((p + 16) as *mut u8).write_volatile(0x11);
+            ((p + 32) as *mut u8).write_volatile(0x22);
+        }
+        register(p, address, (2 * PAGE) as u64);
+        register(p + 1, address, PAGE as u64);
+        let outer = find(address, (2 * PAGE) as u64).unwrap();
+        let inner = find(address, PAGE as u64).unwrap();
+        assert!(!Arc::ptr_eq(&outer, &inner));
+        let list = host.new_list().unwrap();
+        for (copy, memory, len) in [(&outer, true, 2 * PAGE), (&inner, false, PAGE)] {
+            let _writer = list.writer_uses_memory(memory);
+            copy.refresh(&list, address, len as u64);
+            copy.gpu_writes(&list, address, len as u64, true);
+        }
+        let copies = (outer.clone(), inner.clone());
+        list.defer(move || {
+            for (copy, memory, offset, byte) in [(&copies.0, true, 16, 0xaa), (&copies.1, false, 32, 0xbb)] {
+                copy.write_host(address + offset, &[byte]);
+                let (bit, _) = copy.mark_entry(address).unwrap();
+                let b = bitmap(memory).unwrap();
+                // SAFETY: mark_entry returned a valid bit in the mapped bitmap.
+                unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+            }
+        });
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: both reads are inside the live pool.
+        let bytes = unsafe { (((p + 16) as *const u8).read_volatile(), ((p + 32) as *const u8).read_volatile()) };
+        unregister(p + 1, address);
+        unregister(p, address);
+        drop((inner, outer));
+        crate::watch::tests::free(p);
+        assert_eq!(bytes, (0x11, 0xbb));
+    }
+
     /// A partial refresh of an armed page updates its saved bytes too (both
     /// under and beside a pending marked range): copy-back neither puts the
     /// refreshed byte back over a later title write nor drops a shader write
     /// back to the pre-fault value.
     #[test]
     fn partial_refresh_under_marked_range_updates_saved_bytes() {
+        // No submission works through the copies meanwhile.
+        let _quiet = crate::host::tests::no_submissions();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
