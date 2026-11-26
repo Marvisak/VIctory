@@ -294,7 +294,7 @@ pub(crate) fn host_writes(list: &HostList, resource: This) {
 
 fn host_writes_copy(list: &HostList, copy: &Arc<crate::resource::HostTexture>) {
     let copy = copy.clone();
-    list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
+    list.defer_host(move || copy.note_host_written());
 }
 
 fn is_host_written(resource: This) -> bool {

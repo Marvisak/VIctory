@@ -854,6 +854,8 @@ pub(crate) struct HostTexture {
     /// A host copy or resolve wrote it: its contents are the host's, not
     /// title memory's (`crate::texture`).
     pub(crate) host_written: std::sync::atomic::AtomicBool,
+    /// Whether this title-memory-fed copy can be evicted without losing host writes.
+    evictable: std::sync::atomic::AtomicBool,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
@@ -877,6 +879,12 @@ pub(crate) struct HostTexture {
 
 #[cfg(windows)]
 impl HostTexture {
+    /// The host wrote this texture: it no longer needs to be retained as a
+    /// reconstructible copy of title memory.
+    pub(crate) fn note_host_written(&self) {
+        mark_host_written(&self.host_written, &self.evictable, &EVICTABLE);
+    }
+
     /// A host texture made outside the title's resources (twins).
     pub(crate) fn new(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -897,6 +905,7 @@ impl HostTexture {
             state: state.into(),
             castable,
             host_written: false.into(),
+            evictable: false.into(),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,
@@ -971,6 +980,49 @@ static USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 static TEXTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(windows)]
 static TEXTURE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Live host textures that may currently be evicted. Zero lets the per-frame
+/// eviction pass skip its global texture census entirely.
+#[cfg(windows)]
+static EVICTABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+fn set_evictable(flag: &std::sync::atomic::AtomicBool, count: &std::sync::atomic::AtomicU64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !flag.swap(true, Relaxed) {
+        count.fetch_add(1, Relaxed);
+    }
+}
+
+#[cfg(windows)]
+fn clear_evictable(flag: &std::sync::atomic::AtomicBool, count: &std::sync::atomic::AtomicU64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if flag.swap(false, Relaxed) {
+        count.fetch_sub(1, Relaxed);
+    }
+}
+
+#[cfg(windows)]
+fn mark_host_written(
+    host_written: &std::sync::atomic::AtomicBool,
+    evictable: &std::sync::atomic::AtomicBool,
+    count: &std::sync::atomic::AtomicU64,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    host_written.store(true, Relaxed);
+    clear_evictable(evictable, count);
+}
+
+#[cfg(windows)]
+fn title_memory_evictable(has_memory_key: bool, flags: u32, host_written: bool) -> bool {
+    has_memory_key && crate::texture::title_written_flags(flags) && !host_written
+}
+
+#[cfg(windows)]
+fn has_evictable(count: &std::sync::atomic::AtomicU64) -> bool {
+    count.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
 /// Title textures that found their memory's host texture made already.
 #[cfg(windows)]
 static SHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1018,6 +1070,7 @@ impl Drop for HostTexture {
         }
         TEXTURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+        clear_evictable(&self.evictable, &EVICTABLE);
         if *self.used.get_mut() {
             USED.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1331,6 +1384,13 @@ fn shared_texture(
     // bridge the two where the shapes allow.
     let mut t = make_texture(&d, state, clear)?;
     t.key = key;
+    if title_memory_evictable(
+        key.is_some(),
+        t.flags,
+        t.host_written.load(std::sync::atomic::Ordering::Relaxed),
+    ) {
+        set_evictable(&t.evictable, &EVICTABLE);
+    }
     let t = std::sync::Arc::new(t);
     if let Some(k) = key {
         remade(&k);
@@ -1656,14 +1716,6 @@ fn remade(k: &MemoryKey) {
     }
 }
 
-/// Whether host texture `t` may be given up: its contents come from title
-/// memory alone (no render target, depth or unordered access, no host copy
-/// or resolve wrote it), so a texture made again has them back.
-#[cfg(windows)]
-fn evictable(t: &HostTexture) -> bool {
-    t.key.is_some() && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Once per presented frame, before a submission (`Host::execute`, one at a
 /// time, the last one has run): gives up host textures fed from title memory
 /// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
@@ -1674,6 +1726,9 @@ pub(crate) fn evict_unused() {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     let frame = crate::queue::presented();
     if LAST.swap(frame, Relaxed) == frame {
+        return;
+    }
+    if !has_evictable(&EVICTABLE) {
         return;
     }
     let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
@@ -1732,7 +1787,9 @@ fn candidates() -> Vec<Owned> {
     let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
     let mut by: std::collections::HashMap<usize, Owned> = std::collections::HashMap::new();
     for &r in at.by_memory.values().flatten() {
-        if let Some(t) = made(resource(r as This)).filter(|t| evictable(t)) {
+        if let Some(t) = made(resource(r as This))
+            .filter(|t| t.evictable.load(std::sync::atomic::Ordering::Relaxed))
+        {
             by.entry(std::sync::Arc::as_ptr(&t) as usize).or_insert_with(|| (t, Vec::new())).1.push(r);
         }
     }
@@ -2438,6 +2495,47 @@ pub(crate) fn test_buffer(width: u64) -> This {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn evictable_counter_tracks_host_write_and_drop_exactly_once() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+
+        let count = AtomicU64::new(0);
+        let evictable = AtomicBool::new(false);
+        let host_written = AtomicBool::new(false);
+
+        assert!(!has_evictable(&count));
+        assert!(title_memory_evictable(true, 0, false), "title-fed read texture");
+        assert!(!title_memory_evictable(false, 0, false), "twins have no title memory key");
+        assert!(!title_memory_evictable(true, 1, false), "render targets are host-written");
+        assert!(!title_memory_evictable(true, 2, false), "depth targets are host-written");
+        assert!(!title_memory_evictable(true, 4, false), "unordered targets are host-written");
+        assert!(!title_memory_evictable(true, 0, true), "host-written copies cannot be evicted");
+
+        set_evictable(&evictable, &count);
+        assert!(evictable.load(Relaxed));
+        assert_eq!(count.load(Relaxed), 1);
+        assert!(has_evictable(&count));
+        set_evictable(&evictable, &count);
+        assert_eq!(count.load(Relaxed), 1, "marking twice counts once");
+
+        mark_host_written(&host_written, &evictable, &count);
+        assert!(host_written.load(Relaxed));
+        assert!(!evictable.load(Relaxed));
+        assert_eq!(count.load(Relaxed), 0);
+        mark_host_written(&host_written, &evictable, &count);
+        assert_eq!(count.load(Relaxed), 0, "repeated host writes do not underflow");
+
+        let dropped = AtomicBool::new(false);
+        set_evictable(&dropped, &count);
+        assert_eq!(count.load(Relaxed), 1);
+        clear_evictable(&dropped, &count);
+        assert_eq!(count.load(Relaxed), 0, "Drop clears an eligible copy once");
+        clear_evictable(&dropped, &count);
+        assert_eq!(count.load(Relaxed), 0, "repeated Drop accounting cannot underflow");
+        assert!(!has_evictable(&count));
+    }
 
     #[cfg(windows)]
     #[test]
