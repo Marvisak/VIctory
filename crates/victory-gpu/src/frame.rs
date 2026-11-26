@@ -92,17 +92,6 @@ fn last(kind: u32) -> &'static AtomicU64 {
     &LAST[(kind as usize).min(LAST.len() - 1)]
 }
 
-/// The tick a wait for `kind` ends on, and how long until it: the first
-/// one after the last a wait for `kind` took (an event happens once per
-/// tick: a wait woken a little early must not let the next one end on the
-/// same tick), the latest one passed if that is later. A wait begun after
-/// its tick passed (a frame slower than the interval) so ends at once, as
-/// an event signalled at the tick and left signalled until a wait takes it
-/// would (assumed: nothing we have says what a late wait does); waiting for
-/// the next tick instead cost the cutscene's frames 0-33 ms each (4 % of
-/// the frame thread, run perf3). A wait that
-/// comes within `limit` takes the tick here, under the clock's lock, so two
-/// threads waiting for one kind never take the same tick.
 /// Computes a tick from an explicit clock snapshot. Keeping this arithmetic
 /// pure makes the deadline boundary testable without relying on OS scheduling.
 fn next_tick_at(
@@ -120,6 +109,17 @@ fn next_tick_at(
     (tick, wait, wait <= limit)
 }
 
+/// The tick a wait for `kind` ends on, and how long until it: the first
+/// one after the last a wait for `kind` took (an event happens once per
+/// tick: a wait woken a little early must not let the next one end on the
+/// same tick), the latest one passed if that is later. A wait begun after
+/// its tick passed (a frame slower than the interval) so ends at once, as
+/// an event signalled at the tick and left signalled until a wait takes it
+/// would (assumed: nothing we have says what a late wait does); waiting for
+/// the next tick instead cost the cutscene's frames 0-33 ms each (4 % of
+/// the frame thread, run perf3). A wait that comes within `limit` takes the
+/// tick here, under the clock's lock, so two threads waiting for one kind
+/// never take the same tick.
 fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
