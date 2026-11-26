@@ -125,14 +125,40 @@ unsafe impl Send for Clamp {}
 // SAFETY: as above.
 unsafe impl Sync for Clamp {}
 
+#[cfg(feature = "diagnostics")]
+fn census_pipeline() -> Option<&'static std::sync::Arc<crate::census::Pipeline>> {
+    use crate::census::Pipeline;
+    use std::sync::{Arc, OnceLock};
+
+    static ID: OnceLock<Arc<Pipeline>> = OnceLock::new();
+    crate::census::enabled().then(|| {
+        ID.get_or_init(|| {
+            let hash = blake3::hash(SOURCE.as_bytes()).to_hex();
+            Arc::new(Pipeline {
+                hash: hash[..32].to_owned(),
+                shaders: vec![("host_compute", hash[..16].to_owned())],
+            })
+        })
+    })
+}
+
 fn clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
-        .get_or_init(|| match make() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
-                None
+        .get_or_init(|| {
+            #[cfg(feature = "diagnostics")]
+            let timing = census_pipeline().map(|id| (id, std::time::Instant::now()));
+            let made = make();
+            #[cfg(feature = "diagnostics")]
+            if let Some((id, start)) = timing {
+                crate::census::created(id.clone(), start.elapsed(), made.is_err());
+            }
+            match made {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
+                    None
+                }
             }
         })
         .as_ref()
@@ -227,8 +253,14 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
         l.SetComputeRootShaderResourceView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
+        #[cfg(feature = "diagnostics")]
+        let sample = census_pipeline().and_then(|id| {
+            list.census.begin(l, id, crate::census::Work::Clamp(records))
+        });
         // One group walks every record.
         l.Dispatch(records.min(1), 1, 1);
+        #[cfg(feature = "diagnostics")]
+        drop(sample);
         l.ResourceBarrier(&[
             uav_barrier(),
             transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),

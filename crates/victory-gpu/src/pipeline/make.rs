@@ -85,9 +85,31 @@ impl Pending {
     }
 
     fn make(&self) {
+        #[cfg(feature = "diagnostics")]
+        let mut sample = None;
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            #[cfg(feature = "diagnostics")]
+            let made = if crate::census::enabled() {
+                let elapsed = started.elapsed();
+                let mut made = made;
+                let shaders = match &made {
+                    Some(host) => host.stages.iter().map(|s| &s.shader).collect(),
+                    None => self.shaders.iter().collect::<Vec<_>>(),
+                };
+                let pipeline = Arc::new(crate::census::Pipeline {
+                    hash: self.key.clone(),
+                    shaders: shaders.into_iter().map(|s| (s.stage, s.hash.clone())).collect(),
+                });
+                if let Some(host) = &mut made {
+                    host.census = Some(pipeline.clone());
+                }
+                sample = Some((pipeline, elapsed, made.is_none()));
+                made
+            } else {
+                made
+            };
             #[cfg(feature = "diagnostics")]
             log_built(&self.key);
             let (user, kernel) = super::thread_cpu_since(cpu);
@@ -101,8 +123,13 @@ impl Pending {
             made
         });
         let (lock, done) = &DONE;
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+        drop(held);
+        #[cfg(feature = "diagnostics")]
+        if let Some((pipeline, elapsed, failed)) = sample {
+            crate::census::created(pipeline, elapsed, failed);
+        }
     }
 }
 

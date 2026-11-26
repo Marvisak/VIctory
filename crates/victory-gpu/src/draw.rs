@@ -907,6 +907,19 @@ impl State {
         true
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn census<'a>(
+        &self,
+        list: &'a HostList,
+        work: crate::census::Work,
+    ) -> Option<crate::census::Sample<'a>> {
+        if !crate::census::enabled() {
+            return None;
+        }
+        let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        list.census.begin(&list.list, p.census.as_ref()?, work)
+    }
+
     /// The heap index of a raw view (`uav`: unordered access) of the host
     /// copy holding the root view the title set at root parameter `slot`,
     /// and the root address's byte offset in it: a dynamic slot of the view
@@ -1124,8 +1137,14 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
+        #[cfg(feature = "diagnostics")]
+        let sample = p.census.as_ref().and_then(|id| {
+            list.census.begin(&list.list, id, crate::census::Work::Dispatch([x, y, z]))
+        });
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        drop(sample);
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1206,6 +1225,8 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    #[cfg(feature = "diagnostics")]
+                    let _sample = self.census(list, crate::census::Work::Mesh([x, 1, 1]));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1581,6 +1602,8 @@ impl State {
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             #[cfg(feature = "diagnostics")]
             self.probe_small(list, false);
+            #[cfg(feature = "diagnostics")]
+            let _sample = self.census(list, crate::census::Work::Draw(count, instances));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1675,6 +1698,8 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let _sample = self.census(list, crate::census::Work::Indexed(indices, instances));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1805,6 +1830,11 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        let sample = self.census(
+            list,
+            crate::census::Work::Indirect { kind, limit: max, stride, counted: counter.is_some() },
+        );
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1817,6 +1847,8 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        drop(sample);
         // A listed frame, or any frame for a traced shader: what the records
         // held (after the clamp).
         #[cfg(feature = "diagnostics")]
