@@ -63,6 +63,9 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    /// Keeps AMD D3D12 shader intrinsics (`IntersectBvhNode`) alive for the
+    /// lifetime of `device` when `VICTORY_HW_BVH=1`.
+    _amd_ext: Option<victory_shader::emit::host::AmdExtGuard>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -185,7 +188,8 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
+        let warp = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP");
+        if warp {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -195,6 +199,26 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let amd_ext = if !warp && victory_shader::emit::hw_bvh_switch() {
+            match victory_shader::emit::host::enable_amd_bvh(&device) {
+                Some(guard) => {
+                    victory_shader::emit::set_host_hw_bvh(guard.opcode);
+                    tracing::info!(
+                        opcode = format_args!("{:#04x}", guard.opcode),
+                        "AMD hardware BVH ray-node intersection enabled (VICTORY_HW_BVH=1)"
+                    );
+                    Some(guard)
+                }
+                None => {
+                    tracing::warn!(
+                        "VICTORY_HW_BVH=1 requested, but AMD IntersectBvhNode extension is unavailable on this adapter; using software BVH"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -265,6 +289,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
+            _amd_ext: amd_ext,
         })
     }
 }

@@ -234,11 +234,14 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+pub use lower::{
+    host_hw_bvh_active, host_hw_bvh_opcode, hw_bvh_switch, set_host_hw_bvh,
+};
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS,
-    VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    AMD_EXT_SPACE, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, MEMORY_VAS, NULL_BUFFER_VIEW,
+    ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS,
+    VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
 /// The loop limit without an override: 2^20.
@@ -325,6 +328,10 @@ pub struct HostShader {
     /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
     /// marks").
     pub view_marks: bool,
+    /// Whether it uses AMD's `IntersectBvhNode` hardware BVH intrinsic: the
+    /// host binds the page VA table `t`[`MEMORY_VAS`] in [`MEMORY_SPACE`] and
+    /// AMD's magic UAV `u0` in [`AMD_EXT_SPACE`].
+    pub amd_bvh: bool,
 }
 
 impl HostShader {
@@ -537,6 +544,7 @@ pub fn emit_with(
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        amd_bvh: l.amd_bvh,
     })
 }
 
@@ -1070,6 +1078,7 @@ mod tests {
             heap: false,
             heap_writes: false,
             view_marks: false,
+            amd_bvh: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1087,6 +1096,7 @@ mod tests {
                 heap: false,
                 heap_writes: false,
                 view_marks: false,
+                amd_bvh: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

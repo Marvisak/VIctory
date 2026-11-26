@@ -24,6 +24,52 @@ mod bvh;
 
 type Why = &'static str;
 
+static HOST_HW_BVH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tells the translator which AMD `IAmdExtD3DShaderIntrinsics` BVH-intersect
+/// opcode is enabled on the host device (`0x22` for `IntersectBvhNode`, `0` for
+/// disabled).
+pub fn set_host_hw_bvh(opcode: u8) {
+    HOST_HW_BVH.store(opcode, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `VICTORY_HW_BVH=1` is set in the environment.
+pub fn hw_bvh_switch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HW_BVH").is_some_and(|v| v == "1"))
+}
+
+/// The active AMD hardware BVH intrinsic opcode (`0x22`), or `0` if hardware
+/// BVH intersection is inactive.
+pub fn host_hw_bvh_opcode() -> u8 {
+    if hw_bvh_switch() {
+        HOST_HW_BVH.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// Whether AMD hardware BVH ray-node intersection is currently active on this
+/// host.
+pub fn host_hw_bvh_active() -> bool {
+    host_hw_bvh_opcode() != 0
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`host_hw_bvh`], for its thread only (`0` = off).
+    pub(super) static TEST_HW_BVH: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// The AMD hardware BVH opcode to emit during this lowering (`0` = software).
+pub(super) fn host_hw_bvh() -> u8 {
+    #[cfg(test)]
+    if let Some(op) = TEST_HW_BVH.get() {
+        return op;
+    }
+    host_hw_bvh_opcode()
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -52,6 +98,10 @@ pub(crate) struct Lowered {
     /// Marks the pages it writes through buffer views (`emit`, "Write
     /// marks").
     pub view_marks: bool,
+    /// Uses AMD's `IntersectBvhNode` hardware ray-node intersection intrinsic
+    /// (requires `t`[`super::MEMORY_VAS`] in `MEMORY_SPACE` and `u0` in
+    /// `AMD_EXT_SPACE`).
+    pub amd_bvh: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -1400,6 +1450,7 @@ impl<'a> Lower<'a> {
             heap: self.heap[0],
             heap_writes: self.heap[1],
             view_marks: self.s.view_writes.is_some(),
+            amd_bvh: self.s.amd_ext.is_some(),
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]

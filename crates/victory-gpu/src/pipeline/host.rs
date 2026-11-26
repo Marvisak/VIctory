@@ -8,7 +8,9 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    AMD_EXT_SPACE, MEMORY_SPACE, MEMORY_VAS, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -350,6 +352,11 @@ pub(crate) struct Stage {
     pub(crate) memory_dirty: Option<u32>,
     /// Our root parameter of the heap's view addresses (`crate::memory`).
     pub(crate) view_addresses: Option<u32>,
+    /// Our root parameters for AMD hardware BVH intersection: the page VA
+    /// table (`t`[`MEMORY_VAS`] in [`MEMORY_SPACE`]) and AMD's magic UAV
+    /// (`u0` in [`AMD_EXT_SPACE`]).
+    pub(crate) memory_vas: Option<u32>,
+    pub(crate) amd_ext: Option<u32>,
 }
 
 impl Stage {
@@ -474,6 +481,8 @@ impl HostPipeline {
                 memory: None,
                 memory_dirty: None,
                 view_addresses: None,
+                memory_vas: None,
+                amd_ext: None,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -522,10 +531,36 @@ impl HostPipeline {
                     });
                 }
             }
-            for (used, kind, register, out) in [
-                (t.memory, D3D12_ROOT_PARAMETER_TYPE_SRV, 0, &mut stage.memory),
-                (t.memory_writes, D3D12_ROOT_PARAMETER_TYPE_UAV, 0, &mut stage.memory_dirty),
-                (t.view_addresses, D3D12_ROOT_PARAMETER_TYPE_SRV, 1, &mut stage.view_addresses),
+            for (used, kind, register, space, out) in [
+                (t.memory, D3D12_ROOT_PARAMETER_TYPE_SRV, 0, MEMORY_SPACE, &mut stage.memory),
+                (
+                    t.memory_writes,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    0,
+                    MEMORY_SPACE,
+                    &mut stage.memory_dirty,
+                ),
+                (
+                    t.view_addresses,
+                    D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    1,
+                    MEMORY_SPACE,
+                    &mut stage.view_addresses,
+                ),
+                (
+                    t.amd_bvh,
+                    D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    MEMORY_VAS,
+                    MEMORY_SPACE,
+                    &mut stage.memory_vas,
+                ),
+                (
+                    t.amd_bvh,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    0,
+                    AMD_EXT_SPACE,
+                    &mut stage.amd_ext,
+                ),
             ] {
                 if used {
                     *out = Some(params.len() as u32);
@@ -534,7 +569,7 @@ impl HostPipeline {
                         Anonymous: D3D12_ROOT_PARAMETER1_0 {
                             Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                                 ShaderRegister: register,
-                                RegisterSpace: MEMORY_SPACE,
+                                RegisterSpace: space,
                                 Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
                             },
                         },

@@ -610,6 +610,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        amd_bvh: lowered.amd_bvh,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -834,4 +835,328 @@ fn page_table(view: u32, null: u32) -> Vec<u32> {
 fn intersections_on_nodes_in_title_memory_equal_the_reference() {
     run_cases(false, 4, true);
     run_cases(true, 4, true);
+}
+
+struct HwBvhReset;
+impl Drop for HwBvhReset {
+    fn drop(&mut self) {
+        super::lower::TEST_HW_BVH.set(None);
+    }
+}
+
+/// Hardware BVH lowering (`bvh_hw`) emits valid SM 6.6 DXIL with the page VA
+/// table (`t3` in `MEMORY_SPACE`) and AMD's magic UAV (`u0` in
+/// `AMD_EXT_SPACE`).
+#[test]
+fn amd_hw_bvh_lowers_and_validates() {
+    let _reset = HwBvhReset;
+    super::lower::TEST_HW_BVH.set(Some(0x22));
+    for wide in [false, true] {
+        let shader = build(wide, true);
+        assert!(shader.memory && shader.memory_writes && shader.amd_bvh);
+    }
+}
+
+/// Hardware BVH (`IntersectBvhNode`, opcode `0x22`) on a live AMD GPU matches
+/// the CPU reference across random box32, box16, triangle, instance and
+/// procedural nodes for both 32-bit and 64-bit node pointers.
+#[test]
+fn amd_hw_bvh_matches_the_reference_on_the_gpu() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let Some(guard) = super::host::enable_amd_bvh(&host.device) else {
+        eprintln!("AMD IntersectBvhNode extension unavailable on this adapter; skipped");
+        return;
+    };
+    let _reset = HwBvhReset;
+    super::lower::TEST_HW_BVH.set(Some(guard.opcode));
+
+    let entry = 4096 + ((TITLE as u32 >> 16) & 0xFFF) as usize;
+    for wide in [false, true] {
+        let shader = build(wide, true);
+        assert!(shader.amd_bvh);
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .expect("AMD HW BVH compute_pipeline failed");
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Table, 1) => 0,
+                (RootType::Constants, 0) => (TITLE >> (32 * u.dword)) as u32,
+                _ => panic!("{u:?}"),
+            };
+        }
+        let mut rng = Rng(if wide { 99 } else { 19 });
+        let cases: Vec<(Vec<u32>, u32, Ray)> = (0..LANES)
+            .map(|_| {
+                let (mut w, ty, ray) = case(&mut rng);
+                if ty < 4 {
+                    // Hardware barycentric selectors are 0..=2 (3 is undefined in RDNA).
+                    let mut id = 0u32;
+                    for t in 0..4 {
+                        let b = (w[15] >> (8 * t)) & 0xFF;
+                        let i = (b & 3) % 3;
+                        let j = ((b >> 2) & 3) % 3;
+                        id |= ((b & !0xF) | i | (j << 2)) << (8 * t);
+                    }
+                    w[15] = id;
+                }
+                (w, ty, ray)
+            })
+            .collect();
+        let nodes = (LANES * 64) as u32;
+        let mut data = vec![0u32; LANES * 16 + LANES * 32];
+        for (n, (w, ty, ray)) in cases.iter().enumerate() {
+            let ptr = (nodes + 128 * n as u32) >> 3 | ty;
+            let r = &mut data[16 * n..16 * n + 12];
+            r[0] = ptr;
+            r[1] = ray.extent.to_bits();
+            for k in 0..3 {
+                r[2 + k] = ray.origin[k].to_bits();
+                r[5 + k] = ray.dir[k].to_bits();
+                r[8 + k] = ray.inv[k].to_bits();
+            }
+            let at = LANES * 16 + 32 * n;
+            data[at..at + 28].copy_from_slice(w);
+        }
+        // Root params: 0 user_data, 1 page table (t0), 2 dirty bitmap (u0),
+        // 3 page VA table (t3), 4 AMD magic UAV (u0, space2147420894).
+        let roots = vec![
+            (0, Root::Constants(ud)),
+            (1, Root::View { srv: true, data: page_table(1, 3) }),
+            (2, Root::Uav(2 * 4096 / 32)),
+            (3, Root::MemoryVaTable { entry }),
+            (4, Root::Uav(1)),
+        ];
+        let views = [
+            View::RawUav((LANES * 4) as u32),
+            View::Memory(&data),
+            View::Pair,
+            View::NullPair,
+            View::Pair,
+        ];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots,
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("AMD HW BVH dispatch failed");
+        let (mut hits, mut tris) = (0, 0);
+        for (n, (w, ty, ray)) in cases.iter().enumerate() {
+            let want = intersect(w, *ty, ray);
+            let got = &out[0][4 * n..4 * n + 4];
+            match *ty {
+                0..=3 => {
+                    // Hardware `IntersectBvhNode` uses its own numerator scale;
+                    // compare hit/miss, denominator sign, and t / i / j ratios.
+                    let w_f = want.map(f32::from_bits);
+                    let g_f = [got[0], got[1], got[2], got[3]].map(f32::from_bits);
+                    let w_t = w_f[0] / w_f[1];
+                    let g_t = g_f[0] / g_f[1];
+                    let w_hit = w_t.is_finite();
+                    let g_hit = g_t.is_finite();
+                    if w_hit && g_hit {
+                        assert_eq!(
+                            w_f[1].is_sign_positive(),
+                            g_f[1].is_sign_positive(),
+                            "wide={wide} n={n} ty={ty}: face sign mismatch got={g_f:?} want={w_f:?}"
+                        );
+                        let rel = |a: f32, b: f32| (a - b).abs() <= 1e-4 * b.abs().max(1.0);
+                        assert!(
+                            rel(g_t, w_t)
+                                && rel(g_f[2] / g_f[1], w_f[2] / w_f[1])
+                                && rel(g_f[3] / g_f[1], w_f[3] / w_f[1]),
+                            "wide={wide} n={n} ty={ty}: triangle mismatch got={g_f:?} want={w_f:?}"
+                        );
+                        tris += 1;
+                    } else if w_hit != g_hit {
+                        // Only tolerate razor-thin edge hits where watertight
+                        // tie-breakers differ (min barycentric near 0).
+                        let (t_i, t_j) = if w_hit {
+                            (w_f[2] / w_f[1], w_f[3] / w_f[1])
+                        } else {
+                            (g_f[2] / g_f[1], g_f[3] / g_f[1])
+                        };
+                        let min_b = t_i.min(t_j).min(1.0 - t_i - t_j);
+                        assert!(
+                            min_b.abs() < 1e-3,
+                            "wide={wide} n={n} ty={ty}: triangle hit mismatch got={g_f:?} want={w_f:?}"
+                        );
+                    }
+                }
+                4 | 5 => {
+                    // Box hits: exact child pointer set (same hardware order
+                    // except tie-breaking on equal distances).
+                    if got != want {
+                        let mut g_sorted = got.to_vec();
+                        let mut w_sorted = want.to_vec();
+                        g_sorted.sort_unstable();
+                        w_sorted.sort_unstable();
+                        assert_eq!(
+                            g_sorted, w_sorted,
+                            "wide={wide} n={n} ty={ty}: box mismatch got={got:08x?} want={want:08x?} {ray:?}"
+                        );
+                    }
+                    hits += want.iter().filter(|&&c| c != INVALID).count();
+                }
+                _ => {
+                    assert_eq!(got, want, "wide={wide} n={n} ty={ty}: non-box/tri mismatch");
+                }
+            }
+        }
+        eprintln!(
+            "AMD HW BVH (wide={wide}, opcode={:#04x}): matched reference ({hits} boxes and {tris} triangles hit)",
+            guard.opcode
+        );
+    }
+    drop(guard);
+}
+
+/// Standalone GPU throughput benchmark comparing software `bvh_lanes` against
+/// hardware `IntersectBvhNode` (`opcode 0x22`) through `MEMORY_VAS` on the same
+/// mixed box32/box16/triangle workload.
+///
+/// Run with:
+/// `cargo test -p victory-shader --lib amd_hw_bvh_throughput_benchmark -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn amd_hw_bvh_throughput_benchmark() {
+    use std::time::Instant;
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let Some(guard) = super::host::enable_amd_bvh(&host.device) else {
+        eprintln!("AMD IntersectBvhNode extension unavailable on this adapter; skipped");
+        return;
+    };
+    let _reset = HwBvhReset;
+
+    let entry = 4096 + ((TITLE as u32 >> 16) & 0xFFF) as usize;
+    let mut rng = Rng(42);
+    let cases: Vec<(Vec<u32>, u32, Ray)> = (0..LANES)
+        .map(|_| {
+            let (mut w, ty, ray) = case(&mut rng);
+            if ty < 4 {
+                let mut id = 0u32;
+                for t in 0..4 {
+                    let b = (w[15] >> (8 * t)) & 0xFF;
+                    let i = (b & 3) % 3;
+                    let j = ((b >> 2) & 3) % 3;
+                    id |= ((b & !0xF) | i | (j << 2)) << (8 * t);
+                }
+                w[15] = id;
+            }
+            (w, ty, ray)
+        })
+        .collect();
+    let nodes = (LANES * 64) as u32;
+    let mut data = vec![0u32; LANES * 16 + LANES * 32];
+    for (n, (w, ty, ray)) in cases.iter().enumerate() {
+        let ptr = (nodes + 128 * n as u32) >> 3 | ty;
+        let r = &mut data[16 * n..16 * n + 12];
+        r[0] = ptr;
+        r[1] = ray.extent.to_bits();
+        for k in 0..3 {
+            r[2 + k] = ray.origin[k].to_bits();
+            r[5 + k] = ray.dir[k].to_bits();
+            r[8 + k] = ray.inv[k].to_bits();
+        }
+        let at = LANES * 16 + 32 * n;
+        data[at..at + 28].copy_from_slice(w);
+    }
+    let views = [
+        View::RawUav((LANES * 4) as u32),
+        View::Memory(&data),
+        View::Pair,
+        View::NullPair,
+        View::Pair,
+    ];
+    let pt = page_table(1, 3);
+    // 65535 * 32 * 256 = 536,862,720 ray-node intersections per dispatch so
+    // GPU shader execution dominates over per-dispatch D3D12 setup time.
+    let groups = [65_535u32, 32, 1];
+    let total_rays = u64::from(groups[0]) * u64::from(groups[1]) * LANES as u64;
+
+    let bench = |opcode: u8| -> f64 {
+        super::lower::TEST_HW_BVH.set(Some(opcode));
+        let shader = build(true, true);
+        let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Table, 1) => 0,
+                (RootType::Constants, 0) => (TITLE >> (32 * u.dword)) as u32,
+                _ => panic!("{u:?}"),
+            };
+        }
+        let make_roots = || {
+            let mut r = vec![
+                (0, Root::Constants(ud.clone())),
+                (1, Root::View { srv: true, data: pt.clone() }),
+                (2, Root::Uav(2 * 4096 / 32)),
+            ];
+            if shader.amd_bvh {
+                r.push((3, Root::MemoryVaTable { entry }));
+                r.push((4, Root::Uav(1)));
+            }
+            r
+        };
+        // Warmup dispatch.
+        host.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: make_roots(),
+                views: &views,
+                samplers: &[],
+                groups: [256, 1, 1],
+            },
+        )
+        .expect("warmup dispatch");
+        let mut samples = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            host.dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: make_roots(),
+                    views: &views,
+                    samplers: &[],
+                    groups,
+                },
+            )
+            .expect("bench dispatch");
+            samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        samples[samples.len() / 2]
+    };
+
+    let sw_ms = bench(0);
+    let hw_ms = bench(guard.opcode);
+    let speedup = sw_ms / hw_ms;
+    eprintln!(
+        "BVH64 throughput ({total_rays} ray-node tests/dispatch, median of 5): software={sw_ms:.2} ms ({:.1} Mrays/s), hardware(opcode={:#04x})={hw_ms:.2} ms ({:.1} Mrays/s), speedup={speedup:.2}x",
+        (total_rays as f64) / (sw_ms * 1e3),
+        guard.opcode,
+        (total_rays as f64) / (hw_ms * 1e3),
+    );
+    drop(guard);
 }

@@ -30,7 +30,16 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 /// Keeps translated shaders in a folder of `dir` from now on: the folder
 /// of this translator, `None` if it cannot be opened.
 pub fn use_shader_cache(dir: PathBuf) -> Option<PathBuf> {
-    let dir = dir.join(&blake3::Hash::from(*build()).to_hex()[..16]);
+    // Separate the cache folder when `VICTORY_HW_BVH=1` is requested (known at
+    // startup before the D3D12 device is created); each entry is also keyed on
+    // the live active opcode in `host_shader`.
+    let folder = key(
+        victory_shader::SOURCE_HASH,
+        ENCODING,
+        victory_shader::emit::loop_limit(),
+        u8::from(victory_shader::emit::hw_bvh_switch()),
+    );
+    let dir = dir.join(&blake3::Hash::from(folder).to_hex()[..16]);
     match Cache::open(&dir) {
         Ok(cache) => {
             tracing::info!(dir = %dir.display(), "shader cache");
@@ -54,28 +63,37 @@ pub fn counts() -> (u64, u64) {
 /// the compiler), the entry's encoding (this file's text) and the
 /// translation settings (the loop limit, which a diagnostics build can
 /// change at run time).
-fn build() -> &'static [u8; 32] {
-    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
-    BUILD.get_or_init(|| {
-        let limit = victory_shader::emit::loop_limit();
-        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+fn build() -> [u8; 32] {
+    static WARN: std::sync::Once = std::sync::Once::new();
+    let limit = victory_shader::emit::loop_limit();
+    if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+        WARN.call_once(|| {
             tracing::warn!(
                 limit,
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
-        }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
-    })
+        });
+    }
+    key(
+        victory_shader::SOURCE_HASH,
+        ENCODING,
+        limit,
+        victory_shader::emit::host_hw_bvh_opcode(),
+    )
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, hw_bvh: u8) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    if hw_bvh != 0 {
+        h.update(b"VICTORY_HW_BVH=1");
+        h.update(&[hw_bvh]);
+    }
     *h.finalize().as_bytes()
 }
 
@@ -87,7 +105,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     let options = victory_shader::emit::Options { view_marks: true };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &build(), container, translate),
         None => (translate(container), false),
     }
 }
@@ -236,6 +254,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         heap,
         heap_writes,
         view_marks,
+        amd_bvh,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -285,7 +304,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*view_addresses) << 2
             | u32::from(*heap) << 3
             | u32::from(*heap_writes) << 4
-            | u32::from(*view_marks) << 5,
+            | u32::from(*view_marks) << 5
+            | u32::from(*amd_bvh) << 6,
     );
     out
 }
@@ -363,6 +383,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         heap: memory & 8 != 0,
         heap_writes: memory & 16 != 0,
         view_marks: memory & 32 != 0,
+        amd_bvh: memory & 64 != 0,
     }))
 }
 
@@ -396,6 +417,7 @@ mod tests {
             heap: true,
             heap_writes: true,
             view_marks: true,
+            amd_bvh: true,
         }
     }
 
@@ -480,17 +502,19 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, 0);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, 0));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, 0));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, 0));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, 0));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 0x22));
         assert_eq!(
-            *build(),
+            build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                victory_shader::emit::host_hw_bvh_opcode(),
             )
         );
         // The encoding part is this file as built.

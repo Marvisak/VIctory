@@ -53,6 +53,9 @@ const NO_OWNER: u32 = u32::MAX;
 /// Total dwords in a page table buffer (level-1 + `CAPACITY + 1` blocks of
 /// `BLOCK` 2-dword entries).
 const TABLE_DWORDS: usize = LEVEL1 + (CAPACITY + 1) * BLOCK * 2;
+/// Total dwords in the parallel page VA table (`t`[`victory_shader::emit::MEMORY_VAS`]):
+/// `CAPACITY + 1` blocks of `BLOCK` 64-bit host GPU VAs (2 dwords per page).
+const TABLE_VA_DWORDS: usize = (CAPACITY + 1) * BLOCK * 2;
 /// Bits in a list's dirty-page bitmap (one per level-2 entry across all blocks).
 const BITMAP_BITS: usize = (CAPACITY + 1) * BLOCK;
 /// 32-bit words in a dirty-page bitmap.
@@ -70,6 +73,9 @@ pub(crate) struct Map {
     pub(crate) table: u64,
     /// The list's page bitmap's host GPU address (the root UAV).
     pub(crate) dirty: u64,
+    /// The heap's page VA table's host GPU address (`t3` in `MEMORY_SPACE`),
+    /// present when AMD hardware BVH intersection is active.
+    pub(crate) vas: Option<u64>,
     /// Ranges that go back byte for byte instead (root UAVs, see
     /// [`Map::precise`]).
     precise: Arc<Mutex<Vec<(u64, u64)>>>,
@@ -207,6 +213,9 @@ struct Shared {
     table: ID3D12Resource,
     data: usize,
     gpu: u64,
+    /// Parallel 64-bit host GPU VA table per level-2 page entry, allocated
+    /// only when AMD hardware BVH intersection is active.
+    vas: Option<(ID3D12Resource, usize, u64)>,
     /// The pair of null views entries without a copy name.
     null: u32,
     /// Each copy's view pair (its first slot), by copy.
@@ -460,6 +469,49 @@ fn write_table(
     (LEVEL1 + l2_dwords, blocks, owner)
 }
 
+/// Writes the parallel 64-bit host GPU VA table (`out`) for the level-2 entries
+/// described by `blocks` and `owner`.
+///
+/// Only pages whose owning copy covers the entire 64 KiB page and whose host
+/// page VA is 64-byte aligned receive a non-zero VA; partial, unowned or
+/// unaligned pages receive `0` so hardware BVH shaders fall back cleanly to
+/// bounds-checked software loads.
+fn write_va_table(
+    copies: &[(u64, u64)],
+    copy_vas: &[u64],
+    blocks: &[usize],
+    owner: &[u32],
+    out: &mut [u32],
+) {
+    assert!(out.len() >= owner.len() * 2);
+    let (slots, _) = out[..owner.len() * 2].as_chunks_mut::<2>();
+    for (entry, (slot, &o)) in slots.iter_mut().zip(owner).enumerate() {
+        let block = entry / BLOCK;
+        if o == NO_OWNER || block == 0 {
+            slot[0] = 0;
+            slot[1] = 0;
+            continue;
+        }
+        let k = o as usize;
+        let (start, len) = copies[k];
+        let page = entry % BLOCK;
+        let page_addr = ((blocks[block] as u64) << 28) | ((page as u64) << 16);
+        let whole = page_addr >= start && start.checked_add(len).is_some_and(|end| page_addr + 0x1_0000 <= end);
+        let va = if whole {
+            copy_vas[k].wrapping_add(page_addr - start)
+        } else {
+            0
+        };
+        if va != 0 && (va & 63) == 0 {
+            slot[0] = va as u32;
+            slot[1] = (va >> 32) as u32;
+        } else {
+            slot[0] = 0;
+            slot[1] = 0;
+        }
+    }
+}
+
 #[cfg(test)]
 fn table(
     copies: &[(u64, u64)],
@@ -480,9 +532,20 @@ impl Shared {
     /// A page table for `heap`, named nothing yet (written at the first
     /// submission that uses it).
     fn new(heap: &HostHeap) -> Option<Shared> {
+        let host_gpu = crate::host::host()?;
         let bytes = TABLE_DWORDS as u64 * 4;
-        let (table, data) = crate::host::host()?.upload_buffer(bytes)?;
+        let (table, data) = host_gpu.upload_buffer(bytes)?;
         crate::host::name(&table, || "title memory page table".into());
+        let vas = if victory_shader::emit::host_hw_bvh_active() {
+            let va_bytes = TABLE_VA_DWORDS as u64 * 4;
+            let (va_res, va_data) = host_gpu.upload_buffer(va_bytes)?;
+            crate::host::name(&va_res, || "title memory page VAs".into());
+            // SAFETY: `va_res` is a live D3D12 buffer.
+            let va_gpu = unsafe { va_res.GetGPUVirtualAddress() };
+            Some((va_res, va_data as usize, va_gpu))
+        } else {
+            None
+        };
         let null = heap.pair()?;
         heap.raw_pair_at(null, None, 0);
         // SAFETY: a live buffer.
@@ -492,6 +555,7 @@ impl Shared {
             table,
             data: data as usize,
             gpu,
+            vas,
             null,
             pairs: HashMap::new(),
             generation: u64::MAX,
@@ -538,6 +602,18 @@ impl Shared {
         // for `TABLE_DWORDS` dwords; no submission runs.
         let out = unsafe { std::slice::from_raw_parts_mut(self.data as *mut u32, TABLE_DWORDS) };
         let (_, blocks, owner) = write_table(&ranges, &slots, self.null, out);
+        if let Some((_, va_data, _)) = self.vas {
+            let copy_vas: Vec<u64> = named
+                .iter()
+                // SAFETY: each `Shadow::buffer` is a live D3D12 buffer.
+                .map(|c| unsafe { c.buffer.GetGPUVirtualAddress() })
+                .collect();
+            // SAFETY: `va_data` is the persistent mapping of `TABLE_VA_DWORDS`
+            // dwords; no submission runs.
+            let va_out =
+                unsafe { std::slice::from_raw_parts_mut(va_data as *mut u32, TABLE_VA_DWORDS) };
+            write_va_table(&ranges, &copy_vas, &blocks, &owner, va_out);
+        }
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
         self.layout = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
@@ -612,20 +688,26 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
 /// brought up to date at each submission of the list, its written pages
 /// copied back after.
 pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
-    let table = with_heap(key, |heap| {
+    let (table, vas) = with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
         if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host) {
             list.keep(&s.table);
-            return Some(s.gpu);
+            if let Some((va_res, _, _)) = &s.vas {
+                list.keep(va_res);
+            }
+            return Some((s.gpu, s.vas.as_ref().map(|(_, _, g)| *g)));
         }
         // A released heap's table goes with it (lists that name it hold it).
         shared.retain(|(k, _)| *k != key);
         let s = Shared::new(heap)?;
         list.keep(&s.table);
-        let gpu = s.gpu;
+        if let Some((va_res, _, _)) = &s.vas {
+            list.keep(va_res);
+        }
+        let out = (s.gpu, s.vas.as_ref().map(|(_, _, g)| *g));
         shared.push((key, s));
-        Some(gpu)
+        Some(out)
     })
     .flatten()?;
     let pooled = Arc::new(PooledBitmap::new(Bitmap::acquire()?));
@@ -708,6 +790,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     Some(Map {
         table,
         dirty,
+        vas,
         precise,
     })
 }
@@ -792,6 +875,30 @@ mod tests {
         assert_eq!(look_up(&dwords, 0x40_0010), (106, 0x10));
         assert_eq!(look_up(&dwords, 0).0, 100);
         assert_eq!(owner[BLOCK + 0x40], Some(2));
+    }
+
+    #[test]
+    fn va_table_populates_aligned_whole_pages_only() {
+        let copies = [
+            (0x40_0000, 0x2_0000),      // two whole aligned 64 KiB pages
+            (0x42_8000, 0x1_0000),      // spans two partial pages
+            (0x44_0000, 0x1_0000),      // whole page, unaligned host VA
+        ];
+        let copy_vas = [0x1_0000_0000u64, 0x2_0000_0000u64, 0x3_0000_0010u64];
+        let mut dwords = vec![0u32; TABLE_DWORDS];
+        let (_, blocks, owner) = write_table(&copies, &[10, 12, 14], 4, &mut dwords);
+        let mut vas = vec![0u32; owner.len() * 2];
+        write_va_table(&copies, &copy_vas, &blocks, &owner, &mut vas);
+        let read_va = |entry: usize| u64::from(vas[2 * entry]) | (u64::from(vas[2 * entry + 1]) << 32);
+        // Block 1 covers [0, 256 MiB); page 0x40 is 0x40_0000, 0x41 is 0x41_0000.
+        assert_eq!(read_va(BLOCK + 0x40), 0x1_0000_0000);
+        assert_eq!(read_va(BLOCK + 0x41), 0x1_0001_0000);
+        // Partial pages and unaligned host VAs yield 0 (software fallback).
+        assert_eq!(read_va(BLOCK + 0x42), 0);
+        assert_eq!(read_va(BLOCK + 0x43), 0);
+        assert_eq!(read_va(BLOCK + 0x44), 0);
+        // Unowned page yields 0.
+        assert_eq!(read_va(BLOCK + 0x50), 0);
     }
 
     #[test]

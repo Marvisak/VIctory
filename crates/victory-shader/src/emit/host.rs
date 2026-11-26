@@ -19,6 +19,165 @@ pub struct Host {
     warp: bool,
 }
 
+/// Active AMD D3D12 shader-intrinsics extension (`IAmdExtD3DShaderIntrinsics`)
+/// keeping hardware BVH ray-node intersection (`IntersectBvhNode`) enabled for
+/// the lifetime of its `ID3D12Device`.
+pub struct AmdExtGuard {
+    /// Opcode to emit in the magic UAV atomic phases (`0x22` for
+    /// `IntersectBvhNode`).
+    pub opcode: u8,
+    intrinsics: *mut std::ffi::c_void,
+    factory: *mut std::ffi::c_void,
+}
+
+// SAFETY: AMD D3D12 extension COM interfaces are device-scoped and released
+// only on drop; the pointers are never dereferenced concurrently.
+unsafe impl Send for AmdExtGuard {}
+// SAFETY: as above.
+unsafe impl Sync for AmdExtGuard {}
+
+impl Drop for AmdExtGuard {
+    fn drop(&mut self) {
+        // SAFETY: `intrinsics` and `factory` are valid COM `IUnknown*` pointers
+        // obtained from `AmdExtD3DCreateInterface` / `CreateInterface`.
+        unsafe {
+            type ReleaseFn = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+            let release = |obj: *mut std::ffi::c_void| {
+                if !obj.is_null() {
+                    let vtbl = *(obj as *const *const usize);
+                    let f: ReleaseFn = std::mem::transmute(*vtbl.add(2));
+                    f(obj);
+                }
+            };
+            release(self.intrinsics);
+            release(self.factory);
+        }
+    }
+}
+
+/// Enables AMD's D3D12 `IntersectBvhNode` hardware ray-node intersection shader
+/// intrinsic on `device` via the already-loaded `amdxc64.dll` driver module.
+///
+/// Returns `None` on non-AMD GPUs, WARP, or drivers without hardware BVH
+/// intrinsic support so callers fall back silently to software emulation.
+pub fn enable_amd_bvh(device: &ID3D12Device) -> Option<AmdExtGuard> {
+    use windows::core::{GUID, HRESULT};
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+
+    // IID_IAmdExtD3DFactory: {014937EC-9288-446F-A9AC-D75A8E3A984F}
+    const IID_FACTORY: GUID = GUID::from_u128(0x0149_37EC_9288_446F_A9AC_D75A_8E3A_984F);
+    // IID_IAmdExtD3DShaderIntrinsics: {BA019D53-CCAB-4CBD-B56A-7230ED4330AD}
+    const IID_INTRINSICS: GUID = GUID::from_u128(0xBA01_9D53_CCAB_4CBD_B56A_7230_ED43_30AD);
+    const SUPPORT_INTERSECT_INTERNAL: u32 = 0x0D;
+    const SUPPORT_INTERSECT_BVH_NODE: u32 = 0x19;
+    const OPCODE_INTERSECT_BVH_NODE: u8 = 0x22;
+
+    type CreateFactoryFn = unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        *const GUID,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT;
+    type CreateInterfaceFn = unsafe extern "system" fn(
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        *const GUID,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT;
+    type CheckSupportFn = unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> HRESULT;
+    type EnableFn = unsafe extern "system" fn(*mut std::ffi::c_void) -> HRESULT;
+    type ReleaseFn = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+
+    // SAFETY: queries DXGI/D3D12 feature support on `device`, then resolves
+    // `amdxc64.dll` (already loaded by the AMD D3D12 driver on a verified AMD
+    // hardware RT adapter); all vtable slots follow the published AMD AGS /
+    // `AmdExtD3D` COM ABI.
+    unsafe {
+        // Guard against mixed-GPU systems (e.g. AMD iGPU + NVIDIA dGPU) where
+        // `amdxc64.dll` may already be loaded in-process: never hand a foreign
+        // or software `ID3D12Device` to `AmdExtD3DCreateInterface`.
+        let luid = device.GetAdapterLuid();
+        let Ok(dxgi) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return None;
+        };
+        let Ok(adapter) = dxgi.EnumAdapterByLuid::<IDXGIAdapter1>(luid) else {
+            return None;
+        };
+        let Ok(desc) = adapter.GetDesc1() else {
+            return None;
+        };
+        if desc.VendorId != 0x1002
+            || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0
+        {
+            return None;
+        }
+        // Require hardware ray-tracing support (DXR tier >= 1.0, i.e. RDNA 2+)
+        // so pre-RDNA 2 AMD GPUs (GCN / RDNA 1) cannot pass the 0x0D fallback.
+        let mut opts5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+        if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS5,
+                (&raw mut opts5).cast(),
+                size_of_val(&opts5) as u32,
+            )
+            .is_err()
+            || opts5.RaytracingTier.0 < D3D12_RAYTRACING_TIER_1_0.0
+        {
+            return None;
+        }
+
+        let hmod = GetModuleHandleA(c"amdxc64.dll".as_ptr().cast());
+        if hmod.is_null() {
+            return None;
+        }
+        let proc = GetProcAddress(hmod, c"AmdExtD3DCreateInterface".as_ptr().cast())?;
+        let create_factory: CreateFactoryFn = std::mem::transmute(proc);
+
+        let dev_ptr = device.as_raw();
+        let mut factory: *mut std::ffi::c_void = std::ptr::null_mut();
+        if create_factory(dev_ptr, &IID_FACTORY, &mut factory).is_err() || factory.is_null() {
+            return None;
+        }
+        let release = |obj: *mut std::ffi::c_void| {
+            let vtbl = *(obj as *const *const usize);
+            let f: ReleaseFn = std::mem::transmute(*vtbl.add(2));
+            f(obj);
+        };
+
+        // IAmdExtD3DFactory::CreateInterface is vtable slot 3 (after IUnknown).
+        let f_vtbl = *(factory as *const *const usize);
+        let create_iface: CreateInterfaceFn = std::mem::transmute(*f_vtbl.add(3));
+        let mut intrinsics: *mut std::ffi::c_void = std::ptr::null_mut();
+        if create_iface(factory, dev_ptr, &IID_INTRINSICS, &mut intrinsics).is_err()
+            || intrinsics.is_null()
+        {
+            release(factory);
+            return None;
+        }
+
+        // IAmdExtD3DShaderIntrinsics: CheckSupport is slot 4, Enable is slot 5.
+        let i_vtbl = *(intrinsics as *const *const usize);
+        let check_support: CheckSupportFn = std::mem::transmute(*i_vtbl.add(4));
+        let enable: EnableFn = std::mem::transmute(*i_vtbl.add(5));
+
+        // RDNA 2/3 drivers report S_OK for 0x19 (IntersectBvhNode); RDNA 4
+        // drivers report E_NOINTERFACE for 0x19 while reporting S_OK for 0x0D
+        // and compiling opcode 0x22 natively to hardware BVH4 intersection.
+        let supported = check_support(intrinsics, SUPPORT_INTERSECT_BVH_NODE) == HRESULT(0)
+            || check_support(intrinsics, SUPPORT_INTERSECT_INTERNAL) == HRESULT(0);
+        if !supported || enable(intrinsics).is_err() {
+            release(intrinsics);
+            release(factory);
+            return None;
+        }
+
+        Some(AmdExtGuard {
+            opcode: OPCODE_INTERSECT_BVH_NODE,
+            intrinsics,
+            factory,
+        })
+    }
+}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
@@ -259,6 +418,10 @@ impl Host {
         if stages.iter().any(|(s, _)| s.view_marks) {
             views.push((super::VIEW_MARKS, super::MEMORY_SPACE, 1));
             views.push((super::VIEW_WRITES, super::MEMORY_SPACE, 2));
+        }
+        if stages.iter().any(|(s, _)| s.amd_bvh) {
+            views.push((super::MEMORY_VAS, super::MEMORY_SPACE, 1));
+            views.push((0, super::AMD_EXT_SPACE, 2));
         }
         for (register, space, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
@@ -814,6 +977,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        amd_bvh: lowered.amd_bvh,
     })
 }
 
@@ -913,6 +1077,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         heap: false,
         heap_writes: false,
         view_marks: false,
+        amd_bvh: false,
     }
 }
 
@@ -934,6 +1099,12 @@ pub enum Root {
     /// A root raw UAV of this many dwords, zeroed, read back after the
     /// heap's UAVs ([`Host::dispatch`] only).
     Uav(u32),
+    /// A root raw SRV of `2 * 4096` 64-bit page VAs with `entry` set to the
+    /// live host GPU virtual address of the first [`View::Memory`] buffer
+    /// ([`Host::dispatch`] only).
+    MemoryVaTable {
+        entry: usize,
+    },
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -1172,7 +1343,9 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) | Root::MemoryVaTable { .. } => {
+                        return Err("root views in a draw".into());
+                    }
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1553,6 +1726,7 @@ impl Host {
             let sampler_size =
                 dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
             let mut keep = Vec::new();
+            let mut memory_gpu_va: Option<u64> = None;
             // UAVs: (resource, dwords or texture size, readback buffer).
             let mut uavs = Vec::new();
             for (i, v) in d.views.iter().enumerate() {
@@ -1868,6 +2042,9 @@ impl Host {
                         dev.CreateShaderResourceView(b.as_ref(), Some(&srv), at);
                         dev.CreateUnorderedAccessView(b.as_ref(), None, Some(&uav), next);
                         if let Some(b) = b {
+                            if memory_gpu_va.is_none() {
+                                memory_gpu_va = Some(b.GetGPUVirtualAddress());
+                            }
                             let rb = make(
                                 D3D12_HEAP_TYPE_READBACK,
                                 &buffer(u64::from(n) * 4, D3D12_RESOURCE_FLAG_NONE),
@@ -1960,6 +2137,15 @@ impl Host {
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         uavs.push((b, None, n, rb));
+                    }
+                    &Root::MemoryVaTable { entry } => {
+                        let va = memory_gpu_va.ok_or("MemoryVaTable requires a View::Memory")?;
+                        let mut table = vec![0u32; 2 * 4096 * 2];
+                        table[2 * entry] = va as u32;
+                        table[2 * entry + 1] = (va >> 32) as u32;
+                        let b = upload(&table)?;
+                        list.SetComputeRootShaderResourceView(*param, b.GetGPUVirtualAddress());
+                        keep.push(b);
                     }
                 }
             }

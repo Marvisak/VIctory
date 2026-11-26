@@ -47,7 +47,7 @@
 //! public); programs use the ratios and the denominator's sign.
 
 use super::{Lower, Why};
-use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
+use crate::emit::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{Inst, Reg};
 use crate::resource::Source;
@@ -172,7 +172,11 @@ impl Lower<'_> {
         };
         // Inactive lanes may hold any pointer: they read nothing.
         let at = self.begin_guarded(guard);
-        let r = self.bvh_lanes(&nodes, node, &ray);
+        let hw_op = super::host_hw_bvh();
+        let r = match nodes {
+            Nodes::Raw(address) if hw_op != 0 => self.bvh_hw(address, node, &ray, hw_op),
+            _ => self.bvh_lanes(&nodes, node, &ray),
+        };
         let r = match r {
             Ok(r) => r,
             Err(why) => {
@@ -186,6 +190,169 @@ impl Lower<'_> {
             self.write(inst, Reg::V(out + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// Hardware BVH ray-node intersection via AMD D3D12 shader intrinsics
+    /// (`AmdExtD3DShaderIntrinsics_IntersectBvhNode`, opcode `0x22`).
+    ///
+    /// Translates the guest 64-bit node address to a 64-bit host GPU VA via
+    /// the page VA table (`t`[`crate::emit::MEMORY_VAS`] in `MEMORY_SPACE`),
+    /// and falls back to [`Self::bvh_lanes`] for unmapped pages (recording
+    /// misses in the dirty bitmap), partial or unaligned copies, and 128-byte
+    /// box32 nodes straddling a 64 KiB page boundary.
+    fn bvh_hw(
+        &mut self,
+        address: V,
+        node: V,
+        ray: &Ray,
+        opcode: u8,
+    ) -> Result<[V; 4], Why> {
+        let head = self.cur;
+        let i32t = self.s.t.i32;
+        let i64t = self.s.m.int(64);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let lo = self.s.m.cast(head, Cast::Trunc, address, i32t);
+        let hi_shifted = self.s.m.bin(head, Bin::LShr, address, k32);
+        let hi_raw = self.s.m.cast(head, Cast::Trunc, hi_shifted, i32t);
+        let mask16 = self.s.m.i32(0xFFFF);
+        let hi = self.s.m.bin(head, Bin::And, hi_raw, mask16);
+
+        let (k5, k6, k7) = (self.s.m.i32(5), self.s.m.i32(6), self.s.m.i32(7));
+        let kind = self.s.m.bin(head, Bin::And, node, k7);
+        let is_valid = self.s.m.cmp(head, pred::IULT, kind, k6);
+        let lookup_block = self.s.m.new_block();
+        let hw_block = self.s.m.new_block();
+        let sw_block = self.s.m.new_block();
+        let join = self.s.m.new_block();
+        self.s
+            .m
+            .terminate(head, Term::CondBr(is_valid, lookup_block, join));
+
+        // Look up the 64-bit host GPU VA for this 64 KiB guest page.
+        self.cur = lookup_block;
+        let (entry, _block, _l1) = self.memory_page(lo, hi);
+        let lc = self.cur;
+        let vas = self.s.memory_vas_handle();
+        let (k3, iu, both, align) = (
+            self.s.m.i32(3),
+            self.s.m.undef(i32t),
+            self.s.m.i8(3),
+            self.s.m.i32(4),
+        );
+        let va_off = self.s.m.bin(lc, Bin::Shl, entry, k3);
+        let loaded = self.s.op(
+            lc,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[vas, va_off, iu, both, align],
+        );
+        let f_lo = self.s.m.extract(lc, loaded, 0);
+        let va_lo = self.as_int(f_lo);
+        let f_hi = self.s.m.extract(lc, loaded, 1);
+        let va_hi = self.as_int(f_hi);
+
+        let zero = self.s.m.i32(0);
+        let within = self.s.m.bin(lc, Bin::And, lo, mask16);
+        let va_or = self.s.m.bin(lc, Bin::Or, va_lo, va_hi);
+        let mapped = self.s.m.cmp(lc, pred::NE, va_or, zero);
+        let mask63 = self.s.m.i32(63);
+        let va_or_within = self.s.m.bin(lc, Bin::Or, va_lo, within);
+        let low6 = self.s.m.bin(lc, Bin::And, va_or_within, mask63);
+        let aligned = self.s.m.cmp(lc, pred::EQ, low6, zero);
+        let is_box32 = self.s.m.cmp(lc, pred::EQ, kind, k5);
+        let max_box32 = self.s.m.i32(0xFF80);
+        let max_node64 = self.s.m.i32(0xFFC0);
+        let max_within = self.s.m.select(lc, is_box32, max_box32, max_node64);
+        let fits_in_page = self.s.m.cmp(lc, pred::IULE, within, max_within);
+        let ok0 = self.s.m.bin(lc, Bin::And, mapped, aligned);
+        let use_hw = self.s.m.bin(lc, Bin::And, ok0, fits_in_page);
+        self.s
+            .m
+            .terminate(lc, Term::CondBr(use_hw, hw_block, sw_block));
+
+        // Hardware BVH4 intersection via AMD's shader-intrinsics magic UAV.
+        self.cur = hw_block;
+        let node_lo = self.s.m.bin(hw_block, Bin::Add, va_lo, within);
+        let carry_bit = self.s.m.cmp(hw_block, pred::IULT, node_lo, va_lo);
+        let carry = self.s.m.cast(hw_block, Cast::ZExt, carry_bit, i32t);
+        let node_hi = self.s.m.bin(hw_block, Bin::Add, va_hi, carry);
+        let k29 = self.s.m.i32(29);
+        let sh_lo = self.s.m.bin(hw_block, Bin::LShr, node_lo, k3);
+        let hi_bits = self.s.m.bin(hw_block, Bin::Shl, node_hi, k29);
+        let ptr_lo_raw = self.s.m.bin(hw_block, Bin::Or, sh_lo, hi_bits);
+        let ptr_lo = self.s.m.bin(hw_block, Bin::Or, ptr_lo_raw, kind);
+        let ptr_hi = self.s.m.bin(hw_block, Bin::LShr, node_hi, k3);
+
+        let amd_uav = self.s.amd_ext_handle();
+        let phase0 = self.s.m.i32(0x5000_0000 | u32::from(opcode));
+        let phase1 = self.s.m.i32(0x5100_0000 | u32::from(opcode));
+        let f_extent = self.as_int(ray.extent);
+        let f_orig = [
+            self.as_int(ray.origin[0]),
+            self.as_int(ray.origin[1]),
+            self.as_int(ray.origin[2]),
+        ];
+        let f_dir = [
+            self.as_int(ray.dir[0]),
+            self.as_int(ray.dir[1]),
+            self.as_int(ray.dir[2]),
+        ];
+        let f_inv = [
+            self.as_int(ray.inv[0]),
+            self.as_int(ray.inv[1]),
+            self.as_int(ray.inv[2]),
+        ];
+        // AmdExtIntersectBvhNodeFlag: BoxSortEnable (1) | ReturnBarycentrics (2),
+        // zero box growth (`0`).
+        let flags_val = self.s.m.i32(3);
+        let args: [V; 14] = [
+            ptr_lo, ptr_hi, f_extent, f_orig[0], f_orig[1], f_orig[2], f_dir[0], f_dir[1],
+            f_dir[2], f_inv[0], f_inv[1], f_inv[2], flags_val, zero,
+        ];
+        for (idx, &val) in args.iter().enumerate() {
+            let idx_c = self.s.m.i32(idx as u32);
+            self.s.op(
+                hw_block,
+                "atomicCompareExchange.i32",
+                Attr::NoUnwind,
+                i32t,
+                79,
+                &[amd_uav, phase0, iu, iu, idx_c, val],
+            );
+        }
+        let mut hw_res = [zero; 4];
+        for (idx, dst) in hw_res.iter_mut().enumerate() {
+            let idx_c = self.s.m.i32(idx as u32);
+            *dst = self.s.op(
+                hw_block,
+                "atomicCompareExchange.i32",
+                Attr::NoUnwind,
+                i32t,
+                79,
+                &[amd_uav, phase1, iu, iu, idx_c, zero],
+            );
+        }
+        self.s.m.terminate(hw_block, Term::Br(join));
+
+        // Software fallback for unmapped/partial/unaligned/page-straddling nodes.
+        self.cur = sw_block;
+        let sw_res = self.bvh_lanes(&Nodes::Raw(address), node, ray)?;
+        let sw_end = self.cur;
+        self.s.m.terminate(sw_end, Term::Br(join));
+
+        self.cur = join;
+        let none = self.s.m.i32(INVALID);
+        let mut out = [zero; 4];
+        for k in 0..4 {
+            let phi = self.s.m.phi(join, i32t);
+            self.s
+                .m
+                .set_phi(phi, vec![(none, head), (hw_res[k], hw_block), (sw_res[k], sw_end)]);
+            out[k] = phi;
+        }
+        Ok(out)
     }
 
     /// The four result dwords of `ray` against the node `node` points to.

@@ -483,7 +483,7 @@ impl State {
     /// The host addresses of the bound view heap's title-memory page table
     /// and the list's page bitmap for it, set up on first use (the table
     /// names every host copy at each submission).
-    fn memory_map(&mut self, list: &HostList) -> Option<(u64, u64)> {
+    fn memory_map(&mut self, list: &HostList) -> Option<(u64, u64, Option<u64>)> {
         let heap = match self.heaps[0] {
             0 => MEMORY_HEAP,
             h => h,
@@ -491,10 +491,10 @@ impl State {
         if let Some((h, map)) = &self.memory
             && *h == heap
         {
-            return Some((map.table, map.dirty));
+            return Some((map.table, map.dirty, map.vas));
         }
         let map = crate::memory::bind(list, heap)?;
-        let out = (map.table, map.dirty);
+        let out = (map.table, map.dirty, map.vas);
         self.memory = Some((heap, map));
         Some(out)
     }
@@ -869,11 +869,16 @@ impl State {
                 }
             }
             if let Some(param) = stage.memory {
-                let Some((table, dirty)) = self.memory_map(list) else {
+                let Some((table, dirty, vas)) = self.memory_map(list) else {
                     once!("a shader reading title memory dropped: no view heap or page table");
                     not_run("title memory without a view heap or page table");
                     return false;
                 };
+                if stage.memory_vas.is_some() && vas.is_none() {
+                    once!("a hardware BVH shader dropped: no page VA table");
+                    not_run("hardware BVH without a page VA table");
+                    return false;
+                }
                 crate::memory::note_use(&p.name);
                 // What shaders write through a root UAV goes back by its
                 // bytes, as through root views ([`root_view`]).
@@ -893,6 +898,23 @@ impl State {
                         l.SetGraphicsRootShaderResourceView(param, table);
                     }
                     if let Some(param) = stage.memory_dirty {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, dirty);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, dirty);
+                        }
+                    }
+                    if let (Some(param), Some(vas)) = (stage.memory_vas, vas) {
+                        if compute {
+                            l.SetComputeRootShaderResourceView(param, vas);
+                        } else {
+                            l.SetGraphicsRootShaderResourceView(param, vas);
+                        }
+                    }
+                    if let Some(param) = stage.amd_ext {
+                        // AMD's shader-intrinsics magic UAV (`u0, space2147420894`)
+                        // is intercepted by the driver at compile time; binding the
+                        // live dirty-bitmap VA satisfies D3D12 root validation.
                         if compute {
                             l.SetComputeRootUnorderedAccessView(param, dirty);
                         } else {

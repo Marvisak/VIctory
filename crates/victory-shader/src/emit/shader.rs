@@ -40,6 +40,14 @@ pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
 /// The view-mark table's register: `t2` (a raw root SRV) in
 /// [`MEMORY_SPACE`] (`emit`, "Write marks").
 pub const VIEW_MARKS: u32 = 2;
+/// The title-memory page VA table's register: `t3` (a raw root SRV) in
+/// [`MEMORY_SPACE`]: per level-2 page-table entry, two dwords holding the
+/// 64-bit host GPU virtual address of that 64 KiB page (0 when unmapped,
+/// partial or unaligned), read by hardware BVH intersection.
+pub const MEMORY_VAS: u32 = 3;
+/// Register space of AMD's D3D12 shader-intrinsics magic UAV (`u0`), used to
+/// invoke `AmdExtD3DShaderIntrinsics_IntersectBvhNode`.
+pub const AMD_EXT_SPACE: u32 = 2_147_420_894;
 /// The written-pages bitmap of buffer views: `u1` (a raw root UAV) in
 /// [`MEMORY_SPACE`].
 pub const VIEW_WRITES: u32 = 1;
@@ -129,6 +137,12 @@ pub(crate) struct Shader {
     /// handles, once a write through a view is marked.
     pub view_marks: Option<V>,
     pub view_writes: Option<V>,
+    /// The title-memory page VA table's handle (`t3` in [`MEMORY_SPACE`]),
+    /// once hardware BVH intersection reads it.
+    pub memory_vas: Option<V>,
+    /// AMD's shader-intrinsics magic UAV handle (`u0` in [`AMD_EXT_SPACE`]),
+    /// once hardware BVH intersection emits an intrinsic call.
+    pub amd_ext: Option<V>,
     /// The heap index of each handle of an unordered buffer view (writes
     /// through it are marked by the index's view-mark entry).
     pub view_index: std::collections::HashMap<V, V>,
@@ -200,6 +214,8 @@ impl Shader {
             view_addresses: None,
             view_marks: None,
             view_writes: None,
+            memory_vas: None,
+            amd_ext: None,
             view_index: std::collections::HashMap::new(),
             texture_index: std::collections::HashMap::new(),
             texture_reads: Vec::new(),
@@ -463,6 +479,43 @@ impl Shader {
         h
     }
 
+    /// The handle of the title-memory page VA table (`t3` in [`MEMORY_SPACE`],
+    /// a raw buffer of 64-bit host GPU VAs per page-table entry), made in the
+    /// entry block.
+    pub fn memory_vas_handle(&mut self) -> V {
+        if let Some(h) = self.memory_vas {
+            return h;
+        }
+        let h = self.memory_space_handle(MEMORY_VAS, false);
+        self.memory_vas = Some(h);
+        h
+    }
+
+    /// The handle of AMD's shader-intrinsics magic UAV (`u0` in
+    /// [`AMD_EXT_SPACE`]), made in the entry block.
+    pub fn amd_ext_handle(&mut self) -> V {
+        if let Some(h) = self.amd_ext {
+            return h;
+        }
+        let r = self.m.i32(0);
+        let bind = [r, r, self.m.i32(AMD_EXT_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.amd_ext = Some(h);
+        h
+    }
+
     /// A raw buffer bound at `register` in [`MEMORY_SPACE`] (`uav`: `u`,
     /// else `t`), made in the entry block.
     fn memory_space_handle(&mut self, register: u32, uav: bool) -> V {
@@ -587,8 +640,10 @@ impl Shader {
         // of vertex, geometry and mesh programs), as DXC counts them: UAV
         // ranges declared below, not UAVs indexed from the heap.
         let compute = self.threads.is_some() && self.mesh.is_none() && self.gs.is_none();
-        let declared_uavs =
-            !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some();
+        let declared_uavs = !self.root_uavs.is_empty()
+            || self.memory_dirty.is_some()
+            || self.view_writes.is_some()
+            || self.amd_ext.is_some();
         if declared_uavs && !self.pixel && !compute {
             self.flags |= flags::UAVS_EVERY_STAGE;
         }
@@ -608,6 +663,8 @@ impl Shader {
             || self.view_addresses.is_some()
             || self.view_marks.is_some()
             || self.view_writes.is_some()
+            || self.memory_vas.is_some()
+            || self.amd_ext.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -666,6 +723,7 @@ impl Shader {
                 || self.memory.is_some()
                 || self.view_addresses.is_some()
                 || self.view_marks.is_some()
+                || self.memory_vas.is_some()
             {
                 let ty = self
                     .m
@@ -680,6 +738,7 @@ impl Shader {
                     .chain(self.memory.map(|_| (MEMORY_SPACE, 0)))
                     .chain(self.view_addresses.map(|_| (MEMORY_SPACE, 1)))
                     .chain(self.view_marks.map(|_| (MEMORY_SPACE, VIEW_MARKS)))
+                    .chain(self.memory_vas.map(|_| (MEMORY_SPACE, MEMORY_VAS)))
                     .collect();
                 for (n, (space, slot)) in all.into_iter().enumerate() {
                     let ops = vec![
@@ -719,6 +778,7 @@ impl Shader {
                     .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
                     .chain(self.memory_dirty.map(|_| (MEMORY_SPACE, 0)))
                     .chain(self.view_writes.map(|_| (MEMORY_SPACE, VIEW_WRITES)))
+                    .chain(self.amd_ext.map(|_| (AMD_EXT_SPACE, 0)))
                     .collect();
                 for (n, (space, slot)) in all.into_iter().enumerate() {
                     let ops = vec![
