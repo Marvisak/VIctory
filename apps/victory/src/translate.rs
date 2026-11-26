@@ -498,7 +498,11 @@ fn translate(
     else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    // Parsing validated the declared size. Include signatures and metadata,
+    // and stop at the container boundary since a raw source can run to EOF.
+    let size = u32::from_le_bytes(bytes[0x18..0x1c].try_into().expect("4 bytes")) as usize;
+    let hash = blake3::hash(&bytes[..size]);
+    if !lock(seen).insert(hash) {
         t.duplicates += 1;
         return;
     }
@@ -854,6 +858,73 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn container_with_input(semantic: &[u8; 8]) -> Vec<u8> {
+        [
+            b"DXBC".as_slice(),
+            &[0; 16], // digest
+            &1u32.to_le_bytes(), // version 1.0
+            &108u32.to_le_bytes(), // container size
+            &2u32.to_le_bytes(), // part count
+            &40u32.to_le_bytes(), // DXIL offset
+            &52u32.to_le_bytes(), // ISG1 offset
+            b"DXIL",
+            &4u32.to_le_bytes(),
+            b"test", // synthetic payload with no native programs
+            b"ISG1",
+            &48u32.to_le_bytes(),
+            &1u32.to_le_bytes(), // signature element count
+            &8u32.to_le_bytes(), // first element offset
+            &0u32.to_le_bytes(), // stream
+            &40u32.to_le_bytes(), // semantic name offset
+            &[0; 8], // semantic index and system value
+            &3u32.to_le_bytes(), // float component type
+            &0u32.to_le_bytes(), // register
+            &[0x0f, 0x0f, 0, 0], // masks and padding
+            &0u32.to_le_bytes(), // minimum precision
+            semantic,
+        ]
+        .concat()
+    }
+
+    fn duplicate_count(first: &[u8], second: &[u8]) -> usize {
+        let seen = Mutex::new(HashSet::new());
+        let mut tally = Tally::default();
+        let mut checks = Checks {
+            keep: None,
+            validator: None,
+            host: None,
+        };
+        for data in [first, second] {
+            translate(
+                &Source::Raw { offset: 0, data },
+                Path::new("shader.bin"),
+                &seen,
+                &mut tally,
+                &mut checks,
+            );
+        }
+        assert_eq!(tally.containers, 2);
+        assert!(tally.failed.is_empty(), "{:?}", tally.failed);
+        tally.duplicates
+    }
+
+    #[test]
+    fn dedup_keeps_distinct_input_signatures() {
+        let first = container_with_input(b"INPUT_A\0");
+        let second = container_with_input(b"INPUT_B\0");
+        assert_eq!(duplicate_count(&first, &second), 0);
+    }
+
+    #[test]
+    fn dedup_ignores_trailing_file_bytes() {
+        let first = container_with_input(b"INPUT_A\0");
+        let mut second = first.clone();
+        second.extend_from_slice(&[0; 16]);
+        assert_eq!(duplicate_count(&first, &second), 1);
+    }
+
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
     fn emit_dump_inside_repo_is_refused() {
