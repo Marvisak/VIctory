@@ -124,6 +124,43 @@ fn finite_lod(value: f32, fallback: f32) -> f32 {
     }
 }
 
+/// Sanitizes a title-supplied plain `D3D12_SAMPLER_DESC` for the host device.
+/// `CreateSampler` returns `void` and permanently removes the retail D3D12
+/// device (`DXGI_ERROR_INVALID_CALL`) on invalid filter, address mode,
+/// anisotropy, comparison function, LOD bias, or NaN LOD bounds.
+pub(crate) fn sanitize(mut desc: D3D12_SAMPLER_DESC, aniso_point_mip: bool) -> D3D12_SAMPLER_DESC {
+    let raw = desc.Filter.0 as u32;
+    let reduction = raw >> 7;
+    let base = raw & 0x7F;
+    desc.Filter = if reduction <= 3 && (base & !0x15 == 0 || base == 0x54 || base == 0x55) {
+        let base = if base == 0x54 && !aniso_point_mip {
+            0x55
+        } else {
+            base
+        };
+        D3D12_FILTER((reduction << 7 | base) as i32)
+    } else {
+        D3D12_FILTER_MIN_MAG_MIP_LINEAR
+    };
+    desc.AddressU = address_mode(desc.AddressU.0 as u32);
+    desc.AddressV = address_mode(desc.AddressV.0 as u32);
+    desc.AddressW = address_mode(desc.AddressW.0 as u32);
+    desc.MipLODBias = if desc.MipLODBias.is_nan() {
+        0.0
+    } else {
+        desc.MipLODBias
+            .clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX)
+    };
+    desc.MaxAnisotropy = desc.MaxAnisotropy.min(16);
+    desc.ComparisonFunc = match desc.ComparisonFunc.0 {
+        1..=8 => desc.ComparisonFunc,
+        _ => D3D12_COMPARISON_FUNC_NEVER,
+    };
+    desc.MinLOD = finite_lod(desc.MinLOD, 0.0);
+    desc.MaxLOD = finite_lod(desc.MaxLOD, D3D12_FLOAT32_MAX);
+    desc
+}
+
 /// The console's sampler description (27 words): flags, magnification,
 /// minification, mip and depth filters, filter mode, three address modes,
 /// minimum and maximum LOD, LOD bias, secondary bias, anisotropy, its bias
@@ -326,5 +363,46 @@ mod tests {
             ]
         );
         assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
+    }
+
+    #[test]
+    fn plain_sampler_sanitization_preserves_valid_and_clamps_invalid() {
+        let valid = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER(0xd4), // comparison aniso point mip
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_MIRROR,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
+            MipLODBias: -3.5,
+            MaxAnisotropy: 8,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+            BorderColor: [0.25, 0.5, 0.75, 1.0],
+            MinLOD: 1.0,
+            MaxLOD: 12.0,
+        };
+        assert_eq!(sanitize(valid, true), valid);
+        assert_eq!(sanitize(valid, false).Filter, D3D12_FILTER(0xd5));
+
+        let invalid = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER(0x50),
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE(0),
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE(6),
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE(-1),
+            MipLODBias: f32::NAN,
+            MaxAnisotropy: 32,
+            ComparisonFunc: D3D12_COMPARISON_FUNC(9),
+            BorderColor: [1.0; 4],
+            MinLOD: f32::NAN,
+            MaxLOD: f32::NAN,
+        };
+        let clean = sanitize(invalid, true);
+        assert_eq!(clean.Filter, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
+        assert_eq!(
+            [clean.AddressU, clean.AddressV, clean.AddressW],
+            [D3D12_TEXTURE_ADDRESS_MODE_CLAMP; 3]
+        );
+        assert_eq!(clean.MipLODBias, 0.0);
+        assert_eq!(clean.MaxAnisotropy, 16);
+        assert_eq!(clean.ComparisonFunc, D3D12_COMPARISON_FUNC_NEVER);
+        assert_eq!((clean.MinLOD, clean.MaxLOD), (0.0, D3D12_FLOAT32_MAX));
     }
 }

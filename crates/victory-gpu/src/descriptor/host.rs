@@ -1574,6 +1574,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     .cast::<D3D12_SAMPLER_DESC>()
                     .read_unaligned()
             };
+            let desc = crate::sampler::sanitize(desc, crate::sampler::aniso_point_mip(device));
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)
@@ -2461,5 +2462,152 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn plain_sampler_descriptions_are_sanitized_before_host_creation() {
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(true, 64) else {
+            return;
+        };
+        let base = || -> [u32; 13] {
+            [
+                D3D12_FILTER_MIN_MAG_MIP_LINEAR.0 as u32,
+                D3D12_TEXTURE_ADDRESS_MODE_CLAMP.0 as u32,
+                D3D12_TEXTURE_ADDRESS_MODE_CLAMP.0 as u32,
+                D3D12_TEXTURE_ADDRESS_MODE_CLAMP.0 as u32,
+                0.0f32.to_bits(),
+                1,
+                D3D12_COMPARISON_FUNC_NEVER.0 as u32,
+                0,
+                0,
+                0,
+                0,
+                0.0f32.to_bits(),
+                D3D12_FLOAT32_MAX.to_bits(),
+            ]
+        };
+        let with = |f: fn(&mut [u32; 13])| {
+            let mut w = base();
+            f(&mut w);
+            w
+        };
+        let cases: &[(&str, [u32; 13])] = &[
+            // Invalid sampler descriptions that remove the retail D3D12 device on unmodified main
+            ("bad_filter_ffff", with(|w| w[0] = 0xFFFF)),
+            ("bad_filter_02", with(|w| w[0] = 0x02)),
+            ("bad_filter_50", with(|w| w[0] = 0x50)),
+            ("bad_filter_200", with(|w| w[0] = 0x200)),
+            ("addr_u_0", with(|w| w[1] = 0)),
+            ("addr_v_6", with(|w| w[2] = 6)),
+            ("addr_w_99", with(|w| w[3] = 99)),
+            ("aniso_17_plain", with(|w| w[5] = 17)),
+            (
+                "aniso_17_aniso",
+                with(|w| {
+                    w[0] = D3D12_FILTER_ANISOTROPIC.0 as u32;
+                    w[5] = 17;
+                }),
+            ),
+            (
+                "cmp_9_comparison",
+                with(|w| {
+                    w[0] = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR.0 as u32;
+                    w[6] = 9;
+                }),
+            ),
+            ("bias_20", with(|w| w[4] = 20.0f32.to_bits())),
+            ("bias_neg20", with(|w| w[4] = (-20.0f32).to_bits())),
+            ("bias_nan", with(|w| w[4] = f32::NAN.to_bits())),
+            ("bias_inf", with(|w| w[4] = f32::INFINITY.to_bits())),
+            ("minlod_nan", with(|w| w[11] = f32::NAN.to_bits())),
+            ("maxlod_nan", with(|w| w[12] = f32::NAN.to_bits())),
+            // Valid boundary sampler descriptions
+            ("valid_base", base()),
+            (
+                "valid_aniso_point_mip",
+                with(|w| {
+                    w[0] = 0x54;
+                    w[5] = 16;
+                }),
+            ),
+            (
+                "valid_comparison_le",
+                with(|w| {
+                    w[0] = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR.0 as u32;
+                    w[6] = D3D12_COMPARISON_FUNC_LESS_EQUAL.0 as u32;
+                }),
+            ),
+            (
+                "valid_min_max_reduction",
+                with(|w| {
+                    w[0] = D3D12_FILTER_MAXIMUM_ANISOTROPIC.0 as u32;
+                    w[1] = D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE.0 as u32;
+                    w[5] = 8;
+                    w[4] = D3D12_MIP_LOD_BIAS_MAX.to_bits();
+                }),
+            ),
+            (
+                "valid_zero_aniso_plain",
+                with(|w| {
+                    w[5] = 0;
+                    w[11] = 4.0f32.to_bits();
+                    w[12] = 1.0f32.to_bits();
+                }),
+            ),
+        ];
+
+        let msg_count = || {
+            windows::core::Interface::cast::<ID3D12InfoQueue>(&host.device).map_or(0, |q| {
+                // SAFETY: plain info-queue count query.
+                unsafe { q.GetNumStoredMessages() }
+            })
+        };
+        let check_sampler_errors = |name: &str, before: u64| {
+            // SAFETY: plain device query.
+            let reason = unsafe { host.device.GetDeviceRemovedReason() };
+            assert!(reason.is_ok(), "{name} removed the host device: {reason:?}");
+            let Ok(queue) = windows::core::Interface::cast::<ID3D12InfoQueue>(&host.device) else {
+                return;
+            };
+            // SAFETY: each stored message is read into a buffer of its reported size.
+            unsafe {
+                let total = queue.GetNumStoredMessages();
+                let start = before.min(total);
+                for i in start..total {
+                    let mut size = 0;
+                    if queue.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u64; size.div_ceil(8)];
+                    let msg = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    if queue.GetMessage(i, Some(msg), &mut size).is_ok()
+                        && (*msg).Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0
+                    {
+                        let text = String::from_utf8_lossy(std::slice::from_raw_parts(
+                            (*msg).pDescription,
+                            (*msg).DescriptionByteLength,
+                        ));
+                        let text = text.trim_end_matches('\0');
+                        assert!(
+                            !text.contains("CreateSampler"),
+                            "{name} emitted D3D12 debug error: {text}"
+                        );
+                    }
+                }
+            }
+        };
+
+        let mut slot_mem = [0u32; 8];
+        let handle = slot_mem.as_mut_ptr() as u64;
+        for (idx, &(name, words)) in cases.iter().enumerate() {
+            crate::descriptor::create_sampler(std::ptr::null(), &words, handle);
+            let before = msg_count();
+            let view = heap.mirror(idx as u32, handle, true).unwrap();
+            heap.make_at(heap.count + idx as u32, &view);
+            check_sampler_errors(name, before);
+        }
     }
 }
