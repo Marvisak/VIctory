@@ -86,15 +86,24 @@ impl<'a> Container<'a> {
         let mut parts = Vec::with_capacity(count);
         for i in 0..count {
             let offset = u32_at(data, HEADER_SIZE + 4 * i)? as usize;
+            let header_end = offset
+                .checked_add(4)
+                .ok_or(ShaderError::Malformed("part header out of bounds"))?;
             let fourcc = FourCC(
-                data.get(offset..offset + 4)
+                data.get(offset..header_end)
                     .ok_or(ShaderError::Malformed("part header out of bounds"))?
                     .try_into()
                     .expect("4 bytes"),
             );
-            let size = u32_at(data, offset + 4)? as usize;
+            let size = u32_at(data, header_end)? as usize;
+            let body_start = offset
+                .checked_add(8)
+                .ok_or(ShaderError::Malformed("part data out of bounds"))?;
+            let body_end = body_start
+                .checked_add(size)
+                .ok_or(ShaderError::Malformed("part data out of bounds"))?;
             let body = data
-                .get(offset + 8..offset + 8 + size)
+                .get(body_start..body_end)
                 .ok_or(ShaderError::Malformed("part data out of bounds"))?;
             parts.push(Part {
                 fourcc,
@@ -115,19 +124,22 @@ impl<'a> Container<'a> {
 }
 
 pub(crate) fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
-    data.get(at..at + 2)
+    at.checked_add(2)
+        .and_then(|end| data.get(at..end))
         .map(|b| u16::from_le_bytes(b.try_into().expect("2 bytes")))
         .ok_or(ShaderError::Malformed("truncated"))
 }
 
 pub(crate) fn u32_at(data: &[u8], at: usize) -> Result<u32, ShaderError> {
-    data.get(at..at + 4)
+    at.checked_add(4)
+        .and_then(|end| data.get(at..end))
         .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
         .ok_or(ShaderError::Malformed("truncated"))
 }
 
 pub(crate) fn u64_at(data: &[u8], at: usize) -> Result<u64, ShaderError> {
-    data.get(at..at + 8)
+    at.checked_add(8)
+        .and_then(|end| data.get(at..end))
         .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
         .ok_or(ShaderError::Malformed("truncated"))
 }
@@ -180,5 +192,52 @@ mod tests {
         assert!(Container::parse(&bytes).is_err());
         bytes.truncate(last);
         assert!(Container::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn helpers_overflow_safely() {
+        let data = [0u8; 16];
+        for offset in [
+            usize::MAX,
+            usize::MAX - 1,
+            usize::MAX - 2,
+            usize::MAX - 3,
+            usize::MAX - 4,
+            usize::MAX - 7,
+            usize::MAX - 8,
+        ] {
+            assert_eq!(
+                u16_at(&data, offset),
+                Err(ShaderError::Malformed("truncated"))
+            );
+            assert_eq!(
+                u32_at(&data, offset),
+                Err(ShaderError::Malformed("truncated"))
+            );
+            assert_eq!(
+                u64_at(&data, offset),
+                Err(ShaderError::Malformed("truncated"))
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_max_offset_and_size() {
+        // Part with u32::MAX offset
+        let mut bytes = build(&[(FourCC::SFI0, &[0; 8])]);
+        bytes[0x20..0x24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            Container::parse(&bytes).unwrap_err(),
+            ShaderError::Malformed("part header out of bounds")
+        );
+
+        // Part with u32::MAX size
+        let mut bytes = build(&[(FourCC::SFI0, &[0; 8])]);
+        let part_offset = u32_at(&bytes, 0x20).unwrap() as usize;
+        bytes[part_offset + 4..part_offset + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            Container::parse(&bytes).unwrap_err(),
+            ShaderError::Malformed("part data out of bounds")
+        );
     }
 }
