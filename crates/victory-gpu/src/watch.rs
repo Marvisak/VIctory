@@ -860,27 +860,80 @@ fn mark(g: &Guards, first: usize, last: usize) {
 }
 
 /// The runtime mapped the page at `at` where `others` show it already: the
-/// pages are linked both ways, and if we guard it there, it is guarded here
-/// too (a write through the new mapping must not go unseen by the trackers
-/// there).
+/// pages are joined into one alias group, and their guards stay consistent:
+/// if only the new mapping's group is unguarded it is guarded too, and if
+/// any mapping that may already have been written was left unguarded (or
+/// the new mapping's group cannot be guarded), the whole group is marked
+/// changed and opened so no write goes unseen.
 pub fn title_memory_aliased(at: usize, others: &[usize]) {
+    if others.is_empty() {
+        return;
+    }
     let mut g = guards();
     let page = at / PAGE;
+    let mut new_group = vec![page];
+    expand_aliases(&g, &mut new_group);
+    let mut clique = new_group.clone();
     for &other in others {
-        for (x, y) in [(other / PAGE, page), (page, other / PAGE)] {
-            let links = g.alias_of.entry(x).or_default();
-            if !links.contains(&y) {
+        let other = other / PAGE;
+        if !clique.contains(&other) {
+            clique.push(other);
+        }
+    }
+    expand_aliases(&g, &mut clique);
+    if clique.len() <= 1 {
+        return;
+    }
+    for &x in &clique {
+        let links = g.alias_of.entry(x).or_default();
+        for &y in &clique {
+            if x != y && !links.contains(&y) {
                 links.push(y);
             }
         }
     }
-    // If the new mapping cannot be guarded (a write the guards do not see is
-    // under way through it), the page is changed; its bytes now may hold that
-    // write already, so nothing is saved of them.
-    if others.iter().any(|&o| g.protected.contains(&(o / PAGE)))
-        && protect(&mut g, &[page]).is_empty()
-    {
+    let existing = &clique[new_group.len()..];
+    let new_guarded = new_group.iter().any(|p| g.protected.contains(p));
+    let existing_guarded = existing.iter().any(|p| g.protected.contains(p));
+    let existing_unguarded = existing.iter().any(|p| !g.protected.contains(p));
+    let unguarded: Vec<usize> = clique
+        .iter()
+        .copied()
+        .filter(|p| !g.protected.contains(p))
+        .collect();
+    if unguarded.is_empty() || (!new_guarded && !existing_guarded) {
+        return;
+    }
+    if !new_guarded && !existing_unguarded {
+        // Every existing mapping is guarded and only the new mapping's group
+        // is not. If any page in it cannot be guarded (a write the guards do
+        // not see is under way through it), mark the whole group changed
+        // without saving: its bytes may hold that write already.
+        if protect(&mut g, &unguarded).len() < unguarded.len() {
+            changed(&mut g, page, page + 1, false);
+        }
+    } else {
+        // Some mapping that could already be written stayed unguarded while
+        // another in the group was guarded (for example, a take raced between
+        // `title_memory_remapped` and `title_memory_aliased`): mark and open
+        // the whole group without saving so neither a raced write nor later
+        // writes through the unguarded mapping go unseen.
         changed(&mut g, page, page + 1, false);
+    }
+}
+
+/// Extends `pages` with every page reachable from them through `alias_of`.
+fn expand_aliases(g: &Guards, pages: &mut Vec<usize>) {
+    let mut i = 0;
+    while i < pages.len() {
+        if let Some(existing) = g.alias_of.get(&pages[i]) {
+            for &alias in existing {
+                if !pages.contains(&alias) {
+                    pages.push(alias);
+                }
+            }
+        }
+        i += 1;
     }
 }
 
@@ -1445,5 +1498,209 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// `N` unlinked views of one fresh 64 KiB pagefile section.
+    fn shared_views<const N: usize>() -> [usize; N] {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
+        };
+        // SAFETY: a fresh 64 KiB pagefile section mapped `N` times.
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                PAGE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let views = std::array::from_fn(|_| {
+                let v = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE).Value as usize;
+                assert_ne!(v, 0);
+                v
+            });
+            CloseHandle(section);
+            views
+        }
+    }
+
+    /// Unlinks and unmaps views created by [`shared_views`].
+    fn unmap_views(views: &[usize]) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        for &v in views {
+            title_memory_remapped(v, PAGE);
+            // SAFETY: a view mapped by `shared_views`.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ }) };
+        }
+    }
+
+    fn page_protection(at: usize) -> u32 {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        info.Protect
+    }
+
+    /// When a mapping is already guarded (for example, a submission took it
+    /// between `title_memory_remapped` and `title_memory_aliased`) and then
+    /// linked to an unguarded mapping of the same page, the group must be
+    /// marked changed and opened: neither a write that already landed through
+    /// the unguarded mapping nor later writes through it may go unseen.
+    #[test]
+    fn aliasing_a_guarded_page_to_an_unguarded_mapping_does_not_miss_writes() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        let [a, b, c, d] = shared_views();
+        let t = track(a, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        t.arm(a, a + PAGE);
+        assert_eq!(page_protection(a), PAGE_READONLY);
+        assert_eq!(page_protection(b), PAGE_READWRITE);
+        // A write lands through `b` before `title_memory_aliased(a, &[b])`.
+        // SAFETY: `b` is a live read-write view of the shared page.
+        unsafe { (b as *mut u32).write_volatile(0x1122_3344) };
+        title_memory_aliased(a, &[b]);
+        assert!(
+            t.changed(a / PAGE),
+            "a write through the unguarded alias must not be missed"
+        );
+        assert!(
+            t.saved(a / PAGE).is_none(),
+            "post-write bytes must not be saved as pre-write"
+        );
+        assert!(
+            !guards().protected.contains(&(a / PAGE)),
+            "guarded mapping is opened with the mark"
+        );
+        t.disarm();
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        // SAFETY: `a` shares physical backing with `b`.
+        assert_eq!(unsafe { (a as *const u32).read_volatile() }, 0x1122_3344);
+        assert_eq!(page_protection(a), PAGE_READONLY);
+        assert_eq!(page_protection(b), PAGE_READONLY);
+        // Subsequent writes through `b` now fault and mark `t`.
+        // SAFETY: `b` is guarded; the vectored handler opens it on write.
+        unsafe { (b as *mut u32).write_volatile(0x5566_7788) };
+        assert!(t.changed(a / PAGE));
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        // Mixed `others`: `b` is guarded while `c` is unguarded and written.
+        // SAFETY: `c` is not linked or guarded yet.
+        unsafe { (c as *mut u32).write_volatile(0x99aa_bbcc) };
+        title_memory_aliased(d, &[b, c]);
+        assert!(
+            t.changed(a / PAGE),
+            "linking a guarded alias with an unguarded one marks trackers"
+        );
+        drop(t);
+        unmap_views(&[a, b, c, d]);
+    }
+
+    /// Linking a new mapping to one member of an existing alias group joins
+    /// the whole group transitively, so guards, writes, retakes, tracker
+    /// drops, and unmapping the bridge page all stay consistent across the
+    /// remaining mappings.
+    #[test]
+    fn aliasing_through_one_member_joins_the_whole_alias_group() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        let [a, b, c] = shared_views();
+        title_memory_aliased(b, &[a]);
+        title_memory_aliased(c, &[a]);
+        let t = track_copy(b, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(b, b + PAGE), [(b, b + PAGE)]);
+        assert_eq!(page_protection(a), PAGE_READONLY);
+        assert_eq!(page_protection(b), PAGE_READONLY);
+        assert_eq!(page_protection(c), PAGE_READONLY);
+        // A write through `c` faults and marks `b`'s tracker.
+        // SAFETY: `c` is guarded; the handler opens it and marks `t`.
+        unsafe { (c as *mut u32).write_volatile(0xcafe_babe) };
+        assert!(t.changed(b / PAGE));
+        assert_eq!(t.take(b, b + PAGE), [(b, b + PAGE)]);
+        // `retake` at `c` marks `b`'s buffer-copy tracker.
+        retake(c, 16);
+        assert!(t.changed(b / PAGE));
+        assert_eq!(t.take(b, b + PAGE), [(b, b + PAGE)]);
+        // Dropping a tracker on `c` keeps `c` guarded while `t` holds `b`.
+        let u = track(c, PAGE, true).expect("views are tracked");
+        assert_eq!(u.take(c, c + PAGE), [(c, c + PAGE)]);
+        drop(u);
+        assert_eq!(page_protection(c), PAGE_READONLY);
+        // Unmapping the bridge `a` must not sever `b` and `c`.
+        title_memory_remapped(a, PAGE);
+        assert_eq!(t.take(b, b + PAGE), [(b, b + PAGE)]);
+        assert_eq!(page_protection(c), PAGE_READONLY);
+        // SAFETY: `c` is still linked to `b` and guarded.
+        unsafe { (c as *mut u32).write_volatile(0xdead_beef) };
+        assert!(
+            t.changed(b / PAGE),
+            "unmapping `a` must not break `b` <-> `c`"
+        );
+        drop(t);
+        unmap_views(&[a, b, c]);
+    }
+
+    /// Joining an unguarded group to an all-guarded group guards every page
+    /// in the new group; if any sibling in the new group is busy under a
+    /// kernel write, the whole merged group is marked changed and opened.
+    #[test]
+    fn aliasing_a_newly_mapped_page_guards_its_group_and_handles_busy_siblings() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        let [a, b, c, d, e, f] = shared_views();
+        title_memory_aliased(b, &[a]);
+        let t = track(a, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        title_memory_aliased(d, &[c]);
+        title_memory_aliased(c, &[a]);
+        assert!(
+            t.clean(),
+            "guarding a fresh unguarded group keeps the tracker clean"
+        );
+        for v in [a, b, c, d] {
+            assert_eq!(page_protection(v), PAGE_READONLY);
+        }
+        // Writing through `c`'s sibling `d` faults and marks `t`.
+        // SAFETY: `d` is guarded as part of the merged group.
+        unsafe { (d as *mut u32).write_volatile(1) };
+        assert!(t.changed(a / PAGE));
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        // Now join a group whose sibling `f` (not `e` itself) is busy.
+        title_memory_aliased(f, &[e]);
+        let busy = writing(f, 16);
+        title_memory_aliased(e, &[a]);
+        assert!(
+            t.changed(a / PAGE),
+            "a busy sibling must mark the tracked page changed"
+        );
+        let g = guards();
+        for v in [a, b, c, d, e, f] {
+            assert!(
+                !g.protected.contains(&(v / PAGE)),
+                "no partial guard left behind"
+            );
+        }
+        drop(g);
+        drop(busy);
+        drop(t);
+        unmap_views(&[a, b, c, d, e, f]);
+    }
+
+    /// Empty or self-only alias calls neither add a self-link nor disturb
+    /// existing guards.
+    #[test]
+    fn self_aliasing_adds_no_self_link_and_preserves_guards() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        let [a] = shared_views();
+        let t = track(a, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        title_memory_aliased(a, &[]);
+        title_memory_aliased(a, &[a, a + 128]);
+        assert!(!guards().alias_of.contains_key(&(a / PAGE)));
+        assert!(t.clean());
+        assert_eq!(page_protection(a), PAGE_READONLY);
+        drop(t);
+        unmap_views(&[a]);
     }
 }
