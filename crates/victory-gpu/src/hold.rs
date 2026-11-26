@@ -42,12 +42,15 @@ const ALWAYS: u32 = 8;
 impl ValueWait {
     /// Whether it holds with `read` giving the memory's value: `None` for a
     /// comparison we do not know (counted by the caller, taken as holding)
-    /// and for memory that cannot be read (taken as not holding).
+    /// and `Some(false)` for memory that cannot be read (taken as not holding).
     pub(crate) fn holds(&self, read: &dyn Fn(u64, u8) -> Option<u64>) -> Option<bool> {
         if !(NEVER..=ALWAYS).contains(&self.comparison) {
             return None;
         }
-        let value = read(self.address, self.bytes)? & self.mask;
+        let Some(raw) = read(self.address, self.bytes) else {
+            return Some(false);
+        };
+        let value = raw & self.mask;
         let reference = self.reference;
         Some(match self.comparison {
             NEVER => false,
@@ -295,7 +298,45 @@ mod tests {
         assert_eq!(w(GREATER, 4).holds(&read), Some(true));
         assert_eq!(w(0, 5).holds(&read), None, "unknown comparison");
         assert_eq!(w(9, 5).holds(&read), None);
-        assert_eq!(w(EQUAL, 5).holds(&|_, _| None), None, "unreadable memory");
+        assert_eq!(w(EQUAL, 5).holds(&|_, _| None), Some(false), "unreadable memory");
+    }
+
+    #[test]
+    fn unreadable_memory_holds_the_queue_without_counting_as_unknown() {
+        let mut held = Held::default();
+        let wait = ge(0x200, 1);
+        held.push(2, Item::Segment("waiter", vec![wait]));
+
+        let mut ran = Vec::new();
+        let unreadable = |_, _| None;
+        let fence = |_| 0;
+        let mut signal = |_, _| {};
+        let p = held.pump(&mut World {
+            read: &unreadable,
+            fence: &fence,
+            run: &mut |q, segs| ran.push((q, segs)),
+            signal: &mut signal,
+        });
+        assert_eq!((p.pieces, p.segments, p.unknown), (0, 0, 0));
+        assert!(ran.is_empty());
+        assert!(held.holds_work(2));
+
+        let blocked = held.blocked(&unreadable);
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].0, 2);
+        assert_eq!(blocked[0].3, vec![wait]);
+
+        // Once the memory becomes readable and meets the wait, the segment runs.
+        let readable = |a, _| (a == 0x200).then_some(1);
+        let p = held.pump(&mut World {
+            read: &readable,
+            fence: &fence,
+            run: &mut |q, segs| ran.push((q, segs)),
+            signal: &mut signal,
+        });
+        assert_eq!((p.pieces, p.segments, p.unknown, p.waited.len()), (1, 1, 0, 1));
+        assert_eq!(ran, vec![(2, vec!["waiter"])]);
+        assert!(held.is_empty());
     }
 
     /// The compute queue's list waits for a value the graphics queue's list
