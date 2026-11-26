@@ -16,16 +16,56 @@
 //! of the key, so changing the encoding invalidates every entry.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, UserData, Wave64Mode};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
+static WAVE64_MODE: AtomicU8 = AtomicU8::new(0);
+static WAVE64_CAPS: AtomicU8 = AtomicU8::new(0);
+
+fn mode_byte(mode: Wave64Mode) -> u8 {
+    match mode {
+        Wave64Mode::Native => 0,
+        Wave64Mode::Wave32 => 1,
+        Wave64Mode::Emulate => 2,
+    }
+}
+
+/// Records the host device's preferred Wave64 compute lowering strategy and
+/// supported hardware wave sizes.
+#[cfg(windows)]
+pub(crate) fn set_wave64_mode(
+    mode: Wave64Mode,
+    supports_wave32: bool,
+    supports_wave64: bool,
+) {
+    WAVE64_MODE.store(mode_byte(mode), Ordering::Relaxed);
+    let caps = u8::from(supports_wave32) | (u8::from(supports_wave64) << 1);
+    WAVE64_CAPS.store(caps, Ordering::Relaxed);
+}
+
+fn effective_wave64_mode() -> Wave64Mode {
+    if let Ok(v) = std::env::var("VICTORY_WAVE64_EMULATE") {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "0" | "native" => return Wave64Mode::Native,
+            "wave32" | "32" => return Wave64Mode::Wave32,
+            "1" | "emulate" | "force" => return Wave64Mode::Emulate,
+            "" | "auto" => {}
+            other => tracing::warn!(value = other, "unknown VICTORY_WAVE64_EMULATE; using auto"),
+        }
+    }
+    match WAVE64_MODE.load(Ordering::Relaxed) {
+        1 => Wave64Mode::Wave32,
+        2 => Wave64Mode::Emulate,
+        _ => Wave64Mode::Native,
+    }
+}
 
 /// Keeps translated shaders in a folder of `dir` from now on: the folder
 /// of this translator, `None` if it cannot be opened.
@@ -84,16 +124,68 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let wave64 = effective_wave64_mode();
+    let translate = |c: &[u8]| {
+        let mut first = None;
+        for wave64 in lowerings(wave64) {
+            let options = victory_shader::emit::Options {
+                view_marks: true,
+                wave64,
+            };
+            match victory_shader::emit::translate_with(c, options) {
+                Ok(shader) => return Ok(shader),
+                Err(e) => {
+                    first.get_or_insert(e.to_string());
+                }
+            }
+        }
+        Err(first.unwrap_or_default())
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, build(), wave64, container, translate),
         None => (translate(container), false),
     }
 }
 
-/// The cache entry's converter: the build and the container in, the
-/// encoded translation (or refusal) out. `ran` tells a miss from a hit;
+/// The lowerings a translation tries in turn when `mode` is asked for. The
+/// two 64-lane emulations refuse different programs (Wave32 one with a
+/// cross-lane operation in divergent control flow, Emulate one with a
+/// `v_readfirstlane` there), so a program one refuses tries the other, then
+/// the native lowering, whose `WaveSize(64)` a 32-lane host may still refuse
+/// when it makes the pipeline. The refusal kept is the one of `mode`.
+fn lowerings(mode: Wave64Mode) -> Vec<Wave64Mode> {
+    let caps = WAVE64_CAPS.load(Ordering::Relaxed);
+    lowerings_for(mode, caps & 1 != 0, caps & 2 != 0)
+}
+
+fn lowerings_for(
+    mode: Wave64Mode,
+    supports_wave32: bool,
+    supports_wave64: bool,
+) -> Vec<Wave64Mode> {
+    let mut out = vec![mode];
+    match mode {
+        Wave64Mode::Native => {}
+        Wave64Mode::Wave32 => {
+            out.push(Wave64Mode::Emulate);
+            if supports_wave64 {
+                out.push(Wave64Mode::Native);
+            }
+        }
+        Wave64Mode::Emulate => {
+            if supports_wave32 {
+                out.push(Wave64Mode::Wave32);
+            }
+            if supports_wave64 {
+                out.push(Wave64Mode::Native);
+            }
+        }
+    }
+    out
+}
+
+/// The cache entry's converter: the build, the lowering mode and the
+/// container in, the encoded translation (or refusal) out. `ran` tells a miss from a hit;
 /// `made` keeps a miss's translation, so the entry just written is not read
 /// back (the first read of a new file costs about as much as a small
 /// translation where a virus scanner looks at it: 0.5-3 ms here).
@@ -113,7 +205,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let made = (self.translate)(&input[32..]);
+        let made = (self.translate)(&input[33..]);
         let bytes = encode(&made);
         *self.made.lock().unwrap_or_else(|e| e.into_inner()) = Some(made);
         Ok(bytes)
@@ -123,10 +215,12 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
+    mode: Wave64Mode,
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> (Result<HostShader, String>, bool) {
-    let input = [&build[..], container].concat();
+    let mb = [mode_byte(mode)];
+    let input = [&build[..], &mb[..], container].concat();
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
@@ -411,36 +505,43 @@ mod tests {
             Ok(shader())
         };
         assert_eq!(
-            cached(&cache, &build, container, translate),
+            cached(&cache, &build, Wave64Mode::Native, container, translate),
             (Ok(shader()), false)
         );
         assert_eq!(
-            cached(&cache, &build, container, translate),
+            cached(&cache, &build, Wave64Mode::Native, container, translate),
             (Ok(shader()), true)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
-        // Another build translates again.
+        // Another Wave64 mode translates separately.
         assert_eq!(
-            cached(&cache, &[8; 32], container, translate).0,
-            Ok(shader())
+            cached(&cache, &build, Wave64Mode::Wave32, container, translate),
+            (Ok(shader()), false)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 2);
+
+        // Another build translates again.
+        assert_eq!(
+            cached(&cache, &[8; 32], Wave64Mode::Native, container, translate),
+            (Ok(shader()), false)
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH1 broken").unwrap();
         }
         assert_eq!(
-            cached(&cache, &build, container, translate),
+            cached(&cache, &build, Wave64Mode::Native, container, translate),
             (Ok(shader()), false)
         );
-        assert_eq!(runs.load(Ordering::Relaxed), 3);
+        assert_eq!(runs.load(Ordering::Relaxed), 4);
         assert_eq!(
-            cached(&cache, &build, container, translate),
+            cached(&cache, &build, Wave64Mode::Native, container, translate),
             (Ok(shader()), true)
         );
-        assert_eq!(runs.load(Ordering::Relaxed), 3);
+        assert_eq!(runs.load(Ordering::Relaxed), 4);
 
         // Refusals are stored with their reason, and not tried again.
         let fails = AtomicU64::new(0);
@@ -449,8 +550,11 @@ mod tests {
             Err::<HostShader, _>("unsupported".to_owned())
         };
         let refused = (Err("unsupported".to_owned()), false);
-        assert_eq!(cached(&cache, &build, b"other", fail), refused);
-        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0, true));
+        assert_eq!(cached(&cache, &build, Wave64Mode::Native, b"other", fail), refused);
+        assert_eq!(
+            cached(&cache, &build, Wave64Mode::Native, b"other", fail),
+            (refused.0, true)
+        );
         assert_eq!(fails.load(Ordering::Relaxed), 1);
     }
 
@@ -469,7 +573,7 @@ mod tests {
             Ok(shader())
         };
         assert_eq!(
-            cached(&cache, &[7; 32], b"a container", translate),
+            cached(&cache, &[7; 32], Wave64Mode::Native, b"a container", translate),
             (Ok(shader()), false)
         );
         assert_eq!(runs.load(Ordering::Relaxed), 1);
@@ -523,5 +627,18 @@ mod tests {
         let refusal = Err("GFX10 code at 0x10: x is not supported".to_owned());
         assert_eq!(decode(&encode(&refusal)), Some(refusal));
         assert_eq!(decode(&[b"VSHE".as_slice(), &[0xff]].concat()), None);
+    }
+
+    #[test]
+    fn a_lowering_refused_tries_supported_fallbacks() {
+        use Wave64Mode::{Emulate, Native, Wave32};
+        // 64-lane host (with Wave32 also supported, e.g. RDNA)
+        assert_eq!(lowerings_for(Native, true, true), [Native]);
+        assert_eq!(lowerings_for(Emulate, true, true), [Emulate, Wave32, Native]);
+        // 32-lane host (NVIDIA RTX): never fall back to Native Wave64
+        assert_eq!(lowerings_for(Wave32, true, false), [Wave32, Emulate]);
+        assert_eq!(lowerings_for(Emulate, true, false), [Emulate, Wave32]);
+        // 16-lane or WARP host: never fall back to Wave32 or Native Wave64
+        assert_eq!(lowerings_for(Emulate, false, false), [Emulate]);
     }
 }

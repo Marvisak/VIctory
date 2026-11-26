@@ -410,7 +410,10 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        view_marks: false,
+        options: crate::emit::Options {
+            view_marks: false,
+            ..Default::default()
+        },
     })
     .expect("lower");
 

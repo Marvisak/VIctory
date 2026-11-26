@@ -247,6 +247,9 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
+        let (wave64_mode, can_w32, can_w64) = recommended_wave64_mode(&device);
+        crate::shader_cache::set_wave64_mode(wave64_mode, can_w32, can_w64);
+        tracing::info!(?wave64_mode, "Wave64 compute lowering mode selected");
         Ok(Host {
             device,
             depth_bounds_supported,
@@ -281,6 +284,32 @@ fn process_memory() -> (u64, u64) {
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
     (c.PagefileUsage as u64, c.WorkingSetSize as u64)
+}
+
+/// Queries D3D12 wave lane capabilities and chooses the Wave64 lowering mode.
+fn recommended_wave64_mode(device: &ID3D12Device) -> (victory_shader::emit::Wave64Mode, bool, bool) {
+    use victory_shader::emit::Wave64Mode;
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: plain D3D12 feature query with valid struct size.
+    let ok = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut opts).cast(),
+            size_of_val(&opts) as u32,
+        )
+    }
+    .is_ok();
+    if !ok || !opts.WaveOps.as_bool() {
+        return (Wave64Mode::Emulate, false, false);
+    }
+    let can_w64 = opts.WaveLaneCountMin <= 64 && opts.WaveLaneCountMax >= 64;
+    let can_w32 = opts.WaveLaneCountMin <= 32 && opts.WaveLaneCountMax >= 32;
+    let mode = if can_w64 {
+        Wave64Mode::Native
+    } else {
+        Wave64Mode::Emulate
+    };
+    (mode, can_w32, can_w64)
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).

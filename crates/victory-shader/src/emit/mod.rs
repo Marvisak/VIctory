@@ -229,6 +229,8 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
+#[cfg(test)]
+mod wave64_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -368,6 +370,18 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// How a Wave64 compute shader is mapped onto the host device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Wave64Mode {
+    /// Emit native `WaveSize(64)` when compute lane semantics require it.
+    #[default]
+    Native,
+    /// Map virtual 64-lane waves onto 32-lane host waves (`WaveSize(32)`).
+    Wave32,
+    /// Emulate 64-lane waves in group-shared memory without `WaveSize`.
+    Emulate,
+}
+
 /// How a translation is made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {
@@ -375,10 +389,13 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    pub wave64: Wave64Mode,
 }
 
+pub type TranslateOptions = Options;
+
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container, without write marks.
+/// shader container, without write marks and with default [`Wave64Mode::Native`].
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     translate_with(container, Options::default())
 }
@@ -411,7 +428,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     emit_with(&c, &native, &p, &st, &io, &res, options)
 }
 
-/// Emits a program whose earlier stages already ran, without write marks.
+/// Emits a program whose earlier stages already ran, with default options.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -498,7 +515,7 @@ pub fn emit_with(
         outputs: outputs.clone(),
         prims: prims.clone(),
         mesh_stride,
-        view_marks: options.view_marks,
+        options,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving
