@@ -362,7 +362,7 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 struct MemoryEntry {
     handle: V,
     offset: V,
-    /// Block × 4096 + page in the block.
+    /// Block Ã— 4096 + page in the block.
     entry: V,
     block: V,
     /// The level-1 index: address bits 28-39.
@@ -2468,7 +2468,7 @@ impl<'a> Lower<'a> {
     /// +0 on the hardware, where the host's function of the rounded angle
     /// gives about 1e-7. Infinities and NaN give NaN.
     /// shortcut: below 2^-12 turns the hardware scales by a slightly
-    /// different constant than 2π (a last-place difference).
+    /// different constant than 2Ï€ (a last-place difference).
     fn trig_turns(&mut self, x: V, cosine: bool) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);
@@ -2486,7 +2486,7 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, exact, zero, r)
     }
 
-    /// The high dword of a 32 × 32-bit product.
+    /// The high dword of a 32 Ã— 32-bit product.
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
         let i64t = self.s.m.int(64);
@@ -2500,7 +2500,7 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 × anything = 0`, as in D3D9. As on RDNA2, a denormal operand counts
+    /// `0 Ã— anything = 0`, as in D3D9. As on RDNA2, a denormal operand counts
     /// as zero, so the test is on the exponent bits rather than a float
     /// compare (whose result would depend on the host's denormal mode).
     fn legacy_mul(&mut self, a: V, b: V) -> V {
@@ -3314,7 +3314,7 @@ impl<'a> Lower<'a> {
             _ => 1,
         };
         // (byte offset, dwords) per element; read2/write2 scale their two
-        // offsets by the element size (×64 for st64).
+        // offsets by the element size (Ã—64 for st64).
         let pair = |n: &str| -> Vec<(u32, u32)> {
             let w = width(n);
             let scale = 4 * w * if n.contains("st64") { 64 } else { 1 };
@@ -6009,7 +6009,7 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_mad_u64_u32" | "v_mad_i64_i32" => {
-                // 32 × 32 → 64-bit product plus a 64-bit addend (address
+                // 32 Ã— 32 â†’ 64-bit product plus a 64-bit addend (address
                 // arithmetic); the carry out is a lane mask.
                 let signed = name == "v_mad_i64_i32";
                 let (a, bb) = (s(self, 0)?, s(self, 1)?);
@@ -6389,6 +6389,54 @@ impl<'a> Lower<'a> {
                 let lo = self.s.m.cast(c, Cast::SiToFp, lo, self.s.t.f32);
                 let scale = self.s.m.f32(65_536.0f32.to_bits());
                 let r = self.fmad(hi, scale, lo);
+                float(self, r)
+            }
+            "v_cvt_f32_f64" => {
+                // A 64-bit source truncated to f32, as the host's `fptrunc`:
+                // that rounds to nearest even, which is MODE's default; every
+                // other 64-bit round mode (directed, or written at run time)
+                // has no DXIL form and is refused rather than mis-rounded.
+                if self.mode16 != Some(0) {
+                    return Err("a 64-bit conversion in a directed or unknown round mode");
+                }
+                // The literal form below builds the 64 bits with integer
+                // shifts, so the module uses both features.
+                self.s.flags |= flags::FLOAT64 | flags::INT64;
+                // A literal source is the *high* word of the binary64 (RDNA 2
+                // ISA 6.2.1): the low word is zero. A register pair comes
+                // through `src64` as the integer its bits are.
+                let Fields::Valu(v) = &inst.fields else {
+                    return Err("a 64-bit source");
+                };
+                let i64t = self.s.m.int(64);
+                let x = match v.src.first().copied() {
+                    Some(Operand::Literal(k)) => {
+                        let k32 = self.s.m.i32(k);
+                        let hi = self.s.m.cast(c, Cast::ZExt, k32, i64t);
+                        let thirty_two = self.s.m.int_const(i64t, 32);
+                        self.s.m.bin(c, Bin::Shl, hi, thirty_two)
+                    }
+                    // An inline f32 constant is the same value as a binary64
+                    // in a 64-bit float operand, not its f32 bits widened.
+                    Some(Operand::Const(c @ 240..=248)) => {
+                        let x = [
+                            0.5f64,
+                            -0.5,
+                            1.0,
+                            -1.0,
+                            2.0,
+                            -2.0,
+                            4.0,
+                            -4.0,
+                            1.0 / (2.0 * std::f64::consts::PI),
+                        ][usize::from(c - 240)];
+                        self.s.m.int_const(i64t, x.to_bits() as i64)
+                    }
+                    _ => self.src64(inst, 0)?,
+                };
+                let double = self.s.m.double();
+                let bits = self.s.m.cast(c, Cast::Bitcast, x, double);
+                let r = self.s.m.cast(c, Cast::FpTrunc, bits, self.s.t.f32);
                 float(self, r)
             }
             "v_cvt_f32_i32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2"
@@ -8871,7 +8919,7 @@ impl<'a> Lower<'a> {
                         let b = self.s.m.bin(c, Bin::Mul, g[2 * k + 1], g[2 * k + 1]);
                         *l = self.s.m.bin(c, Bin::Add, a, b);
                     }
-                    // FMax, Log (base 2): 0.5 log2(max(|dx|², |dy|²) w²).
+                    // FMax, Log (base 2): 0.5 log2(max(|dx|Â², |dy|Â²) wÂ²).
                     let m = self.binary(35, len2[0], len2[1]);
                     let w2 = self.s.m.bin(c, Bin::Mul, w, w);
                     let m = self.s.m.bin(c, Bin::Mul, m, w2);
@@ -9058,7 +9106,7 @@ impl<'a> Lower<'a> {
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
     /// host's cube sampling turns back into the same texel.
     // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
+    // operand adds 8 Ã— the slice).
     fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
@@ -9210,11 +9258,11 @@ impl<'a> Lower<'a> {
     }
 
     /// The first texel of a gather's footprint along an axis of `size`
-    /// texels at coordinate `u` (bits of a float): floor(u × size − 0.5)
+    /// texels at coordinate `u` (bits of a float): floor(u Ã— size âˆ’ 0.5)
     /// with the product exact and rounded to 1/256 of a texel, half up, as
     /// the hardware does (`gather_level_tests`), i.e.
-    /// (floor(u × size × 512) − 255) >> 9, in 64-bit integers. NaN is 0;
-    /// beyond ±2 every texel of the footprint is outside, as at ±2.
+    /// (floor(u Ã— size Ã— 512) âˆ’ 255) >> 9, in 64-bit integers. NaN is 0;
+    /// beyond Â±2 every texel of the footprint is outside, as at Â±2.
     fn gather_first(&mut self, u: V, size: V) -> V {
         let c = self.cur;
         let f = self.as_float(u);
@@ -9228,7 +9276,7 @@ impl<'a> Lower<'a> {
         let f = self.binary(35, f, lo);
         let f = self.binary(36, f, hi);
         let x = self.as_int(f);
-        // u = m × 2^(e − 150), e at least 1 (denormals).
+        // u = m Ã— 2^(e âˆ’ 150), e at least 1 (denormals).
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let (k23, kff) = (k(self, 23), k(self, 0xFF));
         let e = self.s.m.bin(c, Bin::LShr, x, k23);
@@ -9240,7 +9288,7 @@ impl<'a> Lower<'a> {
         let bit = self.s.m.select(c, normal, implicit, zero);
         let m = self.s.m.bin(c, Bin::Or, m, bit);
         let e = self.s.m.select(c, normal, e, one);
-        // u × size × 512 = m × size × 2^(e − 141); |u| ≤ 2 keeps e ≤ 128.
+        // u Ã— size Ã— 512 = m Ã— size Ã— 2^(e âˆ’ 141); |u| â‰¤ 2 keeps e â‰¤ 128.
         let k141 = k(self, 141);
         let shift = self.s.m.bin(c, Bin::Sub, k141, e);
         let k63 = k(self, 63);
