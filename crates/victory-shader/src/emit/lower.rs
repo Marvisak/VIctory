@@ -63,6 +63,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Wave ballot calls written.
+    #[cfg(all(test, windows))]
+    pub wave_ballot_calls: usize,
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
     pub rovs: bool,
@@ -196,6 +199,9 @@ struct Lower<'a> {
     block: Vec<Option<usize>>,
     cur: usize,
     bools: HashMap<(usize, Bool), V>,
+    /// Source-lane activity ballots by DXIL block and EXEC predicate.
+    /// Cleared at each discard because discarded lanes become helpers.
+    source_ballots: HashMap<(usize, V), [V; 2]>,
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
@@ -660,6 +666,7 @@ impl<'a> Lower<'a> {
             block: vec![None; p.blocks.len()],
             cur: 0,
             bools: HashMap::new(),
+            source_ballots: HashMap::new(),
             lane_bits: HashMap::new(),
             phi_at,
             mask_phis: HashMap::new(),
@@ -1361,8 +1368,7 @@ impl<'a> Lower<'a> {
                     let kill = self
                         .boolean(lanes, at)
                         .map_err(|w| unsupported(offset, w))?;
-                    self.s
-                        .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+                    self.emit_discard(at, kill);
                 }
                 self.inst(b, i)?;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
@@ -1406,6 +1412,8 @@ impl<'a> Lower<'a> {
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(all(test, windows))]
+            wave_ballot_calls: self.s.m.written_calls("dx.op.waveActiveBallot"),
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
@@ -3101,6 +3109,12 @@ impl<'a> Lower<'a> {
         )
     }
 
+    fn emit_discard(&mut self, block: usize, kill: V) {
+        self.s
+            .op(block, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+        self.source_ballots.clear();
+    }
+
     /// Whether `src` is active under the current `EXEC` mask (`guard` for
     /// straight-line narrowing, plus the host wave's live lanes for
     /// branch-structurised control flow). Returns `None` for unguarded pixel
@@ -3117,15 +3131,15 @@ impl<'a> Lower<'a> {
         }
         let bit = guard.unwrap_or_else(|| self.s.m.bool(true));
         let i32t = self.s.t.i32;
-        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-        let ballot = self
-            .s
-            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-        self.s.flags |= flags::WAVE_OPS;
-        let (lo, hi) = (
-            self.s.m.extract(c, ballot, 0),
-            self.s.m.extract(c, ballot, 1),
-        );
+        // The ballot depends on the host lanes reaching this block as well as EXEC.
+        let [lo, hi] = *self.source_ballots.entry((c, bit)).or_insert_with(|| {
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let ballot = self
+                .s
+                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+            self.s.flags |= flags::WAVE_OPS;
+            [self.s.m.extract(c, ballot, 0), self.s.m.extract(c, ballot, 1)]
+        });
         let ballot_lane = if mesh_quad {
             let host_lane = self
                 .s
@@ -9906,8 +9920,7 @@ impl<'a> Lower<'a> {
             }
             let t = self.s.m.bool(true);
             let kill = self.s.m.bin(c, Bin::Xor, g, t);
-            self.s
-                .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+            self.emit_discard(c, kill);
         }
         if mesh && e.target == Target::Primitive {
             return self.emit_indices(e, guard);
@@ -10216,8 +10229,7 @@ impl<'a> Lower<'a> {
                 if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
                     // A lane leaving without its final export was killed.
                     let t = self.s.m.bool(true);
-                    self.s
-                        .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                    self.emit_discard(self.cur, t);
                 }
                 Term::Ret
             }
@@ -10262,8 +10274,7 @@ impl<'a> Lower<'a> {
         let a = self.s.m.new_block();
         if self.s.pixel {
             let t = self.s.m.bool(true);
-            self.s
-                .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+            self.emit_discard(a, t);
         }
         self.s.m.terminate(a, Term::Ret);
         self.abort = Some(a);
