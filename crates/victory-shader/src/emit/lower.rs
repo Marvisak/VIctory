@@ -87,6 +87,9 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    pub host_wave32: bool,
+    /// [`super::Options::wave32_approx`].
+    pub wave32_approx: bool,
 }
 
 enum Stop {
@@ -540,6 +543,15 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
     if fixed_below { lowest } else { lowest.max(code_end & !3) }
 }
 
+/// The ballot word and bit of console lane `lane` on a host wave of
+/// `host_wave` lanes: the host wave's own lane, which `Lower::read_lane`
+/// reads (on a host of 32-lane waves a lane 32-63 names that lane of the
+/// half the host wave stands for).
+fn ballot_bit(lane: u32, host_wave: u32) -> (u32, u32) {
+    let local = lane & (host_wave - 1);
+    (local / 32, local % 32)
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -601,7 +613,9 @@ impl<'a> Lower<'a> {
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
+                // A host of 32-lane waves runs each console wave as two
+                // halves (`x.host_wave32`).
+                s.wave_size = Some(if x.host_wave32 { 32 } else { wave });
             }
         }
         let mut no_barrier = HashSet::new();
@@ -1194,14 +1208,20 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
                 let r = self.s.m.bin(c, Bin::And, r, low);
                 // Lane `hi` runs the section on the console even where it is
-                // elsewhere on the host; there it holds the identity.
+                // elsewhere on the host; there it holds the identity. On a
+                // host of 32-lane waves the scan stays within the half (the
+                // ballot is asked about the lane `read_lane` reads): approximate.
+                if self.host_wave() < self.wave() && !self.x.wave32_approx {
+                    return Err("a cross-half wave scan on a 32-lane host");
+                }
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let b = self
                     .s
                     .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-                let word = self.s.m.extract(c, b, hi / 32);
-                let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
+                let (word, shift) = ballot_bit(hi, self.host_wave());
+                let word = self.s.m.extract(c, b, word);
+                let (sh, one, z) = (self.s.m.i32(shift), self.s.m.i32(1), self.s.m.i32(0));
                 let bit = self.s.m.bin(c, Bin::LShr, word, sh);
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 let there = self.s.m.cmp(c, pred::NE, bit, z);
@@ -1293,6 +1313,17 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
+        if let Some(threads) = self.s.threads
+            && self.x.native.wave64
+            && self.x.host_wave32
+            && threads.iter().product::<u32>() <= 64
+            && self.s.lds_dwords > 0
+        {
+            return Err(unsupported(
+                0,
+                "wave64 compute shader sharing LDS within one wave on a 32-lane host",
+            ));
+        }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1836,6 +1867,11 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
+                // On a host of 32-lane waves the half's own lanes: its high
+                // dword is 0 (`Parts::host_wave32`): approximate.
+                if self.host_wave() < self.wave() && !self.x.wave32_approx {
+                    return Err("a 64-bit wave mask read as data on a 32-lane host");
+                }
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -2901,6 +2937,11 @@ impl<'a> Lower<'a> {
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
             return Err("a cross-lane operation outside compute");
         }
+        // On a host of 32-lane waves, lanes read lanes of their own half
+        // (`Parts::host_wave32`, `Lower::host_lane`): approximate.
+        if !quad && self.host_wave() < self.wave() && !self.x.wave32_approx {
+            return Err("a cross-half operation on a 32-lane host");
+        }
         debug_assert!(self.s.threads.is_none() || self.console_lanes);
         self.s.flags |= flags::WAVE_OPS;
         Ok(())
@@ -3015,6 +3056,23 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 { 64 } else { 32 }
     }
 
+    /// The lanes of a host wave running this program: the console's, or
+    /// 32 on a host of 32-lane waves (`self.x.host_wave32`).
+    fn host_wave(&self) -> u32 {
+        if self.x.host_wave32 { 32 } else { self.wave() }
+    }
+
+    /// A lane number as the host wave can take it: on a host of 32-lane
+    /// waves a console lane 32-63 names the same lane of the other half,
+    /// which this host wave stands for.
+    fn host_lane(&mut self, lane: V) -> V {
+        if self.host_wave() == self.wave() {
+            return lane;
+        }
+        let m = self.s.m.i32(self.host_wave() - 1);
+        self.s.m.bin(self.cur, Bin::And, lane, m)
+    }
+
     fn lane_index(&mut self) -> V {
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
@@ -3091,6 +3149,7 @@ impl<'a> Lower<'a> {
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
+        let lane = self.host_lane(lane);
         self.s.op(
             self.cur,
             "waveReadLaneAt.i32",
@@ -6671,6 +6730,7 @@ impl<'a> Lower<'a> {
                 };
                 self.cross_lane(false)?;
                 let me = self.lane_index();
+                let lane = self.host_lane(lane);
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
@@ -10920,11 +10980,23 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half};
+    use super::{Lowered, Numeric, Parts, ballot_bit, buffer_format, code_table_start, half_shift, lower, packed_half};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
     use crate::{io, ir, resource, structure};
+
+    #[test]
+    fn a_half_scans_ballot_bit_is_the_lane_it_reads() {
+        // On a 64-lane host, console lane 33 is bit 1 of word 1.
+        assert_eq!(ballot_bit(33, 64), (1, 1));
+        // On a 32-lane host the host wave reads its own lane 1 (`read_lane`
+        // masks to the half): the ballot is asked about that lane, not word
+        // 1, which is always 0 there.
+        assert_eq!(ballot_bit(33, 32), (0, 1));
+        assert_eq!(ballot_bit(1, 32), (0, 1));
+        assert_eq!(ballot_bit(63, 32), (0, 31));
+    }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
@@ -10983,6 +11055,8 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_wave32: false,
+            wave32_approx: false,
         })
         .map(|_| ())
     }
@@ -11034,6 +11108,8 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_wave32: false,
+            wave32_approx: false,
         })
     }
 
@@ -11254,6 +11330,8 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_wave32: false,
+            wave32_approx: false,
         })
         .unwrap();
 
@@ -12176,6 +12254,8 @@ mod tests {
                 prims: vec![],
                 mesh_stride: 0,
                 view_marks: false,
+                host_wave32: false,
+                wave32_approx: false,
             })
             .unwrap();
             assert!(lowered.wave_ops);

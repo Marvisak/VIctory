@@ -70,6 +70,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        host_wave32: false,
+        wave32_approx: false,
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.

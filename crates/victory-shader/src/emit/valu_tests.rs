@@ -151,6 +151,8 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        host_wave32: false,
+        wave32_approx: false,
     })?;
 
     let shader = HostShader {
@@ -1722,6 +1724,8 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        host_wave32: false,
+        wave32_approx: false,
     })
     .expect("lower");
     let shader = HostShader {
