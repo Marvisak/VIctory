@@ -1296,6 +1296,7 @@ fn transition(
 
 /// A view in the heap for [`Host::dispatch`].
 #[cfg(test)]
+#[derive(Clone, Copy)]
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
@@ -1310,6 +1311,17 @@ pub enum View<'a> {
     /// An RGBA32F square texture SRV (size, levels) whose texels in level
     /// `n` are all `n`.
     Levels(u32, u32),
+    /// A multisampled R32_FLOAT texture SRV (a 2D one, or with `array`
+    /// a 2D array of `slices`), sample s of pixel (x, y) of slice z holding
+    /// `values[((z * height + y) * width + x) * samples + s]` (in 0..=1).
+    MsaaDepth {
+        width: u32,
+        height: u32,
+        samples: u32,
+        slices: u32,
+        array: bool,
+        values: &'a [f32],
+    },
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1318,6 +1330,11 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// An R32G32_UINT texture UAV (width, height), zeroed (64-bit atomics).
     Uint2TextureUav(u32, u32),
+    /// An RGBA32F 2D-array UAV (width, height, slices), zeroed; read back
+    /// slice by slice.
+    TextureArrayUav(u32, u32, u32),
+    /// An R32_UINT 2D-array UAV (width, height, slices), zeroed.
+    UintTextureArrayUav(u32, u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A typed buffer UAV in this format, of this many elements of this many
@@ -1369,6 +1386,13 @@ pub fn view_strides(views: &[View]) -> Vec<u32> {
         .collect()
 }
 
+/// Bytes of one slice of a readback of `w` x `h` texels of `words` dwords:
+/// rows 256-byte aligned, slices 512-byte aligned.
+#[cfg(test)]
+fn slice_bytes(w: u32, h: u32, words: u32) -> u32 {
+    ((w * 4 * words).next_multiple_of(256) * h).next_multiple_of(512)
+}
+
 /// How [`View::Buffer`] is viewed.
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -1395,13 +1419,21 @@ pub struct Dispatch<'a> {
 #[cfg(test)]
 impl Host {
     /// Runs a compute pipeline and returns each UAV's contents in heap
-    /// order (texels as float bits, row by row).
+    /// order (texels as float bits, row by row, slice by slice).
     pub fn dispatch(
         &self,
         root: &ID3D12RootSignature,
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        // The depth draws' root signature, made before the WARP lock is
+        // taken: making it takes the lock too, and the lock is not
+        // re-entrant (a multisampled view hung on WARP).
+        let msaa_root = if d.views.iter().any(|v| matches!(v, View::MsaaDepth { .. })) {
+            Some(self.root_signature_for(&[])?)
+        } else {
+            None
+        };
         let _guard = self.lock_warp();
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -1553,6 +1585,8 @@ impl Host {
             let sampler_size =
                 dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
             let mut keep = Vec::new();
+            // Other objects the GPU uses until the fence.
+            let mut keep_any: Vec<windows::core::IUnknown> = Vec::new();
             // UAVs: (resource, dwords or texture size, readback buffer).
             let mut uavs = Vec::new();
             for (i, v) in d.views.iter().enumerate() {
@@ -1682,6 +1716,135 @@ impl Host {
                         dev.CreateShaderResourceView(&tex, None, at);
                         keep.push(tex);
                     }
+                    View::MsaaDepth {
+                        width,
+                        height,
+                        samples,
+                        slices,
+                        array,
+                        values,
+                    } => {
+                        // Multisampled textures take no copies of texels:
+                        // each sample of each pixel is drawn, its value as
+                        // depth, by a draw scissored to the pixel with only
+                        // that sample in the sample mask.
+                        let mut desc = texture_as(
+                            width,
+                            height,
+                            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                            DXGI_FORMAT_R32_TYPELESS,
+                        );
+                        desc.DepthOrArraySize = slices as u16;
+                        desc.SampleDesc.Count = samples;
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                        )?;
+                        let dsvs: ID3D12DescriptorHeap = dev
+                            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                                Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                                NumDescriptors: slices,
+                                ..Default::default()
+                            })
+                            .map_err(err)?;
+                        let dsv_size = dev
+                            .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV)
+                            as usize;
+                        let vs = position_vs();
+                        let root = msaa_root.clone().ok_or("a depth draw's root signature")?;
+                        let masks: Vec<ID3D12PipelineState> = (0..samples)
+                            .map(|s| self.depth_pipeline(&root, &vs.dxil, samples, 1 << s))
+                            .collect::<Result<_, _>>()?;
+                        // One triangle over the target per value, at its
+                        // depth.
+                        let vertices: Vec<f32> = values
+                            .iter()
+                            .flat_map(|&z| {
+                                [-1.0, -1.0, z, 1.0, 3.0, -1.0, z, 1.0, -1.0, 3.0, z, 1.0]
+                            })
+                            .collect();
+                        let words: Vec<u32> = vertices.iter().map(|f| f.to_bits()).collect();
+                        let vb = upload(&words)?;
+                        list.SetGraphicsRootSignature(&root);
+                        list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                        list.IASetVertexBuffers(
+                            0,
+                            Some(&[D3D12_VERTEX_BUFFER_VIEW {
+                                BufferLocation: vb.GetGPUVirtualAddress(),
+                                SizeInBytes: (words.len() * 4) as u32,
+                                StrideInBytes: 16,
+                            }]),
+                        );
+                        list.RSSetViewports(&[D3D12_VIEWPORT {
+                            Width: width as f32,
+                            Height: height as f32,
+                            MaxDepth: 1.0,
+                            ..Default::default()
+                        }]);
+                        for slice in 0..slices {
+                            let mut dsv = dsvs.GetCPUDescriptorHandleForHeapStart();
+                            dsv.ptr += slice as usize * dsv_size;
+                            dev.CreateDepthStencilView(
+                                &tex,
+                                Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                                    Format: DXGI_FORMAT_D32_FLOAT,
+                                    ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY,
+                                    Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                                        Texture2DMSArray: D3D12_TEX2DMS_ARRAY_DSV {
+                                            FirstArraySlice: slice,
+                                            ArraySize: 1,
+                                        },
+                                    },
+                                    ..Default::default()
+                                }),
+                                dsv,
+                            );
+                            list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0, 0, None);
+                            list.OMSetRenderTargets(0, None, false, Some(&dsv));
+                            for y in 0..height {
+                                for x in 0..width {
+                                    list.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+                                        left: x as i32,
+                                        top: y as i32,
+                                        right: x as i32 + 1,
+                                        bottom: y as i32 + 1,
+                                    }]);
+                                    for (s, pso) in masks.iter().enumerate() {
+                                        list.SetPipelineState(pso);
+                                        let n =
+                                            ((slice * height + y) * width + x) * samples + s as u32;
+                                        list.DrawInstanced(3, 1, 3 * n, 0);
+                                    }
+                                }
+                            }
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        list.SetPipelineState(pso);
+                        let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_FLOAT,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMS,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            ..Default::default()
+                        };
+                        if array {
+                            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+                            srv.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV {
+                                FirstArraySlice: 0,
+                                ArraySize: slices,
+                            };
+                        }
+                        dev.CreateShaderResourceView(&tex, Some(&srv), at);
+                        keep.push(tex);
+                        keep.push(vb);
+                        keep_any.push(dsvs.into());
+                        keep_any.push(root.into());
+                        keep_any.extend(masks.into_iter().map(Into::into));
+                    }
                     View::RawUav(_) | View::HalfUav(_) | View::TypedUav(..) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
@@ -1725,41 +1888,77 @@ impl Host {
                         )?;
                         uavs.push((b, None, n, rb));
                     }
-                    View::TextureUav(w, h) => {
-                        let t = make(
-                            D3D12_HEAP_TYPE_DEFAULT,
-                            &texture(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                        )?;
-                        dev.CreateUnorderedAccessView(&t, None, None, at);
-                        keep.push(zero(&t, Some((w, h)), 4)?);
-                        let pitch = (w * 16).next_multiple_of(256);
-                        let rb = make(
-                            D3D12_HEAP_TYPE_READBACK,
-                            &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                        )?;
-                        uavs.push((t, Some((w, h)), 4, rb));
-                    }
-                    View::UintTextureUav(w, h) | View::Uint2TextureUav(w, h) => {
-                        let (format, words) = match *v {
-                            View::UintTextureUav(..) => (DXGI_FORMAT_R32_UINT, 1),
-                            _ => (DXGI_FORMAT_R32G32_UINT, 2),
+                    View::TextureUav(..)
+                    | View::UintTextureUav(..)
+                    | View::Uint2TextureUav(..)
+                    | View::TextureArrayUav(..)
+                    | View::UintTextureArrayUav(..) => {
+                        // (width, height, slices, words per texel)
+                        let (w, h, slices, words) = match *v {
+                            View::TextureUav(w, h) => (w, h, 1, 4),
+                            View::UintTextureUav(w, h) => (w, h, 1, 1),
+                            View::Uint2TextureUav(w, h) => (w, h, 1, 2),
+                            View::TextureArrayUav(w, h, n) => (w, h, n, 4),
+                            View::UintTextureArrayUav(w, h, n) => (w, h, n, 1),
+                            _ => unreachable!(),
                         };
+                        let format = match words {
+                            1 => DXGI_FORMAT_R32_UINT,
+                            2 => DXGI_FORMAT_R32G32_UINT,
+                            _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
+                        };
+                        let mut desc =
+                            texture_as(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, format);
+                        desc.DepthOrArraySize = slices as u16;
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
-                            &texture_as(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, format),
+                            &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        dev.CreateUnorderedAccessView(&t, None, None, at);
-                        keep.push(zero(&t, Some((w, h)), words)?);
+                        // Zeroed, every slice (a new committed resource is not
+                        // always zero: WARP reuses a freed buffer's memory).
                         let pitch = (w * 4 * words).next_multiple_of(256);
+                        let zeros = upload(&vec![0; (pitch * h / 4) as usize])?;
+                        let from = footprint_as(&zeros, w, h, words);
+                        for slice in 0..slices {
+                            let to = D3D12_TEXTURE_COPY_LOCATION {
+                                pResource: std::mem::transmute_copy(&t),
+                                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: slice },
+                            };
+                            list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &t,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
+                        keep.push(zeros);
+                        let array = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                                    ArraySize: slices,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        let array = matches!(
+                            *v,
+                            View::TextureArrayUav(..) | View::UintTextureArrayUav(..)
+                        )
+                        .then_some(&array as *const _);
+                        dev.CreateUnorderedAccessView(&t, None, array, at);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
-                            &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
+                            &buffer(
+                                u64::from(slice_bytes(w, h, words) * slices),
+                                D3D12_RESOURCE_FLAG_NONE,
+                            ),
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        uavs.push((t, Some((w, h)), words, rb));
+                        uavs.push((t, Some((w, h, slices)), words, rb));
                     }
                     View::Cbv(data) => {
                         let b = upload(data)?;
@@ -1972,14 +2171,17 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 )]);
                 match size {
-                    Some((w, h)) => list.CopyTextureRegion(
-                        &footprint_as(rb, *w, *h, *n),
-                        0,
-                        0,
-                        0,
-                        &subresource(r),
-                        None,
-                    ),
+                    Some((w, h, slices)) => {
+                        // Slice by slice, each at its own aligned offset.
+                        for slice in 0..*slices {
+                            let mut to = footprint_as(rb, *w, *h, *n);
+                            to.Anonymous.PlacedFootprint.Offset =
+                                u64::from(slice * slice_bytes(*w, *h, *n));
+                            let mut from = subresource(r);
+                            from.Anonymous.SubresourceIndex = slice;
+                            list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                        }
+                    }
                     None => list.CopyBufferRegion(rb, 0, r, 0, u64::from(*n) * 4),
                 }
             }
@@ -1998,13 +2200,15 @@ impl Host {
                 let mut p = std::ptr::null_mut();
                 rb.Map(0, None, Some(&mut p)).map_err(err)?;
                 let words = match size {
-                    Some((w, h)) => {
+                    Some((w, h, slices)) => {
                         let words = *n as usize;
                         let pitch = (*w as usize * 4 * words).next_multiple_of(256);
-                        (0..*h as usize)
-                            .flat_map(|y| {
+                        let slice = slice_bytes(*w, *h, *n) as usize;
+                        (0..*slices as usize * *h as usize)
+                            .flat_map(|row| {
+                                let at = row / *h as usize * slice + row % *h as usize * pitch;
                                 std::slice::from_raw_parts(
-                                    p.cast::<u8>().add(y * pitch).cast::<u32>(),
+                                    p.cast::<u8>().add(at).cast::<u32>(),
                                     *w as usize * words,
                                 )
                                 .to_vec()
@@ -2017,8 +2221,112 @@ impl Host {
                 out.push(words);
             }
             drop(keep);
+            drop(keep_any);
             Ok(out)
         }
+    }
+}
+
+/// A vertex shader that passes a float4 `POSITION` through as the
+/// position ([`View::MsaaDepth`]'s draws).
+#[cfg(test)]
+fn position_vs() -> HostShader {
+    use super::bitcode::{Attr, Term};
+    let mut s = super::shader::Shader::new(false);
+    let b = s.entry;
+    let element = |name: &str, kind, interp| SigElement {
+        name: name.into(),
+        index: 0,
+        kind,
+        comp: 9,
+        interp,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    };
+    s.inputs = vec![element("POSITION", 0, 0)];
+    s.outputs = vec![element("SV_Position", 3, 4)];
+    for col in 0..4 {
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+        let x = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), x];
+        s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+    }
+    s.m.terminate(b, Term::Ret);
+    HostShader {
+        stage: crate::native::HwStage::Vs,
+        dxil: s.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        memory: false,
+        memory_writes: false,
+        view_addresses: false,
+        heap: false,
+        heap_writes: false,
+        view_marks: false,
+    }
+}
+
+#[cfg(test)]
+impl Host {
+    /// A depth-only pipeline of `vs` (float4 positions at stride 16) into
+    /// a D32_FLOAT target of `samples` samples, writing those in `mask`.
+    fn depth_pipeline(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        samples: u32,
+        mask: u32,
+    ) -> Result<ID3D12PipelineState, String> {
+        let layout = [D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(c"POSITION".as_ptr().cast()),
+            SemanticIndex: 0,
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            InputSlot: 0,
+            AlignedByteOffset: 0,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        }];
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the descriptor never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(root) },
+            VS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: vs.as_ptr().cast(),
+                BytecodeLength: vs.len(),
+            },
+            SampleMask: mask,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            },
+            DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: true.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+                DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                ..Default::default()
+            },
+            InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                pInputElementDescs: layout.as_ptr(),
+                NumElements: layout.len() as u32,
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            DSVFormat: DXGI_FORMAT_D32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: samples,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        // SAFETY: the description points at live data.
+        unsafe { self.device.CreateGraphicsPipelineState(&desc) }.map_err(err)
     }
 }
 

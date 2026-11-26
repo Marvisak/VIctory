@@ -8399,22 +8399,31 @@ impl<'a> Lower<'a> {
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
-        let (kind, coords) = match dim {
+        let (mut kind, coords) = match dim {
             0 => (1, 1),
             1 => (2, 2),
             2 => (4, 3),
-            // Sampled (face coordinates and face, see `cube_direction`) or
-            // sized only.
-            3 if name.starts_with("image_sample")
-                || name.starts_with("image_gather")
-                || name == "image_get_resinfo" =>
-            {
-                (5, 3)
-            }
+            // Sampled (face coordinates and face, see `cube_direction`),
+            // sized, or a face's texels (x, y, face: a 2D array to the
+            // console) loaded, stored or updated; see `cube_load` and the
+            // unordered case below.
+            3 => (5, 3),
             4 => (6, 2),
             5 => (7, 3),
-            _ => return Err("an image dimension (cube loads or MSAA)"),
+            // Multisampled: x, y (and slice), then the sample; see the
+            // load below.
+            6 => (3, 2),
+            7 => (8, 3),
+            _ => return Err("an image dimension"),
         };
+        let msaa = matches!(kind, 3 | 8);
+        if msaa && !matches!(name, "image_load" | "image_get_resinfo") {
+            // image_msaa_load returns one channel of four samples (four
+            // data dwords, where the decoder gives one per dmask bit), and
+            // which four is not established here; multisampled stores and
+            // atomics need writable multisampled UAVs (SM 6.7).
+            return Err("a multisampled image access other than a load or size");
+        }
         // Address VGPRs in order.
         let mut regs = Vec::new();
         for a in addr {
@@ -8459,6 +8468,16 @@ impl<'a> Lower<'a> {
             || self
                 .used_kind(src)
                 .is_some_and(|u| u.kind == ResourceType::Uav);
+        let cube = kind == 5;
+        if cube && (uav || name.starts_with("image_atomic_")) {
+            // D3D12 has no cube UAVs: a title views a cube for unordered
+            // access as the 2D array it is, faces as slices, which is how
+            // the console addresses it too.
+            kind = 7;
+        }
+        if msaa && uav {
+            return Err("an unordered multisampled image");
+        }
         let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // DXIL's atomic operations on a 32-bit integer texture UAV; the
@@ -8655,8 +8674,15 @@ impl<'a> Lower<'a> {
             // Width, height, depth or layers, levels (per dmask) of the level
             // in the first address: DXIL's dimensions; a channel DXIL leaves
             // out reads 1 (UAVs: one level).
+            if msaa && dmask & 8 != 0 {
+                // DXIL gives the sample count there; what the console's
+                // image unit returns for a multisampled view is not
+                // established here.
+                return Err("the levels of a multisampled image");
+            }
             let h = self.handle(site, src, false, props)?;
-            let mip = if uav {
+            // Multisampled views have one level and take none.
+            let mip = if uav || msaa {
                 self.s.m.undef(self.s.t.i32)
             } else {
                 addr_val(self, 0)?
@@ -8669,7 +8695,8 @@ impl<'a> Lower<'a> {
             let one = self.s.m.i32(1);
             let present = match kind {
                 1 => [true, false, false, true],
-                2 | 5 | 6 => [true, true, false, true],
+                _ if cube => [true, true, false, true],
+                2 | 3 | 6 => [true, true, false, true],
                 _ => [true, true, true, true],
             };
             let Operand::Vector { reg, .. } = *data else {
@@ -8993,6 +9020,13 @@ impl<'a> Lower<'a> {
             }
             let mip = if name == "image_load_mip" {
                 addr_val(self, coords)?
+            } else if msaa {
+                // DXIL takes the sample where the level would be.
+                // shortcut: the console's last address is a fragment,
+                // the sample itself unless the view's FMASK remaps it (a
+                // shader reading FMASK first passes the fragment it found,
+                // taken here as a sample).
+                addr_val(self, coords)?
             } else if uav {
                 // Our declarations have four channels.
                 self.s.flags |= flags::TYPED_UAV_LOADS;
@@ -9000,17 +9034,21 @@ impl<'a> Lower<'a> {
             } else {
                 self.s.m.i32(0)
             };
-            let mut args = vec![h, mip];
-            args.extend(&cs);
-            args.extend([iu, iu, iu]);
-            self.s.op(
-                c,
-                "textureLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                66,
-                &args,
-            )
+            if cube && !uav {
+                self.cube_load(site, h, &cs, mip)?
+            } else {
+                let mut args = vec![h, mip];
+                args.extend(&cs);
+                args.extend([iu, iu, iu]);
+                self.s.op(
+                    c,
+                    "textureLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    66,
+                    &args,
+                )
+            }
         };
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
@@ -9051,6 +9089,58 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// Texel (x, y) of face `cs[2]` of a cube view at level `mip`, as the
+    /// console loads it (a 2D array to the image unit). DXIL loads no
+    /// texel of a cube, and annotating the handle as a 2D array does not
+    /// make the cube view one: that read zeros on the default hardware
+    /// adapter and every face past the first on WARP (2026-11-24). A view
+    /// is the title's, made before any shader reads it, so the load
+    /// becomes a sample of the texel's centre, point-filtered at level
+    /// `mip`, which picks that texel exactly.
+    // shortcut: past an edge or the last level this clamps where the
+    // console reads zeros; a face past 5 reads face 0 (a cube array's
+    // later cubes: see `cube_direction`); integer formats, which D3D12
+    // cannot sample, are read as floats.
+    fn cube_load(&mut self, site: Site, h: V, cs: &[V], mip: V) -> Result<V, Why> {
+        // Clamped, point-filtered minification, magnification and mip
+        // selection, levels 0 to 15.99 (`StaticSampler::from_words`).
+        const POINT_CLAMP: [u32; 4] = [0x92, 0x00FF_F000, 0x0400_0000, 0];
+        let sh = self.handle(site, &Source::Constant(POINT_CLAMP.to_vec()), true, (14, 0))?;
+        let c = self.cur;
+        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let d = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+        let half = self.s.m.f32(0.5f32.to_bits());
+        let one = self.s.m.f32(1.0f32.to_bits());
+        // Face coordinates in [1, 2], as `cube_direction` takes them.
+        let mut st = [one; 2];
+        for (k, slot) in st.iter_mut().enumerate() {
+            let x = self.s.m.cast(c, Cast::UiToFp, cs[k], f32t);
+            let x = self.s.m.bin(c, Bin::Add, x, half);
+            let n = self.s.m.extract(c, d, k as u32);
+            let n = self.s.m.cast(c, Cast::UiToFp, n, f32t);
+            let x = self.s.m.bin(c, Bin::SDiv, x, n);
+            *slot = self.s.m.bin(c, Bin::Add, x, one);
+        }
+        let face = self.s.m.cast(c, Cast::UiToFp, cs[2], f32t);
+        let dir = self.cube_direction(st[0], st[1], face);
+        let (fu, iu) = (self.s.m.undef(f32t), self.s.m.undef(i32t));
+        let lod = self.s.m.cast(c, Cast::UiToFp, mip, f32t);
+        let mut args = vec![h, sh];
+        args.extend(dir);
+        args.extend([fu, iu, iu, iu, lod]);
+        Ok(self.s.op(
+            c,
+            "sampleLevel.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            62,
+            &args,
+        ))
     }
 
     /// The direction a cube sample's face coordinates stand for: the
