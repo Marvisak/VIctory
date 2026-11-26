@@ -152,9 +152,33 @@ pub(crate) enum Why {
 #[cfg(windows)]
 use crate::hold::Item;
 
+/// A fence reference kept alive while a queue holds a `Signal` or `FenceWait`
+/// for it (`crate::fence::keep` / `crate::fence::let_go`).
+#[cfg(windows)]
+struct KeptFence(usize);
+
+#[cfg(windows)]
+impl KeptFence {
+    fn new(fence: This) -> Self {
+        crate::fence::keep(fence);
+        Self(fence as usize)
+    }
+
+    fn as_this(&self) -> This {
+        self.0 as This
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KeptFence {
+    fn drop(&mut self) {
+        crate::fence::let_go(self.0 as This);
+    }
+}
+
 /// Every queue's held work.
 #[cfg(windows)]
-type Holding = crate::hold::Held<std::sync::Arc<crate::host::HostList>>;
+type Holding = crate::hold::Held<std::sync::Arc<crate::host::HostList>, KeptFence>;
 
 #[cfg(windows)]
 static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(crate::hold::Held::new());
@@ -201,7 +225,7 @@ fn pump(held: &mut Holding, why: Why) {
         account().forced += 1;
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
     }
-    let fence = |f: usize| crate::fence::value(f as This);
+    let fence = |f: &KeptFence| crate::fence::value(f.as_this());
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
     let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
@@ -212,9 +236,9 @@ fn pump(held: &mut Holding, why: Why) {
         drop(lists);
         segments.into_iter().for_each(crate::list::recycle);
     };
-    let mut signal = |f: usize, value: u64| {
-        crate::fence::set(f as This, value);
-        crate::fence::let_go(f as This);
+    let mut signal = |f: KeptFence, value: u64| {
+        crate::fence::set(f.as_this(), value);
+        drop(f);
     };
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
@@ -395,8 +419,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     {
         let mut held = held();
         if held.holds_work(this as usize) {
-            crate::fence::keep(fence);
-            held.push(this as usize, Item::Signal(fence as usize, value));
+            held.push(this as usize, Item::Signal(KeptFence::new(fence), value));
         } else {
             crate::fence::set(fence, value);
         }
@@ -411,18 +434,17 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     S_OK
 }
 /// The queue's later work waits until the fence reaches `value`.
-///
-/// shortcut: the fence is not kept alive while the queue waits for it;
-/// Grand Theft Auto VI makes no queue wait for a fence.
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
     #[cfg(windows)]
-    if crate::host::host().is_some() && crate::fence::value(fence) < value {
+    if crate::host::host().is_some() {
         let mut held = held();
-        held.push(this as usize, Item::FenceWait(fence as usize, value));
-        pump(&mut held, Why::Wait);
+        if crate::fence::value(fence) < value {
+            held.push(this as usize, Item::FenceWait(KeptFence::new(fence), value));
+            pump(&mut held, Why::Wait);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, value);
@@ -952,5 +974,225 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    /// Cross-queue `ID3D12CommandQueue::Wait` must hold its own reference to
+    /// the fence until the wait is satisfied and consumed:
+    /// 1. `queue_a` holds `[wait gate, Signal(f, 1)]` and `queue_b` holds
+    ///    `[Wait(f, 1), write done]`; the title releases `f` before `gate`
+    ///    opens, so `Signal` drops its ref in the same `pump()` before
+    ///    `FenceWait` tests `f` and unblocks `queue_b`.
+    /// 2. `queue_b` holds `[Wait(f2, 1), write done2]`; polling `pump` keeps
+    ///    `f2` alive until CPU `ID3D12Fence::Signal(1)` satisfies it, drops the
+    ///    wait's ref exactly once, and an already-satisfied `Wait` does not
+    ///    add a reference.
+    /// 3. `queue_b` holds `[Wait(f3, 1), write done3]`; the title releases its
+    ///    sole reference immediately and later satisfies `f3` via a GPU
+    ///    bottom-of-pipe write to `f3->GetGPUVirtualAddress()`.
+    #[cfg(windows)]
+    #[test]
+    fn cross_queue_fence_wait_keeps_fence_alive_until_satisfied() {
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+        type QueueFence = extern "system" fn(This, This, u64) -> HRESULT;
+        type FenceSignal = extern "system" fn(This, u64) -> HRESULT;
+        type FenceGpuAddr = extern "system" fn(This) -> u64;
+        type Release = extern "system" fn(This) -> u32;
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let alloc_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+
+        let make_queue = |kind: u32| -> This {
+            let desc = QueueDesc {
+                kind,
+                priority: 0,
+                flags: 0,
+                nodes: 0,
+            };
+            let mut q = null;
+            assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+            q
+        };
+        let queue_a = make_queue(0);
+        let queue_b = make_queue(2);
+        let sig_slot_a = signal_slot(queue_a);
+        let wait_slot_b = signal_slot(queue_b) + 8;
+
+        let mut alloc = null;
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &alloc_iid, &mut alloc),
+            S_OK
+        );
+        let make_list = |kind: u32| -> This {
+            let mut l = null;
+            assert_eq!(
+                crate::list::create_list(null, 0, kind, alloc, null, &list_iid, &mut l),
+                S_OK
+            );
+            l
+        };
+        let make_fence = || -> This {
+            let mut f = null;
+            assert_eq!(
+                crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut f),
+                S_OK
+            );
+            f
+        };
+
+        let buf = crate::resource::test_buffer(256);
+        let (ptr, _) = crate::resource::buffer_bytes(buf).unwrap();
+        let words = ptr.cast::<u64>();
+        // SAFETY: `buf` is a 256-byte committed buffer (32 u64 words).
+        let (gate, done1, done2, done3) =
+            unsafe { (words, words.add(1), words.add(2), words.add(3)) };
+        // SAFETY: zero-initialize our 4 distinct u64 slots.
+        unsafe {
+            gate.write_volatile(0);
+            done1.write_volatile(0);
+            done2.write_volatile(0);
+            done3.write_volatile(0);
+        }
+        const EQUAL: u32 = 3;
+
+        // Case 1: cross-queue Signal + Wait where the title releases its own
+        // reference before `queue_a` unblocks.
+        let list_a1 = make_list(0);
+        crate::list::wait64(list_a1, gate as u64, EQUAL, 1, 0);
+        assert_eq!(slot::<Close>(list_a1, 0x48)(list_a1), S_OK);
+        slot::<Execute>(queue_a, 0x50)(queue_a, 1, &list_a1);
+
+        let f1 = make_fence();
+        assert_eq!(object::refs(f1), 1);
+        assert_eq!(
+            slot::<QueueFence>(queue_a, sig_slot_a)(queue_a, f1, 1),
+            S_OK
+        );
+        assert_eq!(object::refs(f1), 2, "queued Signal holds one reference");
+        assert_eq!(
+            slot::<QueueFence>(queue_b, wait_slot_b)(queue_b, f1, 1),
+            S_OK
+        );
+        assert_eq!(
+            object::refs(f1),
+            3,
+            "queued FenceWait must hold its own reference"
+        );
+
+        let list_b1 = make_list(2);
+        crate::list::write64(list_b1, done1 as u64, 0x5A5A_A5A5, 0, 0);
+        assert_eq!(slot::<Close>(list_b1, 0x48)(list_b1), S_OK);
+        slot::<Execute>(queue_b, 0x50)(queue_b, 1, &list_b1);
+        // SAFETY: `done1` is inside `buf`.
+        assert_eq!(unsafe { done1.read_volatile() }, 0);
+
+        // Legal in D3D12: title drops its reference while both queues still use `f1`.
+        assert_eq!(
+            slot::<Release>(f1, 0x10)(f1),
+            2,
+            "both Signal and FenceWait must keep f1 alive"
+        );
+
+        // Unblock `queue_a`: Signal runs and drops its ref, then FenceWait in the
+        // same pump sees value 1, drops the last ref, and runs `list_b1`.
+        // SAFETY: `gate` is inside `buf`.
+        unsafe { gate.write_volatile(1) };
+        pump_held(Why::Fence);
+        // SAFETY: `done1` is inside `buf`.
+        assert_eq!(unsafe { done1.read_volatile() }, 0x5A5A_A5A5);
+        assert!(!held().holds_work(queue_a as usize));
+        assert!(!held().holds_work(queue_b as usize));
+
+        // Case 2: observer-ref balance across polling, CPU Signal, already-satisfied
+        // Wait, and null fence argument.
+        let f2 = make_fence();
+        assert_eq!(
+            slot::<QueueFence>(queue_b, wait_slot_b)(queue_b, f2, 1),
+            S_OK
+        );
+        assert_eq!(object::refs(f2), 2);
+
+        let list_b2 = make_list(2);
+        crate::list::write64(list_b2, done2 as u64, 0x1234_5678, 0, 0);
+        assert_eq!(slot::<Close>(list_b2, 0x48)(list_b2), S_OK);
+        slot::<Execute>(queue_b, 0x50)(queue_b, 1, &list_b2);
+
+        pump_held(Why::Timer);
+        pump_held(Why::Timer);
+        // SAFETY: `done2` is inside `buf`.
+        assert_eq!(unsafe { done2.read_volatile() }, 0);
+        assert_eq!(object::refs(f2), 2, "repeated polls must keep f2 alive");
+
+        assert_eq!(slot::<FenceSignal>(f2, 0x50)(f2, 1), S_OK);
+        // SAFETY: `done2` is inside `buf`.
+        assert_eq!(unsafe { done2.read_volatile() }, 0x1234_5678);
+        assert_eq!(
+            object::refs(f2),
+            1,
+            "satisfied FenceWait must release its reference exactly once"
+        );
+
+        // Already-satisfied Wait and null fence must not retain a reference.
+        assert_eq!(
+            slot::<QueueFence>(queue_b, wait_slot_b)(queue_b, f2, 1),
+            S_OK
+        );
+        assert_eq!(object::refs(f2), 1);
+        assert_eq!(
+            slot::<QueueFence>(queue_b, wait_slot_b)(queue_b, null, 1),
+            E_INVALIDARG
+        );
+        assert_eq!(slot::<Release>(f2, 0x10)(f2), 0);
+
+        // Case 3: title releases its sole reference immediately after `queue_b->Wait`,
+        // then satisfies the fence via a GPU bottom-of-pipe write to its GPU address.
+        let f3 = make_fence();
+        let f3_va = slot::<FenceGpuAddr>(f3, 0x60)(f3);
+        assert_eq!(
+            slot::<QueueFence>(queue_b, wait_slot_b)(queue_b, f3, 1),
+            S_OK
+        );
+        let list_b3 = make_list(2);
+        crate::list::write64(list_b3, done3 as u64, 0xBEEF_CAFE, 0, 0);
+        assert_eq!(slot::<Close>(list_b3, 0x48)(list_b3), S_OK);
+        slot::<Execute>(queue_b, 0x50)(queue_b, 1, &list_b3);
+
+        assert_eq!(
+            slot::<Release>(f3, 0x10)(f3),
+            1,
+            "pending FenceWait must keep f3 alive after the title releases it"
+        );
+        pump_held(Why::Timer);
+        // SAFETY: `done3` is inside `buf`.
+        assert_eq!(unsafe { done3.read_volatile() }, 0);
+
+        let list_a3 = make_list(0);
+        crate::list::write64(list_a3, f3_va, 1, 0, 0);
+        assert_eq!(slot::<Close>(list_a3, 0x48)(list_a3), S_OK);
+        slot::<Execute>(queue_a, 0x50)(queue_a, 1, &list_a3);
+        // SAFETY: `done3` is inside `buf`.
+        assert_eq!(unsafe { done3.read_volatile() }, 0xBEEF_CAFE);
+        assert!(!held().holds_work(queue_a as usize));
+        assert!(!held().holds_work(queue_b as usize));
+
+        for obj in [
+            list_a1, list_b1, list_b2, list_b3, list_a3, alloc, queue_a, queue_b, buf,
+        ] {
+            assert_eq!(slot::<Release>(obj, 0x10)(obj), 0);
+        }
     }
 }
