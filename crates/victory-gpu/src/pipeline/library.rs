@@ -25,8 +25,8 @@
 //! quick: the library of an AMD driver holds about 140 bytes per pipeline,
 //! and what its own cache lacks is compiled inside the load, for seconds.
 //! Loaded one at a time, 650 pipelines kept the eight workers to one core
-//! for minutes, while each title frame could wait out its 500 ms for
-//! them (`make`). Stores and serialising keep the lock: the size asked for
+//! for minutes, while each title frame could wait out its configured budget
+//! for them (`make`). Stores and serialising keep the lock: the size asked for
 //! must still be right when the bytes are written. Loads take no lock at
 //! all, since a load adds nothing to the library: a save holds the lock
 //! while it serialises the whole library (hundreds of megabytes in the
@@ -480,6 +480,16 @@ pub(crate) fn note_used(key: &str) {
     if used().get_or_insert_with(Used::default).now.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
+}
+
+/// Whether `key`, noted this run, is in the list the next launch reads for
+/// its early starts (tests).
+#[cfg(test)]
+pub(crate) fn wanted_next_launch(key: &str) -> bool {
+    used().as_ref().is_some_and(|u| {
+        let next = Used::read(&u.list().join("\n"));
+        next.before.contains_key(key)
+    })
 }
 
 #[cfg(test)]

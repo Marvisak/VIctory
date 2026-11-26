@@ -8,15 +8,17 @@
 //! the title's threads").
 //!
 //! A first use queues the pipeline and waits for it within a budget per
-//! frame, so the cheap ones (menus, one-off passes such as a colour-grading
-//! bake) are there at once as before; past the budget a draw or dispatch
+//! frame (`VICTORY_PIPELINE_WAIT_MS`, 500 ms by default), so the cheap ones
+//! (menus) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //! Pipelines a draw waits for go ahead of those started early (at the
-//! title's creation, because an earlier run drew them).
+//! title's creation, because an earlier run drew them). A one-off pass, such
+//! as a colour-grading bake, has no later frame to try again in: its first
+//! use may be given its own wait with `VICTORY_PIPELINE_WAIT_ONCE_MS` (off by
+//! default).
 //!
-//! shortcut: the budget (half a second of waiting per title frame) is a
-//! guess; a pass the title runs only once and whose pipeline takes longer
-//! is lost.
+//! A pipeline first used while still pending is listed for the next run
+//! either way, so that run starts making it at creation, during loading.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -177,8 +179,26 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(500);
+/// Waiting allowed per title frame, over all threads
+/// (`VICTORY_PIPELINE_WAIT_MS`, 500 ms by default).
+fn frame_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| millis(std::env::var("VICTORY_PIPELINE_WAIT_MS").ok().as_deref(), 500))
+}
+
+/// Waiting allowed for a pipeline's first use, outside the frame's budget
+/// (`VICTORY_PIPELINE_WAIT_ONCE_MS`, off by default). A pass the title runs
+/// once has no later frame in which to get its pipeline.
+fn once_budget() -> Duration {
+    static ONCE: OnceLock<Duration> = OnceLock::new();
+    *ONCE.get_or_init(|| millis(std::env::var("VICTORY_PIPELINE_WAIT_ONCE_MS").ok().as_deref(), 0))
+}
+
+/// What `var` asks for in milliseconds, or `default` when it is unset or
+/// not a number.
+fn millis(value: Option<&str>, default: u64) -> Duration {
+    Duration::from_millis(value.and_then(|v| v.trim().parse().ok()).unwrap_or(default))
+}
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -193,14 +213,15 @@ pub(crate) fn waiting() -> u64 {
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // Listed for an early start in later runs from its first use, made or
     // not: one a run never got made is the one it should start early.
-    if !p.used.swap(true, Ordering::Relaxed) {
+    let first = !p.used.swap(true, Ordering::Relaxed);
+    if first {
         super::library::note_used(&p.key);
         #[cfg(feature = "diagnostics")]
         log("used", &p.key, String::new);
     }
     if p.made.get().is_none() {
         start(p, true);
-        wait(p, crate::frame::current());
+        wait(p, crate::frame::current(), first);
     }
     p.made.get()?.as_ref()
 }
@@ -233,14 +254,30 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
-fn wait(p: &Pending, frame: u64) {
+/// Waits for `p` with its one-shot budget on first use, else while frame
+/// `frame` has frame budget left.
+fn wait(p: &Pending, frame: u64, first: bool) {
+    if first {
+        let once = once_budget();
+        if !once.is_zero() {
+            wait_for(p, once);
+            return;
+        }
+    }
     static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
     static WAITED_US: AtomicU64 = AtomicU64::new(0);
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
         WAITED_US.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let left =
+        frame_budget().saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let started = Instant::now();
+    wait_for(p, left);
+    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+/// Waits up to `left` for `p` to be made.
+fn wait_for(p: &Pending, left: Duration) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -251,7 +288,6 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 /// Pipelines for the workers: those draws wait for, then those started
@@ -404,6 +440,32 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn wait_budgets_read_milliseconds_or_the_default() {
+        assert_eq!(millis(Some(" 250 "), 500), Duration::from_millis(250));
+        assert_eq!(millis(Some("0"), 500), Duration::ZERO);
+        assert_eq!(millis(Some("not a number"), 500), Duration::from_millis(500));
+        assert_eq!(millis(None, 500), Duration::from_millis(500));
+    }
+
+    /// A draw whose pipeline is still being made when its wait ends has
+    /// still used it: the next launch must start it early.
+    #[test]
+    fn pending_pipeline_is_wanted_for_the_next_launch() {
+        let p = Arc::new(Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ));
+        // Queued and already taken: no worker can make it during the wait.
+        p.queued.store(true, Ordering::Relaxed);
+        p.taken.store(true, Ordering::Relaxed);
+        assert!(ready(&p).is_none());
+        assert!(p.made.get().is_none());
+        assert!(crate::pipeline::library::wanted_next_launch(&p.key));
     }
 
     #[cfg(feature = "diagnostics")]
