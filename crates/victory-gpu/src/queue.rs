@@ -372,6 +372,19 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
+/// `SuspendX(flags)`: on the console, a title's suspend routine stops its
+/// queues' GPU work (`ResumeX` restarts it). Our submissions have run when
+/// Execute returns (work held for a wait runs as soon as the wait is met),
+/// and a suspended title is never resumed here, since the process ends
+/// (`lifecycle::end_title`), so there is nothing to stop.
+extern "system" fn suspend_x(_: This, flags: u32) -> HRESULT {
+    tracing::debug!(flags, "command queue suspended");
+    S_OK
+}
+/// `ResumeX`: nothing was stopped (see [`suspend_x`]).
+extern "system" fn resume_x(_: This) -> HRESULT {
+    S_OK
+}
 /// At once, or behind the work the queue holds (its fence, and the memory
 /// the title reads it at, move only once that work has run).
 extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
@@ -709,7 +722,7 @@ extern "system" fn desc(this: This, out: *mut QueueDesc) {
 /// The queue methods by their slot in older titles' queues (the 2020-era
 /// layout): IUnknown 3, object 4, device child 1, queue 26 (12 as on PC,
 /// then console ones).
-const METHODS: [(usize, *const ()); 15] = [
+const METHODS: [(usize, *const ()); 17] = [
     (0, query as *const ()),
     (2, release as *const ()),
     (7, object::parent_device as *const ()), // 0x38
@@ -720,6 +733,8 @@ const METHODS: [(usize, *const ()); 15] = [
     (14, signal as *const ()),               // 0x70
     (15, wait as *const ()),                 // 0x78
     (16, timestamp_frequency as *const ()),  // 0x80
+    (21, suspend_x as *const ()),            // 0xa8
+    (22, resume_x as *const ()),             // 0xb0
     (26, desc as *const ()),                 // 0xd0
     (29, copy_page_mappings as *const ()),   // 0xe8 page mapping batch
     (30, present as *const ()),              // 0xf0
@@ -897,6 +912,34 @@ mod tests {
         assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
         assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
+    }
+
+    /// Grand Theft Auto VI's suspend routine calls `SuspendX(0)` at 0xb8;
+    /// `ResumeX` follows at 0xc0. Both succeed, in either queue layout.
+    #[test]
+    fn queues_suspend_and_resume() {
+        let (old, new) = (queue_table(false), queue_table(true));
+        assert_eq!(new[23], suspend_x as *const ()); // 0xb8
+        assert_eq!(new[24], resume_x as *const ()); // 0xc0
+        assert_eq!(old[21], new[23]); // 0xa8 in older queues
+        assert_eq!(old[22], new[24]); // 0xb0
+        for (table, at) in [(&FUNCTIONS, 0xa8), (&NEWER_FUNCTIONS, 0xb8)] {
+            let object = Queue {
+                object: Object::new(table),
+                kind: 0,
+                desc: QueueDesc {
+                    kind: 0,
+                    priority: 0,
+                    flags: 0,
+                    nodes: 0,
+                },
+            };
+            let q: This = std::ptr::from_ref(&object).cast();
+            let suspend = slot::<extern "system" fn(This, u32) -> HRESULT>(q, at);
+            let resume = slot::<extern "system" fn(This) -> HRESULT>(q, at + 8);
+            assert_eq!(suspend(q, 0), S_OK);
+            assert_eq!(resume(q), S_OK);
+        }
     }
 
     #[test]
