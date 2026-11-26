@@ -9746,7 +9746,8 @@ impl<'a> Lower<'a> {
         }
         if let Some((width, signed)) = sub {
             // The dword holding the field, as `global_load_ubyte` and kin.
-            // shortcut: the field is taken not to cross a dword.
+            // A half at byte 3 straddles: its high byte is byte 0 of the
+            // next dword.
             if index.is_some() {
                 return Err("a byte or half buffer load by index");
             }
@@ -9754,20 +9755,22 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::And, off, not3);
             let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, guard)?;
             let c = self.cur;
-            let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                139,
-                &[h, at, iu, mask, align],
-            );
-            let w = self.s.m.extract(c, r, 0);
-            let w = self.as_int(w);
+            let w = self.raw_dword(h, at);
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-            let x = self.s.m.bin(c, Bin::LShr, w, sh);
+            let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
+            if width == 16 {
+                // Reads this dword again when the half does not straddle,
+                // so nothing is read that was not before.
+                let is3 = self.s.m.cmp(c, pred::EQ, byte, three);
+                let [four, eight, zero] = [4, 8, 0].map(|k| self.s.m.i32(k));
+                let next = self.s.m.bin(c, Bin::Add, at, four);
+                let next = self.s.m.select(c, is3, next, at);
+                let hi = self.raw_dword(h, next);
+                let hi = self.s.m.bin(c, Bin::Shl, hi, eight);
+                let hi = self.s.m.select(c, is3, hi, zero);
+                x = self.s.m.bin(c, Bin::Or, x, hi);
+            }
             let left = self.s.m.i32(32 - width);
             let x = self.s.m.bin(c, Bin::Shl, x, left);
             let x = self
