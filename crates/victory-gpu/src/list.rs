@@ -655,9 +655,20 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if crate::texture::title_written(&from) {
                 crate::texture::upload(list, src, &from);
             }
+            // Two title textures over one memory share one host texture: the
+            // copy would be of that texture onto itself, which the host does
+            // not allow (the debug layer: CopyResource with its destination
+            // in the COPY_SOURCE state, as the two transitions left it), and
+            // it changes nothing. The transitions and the copy are left out,
+            // and the texture is not noted as written by the host: it still
+            // shows title memory, whose later CPU writes are uploaded.
+            if same_texture(&to, &from) {
+                self_copy(dst, src);
+                return;
+            }
+            crate::texture::host_writes(list, dst);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_writes(list, dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -671,6 +682,34 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
+}
+
+/// Copies left out since the start because both sides were one subresource
+/// of one host texture ([`copy_resource`], [`copy_texture_region`]).
+#[cfg(windows)]
+static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether two host resources are one.
+#[cfg(windows)]
+fn same_texture(
+    a: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    b: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> bool {
+    windows::core::Interface::as_raw(a) == windows::core::Interface::as_raw(b)
+}
+
+/// Counts a copy left out by [`same_texture`]; the first is logged.
+#[cfg(windows)]
+fn self_copy(dst: This, src: This) {
+    SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::info!(
+            ?dst,
+            ?src,
+            "a copy between two title textures over one host texture is left out (the first)"
+        );
+    });
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
@@ -719,6 +758,8 @@ extern "system" fn copy_texture_region(
             return;
         };
         let mut from = src;
+        // Both sides are one subresource of one host texture (set below).
+        let mut same = false;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -750,11 +791,40 @@ extern "system" fn copy_texture_region(
             if crate::texture::title_written(&texture) {
                 crate::texture::upload(list, src.resource, &texture);
             }
-            ensure_state(list, src.resource, COPY_SOURCE);
+            // Two title textures over one memory, one host texture: the
+            // same subresource on both sides is not a copy the host allows
+            // (a subresource is in one state). Left out below; at the same
+            // place it changes nothing.
+            // shortcut: a copy to another place in the same subresource is
+            // left out too (it would need a copy through a texture of ours).
+            same = same_texture(&texture, &to)
+                && dst.kind != FOOTPRINT
+                && src.footprint.offset as u32 == dst.footprint.offset as u32;
+            if !same {
+                ensure_state(list, src.resource, COPY_SOURCE);
+            }
             from.resource = texture.as_raw().cast_const().cast();
         }
-        ensure_state(list, dst.resource, COPY_DEST);
+        if same {
+            // SAFETY: the title's box (same layout as the host's) or null.
+            let in_place = match unsafe { source_box.as_ref() } {
+                Some(b) => [b[0], b[1], b[2]] == [x, y, z],
+                None => [x, y, z] == [0; 3],
+            };
+            // Nothing is written, so the texture is not noted as written by
+            // the host either: it still shows title memory, whose later CPU
+            // writes are uploaded.
+            if !in_place {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!("a copy to another place in its own subresource is not done");
+                });
+            }
+            self_copy(dst.resource, src.resource);
+            return;
+        }
         crate::texture::host_writes(list, dst.resource);
+        ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -2044,6 +2114,112 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
+        }
+    }
+
+    /// Two title textures over one memory share one host texture. A copy
+    /// between them, whole or of one subresource in place, is left out (the
+    /// host refuses a copy of a texture onto itself) and leaves the texture
+    /// showing title memory, not noted as written by the host (which would
+    /// stop the CPU's later writes from being uploaded); one between
+    /// textures over two memories is recorded and noted.
+    #[test]
+    fn a_copy_between_textures_over_one_memory_is_left_out() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let memory = || {
+            let layout = std::alloc::Layout::from_size_align(1 << 20, 1 << 16).unwrap();
+            // SAFETY: a non-zero size; leaked, as title memory outlives a test.
+            unsafe { std::alloc::alloc_zeroed(layout) as u64 }
+        };
+        // A 64x64 RGBA8 texture at `address`, read by shaders.
+        let texture = |address: u64| {
+            let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 1 | 1 << 16, 28, 1, 0, 0, 0, 0];
+            let iid = crate::object::guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let mut out = null;
+            let words = words.as_ptr().cast();
+            let made = crate::resource::create_at_address(
+                null,
+                address,
+                words,
+                0,
+                std::ptr::null(),
+                &iid,
+                &mut out,
+            );
+            assert_eq!(made, S_OK);
+            out
+        };
+        let one = memory();
+        let (a, b, c) = (texture(one), texture(one), texture(memory()));
+        let copy = |t: This| crate::resource::host_copy(t).unwrap();
+        assert!(
+            Arc::ptr_eq(&copy(a), &copy(b)),
+            "one memory, one host texture"
+        );
+        assert!(!Arc::ptr_eq(&copy(a), &copy(c)));
+        let _ = host.log_messages();
+
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let new_list = || {
+            let mut list = null;
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            list
+        };
+        // Closed and submitted: the notes a list makes land then.
+        let submit = |list: This| {
+            assert_eq!(close(list), S_OK);
+            host.execute(&[host_list(list).expect("a host list")]);
+        };
+        let host_written = |t: This| copy(t).host_written.load(Relaxed);
+        let list = new_list();
+        let before = SELF_COPIES.load(Relaxed);
+        copy_resource(list, a, b);
+        assert_eq!(SELF_COPIES.load(Relaxed), before + 1, "whole");
+        let at = |resource: This| {
+            // SAFETY: plain data; subresource 0.
+            let mut location: CopyLocation = unsafe { std::mem::zeroed() };
+            location.resource = resource;
+            location
+        };
+        copy_texture_region(list, &at(a), 0, 0, 0, &at(b), std::ptr::null());
+        assert_eq!(
+            SELF_COPIES.load(Relaxed),
+            before + 2,
+            "a subresource in place"
+        );
+        submit(list);
+        assert!(!host_written(a), "left out: still title memory's");
+
+        let other = new_list();
+        copy_resource(other, a, c);
+        copy_texture_region(other, &at(c), 0, 0, 0, &at(a), std::ptr::null());
+        assert_eq!(SELF_COPIES.load(Relaxed), before + 2, "two memories");
+        submit(other);
+        assert!(host_written(a) && host_written(c), "copied: the host's");
+        assert_eq!(
+            host.log_messages(),
+            None,
+            "the debug layer saw nothing wrong"
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [list, other, allocator, a, b, c] {
+            release(object);
         }
     }
 }
