@@ -105,3 +105,37 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+
+The code cites three design documents, "decision 0003" (the shader
+translation), "decision 0005" (title memory), and "decision 0007" (the
+host GPU), which are not in the repo. Until they are, the module docs
+are the current record of each decision's shape:
+
+**0003 — shader translation** (`victory-shader`): the stages, in
+order, are SSA (`ir.rs`), control-flow structurisation without EXEC
+(`structure.rs`), I/O raising (`io.rs`), whole-wave sections
+(`emit/wave.rs`), lowering one machine instruction at a time
+(`emit/lower.rs`), resource tracking (`resource.rs`), and DXIL
+emission with the host bindings (`emit/mod.rs`). Translated shaders
+are kept on disk keyed by the container's content and the translator
+build that made them (`victory-gpu::shader_cache`).
+
+**0005 — title memory**: shaders that read or write memory at
+addresses they compute look each address up in a page table over the
+host copies (`victory-gpu/src/memory.rs`; the contract is in
+`victory-shader`'s `emit/mod.rs`), and BVH ray tests read their nodes
+the same way (`emit/lower/bvh.rs`).
+
+**0007 — host GPU** (`victory-gpu`): one device and a direct queue
+(`host.rs`, `queue.rs`), with every submission waited for. Title
+buffers get host copies whose read ranges are refreshed from title
+memory before each submission and whose written ranges go back after
+it (`shadow.rs`, write-watched in `watch.rs`); textures the title
+writes are detiled into their host copies when their content changed
+(`texture.rs`). Pipelines are made by workers, not by the title
+thread that first records a draw with them, within a per-frame wait
+budget; past it a draw is dropped, as an untranslated one is
+(`pipeline/make.rs`). Compiled host pipelines go into the host's
+pipeline library under the cache folder, and the title pipelines a
+run used are listed for early making on the next run
+(`pipeline/library.rs`).
