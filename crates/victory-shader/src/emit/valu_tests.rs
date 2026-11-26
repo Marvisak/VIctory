@@ -2281,3 +2281,77 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+#[test]
+fn v_swaprel_b32_swaps_indexed_vgprs_and_respects_exec() {
+    // s0..s2 hold initial (v1, v2, v3) via build_valu_cs; s3 holds M0 (M0[9:0] = src0
+    // offset, M0[25:16] = dst offset); v_swaprel_b32 v1, v1 swaps v[1 + M0[25:16]] and
+    // v[1 + M0[9:0]] and then v0 packs the three resulting low bytes (v1 | v2<<8 | v3<<16)
+    // unless s0 == 0, which clears EXEC independently to test guard preservation on valid M0.
+    // v_swaprel_b32 v1, v1: VOP1 opcode 0x68 -> 0x7E02_D101 (vdst=1, op=0x68<<9=0xD000, src0=257)
+    let swap = 0x7E00_0000 | (1u32 << 17) | (0x68u32 << 9) | 257;
+    // Pack v1 + (v2 << 8) + (v3 << 16) into v0 using v_lshl_or_b32 / v_lshlrev:
+    let shader = build_valu_cs(&[
+        0xBE86_037E, // s_mov_b32 s6, exec_lo
+        // If s0 == 0, clear exec_lo so v_swaprel_b32 must leave v1..v3 untouched.
+        0xBF06_8000, // s_cmp_eq_i32 s0, 0
+        0xBF84_0001, // s_cbranch_scc0 +1 -> set m0
+        0xBEFE_0380, // s_mov_b32 exec_lo, 0
+        0xBEFC_0303, // s_mov_b32 m0, s3
+        swap,
+        0xBEFE_0306, // s_mov_b32 exec_lo, s6 (restore active lanes)
+        0x3404_0488, // v_lshlrev_b32 v2, 8, v2
+        0x3406_0690, // v_lshlrev_b32 v3, 16, v3
+        0x3800_0501, // v_or_b32 v0, v1, v2
+        0x3800_0700, // v_or_b32 v0, v0, v3
+    ]);
+
+    let cases: &[([u32; 4], u32)] = &[
+        // (v1, v2, v3, m0) -> packed (v1 | v2<<8 | v3<<16)
+        ([0x11, 0x22, 0x33, 0x0000_0002], 0x00_11_22_33), // dst+0 (v1) <-> src+2 (v3)
+        ([0x11, 0x22, 0x33, 0x0001_0002], 0x00_22_33_11), // dst+1 (v2) <-> src+2 (v3)
+        ([0x11, 0x22, 0x33, 0xFC01_FC02], 0x00_22_33_11), // upper bits [31:26],[15:10] ignored
+        ([0x11, 0x22, 0x33, 0x0001_0001], 0x00_33_22_11), // self-swap dst+1 <-> src+1
+        ([0x00, 0x22, 0x33, 0x0001_0002], 0x00_33_22_00), // EXEC == 0 on valid M0: unchanged
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_swaprel_b32(m0={:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[3],
+        );
+    });
+}
+
+#[test]
+fn v_swaprel_b32_constant_m0_swaps_distant_ranges() {
+    // Constant M0 = 2 bounds [v1, v4) and [v10, v13) separately via range.rs, leaving
+    // a gap between them; v_swaprel_b32 v1, v10 swaps v[1 + 0] (v1) and v[10 + 2] (v12).
+    let shader = build_valu_cs(&[
+        vop1(0x001, 11, vgpr(3)), // v11 = s2
+        vop1(0x001, 12, vgpr(4)), // v12 = s3
+        0xBEFC_0382,              // s_mov_b32 m0, 2 (src_off=2, dst_off=0)
+        vop1(0x068, 1, vgpr(10)), // v_swaprel_b32 v1, v10
+        0x3404_0488,              // v_lshlrev_b32 v2, 8, v2
+        0x3416_1690,              // v_lshlrev_b32 v11, 16, v11
+        0x3418_1898,              // v_lshlrev_b32 v12, 24, v12
+        0x3800_0501,              // v_or_b32 v0, v1, v2
+        0x3800_1700,              // v_or_b32 v0, v0, v11
+        0x3800_1900,              // v_or_b32 v0, v0, v12
+    ]);
+
+    let cases: &[([u32; 4], u32)] = &[
+        ([0x11, 0x22, 0xAA, 0xBB], 0x11_AA_22_BB),
+        ([0x42, 0x10, 0x20, 0x99], 0x42_20_10_99),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_swaprel_b32 constant m0=2 = {got:#010x}, want {want:#010x}",
+        );
+    });
+}
