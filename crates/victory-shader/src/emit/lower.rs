@@ -72,6 +72,9 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Whether the program checks texel residency (`CheckAccessFullyMapped`).
+    #[cfg(test)]
+    pub tiled_resources: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1412,6 +1415,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            tiled_resources: self.s.flags & flags::TILED_RESOURCES != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -8387,10 +8392,21 @@ impl<'a> Lower<'a> {
         else {
             unreachable!()
         };
-        if *tfe || *lwe {
-            return Err("an image access with tfe or lwe");
+        if *lwe {
+            return Err("an image access with lwe");
         }
         let name = inst.name();
+        // TFE adds a status dword to the results of loads, samples and
+        // gathers (below); stores, atomics, queries and BVH intersections
+        // return none.
+        if *tfe
+            && (name.starts_with("image_store")
+                || name.starts_with("image_atomic_")
+                || name.starts_with("image_bvh")
+                || matches!(name, "image_get_resinfo" | "image_get_lod"))
+        {
+            return Err("tfe on an image store, atomic or query");
+        }
         if name.starts_with("image_bvh") {
             return self.bvh(inst, b, i);
         }
@@ -9046,6 +9062,27 @@ impl<'a> Lower<'a> {
                     _ => p[0],
                 })
                 .collect();
+        }
+        if *tfe {
+            // The texel-fail code in the dword after the data: zero when every
+            // texel read was resident, which on the host is DXIL's status
+            // having touched only mapped tiles (always, outside tiled
+            // resources).
+            // shortcut: a fail reads 1, whatever other bits the console sets
+            // (code that checks residency compares the dword with zero).
+            let status = self.s.m.extract(c, r, 4);
+            let i1t = self.s.t.i1;
+            let mapped = self.s.op(
+                c,
+                "checkAccessFullyMapped.i32",
+                Attr::ReadOnly,
+                i1t,
+                71,
+                &[status],
+            );
+            let (resident, failed) = (self.s.m.i32(0), self.s.m.i32(1));
+            xs.push(self.s.m.select(c, mapped, resident, failed));
+            self.s.flags |= flags::TILED_RESOURCES;
         }
         for (k, x) in xs.into_iter().enumerate() {
             self.write(inst, Reg::V(reg + k as u8), x, guard);

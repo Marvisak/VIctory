@@ -174,6 +174,10 @@
 //!   [`VIEW_READS`] + the view's heap index in the same bitmap, after the
 //!   written pages, where still clear: the host makes views it left null
 //!   until a shader reads them (textures the title placed itself).
+//! * **Texel residency** (added 2026-11-24): a load, sample or gather with
+//!   `tfe` gets its status dword from `CheckAccessFullyMapped` (0 when
+//!   resident, else 1), which declares the tiled-resources feature, so the
+//!   host device needs tiled resources tier 2.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -222,6 +226,8 @@ mod shader;
 mod stride_tests;
 #[cfg(all(test, windows))]
 mod synthetic_tests;
+#[cfg(test)]
+mod tfe_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
