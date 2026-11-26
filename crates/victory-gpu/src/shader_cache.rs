@@ -8,6 +8,8 @@
 //! writes them atomically; an entry that does not read back is translated
 //! again. A container that does not translate is kept too, with the reason,
 //! so it is not tried again on every run.
+//! Both kinds end with a BLAKE3 digest of the complete entry, checked before
+//! decoding any fields, so damaged DXIL and metadata are cache misses too.
 //!
 //! `victory translate --cache` fills the same cache ahead of a run, through
 //! [`host_shader`].
@@ -85,7 +87,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => (translate(container), false),
@@ -174,9 +177,9 @@ fn cached(
     )
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 /// A container that does not translate: the reason follows.
-const REFUSED: &[u8; 4] = b"VSHE";
+const REFUSED: &[u8; 4] = b"VSF3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -213,11 +216,13 @@ fn root_type(code: u32) -> RootType {
 }
 
 /// Little-endian words and length-prefixed lists; a refusal is its
-/// reason's text.
+/// reason's text. Both carry a digest covering the marker and all fields.
 fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
     let s = match translation {
         Ok(s) => s,
-        Err(reason) => return [REFUSED.as_slice(), reason.as_bytes()].concat(),
+        Err(reason) => {
+            return checksum_entry([REFUSED.as_slice(), reason.as_bytes()].concat());
+        }
     };
     // Every field by name: a field added to `HostShader` must be added here
     // (and to `decode`).
@@ -287,10 +292,20 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap_writes) << 4
             | u32::from(*view_marks) << 5,
     );
-    out
+    checksum_entry(out)
+}
+
+fn checksum_entry(mut bytes: Vec<u8>) -> Vec<u8> {
+    let digest = blake3::hash(&bytes);
+    bytes.extend_from_slice(digest.as_bytes());
+    bytes
 }
 
 fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
+    let (bytes, digest) = bytes.split_at_checked(bytes.len().checked_sub(32)?)?;
+    if blake3::hash(bytes).as_bytes() != digest {
+        return None;
+    }
     struct Reader<'a>(&'a [u8]);
     impl<'a> Reader<'a> {
         fn take(&mut self, n: usize) -> Option<&'a [u8]> {
@@ -450,8 +465,25 @@ mod tests {
         };
         let refused = (Err("unsupported".to_owned()), false);
         assert_eq!(cached(&cache, &build, b"other", fail), refused);
-        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0, true));
+        assert_eq!(
+            cached(&cache, &build, b"other", fail),
+            (refused.0.clone(), true)
+        );
         assert_eq!(fails.load(Ordering::Relaxed), 1);
+
+        let path = walk(dir.path())
+            .into_iter()
+            .find(|path| std::fs::read(path).is_ok_and(|bytes| bytes.starts_with(REFUSED)))
+            .expect("cached refusal entry");
+        std::fs::write(&path, &encode(&Err("unsupported".to_owned()))[..8]).unwrap();
+        assert_eq!(
+            cached(&cache, &build, b"other", fail),
+            (Err("unsupported".to_owned()), false),
+            "a truncated refusal is retranslated, not returned as a cache hit"
+        );
+        assert_eq!(fails.load(Ordering::Relaxed), 2);
+        assert_eq!(cached(&cache, &build, b"other", fail), (refused.0, true));
+        assert_eq!(fails.load(Ordering::Relaxed), 2);
     }
 
     /// A translation whose entry cannot be written (the cache folder is
@@ -521,7 +553,107 @@ mod tests {
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
         let refusal = Err("GFX10 code at 0x10: x is not supported".to_owned());
-        assert_eq!(decode(&encode(&refusal)), Some(refusal));
-        assert_eq!(decode(&[b"VSHE".as_slice(), &[0xff]].concat()), None);
+        let encoded = encode(&refusal);
+        assert_eq!(decode(&encoded), Some(refusal.clone()));
+        for end in [4, 8, encoded.len() - 1] {
+            assert_eq!(decode(&encoded[..end]), None, "truncated refusal at {end}");
+        }
+        let mut damaged = encoded.clone();
+        damaged[40] ^= 1;
+        assert_eq!(decode(&damaged), None, "same-length refusal corruption");
+        assert_eq!(
+            decode(&checksum_entry([REFUSED.as_slice(), &[0xff]].concat())),
+            None
+        );
+    }
+
+    #[test]
+    fn a_digest_does_not_make_malformed_fields_valid() {
+        let bytes = encode(&Ok(shader()));
+        let payload = &bytes[..bytes.len() - 32];
+        for end in 0..payload.len() {
+            assert_eq!(decode(&checksum_entry(payload[..end].to_vec())), None);
+        }
+        let mut unknown_stage = payload.to_vec();
+        unknown_stage[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(decode(&checksum_entry(unknown_stage)), None);
+        let mut extra_field = payload.to_vec();
+        extra_field.push(0);
+        assert_eq!(decode(&checksum_entry(extra_field)), None);
+        let mut old_success = payload.to_vec();
+        old_success[..4].copy_from_slice(b"VSH1");
+        assert_eq!(decode(&checksum_entry(old_success)), None);
+        for old_refusal in [b"VSHE", b"VSF2"] {
+            assert_eq!(decode(&checksum_entry(old_refusal.to_vec())), None);
+        }
+    }
+
+    #[test]
+    fn every_translation_byte_is_checked() {
+        for translation in [
+            Ok(shader()),
+            Err("unsupported".to_owned()),
+            Err("unsupported: \u{3c0}".to_owned()),
+            Err(String::new()),
+        ] {
+            let bytes = encode(&translation);
+            assert_eq!(decode(&bytes), Some(translation));
+            for end in 0..bytes.len() {
+                assert_eq!(decode(&bytes[..end]), None, "truncated at {end}");
+            }
+            for (at, _) in bytes.iter().enumerate() {
+                let mut damaged = bytes.clone();
+                damaged[at] ^= 1;
+                assert_eq!(decode(&damaged), None, "changed byte {at}");
+            }
+            assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
+            assert_eq!(decode(&[bytes.as_slice(), bytes.as_slice()].concat()), None);
+        }
+    }
+
+    #[test]
+    fn damaged_success_is_retranslated() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [9; 32];
+        let input = b"synthetic container";
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        assert_eq!(
+            cached(&cache, &build, input, translate),
+            (Ok(shader()), false)
+        );
+        let paths = walk(dir.path());
+        assert_eq!(paths.len(), 1);
+        let path = &paths[0];
+
+        for damage in 0..3 {
+            let mut bytes = std::fs::read(path).unwrap();
+            match damage {
+                0 => {
+                    bytes.pop();
+                }
+                1 => {
+                    let dxil = &shader().dxil;
+                    let at = bytes.windows(dxil.len()).position(|w| w == dxil).unwrap();
+                    bytes[at + 5] ^= 1; // a changed DXIL byte still parses as VSH1
+                }
+                _ => bytes.push(0),
+            }
+            std::fs::write(path, bytes).unwrap();
+            assert_eq!(
+                cached(&cache, &build, input, translate),
+                (Ok(shader()), false)
+            );
+            assert_eq!(runs.load(Ordering::Relaxed), damage + 2);
+            assert_eq!(
+                cached(&cache, &build, input, translate),
+                (Ok(shader()), true)
+            );
+            assert_eq!(runs.load(Ordering::Relaxed), damage + 2);
+        }
     }
 }
