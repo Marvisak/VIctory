@@ -78,8 +78,27 @@ impl HostPolicy {
         if !self.allows(dll) {
             return None;
         }
-        imp::resolve(dll, symbol)
+        let host = imp::resolve(dll, symbol)?;
+        #[cfg(windows)]
+        if dll.eq_ignore_ascii_case("vcruntime140.dll") && copy_beside_on()
+            && let ImportSymbol::Name { name, .. } = symbol
+        {
+            match name.as_str() {
+                "memcpy" => return Some(victory_gpu::tracked_memcpy as *const () as usize),
+                "memset" => return Some(victory_gpu::tracked_memset as *const () as usize),
+                _ => {}
+            }
+        }
+        Some(host)
     }
+}
+
+/// The opt-in title CRT copy path and its writable section views.
+#[cfg(windows)]
+pub(crate) fn copy_beside_on() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
+        std::env::var("VICTORY_COPY_BESIDE").as_deref() == Ok("1"));
+    *ENABLED
 }
 
 /// The host's own `name` from the System32 DLL `dll`: what a title import
@@ -179,6 +198,23 @@ mod imp {
 
         unsafe extern "system" fn idle(_: *mut c_void) -> u32 {
             0
+        }
+
+        #[test]
+        fn crt_copy_imports_follow_the_switch_and_host_policy() {
+            use super::super::{HostPolicy, copy_beside_on, function};
+            use victory_pe::ImportSymbol;
+            let dll = "VCRUNTIME140.dll";
+            for (name, wrapper) in [
+                ("memcpy", victory_gpu::tracked_memcpy as *const () as usize),
+                ("memset", victory_gpu::tracked_memset as *const () as usize),
+            ] {
+                let symbol = ImportSymbol::Name { hint: 0, name: name.into() };
+                let host = function(dll, name).unwrap();
+                let expected = if copy_beside_on() { wrapper } else { host };
+                assert_eq!(HostPolicy::default().resolve(dll, &symbol), Some(expected));
+                assert_eq!(HostPolicy::none().resolve(dll, &symbol), None);
+            }
         }
 
         /// One thread loads a DLL nothing has loaded yet, which needs the

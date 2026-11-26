@@ -884,6 +884,126 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     }
 }
 
+/// Our own view of the title pages that show a section (`victory_hle`'s
+/// physical pages): the address of a page there, by title page number. A
+/// store beside a guard is made while this is read; the runtime changes it
+/// before it unmaps a view ([`title_memory_beside_gone`]), so no store goes
+/// to a page the title address no longer shows.
+static BESIDE_VIEWS: std::sync::RwLock<BTreeMap<usize, usize>> = std::sync::RwLock::new(BTreeMap::new());
+
+// A bit remembers that a 2 MiB region has ever had a writable section view.
+// Collisions and stale bits only lead to a lookup. A clear bit lets an
+// ordinary CRT copy go straight to its native operation. Even during
+// registration the native destination still faults on a protected page.
+const REGION_SHIFT: u32 = 21;
+static BESIDE_REGIONS: [std::sync::atomic::AtomicU64; 1024] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 1024];
+
+fn region_bit(region: usize) -> (&'static std::sync::atomic::AtomicU64, u64) {
+    (&BESIDE_REGIONS[(region / 64) % BESIDE_REGIONS.len()], 1u64 << (region % 64))
+}
+
+fn ordinary_destination(at: usize, len: usize) -> bool {
+    debug_assert!(len > 0);
+    let first = at >> REGION_SHIFT;
+    if at.saturating_add(len - 1) >> REGION_SHIFT != first {
+        return false;
+    }
+    let (word, mask) = region_bit(first);
+    word.load(std::sync::atomic::Ordering::Relaxed) & mask == 0
+}
+
+/// The runtime mapped a section's page at title address `at` (a 64 KiB
+/// page); `ours` shows the same page, writable, at an address of our own.
+///
+/// # Safety
+/// Both page-aligned views must show the same physical page. The second
+/// must stay writable until the runtime unregisters the first before unmapping.
+pub unsafe fn title_memory_beside(at: usize, ours: usize) {
+    let (word, mask) = region_bit(at >> REGION_SHIFT);
+    word.fetch_or(mask, std::sync::atomic::Ordering::Relaxed);
+    BESIDE_VIEWS.write().unwrap_or_else(|e| e.into_inner()).insert(at / PAGE, ours);
+}
+
+/// The runtime is about to unmap (or map over) `[at, at + len)`: no store
+/// goes beside its guards from now on, and none is under way.
+pub fn title_memory_beside_gone(at: usize, len: usize) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut views = BESIDE_VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    let gone: Vec<usize> = views.range(first..last).map(|(&p, _)| p).collect();
+    for page in gone {
+        views.remove(&page);
+    }
+}
+
+/// One CRT destination chunk. Only redirect writes to a page we guarded.
+fn bulk_chunk(at: usize, write: impl FnOnce(*mut u8)) -> bool {
+    let page = at / PAGE;
+    let views = BESIDE_VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(&ours) = views.get(&page) else { return false };
+    let mut g = guards();
+    if !g.protected.contains(&page) {
+        return false;
+    }
+    let others = g.alias_of.get(&page).cloned().unwrap_or_default();
+    mark_changed(&mut g, page, page + 1, true);
+    for other in others {
+        mark_changed(&mut g, other, other + 1, true);
+    }
+    write((ours + at % PAGE) as *mut u8);
+    true
+}
+
+fn bulk_write(mut at: usize, len: usize, write: impl Fn(*mut u8, usize, usize)) {
+    if len == 0 {
+        return;
+    }
+    if ordinary_destination(at, len) {
+        write(at as *mut u8, 0, len);
+        return;
+    }
+    let mut offset = 0;
+    while offset < len {
+        let count = (PAGE - at % PAGE).min(len - offset);
+        if !bulk_chunk(at, |dst| write(dst, offset, count)) {
+            // The ordinary write may fault. Release every tracker lock first.
+            write(at as *mut u8, offset, count);
+        }
+        offset += count;
+        at += count;
+    }
+}
+
+/// Title CRT memset with guard-aware section writes.
+/// # Safety
+/// The destination must be writable for len bytes under the title's mapping.
+pub unsafe extern "C" fn tracked_memset(dst: *mut u8, value: i32, len: usize) -> *mut u8 {
+    // SAFETY: each chunk is inside the destination or its registered writable view.
+    bulk_write(dst as usize, len, |out, _, count| unsafe {
+        std::ptr::write_bytes(out, value as u8, count);
+    });
+    dst
+}
+
+/// Title CRT memcpy with guard-aware section writes.
+/// # Safety
+/// Both ranges must be valid for the requested copy.
+pub unsafe extern "C" fn tracked_memcpy(dst: *mut u8, src: *const u8, len: usize) -> *mut u8 {
+    if len == 0 || dst.cast_const() == src {
+        return dst;
+    }
+    if (dst as usize).abs_diff(src as usize) < len {
+        // SAFETY: both ranges are valid. Preserve overlapping moves in either direction.
+        unsafe { std::ptr::copy(src, dst, len) };
+    } else {
+        // SAFETY: each source chunk is within src, and out shows its destination chunk.
+        bulk_write(dst as usize, len, |out, offset, count| unsafe {
+            std::ptr::copy(src.add(offset), out, count);
+        });
+    }
+    dst
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
@@ -1300,6 +1420,192 @@ pub(crate) mod tests {
             title_memory_aliased(b + k, &[a + k]);
         }
         (a, b)
+    }
+
+    // Map one section twice. Only the first mapped_pages have a registered
+    // writable alias: the remaining pages exercise the ordinary fault path.
+    fn with_crt_views(pages: usize, mapped_pages: usize, test: impl FnOnce(usize, windows_sys::Win32::Foundation::HANDLE)) {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        let size = pages * PAGE;
+        // SAFETY: both views stay mapped for the callback and span the section.
+        unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE,
+                0, size.try_into().unwrap(), std::ptr::null());
+            assert!(!section.is_null());
+            let view = || MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, size);
+            let (title, ours) = (view(), view());
+            let a = title.Value as usize;
+            assert!(a != 0 && !ours.Value.is_null());
+            for offset in (0..mapped_pages * PAGE).step_by(PAGE) {
+                title_memory_beside(a + offset, ours.Value as usize + offset);
+            }
+            test(a, section);
+            title_memory_beside_gone(a, size);
+            UnmapViewOfFile(title);
+            UnmapViewOfFile(ours);
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
+
+    #[test]
+    fn crt_writes_across_guarded_and_ordinary_pages() {
+        with_crt_views(2, 1, |a, _| {
+            let t = track(a, 2 * PAGE, true).unwrap();
+            t.take(a, a + 2 * PAGE);
+            let dst = (a + PAGE - 4) as *mut u8;
+            // SAFETY: the eight bytes cross two valid title pages.
+            unsafe {
+                assert_eq!(tracked_memset(dst, 0x1ab, 8), dst);
+                assert_eq!(std::slice::from_raw_parts(dst, 8), &[0xab; 8]);
+                assert!(guards().protected.contains(&(a / PAGE)));
+                assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+                let bytes = *b"12345678";
+                assert_eq!(tracked_memcpy(dst, bytes.as_ptr(), 8), dst);
+                assert_eq!(std::slice::from_raw_parts(dst, 8), &bytes);
+                assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+            }
+        });
+    }
+
+    #[test]
+    fn crt_write_preserves_armed_alias_and_unregisters_before_remap() {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        with_crt_views(1, 1, |a, section| {
+            // SAFETY: a third writable view of the same live section.
+            let alias = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+            let b = alias.Value as usize;
+            assert_ne!(b, 0);
+            title_memory_aliased(b, &[a]);
+            let tracker = track(b, PAGE, true).unwrap();
+            tracker.take(b, b + PAGE);
+            tracker.arm(b, b + PAGE);
+            // SAFETY: the title-mapped destination covers the four bytes.
+            unsafe { tracked_memset((a + 16) as *mut u8, 0x55, 4) };
+            assert!(tracker.changed(b / PAGE));
+            assert_eq!(tracker.saved(b / PAGE).unwrap()[16..20], [0; 4]);
+            // SAFETY: the alias is a readable view of those bytes.
+            assert_eq!(unsafe { std::slice::from_raw_parts((b + 16) as *const u8, 4) }, [0x55; 4]);
+            assert_eq!(tracker.take(b, b + PAGE), [(b, b + PAGE)]);
+            title_memory_beside_gone(a, PAGE);
+            assert!(!bulk_chunk(a, |_| panic!("unregistered view used")));
+            // SAFETY: the title mapping stays valid after unregistering its writable view.
+            unsafe { tracked_memset(a as *mut u8, 0x33, 4) };
+            assert_eq!(tracker.take(b, b + PAGE), [(b, b + PAGE)]);
+            drop(tracker);
+            title_memory_remapped(b, PAGE);
+            // SAFETY: this test owns the alias and its tracking has ended.
+            unsafe { UnmapViewOfFile(alias) };
+        });
+    }
+
+    #[test]
+    fn crt_fast_check_keeps_registered_pages_and_straddling_ranges() {
+        with_crt_views(1, 1, |a, _| {
+            assert!(!ordinary_destination(a, PAGE));
+            let next = ((a >> REGION_SHIFT) + 1) << REGION_SHIFT;
+            assert!(!ordinary_destination(next - 1, 2));
+            title_memory_beside_gone(a, PAGE);
+            // A remembered region can outlive its view. The locked lookup
+            // still falls back to a native write and cannot use a stale pointer.
+            assert!(!bulk_chunk(a, |_| panic!("unregistered view used")));
+        });
+    }
+
+    #[test]
+    fn concurrent_crt_writes_are_visible_after_the_last_take() {
+        use std::sync::{Barrier, atomic::{AtomicUsize, Ordering}};
+        const WRITERS: usize = 4;
+        const PAGES: usize = WRITERS * 2;
+        const ROUNDS: u8 = 120;
+        with_crt_views(PAGES, PAGES, |a, _| {
+            let end = a + PAGES * PAGE;
+            let tracker = track(a, PAGES * PAGE, true).unwrap();
+            tracker.take(a, end);
+            let start = Barrier::new(WRITERS + 1);
+            let done = AtomicUsize::new(0);
+            let mut mirror = [[0u8; 64]; PAGES];
+            let mut refresh = || {
+                for (from, to) in tracker.take(a, end) {
+                    for addr in (from..to).step_by(PAGE) {
+                        // ReadProcessMemory copies a snapshot while the title can write.
+                        assert!(crate::host::read_into(addr as *const u8, &mut mirror[(addr - a) / PAGE]));
+                    }
+                }
+            };
+            std::thread::scope(|scope| {
+                for worker in 0..WRITERS {
+                    let (start, done) = (&start, &done);
+                    scope.spawn(move || {
+                        start.wait();
+                        for round in 1..=ROUNDS {
+                            let value = round + worker as u8;
+                            let src = [value; 64];
+                            // SAFETY: each writer owns its two destination pages;
+                            // the kernel reads them for the tracker.
+                            unsafe {
+                                tracked_memcpy((a + worker * PAGE) as *mut u8, src.as_ptr(), 64);
+                                tracked_memset((a + (worker + WRITERS) * PAGE) as *mut u8, i32::from(value), 64);
+                            }
+                        }
+                        done.fetch_add(1, Ordering::Release);
+                    });
+                }
+                start.wait();
+                while done.load(Ordering::Acquire) != WRITERS {
+                    refresh();
+                }
+            });
+            refresh();
+            for (page, bytes) in mirror.iter().enumerate() {
+                assert_eq!(bytes, &[ROUNDS + (page % WRITERS) as u8; 64]);
+            }
+        });
+    }
+
+    /// Alternate the native and redirected paths on exactly the same section
+    /// and tracker. Each round writes 4 KiB on every freshly guarded page.
+    #[test]
+    #[ignore]
+    fn guarded_crt_copy_benchmark() {
+        const PAGES: usize = 32;
+        const ROUNDS: usize = 100;
+        with_crt_views(PAGES, PAGES, |a, _| {
+            let end = a + PAGES * PAGE;
+            let tracker = track(a, PAGES * PAGE, true).unwrap();
+            tracker.take(a, end);
+            let run = |redirect: bool| {
+                let start = std::time::Instant::now();
+                for round in 0..ROUNDS {
+                    let src = [round as u8; 4096];
+                    for page in 0..PAGES {
+                        let dst = (a + page * PAGE) as *mut u8;
+                        // SAFETY: disjoint source and destination, both 4 KiB.
+                        unsafe {
+                            if redirect {
+                                tracked_memcpy(dst, src.as_ptr(), src.len());
+                            } else {
+                                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+                            }
+                        }
+                    }
+                    assert_eq!(tracker.take(a, end), [(a, end)]);
+                }
+                let elapsed = start.elapsed();
+                for page in 0..PAGES {
+                    // SAFETY: each page starts with 4 KiB written in the last round.
+                    let bytes = unsafe { std::slice::from_raw_parts((a + page * PAGE) as *const u8, 4096) };
+                    assert!(bytes.iter().all(|&v| v == (ROUNDS - 1) as u8));
+                }
+                elapsed
+            };
+            for redirect in [false, true, true, false, false, true] {
+                let elapsed = run(redirect);
+                eprintln!("guarded CRT copy: redirect={redirect}, {} copies, {:.2} us/copy including take",
+                    PAGES * ROUNDS, elapsed.as_secs_f64() * 1e6 / (PAGES * ROUNDS) as f64);
+            }
+        });
     }
 
     /// A write through another mapping of the same pages marks the tracker
