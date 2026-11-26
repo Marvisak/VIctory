@@ -57,6 +57,9 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// LDS accesses lowered with their bound.
+    #[cfg(test)]
+    pub lds_bounds: u32,
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
@@ -1402,6 +1405,8 @@ impl<'a> Lower<'a> {
             view_marks: self.s.view_writes.is_some(),
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            lds_bounds: self.s.lds_bounds,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
             #[cfg(test)]
@@ -3295,6 +3300,7 @@ impl<'a> Lower<'a> {
             let index = l.s.m.bin(c, Bin::LShr, at, two);
             let n = l.s.m.i32(l.s.lds_dwords);
             let inside = l.s.m.cmp(c, pred::IULT, index, n);
+            l.s.lds_bounds += 1;
             let zero = l.s.m.i32(0);
             let index = l.s.m.select(c, inside, index, zero);
             let lds = l.s.lds();
@@ -11314,6 +11320,24 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    #[test]
+    fn lds_accesses_are_bounded_by_the_allocation() {
+        // A write, a read and an atomic with a returned value at an address
+        // taken from v0: each compares its dword index with the allocation
+        // (unsigned), so an address outside reads 0 and stores nothing.
+        let words = [
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xD8D8_0000,
+            0x0200_0000, // ds_read_b32 v2, v0
+            0xD880_0000,
+            0x0300_0100, // ds_add_rtn_u32 v3, v0, v1
+            S_ENDPGM,
+        ];
+        let l = lower_with(&words, vec![], vec![]).unwrap();
+        assert_eq!(l.lds_bounds, 3, "one bound per LDS access");
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
