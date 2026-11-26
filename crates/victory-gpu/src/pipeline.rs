@@ -561,6 +561,14 @@ fn read_stream(
         };
         at += size;
     }
+    // The pre-build writes the vertex or mesh shader before the pixel shader.
+    // The title's stream can reverse those subobjects for the same pipeline.
+    if let [pixel, producer] = shaders.as_slice()
+        && pixel.stage == "pixel"
+        && matches!(producer.stage, "vertex" | "mesh")
+    {
+        shaders.swap(0, 1);
+    }
     (shaders, graphics)
 }
 
@@ -737,6 +745,48 @@ mod tests {
             None
         });
         assert_eq!(*seen.borrow(), [("vertex", 0x1000, 7)]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prebuild_and_runtime_use_the_same_key_for_reordered_graphics_stages() {
+        let (vertex, mesh, pixel, other_pixel) = (b"key-fixture-vs", b"key-fixture-ms", b"key-fixture-ps", b"key-fixture-ps-control");
+        let shader = |kind, bytes: &[u8]| [kind, bytes.as_ptr() as u64, bytes.len() as u64];
+        let stream = |a: [u64; 3], b: [u64; 3]| -> Vec<u8> {
+            a.into_iter().chain(b).flat_map(u64::to_le_bytes).collect()
+        };
+        let build = |bytes: &[u8]| {
+            // SAFETY: the stream names the live synthetic shader slices above.
+            unsafe { Prebuild::graphics(bytes) }.key()
+        };
+        let device = crate::device::device();
+        type Create = extern "system" fn(This, *const StreamDesc, *const Iid, *mut This) -> HRESULT;
+        let create = slot::<Create>(device, 0x2b0);
+        let runtime = |bytes: &[u8]| {
+            let desc = StreamDesc { size: bytes.len(), stream: bytes.as_ptr() };
+            let mut out = std::ptr::null();
+            assert_eq!(create(device, &desc, &PIPELINE_IIDS[0], &mut out), S_OK);
+            let key = pipeline(out).host.key.clone();
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(out, 0x10)(out), 0);
+            key
+        };
+
+        let pixel_stage = shader(2, pixel);
+        let mut keys = Vec::new();
+        for (kind, geometry) in [(1, vertex), (24, mesh)] {
+            let first = shader(kind, geometry);
+            let forward = stream(first, pixel_stage);
+            let reverse = stream(pixel_stage, first);
+            let prebuilt = build(&forward);
+            assert_eq!(runtime(&forward), prebuilt);
+            assert_ne!(runtime(&stream(first, shader(2, other_pixel))), prebuilt);
+            keys.push((runtime(&reverse), build(&reverse), prebuilt));
+        }
+        assert_ne!(keys[0].2, keys[1].2, "vertex and mesh keys stay distinct");
+        assert!(
+            keys.iter().all(|(runtime, reverse_prebuild, prebuilt)| runtime == prebuilt && reverse_prebuild == prebuilt),
+            "reversed runtime, reversed prebuild, canonical prebuild: {keys:?}"
+        );
     }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
