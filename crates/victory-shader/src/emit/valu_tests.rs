@@ -63,6 +63,22 @@ const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     ]
 }
 
+/// VOP2 `op vdst, src0, vsrc1` (e32 encoding).
+const fn vop2_e32(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    (op as u32 & 0x3F) << 25
+        | (vdst as u32 & 0xFF) << 17
+        | (vsrc1 as u32 & 0xFF) << 9
+        | (src0 as u32 & 0x1FF)
+}
+
+/// MUBUF `buffer_store_dword vdata, vaddr, srsrc, soffset offen offset:offset`.
+const fn buffer_store_dword_offen(vdata: u8, vaddr: u8, srsrc: u8, offset: u16) -> [u32; 2] {
+    [
+        0xE070_1000 | (offset as u32 & 0xFFF),
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
 const fn sgpr(n: u8) -> u16 {
     n as u16
 }
@@ -2280,4 +2296,330 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
             inp[0], inp[1],
         );
     });
+}
+
+/// Builds a multi-lane synthetic compute shader (`wave64`: 64 threads, else 32)
+/// with 4 root constants in `s0..s3` and a raw UAV at heap index 0 (`s[8:11]`).
+fn build_wave_cs(wave64: bool, body: &[u32]) -> HostShader {
+    let wave = if wave64 { 64u32 } else { 32 };
+    let mut words = Vec::new();
+    words.push(s_mov_b32(5, 0x80)); // s_mov_b32 s5, 0 (s4 = table offset 0)
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(body);
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: 12,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: (2 << 1) | (1 << 15),
+            threads: [wave, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
+    };
+
+    #[cfg(windows)]
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation");
+    }
+
+    shader
+}
+
+#[test]
+fn v_writelane_b32_ignores_exec_and_masks_lane() {
+    for wave64 in [false, true] {
+        let wave = if wave64 { 64u32 } else { 32 };
+        let half = wave / 2;
+        let mut b = Vec::new();
+        // v1 = 0x1000 | v0; v2 = 0x2000 | v0; v3 = 0x3000 | v0
+        for (dst, tag) in [(1u8, 0x1000u32), (2, 0x2000), (3, 0x3000)] {
+            b.push(vop2_e32(0x1C, dst, 0xFF, 0)); // v_or_b32 vdst, literal, v0
+            b.push(tag);
+        }
+        // Narrow EXEC to upper half (`lanes half..wave`), leaving `0..half` inactive.
+        b.extend_from_slice(&vop3(0x0D6, 126, vgpr(0), 128 + half as u16, 0));
+
+        // 1. Write 0xCAFEBABE to inactive lane 0.
+        b.push(0x35 << 26 | 0x361 << 16 | 1); // v_writelane_b32 v1, literal, 0
+        b.push(0xFF | (128u32) << 9);
+        b.push(0xCAFE_BABE);
+
+        // 2. Control VALU: `v_add_nc_u32 v2, 0x100, v2` obeys EXEC (only `half..wave` change).
+        b.push(vop2_e32(0x25, 2, 0xFF, 2));
+        b.push(0x0000_0100);
+
+        // 3. Dynamic SGPR selector `s1`: `v_writelane_b32 v1, s0, s1` (wraps modulo wave).
+        b.extend_from_slice(&vop3(0x361, 1, sgpr(0), sgpr(1), 0));
+
+        // 4. Explicit `exec_lo` read spilled into inactive lane 0: `v_writelane_b32 v3, exec_lo, 0`.
+        b.extend_from_slice(&vop3(0x361, 3, sgpr(126), 128, 0));
+
+        // 5. EXEC == 0 in straight-line code: `v_writelane_b32 v1, s2, 5` still writes lane 5.
+        if wave64 {
+            b.push(0xBE80_0000 | 126 << 16 | 0x04 << 8 | 128); // s_mov_b64 exec, 0
+        } else {
+            b.push(s_mov_b32(126, 128)); // s_mov_b32 exec_lo, 0
+        }
+        b.extend_from_slice(&vop3(0x361, 1, sgpr(2), 128 + 5, 0));
+
+        // Restore full EXEC, read dynamic wrapped lane `s3` via `v_readlane_b32 s12, v1, s3`.
+        if wave64 {
+            b.push(0xBE80_0000 | 126 << 16 | 0x04 << 8 | 193); // s_mov_b64 exec, -1
+        } else {
+            b.push(s_mov_b32(126, 193)); // s_mov_b32 exec_lo, -1
+        }
+        b.extend_from_slice(&vop3(0x360, 12, vgpr(1), sgpr(3), 0));
+        b.push(vop1(0x001, 4, sgpr(12))); // v4 = s12
+
+        // Store 4 dwords per lane at byte offset `v0 * 16`: v1, v2, v3, v4.
+        b.push(vop2_e32(0x1A, 5, 128 + 4, 0)); // v_lshlrev_b32 v5, 4, v0
+        b.extend_from_slice(&buffer_store_dword_offen(1, 5, 8, 0));
+        b.extend_from_slice(&buffer_store_dword_offen(2, 5, 8, 4));
+        b.extend_from_slice(&buffer_store_dword_offen(3, 5, 8, 8));
+        b.extend_from_slice(&buffer_store_dword_offen(4, 5, 8, 12));
+
+        let shader = build_wave_cs(wave64, &b);
+        let dyn_cases: &[[u32; 4]] = if wave64 {
+            &[
+                // [s0_val, s1_write_sel, s2_lane5_val, s3_read_sel]
+                [0x1111_2222, 65, 0x5555_0005, 64], // 65 -> 1, 64 -> 0 (0xCAFEBABE)
+                [0x3333_4444, u32::MAX, 0x5555_0005, 129], // -1 -> 63, 129 -> 1
+                [0x7777_8888, 32, 0x5555_0005, u32::MAX], // 32 -> 32, -1 -> 63
+                [0x9999_AAAA, 0x2000_0000, 0x5555_0005, 69], // 0x2000_0000 -> 0, 69 -> 5
+            ]
+        } else {
+            &[
+                [0x1111_2222, 33, 0x5555_0005, 32], // 33 -> 1, 32 -> 0 (0xCAFEBABE)
+                [0x3333_4444, 65, 0x5555_0005, u32::MAX], // 65 -> 1, -1 -> 31
+                [0x7777_8888, u32::MAX, 0x5555_0005, 37], // -1 -> 31, 37 -> 5
+                [0x9999_AAAA, 32, 0x5555_0005, 64], // 32 -> 0, 64 -> 0
+            ]
+        };
+
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+                assert!(warp, "{label}: no pipeline for a wave of {wave}");
+                eprintln!("{label}: no pipeline for a wave of {wave}; skipped");
+                continue;
+            };
+            for (test_idx, &[s0, s1, s2, s3]) in dyn_cases.iter().enumerate() {
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = match (u.root, u.slot) {
+                        (RootType::Constants, 0) => [s0, s1, s2, s3][u.dword as usize],
+                        (RootType::Table, 1) => 0,
+                        other => panic!("unexpected user data {other:?}"),
+                    };
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::RawUav(wave * 4)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                let dwords = &out[0];
+                let target_dyn_lane = (s1 % wave) as usize;
+                let target_read_lane = (s3 % wave) as usize;
+
+                let mut expected_v1: Vec<u32> = (0..wave).map(|l| 0x1000 | l).collect();
+                expected_v1[0] = 0xCAFE_BABE;
+                expected_v1[target_dyn_lane] = s0;
+                expected_v1[5] = s2;
+
+                let expected_exec_lo = if wave64 { 0 } else { u32::MAX << half };
+                let expected_read = expected_v1[target_read_lane];
+
+                for (l, &exp_v1) in expected_v1.iter().enumerate() {
+                    let base = l * 4;
+                    let got_v1 = dwords[base];
+                    let got_v2 = dwords[base + 1];
+                    let got_v3 = dwords[base + 2];
+                    let got_rl = dwords[base + 3];
+
+                    let want_v2 = if (l as u32) >= half {
+                        (0x2000 | l as u32).wrapping_add(0x100)
+                    } else {
+                        0x2000 | l as u32
+                    };
+                    let want_v3 = if l == 0 {
+                        expected_exec_lo
+                    } else {
+                        0x3000 | l as u32
+                    };
+                    assert_eq!(
+                        got_v1, exp_v1,
+                        "{label} Wave{wave} case {test_idx} lane {l} v1"
+                    );
+                    assert_eq!(got_v2, want_v2, "{label} Wave{wave} case {test_idx} lane {l} v2");
+                    assert_eq!(got_v3, want_v3, "{label} Wave{wave} case {test_idx} lane {l} v3");
+                    assert_eq!(
+                        got_rl, expected_read,
+                        "{label} Wave{wave} case {test_idx} lane {l} readlane"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn v_readlane_and_writelane_wrap_constant_lane_selector() {
+    for wave64 in [false, true] {
+        let wave = if wave64 { 64u32 } else { 32 };
+        let mut b = Vec::new();
+        // v1 = 0x4000 | v0
+        b.push(vop2_e32(0x1C, 1, 0xFF, 0));
+        b.push(0x4000);
+        // Inline `64` (`128 + 64 = 192`) wraps to lane 0 in both Wave32 and Wave64!
+        b.extend_from_slice(&vop3(0x361, 1, sgpr(0), 192, 0));
+        // Inline `-1` (`193`) wraps to `wave - 1` (`31` in Wave32, `63` in Wave64).
+        b.extend_from_slice(&vop3(0x361, 1, sgpr(1), 193, 0));
+        // Literal `65` wraps to lane `1` in both Wave32 and Wave64.
+        b.push(0x35 << 26 | 0x361 << 16 | 1);
+        b.push(sgpr(2) as u32 | 0xFF << 9);
+        b.push(65);
+        // Constant `v_readlane_b32`: inline `64` -> lane 0, inline `-1` -> lane `wave - 1`.
+        b.extend_from_slice(&vop3(0x360, 12, vgpr(1), 192, 0));
+        b.extend_from_slice(&vop3(0x360, 13, vgpr(1), 193, 0));
+        b.push(vop1(0x001, 2, sgpr(12)));
+        b.push(vop1(0x001, 3, sgpr(13)));
+
+        b.push(vop2_e32(0x1A, 5, 128 + 4, 0)); // v5 = v0 * 16
+        b.extend_from_slice(&buffer_store_dword_offen(1, 5, 8, 0));
+        b.extend_from_slice(&buffer_store_dword_offen(2, 5, 8, 4));
+        b.extend_from_slice(&buffer_store_dword_offen(3, 5, 8, 8));
+
+        let shader = build_wave_cs(wave64, &b);
+        let [s0, s1, s2] = [0x1357_9BDFu32, 0x2468_ACE0, 0xDEAD_C0DE];
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+                assert!(warp, "{label}: no pipeline for a wave of {wave}");
+                eprintln!("{label}: no pipeline for a wave of {wave}; skipped");
+                continue;
+            };
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => [s0, s1, s2, 0][u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(wave * 4)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("dispatch");
+            let dwords = &out[0];
+            for l in 0..wave as usize {
+                let base = l * 4;
+                let got_v1 = dwords[base];
+                let got_rl0 = dwords[base + 1];
+                let got_rl1 = dwords[base + 2];
+                let want_v1 = if l == 0 {
+                    s0
+                } else if l == (wave as usize - 1) {
+                    s1
+                } else if l == 1 {
+                    s2
+                } else {
+                    0x4000 | l as u32
+                };
+                assert_eq!(got_v1, want_v1, "{label} Wave{wave} lane {l} v1");
+                assert_eq!(got_rl0, s0, "{label} Wave{wave} lane {l} readlane 64");
+                assert_eq!(got_rl1, s1, "{label} Wave{wave} lane {l} readlane -1");
+            }
+        }
+    }
 }
