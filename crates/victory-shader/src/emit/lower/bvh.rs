@@ -190,6 +190,23 @@ impl Lower<'_> {
 
     /// The four result dwords of `ray` against the node `node` points to.
     fn bvh_lanes(&mut self, nodes: &Nodes, node: V, ray: &Ray) -> Result<[V; 4], Why> {
+        if super::super::bvh_miss() {
+            let c = self.cur;
+            let seven = self.s.m.i32(7);
+            let ty = self.s.m.bin(c, Bin::And, node, seven);
+            let four = self.s.m.i32(4);
+            let is_tri = self.s.m.cmp(c, pred::IULT, ty, four);
+            let none = self.s.m.i32(INVALID);
+            let tri_miss = [
+                self.s.m.i32(f32::INFINITY.to_bits()),
+                self.s.m.i32(1.0f32.to_bits()),
+                self.s.m.i32(0),
+                self.s.m.i32(0),
+            ];
+            return Ok(std::array::from_fn(|k| {
+                self.s.m.select(c, is_tri, tri_miss[k], none)
+            }));
+        }
         let w = self.node_dwords(nodes, 0, 16)?;
         let c = self.cur;
         let seven = self.s.m.i32(7);
