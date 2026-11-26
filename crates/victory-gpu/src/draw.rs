@@ -1331,7 +1331,8 @@ impl State {
                 // slots, which for constant buffer tables hold no constant
                 // view: a texture or null descriptor read as a buffer gives
                 // a wild address on AMD and the device is removed (#59).
-                // The draw or dispatch is dropped instead.
+                // Occupied slots still back recorded descriptor tables.
+                // Drop this draw or dispatch until free slots are available.
                 self.table_failed = true;
                 continue;
             };
@@ -3906,5 +3907,87 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(host.log_messages(), None, "case {case} D3D12 debug errors");
             let _ = kept_obj;
         }
+    }
+
+    use crate::object::{guid, slot};
+
+    #[test]
+    fn exhausted_heap_keeps_existing_descriptor_tables_reserved() {
+        let Some(device) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let list = device.new_list().unwrap();
+
+        #[repr(C)]
+        struct ExtendedHeapDesc {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC,
+            placement: [u64; 2],
+        }
+        let desc = ExtendedHeapDesc {
+            desc: D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1_245_184,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            },
+            placement: [0; 2],
+        };
+        let iid = ID3D12DescriptorHeap::IID;
+        let iid = guid(iid.data1, iid.data2, iid.data3, iid.data4);
+        let mut guest = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                std::ptr::from_ref(&desc).cast(),
+                &iid,
+                &mut guest,
+            ),
+            S_OK
+        );
+        let heap = crate::descriptor::heap(guest);
+        let host = heap.host().unwrap();
+        let release_guest = || {
+            let release = slot::<extern "system" fn(This) -> u32>(guest, 0x10);
+            assert_eq!(release(guest), 0);
+        };
+        if host.count() >= desc.desc.NumDescriptors {
+            list.close();
+            release_guest();
+            return; // adapter accepted full request without capping
+        }
+        let table = heap.start + u64::from(host.count()) * 32;
+        // SAFETY: the heap is live and GetDesc is a plain query.
+        let capacity = unsafe { host.heap.GetDesc() }.NumDescriptors - host.count();
+        let held = host.dynamic(capacity).unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[guest]);
+        state.set_table(true, 0, table);
+        let used = [UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 1,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+
+        let while_held = state.tables(&list, &used, true);
+        let declined = state.table_failed;
+        drop(state);
+        host.release(held, capacity);
+
+        let mut state = State::default();
+        state.set_heaps(&[guest]);
+        state.set_table(true, 0, table);
+        let after_release = state.tables(&list, &used, true);
+        drop(state);
+        list.close();
+        release_guest();
+
+        assert!(while_held.is_empty(), "reused a live range: {while_held:?}");
+        assert!(declined);
+        assert_eq!(after_release, vec![(0, held * 32)]);
     }
 }

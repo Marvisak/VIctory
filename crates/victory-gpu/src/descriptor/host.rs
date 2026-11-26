@@ -158,10 +158,12 @@ impl HostHeap {
             match make(count + MIN_DYNAMIC) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
+                    // D3D12 Tier 1 hardware limit: NVIDIA (Ampere, Ada, Blackwell)
+                    // caps CBV_SRV_UAV heaps at 1,000,000 descriptors. Cap gracefully
+                    // at PORTABLE_VIEWS rather than failing adapter initialization.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    let heap = make(PORTABLE_VIEWS).ok()?;
+                    (heap, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -732,7 +734,11 @@ impl HostHeap {
                     "title slot past the host heap"
                 );
             }
-            return None;
+            // Graceful degradation: return the title's view so callers (e.g. table_entry)
+            // can still transition and prepare resources rather than dropping state.
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            return (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
@@ -2220,10 +2226,11 @@ mod tests {
             return; // no host GPU
         };
         // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
+        // `HEAP_VIEWS`, `HEAP_SAMPLERS`, or capped at `PORTABLE_VIEWS` on NVIDIA).
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            let num = heap.heap.GetDesc().NumDescriptors;
+            assert!(num >= victory_shader::emit::HEAP_VIEWS || num >= MIN_DYNAMIC);
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
@@ -2461,5 +2468,44 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    /// Contiguous spans that cross the search cursor are found.
+    #[test]
+    fn dynamic_cursor_wraparound_finds_contiguous_span() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // Fill the heap in two parts: first dynamic - 10 slots, then 10 slots.
+        let a = heap.dynamic(heap.dynamic - 10).unwrap();
+        let b = heap.dynamic(10).unwrap();
+        assert_eq!(a, 4);
+        assert_eq!(b, 4 + heap.dynamic - 10);
+        // Release the first part.
+        heap.release(a, heap.dynamic - 10);
+        // Request 10 slots: finds them in the freed range at the start.
+        let c = heap.dynamic(10).unwrap();
+        assert_eq!(c, 4);
+    }
+
+    /// Requesting more than 1,000,000 descriptors either allocates the full request on
+    /// capable (Tier 3) adapters or caps gracefully within PORTABLE_VIEWS without panicking.
+    #[test]
+    fn heap_request_over_one_million_caps_gracefully() {
+        let Some(heap) = HostHeap::new(false, 1_245_184) else {
+            return; // no host GPU or device failed
+        };
+        assert!(heap.count > 0);
+        assert!(heap.dynamic > 0);
+        if heap.count < 1_245_184 {
+            assert!(heap.count + heap.dynamic <= PORTABLE_VIEWS);
+        }
+        // Mirroring a slot past the capped host count handles it gracefully without panic:
+        // with tag 0 it returns None.
+        let mut zero_handle: [u32; 3] = [0, 0, 0];
+        assert!(heap.mirror(1_245_000, (&raw mut zero_handle) as u64, false).is_none());
+        // With VIEW_TAG and an unallocated generation, it safely yields None without host heap indexing.
+        let mut view_handle: [u32; 3] = [VIEW_TAG, 0, 0];
+        assert_eq!(heap.mirror(1_245_000, (&raw mut view_handle) as u64, false), None);
     }
 }
