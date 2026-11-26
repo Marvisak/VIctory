@@ -55,6 +55,7 @@ pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    pub const NO_REFACTORING: u64 = 1 << 1;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -138,6 +139,8 @@ pub(crate) struct Shader {
     pub texture_index: std::collections::HashMap<V, V>,
     pub texture_reads: Vec<V>,
     pub flags: u64,
+    /// A fused multiply-add (`FMad`) was emitted: the driver may then fuse.
+    pub fused: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -204,6 +207,7 @@ impl Shader {
             texture_index: std::collections::HashMap::new(),
             texture_reads: Vec::new(),
             flags: 0,
+            fused: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
@@ -568,6 +572,14 @@ impl Shader {
         h
     }
 
+    /// Refactoring lets the host fuse a multiply and an add the console
+    /// rounds apart (Intel UHD does); only `FMad` needs it, to fuse at all.
+    pub(crate) fn settle_flags(&mut self) {
+        if !self.fused {
+            self.flags |= flags::NO_REFACTORING;
+        }
+    }
+
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
@@ -841,6 +853,7 @@ impl Shader {
         if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
             self.flags |= flags::STENCIL_REF;
         }
+        self.settle_flags();
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
