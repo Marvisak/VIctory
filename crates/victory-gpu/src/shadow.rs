@@ -826,25 +826,23 @@ pub(crate) fn view_writes(memory: bool) -> Option<u64> {
 
 /// Heap slots whose texture views shaders read: the marks seen so far (a
 /// slot's stays set in the bitmap until [`forget_read`]), and the slots to
-/// clear at the next [`take_reads`].
+/// clear before the next submission.
 static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()));
 
-/// After a submission: the heap slots its shaders first read texture views
-/// at (`victory_shader::emit`, "Read marks"), each once until
-/// [`forget_read`]. Clears the slots forgotten since first.
-pub(crate) fn take_reads() -> Vec<u32> {
+/// Clear forgotten read marks after the previous submission has finished and
+/// before the next one runs. Doing this before execution matters: clearing in
+/// [`take_reads`] would also erase a new mark written by that next submission.
+pub(crate) fn clear_forgotten() {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
-    // Both bitmaps: shaders that use title memory mark their reads in theirs.
     let mut maps: Vec<&mut [u32]> = [false, true]
         .into_iter()
         .filter_map(bitmap)
-        // SAFETY: the mapped bitmap's read marks; the GPU is done with them
-        // (one submission runs at a time).
+        // SAFETY: the previous submission is done and the next has not run.
         .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
         .collect();
     if maps.is_empty() {
-        return Vec::new();
+        return;
     }
     let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
     let (seen, forgotten) = &mut *reads;
@@ -856,6 +854,28 @@ pub(crate) fn take_reads() -> Vec<u32> {
             seen[w] &= !bit;
         }
     }
+}
+
+/// After a submission: the heap slots its shaders first read texture views
+/// at (`victory_shader::emit`, "Read marks"), each once until
+/// [`forget_read`].
+pub(crate) fn take_reads() -> Vec<u32> {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
+    // Both bitmaps: shaders that use title memory mark their reads in theirs.
+    let maps: Vec<&mut [u32]> = [false, true]
+        .into_iter()
+        .filter_map(bitmap)
+        // SAFETY: the mapped bitmap's read marks; the GPU is done with them
+        // (one submission runs at a time).
+        .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
+        .collect();
+    if maps.is_empty() {
+        return Vec::new();
+    }
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    let (seen, _) = &mut *reads;
+    seen.resize(words, 0);
     let mut new = Vec::new();
     for (w, s) in seen.iter_mut().enumerate() {
         let mut fresh = maps.iter().fold(0, |x, bits| x | bits[w]) & !*s;
@@ -897,6 +917,34 @@ pub(crate) fn reads_since() -> Vec<u32> {
 /// marked again.
 pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
+}
+
+/// Take whether heap slot `slot` was queued to be marked again
+/// ([`forget_read`]); removes the test's entry so it cannot affect another test.
+#[cfg(test)]
+pub(crate) fn take_forgotten(slot: u32) -> bool {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
+    let mut maps: Vec<&mut [u32]> = [false, true]
+        .into_iter()
+        .filter_map(bitmap)
+        // SAFETY: this test-only cleanup runs with no submission in flight.
+        .map(|b| unsafe {
+            std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words)
+        })
+        .collect();
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(at) = reads.1.iter().position(|&s| s == slot) else {
+        return false;
+    };
+    reads.1.remove(at);
+    let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
+    if w < words {
+        maps.iter_mut().for_each(|bits| bits[w] &= !bit);
+        reads.0.resize(words, 0);
+        reads.0[w] &= !bit;
+    }
+    true
 }
 
 /// After a submission: every page its shaders marked as written through

@@ -734,7 +734,10 @@ pub(crate) mod tests {
         let again = crate::shadow::take_reads();
         assert!(!again.contains(&plain) && !again.contains(&memory), "each once");
         crate::shadow::forget_read(memory);
-        assert!(!crate::shadow::take_reads().contains(&memory), "forgotten: its mark cleared");
+        // The next submission clears the old mark before the GPU writes a
+        // new one; clearing it in take_reads would lose that new mark.
+        crate::shadow::clear_forgotten();
+        assert!(!crate::shadow::take_reads().contains(&memory), "forgotten: its old mark cleared");
         crate::shadow::tests::mark_read(true, memory);
         assert!(crate::shadow::take_reads().contains(&memory), "read again after it was forgotten");
     }
@@ -1557,6 +1560,9 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         let mut removed_in = None;
+        // Clear marks forgotten while preparing this submission before its
+        // shaders can write fresh marks to the same bitmap slots.
+        crate::shadow::clear_forgotten();
         for (i, group) in groups.iter().enumerate() {
             let Some(next) = next_submission_value(*submitted) else {
                 fail(format_args!("host submission fence value exhausted before submission"));
