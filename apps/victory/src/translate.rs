@@ -647,24 +647,29 @@ fn check(
             }
         }
         Err(text) => {
-            let first = text
-                .lines()
-                .find(|l| l.contains("error"))
-                .unwrap_or(text.lines().next().unwrap_or(""))
-                .to_owned();
+            let first = validator_reason(&text);
             if let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP") {
                 let n = t
                     .failed
                     .get(&format!("validator: {first}"))
                     .map_or(0, |f| f.0);
                 if n < 3 {
+                    // The readable part is 40 alphanumeric characters, which
+                    // two different reasons can share once their punctuation
+                    // is dropped ("A" and "A (and 1 more error)" both become
+                    // "Aand1moreerror" when the suffix is long enough to
+                    // reach the cut). A hash of the whole reason keeps the
+                    // files apart, so a dump is never overwritten by another
+                    // reason that merely reads alike.
+                    let digest = blake3::hash(first.as_bytes());
                     let name = format!(
-                        "{dir}/{}_{n}",
+                        "{dir}/{}_{}_{n}",
                         first
                             .chars()
                             .filter(char::is_ascii_alphanumeric)
                             .take(40)
-                            .collect::<String>()
+                            .collect::<String>(),
+                        &digest.to_hex()[..8]
                     );
                     let _ = std::fs::write(format!("{name}.dxil"), &shader.dxil);
                     let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
@@ -673,6 +678,45 @@ fn check(
             t.fail(format!("validator: {first}"), label);
         }
     }
+}
+
+/// The validator's own answer: the first error it named, plus how many other
+/// distinct ones it named, without the opening line that only announces the
+/// refusal. That line reads "Entry function performs some operation that is
+/// incompatible with the shader stage or other entry properties. See other
+/// errors for details." — taken alone it names no operation, and the errors
+/// after it are what say which stage or feature is at fault. An error the
+/// validator repeats per site counts once, so the text is the same for two
+/// programs whose messages are the same and the tally does not split them.
+fn validator_reason(text: &str) -> String {
+    let errors: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("error:") && !l.contains("See other errors for details"))
+        .filter(|l| !l.contains("Entry function performs some operation"))
+        .collect();
+    if errors.is_empty() {
+        // Nothing but the announcement (or nothing at all): keep one line.
+        return text.lines().next().unwrap_or("").to_owned();
+    }
+    let mut named: Vec<&str> = Vec::new();
+    for e in &errors {
+        if !named.contains(e) {
+            named.push(e);
+        }
+    }
+    // The errors kept beyond the one reported: the distinct ones, so a
+    // message repeated per site does not report a phantom "and 1 more".
+    let more = named.len().saturating_sub(1);
+    if more == 0 {
+        return named[0].to_owned();
+    }
+    format!("{} (and {more} more error{})", named[0], plural(more))
+}
+
+/// `s` when `n` is not one.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 /// Emission counts of `stage`'s kind: 0 programs, 1 emitted, 2 validated,
@@ -870,5 +914,55 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    use super::validator_reason;
+
+    /// The validator's refusals name the operation in the errors after the
+    /// one announcing the refusal; taking the first line alone loses it.
+    #[test]
+    fn a_validator_refusal_is_reported_by_what_it_names() {
+        let text = "Function: main: error: Entry function performs some operation that is incompatible with the shader stage or other entry properties.  See other errors for details.\n\
+Function: main: error: Opcode DecodeShaderTable is invalid in shader stage Compute.\n\
+Function: main: error: something else entirely.\n\
+Validation failed.";
+        assert_eq!(
+            validator_reason(text),
+            "Function: main: error: Opcode DecodeShaderTable is invalid in shader stage Compute. \
+             (and 1 more error)"
+        );
+        // The same error repeated for two sites is one error, not two: no
+        // "(and 1 more error)", and no split tally key for two programs that
+        // say the same thing.
+        let repeated = "Function: main: error: Opcode DecodeShaderTable is invalid in shader stage Compute.\n\
+Function: main: error: Opcode DecodeShaderTable is invalid in shader stage Compute.\n\
+Validation failed.";
+        assert_eq!(
+            validator_reason(repeated),
+            "Function: main: error: Opcode DecodeShaderTable is invalid in shader stage Compute."
+        );
+        // The real shape of those refusals: the announcement, then the one
+        // error that names the stage.
+        assert_eq!(
+            validator_reason(
+                "Function: main: error: Entry function performs some operation that is \
+                 incompatible with the shader stage or other entry properties.  See other errors \
+                 for details.\nFunction: main: error: Function uses features incompatible with the \
+                 shader stage (cs) of the entry function.\nValidation failed."
+            ),
+            "Function: main: error: Function uses features incompatible with the shader stage (cs) \
+             of the entry function."
+        );
+        // A single, specific refusal stands on its own.
+        assert_eq!(
+            validator_reason("Function: main: error: Only one of these.\nValidation failed."),
+            "Function: main: error: Only one of these."
+        );
+        // Nothing to name: whatever the validator said, on one line.
+        assert_eq!(
+            validator_reason("rejected (0x80004005)"),
+            "rejected (0x80004005)"
+        );
+        assert_eq!(validator_reason(""), "");
     }
 }
