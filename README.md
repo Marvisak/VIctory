@@ -57,7 +57,10 @@ What each part does today and what it still needs:
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+`rust-toolchain.toml`). On Windows 10 (a serviced Windows 10 runtime that
+provides `ID3D12SDKConfiguration1`), place a DirectX 12 Agility SDK
+`D3D12\D3D12Core.dll` beside `victory.exe` or set
+`VICTORY_D3D12_AGILITY=<dir>`.
 
 To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
 the installer from https://rustup.rs). The first `cargo` command in this

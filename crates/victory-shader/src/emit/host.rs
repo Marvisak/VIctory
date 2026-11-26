@@ -77,7 +77,6 @@ unsafe impl Sync for SharedDevice {}
 fn create_device(warp: bool) -> Result<ID3D12Device, String> {
     // SAFETY: plain D3D12/DXGI calls with valid out pointers.
     unsafe {
-        let mut device: Option<ID3D12Device> = None;
         let factory: IDXGIFactory4 =
             CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
         let adapter: IDXGIAdapter1 = if warp {
@@ -85,8 +84,14 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
         } else {
             hardware_adapter(&factory).map_err(err)?
         };
-        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-        let device = device.ok_or("no device")?;
+        let device = match super::agility::Factory::load()? {
+            Some(agility) => agility.create_device(&adapter).map_err(err)?,
+            None => {
+                let mut device: Option<ID3D12Device> = None;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                device.ok_or("no device")?
+            }
+        };
         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_6,
         };
@@ -328,8 +333,13 @@ impl Host {
         let blob: ID3DBlob = unsafe {
             let mut blob = None;
             let mut error = None;
-            D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error))
-                .map_err(err)?;
+            super::agility::serialize_versioned_root_signature(
+                &self.device,
+                &desc,
+                &mut blob,
+                Some(&mut error),
+            )
+            .map_err(err)?;
             blob.ok_or("no root signature blob")?
         };
         // SAFETY: `blob` stays alive for the lifetime of `bytes`.

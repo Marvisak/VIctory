@@ -195,6 +195,8 @@
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
 
+#[cfg(all(windows, any(test, feature = "host")))]
+pub mod agility;
 mod bitcode;
 #[cfg(test)]
 mod census_tests;
