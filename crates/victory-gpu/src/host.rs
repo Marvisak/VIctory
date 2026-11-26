@@ -189,6 +189,15 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some(adapter) = hardware_adapter() {
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                tracing::warn!(
+                    "failed to create D3D12 device on selected hardware adapter; falling back to default"
+                );
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
+            // Whether a GPU hang ends the run or freezes the PC (#1054).
+            crate::tdr::log();
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             // Whether a GPU hang ends the run or freezes the PC (#1054).
@@ -377,6 +386,135 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
         Some((info.CurrentUsage as f64 / 1e6, info.Budget as f64 / 1e6))
     };
     Some([info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?])
+}
+
+/// Reads an adapter's null-terminated UTF-16 description into a Rust `String`.
+fn adapter_name(desc: &[u16]) -> String {
+    let len = desc.iter().position(|&c| c == 0).unwrap_or(desc.len());
+    String::from_utf16_lossy(&desc[..len])
+}
+
+/// Probes whether a hardware adapter supports D3D_FEATURE_LEVEL_12_0.
+fn supports_d3d12(adapter: &IDXGIAdapter1) -> bool {
+    // SAFETY: D3D12CreateDevice with a null out-pointer tests feature level support without creating a device.
+    unsafe {
+        D3D12CreateDevice(
+            adapter,
+            D3D_FEATURE_LEVEL_12_0,
+            std::ptr::null_mut::<Option<ID3D12Device>>(),
+        )
+        .is_ok()
+    }
+}
+
+/// Filters and ranks adapter candidates, requiring non-software and D3D12 FL 12.0 support,
+/// and ranking by dedicated video memory.
+#[cfg(test)]
+fn select_adapter_from_candidates<T: Clone>(
+    candidates: impl IntoIterator<Item = (T, String, bool, usize, bool)>,
+    filter: Option<&str>,
+) -> Option<T> {
+    let clean_filter = filter.map(str::trim).filter(|f| !f.is_empty());
+    if let Some(f) = clean_filter {
+        let f_lower = f.to_lowercase();
+        for (adapter, name, software, _vram, fl12) in candidates {
+            if !software && fl12 && name.to_lowercase().contains(&f_lower) {
+                return Some(adapter);
+            }
+        }
+        return None;
+    }
+
+    let mut best: Option<(T, usize)> = None;
+    for (adapter, _name, software, vram, fl12) in candidates {
+        if !software && fl12 && vram > 0 {
+            let is_better = best.as_ref().is_none_or(|(_, best_vram)| vram > *best_vram);
+            if is_better {
+                best = Some((adapter, vram));
+            }
+        }
+    }
+    best.map(|(a, _)| a)
+}
+
+/// Finds the preferred high-performance hardware adapter (e.g. discrete NVIDIA or AMD GPU)
+/// on multi-GPU systems, avoiding defaulting to integrated graphics.
+fn hardware_adapter() -> Option<IDXGIAdapter> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+
+        // If an explicit adapter substring is requested via VICTORY_D3D12_ADAPTER, search for it.
+        // Empty or whitespace-only values are ignored, and software adapters are skipped.
+        let env_filter = std::env::var("VICTORY_D3D12_ADAPTER").ok();
+        let clean_filter = env_filter.as_deref().map(str::trim).filter(|f| !f.is_empty());
+        if let Some(filter) = clean_filter {
+            let filter_lower = filter.to_lowercase();
+            let mut i = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(i) {
+                i += 1;
+                if let Ok(desc) = adapter.GetDesc1()
+                    && desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+                {
+                    let name = adapter_name(&desc.Description);
+                    if name.to_lowercase().contains(&filter_lower) && supports_d3d12(&adapter) {
+                        tracing::info!(adapter = %name, "selected hardware adapter via VICTORY_D3D12_ADAPTER");
+                        return adapter.cast::<IDXGIAdapter>().ok();
+                    }
+                }
+            }
+            tracing::warn!(filter = %filter, "no hardware adapter matched VICTORY_D3D12_ADAPTER");
+        }
+
+        // Query DXGIFactory6 for OS-preferred high-performance hardware GPU.
+        if let Ok(factory6) = factory.cast::<IDXGIFactory6>() {
+            let mut i = 0;
+            while let Ok(adapter) = factory6.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                i,
+                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+            ) {
+                i += 1;
+                if let Ok(desc) = adapter.GetDesc1()
+                    && desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+                    && desc.DedicatedVideoMemory > 0
+                    && supports_d3d12(&adapter)
+                {
+                    let name = adapter_name(&desc.Description);
+                    tracing::info!(adapter = %name, "selected high-performance hardware adapter");
+                    return adapter.cast::<IDXGIAdapter>().ok();
+                }
+            }
+        }
+
+        // Fallback: enumerate all adapters and select the non-software adapter with the most dedicated VRAM.
+        // Aligns with victory-shader's emit::host::hardware_adapter rule.
+        let mut best: Option<(IDXGIAdapter1, usize, String)> = None;
+        let mut i = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            i += 1;
+            if let Ok(desc) = adapter.GetDesc1()
+                && desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+                && desc.DedicatedVideoMemory > 0
+                && supports_d3d12(&adapter)
+            {
+                let vram = desc.DedicatedVideoMemory;
+                let is_better = best
+                    .as_ref()
+                    .is_none_or(|(_, best_vram, _)| vram > *best_vram);
+                if is_better {
+                    let name = adapter_name(&desc.Description);
+                    best = Some((adapter, vram, name));
+                }
+            }
+        }
+
+        if let Some((adapter, _, name)) = best {
+            tracing::info!(adapter = %name, "selected hardware adapter by dedicated video memory");
+            return adapter.cast::<IDXGIAdapter>().ok();
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]
@@ -650,6 +788,75 @@ pub(crate) mod tests {
         Compositor::new(&host.device, DXGI_FORMAT_R8G8B8A8_UNORM)
             .expect("create compositor root signature and both pipeline states");
         eprintln!("PresentX compositor initialized");
+    }
+
+    #[test]
+    fn adapter_name_handles_null_terminator() {
+        let raw = [b'G' as u16, b'P' as u16, b'U' as u16, 0, b'X' as u16];
+        assert_eq!(adapter_name(&raw), "GPU");
+        let no_null = [b'A' as u16, b'B' as u16];
+        assert_eq!(adapter_name(&no_null), "AB");
+    }
+
+    #[test]
+    fn hardware_adapter_selects_non_software() {
+        if let Some(adapter) = hardware_adapter() {
+            // SAFETY: hardware_adapter returns a valid DXGI adapter.
+            let desc = unsafe { adapter.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
+            eprintln!(
+                "hardware_adapter: description={}, vendor={:#x}, flags={:#x}",
+                adapter_name(&desc.Description),
+                desc.VendorId,
+                desc.Flags
+            );
+            assert_eq!(
+                desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32,
+                0,
+                "hardware_adapter must not select a software adapter"
+            );
+        }
+    }
+
+    #[test]
+    fn select_adapter_fixed_list_rules() {
+        let mock = vec![
+            ("Basic Render", "Microsoft Basic Render Driver".to_string(), true, 0, true),
+            ("Intel UHD", "Intel(R) UHD Graphics 770".to_string(), false, 128 * 1024 * 1024, true),
+            (
+                "RTX 4060",
+                "NVIDIA GeForce RTX 4060 Laptop GPU".to_string(),
+                false,
+                8 * 1024 * 1024 * 1024,
+                true,
+            ),
+            (
+                "Virtual Display",
+                "Virtual Display Adapter".to_string(),
+                false,
+                4 * 1024 * 1024 * 1024,
+                false, // no FL 12.0
+            ),
+        ];
+
+        // Default: selects RTX 4060 by highest dedicated VRAM.
+        assert_eq!(select_adapter_from_candidates(mock.clone(), None), Some("RTX 4060"));
+
+        // Whitespace or empty filter: falls back to default selection.
+        assert_eq!(select_adapter_from_candidates(mock.clone(), Some("")), Some("RTX 4060"));
+        assert_eq!(select_adapter_from_candidates(mock.clone(), Some("   ")), Some("RTX 4060"));
+
+        // Explicit substring match.
+        assert_eq!(select_adapter_from_candidates(mock.clone(), Some("Intel")), Some("Intel UHD"));
+        assert_eq!(select_adapter_from_candidates(mock.clone(), Some("  rtx  ")), Some("RTX 4060"));
+
+        // Software adapter requested via filter must be rejected.
+        assert_eq!(select_adapter_from_candidates(mock.clone(), Some("Basic")), None);
+
+        // Adapter without FL 12.0 support must be rejected.
+        assert_eq!(select_adapter_from_candidates(mock.clone(), Some("Virtual")), None);
+
+        // Non-matching filter returns None.
+        assert_eq!(select_adapter_from_candidates(mock.clone(), Some("nonexistent")), None);
     }
 
     #[test]

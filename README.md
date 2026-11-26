@@ -163,6 +163,10 @@ default worker count.
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+Adapter selection: `VICTORY_D3D12_ADAPTER=<name>` selects a host adapter
+by substring match (case-insensitive; default: prefers high-performance
+hardware GPU with most dedicated VRAM). Available in all builds.
+
 ### Windows shader-test validator
 
 The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.
