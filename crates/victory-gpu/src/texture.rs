@@ -239,9 +239,14 @@ fn is_host_written(resource: This) -> bool {
 /// Whether `resource`'s host copy takes its contents from title memory:
 /// a texture the host GPU does not render to or write.
 pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
-    const TARGET_DEPTH_UNORDERED: i32 = 0x7;
     // SAFETY: a live resource.
-    unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
+    title_written_flags(unsafe { texture.GetDesc() }.Flags.0 as u32)
+}
+
+/// `title_written` for cached D3D12 resource flags.
+pub(crate) fn title_written_flags(flags: u32) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    flags & TARGET_DEPTH_UNORDERED == 0
 }
 
 /// Copies [`alias_copy`] recorded since the last frame-rate line.
@@ -368,21 +373,10 @@ pub(crate) fn alias_copy(
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
     // Once per list for each host texture, however many title textures of
     // its memory the list samples.
     if is_host_written(resource) {
-        #[cfg(feature = "diagnostics")]
-        {
-            static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
-            if SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(resource as usize) {
-                let memory = crate::resource::texture_memory(resource).map(|(m, _)| m);
-                // SAFETY: a live resource.
-                let desc = unsafe { texture.GetDesc() };
-                tracing::debug!(?resource, ?memory, ?desc, "a sampled texture keeps what the host copied into it: not uploaded from title memory");
-            }
-        }
+        kept_host_contents(resource, texture);
         return;
     }
     if !list.first_use(texture.as_raw() as usize) {
@@ -391,9 +385,53 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     let (Some(staging), Some(copy)) = (staging(resource, texture), crate::resource::host_copy(resource)) else {
         return;
     };
-    // Each list recorded the copy before (run perf7: 149 textures uploaded
-    // 3,195 times in a frame, 17 ms of GPU time), changed or not.
     list.defer_texture(staging, copy);
+}
+
+/// Uploads a caller-pinned host copy, avoiding a second host-copy lookup
+/// between upload and state transition.
+pub(crate) fn upload_copy(
+    list: &HostList,
+    resource: This,
+    copy: &Arc<crate::resource::HostTexture>,
+) {
+    if copy.host_written.load(std::sync::atomic::Ordering::Relaxed) {
+        kept_host_contents(resource, &copy.texture);
+        return;
+    }
+    if !list.first_use(copy.texture.as_raw() as usize) {
+        return;
+    }
+    let Some(staging) = staging_copy(resource, &copy.texture, copy) else {
+        return;
+    };
+    list.defer_texture(staging, copy.clone());
+}
+
+/// Diagnostics: record once per title texture that its host-written
+/// contents are intentionally retained rather than re-uploaded.
+#[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+fn kept_host_contents(resource: This, texture: &ID3D12Resource) {
+    #[cfg(feature = "diagnostics")]
+    {
+        static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+        if SEEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_default()
+            .insert(resource as usize)
+        {
+            let memory = crate::resource::texture_memory(resource).map(|(m, _)| m);
+            // SAFETY: a live resource.
+            let desc = unsafe { texture.GetDesc() };
+            tracing::debug!(
+                ?resource,
+                ?memory,
+                ?desc,
+                "a sampled texture keeps what the host copied into it: not uploaded from title memory"
+            );
+        }
+    }
 }
 
 /// Records into `list` the copy of `buffer` (laid out as `staging` says)
@@ -801,6 +839,15 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 /// (one for all title textures of its memory).
 pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let copy = crate::resource::host_copy(resource)?;
+    staging_copy(resource, texture, &copy)
+}
+
+/// Gets staging state for the exact host copy already pinned by the caller.
+fn staging_copy(
+    resource: This,
+    texture: &ID3D12Resource,
+    copy: &Arc<crate::resource::HostTexture>,
+) -> Option<Arc<Staging>> {
     let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = held.as_ref() {
         return Some(s.clone());
@@ -865,6 +912,16 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_title_written_flags_match_resource_flag_semantics() {
+        assert!(title_written_flags(0));
+        assert!(!title_written_flags(0x1)); // render target
+        assert!(!title_written_flags(0x2)); // depth/stencil
+        assert!(!title_written_flags(0x4)); // unordered access
+        assert!(!title_written_flags(0x7)); // any host-written use
+        assert!(title_written_flags(0x8)); // deny shader resource alone
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
