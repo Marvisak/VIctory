@@ -48,13 +48,26 @@ fn drives() -> MutexGuard<'static, Vec<(u16, Vec<u16>)>> {
 /// Gives the host folder `root` a drive letter (the same one if it already
 /// has one): the highest letter neither the host nor another mount uses.
 pub fn mount(root: &Path) -> Option<char> {
+    mount_in(&mut drives(), root, || {
+        // SAFETY: no arguments.
+        unsafe { GetLogicalDrives() }
+    })
+}
+
+fn mount_in(
+    drives: &mut Vec<(u16, Vec<u16>)>,
+    root: &Path,
+    host_drives: impl FnOnce() -> u32,
+) -> Option<char> {
     let wide = root_wide(root);
-    let mut drives = drives();
     if let Some(&(letter, _)) = drives.iter().find(|(_, r)| *r == wide) {
         return char::from_u32(letter.into());
     }
-    // SAFETY: no arguments.
-    let host = unsafe { GetLogicalDrives() };
+    let host = host_drives();
+    if host == 0 {
+        tracing::warn!(root = %root.display(), "GetLogicalDrives failed");
+        return None;
+    }
     let letter = (b'D'..=b'Z').rev().find(|&l| {
         host >> (l - b'A') & 1 == 0 && !drives.iter().any(|(m, _)| *m == u16::from(l))
     })?;
@@ -760,6 +773,45 @@ mod tests {
 
     fn text(v: &[u16]) -> String {
         String::from_utf16_lossy(&v[..v.len() - 1])
+    }
+
+    #[test]
+    fn mount_in_rejects_failed_host_drive_query() {
+        let existing = vec![(u16::from(b'Y'), root_wide(Path::new(r"C:\existing")))];
+        let mut drives = existing.clone();
+
+        assert_eq!(mount_in(&mut drives, Path::new(r"C:\new"), || 0), None);
+        assert_eq!(drives, existing);
+    }
+
+    #[test]
+    fn mount_in_uses_only_d_through_z() {
+        let root = Path::new(r"C:\new");
+        for host in [0x03ff_ffff, 0x03ff_fff8] {
+            let mut drives = Vec::new();
+            assert_eq!(mount_in(&mut drives, root, || host), None);
+            assert!(drives.is_empty());
+        }
+    }
+
+    #[test]
+    fn mount_in_chooses_highest_free_letter_and_reuses_mounts() {
+        let mut drives = Vec::new();
+        let first = Path::new(r"C:\first");
+        let second = Path::new(r"C:\second");
+        let host = || 1 << (b'C' - b'A');
+
+        assert_eq!(mount_in(&mut drives, first, host), Some('Z'));
+        assert_eq!(mount_in(&mut drives, second, host), Some('Y'));
+        let cached = mount_in(&mut drives, first, || panic!("queried host drives"));
+        assert_eq!(cached, Some('Z'));
+        assert_eq!(
+            drives,
+            [
+                (u16::from(b'Z'), root_wide(first)),
+                (u16::from(b'Y'), root_wide(second)),
+            ]
+        );
     }
 
     #[test]
