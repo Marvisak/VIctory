@@ -1033,6 +1033,30 @@ struct Deferred {
 }
 
 impl Host {
+    /// Whether the host's D3D12 runtime has shader model 6.6 (the root
+    /// signatures index the heaps directly) and `ID3D12Device10` (textures
+    /// made castable to other formats). Windows 10's own runtime has
+    /// neither: there the GPU tests that need them are skipped, as without
+    /// the Agility SDK (#2460) the runtime refuses what they make.
+    #[cfg(test)]
+    pub(crate) fn agility_runtime(&self) -> bool {
+        use windows::core::Interface;
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        // SAFETY: the query writes a structure of the given size.
+        let sm66 = unsafe {
+            self.device.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, (&raw mut model).cast(), size_of_val(&model) as u32)
+        }
+        .is_ok()
+            && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+        let ok = sm66 && self.device.cast::<ID3D12Device10>().is_ok();
+        if !ok {
+            eprintln!("the host's D3D12 runtime has no shader model 6.6 or no ID3D12Device10 (Windows 10 without the Agility SDK); skipped");
+        }
+        ok
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {

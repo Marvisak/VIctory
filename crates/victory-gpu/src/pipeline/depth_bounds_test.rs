@@ -99,6 +99,9 @@ fn depth_bounds_control_a_title_draw() {
         eprintln!("skipped depth bounds render: no host D3D12 device");
         return;
     };
+    if !host.agility_runtime() {
+        return;
+    }
     render_with_depth_bounds(host, fullscreen_vertex_shader(), None);
 }
 
