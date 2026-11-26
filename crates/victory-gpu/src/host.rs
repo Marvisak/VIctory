@@ -27,12 +27,22 @@ pub(crate) fn pc_state(state: u32) -> u32 {
     state & 0x01ff_ffff
 }
 
-/// A console state as a host texture state: PC bits only, and none of the
-/// buffer-only ones the console allows on textures (vertex, constant and
-/// index buffer, stream out, indirect arguments, as in "generic read").
+/// Texture write states on a direct command list: each is mutually exclusive
+/// with every other state bit in D3D12 (`RENDER_TARGET`, `UNORDERED_ACCESS`,
+/// `DEPTH_WRITE`, `COPY_DEST`, `RESOLVE_DEST`).
+const WRITE_TEXTURE_STATES: u32 = 0x4 | 0x8 | 0x10 | 0x400 | 0x1000;
+
+/// Texture read states on a direct command list: combinable with each other,
+/// never with a write state (`DEPTH_READ`, `NON_PIXEL_SHADER_RESOURCE`,
+/// `PIXEL_SHADER_RESOURCE`, `COPY_SOURCE`, `RESOLVE_SOURCE`).
+const READ_TEXTURE_STATES: u32 = 0x20 | 0x40 | 0x80 | 0x800 | 0x2000;
+
+/// A console state as a host texture state on a direct command list: only the
+/// texture read and write bits the host's direct queue accepts (dropping
+/// buffer-only, video-queue, raytracing, shading-rate, reserved, and
+/// console-only bits).
 pub(crate) fn texture_state(state: u32) -> u32 {
-    const BUFFER_ONLY: u32 = 0x1 | 0x2 | 0x100 | 0x200;
-    pc_state(state) & !BUFFER_ONLY
+    pc_state(state) & (WRITE_TEXTURE_STATES | READ_TEXTURE_STATES)
 }
 
 /// Render target views live only until their command is recorded, so a
@@ -779,6 +789,332 @@ pub(crate) mod tests {
                 .unwrap();
         node.pCommandListDebugNameA = longer.as_ptr().cast();
         assert!(!list.is_node(&node), "a number that only starts with ours is no match");
+    }
+
+    #[test]
+    fn legal_for_strips_unsupported_bits_and_enforces_exclusive_write_states() {
+        const RT: u32 = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        const UAV: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+        const DEPTH_WRITE: u32 = D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32;
+        const DEPTH_READ: u32 = D3D12_RESOURCE_STATE_DEPTH_READ.0 as u32;
+        const NON_PS: u32 = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32;
+        const PS: u32 = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
+        const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
+        const COPY_SOURCE: u32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+        const RESOLVE_DEST: u32 = D3D12_RESOURCE_STATE_RESOLVE_DEST.0 as u32;
+        const RESOLVE_SOURCE: u32 = D3D12_RESOURCE_STATE_RESOLVE_SOURCE.0 as u32;
+        const ALLOW_RT: u32 = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32;
+        const ALLOW_DS: u32 = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 as u32;
+        const ALLOW_UAV: u32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32;
+        const DENY_SRV: u32 = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 as u32;
+
+        // Buffer-only, reserved, video-queue, raytracing, shading-rate, and
+        // console bits are all stripped from texture states.
+        assert_eq!(
+            texture_state(
+                0x1 | 0x2
+                    | 0x100
+                    | 0x200
+                    | 0x4000
+                    | 0x8000
+                    | 0x00ff_0000
+                    | 0x0100_0000
+                    | 0xfe00_0000
+            ),
+            0
+        );
+        // Write states cannot combine with read states or other write states.
+        assert_eq!(legal_for(ALLOW_DS, DEPTH_WRITE | DEPTH_READ), DEPTH_WRITE);
+        assert_eq!(legal_for(ALLOW_DS, DEPTH_WRITE | PS | NON_PS), DEPTH_WRITE);
+        assert_eq!(legal_for(ALLOW_RT, RT | PS), RT);
+        assert_eq!(legal_for(ALLOW_UAV, UAV | NON_PS), UAV);
+        assert_eq!(legal_for(0, COPY_DEST | COPY_SOURCE), COPY_DEST);
+        assert_eq!(legal_for(0, RESOLVE_DEST | RESOLVE_SOURCE), RESOLVE_DEST);
+        assert_eq!(legal_for(ALLOW_RT | ALLOW_UAV, RT | UAV), RT);
+        assert_eq!(legal_for(ALLOW_DS, DEPTH_WRITE | COPY_DEST), DEPTH_WRITE);
+        // Forbidden write bits are stripped before enforcing exclusivity so
+        // compatible read bits survive.
+        assert_eq!(legal_for(ALLOW_DS, UAV | PS), PS);
+        assert_eq!(
+            legal_for(ALLOW_DS | DENY_SRV, UAV | DEPTH_READ | PS),
+            DEPTH_READ
+        );
+        // Direct callers of `legal_for` also drop unsupported state bits.
+        assert_eq!(
+            legal_for(ALLOW_RT, PS | 0x4000 | 0x1_0000 | 0x40_0000 | 0x0100_0000),
+            PS
+        );
+        // Valid read-state combinations remain intact.
+        assert_eq!(
+            legal_for(ALLOW_DS, DEPTH_READ | PS | NON_PS | COPY_SOURCE),
+            DEPTH_READ | PS | NON_PS | COPY_SOURCE
+        );
+        assert_eq!(
+            legal_for(0, NON_PS | PS | COPY_SOURCE | RESOLVE_SOURCE),
+            NON_PS | PS | COPY_SOURCE | RESOLVE_SOURCE
+        );
+    }
+
+    #[test]
+    fn initial_and_barrier_texture_states_are_accepted_by_d3d12() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata, Subscriber};
+
+        let Some(host) = host() else {
+            return;
+        };
+
+        struct Capture(Arc<Mutex<Vec<(i32, i32, String)>>>);
+        struct Fields {
+            id: Option<i32>,
+            severity: Option<i32>,
+            message: String,
+        }
+        impl Visit for Fields {
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                if field.name() == "id" {
+                    self.id = Some(value as i32);
+                } else if field.name() == "severity" {
+                    self.severity = Some(value as i32);
+                }
+            }
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                if field.name() == "id" {
+                    self.id = Some(value as i32);
+                } else if field.name() == "severity" {
+                    self.severity = Some(value as i32);
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    self.message = value.to_owned();
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.message = format!("{value:?}");
+                }
+            }
+        }
+        impl Subscriber for Capture {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let mut f = Fields {
+                    id: None,
+                    severity: None,
+                    message: String::new(),
+                };
+                event.record(&mut f);
+                if let (Some(id), Some(sev)) = (f.id, f.severity)
+                    && sev <= D3D12_MESSAGE_SEVERITY_WARNING.0
+                {
+                    self.0
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((id, sev, f.message));
+                }
+            }
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(Capture(captured.clone()));
+        let _ = host.log_messages();
+        captured.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        let null = std::ptr::null();
+        let resource_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let allocator_iid = crate::object::guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = crate::object::guid(
+            0x7116d91c,
+            0xe7e4,
+            0x47ce,
+            [0xb8, 0xc6, 0xec, 0x81, 0x68, 0xf4, 0x37, 0xe5],
+        );
+        let release =
+            |r| crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(r, 0x10)(r);
+
+        // Depth textures always pass their sanitized initial state directly to
+        // CreateCommittedResource / CreatePlacedResource.
+        let initial_cases: &[(u32, u32)] = &[
+            (0x10 | 0x20, 0x10),  // DEPTH_WRITE | DEPTH_READ -> DEPTH_WRITE
+            (0x10 | 0x80, 0x10),  // DEPTH_WRITE | PIXEL_SHADER_RESOURCE -> DEPTH_WRITE
+            (0x10 | 0x400, 0x10), // DEPTH_WRITE | COPY_DEST -> DEPTH_WRITE
+            (0x10 | 0x4000 | 0x1_0000 | 0x40_0000 | 0x0100_0000, 0x10),
+            (0x1_0000, 0),       // VIDEO_DECODE_READ -> COMMON
+            (0x40_0000, 0),      // RAYTRACING_ACCELERATION_STRUCTURE -> COMMON
+            (0x0100_0000, 0),    // SHADING_RATE_SOURCE -> COMMON
+            (0x20 | 0x80, 0xa0), // DEPTH_READ | PIXEL_SHADER_RESOURCE preserved
+        ];
+        #[repr(align(8))]
+        struct Words([u32; 14]);
+        let depth_desc = Words([3, 0, 0, 0, 16, 0, 16, 1 | 1 << 16, 40, 1, 0, 0, 2, 0]);
+        let color_desc = Words([3, 0, 0, 0, 16, 0, 16, 1 | 1 << 16, 28, 1, 0, 0, 1 | 4, 0]);
+        let heap_props: [u32; 5] = [1, 0, 0, 1, 1];
+
+        let mut created = Vec::new();
+        for &(initial, expected) in initial_cases {
+            let mut res = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    heap_props.as_ptr().cast(),
+                    0,
+                    depth_desc.0.as_ptr().cast(),
+                    initial,
+                    null.cast(),
+                    &resource_iid,
+                    &mut res,
+                ),
+                0
+            );
+            let copy = crate::resource::host_copy(res).unwrap_or_else(|| {
+                panic!("depth texture with initial state {initial:#x} must create a host texture")
+            });
+            assert_eq!(copy.state.load(Ordering::Relaxed), expected);
+            created.push(res);
+        }
+
+        // Exercise title ID3D12GraphicsCommandList::ResourceBarrier end-to-end.
+        let mut color_res = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                heap_props.as_ptr().cast(),
+                0,
+                color_desc.0.as_ptr().cast(),
+                0,
+                null.cast(),
+                &resource_iid,
+                &mut color_res,
+            ),
+            0
+        );
+        let depth_res = created[0];
+        let color_copy = crate::resource::host_copy(color_res).expect("color host texture");
+        let depth_copy = crate::resource::host_copy(depth_res).expect("depth host texture");
+        let watched = [
+            format!("{:016x}", color_copy.texture.as_raw() as usize),
+            format!("{:016x}", depth_copy.texture.as_raw() as usize),
+        ];
+
+        let mut allocator = null;
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            0
+        );
+        let mut cmd_list = null;
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut cmd_list),
+            0
+        );
+
+        #[repr(C)]
+        struct TitleBarrier {
+            kind: u32,
+            flags: u32,
+            resource: crate::object::This,
+            subresource_and_before: u64,
+            after: u64,
+        }
+        let barrier_fn = crate::object::slot::<
+            extern "system" fn(crate::object::This, u32, *const TitleBarrier) -> u32,
+        >(cmd_list, 0xd0);
+
+        let depth_states = [
+            0x10u32 | 0x20, // DEPTH_WRITE | DEPTH_READ -> 0x10
+            0x20 | 0x80,    // DEPTH_READ | PS -> 0xa0
+            0x10 | 0x80,    // DEPTH_WRITE | PS -> 0x10
+            0x8 | 0x80,     // forbidden UAV | PS -> 0x80
+            0x800 | 0x1_0000 | 0x4000 | 0x40_0000 | 0x0100_0000, // COPY_SOURCE | bad bits -> 0x800
+        ];
+        let color_states = [
+            0x4u32 | 0x80,                                      // RT | PS -> 0x4
+            0x8 | 0x40,                                         // UAV | NON_PS -> 0x8
+            0x4 | 0x8,                                          // RT | UAV -> 0x4
+            0x400 | 0x800,                                      // COPY_DEST | COPY_SOURCE -> 0x400
+            0x80 | 0x4000 | 0x1_0000 | 0x40_0000 | 0x0100_0000, // PS | bad bits -> 0x80
+            0x80 | 0x2000,                                      // PS | RESOLVE_SOURCE -> 0x2080
+        ];
+        for &after in &depth_states {
+            let b = TitleBarrier {
+                kind: 0,
+                flags: 0,
+                resource: depth_res,
+                subresource_and_before: 0xffff_ffff,
+                after: u64::from(after),
+            };
+            barrier_fn(cmd_list, 1, &b);
+        }
+        for &after in &color_states {
+            let b = TitleBarrier {
+                kind: 0,
+                flags: 0,
+                resource: color_res,
+                subresource_and_before: 0xffff_ffff,
+                after: u64::from(after),
+            };
+            barrier_fn(cmd_list, 1, &b);
+        }
+
+        let hl = crate::list::host_list(cmd_list).expect("host list");
+        // SAFETY: check Close() directly instead of aborting if a barrier was invalid.
+        let closed = unsafe { hl.list.Close() };
+        if closed.is_ok() {
+            host.execute(&[hl]);
+        }
+        let _ = host.log_messages();
+        let msgs: Vec<_> = captured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(id, _, m)| {
+                matches!(*id, 522 | 526 | 527 | 537)
+                    || watched.iter().any(|w| m.to_ascii_lowercase().contains(w))
+            })
+            .cloned()
+            .collect();
+
+        let depth_final = depth_copy.state.load(Ordering::Relaxed);
+        let color_final = color_copy.state.load(Ordering::Relaxed);
+        drop((color_copy, depth_copy));
+        assert_eq!(release(cmd_list), 0);
+        assert_eq!(release(allocator), 0);
+        assert_eq!(release(color_res), 0);
+        for res in created {
+            assert_eq!(release(res), 0);
+        }
+
+        assert!(
+            closed.is_ok(),
+            "command list failed to close: {closed:?}; debug msgs: {msgs:#?}"
+        );
+        assert!(
+            msgs.is_empty(),
+            "D3D12 debug layer reported errors/warnings: {msgs:#?}"
+        );
+        assert_eq!(depth_final, 0x800);
+        assert_eq!(color_final, 0x2080);
     }
 }
 
@@ -3568,7 +3904,10 @@ pub(crate) fn legal_state(texture: &ID3D12Resource, state: u32) -> u32 {
     legal_for(unsafe { texture.GetDesc() }.Flags.0 as u32, state)
 }
 
-/// [`legal_state`] for a texture with resource flags `flags`.
+/// [`legal_state`] for a texture with resource flags `flags`: drops states
+/// that are not valid direct-queue texture states or are forbidden by
+/// `flags`, and enforces D3D12's rule that a write state cannot combine with
+/// any other state bit.
 pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
     // (flag, set or clear forbids, state bits): render target, unordered
     // access, depth, denied shader resource.
@@ -3578,10 +3917,16 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         (0x2, false, 0x10 | 0x20),
         (0x8, true, 0x40 | 0x80),
     ];
-    FORBIDDEN
+    let state = FORBIDDEN
         .iter()
         .filter(|&&(flag, deny, _)| (flags & flag != 0) == deny)
-        .fold(state, |s, &(_, _, bits)| s & !bits)
+        .fold(texture_state(state), |s, &(_, _, bits)| s & !bits);
+    let writes = state & WRITE_TEXTURE_STATES;
+    if writes != 0 {
+        1 << writes.trailing_zeros()
+    } else {
+        state
+    }
 }
 
 impl Host {
