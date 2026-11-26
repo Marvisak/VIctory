@@ -20,7 +20,11 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+mod buffers;
 mod bvh;
+use buffers::lds_sub_dword;
+#[cfg(test)]
+pub(super) use buffers::sub_dword;
 
 type Why = &'static str;
 
@@ -3331,13 +3335,7 @@ impl<'a> Lower<'a> {
             } else {
                 // A byte or half, extended (`_d16`: into the low half,
                 // `_d16_hi`: the high half, the other half kept).
-                let (bits, signed) = match rest.trim_end_matches("_hi").trim_end_matches("_d16") {
-                    "_u8" => (8, false),
-                    "_i8" => (8, true),
-                    "_u16" => (16, false),
-                    "_i16" => (16, true),
-                    _ => return Err("an LDS read of bytes or halves"),
-                };
+                let (bits, signed) = lds_sub_dword(name).ok_or("an LDS read of bytes or halves")?;
                 let reg = dst_reg.ok_or("an LDS read result")?;
                 let (p, inside) = dword(self, offset);
                 let x = self.s.m.load(c, p);
@@ -3393,16 +3391,10 @@ impl<'a> Lower<'a> {
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
                 vec![(offset, width(name))]
             } else {
-                // A byte or half (`_d16_hi`: the high half of the data) into
-                // its dword through atomics, so lanes writing the other parts
-                // of the dword keep theirs.
-                // shortcut: lanes writing the same part in one instruction
-                // leave the OR of theirs (the console keeps one).
-                let bits = match rest.trim_end_matches("_d16_hi") {
-                    "_b8" => 8,
-                    "_b16" => 16,
-                    _ => return Err("an LDS write of bytes or halves"),
-                };
+                // A byte or half (`_d16_hi`: the data's high half) by a
+                // compare-exchange loop: other parts keep their lanes' bytes,
+                // one lane's value wins a part (AND then OR merged two).
+                let (bits, _) = lds_sub_dword(name).ok_or("an LDS write of bytes or halves")?;
                 let x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
                 let x = if rest.ends_with("_d16_hi") {
                     let k16 = self.s.m.i32(16);
@@ -3417,12 +3409,24 @@ impl<'a> Lower<'a> {
                 let part = self.s.m.bin(c, Bin::Shl, mask, sh);
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, part, ones);
+                // Past the allocation the write is dropped (`on`).
                 let (p, inside) = dword(self, offset);
                 let g = on(self, inside);
                 let at = self.begin_guarded(Some(g));
-                use super::bitcode::Rmw;
-                self.s.m.atomic(self.cur, Rmw::And, p, keep);
-                self.s.m.atomic(self.cur, Rmw::Or, p, set);
+                // first = load; loop: old = phi(first, seen); seen =
+                // cmpxchg(old, old & keep | set); until seen == old.
+                let head = self.cur;
+                let first = self.s.m.load(head, p);
+                let (body, exit) = (self.s.m.new_block(), self.s.m.new_block());
+                self.s.m.terminate(head, Term::Br(body));
+                let old = self.s.m.phi(body, self.s.t.i32);
+                let kept = self.s.m.bin(body, Bin::And, old, keep);
+                let new = self.s.m.bin(body, Bin::Or, kept, set);
+                let seen = self.s.m.cmpxchg(body, p, old, new);
+                self.s.m.set_phi(old, vec![(first, head), (seen, body)]);
+                let done = self.s.m.cmp(body, pred::EQ, seen, old);
+                self.s.m.terminate(body, Term::CondBr(done, exit, body));
+                self.cur = exit;
                 self.end_guarded(at, &[]);
                 return Ok(());
             };
@@ -9436,9 +9440,12 @@ impl<'a> Lower<'a> {
         };
         let index = if *idxen { Some(vaddr(self, 0)?) } else { None };
         let mut off = self.s.m.i32(u32::from(*offset));
+        // The byte offset when it is a constant.
+        let mut fixed = Some(u32::from(*offset));
         if *offen {
             let o = vaddr(self, u8::from(*idxen))?;
             off = self.s.m.bin(c, Bin::Add, off, o);
+            fixed = None;
         }
         if !matches!(
             soffset,
@@ -9446,6 +9453,9 @@ impl<'a> Lower<'a> {
         ) {
             let so = self.operand(inst, soffset)?;
             off = self.s.m.bin(c, Bin::Add, off, so);
+            fixed = fixed
+                .zip(self.s.m.int_value(so))
+                .map(|(f, k)| f.wrapping_add(k as u32));
         }
         let src = self
             .descriptors
@@ -9457,19 +9467,28 @@ impl<'a> Lower<'a> {
         if base != 0 {
             let b = self.s.m.i32(base);
             off = self.s.m.bin(c, Bin::Add, off, b);
+            fixed = fixed.map(|f| f.wrapping_add(base));
         }
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
+            fixed = None;
         }
+        // Views read raw (all but typed views; typed-format loads too): an
+        // index is a byte offset, `index * stride`, added to the offset.
+        let raw = !typed || format.is_some();
         // A descriptor built around a root view has the stride the code puts
         // in dword 1 (bits 16-29) and no record limit (dword 2 is -1): an
         // index is a byte offset into the raw root view.
         let index = match (src, index) {
             (Source::Built { address, bits, words }, Some(ix))
-                if address.param < self.x.native.layout.len() && !typed =>
+                if address.param < self.x.native.layout.len() && raw =>
             {
                 if bits >> 30 != 0 || words[0] != u32::MAX {
                     return Err("a root view indexed with swizzling or a record limit");
+                }
+                // The lane index added to the index (dword 3 bit 23).
+                if words[1] >> 23 & 1 != 0 {
+                    return Err("a swizzled root view: the lane index added to the index");
                 }
                 let stride = self.s.m.i32(bits >> 16 & 0x3FFF);
                 let byte = self.s.m.bin(c, Bin::Mul, ix, stride);
@@ -9525,7 +9544,7 @@ impl<'a> Lower<'a> {
         // so no stride: its bytes are addressed as the hardware does, the
         // element times the view's stride (the host's table) plus the offset.
         let index = match index {
-            Some(i) if used.is_none() && !typed => {
+            Some(i) if used.is_none() && raw => {
                 let stride = self.view_stride(src)?;
                 let rows = self.s.m.bin(c, Bin::Mul, i, stride);
                 off = self.s.m.bin(c, Bin::Add, rows, off);
@@ -9669,18 +9688,26 @@ impl<'a> Lower<'a> {
             // Where the write starts in the view, and how many bytes it may
             // cover (for its marks).
             let (byte, bytes);
+            // A typed store of fewer than four channels: the element to
+            // load the others from.
+            let mut merge = None;
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
-                }
                 let h = typed_h.ok_or("a typed buffer store")?;
-                let element = index.unwrap_or(self.s.m.i32(0));
+                let element = self.typed_element(index, off, fixed, used)?;
                 args.push(h);
                 args.extend([element, iu]);
                 for x in vals {
                     args.push(self.as_float(x));
+                }
+                if count < 4 {
+                    // DXIL typed stores write all four channels; the console
+                    // writes those it is given. shortcut: the others are
+                    // taken to keep what memory holds (they are loaded and
+                    // stored back, converted through floats: exact for float
+                    // and unorm formats, and not atomic with other lanes'
+                    // stores to the same element).
+                    self.s.flags |= flags::TYPED_UAV_LOADS;
+                    merge = Some((h, element));
                 }
                 // The element's size is the view's stride (16 bytes at most).
                 (byte, bytes) = match self.s.view_index.get(&h).copied() {
@@ -9721,6 +9748,20 @@ impl<'a> Lower<'a> {
                 args.push(self.s.m.i32(4));
             }
             let at = self.begin_guarded(guard);
+            if let Some((h, e)) = merge {
+                let r = self.s.op(
+                    self.cur,
+                    "bufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    68,
+                    &[h, e, iu],
+                );
+                for k in count..4 {
+                    let x = self.s.m.extract(self.cur, r, k);
+                    args.insert(3 + k as usize, x);
+                }
+            }
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.mark_view_write(args[0], byte, bytes, None);
@@ -9728,8 +9769,14 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(f) = *format {
-            if index.is_some() {
-                return Err("a typed-format load by index");
+            // By index (what the root-view and heap cases above leave): the
+            // console adds index * stride (the descriptor's) to the byte
+            // offset.
+            if let Some(index) = index {
+                let stride = self.descriptor_stride(src, used)?;
+                let k = self.s.m.i32(stride);
+                let at = self.s.m.bin(c, Bin::Mul, index, k);
+                off = self.s.m.bin(c, Bin::Add, at, off);
             }
             let (h, off) = self.raw_view(site, src, off, 4 * count, (11 | u, 0), false, guard)?;
             let Some(Operand::Vector { reg, .. }) = *data else {
@@ -9782,15 +9829,13 @@ impl<'a> Lower<'a> {
         }
         let mut typed_h = None;
         let r = if typed {
-            if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
-                return Err("a typed buffer load at an offset");
-            }
+            // The console's index and byte offset as the host's element.
+            let index = self.typed_element(index, off, fixed, used)?;
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
             let h = self.handle(site, src, false, (10 | u, 0x409))?;
             typed_h = Some(h);
-            let index = index.unwrap_or(self.s.m.i32(0));
             self.s.op(
                 c,
                 "bufferLoad.f32",
@@ -9881,6 +9926,31 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// The stride of the buffer descriptor `src` (`used`, its used-resource
+    /// entry) for a typed-format load by index (around a root view or from
+    /// the resource heap, the index is a byte offset before): a descriptor
+    /// built in the code has it in the bits OR-ed into dword 1; one from a
+    /// table, the entry's (shortcut: taken to be the descriptor's, as for
+    /// structured buffers).
+    fn descriptor_stride(&self, src: &Source, used: Option<&UsedResource>) -> Result<u32, Why> {
+        let stride = match *src {
+            Source::Built { bits, words, .. } => {
+                // Swizzled addressing (dword 1 bit 31) and the lane index
+                // added to the index (dword 3 bit 23) address otherwise.
+                if bits >> 31 != 0 || words[1] >> 23 & 1 != 0 {
+                    return Err("a swizzled buffer descriptor");
+                }
+                // (Known, so 0 too: the console then ignores the index.)
+                return Ok(bits >> 16 & 0x3FFF);
+            }
+            _ => used.map_or(0, |u| u.stride),
+        };
+        if stride == 0 {
+            return Err("a typed-format load by index of unknown stride");
+        }
+        Ok(stride)
     }
 
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {

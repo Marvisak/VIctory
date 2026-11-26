@@ -1339,6 +1339,13 @@ pub enum View<'a> {
     /// host's null raw buffer SRV at [`super::NULL_BUFFER_VIEW`] and UAV
     /// below it.
     NullBuffers,
+    /// A typed buffer UAV over these dwords, elements in this format of
+    /// this many bytes.
+    FormatUav {
+        data: &'a [u32],
+        format: DXGI_FORMAT,
+        bytes: u32,
+    },
 }
 
 /// The host's view-stride table (`t`[`super::VIEW_STRIDES`]) for a view
@@ -1724,6 +1731,43 @@ impl Host {
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         uavs.push((b, None, n, rb));
+                    }
+                    View::FormatUav {
+                        data,
+                        format,
+                        bytes,
+                    } => {
+                        let size = data.len() as u64 * 4;
+                        let src = upload(data)?;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        list.CopyBufferRegion(&b, 0, &src, 0, size);
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
+                        keep.push(src);
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: (size / u64::from(bytes)) as u32,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(size, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((b, None, data.len() as u32, rb));
                     }
                     View::TextureUav(w, h) => {
                         let t = make(

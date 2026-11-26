@@ -57,17 +57,22 @@
 //!   descriptor fields.
 //! * **Buffer views in the heap** are declared by how the shader reads
 //!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
-//!   typed-format loads without an index; structured with the used-resource
+//!   typed-format loads; structured with the used-resource
 //!   entry's stride when indexed; typed with four 32-bit float channels for
 //!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
 //!   that index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
-//!   title's view description says. Typed-format loads from heap
+//!   title's view description says. A typed access at a byte offset
+//!   (added 2026-11-24) reads element `index + offset / stride`, the stride
+//!   the used-resource entry's: the host's typed view must have elements of
+//!   that size. Typed-format loads from heap
 //!   descriptors (1,024 world compute programs, ray-tracing material
-//!   resolves) read raw views this way. Buffers read by element through
-//!   the resource heap (no used-resource entry, so no stride) are raw too,
-//!   addressed at element × the view's stride + offset, the stride from
-//!   the view-stride table: root SRV `t`[`VIEW_STRIDES`] in
+//!   resolves) read raw views this way; by index (added 2026-11-24), at
+//!   `index * stride`, the stride a built descriptor's own or the
+//!   used-resource entry's. Buffers read by element through the resource
+//!   heap (no used-resource entry, so no stride; typed-format loads too)
+//!   are raw too, addressed at element × the view's stride + offset, the
+//!   stride from the view-stride table: root SRV `t`[`VIEW_STRIDES`] in
 //!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`], whose dword
 //!   `i` the host keeps at the byte stride of the buffer view at heap
 //!   index `i`.
@@ -198,6 +203,8 @@
 mod bitcode;
 #[cfg(test)]
 mod census_tests;
+#[cfg(all(test, windows))]
+mod buffer_lds_tests;
 #[cfg(all(test, windows))]
 mod bvh_tests;
 mod container;
