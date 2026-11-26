@@ -690,6 +690,18 @@ impl State {
         } else {
             None
         };
+        // The loop-cut counter (`crate::loop_cuts`), in every pipeline while
+        // translated loops count their cuts.
+        if let (Some(param), Some(counter)) = (p.loop_cuts, crate::loop_cuts::address()) {
+            // SAFETY: an open list; the counter lives for good.
+            unsafe {
+                if compute {
+                    l.SetComputeRootUnorderedAccessView(param, counter);
+                } else {
+                    l.SetGraphicsRootUnorderedAccessView(param, counter);
+                }
+            }
+        }
         // Shaders taking views from the heap itself read (or write) views no
         // table names: everything the bound heap's views reach is brought up
         // to date at submission (`crate::bindless`).
