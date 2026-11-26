@@ -1027,3 +1027,372 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
     // never spinning to LOOP_LIMIT (1 << 20).
     assert_eq!(pixels, vec![[0.0; 4], [0.0; 4], [1.0; 4], [1.0; 4]]);
 }
+
+/// How [`quad_program_as`] samples: plain, or with a texel offset of (1, 0)
+/// (`image_sample_o`). An offset moves the footprint, not its derivatives,
+/// so both pick the same level.
+#[derive(Clone, Copy, Debug)]
+enum Sample {
+    Plain,
+    Offset,
+    /// `image_sample_b_o` with a bias of 1: offset, bias, u, v.
+    BiasOffset,
+}
+
+/// Sample red using (u, v) from entry x + width*y. Optionally store the
+/// flat ID read from wave lane zero alongside the sampled value.
+fn quad_program_as(form: Sample, width: u32, read_wave_base: bool) -> Vec<u32> {
+    let output_shift = if read_wave_base { 3 } else { 2 };
+    let mut w = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xF408_0502,
+        0xFA00_0020, // s_load_dwordx4 s[20:23], s[4:5], 0x20
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xB008_01B6, // s_movk_i32 s8, 0x1b6
+        0xBE89_03FF,
+        0x00C0_0000, // s_mov_b32 s9, 0xc00000
+        0xBE8A_03FF,
+        0x1850_0000,                // s_mov_b32 s10, 0x18500000
+        0xBE8B_0380,                // s_mov_b32 s11, 0
+        0x1604_0280 | width,        // v_mul_u32_u24 v2, width, v1
+        0x4A04_0500,                // v_add_nc_u32 v2, v0, v2
+        0x3420_0483,                // v_lshlrev_b32 v16, 3, v2
+        0x3428_0480 | output_shift, // v20 = output byte offset
+        0xBF8C_C07F,                // s_waitcnt lgkmcnt(0)
+        0xE034_1000,
+        0x8005_0D10, // buffer_load_dwordx2 v[13:14], v16, s[20:23], 0 offen
+        0x7E18_0281, // v_mov_b32 v12, 1 (offset x 1, y 0)
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    ];
+    if matches!(form, Sample::BiasOffset) {
+        w.extend([
+            0x7E1E_030E, // v_mov_b32 v15, v14
+            0x7E1C_030D, // v_mov_b32 v14, v13
+            0x7E1A_02F2, // v_mov_b32 v13, 1.0
+        ]);
+    }
+    w.extend(match form {
+        // image_sample v4, v[13:14], s[12:19], s[8:11] dmask:0x1 dim:2D
+        Sample::Plain => [0xF080_0108, 0x0043_040D],
+        // image_sample_o v4, v[12:14]: offset, u, v
+        Sample::Offset => [0xF0C0_0108, 0x0043_040C],
+        // image_sample_b_o v4, v[12:15]: offset, bias, u, v
+        Sample::BiasOffset => [0xF0D4_0108, 0x0043_040C],
+    });
+    w.push(0xBF8C_3F70); // s_waitcnt vmcnt(0)
+    if read_wave_base {
+        w.extend([
+            0xD760_0018,
+            0x0001_0102, // v_readlane_b32 s24, v2, 0
+            0x7E0A_0218, // v_mov_b32 v5, s24
+            0xE074_1000, // buffer_store_dwordx2 v[4:5]
+        ]);
+    } else {
+        w.push(0xE070_1000); // buffer_store_dword v4
+    }
+    w.extend([0x800A_0414, 0xBF81_0000]); // v20, s[40:43], 0 offen; s_endpgm
+    w
+}
+
+/// An implicit-level `image_sample` in a [8, 8, 1] compute group takes its
+/// derivatives as the console's hardware does: across quads of lanes
+/// (lanes 4k..4k+3, threads in x-major order, so four threads of one row),
+/// lane 1 less lane 0 and lane 2 less lane 0. Not across 2x2 tiles of
+/// thread ids, as SM 6.6 compute derivatives define them for 2D groups.
+///
+/// u steps two texels every second x, v eight texels per y, so each
+/// derivative pair has one nonzero vector and the level does not depend on
+/// how the sampler combines them. Lane quads (x, x+1, x+2 of one row):
+/// ddx = 0, ddy = 2 texels along u: level 1. 2x2 tiles: ddx = 0, ddy = 8
+/// texels along v: level 3. Each level of the 64x64 texture holds its own
+/// number, so red is the level sampled.
+#[test]
+fn compute_samples_take_derivatives_from_lane_quads() {
+    let size = 64u32;
+    let levels = 7u32;
+    let mut texels = Vec::new();
+    for l in 0..levels {
+        let n = (size >> l) as usize;
+        // Red is the level plus the texel's x over 10000: a tag for
+        // which texel a sample read (linear in x, so a filter keeps it).
+        for _ in 0..n {
+            texels.extend((0..n).map(|x| [l as f32 + x as f32 / 1e4, 0.0, 0.0, 1.0]));
+        }
+    }
+    let input: Vec<u32> = (0..64u32)
+        .flat_map(|f| {
+            let (x, y) = (f % 8, f / 8);
+            let u = (17.0 + 2.0 * (x / 2) as f32) / size as f32;
+            let v = (4.0 + 8.0 * y as f32 + 0.5) / size as f32;
+            [u.to_bits(), v.to_bits()]
+        })
+        .collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (wave64, form) in [
+        (false, Sample::Plain),
+        (true, Sample::Plain),
+        (false, Sample::Offset),
+        (true, Sample::Offset),
+        (false, Sample::BiasOffset),
+        (true, Sample::BiasOffset),
+    ] {
+        // The level (a bias of 1 adds one) and the texel offset in x.
+        let (level, offset) = match form {
+            Sample::Plain => (1.0, 0.0),
+            Sample::Offset => (1.0, 1.0),
+            Sample::BiasOffset => (2.0, 1.0),
+        };
+        let shader = match build_group(
+            &quad_program_as(form, 8, false),
+            wave64,
+            [8, 8, 1],
+            1 << 1 | 1 << 11,
+        ) {
+            Ok(s) => s,
+            Err(e) => panic!(
+                "wave{} {form:?}: lower: {e:?}",
+                if wave64 { 64 } else { 32 }
+            ),
+        };
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+            && let Err(e) = v.validate(&mut shader.dxil.clone())
+        {
+            panic!(
+                "wave{}: DXIL validation failed: {e:?}",
+                if wave64 { 64 } else { 32 }
+            );
+        }
+        let views = [
+            View::Mipped(size, size, levels, &texels),
+            // Read with buffer_load_dwordx2 ... offen: a raw view.
+            View::Buffer {
+                data: &input,
+                stride: Stride::Raw,
+            },
+            View::RawUav(64 * 4),
+        ];
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let w = if wave64 { 64 } else { 32 };
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+                eprintln!("wave{w} {label}: no pipeline; skipped");
+                continue;
+            };
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("wave{w} {label}: dispatch failed: {e}"));
+            ran += 1;
+            let got: Vec<f32> = out[0][..64].iter().map(|&x| f32::from_bits(x)).collect();
+            eprintln!("wave{w} {form:?} {label}: levels {got:?}");
+            for (f, &g) in got.iter().enumerate() {
+                let (x, y) = (f % 8, f / 8);
+                let l = g.round();
+                assert!(
+                    (l - level).abs() < 0.5 && (g - l) < 0.01,
+                    "wave{w} {form:?} {label}: thread ({x}, {y}) sampled level {g}, the lane quads give {level} (2x2 tiles give 3)"
+                );
+                // The texel read: at the sampled level's size n, u lands on
+                // coordinate c (in texels); the offset moves it by whole
+                // texels. A point sample reads texel floor(c), a linear one
+                // c - 0.5 of the tag.
+                let n = (size >> l as u32) as f32;
+                let c = (17.0 + 2.0 * (x / 2) as f32) / size as f32 * n + offset;
+                let tag = (g - l) * 1e4;
+                assert!(
+                    (tag - c.floor()).abs() < 0.05 || (tag - (c - 0.5)).abs() < 0.05,
+                    "wave{w} {form:?} {label}: thread ({x}, {y}) read texel {tag}, the offset of {offset} gives {} (or {})",
+                    c.floor(),
+                    c - 0.5
+                );
+            }
+        }
+    }
+    assert!(ran > 0, "no host device ran the test");
+}
+
+#[test]
+fn multirow_samples_and_console_wave_reads_keep_each_guest_thread() {
+    use crate::dxbc::{Container, FourCC};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let tag = |level: u32, x, y| (10000 * level + 64 * y + x) as f32;
+    let mut texels = Vec::new();
+    for level in 0..7 {
+        let edge = 64u32 >> level;
+        for y in 0..edge {
+            texels.extend((0..edge).map(|x| [tag(level, x, y), 0., 0., 1.]));
+        }
+    }
+    for (width, height, wave) in [32, 64]
+        .into_iter()
+        .flat_map(|wave| [(6, 8, wave), (6, 16, wave), (8, 8, wave)])
+    {
+        let n = width * height;
+        let shader = build_group(
+            &quad_program_as(Sample::Plain, width, true),
+            wave == 64,
+            [width, height, 1],
+            1 << 1 | 1 << 11,
+        )
+        .unwrap();
+        let dxil = Container::parse(&shader.dxil).unwrap();
+        let psv = dxil.part(FourCC::PSV0).unwrap().data;
+        // NumThreads in PSVRuntimeInfo2, after the runtime-info size.
+        let dims: [u32; 3] = std::array::from_fn(|i| {
+            u32::from_le_bytes(psv[40 + i * 4..44 + i * 4].try_into().unwrap())
+        });
+        assert_eq!(dims, [n, 1, 1]);
+        let input: Vec<u32> = (0..n)
+            .flat_map(|f| {
+                [
+                    ((9.0 + 2.0 * ((f % 16) / 2) as f32) / 64.0).to_bits(),
+                    ((9.0 + 4.0 * (f / 16) as f32) / 64.0).to_bits(),
+                ]
+            })
+            .collect();
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            if !warp && std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+                continue;
+            }
+            let Ok(host) = Host::new(warp) else {
+                continue;
+            };
+            let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: this live device writes an OPTIONS1 structure of the specified size.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut caps).cast(),
+                    size_of_val(&caps) as u32,
+                )
+            }
+            .unwrap();
+            if !caps.WaveOps.as_bool()
+                || !(caps.WaveLaneCountMin..=caps.WaveLaneCountMax).contains(&wave)
+            {
+                eprintln!("{label}: Wave{wave} unsupported; skipped");
+                continue;
+            }
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(
+                            0,
+                            Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]),
+                        )],
+                        views: &[
+                            View::Mipped(64, 64, 7, &texels),
+                            View::Buffer {
+                                data: &input,
+                                stride: Stride::Raw,
+                            },
+                            View::RawUav(2 * n),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            for f in 0..n {
+                // The coordinates reach mip 1 at the center of this texel.
+                let expected = tag(1, 4 + (f % 16) / 2, 4 + 2 * (f / 16)).to_bits();
+                let i = 2 * f as usize;
+                assert_eq!(
+                    &out[0][i..i + 2],
+                    &[expected, f & !(wave - 1)],
+                    "{label} Wave{wave}, {width}x{height}, thread {f}"
+                );
+            }
+            eprintln!(
+                "{label} Wave{wave} {width}x{height}: {n} sample and wave-base pairs matched"
+            );
+        }
+    }
+}
+
+fn build_group(
+    words: &[u32],
+    wave64: bool,
+    threads: [u32; 3],
+    rsrc2: u32,
+) -> Result<HostShader, crate::ShaderError> {
+    let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride,
+        dwords,
+        user_data: 0,
+        slot: 0,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: 32,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![
+            range(ResourceType::Srv, 0, 8, 0),
+            range(ResourceType::Srv, 8, 4, 8),
+            range(ResourceType::Uav, 16, 4, 0),
+        ],
+        io: StageIo::Cs(ComputeIo { rsrc2, threads }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let lowered = lowered(&native)?;
+    Ok(HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        static_samplers: lowered
+            .samplers
+            .iter()
+            .map(|&w| super::StaticSampler::from_words(w))
+            .collect(),
+        samplers: lowered.samplers,
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
+    })
+}
