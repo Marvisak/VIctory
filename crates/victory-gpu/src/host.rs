@@ -392,6 +392,142 @@ pub(crate) mod tests {
         ISSUED.with(|l| std::mem::take(&mut *l.borrow_mut()))
     }
 
+    /// Eight lists each moving 400 textures to states of their own: planned
+    /// in submission order, every prelude starts from the states the list
+    /// before leaves (replayed in the GPU's order, prelude then list, by the
+    /// debug layer's rule); recorded on several threads (3,200 barriers),
+    /// each lands where its list's prelude goes.
+    #[test]
+    fn preludes_planned_in_order_record_on_several_threads() {
+        use super::*;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 16,
+            Height: 16,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let textures: Vec<_> = (0..400)
+            .map(|_| {
+                let mut texture: Option<ID3D12Resource> = None;
+                // SAFETY: plain creation; our out pointer.
+                unsafe {
+                    host.device.CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut texture,
+                    )
+                }
+                .unwrap();
+                std::sync::Arc::new(crate::resource::HostTexture::new(
+                    texture.unwrap(),
+                    0,
+                    Vec::new(),
+                ))
+            })
+            .collect();
+        const STATES: [u32; 4] = [0x4, 0x80, 0x800, 0x40];
+        let lists: Vec<HostList> = (0..8).map(|_| host.new_list().unwrap()).collect();
+        let mut recorded = Vec::new();
+        issued();
+        for (k, list) in lists.iter().enumerate() {
+            for t in &textures {
+                // The first move is the prelude's; the second is recorded.
+                for wanted in [STATES[2 * k % 4], STATES[(2 * k + 1) % 4]] {
+                    if let Some(b) = list.move_texture(t, wanted) {
+                        // SAFETY: an open list and a live texture.
+                        unsafe { list.list.ResourceBarrier(&[b]) };
+                    }
+                }
+            }
+            list.close();
+            recorded.push(issued());
+        }
+        let key = |t: &ID3D12Resource| t.as_raw() as usize;
+        let mut states: std::collections::HashMap<usize, u32> =
+            textures.iter().map(|t| (key(&t.texture), 0)).collect();
+        let mut later = Vec::new();
+        for (k, list) in lists.iter().enumerate() {
+            let Prelude::Barriers(barriers) = list.plan_prelude() else {
+                panic!("list {k}: a prelude of barriers");
+            };
+            let prelude: Vec<_> = barriers
+                .iter()
+                .map(|(t, from, to)| (key(t), *from, *to))
+                .collect();
+            replay(&prelude, &mut states).unwrap_or_else(|e| panic!("list {k} prelude: {e}"));
+            replay(&recorded[k], &mut states).unwrap_or_else(|e| panic!("list {k}: {e}"));
+            later.push((2 * k, list, barriers));
+        }
+        for t in &textures {
+            assert_eq!(states[&key(&t.texture)], t.state.load(Ordering::Relaxed));
+        }
+        let made = record_preludes(&later);
+        assert_eq!(
+            made.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
+            [0, 2, 4, 6, 8, 10, 12, 14]
+        );
+        assert!(made.iter().all(|(_, prelude)| prelude.is_some()));
+        // Timing (`VICTORY_PRELUDE_BENCH=1`, with `--nocapture`): the same
+        // preludes recorded one after another and on several threads.
+        if std::env::var_os("VICTORY_PRELUDE_BENCH").is_some() {
+            let mut times = [Vec::new(), Vec::new()];
+            for round in 0..40 {
+                let started = std::time::Instant::now();
+                if round % 2 == 0 {
+                    later
+                        .iter()
+                        .for_each(|(_, list, b)| drop(list.record_prelude(b)));
+                } else {
+                    drop(record_preludes(&later));
+                }
+                times[round % 2].push(started.elapsed().as_secs_f64() * 1e6);
+            }
+            for (how, mut t) in ["in order", "threads"].into_iter().zip(times) {
+                t.sort_by(f64::total_cmp);
+                eprintln!("{how}: median {:.0} us", t[t.len() / 2]);
+            }
+        }
+        for list in &lists {
+            list.reset();
+        }
+    }
+
+    /// Preludes go on threads only with four or more of them holding
+    /// [`super::PARALLEL_PRELUDE_BARRIERS`] barriers in all: eight of 40
+    /// barriers each are recorded one after another, eight of 400 on threads.
+    #[test]
+    fn small_submissions_record_their_preludes_in_order() {
+        use super::{PARALLEL_PRELUDE_BARRIERS, on_threads};
+        assert!(!on_threads(8, 8 * 40));
+        assert!(on_threads(8, 8 * 400));
+        assert!(!on_threads(8, PARALLEL_PRELUDE_BARRIERS - 1));
+        assert!(on_threads(4, PARALLEL_PRELUDE_BARRIERS));
+        assert!(!on_threads(3, 3 * 2000));
+        assert!(!on_threads(0, 0));
+    }
+
     /// Replays transitions in the order the GPU runs them from the states
     /// in `states` (resources not in it are not checked), by the debug
     /// layer's rule: each barrier's before-state is the resource's current
@@ -1238,15 +1374,45 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        let parallel = parallel_preludes(runs);
+        // Preludes of barriers only, recorded after the loop (`parallel`):
+        // where each goes in `lists`, its list, its barriers.
+        let mut later = Vec::new();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
+            let prelude = list.plan_prelude();
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                match &prelude {
+                    Prelude::None => {}
+                    Prelude::Recorded(_) => add(C::Preludes, 1),
+                    Prelude::Barriers(b) => {
+                        add(C::Preludes, 1);
+                        add(C::PreludeBarriers, b.len() as u64);
+                    }
+                }
+            }
+            match prelude {
+                Prelude::None => {}
+                Prelude::Recorded(prelude) => lists.push(Some(prelude)),
+                Prelude::Barriers(barriers) if parallel => {
+                    later.push((lists.len(), *list, barriers));
+                    lists.push(None);
+                }
+                Prelude::Barriers(barriers) => lists.push(list.record_prelude(&barriers)),
             }
             lists.push(list.list.cast().ok());
+        }
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
+            for (at, prelude) in record_preludes(&later) {
+                lists[at] = prelude;
+            }
         }
         batch.flush();
         let prepared = std::time::Instant::now();
@@ -1919,7 +2085,12 @@ impl HostList {
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// The prelude the list needs at its submission: none, one recorded
+    /// (its depth textures' twin copies read the states the lists before it
+    /// leave, so it is recorded in order), or barriers to record
+    /// ([`HostList::record_prelude`]). Either way the textures' states are
+    /// those the list leaves from then on.
+    fn plan_prelude(&self) -> Prelude {
         // Depth textures and their twins first, from their real states and
         // back: the side each first use needs, made newer.
         let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
@@ -1946,7 +2117,18 @@ impl HostList {
         };
         if copies.is_empty() && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first) {
             left();
-            return None;
+            return Prelude::None;
+        }
+        if copies.is_empty() {
+            let barriers = states
+                .values()
+                .filter_map(|(first, _, copy)| {
+                    let real = copy.state.load(Ordering::Relaxed);
+                    (real != *first).then(|| (copy.texture.clone(), real, *first))
+                })
+                .collect();
+            left();
+            return Prelude::Barriers(barriers);
         }
         let (allocator, list) = &self.prelude;
         // SAFETY: the prelude is not executing (every submission is waited
@@ -1983,6 +2165,36 @@ impl HostList {
             })
         };
         left();
+        if let Err(e) = recorded {
+            fail(format_args!("a host state prelude did not record ({e})"));
+        }
+        list.cast().ok().map_or(Prelude::None, Prelude::Recorded)
+    }
+
+    /// Records the list's prelude of `barriers` (texture, from, to, host
+    /// states) planned by [`HostList::plan_prelude`]: only the D3D12 calls,
+    /// so preludes of different lists may be recorded on several threads.
+    fn record_prelude(&self, barriers: &[(ID3D12Resource, u32, u32)]) -> Option<ID3D12CommandList> {
+        let barriers: Vec<_> = barriers
+            .iter()
+            .map(|(texture, from, to)| {
+                transition(
+                    texture,
+                    D3D12_RESOURCE_STATES(*from as i32),
+                    D3D12_RESOURCE_STATES(*to as i32),
+                )
+            })
+            .collect();
+        let (allocator, list) = &self.prelude;
+        // SAFETY: the prelude is not executing (every submission is waited
+        // for), and only this call records it; the textures are live.
+        let recorded = unsafe {
+            allocator.Reset().and_then(|()| {
+                list.Reset(allocator, None)?;
+                list.ResourceBarrier(&barriers);
+                list.Close()
+            })
+        };
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
@@ -2380,6 +2592,74 @@ impl HostList {
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }
+}
+
+/// A prelude's barriers: texture, from, to (host states).
+type PreludeBarriers = Vec<(ID3D12Resource, u32, u32)>;
+
+/// A prelude of barriers recorded after its submission's loop: where it
+/// goes among the submission's lists, its list, its barriers.
+type LaterPrelude<'a> = (usize, &'a HostList, PreludeBarriers);
+
+/// What a list needs before it at its submission ([`HostList::plan_prelude`]).
+enum Prelude {
+    None,
+    /// Recorded already.
+    Recorded(ID3D12CommandList),
+    /// Barriers to record.
+    Barriers(PreludeBarriers),
+}
+
+/// Barriers a submission's preludes hold in all before they are recorded on
+/// several threads; fewer are recorded one after another.
+const PARALLEL_PRELUDE_BARRIERS: usize = 2048;
+
+/// Whether `preludes` preludes of `barriers` barriers in all are recorded on
+/// several threads: four or more, with [`PARALLEL_PRELUDE_BARRIERS`] in all.
+fn on_threads(preludes: usize, barriers: usize) -> bool {
+    preludes >= 4 && barriers >= PARALLEL_PRELUDE_BARRIERS
+}
+
+/// Whether the submission of `runs` records its lists' preludes of barriers
+/// on several threads (`VICTORY_PARALLEL_PRELUDES=1`; off by default): with
+/// four lists or more, each once (a list has one prelude to record).
+fn parallel_preludes(runs: &[&HostList]) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on =
+        *ON.get_or_init(|| std::env::var_os("VICTORY_PARALLEL_PRELUDES").is_some_and(|v| v == "1"));
+    if !on || runs.len() < 4 {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::with_capacity(runs.len());
+    runs.iter()
+        .all(|list| seen.insert(std::ptr::from_ref(*list)))
+}
+
+/// Records the preludes of barriers `later` holds (where each goes among a
+/// submission's lists, its list, its barriers): on several threads when
+/// [`on_threads`], else one after another. All are recorded when it
+/// returns, before the lists go to the GPU in their order.
+fn record_preludes(later: &[LaterPrelude<'_>]) -> Vec<(usize, Option<ID3D12CommandList>)> {
+    let barriers: usize = later.iter().map(|(_, _, b)| b.len()).sum();
+    if !on_threads(later.len(), barriers) {
+        return later
+            .iter()
+            .map(|(at, list, b)| (*at, list.record_prelude(b)))
+            .collect();
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::ThreadedPreludes, later.len() as u64);
+    let recorded: Vec<Mutex<Option<ID3D12CommandList>>> =
+        later.iter().map(|_| Mutex::new(None)).collect();
+    crate::texture::in_parallel(later.len(), |k| {
+        let (_, list, b) = &later[k];
+        *recorded[k].lock().unwrap_or_else(|e| e.into_inner()) = list.record_prelude(b);
+    });
+    later
+        .iter()
+        .zip(recorded)
+        .map(|((at, ..), r)| (*at, r.into_inner().unwrap_or_else(|e| e.into_inner())))
+        .collect()
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the

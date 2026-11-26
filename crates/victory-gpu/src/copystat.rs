@@ -104,8 +104,13 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
+    /// State preludes recorded; barriers in those of barriers only; those
+    /// recorded on several threads.
+    Preludes,
+    PreludeBarriers,
+    ThreadedPreludes,
 }
-const COUNTERS: usize = 61;
+const COUNTERS: usize = 64;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -234,7 +239,7 @@ pub(crate) fn log(frames: f64) {
          asking for other mappings, {:.1} ms waiting for the guard lock; preparing: {:.1} ms in \
          refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
          work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
-         heap texture uploads {:.1} ms, state preludes {:.1} ms, heap slots the title copied {:.1} ms ({:.0} slots), title threads waiting to write views {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
+         heap texture uploads {:.1} ms, state preludes {:.1} ms ({:.1} preludes, {:.0} barriers, {:.1} on threads), heap slots the title copied {:.1} ms ({:.0} slots), title threads waiting to write views {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
          {:.0} hard faults",
         c[C::Submissions as usize],
         c[C::Copies as usize],
@@ -288,6 +293,9 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::StepMemoryUs as usize]),
         ms(c[C::UploadsUs as usize]),
         ms(c[C::PreludeUs as usize]),
+        c[C::Preludes as usize],
+        c[C::PreludeBarriers as usize],
+        c[C::ThreadedPreludes as usize],
         ms(c[C::SyncHeapsUs as usize]),
         c[C::SyncSlots as usize],
         ms(c[C::MirrorWaitUs as usize]),
