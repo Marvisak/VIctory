@@ -830,9 +830,9 @@ pub(crate) struct HostList {
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
     /// In a frame `crate::capture` lists: the textures the list renders to
-    /// or writes, and the pipeline that first wrote each (diagnostics).
+    /// or writes, and the pipelines that wrote each, in order (diagnostics).
     #[cfg(feature = "diagnostics")]
-    targets: Mutex<Vec<(usize, String)>>,
+    targets: Mutex<Vec<(usize, Vec<String>)>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -1428,17 +1428,19 @@ impl Host {
         release_retired();
         release_later(Box::new((batch, back, withheld, heaps)));
         self.log_messages();
-        // A listed frame: what this submission's lists drew, as it is now
-        // (the dumps submit lists of their own).
+        // A listed frame: what this submission's lists drew, as it is now,
+        // with every pipeline that wrote each texture in the submission (the
+        // dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
         if traced {
             let sub = *submitted;
             drop(submitted);
-            let mut targets: Vec<(usize, String)> = Vec::new();
+            let mut targets: Vec<(usize, Vec<String>)> = Vec::new();
             for r in runs {
-                for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-                    if !targets.iter().any(|x| x.0 == t.0) {
-                        targets.push(t.clone());
+                for (resource, writers) in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                    match targets.iter_mut().find(|x| x.0 == *resource) {
+                        Some((_, all)) => writers.iter().for_each(|w| crate::capture::add_writer(all, w)),
+                        None => targets.push((*resource, writers.clone())),
                     }
                 }
             }
@@ -2032,8 +2034,13 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn note_target(&self, resource: usize, by: &str) {
         let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
-        if !targets.iter().any(|t| t.0 == resource) {
-            targets.push((resource, by.to_owned()));
+        match targets.iter_mut().find(|t| t.0 == resource) {
+            Some((_, writers)) => crate::capture::add_writer(writers, by),
+            None => {
+                let mut writers = Vec::new();
+                crate::capture::add_writer(&mut writers, by);
+                targets.push((resource, writers));
+            }
         }
     }
 

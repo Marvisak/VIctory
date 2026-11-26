@@ -231,14 +231,48 @@ pub(crate) fn save_read_back(
 /// structure: floats scaled by their largest value, depth by its range).
 /// The host copies are held: the title may release a target before the
 /// frame is presented.
-/// Each with the first pipeline that wrote it as an unordered-access view
-/// (`-by-<pipeline>` in the name; `-black` when its colour is all zeros).
+/// Each with the pipelines that wrote it as an unordered-access view, in
+/// order: the first in the name (`-by-<pipeline>`, `-and-<n>-more` when
+/// others wrote it after; `-black` when its colour is all zeros), all of
+/// them in the log.
 /// `VICTORY_DUMP_WRITERS` (shader hashes) adds, in any frame, the textures
 /// a pipeline with one of them writes, the first frame it runs.
 #[allow(clippy::type_complexity)]
 static TARGETS: std::sync::Mutex<
-    Vec<(usize, std::sync::Arc<crate::resource::HostTexture>, String)>,
+    Vec<(usize, std::sync::Arc<crate::resource::HostTexture>, Vec<String>)>,
 > = std::sync::Mutex::new(Vec::new());
+
+/// Adds `by` (a pipeline's name; empty: none known) to a target's writers,
+/// once, keeping their order.
+pub(crate) fn add_writer(writers: &mut Vec<String>, by: &str) {
+    if !by.is_empty() && !writers.iter().any(|w| w == by) {
+        writers.push(by.to_owned());
+    }
+}
+
+/// A dumped target's writers as its file name gives them: the first one's
+/// hashes (its name is "[stage hash, ...]"), then how many others wrote it
+/// after it (`-and-<n>-more`); empty if none is known.
+fn writers_label(writers: &[String]) -> String {
+    let mut known = writers.iter().filter(|w| !w.is_empty());
+    let Some(first) = known.next() else {
+        return String::new();
+    };
+    let mut label: String = first.chars().filter(char::is_ascii_alphanumeric).collect();
+    let more = known.count();
+    if more > 0 {
+        label.push_str(&format!("-and-{more}-more"));
+    }
+    label
+}
+
+/// Logs every writer of a dumped target, in order, when there is more than
+/// one (the file name gives the first).
+fn log_writers(stem: &str, resource: crate::object::This, writers: &[String]) {
+    if writers.len() > 1 {
+        tracing::info!(?resource, "dumped target {stem}: written by, in order: {}", writers.join(", "));
+    }
+}
 
 thread_local! {
     /// The pipeline whose draw or dispatch this thread is binding.
@@ -274,6 +308,16 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
         return;
     }
     let by = WRITER.with(|w| w.borrow().clone());
+    note_target_by(list, resource, &by);
+}
+
+/// As [`note_target`], with the writer named: a draw that renders to
+/// `resource` (pipeline `by`).
+pub(crate) fn note_target_by(list: &crate::host::HostList, resource: crate::object::This, by: &str) {
+    if resource.is_null() || !dump_on() {
+        return;
+    }
+    let by = by.to_owned();
     // Lists are recorded ahead of the frame that submits them.
     list.note_target(resource as usize, &by);
     if !listed(crate::queue::presented() + 1) {
@@ -297,10 +341,12 @@ pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object:
         }
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.iter().any(|(r, _, _)| *r == resource as usize)
-        && let Some(copy) = crate::resource::host_copy(resource)
-    {
-        targets.push((resource as usize, copy, by));
+    if let Some((_, _, writers)) = targets.iter_mut().find(|(r, _, _)| *r == resource as usize) {
+        add_writer(writers, &by);
+    } else if let Some(copy) = crate::resource::host_copy(resource) {
+        let mut writers = Vec::new();
+        add_writer(&mut writers, &by);
+        targets.push((resource as usize, copy, writers));
     }
 }
 
@@ -318,7 +364,7 @@ pub(crate) fn dump_targets(frame: u64) {
     // Writers dumped once.
     if let Some(writers) = WRITERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         writers.retain(|h| {
-            !targets.iter().any(|t| t.2.contains(h.as_str()))
+            !targets.iter().any(|t| t.2.iter().any(|w| w.contains(h.as_str())))
                 && !buffers.iter().any(|b| b.2.contains(h.as_str()))
         });
     }
@@ -344,7 +390,7 @@ pub(crate) fn dump_targets(frame: u64) {
         );
     }
     let Some(host) = crate::host::host() else { return };
-    for (i, (resource, copy, by)) in targets.iter().enumerate() {
+    for (i, (resource, copy, writers)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
@@ -353,20 +399,26 @@ pub(crate) fn dump_targets(frame: u64) {
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        let target = (i, *resource as crate::object::This, by.as_str());
-        dump_one(host, texture, state, &format!("frame-{frame}"), target, &d);
+        let stem = format!("frame-{frame}-{i:02}");
+        let resource = *resource as crate::object::This;
+        log_writers(&stem, resource, writers);
+        dump_one(host, texture, state, &stem, (resource, &writers_label(writers)), &d);
     }
 }
 
 /// After submission `sub` of a listed frame has run: the textures its lists
-/// rendered to or wrote, as `frame-<n>-s<sub>-<i>-...` (what each holds
-/// then, to follow a frame pass by pass).
-pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
+/// rendered to or wrote, as `frame-<n>-s<sub>-<i>-...`, each with the
+/// pipelines that wrote it in the submission (`writers`, in order). Each
+/// holds what the whole submission left there, not what the pipeline its
+/// name gives wrote: later commands of the submission may have written it
+/// too. `VICTORY_DUMP_AFTER` dumps a texture right after one pipeline's
+/// command ([`dump_after`]).
+pub(crate) fn dump_submission(sub: u64, targets: &[(usize, Vec<String>)]) {
     use std::sync::atomic::Ordering::Relaxed;
     let Some(host) = crate::host::host() else { return };
     let frame = crate::queue::presented() + 1;
     peek(&format!("frame-{frame}-s{sub:04}"));
-    for (i, (resource, by)) in targets.iter().enumerate() {
+    for (i, (resource, writers)) in targets.iter().enumerate() {
         let Some(copy) = crate::resource::host_copy(*resource as crate::object::This) else {
             continue;
         };
@@ -377,18 +429,122 @@ pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
             continue;
         }
         let state = copy.state.load(Relaxed);
-        let target = (i, *resource as crate::object::This, by.as_str());
-        dump_one(host, texture, state, &format!("frame-{frame}-s{sub:04}"), target, &d);
+        let stem = format!("frame-{frame}-s{sub:04}-{i:02}");
+        let resource = *resource as crate::object::This;
+        let by = writers_label(writers);
+        log_writers(&stem, resource, writers);
+        dump_one(host, texture, state, &stem, (resource, &by), &d);
         // A depth texture's writable twin (`crate::twin`): what unordered
         // views wrote, which reaches the depth texture at its next use.
         for (p, plane) in copy.twin.get().and_then(Option::as_ref).iter().flat_map(|t| t.planes.iter().enumerate()) {
             // SAFETY: a live resource.
             let pd = unsafe { plane.texture.GetDesc() };
-            let by = format!("{by}-twin{p}");
-            let target = (i, *resource as crate::object::This, by.as_str());
-            dump_one(host, &plane.texture, plane.state.load(Relaxed), &format!("frame-{frame}-s{sub:04}"), target, &pd);
+            let by = if by.is_empty() { format!("twin{p}") } else { format!("{by}-twin{p}") };
+            dump_one(host, &plane.texture, plane.state.load(Relaxed), &stem, (resource, &by), &pd);
         }
     }
+}
+
+/// `VICTORY_DUMP_AFTER=<hash>,...`: whether, in this listed frame, the
+/// textures a dispatch or draw of pipeline `name` writes are dumped right
+/// after it ([`dump_after`]).
+pub(crate) fn after_wanted(name: &str) -> bool {
+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        let list = std::env::var("VICTORY_DUMP_AFTER").unwrap_or_default();
+        list.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect()
+    });
+    !hashes.is_empty()
+        && folder().is_some()
+        && hashes.iter().any(|h| name.contains(h.as_str()))
+        && listed(crate::queue::presented() + 1)
+}
+
+/// A texture read back in a list right after a command that wrote it.
+pub(crate) struct Snapshot {
+    pub(crate) buffer: ID3D12Resource,
+    pub(crate) footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    pub(crate) desc: D3D12_RESOURCE_DESC,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the rest is plain data.
+unsafe impl Send for Snapshot {}
+// SAFETY: as above.
+unsafe impl Sync for Snapshot {}
+
+/// Records in `list`, at this point of it, a copy of title texture
+/// `resource`'s host copy (its first subresource) into a readback buffer
+/// the list keeps, after every unordered-access write before it; the
+/// texture goes back to `state` (a `D3D12_RESOURCE_STATES` value) for the
+/// commands after. None without a host texture, and for a depth texture
+/// with a writable twin (`crate::twin`), where what views wrote is not in
+/// the texture yet.
+pub(crate) fn snapshot(
+    list: &crate::host::HostList,
+    resource: crate::object::This,
+    state: u32,
+) -> Option<Snapshot> {
+    const COPY_SOURCE: u32 = 0x800;
+    let host = crate::host::host()?;
+    if crate::resource::host_copy(resource).is_some_and(|c| c.twin.get().is_some_and(Option::is_some)) {
+        return None;
+    }
+    let texture = crate::resource::host_resource(resource)?;
+    // SAFETY: a live resource.
+    let desc = unsafe { texture.GetDesc() };
+    let all = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    };
+    // SAFETY: an open list.
+    unsafe { list.list.ResourceBarrier(&[all]) };
+    crate::list::ensure_state(list, resource, COPY_SOURCE);
+    let read = read_back(&host.device, &list.list, &texture);
+    crate::list::ensure_state(list, resource, state);
+    let (buffer, footprint) = read?;
+    list.keep(&buffer);
+    Some(Snapshot {
+        buffer,
+        footprint,
+        desc,
+    })
+}
+
+/// With `VICTORY_DUMP_AFTER` (see [`after_wanted`]): title texture
+/// `resource`, which pipeline `by` just wrote, read back in `list` right
+/// after the command (see [`snapshot`]; `state` is where it goes back to)
+/// and saved once the list has run, as `frame-<n>-after-<k>-...` (`n` the
+/// frame whose submission ran it, as in the per-submission dumps; `k`
+/// counts these dumps in the order they were recorded): what that command
+/// left there, before anything later in the frame writes it. 2D textures
+/// only.
+pub(crate) fn dump_after(list: &crate::host::HostList, resource: crate::object::This, state: u32, by: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static AFTER: AtomicU64 = AtomicU64::new(0);
+    let Some(texture) = crate::resource::host_resource(resource) else { return };
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        return;
+    }
+    let Some(shot) = snapshot(list, resource, state) else {
+        tracing::info!(?resource, by, "not dumped after its command: a depth texture with a writable twin");
+        return;
+    };
+    let k = AFTER.fetch_add(1, Relaxed);
+    let by = writers_label(&[by.to_owned()]);
+    let resource = resource as usize;
+    // Lists are recorded ahead of the frame that submits them: named when
+    // the list has run.
+    list.defer_after(move || {
+        let stem = format!("frame-{}-after-{k:04}", crate::queue::presented() + 1);
+        save_target(&stem, resource as crate::object::This, &by, &shot.desc, &shot.buffer, &shot.footprint);
+    });
 }
 
 /// `VICTORY_PEEK=<address>[:<bytes>],...` (hex addresses, 16 bytes by
@@ -514,12 +670,14 @@ pub(crate) fn read_indirect(
     }
 }
 
+/// Reads `texture` (in `state`) back in a list of ours and saves it (see
+/// [`save_target`]).
 fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
     state: u32,
-    prefix: &str,
-    (i, resource, by): (usize, crate::object::This, &str),
+    stem: &str,
+    (resource, by): (crate::object::This, &str),
     d: &D3D12_RESOURCE_DESC,
 ) {
     let Ok(list) = host.new_list() else { return };
@@ -541,6 +699,21 @@ fn dump_one(
     list.close();
     host.execute(&[&list]);
     let Some((buffer, footprint)) = read else { return };
+    save_target(stem, resource, by, d, &buffer, &footprint);
+}
+
+/// Saves a texture (description `d`) that [`read_back`] copied into
+/// `buffer`, once the copy has run, as
+/// `<stem>-<resource>-<w>x<h>-f<format>[-by-<by>][-black].png`; a target of
+/// 16 texels or fewer is logged as values too.
+fn save_target(
+    stem: &str,
+    resource: crate::object::This,
+    by: &str,
+    d: &D3D12_RESOURCE_DESC,
+    buffer: &ID3D12Resource,
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+) {
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished; the mapping spans the footprint's rows.
@@ -560,21 +733,17 @@ fn dump_one(
                     format!("{w:#x}={}", f32::from_bits(w))
                 })
                 .collect();
-            tracing::info!(?resource, format = f.Format.0, "tiny target {prefix}-{i:02}: {}", words.join(" "));
+            tracing::info!(?resource, format = f.Format.0, "tiny target {stem}: {}", words.join(" "));
         }
         // A 24-bit depth plane copies out as 32-bit words (`R32_TYPELESS`):
         // decode it as depth, not as floats (all denormals, shown black).
         let format = if matches!(d.Format.0, 44..=47) { d.Format.0 } else { f.Format.0 };
         if let Some(rgba) = to_rgba(format as u32, f.Width as usize, f.Height as usize, pitch, rows) {
-            let mut name = format!(
-                "{prefix}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
-            );
-            // The pipeline's hashes (its name is "[stage hash, ...]").
-            let by: String = by.chars().filter(char::is_ascii_alphanumeric).collect();
+            let mut name = format!("{stem}-{resource:?}-{}x{}-f{}", d.Width, d.Height, d.Format.0);
+            // Its writers (`writers_label`).
             if !by.is_empty() {
                 name.push_str("-by-");
-                name.push_str(&by);
+                name.push_str(by);
             }
             // Whether anything but zeros is there (a dump is normalized).
             if rgba.chunks(4).all(|p| p[..3] == [0, 0, 0]) {
@@ -899,6 +1068,22 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// A dumped target's name gives its first writer and how many others
+    /// wrote it after; writers are kept once each, in order.
+    #[test]
+    fn dump_names_give_the_first_writer_and_how_many_more() {
+        use super::{add_writer, writers_label};
+
+        let mut writers = Vec::new();
+        for by in ["[compute 0a1b]", "", "[vertex 2c3d, pixel 4e5f]", "[compute 0a1b]", "[compute 6a7b]"] {
+            add_writer(&mut writers, by);
+        }
+        assert_eq!(writers, ["[compute 0a1b]", "[vertex 2c3d, pixel 4e5f]", "[compute 6a7b]"]);
+        assert_eq!(writers_label(&writers), "compute0a1b-and-2-more");
+        assert_eq!(writers_label(&writers[..1]), "compute0a1b");
+        assert_eq!(writers_label(&[]), "");
+    }
+
     #[test]
     fn half_classifies_special_and_finite_values() {
         use super::half;

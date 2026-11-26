@@ -593,9 +593,15 @@ impl State {
         const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            // The draws that render to a target are among its writers in
+            // the dumps (`crate::capture`).
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_target_by(list, t as This, &p.name);
         }
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_target_by(list, self.depth as This, &p.name);
         }
         // A depth copy of ours (`crate::twin`) ran a compute pipeline.
         if list.take_rebind() {
@@ -1128,6 +1134,8 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
+        #[cfg(feature = "diagnostics")]
+        self.dump_after(list, true);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1208,6 +1216,8 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    self.dump_after(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1445,7 +1455,7 @@ impl State {
         if !crate::capture::listed(crate::queue::presented() + 1) {
             return;
         }
-        let (Some(p), Some(host)) = (crate::pipeline::host_pipeline(self.pipeline as This), crate::host::host()) else {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return;
         };
         for stage in &p.stages {
@@ -1462,35 +1472,15 @@ impl State {
                 if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D && d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D {
                     continue;
                 }
-                const COPY_SOURCE: u32 = 0x800;
                 const UNORDERED: u32 = 0x8;
-                // All UAV writes done before the copy.
-                let all = D3D12_RESOURCE_BARRIER {
-                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
-                    },
-                };
-                // SAFETY: an open list.
-                unsafe { list.list.ResourceBarrier(&[all]) };
-                crate::list::ensure_state(list, r as This, COPY_SOURCE);
-                let read = crate::capture::read_back(&host.device, &list.list, &t);
-                crate::list::ensure_state(list, r as This, UNORDERED);
-                let Some((buffer, f)) = read else { continue };
-                list.keep(&buffer);
-                struct Readback(ID3D12Resource);
-                // SAFETY: D3D12 objects are free-threaded.
-                unsafe impl Send for Readback {}
-                // SAFETY: as above.
-                unsafe impl Sync for Readback {}
-                let buffer = Readback(buffer);
+                let Some(shot) = crate::capture::snapshot(list, r as This, UNORDERED) else { continue };
                 let who = format!("{} s{}+{} {r:#x} {}x{}x{} f{}", stage.shader.hash, u.slot, u.table_offset_dwords, d.Width, d.Height, d.DepthOrArraySize, d.Format.0);
                 list.defer_after(move || {
+                    let f = shot.footprint;
                     let mut data = std::ptr::null_mut();
                     // SAFETY: the list has run; the mapping spans the first slice.
                     unsafe {
-                        if buffer.0.Map(0, None, Some(&mut data)).is_err() {
+                        if shot.buffer.Map(0, None, Some(&mut data)).is_err() {
                             return;
                         }
                         let n = (f.Footprint.RowPitch * f.Footprint.Height) as usize / 4;
@@ -1498,10 +1488,55 @@ impl State {
                         let set = w.iter().filter(|&&x| x != 0).count();
                         let first: Vec<f32> = w.iter().take(8).map(|&x| f32::from_bits(x)).collect();
                         tracing::info!(target: "victory_gpu::trace", "written {who} right after the dispatch: {set} of {n} dwords set, first {first:?}");
-                        buffer.0.Unmap(0, None);
+                        shot.buffer.Unmap(0, None);
                     }
                 });
             }
+        }
+    }
+
+    /// With `VICTORY_DUMP_AFTER` naming the bound pipeline, in a listed
+    /// frame, right after its dispatch (`compute`) or draw: the 2D textures
+    /// it writes, saved as that command left them, before anything later in
+    /// the frame writes them (`capture::dump_after`). They are the textures
+    /// its shaders write through unordered views in tables, and a draw's
+    /// render targets and depth.
+    #[cfg(feature = "diagnostics")]
+    fn dump_after(&self, list: &HostList, compute: bool) {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        if !crate::capture::after_wanted(&p.name) {
+            return;
+        }
+        const RENDER_TARGET: u32 = 0x4;
+        const UNORDERED: u32 = 0x8;
+        const DEPTH_WRITE: u32 = 0x10;
+        let mut written: Vec<(usize, u32)> = Vec::new();
+        for stage in &p.stages {
+            for u in stage.translated().used.iter().filter(|u| u.kind == ResourceType::Uav) {
+                let (RootType::Table, Some(Root::Table(table))) = (u.root, self.roots_ref(compute).get(usize::from(u.slot))) else {
+                    continue;
+                };
+                if let Some(View::Unordered(r, ..)) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                    && !written.iter().any(|w| w.0 == r)
+                {
+                    written.push((r, UNORDERED));
+                }
+            }
+        }
+        if !compute {
+            for &t in &self.targets {
+                if !written.iter().any(|w| w.0 == t) {
+                    written.push((t, RENDER_TARGET));
+                }
+            }
+            if self.depth != 0 && !written.iter().any(|w| w.0 == self.depth) {
+                written.push((self.depth, DEPTH_WRITE));
+            }
+        }
+        for (r, state) in written {
+            crate::capture::dump_after(list, r as This, state, &p.name);
         }
     }
 
@@ -1586,6 +1621,8 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            self.dump_after(list, false);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1680,6 +1717,8 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            self.dump_after(list, false);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1828,6 +1867,7 @@ impl State {
                 let name = crate::pipeline::shaders_of(pipeline);
                 crate::capture::read_indirect(list, (&clamped, 0), count, (kind, stride, max), name, always);
             }
+            self.dump_after(list, kind == DISPATCH);
         }
         crate::indirect::done(list, &clamped);
         if kind == DISPATCH {
@@ -3566,6 +3606,53 @@ void main(uint3 id : SV_DispatchThreadID) {
             // SAFETY: inside the mapped output: texel (7, 2) of the read.
             let got = unsafe { (data.add((2 * 64 + 7) * 16) as *const [f32; 4]).read() };
             assert_eq!(got, want, "round {round}");
+        }
+    }
+
+    /// A snapshot recorded right after a dispatch (`capture::snapshot`, what
+    /// `VICTORY_DUMP_AFTER` saves) holds what that dispatch wrote, though a
+    /// later dispatch of the same list writes the texture again; between
+    /// them the texture goes back to unordered access.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_snapshot_right_after_a_dispatch_holds_what_it_wrote() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const UNORDERED: u32 = 0x8;
+        let slots = Slots::new(1);
+        // R32_FLOAT, 64x64, unordered access.
+        let texture = texture_at_address(title_memory(1 << 20), &texture_words(64, 64, 41, 0, 4));
+        let unordered = View::Unordered(texture as usize, 0, Some([41, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        slots.make(0, &unordered);
+        let fill = |value: &str| {
+            compile_cs(&format!(
+                "#define RS \"DescriptorTable(UAV(u0))\"\nRWTexture2D<float> o : register(u0);\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ o[id.xy] = {value}; }}"
+            ))
+        };
+        let (first, second) = (fill("1.5"), fill("2.5"));
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Uav), &unordered, false);
+        run(&list, &slots, &first, 0, None, (8, 8));
+        let after_first = crate::capture::snapshot(&list, texture, UNORDERED).expect("a snapshot after the first dispatch");
+        run(&list, &slots, &second, 0, None, (8, 8));
+        let after_second = crate::capture::snapshot(&list, texture, UNORDERED).expect("a snapshot after the second dispatch");
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None, "D3D12 debug layer messages");
+        for (shot, want) in [(&after_first, 1.5f32), (&after_second, 2.5)] {
+            let f = shot.footprint.Footprint;
+            assert_eq!((f.Width, f.Height), (64, 64));
+            let mut data = std::ptr::null_mut();
+            // SAFETY: the list has run; the mapping spans the footprint's rows.
+            unsafe {
+                shot.buffer.Map(0, None, Some(&mut data)).unwrap();
+                for y in 0..64 {
+                    let row = std::slice::from_raw_parts(data.cast::<u8>().add(y * f.RowPitch as usize).cast::<f32>(), 64);
+                    assert!(row.iter().all(|&v| v == want), "row {y}: {:?}, want {want}", &row[..4]);
+                }
+                shot.buffer.Unmap(0, None);
+            }
         }
     }
 
