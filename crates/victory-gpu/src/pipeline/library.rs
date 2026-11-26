@@ -33,7 +33,7 @@
 //! world), and loads that waited on it stalled every worker for as long.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
@@ -314,39 +314,72 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    let (blob, prebuilt) = {
-        let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
-            return;
-        }
-        // SAFETY: a plain size query on a live library.
-        let size = unsafe { l.library.GetSerializedSize() };
-        let Some(mut bytes) = zeroed(size) else {
-            // Left for a later save: the pipelines stay counted as added.
-            tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
-            return;
-        };
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe { l.library.Serialize(&mut bytes) }.map(|()| bytes);
-        match bytes {
-            Ok(bytes) => {
-                l.added = 0;
-                l.prebuilt_changed = false;
-                // Kept beside the bytes it holds for (also when a run adds
-                // pipelines).
-                let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                return;
-            }
-        }
+    let library_changed = {
+        let l = library.state.lock().unwrap_or_else(|e| e.into_inner());
+        l.added > 0 || l.prebuilt_changed
     };
-    let used = used().as_ref().map(Used::list).unwrap_or_default();
+    save_files(
+        dir,
+        &USED_CHANGED,
+        || used().as_ref().map(Used::list).unwrap_or_default(),
+        library_changed,
+        || {
+            let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
+            if l.added == 0 && !l.prebuilt_changed {
+                return None;
+            }
+            // SAFETY: a plain size query on a live library.
+            let size = unsafe { l.library.GetSerializedSize() };
+            let Some(mut bytes) = zeroed(size) else {
+                // Left for a later save: the pipelines stay counted as added.
+                tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
+                return None;
+            };
+            // SAFETY: a buffer of the size the library asks for.
+            match unsafe { l.library.Serialize(&mut bytes) } {
+                Ok(()) => {
+                    l.added = 0;
+                    l.prebuilt_changed = false;
+                    // Kept beside the bytes it holds for (also when a run adds
+                    // pipelines).
+                    let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
+                    Some((bytes, prebuilt))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "host pipeline library not serialised");
+                    None
+                }
+            }
+        },
+    );
+}
+
+fn save_files(
+    dir: &Path,
+    used_changed: &AtomicBool,
+    snapshot_used: impl FnOnce() -> Vec<String>,
+    library_changed: bool,
+    serialize: impl FnOnce() -> Option<(Vec<u8>, Option<String>)>,
+) {
+    // Early-list saves do not require serialising or rewriting the host
+    // pipeline library, and a library OOM or serialise error must not lose them.
+    if used_changed.swap(false, Ordering::Relaxed) {
+        let used = snapshot_used();
+        let written = std::fs::create_dir_all(dir)
+            .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+        match written {
+            Ok(()) => tracing::info!(early = used.len(), "early pipeline list saved"),
+            Err(e) => {
+                used_changed.store(true, Ordering::Relaxed);
+                tracing::warn!(error = %e, "early pipeline list not saved");
+            }
+        }
+    }
+    let Some((blob, prebuilt)) = library_changed.then(serialize).flatten() else {
+        return;
+    };
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
             None => Ok(()),
@@ -356,7 +389,6 @@ pub(crate) fn save(now: bool) {
     match written {
         Ok(()) => tracing::info!(
             bytes = blob.len(),
-            early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
@@ -485,6 +517,94 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_only_the_early_list_skips_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let used_changed = AtomicBool::new(true);
+        let mut serializations = 0;
+        save_files(
+            dir,
+            &used_changed,
+            || vec!["recent".into(), "older".into()],
+            false,
+            || {
+                serializations += 1;
+                Some((vec![1], Some("prebuilt".into())))
+            },
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join(EARLY_FILE)).unwrap(),
+            "recent\nolder"
+        );
+        assert_eq!(serializations, 0);
+        assert!(!dir.join(LIBRARY_FILE).exists());
+        assert!(!dir.join(PREBUILT_FILE).exists());
+        assert!(!used_changed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn saving_the_early_list_survives_failed_serialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let used_changed = AtomicBool::new(true);
+        let mut serializations = 0;
+        save_files(
+            dir,
+            &used_changed,
+            || vec!["recent".into()],
+            true,
+            || {
+                serializations += 1;
+                None
+            },
+        );
+
+        assert_eq!(serializations, 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(EARLY_FILE)).unwrap(),
+            "recent"
+        );
+        assert!(!dir.join(LIBRARY_FILE).exists());
+        assert!(!used_changed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn saving_the_early_list_retries_after_an_io_error() {
+        for fail_create_dir in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = dir.path().join("cache");
+            let early = cache.join(EARLY_FILE);
+            if fail_create_dir {
+                std::fs::write(&cache, b"").unwrap();
+            } else {
+                std::fs::create_dir_all(&early).unwrap();
+            }
+            let used_changed = AtomicBool::new(true);
+            let save = || {
+                save_files(
+                    &cache,
+                    &used_changed,
+                    || vec!["recent".into()],
+                    false,
+                    || Some((vec![1], None)),
+                );
+            };
+
+            save();
+            assert!(used_changed.load(Ordering::Relaxed));
+            if fail_create_dir {
+                std::fs::remove_file(&cache).unwrap();
+            } else {
+                std::fs::remove_dir(&early).unwrap();
+            }
+            save();
+            assert_eq!(std::fs::read_to_string(early).unwrap(), "recent");
+            assert!(!used_changed.load(Ordering::Relaxed));
+        }
+    }
 
     /// A size the host cannot give is refused, not fatal; others are zeros.
     #[test]
