@@ -234,9 +234,14 @@ fn is_host_written(resource: This) -> bool {
 /// Whether `resource`'s host copy takes its contents from title memory:
 /// a texture the host GPU does not render to or write.
 pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
-    const TARGET_DEPTH_UNORDERED: i32 = 0x7;
     // SAFETY: a live resource.
-    unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
+    title_written_flags(unsafe { texture.GetDesc() }.Flags.0 as u32)
+}
+
+/// [`title_written`] of a texture with resource flags `flags`.
+pub(crate) fn title_written_flags(flags: u32) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    flags & TARGET_DEPTH_UNORDERED == 0
 }
 
 /// Copies [`alias_copy`] recorded since the last frame-rate line.
@@ -352,16 +357,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // Once per list for each host texture, however many title textures of
     // its memory the list samples.
     if is_host_written(resource) {
-        #[cfg(feature = "diagnostics")]
-        {
-            static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
-            if SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(resource as usize) {
-                let memory = crate::resource::texture_memory(resource).map(|(m, _)| m);
-                // SAFETY: a live resource.
-                let desc = unsafe { texture.GetDesc() };
-                tracing::debug!(?resource, ?memory, ?desc, "a sampled texture keeps what the host copied into it: not uploaded from title memory");
-            }
-        }
+        kept_host_contents(resource, texture);
         return;
     }
     if !list.first_use(texture.as_raw() as usize) {
@@ -373,6 +369,52 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // Each list recorded the copy before (run perf7: 149 textures uploaded
     // 3,195 times in a frame, 17 ms of GPU time), changed or not.
     list.defer_texture(staging, copy);
+}
+
+/// [`upload`] of `resource`'s host copy `copy`, which the caller already
+/// holds (a draw's table entry): the same, without looking it up again.
+pub(crate) fn upload_copy(
+    list: &HostList,
+    resource: This,
+    copy: &Arc<crate::resource::HostTexture>,
+) {
+    if copy.host_written.load(std::sync::atomic::Ordering::Relaxed) {
+        kept_host_contents(resource, &copy.texture);
+        return;
+    }
+    if !list.first_use(copy.texture.as_raw() as usize) {
+        return;
+    }
+    let Some(staging) = staging(resource, &copy.texture) else {
+        return;
+    };
+    list.defer_texture(staging, copy.clone());
+}
+
+/// Diagnostics: says once per title texture that it keeps what the host
+/// copied into it.
+#[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+fn kept_host_contents(resource: This, texture: &ID3D12Resource) {
+    #[cfg(feature = "diagnostics")]
+    {
+        static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+        if SEEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_default()
+            .insert(resource as usize)
+        {
+            let memory = crate::resource::texture_memory(resource).map(|(m, _)| m);
+            // SAFETY: a live resource.
+            let desc = unsafe { texture.GetDesc() };
+            tracing::debug!(
+                ?resource,
+                ?memory,
+                ?desc,
+                "a sampled texture keeps what the host copied into it: not uploaded from title memory"
+            );
+        }
+    }
 }
 
 /// Records into `list` the copy of `buffer` (laid out as `staging` says)
