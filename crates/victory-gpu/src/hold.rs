@@ -83,6 +83,8 @@ pub(crate) struct Pumped {
     pub(crate) waited: Vec<(usize, Duration)>,
     /// Waits with a comparison we do not know (taken as holding).
     pub(crate) unknown: u32,
+    /// Whether any queue still has work waiting after this pump.
+    pub(crate) blocked: bool,
 }
 
 /// Every queue's held work.
@@ -131,7 +133,27 @@ impl<S, F> Held<S, F> {
     }
 
     /// Runs every queue's heads that may run, until none can.
+    ///
+    /// Each memory word is read at most once between executions in this
+    /// pump. Running a piece may write wait words, so execution invalidates
+    /// the cache before any queue is tested again.
     pub(crate) fn pump(&mut self, w: &mut World<S, F>) -> Pumped {
+        let World {
+            read,
+            fence,
+            run,
+            signal,
+        } = w;
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read = |address: u64, bytes: u8| {
+            let mut cache = reads.borrow_mut();
+            if let Some((_, _, value)) = cache.iter().find(|(a, b, _)| *a == address && *b == bytes) {
+                return *value;
+            }
+            let value = read(address, bytes);
+            cache.push((address, bytes, value));
+            value
+        };
         let mut done = Pumped::default();
         loop {
             let mut moved = false;
@@ -143,7 +165,7 @@ impl<S, F> Held<S, F> {
                         Some((Item::Segment(_, waits), since, fresh)) => {
                             let mut ok = true;
                             for wait in waits.iter() {
-                                match wait.holds(w.read) {
+                                match wait.holds(&read) {
                                     Some(true) => {}
                                     Some(false) => ok = false,
                                     None => done.unknown += 1,
@@ -160,13 +182,14 @@ impl<S, F> Held<S, F> {
                         // it runs first.
                         Some((Item::Signal(..), ..)) => {
                             if !piece.is_empty() {
-                                (w.run)(*queue, std::mem::take(&mut piece));
+                                run(*queue, std::mem::take(&mut piece));
+                                reads.borrow_mut().clear();
                                 done.pieces += 1;
                             }
                             true
                         }
                         Some((Item::FenceWait(fence, value), _, fresh)) => {
-                            let ok = (w.fence)(fence) >= *value;
+                            let ok = fence(fence) >= *value;
                             if !ok {
                                 *fresh = false;
                             }
@@ -182,13 +205,17 @@ impl<S, F> Held<S, F> {
                             piece.push(s);
                             done.segments += 1;
                         }
-                        Some(Item::Signal(fence, value)) => (w.signal)(fence, value),
+                        Some(Item::Signal(fence, value)) => {
+                            signal(fence, value);
+                            reads.borrow_mut().clear();
+                        },
                         Some(Item::FenceWait(fence, _)) => drop(fence),
                         None => {}
                     }
                 }
                 if !piece.is_empty() {
-                    (w.run)(*queue, piece);
+                    run(*queue, piece);
+                    reads.borrow_mut().clear();
                     done.pieces += 1;
                 }
             }
@@ -197,6 +224,10 @@ impl<S, F> Held<S, F> {
             }
         }
         self.queues.retain(|(_, items)| !items.is_empty());
+        // Derive this from the final queue state, not from an observation
+        // made during an earlier pass: later queues may have released a
+        // previously blocked head. FenceWait heads also keep the timer alive.
+        done.blocked = !self.queues.is_empty();
         done
     }
 
@@ -333,6 +364,34 @@ mod tests {
     /// A list's second segment waits for a value the other queue writes
     /// after reading what the first segment wrote: the cut is what lets
     /// both make progress.
+    #[test]
+    fn a_queue_unblocked_by_later_work_does_not_remain_blocked() {
+        let fake = RefCell::new(Fake::default());
+        fake.borrow_mut().writes.insert("release", vec![(0x100, 1)]);
+        let mut held = Held::default();
+        // Queue 1 is tested before queue 2, so it blocks on the first pass.
+        held.push(1, Item::Segment("waiting", vec![ge(0x100, 1)]));
+        held.push(2, Item::Segment("release", vec![]));
+
+        let p = pump(&mut held, &fake);
+
+        assert_eq!(fake.borrow().log, ["q2: release", "q1: waiting"]);
+        assert!(!p.blocked, "all queues drained during the later pump pass");
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn a_pending_fence_wait_keeps_the_pump_blocked() {
+        let fake = RefCell::new(Fake::default());
+        let mut held = Held::default();
+        held.push(2, Item::FenceWait(5, 2));
+
+        let p = pump(&mut held, &fake);
+
+        assert!(p.blocked, "FenceWait must keep the timer polling active");
+        assert!(held.holds_work(2));
+    }
+
     #[test]
     fn chained_waits_across_two_queues() {
         let fake = RefCell::new(Fake::default());
