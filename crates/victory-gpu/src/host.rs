@@ -1819,14 +1819,23 @@ impl HostList {
         // One host texture for the whole move (`crate::resource::evict` may
         // give it up meanwhile; this list then holds it).
         let copy = crate::resource::host_copy(resource)?;
+        self.transition_copy(&copy, wanted)
+    }
+
+    /// [`HostList::transition`] for an already-pinned host texture.
+    pub(crate) fn transition_copy(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<(ID3D12Resource, u32)> {
         let texture = copy.texture.clone();
         if let Some(Some(twin)) = copy.twin.get()
-            && crate::twin::route(self, &copy, twin, wanted)
+            && crate::twin::route(self, copy, twin, wanted)
         {
             return None;
         }
         let wanted = legal_state(&texture, wanted);
-        self.track(&copy, wanted).map(|before| (texture, before))
+        self.track(copy, wanted).map(|before| (texture, before))
     }
 
     /// The list's state for host texture `copy` becomes `wanted` (a legal
