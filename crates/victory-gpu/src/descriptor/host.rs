@@ -794,6 +794,7 @@ impl HostHeap {
             // memory) is made without the slot lock, which title threads
             // binding and writing views wait on (run evict5).
             drop(made);
+            let _ = crate::resource::take_refused_for_memory();
             prepare(&view);
             made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             // The title may have written another record there meanwhile (and
@@ -823,6 +824,13 @@ impl HostHeap {
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
+                // Its texture is asked for again once the host may have
+                // room (`resource::Resource::host`): the slot's next read is
+                // marked again, or a slot shaders only read through the heap
+                // stayed null (its one read mark went on this null view).
+                if !later && crate::resource::take_refused_for_memory() {
+                    crate::shadow::forget_read(index);
+                }
             }
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
