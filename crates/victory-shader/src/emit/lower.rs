@@ -60,6 +60,8 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    #[cfg(test)]
+    pub written_instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1405,6 +1407,8 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
             #[cfg(test)]
+            written_instructions: self.s.m.written_instructions(),
+            #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
@@ -2284,14 +2288,21 @@ impl<'a> Lower<'a> {
         let small = self.s.m.cmp(c, pred::IULT, a, min_normal);
         let r = self.s.m.select(c, small, den, normal);
         let is_nan = self.s.m.cmp(c, pred::IUGT, a, infinity);
-        // A NaN keeps the top of its payload, quieted (as the RX 6700 XT,
-        // RDNA2 like the console, converts).
-        let payload = self.s.m.bin(c, Bin::LShr, a, k13);
-        let (low10, quiet) = (k(self, 0x3FF), k(self, 0x7E00));
-        let payload = self.s.m.bin(c, Bin::And, payload, low10);
-        let nan = self.s.m.bin(c, Bin::Or, payload, quiet);
+        let nan = self.narrow16_nan(a);
         let r = self.s.m.select(c, is_nan, nan, r);
         self.s.m.bin(c, Bin::Or, r, sign)
+    }
+
+    /// The low 15 bits of an f16 NaN from the magnitude of its f32 bits.
+    fn narrow16_nan(&mut self, magnitude: V) -> V {
+        // A NaN keeps the top of its payload, quieted (as the RX 6700 XT,
+        // RDNA2 like the console, converts).
+        let c = self.cur;
+        let k13 = self.s.m.i32(13);
+        let payload = self.s.m.bin(c, Bin::LShr, magnitude, k13);
+        let (low10, quiet) = (self.s.m.i32(0x3FF), self.s.m.i32(0x7E00));
+        let payload = self.s.m.bin(c, Bin::And, payload, low10);
+        self.s.m.bin(c, Bin::Or, payload, quiet)
     }
 
     /// Fused f16 multiply-add with one nearest-even rounding. The product
@@ -2366,11 +2377,11 @@ impl<'a> Lower<'a> {
         let rounded = m.select(c, overflow, infinity, rounded);
         let k16 = m.i32(16);
         let sign = m.bin(c, Bin::LShr, sign, k16);
-        let rounded = m.bin(c, Bin::Or, sign, rounded);
         let f32_infinity = m.i32(0x7F80_0000);
-        let nan = m.cmp(c, pred::IUGT, magnitude, f32_infinity);
-        let fallback = self.narrow16(sum);
-        self.s.m.select(c, nan, fallback, rounded)
+        let is_nan = m.cmp(c, pred::IUGT, magnitude, f32_infinity);
+        let nan = self.narrow16_nan(magnitude);
+        let half = self.s.m.select(c, is_nan, nan, rounded);
+        self.s.m.bin(c, Bin::Or, sign, half)
     }
 
     /// `f` as an f16 in the low bits, rounded toward zero: the nearest-even
@@ -11089,6 +11100,20 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn f16_fma_packs_nan_without_a_second_rounding_path() {
+        let shader = lower_valu(&[
+            0xD74B_0000, // v_fma_f16 v0, v1, v2, v3
+            0x101 | (0x102 << 9) | (0x103 << 18),
+        ])
+        .unwrap();
+        assert!(
+            shader.written_instructions <= 78,
+            "expected at most 78 DXIL instructions, got {}",
+            shader.written_instructions
+        );
     }
 
     #[test]

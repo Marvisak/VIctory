@@ -440,6 +440,41 @@ fn v_fma_f16_rounds_once_and_preserves_other_half() {
     }
 }
 
+#[test]
+fn v_fma_f16_quiets_nans() {
+    let mut words = vec![vop1(0x001, 0, vgpr(4))]; // seed the destination
+    words.extend(vop3(0x34B, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let shader = build_valu_cs(&words);
+    let cases = [
+        ([0x7C35, 0x3C00, 0, 0], 0x0000_7E35), // signaling NaN multiplicand
+        ([0x3C00, 0x3C00, 0xFE42, 0], 0x0000_FE42), // quiet NaN addend
+        ([0x7C00, 0, 0, 0], 0x0000_FE00),      // infinity times zero
+        ([0xFC35, 0x3C00, 0, 0], 0x0000_FE35), // negative signaling NaN multiplicand
+        ([0x7C35, 0x3C00, 0, 0xABCD_1234], 0xABCD_7E35), // preserve the upper half
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    run_cases(&shader, &inputs, |backend, i, input, actual| {
+        let expected = cases[i].1;
+        if backend == "hardware" {
+            // Hardware can canonicalize the NaN during f32 arithmetic.
+            assert!(
+                is_f16_nan(actual as u16) && actual & 0x0200 != 0,
+                "{backend} case {i} with {input:08x?}: expected a quiet f16 NaN, got {actual:#010x}"
+            );
+            assert_eq!(
+                actual >> 16,
+                expected >> 16,
+                "{backend} case {i} with {input:08x?}: upper half"
+            );
+        } else {
+            assert_eq!(
+                actual, expected,
+                "{backend} case {i} with {input:08x?}: got {actual:#010x}, expected {expected:#010x}"
+            );
+        }
+    });
+}
+
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = u32::from(bits >> 15) << 31;
     let exp = (bits >> 10) & 0x1F;
