@@ -1061,7 +1061,7 @@ pub(crate) mod life {
 
 /// Moves the host texture to `wanted` (a host texture state); the host
 /// resource and the state it leaves, if that is a change.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let host = resource(this).host()?;

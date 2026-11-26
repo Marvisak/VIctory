@@ -392,6 +392,11 @@ pub(crate) mod tests {
         ISSUED.with(|l| std::mem::take(&mut *l.borrow_mut()))
     }
 
+    /// Holds the presenter lock for deterministic concurrency tests.
+    pub(crate) fn hold_presenter(host: &super::Host) -> impl Drop + '_ {
+        host.presenter.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Replays transitions in the order the GPU runs them from the states
     /// in `states` (resources not in it are not checked), by the debug
     /// layer's rule: each barrier's before-state is the resource's current
@@ -1156,7 +1161,11 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.execute_locked(submitted, runs);
+    }
+
+    fn execute_locked(&self, mut submitted: std::sync::MutexGuard<'_, u64>, runs: &[&HostList]) {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -3177,14 +3186,58 @@ impl Meter {
     }
 }
 
+/// A texture presented by [`Host::present_planes`].
+pub(crate) enum PresentPlane<'a> {
+    /// A title texture whose tracked host state is read under `Host::submitted`.
+    Tracked(&'a crate::resource::HostTexture),
+    /// A raw host texture in a known state (tests).
+    #[cfg(all(test, feature = "diagnostics"))]
+    Raw(&'a ID3D12Resource, u32),
+}
+
+impl<'a> PresentPlane<'a> {
+    fn texture(&self) -> &'a ID3D12Resource {
+        match self {
+            Self::Tracked(copy) => &copy.texture,
+            #[cfg(all(test, feature = "diagnostics"))]
+            Self::Raw(texture, _) => texture,
+        }
+    }
+
+    fn state(&self) -> u32 {
+        match self {
+            Self::Tracked(copy) => copy.state.load(Ordering::Relaxed),
+            #[cfg(all(test, feature = "diagnostics"))]
+            Self::Raw(_, state) => *state,
+        }
+    }
+}
+
 impl Host {
     /// Shows one or more `planes` (each a live host texture and its current
     /// host state, kept in that state), compositing planes 1.. on top of
     /// plane 0 when multiple planes are presented, as frame `frame` (saved if
     /// captures are on). `None` if nothing was shown; else, in diagnostics
     /// builds, whether the frame was black.
+    #[cfg(all(test, feature = "diagnostics"))]
     pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
-        self.present_with_compositor(
+        let planes: Vec<_> = planes
+            .iter()
+            .map(|&(texture, state)| PresentPlane::Raw(texture, state))
+            .collect();
+        self.present_planes(&planes, frame).0
+    }
+
+    /// Shows one or more `planes`, reading each tracked texture's live host
+    /// state under `Host::submitted` so concurrent submissions never observe a
+    /// phantom transition state or race with the present copy's barriers.
+    /// Returns the presentation outcome and the primary plane's observed state.
+    pub(crate) fn present_planes(
+        &self,
+        planes: &[PresentPlane<'_>],
+        frame: u64,
+    ) -> (Option<bool>, u32) {
+        self.present_planes_with_compositor(
             planes,
             frame,
             Compositor::new,
@@ -3193,27 +3246,47 @@ impl Host {
         )
     }
 
+    #[cfg(all(test, feature = "diagnostics"))]
     fn present_with_compositor(
         &self,
         planes: &[(&ID3D12Resource, u32)],
+        frame: u64,
+        create_compositor: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
+        inspect: impl FnOnce(&ID3D12Resource, &D3D12_PLACED_SUBRESOURCE_FOOTPRINT),
+    ) -> Option<bool> {
+        let planes: Vec<_> = planes
+            .iter()
+            .map(|&(texture, state)| PresentPlane::Raw(texture, state))
+            .collect();
+        self.present_planes_with_compositor(&planes, frame, create_compositor, inspect)
+            .0
+    }
+
+    fn present_planes_with_compositor(
+        &self,
+        planes: &[PresentPlane<'_>],
         frame: u64,
         create_compositor: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
         #[cfg(all(test, feature = "diagnostics"))] inspect: impl FnOnce(
             &ID3D12Resource,
             &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         ),
-    ) -> Option<bool> {
-        let &(primary, _) = planes.first()?;
+    ) -> (Option<bool>, u32) {
+        let Some(first) = planes.first() else {
+            return (None, 0);
+        };
+        let primary = first.texture();
+        let fallback_state = || first.state();
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
         let Some(format) = swap_format(primary_desc.Format) else {
             tracing::warn!(format = primary_desc.Format.0, "cannot present this format");
-            return None;
+            return (None, fallback_state());
         };
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let Presentation { presenter, retry } = &mut *presentation;
         if presenter.is_none() && !retry.ready(Instant::now()) {
-            return None;
+            return (None, fallback_state());
         }
         let cached_format = presenter
             .as_ref()
@@ -3235,29 +3308,32 @@ impl Host {
             planes
         };
         let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
-        for &(tex, _) in &planes[1..] {
+        for plane in &planes[1..] {
             // SAFETY: live resource.
-            let d = unsafe { tex.GetDesc() };
+            let d = unsafe { plane.texture().GetDesc() };
             width = width.max(d.Width as u32);
             height = height.max(d.Height);
         }
         if presenter.is_none() {
             *presenter = match retry
-                .attempt(Instant::now(), || self.presenter(width, height, format))?
+                .attempt(Instant::now(), || self.presenter(width, height, format))
             {
-                Ok(p) => Some(p),
-                Err((step, e)) => {
+                Some(Ok(p)) => Some(p),
+                Some(Err((step, e))) => {
                     tracing::warn!(error = %e, step, width, height, format = format.0, "no swap chain");
-                    return None;
+                    return (None, fallback_state());
                 }
+                None => return (None, fallback_state()),
             };
         }
-        let p = presenter.as_mut()?;
+        let Some(p) = presenter.as_mut() else {
+            return (None, fallback_state());
+        };
         if let Some(c) = new_compositor {
             p.compositor = Some(c);
         }
         if (p.width, p.height, p.format) != (width, height, format) {
-            let resized = retry.attempt(Instant::now(), || {
+            let Some(resized) = retry.attempt(Instant::now(), || {
                 // SAFETY: no back buffer is held; every submission was waited for.
                 unsafe {
                     p.swap_chain.ResizeBuffers(
@@ -3268,12 +3344,14 @@ impl Host {
                         DXGI_SWAP_CHAIN_FLAG(0),
                     )
                 }
-            })?;
+            }) else {
+                return (None, fallback_state());
+            };
             match resized {
                 Ok(()) => (p.width, p.height, p.format) = (width, height, format),
                 Err(e) => {
                     tracing::warn!(error = %e, width, height, format = format.0, "swap chain not resized");
-                    return None;
+                    return (None, fallback_state());
                 }
             }
         }
@@ -3281,8 +3359,16 @@ impl Host {
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
-                return None;
+                return (None, fallback_state());
             };
+            // Serialize tracked state reads, barrier recording, and execution
+            // with `Host::execute` so `p.copy` matches the live GPU state.
+            let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let planes: Vec<(&ID3D12Resource, u32)> = planes
+                .iter()
+                .map(|plane| (plane.texture(), plane.state()))
+                .collect();
+            let primary_state = planes[0].1;
             p.copy.reset();
             let list = &p.copy.list;
             let (capture, probe) = if planes.len() == 1 {
@@ -3468,7 +3554,7 @@ impl Host {
                 (capture, probe)
             };
             p.copy.close();
-            self.execute(&[&p.copy]);
+            self.execute_locked(submitted, &[&p.copy]);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 // Tests inspect the completed copy before flip-discard Present
@@ -3480,11 +3566,14 @@ impl Host {
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            return (
+                Some(probe.is_some_and(|b| crate::capture::black(&b))),
+                primary_state,
+            );
             #[cfg(not(feature = "diagnostics"))]
             {
                 let _ = (capture, probe);
-                Some(false)
+                (Some(false), primary_state)
             }
         }
     }
@@ -4129,5 +4218,173 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+    }
+}
+
+#[cfg(test)]
+mod present_state_sync_tests {
+    use super::*;
+    use crate::object::{S_OK, This, slot};
+
+    /// `Host::present_planes` reads tracked texture states only after
+    /// acquiring `Host::submitted`, so a submission running while presentation
+    /// prepares cannot make `p.copy` emit stale before-state barriers on either
+    /// the single-plane fallback path or the multi-plane compositor path.
+    #[test]
+    fn present_planes_reads_live_state_under_submission_lock() {
+        let Some(host) = host() else {
+            return;
+        };
+        const TARGET: u32 = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        const SHADER: u32 = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
+        const COPY_SRC: u32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+
+        let address = crate::watch::tests::pool(2);
+        let null = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        #[repr(align(8))]
+        struct TextureWords([u32; 14]);
+        let desc = TextureWords([3, 0, 0, 0, 32, 0, 32, 1 | 1 << 16, 28, 1, 0, 1, 1, 0]);
+        let make = |page: usize| {
+            let mut resource = null;
+            assert_eq!(
+                crate::resource::create_at_address(
+                    null,
+                    (address + page * crate::watch::PAGE) as u64,
+                    desc.0.as_ptr().cast(),
+                    0,
+                    null.cast(),
+                    &iid,
+                    &mut resource,
+                ),
+                S_OK
+            );
+            resource
+        };
+        let (scene, overlay) = (make(0), make(1));
+        let scene_copy = crate::resource::host_copy(scene).unwrap();
+        let overlay_copy = crate::resource::host_copy(overlay).unwrap();
+        let scene_raw = scene_copy.texture.as_raw() as usize;
+        let overlay_raw = overlay_copy.texture.as_raw() as usize;
+
+        let setup = host.new_list().unwrap();
+        crate::list::ensure_state(&setup, scene, TARGET);
+        crate::list::ensure_state(&setup, overlay, TARGET);
+        // SAFETY: live render targets on an open list.
+        unsafe {
+            setup
+                .list
+                .ClearRenderTargetView(host.rtv(&scene_copy.texture, None), &[1.0, 0.0, 0.0, 1.0], None);
+            setup.list.ClearRenderTargetView(
+                host.rtv(&overlay_copy.texture, None),
+                &[0.0, 0.0, 0.5, 0.5],
+                None,
+            );
+        }
+        setup.close();
+        host.execute(&[&setup]);
+        let mut gpu_states = std::collections::HashMap::from([(scene_raw, TARGET), (overlay_raw, TARGET)]);
+
+        // Case 1: single-plane fallback after an intervening submission moves
+        // `scene` from RENDER_TARGET to COPY_SOURCE while compositor setup runs.
+        let mut fallback_ran = false;
+        let mut fallback_state = 0;
+        let mut fallback_barriers = Vec::new();
+        for _ in 0..8 {
+            if let Some(p) = host.presenter.lock().unwrap_or_else(|e| e.into_inner()).presenter.as_mut() {
+                p.compositor = None;
+            }
+            let _ = tests::issued();
+            let (_, state) = host.present_planes_with_compositor(
+                &[
+                    PresentPlane::Tracked(&scene_copy),
+                    PresentPlane::Tracked(&overlay_copy),
+                ],
+                1,
+                |_, _| {
+                    fallback_ran = true;
+                    let intervening = host.new_list().unwrap();
+                    crate::list::ensure_state(&intervening, scene, COPY_SRC);
+                    intervening.close();
+                    host.execute(&[&intervening]);
+                    Err(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_FAIL,
+                    ))
+                },
+                #[cfg(feature = "diagnostics")]
+                |_, _| {},
+            );
+            fallback_barriers = tests::issued();
+            fallback_state = state;
+            if fallback_ran {
+                break;
+            }
+        }
+        assert!(fallback_ran, "compositor callback ran for single-plane fallback");
+        assert_eq!(fallback_state, COPY_SRC);
+        assert_eq!(scene_copy.state.load(Ordering::Relaxed), COPY_SRC);
+        assert_eq!(tests::replay(&fallback_barriers, &mut gpu_states), Ok(()));
+
+        // Case 2: multi-plane composite after an intervening submission moves
+        // `scene` to PIXEL_SHADER_RESOURCE and `overlay` to COPY_SOURCE.
+        let mut composite_ran = false;
+        let mut composite_shown = None;
+        let mut composite_state = 0;
+        let mut composite_barriers = Vec::new();
+        for _ in 0..8 {
+            if let Some(p) = host.presenter.lock().unwrap_or_else(|e| e.into_inner()).presenter.as_mut() {
+                p.compositor = None;
+            }
+            let _ = tests::issued();
+            let (shown, state) = host.present_planes_with_compositor(
+                &[
+                    PresentPlane::Tracked(&scene_copy),
+                    PresentPlane::Tracked(&overlay_copy),
+                ],
+                2,
+                |device, format| {
+                    composite_ran = true;
+                    let intervening = host.new_list().unwrap();
+                    crate::list::ensure_state(&intervening, scene, SHADER);
+                    crate::list::ensure_state(&intervening, overlay, COPY_SRC);
+                    intervening.close();
+                    host.execute(&[&intervening]);
+                    Compositor::new(device, format)
+                },
+                #[cfg(feature = "diagnostics")]
+                |_, _| {},
+            );
+            composite_barriers = tests::issued();
+            composite_shown = shown;
+            composite_state = state;
+            if composite_ran {
+                break;
+            }
+        }
+        assert!(composite_ran, "compositor callback ran for multi-plane composite");
+        assert_eq!(composite_state, SHADER);
+        assert_eq!(scene_copy.state.load(Ordering::Relaxed), SHADER);
+        assert_eq!(overlay_copy.state.load(Ordering::Relaxed), COPY_SRC);
+        assert_eq!(tests::replay(&composite_barriers, &mut gpu_states), Ok(()));
+        if composite_shown.is_some() {
+            assert!(
+                composite_barriers.contains(&(overlay_raw, COPY_SRC, SHADER))
+                    && composite_barriers.contains(&(overlay_raw, SHADER, COPY_SRC)),
+                "compositor copy must transition overlay from its live COPY_SOURCE state and back: {composite_barriers:?}"
+            );
+        }
+
+        let release = |resource: This| slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+        assert_eq!(release(scene), 0);
+        assert_eq!(release(overlay), 0);
+        drop((setup, scene_copy, overlay_copy));
+        crate::watch::tests::free(address);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
