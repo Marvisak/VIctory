@@ -64,6 +64,90 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+#[cfg(test)]
+const FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Check removal before treating any fence value as completion: D3D12
+/// returns u64::MAX when the device is removed. The injected clock and
+/// queries let tests exercise failures without hanging or removing a GPU.
+#[cfg(test)]
+fn wait_for_fence(
+    timeout: std::time::Duration,
+    mut poll: impl FnMut() -> (u64, Result<(), String>),
+    mut elapsed: impl FnMut() -> std::time::Duration,
+    mut pause: impl FnMut(),
+) -> Result<(), String> {
+    loop {
+        let (completed, device) = poll();
+        device.map_err(|reason| format!("device removed: {reason}"))?;
+        if completed == u64::MAX {
+            return Err("device removed: fence completed value is u64::MAX".into());
+        }
+        if completed >= 1 {
+            return Ok(());
+        }
+        if elapsed() >= timeout {
+            return Err(format!(
+                "GPU fence timed out after {timeout:?} (completed {completed}, expected 1)"
+            ));
+        }
+        pause();
+    }
+}
+
+/// A failed signal or wait cannot prove that submitted work is finished.
+/// Keep its objects until process exit, including on unwinding, rather
+/// than release memory the GPU may still use. Successful work drops them
+/// normally. This is only the test host's failure path.
+#[cfg(test)]
+fn retain_until_complete<T>(
+    objects: T,
+    finish: impl FnOnce(&T) -> Result<(), String>,
+) -> Result<T, String> {
+    let objects = std::mem::ManuallyDrop::new(objects);
+    finish(&objects)
+        .map_err(|e| format!("{e}; submission resources retained until process exit"))?;
+    Ok(std::mem::ManuallyDrop::into_inner(objects))
+}
+
+#[cfg(test)]
+fn submit_and_wait<T>(
+    dev: &ID3D12Device,
+    queue: ID3D12CommandQueue,
+    alloc: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    resources: T,
+) -> Result<T, String> {
+    // SAFETY: live D3D12 objects. All fallible setup precedes submission;
+    // everything submitted is retained unless the wait confirms completion.
+    unsafe {
+        let command: ID3D12CommandList = list.cast().map_err(err)?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+        let (_, _, _, _, resources) = retain_until_complete(
+            (queue, alloc, list, fence, resources),
+            |(queue, _, _, fence, _)| {
+                queue.ExecuteCommandLists(&[Some(command)]);
+                queue
+                    .Signal(fence, 1)
+                    .map_err(|e| format!("fence signal failed: {}", err(e)))?;
+                let start = std::time::Instant::now();
+                wait_for_fence(
+                    FENCE_TIMEOUT,
+                    || {
+                        (
+                            fence.GetCompletedValue(),
+                            dev.GetDeviceRemovedReason().map_err(err),
+                        )
+                    },
+                    || start.elapsed(),
+                    std::thread::yield_now,
+                )
+            },
+        )?;
+        Ok(resources)
+    }
+}
+
 /// A D3D12 device kept alive for the process so concurrent callers do not
 /// race creating and tearing down the same singleton adapter device.
 struct SharedDevice(ID3D12Device);
@@ -1241,21 +1325,25 @@ impl Host {
             };
             list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
             list.Close().map_err(err)?;
-            queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
-            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-            queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if dev.GetDeviceRemovedReason().is_err() {
-                    return Err(format!(
-                        "device removed: {}",
-                        err(dev.GetDeviceRemovedReason().unwrap_err())
-                    ));
-                }
-                std::thread::yield_now();
-            }
-            if let Err(e) = dev.GetDeviceRemovedReason() {
-                return Err(format!("device removed: {}", err(e)));
-            }
+            let (readback, _) = submit_and_wait(
+                dev,
+                queue,
+                alloc,
+                list,
+                (
+                    readback,
+                    (
+                        target,
+                        rtv_heap,
+                        views,
+                        sampler_heap,
+                        vb,
+                        keep,
+                        root.clone(),
+                        pso.clone(),
+                    ),
+                ),
+            )?;
             let mut p = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut p)).map_err(err)?;
             let mut out = Vec::with_capacity((w * h) as usize);
@@ -1267,7 +1355,6 @@ impl Host {
                 out.extend_from_slice(row);
             }
             readback.Unmap(0, None);
-            drop(keep);
             Ok(out)
         }
     }
@@ -1984,15 +2071,13 @@ impl Host {
                 }
             }
             list.Close().map_err(err)?;
-            queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
-            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-            queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
+            let (uavs, _) = submit_and_wait(
+                dev,
+                queue,
+                alloc,
+                list,
+                (uavs, (keep, views, samplers, root.clone(), pso.clone())),
+            )?;
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
                 let mut p = std::ptr::null_mut();
@@ -2016,7 +2101,6 @@ impl Host {
                 rb.Unmap(0, None);
                 out.push(words);
             }
-            drop(keep);
             Ok(out)
         }
     }
@@ -2024,9 +2108,148 @@ impl Host {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::Barrier;
+    use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn fence_wait_completes_before_the_deadline() {
+        let mut values = [0, 0, 1].into_iter();
+        let pauses = Cell::new(0);
+        wait_for_fence(
+            FENCE_TIMEOUT,
+            || (values.next().expect("bounded polls"), Ok(())),
+            || FENCE_TIMEOUT - Duration::from_nanos(1),
+            || pauses.set(pauses.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(pauses.get(), 2);
+        // An already complete fence needs no clock or wait, even at the deadline.
+        wait_for_fence(
+            Duration::ZERO,
+            || (1, Ok(())),
+            || panic!("complete fence"),
+            || panic!("complete fence"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn fence_wait_times_out_at_the_deadline() {
+        let mut times = [FENCE_TIMEOUT - Duration::from_nanos(1), FENCE_TIMEOUT].into_iter();
+        let pauses = Cell::new(0);
+        let error = wait_for_fence(
+            FENCE_TIMEOUT,
+            || (0, Ok(())),
+            || times.next().expect("bounded wait"),
+            || pauses.set(pauses.get() + 1),
+        )
+        .unwrap_err();
+        assert_eq!(pauses.get(), 1);
+        assert_eq!(
+            error,
+            "GPU fence timed out after 30s (completed 0, expected 1)"
+        );
+    }
+
+    #[test]
+    fn fence_wait_never_reads_back_a_removed_device() {
+        for (value, reason, expected) in [
+            (u64::MAX, Ok(()), "fence completed value is u64::MAX"),
+            (
+                u64::MAX,
+                Err("DXGI_ERROR_DEVICE_HUNG".into()),
+                "DXGI_ERROR_DEVICE_HUNG",
+            ),
+            (
+                0,
+                Err("DXGI_ERROR_DEVICE_RESET".into()),
+                "DXGI_ERROR_DEVICE_RESET",
+            ),
+            (
+                1,
+                Err("DXGI_ERROR_DEVICE_REMOVED".into()),
+                "DXGI_ERROR_DEVICE_REMOVED",
+            ),
+        ] {
+            let mut polls = [(0, Ok(())), (value, reason)].into_iter();
+            let pauses = Cell::new(0);
+            let error = wait_for_fence(
+                FENCE_TIMEOUT,
+                || polls.next().expect("removal must end the wait"),
+                || Duration::ZERO,
+                || pauses.set(pauses.get() + 1),
+            )
+            .unwrap_err();
+            assert_eq!(error, format!("device removed: {expected}"));
+            assert_eq!(pauses.get(), 1);
+        }
+    }
+
+    struct DropCount<'a>(&'a Cell<usize>);
+
+    impl Drop for DropCount<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn submission_objects_are_released_only_after_completion() {
+        let drops = Cell::new(0);
+        let mut values = [0, 1].into_iter();
+        let objects = retain_until_complete(DropCount(&drops), |_| {
+            wait_for_fence(
+                FENCE_TIMEOUT,
+                || {
+                    assert_eq!(drops.get(), 0, "GPU still owns the submission");
+                    (values.next().unwrap(), Ok(()))
+                },
+                || Duration::ZERO,
+                || {},
+            )
+        })
+        .unwrap();
+        assert_eq!(drops.get(), 0);
+        drop(objects);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn submission_errors_retain_objects_and_preserve_the_diagnostic() {
+        for value in [0, u64::MAX] {
+            let drops = Cell::new(0);
+            let result = retain_until_complete(DropCount(&drops), |_| {
+                wait_for_fence(
+                    FENCE_TIMEOUT,
+                    || (value, Ok(())),
+                    || FENCE_TIMEOUT,
+                    || panic!("terminal fence status"),
+                )
+            });
+            let error = result.err().expect("failed wait");
+            assert!(error.contains(if value == 0 {
+                "timed out"
+            } else {
+                "device removed"
+            }));
+            assert!(error.ends_with("submission resources retained until process exit"));
+            assert_eq!(drops.get(), 0);
+        }
+        let drops = Cell::new(0);
+        let result = retain_until_complete(DropCount(&drops), |_| {
+            Err("fence signal failed: synthetic error".into())
+        });
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .starts_with("fence signal failed: synthetic error;")
+        );
+        assert_eq!(drops.get(), 0);
+    }
 
     /// Regression test for concurrent WARP device creation, pipeline
     /// compilation, and draws across threads (issue #181).
