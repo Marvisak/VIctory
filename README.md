@@ -55,6 +55,8 @@ What each part does today and what it still needs:
 
 ## Getting started
 
+Linux (Wine/Proton, unsupported): see [docs/linux.md](docs/linux.md).
+
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
