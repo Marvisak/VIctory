@@ -1493,6 +1493,7 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
+            Input::GroupId(0) if self.x.native.stage == HwStage::Cs => return self.group_x(),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
@@ -1556,6 +1557,32 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// A compute program's group x: the host's plus the first group of the
+    /// part of the dispatch running ([`super::GROUP_BASE`], in a user-data
+    /// dword past the console's). The host runs at most 65,535 groups in x
+    /// at once, the console more, so the host runs a larger dispatch in
+    /// parts.
+    fn group_x(&mut self) -> Val {
+        let Val::I32(id) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        let index = self
+            .x
+            .native
+            .layout
+            .iter()
+            .map(|p| u32::from(p.user_data) + p.sgprs)
+            .max()
+            .unwrap_or(0);
+        let base = self.user_at(UserData {
+            index,
+            slot: 0,
+            root: RootType::Other(super::GROUP_BASE),
+            dword: 0,
+        });
+        Val::I32(self.s.m.bin(self.s.entry, Bin::Add, id, base))
     }
 
     /// A component of a compute thread or group id, read in the entry block.

@@ -351,6 +351,14 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 /// address's byte offset in the view [`ROOT_SRV_VIEW`] or [`ROOT_UAV_VIEW`]
 /// names.
 pub const ROOT_VIEW_OFFSET: u32 = 4;
+/// [`UserData::root`] `RootType::Other(GROUP_BASE)`: a dword the host fills
+/// itself, not from the title's root arguments, with the first group (in
+/// x) of the part of a compute dispatch it runs. A compute program's group
+/// x adds it: the host runs at most 65,535 groups in x at once.
+pub const GROUP_BASE: u32 = 0x104;
+/// The most groups in one dimension the host runs in one dispatch
+/// (`D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION`).
+pub const HOST_GROUPS: u32 = 65_535;
 
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

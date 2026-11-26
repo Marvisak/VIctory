@@ -349,7 +349,12 @@ fn run(
     );
     let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     for u in &shader.user_data {
-        assert_eq!((u.root, u.slot), (RootType::Table, 0), "user data {u:?}");
+        // The table's heap offset, or the first group of the dispatch.
+        let group_base = RootType::Other(super::GROUP_BASE);
+        assert!(
+            (u.root, u.slot) == (RootType::Table, 0) || u.root == group_base,
+            "user data {u:?}"
+        );
         ud[u.index as usize] = 0;
     }
     let views = [
@@ -381,6 +386,59 @@ fn run(
             }
         })
         .collect())
+}
+
+/// A program's group x adds the first group of the part of a dispatch the
+/// host runs (`GROUP_BASE`, a user-data dword past the console's): one
+/// group run with base 1 reads its input and writes its output as group 1,
+/// on the hardware adapter and WARP.
+#[test]
+fn group_x_starts_at_the_dispatch_part() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let shader = lower_program(&program(&[], false)).expect("lowered");
+    let group_base = RootType::Other(super::GROUP_BASE);
+    let base: Vec<_> = shader
+        .user_data
+        .iter()
+        .filter(|u| u.root == group_base)
+        .collect();
+    // s4 holds the table, s6 the group id: the base comes after them.
+    assert_eq!(base.len(), 1, "{:?}", shader.user_data);
+    assert_eq!(base[0].index, 5);
+    // Thread t of group g reads input [0, 0, 0, 1000 + 64g + t] (v4).
+    let data: Vec<u32> = (0..128).flat_map(|t| [0, 0, 0, 1000 + t]).collect();
+    let mut ran = 0;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        ud[base[0].index as usize] = 1;
+        let views = [
+            View::Buffer {
+                data: &data,
+                stride: Stride::Raw,
+            },
+            View::RawUav(2 * 64 * 16),
+        ];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatched");
+        for t in 0..128 {
+            let want = if t < 64 { [0; 4] } else { [1000 + t as u32; 4] };
+            assert_eq!(out[0][4 * t..4 * t + 4], want, "warp {warp}, thread {t}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device");
 }
 
 // ---- comparing ----
