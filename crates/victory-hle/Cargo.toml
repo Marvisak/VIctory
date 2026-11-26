@@ -52,6 +52,18 @@ windows-core = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 
+# The conformance title's GPU frame drawn natively on WARP, its reference
+# (tests/conformance/reference.rs).
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
 [features]
 # Debugging switches (scripted keys and the like).
 diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows-core"]

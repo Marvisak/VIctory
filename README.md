@@ -143,6 +143,111 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+## Tests
+
+Everything below runs without game data. `cargo test --workspace` runs the
+unit tests of every crate and the acceptance suite; the shader tests run one
+at a time (`cargo test -p victory-shader -- --test-threads=1`, see
+[the validator](#windows-shader-test-validator)).
+
+### The conformance title (acceptance suite)
+
+`tests/fixtures/conformance` is a small title of our own, built from source
+by the test and loaded through VIctory like a real one. It calls the
+console runtime the way a title does and checks the answers against what
+the public platform documentation says, citing the page per check. It links
+no SDK and holds no game data.
+
+```powershell
+cargo conformance          # or: cargo test -p victory-hle --test conformance -- --nocapture
+```
+
+It reports one TAP line per check (189 of them):
+
+| Area | What it checks |
+|---|---|
+| Runtime | loading `xgameruntime.dll`, initialising, reaching each area's object |
+| Task queues and async calls | dispatch modes, cancellation, status, a provider's call order |
+| System information | console id, analytics info |
+| Memory | physical pages mapped at two addresses reading back the same bytes (invariants: XMem's pages are not public) |
+| DirectStorage | completion order, automatic submission, capacity and size limits, cancel by tag |
+| Game saves | update and quota limits, atomic updates, container names |
+| User | default user, gamertags, ids, handles |
+| Networking, package, display | connectivity hint, package, HDR mode |
+| Files | the package drive (read-only) and temporary storage, with Win32 and C runtime semantics |
+| Persistent local storage | path size and path |
+| GPU frame | see below |
+
+Checks VIctory is known to answer differently are listed with the reason in
+`KNOWN` (`crates/victory-hle/tests/conformance.rs`): reported, not failed. A
+listed check that starts passing fails the test, so the list stays true.
+
+### The GPU frame (a drawing test title)
+
+The same title draws a frame through VIctory's console D3D12, as a game
+would: device, queue, command lists, descriptor heaps, root signatures, a
+graphics and a compute pipeline whose shaders are hand-assembled console
+(GFX10) programs, vertex, index and constant buffers in title memory, a
+texture uploaded by a copy, and a depth buffer. The scene is a ground plane,
+two cubes and a glowing pyramid, lit by a directional light, textured from a
+checkerboard, then blurred by a compute pass (512x288). The test draws the
+same scene natively on WARP from equivalent HLSL and compares the two
+images (`the_gpu_frame_matches_warp`).
+
+```powershell
+# Watch it: present the frame, animated, in a window for 10 seconds.
+$env:VICTORY_CONFORMANCE_WINDOW = 10
+cargo test -p victory-hle --test conformance the_gpu_frame_matches_warp -- --nocapture
+# Save VIctory's and WARP's frames as victory.ppm and warp.ppm.
+$env:VICTORY_CONFORMANCE_DUMP = "frames"
+```
+
+### The demo
+
+`cargo demo` shows the GPU frame, animated, in a window until you close it,
+with VIctory's overlay (frame rate and frame times) in its top left corner:
+to leave running, or to show. The window's frames add hills of Perlin
+noise around the ground; the checks still run on the 512x288 frame,
+without them.
+
+`--scale <n>` is a stress test of VIctory itself, not of the GPU: each
+step past 1 adds 64 small objects to a frame, each a draw with its
+constants written into title memory and its view made in the descriptor
+heap that frame, and one more submission, as a title's frame grows. Every
+5 seconds it prints the frame rate and the work per frame, so runs at
+different scales compare.
+
+```powershell
+cargo demo                          # 1440p until the window is closed
+cargo demo --resolution 4k          # 720p, 1080p, 1440p, 4k, or <width>x<height>
+cargo demo --scale 64               # 4,037 draws and 64 submissions a frame
+cargo demo --seconds 30 --dump frames   # then save the last frame as frames/window.ppm
+cargo conformance --window 10 --resolution 1080p   # the whole suite, then 10 s of frames
+```
+
+Both build the test in release (`--debug` for the dev profile, whose
+frames are much slower).
+
+### On macOS
+
+`cargo conformance` and `cargo demo` also run on a Mac with Apple silicon,
+under [CrossOver](https://www.codeweavers.com/crossover) (Wine, with Apple's
+D3DMetal for Direct3D 12, and Rosetta 2 for the x86-64 code). The title and
+the test are cross-compiled for Windows with
+[cargo-xwin](https://github.com/rust-cross/cargo-xwin), and run in a
+CrossOver bottle named `VIctory`, made on first use:
+
+```sh
+cargo install --locked cargo-xwin   # once; its first build downloads Microsoft's CRT and Windows SDK
+cargo demo
+```
+
+`VICTORY_CROSSOVER_BIN` names CrossOver's `bin` folder if the app is not in
+`/Applications`. There is no WARP under D3DMetal, so the comparison with
+it is skipped; every other check runs. The library crates' own tests run
+natively (`cargo test --workspace --exclude victory`); the `victory`
+executable, the game itself and GPU timings need Windows.
+
 ## Commands
 
 ```

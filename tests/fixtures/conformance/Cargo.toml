@@ -1,0 +1,23 @@
+# The conformance title: a stand-in for an Xbox title, written by us from
+# the public platform documentation only. It is NOT a workspace member:
+# crates/victory-hle/tests/conformance.rs builds it on demand and runs it
+# through VIctory's own loader and runtime. It links no SDK.
+[package]
+name = "conformance"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.dev]
+panic = "abort"
+
+[workspace]
+
+[dependencies]
+# Compresses the zlib requests DirectStorage inflates; the workspace's own
+# version (victory-hle inflates them with it).
+miniz_oxide = "0.9.1"

@@ -1,2 +1,6 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+# `cargo conformance`: the acceptance suite; `cargo demo`: its GPU frame in
+# a window until closed (see xtask/src/conformance.rs).
+conformance = "run --quiet --package xtask -- conformance"
+demo = "run --quiet --package xtask -- demo"

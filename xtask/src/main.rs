@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod conformance;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,12 +27,21 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Run the acceptance suite (the conformance title): natively on
+    /// Windows, under CrossOver on macOS. `--window 10` also shows its GPU
+    /// frame, animated, with the frame rate. Also `cargo conformance`.
+    Conformance(conformance::Conformance),
+    /// Show the conformance title's GPU frame, animated, with the frame
+    /// rate, until its window is closed. Also `cargo demo`.
+    Demo(conformance::Demo),
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::Conformance(args) => conformance::conformance(&root, args),
+        Cmd::Demo(args) => conformance::demo(&root, args),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
