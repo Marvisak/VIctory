@@ -627,7 +627,11 @@ impl State {
         // set after them. Title memory's views need a view heap: ours where
         // the title binds none (the BVH builder's dispatches may not).
         let memory_heap = self.heaps[0] == 0
-            && p.stages.iter().any(|s| s.memory.is_some() || has_root_views(&s.translated().host));
+            && p.stages.iter().any(|s| {
+                s.memory.is_some()
+                    || has_root_views(&s.translated().host)
+                    || has_view_strides(&s.root_srvs)
+            });
         self.bind_heaps(list, memory_heap);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
@@ -661,10 +665,7 @@ impl State {
         // The bound view heap's mark table and the bitmap shaders mark
         // their writes through views in (`crate::shadow::copy_back_marks`).
         let marks = if let Some((table_param, bitmap_param)) = p.marks {
-            let heap = match self.heaps[0] {
-                0 => crate::memory::heap(),
-                h => crate::descriptor::heap(h as This).host(),
-            };
+            let heap = self.active_view_heap();
             // Shaders using title memory mark in a bitmap of their own, held
             // back while their results are (`crate::memory::withholding`).
             let memory = p.stages.iter().any(|s| s.memory.is_some());
@@ -805,12 +806,11 @@ impl State {
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
                     if kind == 1 && slot == victory_shader::emit::VIEW_STRIDES {
-                        // The bound view heap's stride table; without one
-                        // the shader would read an unbound root view.
-                        let heap = (self.heaps[0] != 0)
-                            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-                            .flatten();
-                        let Some(table) = heap.and_then(|h| h.strides()) else {
+                        // The bound view heap's stride table (falling back to
+                        // ours when the title binds none, matching `p.marks`
+                        // and `root_view`); without one the shader would read
+                        // an unbound root view.
+                        let Some(table) = self.active_view_heap().and_then(|h| h.strides()) else {
                             once!("a shader reads view strides without a view heap: dropped");
                             not_run("view strides without a view heap");
                             return false;
@@ -979,6 +979,15 @@ impl State {
         }
         self.root_slots.insert((key, copy, uav), index);
         Some((index, offset))
+    }
+
+    /// The host view heap currently in effect: the title's, or our fallback
+    /// view heap when the title binds none.
+    fn active_view_heap(&self) -> Option<&crate::descriptor::host::HostHeap> {
+        match self.heaps[0] {
+            0 => crate::memory::heap(),
+            h => crate::descriptor::heap(h as This).host(),
+        }
     }
 
     /// Gives the host list the title's heaps if it has others.
@@ -2018,6 +2027,12 @@ fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
     t.user_data.iter().any(is_root_view)
 }
 
+fn has_view_strides(root_srvs: &[(u8, u32)]) -> bool {
+    root_srvs
+        .iter()
+        .any(|&(slot, _)| slot == victory_shader::emit::VIEW_STRIDES)
+}
+
 /// The console's own primitive topologies.
 const TRIANGLE_FAN: u32 = 6;
 const RECTANGLES: u32 = 17;
@@ -2045,6 +2060,29 @@ mod tests {
         );
         // A title sampler heap stays whatever the views are.
         assert_eq!(State::wanted([0, 0x20], true), [MEMORY_HEAP, 0x20]);
+    }
+
+    #[test]
+    fn view_strides_falls_back_to_memory_heap_when_no_title_heap_is_bound() {
+        assert!(has_view_strides(&[(victory_shader::emit::VIEW_STRIDES, 2)]));
+        assert!(!has_view_strides(&[(0, 2)]));
+        assert_eq!(
+            State::wanted([0, 0], has_view_strides(&[(victory_shader::emit::VIEW_STRIDES, 2)])),
+            [MEMORY_HEAP, SAMPLERS_OURS]
+        );
+
+        let state = State::default();
+        let Some(mem) = crate::memory::heap() else {
+            return; // no host GPU here
+        };
+        let heap = state
+            .active_view_heap()
+            .expect("fallback view heap when no title view heap is bound");
+        assert!(std::ptr::eq(heap, mem));
+        assert!(
+            heap.strides().is_some(),
+            "fallback view heap supplies the VIEW_STRIDES table"
+        );
     }
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
