@@ -21,8 +21,13 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod images;
 
 type Why = &'static str;
+
+/// A handle made in a block: (block, descriptor load, first dword, sampler,
+/// annotated properties).
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -214,15 +219,15 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<HandleKey, V>,
     /// Handles made in the entry block for descriptors at addresses the
     /// root parameters alone give (table and heap loads with no other
     /// term), by base value, byte offset, dword, offset register, sampler
     /// heap and properties ([`Lower::entry_address`]).
-    entry_handles: HashMap<(EntryAddress, u8, bool, u32), V>,
+    entry_handles: HashMap<(EntryAddress, u8, bool, (u32, u32)), V>,
     /// Handles of descriptors chosen by control flow, made in their join
     /// block, by the choice (its `Debug` text), sampler heap and properties.
-    join_handles: HashMap<(String, bool, u32), V>,
+    join_handles: HashMap<(String, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -5368,7 +5373,7 @@ impl<'a> Lower<'a> {
                 // compiler reloads one before every use rather than keep it
                 // (ActivateRays: 2,399 loads of one), and one handle made in
                 // the entry block serves them all.
-                let key = (address, *first, sampler, props.0);
+                let key = (address, *first, sampler, props);
                 if let Some(&h) = self.entry_handles.get(&key) {
                     return Ok(h);
                 }
@@ -5381,7 +5386,7 @@ impl<'a> Lower<'a> {
                 Ok(h)
             }
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -5490,7 +5495,7 @@ impl<'a> Lower<'a> {
                 // One handle at the join for every access the choice reaches
                 // (each is in a block the join dominates).
                 let _ = site;
-                let key = (format!("{src:?}"), sampler, props.0);
+                let key = (format!("{src:?}"), sampler, props);
                 if let Some(&h) = self.join_handles.get(&key) {
                     return Ok(h);
                 }
@@ -8584,14 +8589,42 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if store {
-            if name != "image_store" {
-                return Err("an image store to a mip level");
+            if name == "image_store_mip" {
+                // The level (the address after the coordinates) counts from
+                // the descriptor's base level. shortcut: a host UAV views a
+                // single level, taken to be that base level (the one the
+                // title made the view for). Level 0 is the view's own;
+                // another would need a view per level, which the title's
+                // heap does not hold, so it stops the program, as does a
+                // level known only when the program runs.
+                let r = *regs
+                    .get(if *a16 { coords / 2 } else { coords })
+                    .ok_or("an image address")?;
+                let v = inst.read(Reg::V(r)).ok_or("an image address")?;
+                let x = self.i32_of(v)?;
+                let level = self.s.m.int_value(x).map(|w| {
+                    let w = w as u32;
+                    if *a16 {
+                        w >> (16 * (coords as u32 % 2)) & 0xFFFF
+                    } else {
+                        w
+                    }
+                });
+                if level != Some(0) {
+                    return Err("an image store to a mip level other than 0 or unknown");
+                }
+            } else if name != "image_store" {
+                return Err(name);
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
-            }
+            // The console converts the data by the view's format. The host
+            // types the store: as integers when an atomic tells the view is
+            // of an integer format (see `integer_image`), else as floats.
+            // shortcut: a store to an integer view no atomic reveals stays
+            // a float store, which D3D leaves undefined; the hardware
+            // adapter and WARP the tests ran on wrote its dwords to
+            // 32-bit integer views unchanged (denormals and NaNs included),
+            // but its d16 data is converted as f16.
+            let integer = self.integer_image(src);
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -8600,24 +8633,47 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
-            for k in 0..4u8 {
-                // d16: two f16 channels per VGPR, low half first.
+            // The data VGPRs hold the enabled channels only, in channel
+            // order. The console writes the others as 0 (the ISA guides'
+            // DMASK: "missing components get 0"; LLVM trims zero channels
+            // from image stores on the same grounds), so the host's store
+            // writes all four: DXIL's validator wants typed UAV stores to
+            // write every channel (with a 0xF mask) anyway.
+            let zero = if integer {
+                self.s.m.i32(0)
+            } else {
+                self.s.m.f32(0)
+            };
+            let mut vals = vec![zero; 4];
+            for (k, ch) in (0..4u8).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
+                let k = k as u8;
+                // d16: two 16-bit channels per VGPR, low half first: f16 or
+                // (shortcut: zero-extended, as for unsigned formats) integers.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
-                vals.push(if *d16 {
+                vals[usize::from(ch)] = if *d16 {
                     let mut x = self.i32_of(v)?;
+                    let c = self.cur;
                     if k % 2 == 1 {
                         let k16 = self.s.m.i32(16);
-                        x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
+                        x = self.s.m.bin(c, Bin::LShr, x, k16);
                     }
-                    let f32t = self.s.t.f32;
-                    self.s
-                        .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                    if integer {
+                        let low = self.s.m.i32(0xFFFF);
+                        self.s.m.bin(c, Bin::And, x, low)
+                    } else {
+                        let f32t = self.s.t.f32;
+                        self.s
+                            .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                    }
+                } else if integer {
+                    self.i32_of(v)?
                 } else {
                     self.float_of(v)?
-                });
+                };
             }
+            // Four channels of U32 or F32.
+            let props = (props.0, if integer { 0x405 } else { 0x409 });
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
@@ -8625,14 +8681,12 @@ impl<'a> Lower<'a> {
             args.extend(vals);
             args.push(self.s.m.i8(0xF));
             let void = self.s.t.void;
-            self.s.op(
-                self.cur,
-                "textureStore.f32",
-                Attr::NoUnwind,
-                void,
-                67,
-                &args,
-            );
+            let typed = if integer {
+                "textureStore.i32"
+            } else {
+                "textureStore.f32"
+            };
+            self.s.op(self.cur, typed, Attr::NoUnwind, void, 67, &args);
             self.end_guarded(at, &[]);
             return Ok(());
         }
