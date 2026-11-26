@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
+use windows_sys::Win32::Foundation::ERROR_INVALID_USER_BUFFER;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
@@ -993,19 +994,70 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         .state
         .file;
     let started = std::time::Instant::now();
-    let mut done = 0;
-    let result = loop {
-        if done == out.len() {
-            break Ok(());
-        }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
-            Ok(0) => break Err(END_OF_FILE),
-            Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
-        }
-    };
+    let result = read_file_into(out, request.offset, request.options == 0, |buf, at| {
+        file.seek_read(buf, at)
+    });
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
+}
+
+const RAW_READ_STAGING_LIMIT: usize = 1024 * 1024;
+
+fn read_file_into(
+    out: &mut [u8],
+    offset: u64,
+    allow_staging: bool,
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> Result<(), HRESULT> {
+    let mut done = 0;
+    while done < out.len() {
+        let at = offset.checked_add(done as u64).ok_or(E_INVALIDARG)?;
+        match read(&mut out[done..], at) {
+            Ok(0) => return Err(END_OF_FILE),
+            Ok(n) if n <= out.len() - done => done += n,
+            Ok(_) => return Err(E_INVALIDARG),
+            Err(error)
+                if allow_staging
+                    && error.raw_os_error() == Some(ERROR_INVALID_USER_BUFFER as i32) =>
+            {
+                tracing::debug!("dstorage: staging raw read after invalid user buffer");
+                return read_file_staged(&mut out[done..], at, read);
+            }
+            Err(error) => return Err(from_win32(&error)),
+        }
+    }
+    Ok(())
+}
+
+fn read_file_staged(
+    out: &mut [u8],
+    offset: u64,
+    mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> Result<(), HRESULT> {
+    let capacity = out.len().min(RAW_READ_STAGING_LIMIT);
+    let mut staging = Vec::new();
+    staging
+        .try_reserve_exact(capacity)
+        .map_err(|_| E_OUTOFMEMORY)?;
+    staging.resize(capacity, 0);
+
+    let mut done = 0;
+    while done < out.len() {
+        let at = offset.checked_add(done as u64).ok_or(E_INVALIDARG)?;
+        let len = (out.len() - done).min(staging.len());
+        let n = read(&mut staging[..len], at).map_err(|error| from_win32(&error))?;
+        if n == 0 {
+            return Err(END_OF_FILE);
+        }
+        if n > len {
+            return Err(E_INVALIDARG);
+        }
+        let destination = &mut out[done..done + n];
+        let _writing = victory_gpu::kernel_will_write(destination.as_mut_ptr() as usize, n);
+        destination.copy_from_slice(&staging[..n]);
+        done += n;
+    }
+    Ok(())
 }
 
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
@@ -1134,6 +1186,155 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn raw_read_keeps_direct_reads_on_the_original_buffer() {
+        let mut out = [0; 4];
+        let mut calls = 0;
+        read_file_into(&mut out, 7, true, |buf, at| {
+            calls += 1;
+            assert_eq!(at, 7);
+            assert_eq!(buf.len(), 4);
+            buf.copy_from_slice(b"data");
+            Ok(4)
+        })
+        .unwrap();
+        assert_eq!(&out, b"data");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn raw_read_stages_only_the_unread_suffix_after_invalid_user_buffer() {
+        let expected = b"partial and staged";
+        let mut out = vec![0; expected.len()];
+        let mut calls = 0;
+        read_file_into(&mut out, 41, true, |buf, at| {
+            calls += 1;
+            match calls {
+                1 => {
+                    buf[..3].copy_from_slice(&expected[..3]);
+                    Ok(3)
+                }
+                2 => Err(std::io::Error::from_raw_os_error(
+                    ERROR_INVALID_USER_BUFFER as i32,
+                )),
+                _ => {
+                    let start = (at - 41) as usize;
+                    let n = buf.len().min(2);
+                    buf[..n].copy_from_slice(&expected[start..start + n]);
+                    Ok(n)
+                }
+            }
+        })
+        .unwrap();
+        assert_eq!(out, expected);
+        assert_eq!(calls, 10);
+    }
+
+    #[test]
+    fn raw_read_staging_caps_each_read_and_preserves_failures() {
+        let expected = vec![0x5a; RAW_READ_STAGING_LIMIT + 7];
+        let mut out = vec![0; expected.len()];
+        let mut calls = 0;
+        let mut largest_staged_read = 0;
+        read_file_into(&mut out, 0, true, |buf, at| {
+            calls += 1;
+            if calls == 1 {
+                return Err(std::io::Error::from_raw_os_error(
+                    ERROR_INVALID_USER_BUFFER as i32,
+                ));
+            }
+            largest_staged_read = largest_staged_read.max(buf.len());
+            let start = at as usize;
+            buf.copy_from_slice(&expected[start..start + buf.len()]);
+            Ok(buf.len())
+        })
+        .unwrap();
+        assert_eq!(out, expected);
+        assert_eq!(calls, 3);
+        assert_eq!(largest_staged_read, RAW_READ_STAGING_LIMIT);
+
+        let mut out = [0; 1];
+        let error = read_file_into(&mut out, 0, true, |_, _| {
+            Err(std::io::Error::from_raw_os_error(5))
+        })
+        .unwrap_err();
+        assert_eq!(error, (0x8007_0005_u32) as i32);
+
+        let mut calls = 0;
+        let error = read_file_into(&mut out, 0, true, |_, _| {
+            calls += 1;
+            if calls == 1 {
+                Err(std::io::Error::from_raw_os_error(
+                    ERROR_INVALID_USER_BUFFER as i32,
+                ))
+            } else {
+                Err(std::io::Error::from_raw_os_error(5))
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error, (0x8007_0005_u32) as i32);
+        assert_eq!(calls, 2);
+
+        let error = read_file_into(&mut out, 0, true, |_, _| {
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_INVALID_USER_BUFFER as i32,
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error, (0x8007_06F8_u32) as i32);
+
+        let error = read_file_into(&mut out, 0, false, |_, _| {
+            Err(std::io::Error::from_raw_os_error(
+                ERROR_INVALID_USER_BUFFER as i32,
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error, (0x8007_06F8_u32) as i32);
+    }
+
+    #[test]
+    fn raw_read_staging_preserves_eof_and_rejects_offset_overflow() {
+        let mut out = [0; 2];
+        let mut calls = 0;
+        let error = read_file_into(&mut out, 0, true, |_, _| {
+            calls += 1;
+            if calls == 1 {
+                Err(std::io::Error::from_raw_os_error(
+                    ERROR_INVALID_USER_BUFFER as i32,
+                ))
+            } else {
+                Ok(0)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error, END_OF_FILE);
+
+        let mut calls = 0;
+        let error = read_file_into(&mut out, u64::MAX, true, |buf, _| {
+            calls += 1;
+            buf[0] = 1;
+            Ok(1)
+        })
+        .unwrap_err();
+        assert_eq!(error, E_INVALIDARG);
+        assert_eq!(calls, 1);
+
+        let mut calls = 0;
+        let error = read_file_into(&mut out, u64::MAX, true, |buf, _| {
+            calls += 1;
+            if calls == 1 {
+                return Err(std::io::Error::from_raw_os_error(
+                    ERROR_INVALID_USER_BUFFER as i32,
+                ));
+            }
+            buf[0] = 1;
+            Ok(1)
+        })
+        .unwrap_err();
+        assert_eq!(error, E_INVALIDARG);
+        assert_eq!(calls, 2);
+    }
 
     #[test]
     fn a_scheduler_requires_at_least_one_worker() {
