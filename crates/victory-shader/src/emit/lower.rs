@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod shift;
 
 type Why = &'static str;
 
@@ -3786,27 +3787,16 @@ impl<'a> Lower<'a> {
                     Ok(())
                 }
                 "s_lshl_b64" | "s_lshr_b64" | "s_ashr_i64" => {
+                    // On the two dwords: a 64-bit DXIL shift would need the
+                    // SFI0 INT64 feature (see `Self::shift64`).
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
                     let n = src32(self, 1)?;
-                    let i64t = self.s.m.int(64);
-                    self.s.flags |= flags::INT64;
-                    let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
-                    let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
-                    let k32 = self.s.m.int_const(i64t, 32);
-                    let b = self.s.m.bin(c, Bin::Shl, b, k32);
-                    let x = self.s.m.bin(c, Bin::Or, a, b);
-                    let k63 = self.s.m.i32(63);
-                    let n = self.s.m.bin(c, Bin::And, n, k63);
-                    let n = self.s.m.cast(c, Cast::ZExt, n, i64t);
                     let op = match name {
                         "s_lshl_b64" => Bin::Shl,
                         "s_lshr_b64" => Bin::LShr,
                         _ => Bin::AShr,
                     };
-                    let r = self.s.m.bin(c, op, x, n);
-                    let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
-                    let rh = self.s.m.bin(c, Bin::LShr, r, k32);
-                    let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    let (rl, rh) = self.shift64(a, b, n, op);
                     self.set(lo, Val::I32(rl));
                     self.set(hi, Val::I32(rh));
                     let s = nonzero(self, rl, rh);
@@ -5988,22 +5978,19 @@ impl<'a> Lower<'a> {
         }
         match name {
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
+                // On the two dwords: a 64-bit DXIL shift would need the SFI0
+                // INT64 feature (see `Self::shift64`).
                 let n = s(self, 0)?;
-                let x = self.src64(inst, 1)?;
-                let i64t = self.s.m.int(64);
-                let k63 = self.s.m.i32(63);
-                let n = self.s.m.bin(c, Bin::And, n, k63);
-                let n = self.s.m.cast(c, Cast::ZExt, n, i64t);
+                let (a, b) = self.src64_dwords(inst, 1)?;
                 let op = match name {
                     "v_lshlrev_b64" => Bin::Shl,
                     "v_lshrrev_b64" => Bin::LShr,
                     _ => Bin::AShr,
                 };
-                let r = self.s.m.bin(c, op, x, n);
+                let (lo, hi) = self.shift64(a, b, n, op);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a 64-bit result");
                 };
-                let (lo, hi) = self.split64(r);
                 self.write(inst, Reg::V(reg), lo, guard);
                 self.write(inst, Reg::V(reg + 1), hi, guard);
                 Ok(())
@@ -11276,6 +11263,96 @@ mod tests {
             0,
             "dynamic v_perm_b32 must not require INT64"
         );
+    }
+
+    /// The SFI0 feature bits of a synthetic compute shader that shifts a
+    /// 64-bit value and stores both result dwords to LDS. `vector` picks the
+    /// VOP3 form (v[1:2] shifted by v3 into v[5:6]), otherwise the SOP2 form
+    /// (s[0:1] shifted by s2 into s[6:7]).
+    fn shift_features(op: u32, vector: bool) -> u64 {
+        let sop2 = |op: u32, dst: u32, src0: u32, src1: u32| {
+            0x8000_0000 | (op & 0x7F) << 23 | (dst & 0x7F) << 16 | (src1 & 0xFF) << 8 | src0 & 0xFF
+        };
+        let mut words = if vector {
+            // v_lshlrev_b64 v[5:6], v3, v[1:2].
+            vec![0xD400_0000 | (op & 0x3FF) << 16 | 5, 0x0002_0303]
+        } else {
+            vec![
+                sop2(op, 6, 0, 2), // s_lshl_b64 s[6:7], s[0:1], s2
+                0x7E0A_0206,       // v_mov_b32 v5, s6
+                0x7E0C_0207,       // v_mov_b32 v6, s7
+            ]
+        };
+        words.extend_from_slice(&[
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xD834_0000, // ds_write_b32 v0, v5
+            0x0000_0500,
+            0xD834_0004, // ds_write_b32 v0, v6 offset:4
+            0x0000_0600,
+            S_ENDPGM,
+        ]);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+
+        let emitted = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+        })
+        .unwrap();
+
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
+
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+
+        u64::from_le_bytes(features.data.try_into().unwrap())
+    }
+
+    #[test]
+    fn scalar_64_bit_shifts_need_no_int64() {
+        for op in [0x1Fu32, 0x21, 0x23] {
+            assert_eq!(
+                shift_features(op, false) & 0x8000,
+                0,
+                "SOP2 {op:#x} must not require INT64"
+            );
+        }
+    }
+
+    #[test]
+    fn vector_64_bit_shifts_need_no_int64() {
+        for op in [0x2FFu32, 0x300, 0x301] {
+            assert_eq!(
+                shift_features(op, true) & 0x8000,
+                0,
+                "VOP3 {op:#x} must not require INT64"
+            );
+        }
     }
 
     #[test]
