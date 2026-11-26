@@ -35,3 +35,9 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      - name: D3D12 WARP OOM recovery regressions
+        run: |
+          cargo test -p victory-gpu --features diagnostics --lib --locked resource::tests::oom_backoff_reuses_host_texture_from_another_resource_with_same_memory_key -- --nocapture
+          cargo test -p victory-gpu --features diagnostics --lib --locked resource::tests::a_slot_left_null_for_want_of_memory_is_read_again -- --nocapture
+        env:
+          VICTORY_D3D12_WARP: "1"
