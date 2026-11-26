@@ -24,7 +24,7 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
-fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+fn merge_writeback_bytes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> u8 {
     let mut changed = 0;
     for ((title_byte, host_byte), old_byte) in title.iter_mut().zip(host).zip(old) {
         let mask = 0u8.wrapping_sub(u8::from(*host_byte != *old_byte));
@@ -33,6 +33,34 @@ fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
         *host_byte = *title_byte;
         changed |= delta;
     }
+    changed
+}
+
+fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    let mut changed = 0;
+
+    let n = title.len().min(host.len()).min(old.len());
+    let (t_chunks, t_rem) = title[..n].as_chunks_mut::<8>();
+    let (h_chunks, h_rem) = host[..n].as_chunks_mut::<8>();
+    let (o_chunks, o_rem) = old[..n].as_chunks::<8>();
+
+    for ((t_chunk, h_chunk), o_chunk) in t_chunks.iter_mut().zip(h_chunks).zip(o_chunks) {
+        let o_word = u64::from_ne_bytes(*o_chunk);
+        let h_word = u64::from_ne_bytes(*h_chunk);
+        let t_word = u64::from_ne_bytes(*t_chunk);
+
+        // Fast path: if host == old, the GPU did not touch this 8-byte word.
+        if h_word == o_word {
+            if h_word != t_word {
+                *h_chunk = *t_chunk;
+            }
+            continue;
+        }
+
+        changed |= merge_writeback_bytes(t_chunk, h_chunk, o_chunk);
+    }
+
+    changed |= merge_writeback_bytes(t_rem, h_rem, o_rem);
     changed != 0
 }
 
