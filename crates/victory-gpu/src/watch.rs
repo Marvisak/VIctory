@@ -1446,4 +1446,103 @@ pub(crate) mod tests {
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
     }
+
+    /// What the title's threads wait for when they write guarded pages
+    /// while a submission takes them again (issue #400: about 940 faults a
+    /// frame at about 450 µs each, mostly waiting for the guard lock).
+    ///
+    /// `writers` threads write one dword at a time into a hot set of
+    /// `HOT` pages of a write-watched pool; a submission thread, in rounds,
+    /// arms every other tracker (as a root view's declaration does) and
+    /// takes every tracker, which guards the written pages again. A write
+    /// slower than 2 µs counts as a fault. Per writer count: faults a
+    /// second, their median and 99th percentile, and a take round's median.
+    ///
+    /// `cargo test --release -p victory-gpu --lib guard_lock_contention_bench
+    /// -- --ignored --nocapture --test-threads=1` (`GUARD_BENCH_MS` sets the
+    /// time per writer count, 1,500 by default).
+    #[test]
+    #[ignore = "a benchmark: run alone, in release"]
+    fn guard_lock_contention_bench() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        use std::time::{Duration, Instant};
+        const HOT: usize = 256;
+        const PER_TRACKER: usize = 16;
+        let millis: u64 = std::env::var("GUARD_BENCH_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
+        let p = pool(HOT);
+        let trackers: Vec<Tracked> = (0..HOT / PER_TRACKER)
+            .map(|i| track_copy(p + i * PER_TRACKER * PAGE, PER_TRACKER * PAGE, true).expect("pool memory is tracked"))
+            .collect();
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v.get(v.len() / 2).copied().unwrap_or(0.0)
+        };
+        let p99 = |v: &[f64]| v.get(v.len() * 99 / 100).copied().unwrap_or(0.0);
+        println!(
+            "{HOT} hot pages, {} trackers of {PER_TRACKER} pages, every other armed; {millis} ms per row",
+            trackers.len()
+        );
+        println!("{:>7} {:>10} {:>12} {:>12} {:>14}", "writers", "faults/s", "fault p50", "fault p99", "take round p50");
+        for writers in [1usize, 2, 4, 8, 15] {
+            for t in &trackers {
+                t.take(t.start, t.end);
+            }
+            let stop = AtomicBool::new(false);
+            let (faults, mut rounds) = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..writers)
+                    .map(|w| {
+                        let stop = &stop;
+                        s.spawn(move || {
+                            let mut slow = Vec::new();
+                            let mut x = 0x9e37_79b9_u32.wrapping_mul(w as u32 + 1);
+                            while !stop.load(Relaxed) {
+                                x ^= x << 13;
+                                x ^= x >> 17;
+                                x ^= x << 5;
+                                let at = p + (x as usize % HOT) * PAGE + (x as usize >> 16 & 0x3FFC);
+                                let t0 = Instant::now();
+                                // SAFETY: the pool's committed pages; a guarded
+                                // one faults into the handler, which opens it.
+                                unsafe { (at as *mut u32).write_volatile(x) };
+                                let us = t0.elapsed().as_secs_f64() * 1e6;
+                                if us > 2.0 {
+                                    slow.push(us);
+                                }
+                            }
+                            slow
+                        })
+                    })
+                    .collect();
+                let mut rounds = Vec::new();
+                let end = Instant::now() + Duration::from_millis(millis);
+                while Instant::now() < end {
+                    let t0 = Instant::now();
+                    for (i, t) in trackers.iter().enumerate() {
+                        if i % 2 == 0 && std::env::var_os("GUARD_BENCH_NO_ARM").is_none() {
+                            t.arm(t.start, t.end);
+                        }
+                        t.take(t.start, t.end);
+                    }
+                    rounds.push(t0.elapsed().as_secs_f64() * 1e6);
+                    for t in trackers.iter().step_by(2) {
+                        t.disarm();
+                    }
+                    std::thread::sleep(Duration::from_micros(500));
+                }
+                stop.store(true, Relaxed);
+                let faults: Vec<f64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+                (faults, rounds)
+            });
+            let mut faults = faults;
+            let rate = faults.len() as f64 / (millis as f64 / 1e3);
+            let p50 = median(&mut faults);
+            println!(
+                "{writers:>7} {rate:>10.0} {p50:>10.1}us {:>10.1}us {:>12.1}us",
+                p99(&faults),
+                median(&mut rounds)
+            );
+        }
+        drop(trackers);
+        free(p);
+    }
 }
