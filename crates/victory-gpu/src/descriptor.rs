@@ -158,6 +158,59 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Mirrors a contiguous descriptor copy with one heap lookup and pending lock.
+#[cfg(windows)]
+fn mirror_copy(dst: u64, count: u32, kind: u32, step: u64) {
+    let Some(bytes) = u64::from(count).checked_mul(step) else { return };
+    let Some(end) = dst.checked_add(bytes) else { return };
+    #[cfg(feature = "diagnostics")]
+    let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    drop(waited);
+    let Some(&(start, limit, at)) = heaps.iter().find(|&&(start, limit, _)| dst < limit && start < end) else {
+        return;
+    };
+    // SAFETY: registered heaps stay alive while the registry is locked.
+    let heap = unsafe { &*(at as *const Heap) };
+    if dst >= start
+        && end <= limit
+        && kind == heap.desc.kind
+        && (dst - start).is_multiple_of(step)
+    {
+        let first = ((dst - start) / step) as u32;
+        let Some(last) = first.checked_add(count) else { return };
+        if last > heap.desc.count { return; }
+        let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match heap.host.get() {
+            None => pending.extend(first..last),
+            Some(host) => {
+                drop(pending);
+                if let Some(host) = host {
+                    const BATCH: u32 = 256;
+                    for from in (first..last).step_by(BATCH as usize) {
+                        let to = from.saturating_add(BATCH).min(last);
+                        if to - from < 8 {
+                            for i in from..to {
+                                host.mirror(i, start + u64::from(i) * step, false);
+                            }
+                        } else {
+                            host.sync_slots(from, to, start, step);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    // Keep the original semantics for cross-heap, misaligned, and mismatched-kind ranges.
+    drop(heaps);
+    for i in 0..count {
+        mirror(dst + u64::from(i) * step);
+    }
+}
+
+
 /// Mirrors what the title wrote into its shader-visible heaps without a
 /// call: Grand Theft Auto VI copies descriptors (our records) into its heap
 /// as bytes, so only a change of its memory shows them. Each slot of a page
@@ -748,15 +801,17 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let Some(step) = increment(kind).map(u64::from) else {
         return;
     };
-    let len = u64::from(count) * step;
-    if dst != 0 && src != 0 {
-        // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
-        #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+    if count == 0 || dst == 0 || src == 0 {
+        return;
     }
+    let Some(len) = u64::from(count).checked_mul(step) else { return };
+    if dst != src {
+        // SAFETY: both ranges are descriptor slots the title owns and may overlap.
+        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+    }
+    // Self-copy still mirrors: it can expose records written directly as bytes.
+    #[cfg(windows)]
+    mirror_copy(dst, count, kind, step);
 }
 
 /// Device method: ranges of descriptors (start and count each) gathered
@@ -1075,6 +1130,88 @@ pub(crate) mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    /// A contiguous descriptor copy crossing adjacent heaps must use the
+    /// original per-handle fallback and enqueue both destination slots.
+    #[cfg(windows)]
+    #[test]
+    fn contiguous_copy_crossing_heap_boundary_mirrors_both_heaps() {
+        let mut memory = vec![0u8; 8 * 16];
+        let base = memory.as_mut_ptr() as u64;
+        let desc = HeapDesc { kind: SAMPLERS, count: 4, flags: SHADER_VISIBLE, nodes: 1 };
+        let mut first = std::ptr::null();
+        let mut second = std::ptr::null();
+        assert_eq!(create(desc, Placement { address: base, size: 4 * 16 }, &mut first), S_OK);
+        assert_eq!(create(desc, Placement { address: base + 4 * 16, size: 4 * 16 }, &mut second), S_OK);
+        let source = [0u8; 2 * 16];
+        copy_simple(std::ptr::null(), 2, base + 3 * 16, source.as_ptr() as u64, SAMPLERS);
+        let a = heap(first).pending.lock().unwrap().clone();
+        let b = heap(second).pending.lock().unwrap().clone();
+        assert_eq!(a, [3]);
+        assert_eq!(b, [0]);
+        release(first);
+        release(second);
+    }
+
+    /// The batch path replays lazy slots and covers both the 256-slot
+    /// batch boundary and the small per-handle tail.
+    #[cfg(windows)]
+    #[test]
+    fn descriptor_copies_mirror_batched_slots_before_and_after_host_creation() {
+        let null = std::ptr::null();
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 261,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let mut h = null;
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut h), S_OK);
+        let dst = heap(h).start;
+        let mut source = [[0u64; 2]; 261];
+        let src = source.as_mut_ptr() as u64;
+        for i in [0, 255, 256, 260] {
+            create_sampler(null, &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], src + i * 16);
+        }
+        copy_simple(null, 261, dst, src, SAMPLERS);
+        assert_eq!(heap(h).pending.lock().unwrap().len(), 261);
+        if crate::host::host().is_some() {
+            let host = heap(h).host().expect("host sampler heap");
+            for i in [0, 255, 256, 260] {
+                assert!(host.made(i));
+            }
+            // SAFETY: these are full descriptors in the live source and destination.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src as *const u8, (dst + 16) as *mut u8, 16);
+                (dst as *mut [u64; 2]).write_unaligned([0; 2]);
+            }
+            assert!(host.made(0));
+            assert!(!host.made(1));
+            copy_simple(null, 261, dst, dst, SAMPLERS);
+            assert!(!host.made(0), "a raw write cleared slot 0");
+            assert!(host.made(1), "a raw write installed slot 1");
+            assert!(host.made(260), "the tail descriptor survives");
+        }
+        release(h);
+    }
+
+    /// The underlying descriptor copy retains memmove semantics for both
+    /// overlap directions, and self-copy still exercises the mirror path.
+    #[test]
+    fn contiguous_descriptor_copy_preserves_overlap_and_self_copy() {
+        let mut memory = vec![0u8; 5 * 32];
+        for i in 0..5 {
+            memory[i * 32] = (i + 1) as u8;
+        }
+        let base = memory.as_mut_ptr() as u64;
+        copy_simple(std::ptr::null(), 4, base + 32, base, VIEWS_KIND);
+        assert_eq!((0..5).map(|i| memory[i * 32]).collect::<Vec<_>>(), [1, 1, 2, 3, 4]);
+        copy_simple(std::ptr::null(), 4, base, base + 32, VIEWS_KIND);
+        assert_eq!((0..5).map(|i| memory[i * 32]).collect::<Vec<_>>(), [1, 2, 3, 4, 4]);
+        let before = memory.clone();
+        copy_simple(std::ptr::null(), 5, base, base, VIEWS_KIND);
+        assert_eq!(memory, before);
     }
 
     /// A record the title copies into its shader-visible heap as bytes (no
