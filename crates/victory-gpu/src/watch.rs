@@ -1526,11 +1526,15 @@ pub(crate) mod tests {
     /// takes every tracker, which guards the written pages again. A write
     /// slower than 2 µs counts as a fault. Per writer count: faults a
     /// second, their median and 99th percentile, and a take round's median.
+    /// A kernel writer thread meanwhile opens 8-page ranges with [`writing`]
+    /// every 200 µs (a file read, DirectStorage): its median and 99th
+    /// percentile, the opening and the marking after.
     ///
     /// `cargo test --release -p victory-gpu --lib guard_lock_contention_bench
     /// -- --ignored --nocapture --test-threads=1` (`GUARD_BENCH_MS` sets the
     /// time per writer count, 1,500 by default; `GUARD_BENCH_SPIN_US` has
-    /// each writer work that long between writes, 0 by default).
+    /// each writer work that long between writes, 0 by default;
+    /// `GUARD_BENCH_NO_ARM` arms nothing).
     #[test]
     #[ignore = "a benchmark: run alone, in release"]
     fn guard_lock_contention_bench() {
@@ -1553,13 +1557,16 @@ pub(crate) mod tests {
             "{HOT} hot pages, {} trackers of {PER_TRACKER} pages, every other armed; {millis} ms per row",
             trackers.len()
         );
-        println!("{:>7} {:>10} {:>12} {:>12} {:>14}", "writers", "faults/s", "fault p50", "fault p99", "take round p50");
+        println!(
+            "{:>7} {:>10} {:>12} {:>12} {:>14} {:>14} {:>12}",
+            "writers", "faults/s", "fault p50", "fault p99", "take round p50", "8-page write p50", "p99"
+        );
         for writers in [1usize, 2, 4, 8, 15] {
             for t in &trackers {
                 t.take(t.start, t.end);
             }
             let stop = AtomicBool::new(false);
-            let (faults, mut rounds) = std::thread::scope(|s| {
+            let (faults, mut rounds, mut kernel) = std::thread::scope(|s| {
                 let handles: Vec<_> = (0..writers)
                     .map(|w| {
                         let stop = &stop;
@@ -1588,6 +1595,29 @@ pub(crate) mod tests {
                         })
                     })
                     .collect();
+                // A kernel write (a file read, DirectStorage) over 8 pages
+                // every 200 µs: what `writing` and its drop take, together.
+                let kernel = {
+                    let stop = &stop;
+                    s.spawn(move || {
+                        let mut took = Vec::new();
+                        let mut x = 0x85eb_ca6b_u32;
+                        while !stop.load(Relaxed) {
+                            x ^= x << 13;
+                            x ^= x >> 17;
+                            x ^= x << 5;
+                            let at = p + (x as usize % (HOT - 8)) * PAGE;
+                            let t0 = Instant::now();
+                            let open = writing(at, 8 * PAGE);
+                            // SAFETY: the pool's pages, kept open by `open`.
+                            unsafe { std::ptr::write_bytes(at as *mut u8, x as u8, 8 * PAGE) };
+                            drop(open);
+                            took.push(t0.elapsed().as_secs_f64() * 1e6);
+                            std::thread::sleep(Duration::from_micros(200));
+                        }
+                        took
+                    })
+                };
                 let mut rounds = Vec::new();
                 let end = Instant::now() + Duration::from_millis(millis);
                 while Instant::now() < end {
@@ -1606,15 +1636,17 @@ pub(crate) mod tests {
                 }
                 stop.store(true, Relaxed);
                 let faults: Vec<f64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
-                (faults, rounds)
+                (faults, rounds, kernel.join().unwrap())
             });
             let mut faults = faults;
             let rate = faults.len() as f64 / (millis as f64 / 1e3);
             let p50 = median(&mut faults);
+            let kernel_p50 = median(&mut kernel);
             println!(
-                "{writers:>7} {rate:>10.0} {p50:>10.1}us {:>10.1}us {:>12.1}us",
+                "{writers:>7} {rate:>10.0} {p50:>10.1}us {:>10.1}us {:>12.1}us {kernel_p50:>12.1}us {:>10.1}us",
                 p99(&faults),
-                median(&mut rounds)
+                median(&mut rounds),
+                p99(&kernel)
             );
         }
         drop(trackers);
