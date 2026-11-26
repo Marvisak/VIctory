@@ -221,7 +221,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         return None;
     }
     Some(AllocationInfo {
-        size: bytes.checked_next_multiple_of(KIB_64)?,
+        size: bytes.checked_next_multiple_of(alignment)?,
         alignment,
     })
 }
@@ -2677,6 +2677,35 @@ mod tests {
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+    }
+
+    #[test]
+    fn footprint_fallback_rounds_size_to_alignment() {
+        let aligned_buf = ResourceDesc {
+            alignment: MIB_4,
+            ..buffer(256)
+        };
+        assert_eq!(
+            footprint(&aligned_buf),
+            Some(AllocationInfo {
+                size: MIB_4,
+                alignment: MIB_4,
+            })
+        );
+
+        let msaa_fallback = ResourceDesc {
+            sample_count: 4,
+            layout: 2,
+            ..texture(64, 64, 28, 1)
+        };
+        assert!(texture_layout(&msaa_fallback).is_none());
+        assert_eq!(
+            footprint(&msaa_fallback),
+            Some(AllocationInfo {
+                size: MIB_4,
+                alignment: MIB_4,
+            })
+        );
     }
 
     #[test]
