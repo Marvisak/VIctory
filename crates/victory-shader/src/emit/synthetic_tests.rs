@@ -343,7 +343,7 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
         };
         // The program declares the console's wave of 32, which WARP refuses.
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            assert!(warp, "{label}: no pipeline for a wave of 32");
+            assert!(warp || !host.supports_wave_lanes(32), "{label}: no pipeline for a wave of 32");
             eprintln!("{label}: no pipeline for a wave of 32; skipped");
             continue;
         };
@@ -407,7 +407,10 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
         // Fixed WaveSize pipelines are refused by WARP, and WaveSize(64) by
         // 32-lane hardware adapters.
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            assert!(warp || wave64, "{label}: no pipeline for a wave of 32");
+            assert!(
+                warp || !host.supports_wave_lanes(if wave64 { 64 } else { 32 }),
+                "{label}: no pipeline for a wave of 32"
+            );
             eprintln!("{label}: no pipeline for a wave of {wave}; skipped");
             continue;
         };
@@ -576,7 +579,7 @@ fn a_mask_joined_with_data_at_a_uniform_loop_is_its_number() {
             continue;
         };
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            assert!(warp, "{label}: no pipeline for a wave of 32");
+            assert!(warp || !host.supports_wave_lanes(32), "{label}: no pipeline for a wave of 32");
             eprintln!("{label}: no pipeline for a wave of 32; skipped");
             continue;
         };
@@ -647,7 +650,7 @@ fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
                 continue;
             };
             let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-                assert!(warp, "{label}: no pipeline for a wave of 32");
+                assert!(warp || !host.supports_wave_lanes(32), "{label}: no pipeline for a wave of 32");
                 eprintln!("{label}: no pipeline for a wave of 32; skipped");
                 continue;
             };
@@ -755,7 +758,7 @@ fn relative_moves_in_waterfall_loops_reach_each_lane_s_element() {
             continue;
         };
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            assert!(warp, "{label}: no pipeline for a wave of 32");
+            assert!(warp || !host.supports_wave_lanes(32), "{label}: no pipeline for a wave of 32");
             eprintln!("{label}: no pipeline for a wave of 32; skipped");
             continue;
         };

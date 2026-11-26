@@ -595,6 +595,35 @@ impl Host {
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
 
+    /// The wave lane counts this device offers (`D3D12_FEATURE_D3D12_OPTIONS1`).
+    /// A pipeline that declares `WaveSize(n)` needs `n` inside them: WARP
+    /// refuses any fixed `WaveSize`, and some integrated parts cap the wave
+    /// at 16, so a test that assumes 32-lane waves everywhere fails where
+    /// the device simply cannot run one.
+    pub fn wave_lane_counts(&self) -> Option<(u32, u32)> {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: `options` is the structure the query fills, sized by
+        // `size_of_val`.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .ok()?;
+        Some((options.WaveLaneCountMin, options.WaveLaneCountMax))
+    }
+
+    /// Whether a pipeline declaring `WaveSize(lanes)` can be created here.
+    /// Unknown counts answer `true`: let creation decide.
+    pub fn supports_wave_lanes(&self, lanes: u32) -> bool {
+        match self.wave_lane_counts() {
+            Some((min, max)) => (min..=max).contains(&lanes),
+            None => true,
+        }
+    }
+
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
     /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
     /// does not, their results can differ in kind (NaN where an overflowing
