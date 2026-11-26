@@ -391,6 +391,11 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
 /// # Safety
 /// `context` is the state of a thread that faulted at a `clzero`; the
 /// lines its registers name are the title's to zero.
+/// The next line in a `clzero` loop, or `None` when `+ 0x40` wraps.
+fn advance_line(rax: u64) -> Option<u64> {
+    rax.checked_add(0x40)
+}
+
 unsafe fn clzero(context: &mut CONTEXT) -> bool {
     // SAFETY: (every use) a line the title asked to zero.
     let zero = |rax: u64| unsafe { ((rax & !63) as *mut u8).write_bytes(0, 64) };
@@ -408,8 +413,11 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
             let limit = *gpr(context, limit);
             loop {
                 zero(context.Rax);
-                context.Rax = context.Rax.wrapping_add(0x40);
-                if context.Rax >= limit {
+                let Some(next) = advance_line(context.Rax) else {
+                    break;
+                };
+                context.Rax = next;
+                if next >= limit {
                     break;
                 }
             }
@@ -440,7 +448,10 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
                     break;
                 }
                 context.Rax = next;
-                *gpr(context, a) = next.wrapping_add(0x40);
+                let Some(after) = advance_line(next) else {
+                    break;
+                };
+                *gpr(context, a) = after;
             }
             context.EFlags =
                 context.EFlags & !CMP_FLAGS | cmp_flags(*gpr(context, a), limit);
@@ -1287,6 +1298,14 @@ mod tests {
         assert_eq!((last, next), (start + 128, start + 192));
         assert_eq!(flags as u32 & CMP_FLAGS, native_compare(next, start + 192));
         assert_eq!(zeroed(&mem), [false, true, true]);
+    }
+
+    #[test]
+    fn clzero_loop_advance_stops_before_u64_wraparound() {
+        assert_eq!(super::advance_line(0), Some(0x40));
+        assert_eq!(super::advance_line(u64::MAX - 0x40), Some(u64::MAX));
+        assert_eq!(super::advance_line(u64::MAX - 0x3f), None);
+        assert_eq!(super::advance_line(u64::MAX), None);
     }
 
     fn reg(low: u64, high: u64) -> M128A {
