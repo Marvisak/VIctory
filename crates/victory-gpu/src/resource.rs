@@ -2948,6 +2948,15 @@ mod tests {
             take_refused_for_memory(),
             "the failed first lookup is reported as a transient memory refusal"
         );
+        assert!(
+            a.refused_until.load(std::sync::atomic::Ordering::Relaxed) > now_ms(),
+            "the first OOM must publish a retry deadline"
+        );
+        assert_eq!(
+            a.out_of_memory.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the first OOM must increment the consecutive retry count"
+        );
 
         // Keep Resource A inside the OOM cooldown while B creates the
         // shared texture. The normal test cooldown is only 100 ms; a slow
