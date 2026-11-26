@@ -375,7 +375,7 @@ struct Lane {
     held: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    reads: VecDeque<(u64, QueuedRead)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -391,6 +391,8 @@ unsafe impl Send for Lane {}
 struct Job {
     lane: u64,
     seq: u64,
+    #[cfg(feature = "diagnostics")]
+    request_id: u64,
     request: Request,
     staging: u64,
 }
@@ -458,10 +460,41 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let span = tracing::trace_span!(
+            target: "victory_dstorage",
+            "read",
+            queue = job.lane,
+            seq = job.seq,
+            request_id = job.request_id,
+            options = format_args!("{:#x}", job.request.options),
+            source_size = job.request.source_size,
+            memory_source = job.request.options & MEMORY_SOURCE != 0,
+            destination_size = job.request.destination_size,
+            intermediate_size = job.request.intermediate_size,
+            offset = job.request.offset,
+            zlib = job.request.options & ZLIB != 0,
+            bcpack = (job.request.options & BCPACK) >> 1,
+        )
+        .entered();
+        #[cfg(feature = "diagnostics")]
+        tracing::trace!(target: "victory_dstorage", "started");
         let result = execute(&job.request);
+        #[cfg(feature = "diagnostics")]
+        {
+            match result {
+                Ok(written) => tracing::trace!(target: "victory_dstorage", written, "completed"),
+                Err(hr) => tracing::trace!(
+                    target: "victory_dstorage",
+                    hr = format_args!("{:#010x}", hr as u32),
+                    "failed"
+                ),
+            }
+            drop(span);
+        }
         lanes = scheduler.lock();
-        lanes.finish(&job, result);
-        lanes.count(&job, started);
+        lanes.finish(&job, result.map(drop));
+        lanes.count(&job, started, result.unwrap_or(0));
         if std::mem::take(&mut lanes.starved) {
             scheduler.work.notify_all();
         }
@@ -471,13 +504,13 @@ fn work(scheduler: &'static Scheduler) {
 
 impl Lanes {
     /// Counts a finished request; every 5 s a debug line sums them up.
-    fn count(&mut self, job: &Job, started: std::time::Instant) {
+    fn count(&mut self, job: &Job, started: std::time::Instant, written: usize) {
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
-        *bytes += u64::from(job.request.destination_size);
+        *bytes += written as u64;
         *busy += started.elapsed();
         if job.request.options & BCPACK != 0 {
-            self.bcpack.0 += u64::from(job.request.destination_size);
+            self.bcpack.0 += written as u64;
             self.bcpack.1 += started.elapsed();
         }
         if job.request.options & PAGE_DESTINATION != 0 {
@@ -518,7 +551,8 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
+        let &(seq, read) = lane.reads.front()?;
+        let request = read.request;
         let staging = staging_bytes(&request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
@@ -536,6 +570,8 @@ impl Lanes {
         Some(Job {
             lane: id,
             seq,
+            #[cfg(feature = "diagnostics")]
+            request_id: read.id,
             request,
             staging,
         })
@@ -589,7 +625,7 @@ impl Lanes {
         for command in commands {
             let hold = !explicit
                 && match &command {
-                    Command::Read(r) => r.options & PAGE_DESTINATION != 0,
+                    Command::Read(read) => read.request.options & PAGE_DESTINATION != 0,
                     Command::Status(_) => !lane.held.is_empty(),
                 };
             if hold {
@@ -725,8 +761,28 @@ const MEMORY_SOURCE: u64 = 1 << 22;
 
 const PAGE: usize = 64 * 1024;
 
+/// Trace identity belongs to the queued copy, outside the title's request ABI.
+#[derive(Clone, Copy)]
+struct QueuedRead {
+    request: Request,
+    #[cfg(feature = "diagnostics")]
+    id: u64,
+}
+
+impl QueuedRead {
+    fn new(request: Request) -> Self {
+        #[cfg(feature = "diagnostics")]
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self {
+            request,
+            #[cfg(feature = "diagnostics")]
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
 enum Command {
-    Read(Request),
+    Read(QueuedRead),
     Status(Status),
 }
 
@@ -755,7 +811,15 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    let read = QueuedRead::new(request);
+    let _accepted = queue(this, Command::Read(read));
+    #[cfg(feature = "diagnostics")]
+    tracing::trace!(
+        target: "victory_dstorage",
+        request_id = read.id,
+        accepted = _accepted,
+        "enqueue returned"
+    );
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -774,16 +838,31 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
 
 /// Adds a command to the queue; blocks while the queue is full, and
 /// submits on its own once half of it is enqueued, as the console does.
-fn queue(this: QueueRef, command: Command) {
+fn queue(this: QueueRef, command: Command) -> bool {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
+    #[cfg(feature = "diagnostics")]
+    if let Command::Read(read) = &command {
+        let r = &read.request;
+        tracing::trace!(
+            target: "victory_dstorage",
+            queue = id,
+            request_id = read.id,
+            options = format_args!("{:#x}", r.options),
+            source_size = r.source_size,
+            destination_size = r.destination_size,
+            intermediate_size = r.intermediate_size,
+            offset = r.offset,
+            "enqueue requested"
+        );
+    }
     let Some(scheduler) = scheduler() else {
-        return;
+        return false;
     };
     let mut lanes = scheduler.lock();
     loop {
         let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
-            return; // closed: dropped (a status releases its array)
+            return false; // closed: dropped (a status releases its array)
         };
         // One slot stays free, as the console's count of empty slots says.
         if lane.entries() + 1 < lane.capacity.max(2) {
@@ -805,7 +884,7 @@ fn queue(this: QueueRef, command: Command) {
             .unwrap_or_else(|e| e.into_inner());
     }
     let Some(lane) = lanes.lanes.get_mut(&id) else {
-        return;
+        return false;
     };
     lane.unsubmitted.push(command);
     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
@@ -823,6 +902,7 @@ fn queue(this: QueueRef, command: Command) {
             );
         }
     }
+    true
 }
 
 extern "system" fn submit(this: QueueRef) {
@@ -846,8 +926,8 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
-/// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+/// Reads, inflates and/or unpacks one request. Returns the completed output size.
+fn execute(request: &Request) -> Result<usize, HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -890,7 +970,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
+    let written = into_destination(request, size, |out| match tables {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
@@ -900,9 +980,10 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         options = format_args!("{options:#x}"),
         offset = request.offset,
         size,
+        written,
         "dstorage: request done"
     );
-    Ok(())
+    Ok(written)
 }
 
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
@@ -912,6 +993,14 @@ fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
     miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
         .map_err(|status| {
             tracing::debug!(?status, "dstorage: zlib stream");
+            #[cfg(feature = "diagnostics")]
+            tracing::trace!(
+                target: "victory_dstorage",
+                ?status,
+                compressed = source.len(),
+                capacity = out.len(),
+                "zlib stopped"
+            );
             INVALID_DATA
         })
 }
@@ -981,22 +1070,29 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let source = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        match source.file.seek_read(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
         }
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    tracing::trace!(
+        target: "victory_dstorage",
+        file = %source.path,
+        read = done,
+        requested = out.len(),
+        hr = format_args!("{:#010x}", result.err().unwrap_or(S_OK) as u32),
+        "file read"
+    );
     result
 }
 
@@ -1009,7 +1105,7 @@ fn into_destination(
     request: &Request,
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
-) -> Result<(), HRESULT> {
+) -> Result<usize, HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
@@ -1017,7 +1113,7 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        return fill(out);
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
@@ -1031,12 +1127,12 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        return fill(window.bytes());
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
-        return Ok(());
+        return Ok(n);
     }
     // Page number 0 is no page (numbers start at 0x10_0000): a list naming
     // it is one the title has not filled yet. The title writes a request's
@@ -1059,7 +1155,7 @@ fn into_destination(
                         "dstorage: a page list filled after its request started: written late"
                     );
                 }
-                return Ok(());
+                return Ok(n);
             }
         }
     }
@@ -1312,6 +1408,37 @@ mod tests {
     }
 
     #[test]
+    fn records_completed_bytes_and_distinguishes_short_zlib_from_overflow() {
+        for (len, capacity) in [(46_586, 65_536), (65_536, 46_586)] {
+            let bytes = pattern(len);
+            let packed = miniz_oxide::deflate::compress_to_vec_zlib(&bytes, 6);
+            for (options, input) in [(MEMORY_SOURCE, &bytes), (ZLIB | MEMORY_SOURCE, &packed)] {
+                let mut out = vec![0x7e; capacity];
+                let r = request(
+                    options,
+                    out.as_mut_ptr().cast(),
+                    capacity,
+                    input.as_ptr().cast(),
+                    0,
+                    input.len(),
+                );
+                if len <= capacity {
+                    assert_eq!(execute(&r), Ok(len));
+                    assert_eq!(out[..len], bytes);
+                    assert!(out[len..].iter().all(|&v| v == 0x7e));
+                } else {
+                    let hr = if options & ZLIB != 0 {
+                        INVALID_DATA
+                    } else {
+                        E_INVALIDARG
+                    };
+                    assert_eq!(execute(&r), Err(hr));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn statuses_complete_in_order_with_the_first_failure() {
         let contents = pattern(4096);
         let (_dir, file) = file_with(&contents);
@@ -1389,7 +1516,25 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
+        lane.unsubmitted.push(Command::Read(QueuedRead::new(r)));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn identical_enqueues_keep_distinct_ids_through_worker_dispatch() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 4));
+        let r = request(0, std::ptr::null_mut(), 16, std::ptr::null(), 0, 16);
+        let first = QueuedRead::new(r);
+        let second = QueuedRead::new(r);
+        assert_ne!(first.id, second.id);
+        l.lanes.get_mut(&0).unwrap().unsubmitted.extend([
+            Command::Read(first),
+            Command::Read(second),
+        ]);
+        l.submit(0);
+        assert_eq!(l.start().unwrap().request_id, first.id);
+        assert_eq!(l.start().unwrap().request_id, second.id);
     }
 
     #[test]
