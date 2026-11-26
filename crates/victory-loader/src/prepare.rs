@@ -116,6 +116,13 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
 /// Size of an IMAGE_IMPORT_DESCRIPTOR in the PE file.
 const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
 
+/// The address a DIR64 relocation entry names. A malformed block can put the
+/// page base near `u32::MAX`; the entry then has no address, and is skipped
+/// instead of panicking in debug builds or wrapping in release ones.
+fn reloc_address(page: u32, entry: u16) -> Option<u32> {
+    page.checked_add(u32::from(entry & 0xFFF))
+}
+
 /// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
 /// RVA it patches). Empty if the image has no readable relocation table.
 fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
@@ -131,7 +138,12 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
         return out;
     };
-    let (mut at, end) = (start as usize, start as usize + size as usize);
+    // A malformed size can name an end past the file. The reads below stop at
+    // `bytes` anyway; the clamp only keeps the bound honest.
+    let (mut at, end) = (
+        start as usize,
+        (start as usize).saturating_add(size as usize).min(bytes.len()),
+    );
     while at + 8 <= end {
         let (Some(page), Some(block)) =
             (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
@@ -147,8 +159,11 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
                 break;
             };
             let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+            if e >> 12 != DIR64 {
+                continue;
+            }
+            if let Some(address) = reloc_address(page, e) {
+                out.push((entry, address));
             }
         }
         at += block;
@@ -279,5 +294,17 @@ mod tests {
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());
+    }
+
+    /// A malformed BASERELOC block can name a page base with no room left for
+    /// the entry's offset. That address is skipped, not overflowed: debug
+    /// builds would panic there and release builds would wrap.
+    #[test]
+    fn relocation_addresses_past_u32_are_skipped() {
+        assert_eq!(reloc_address(0x1000, 0x0A), Some(0x100A));
+        assert_eq!(reloc_address(0xFFFF_FFF0, 0x00F), Some(0xFFFF_FFFF));
+        assert_eq!(reloc_address(0xFFFF_FFF0, 0x010), None);
+        // Only the entry's low 12 bits are the offset; its high bits are the type.
+        assert_eq!(reloc_address(0x2000, 0xA000), Some(0x2000));
     }
 }
