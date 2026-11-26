@@ -843,10 +843,21 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     if !dst.footprint.row_pitch.is_multiple_of(256) {
         refused!("a row pitch not a multiple of 256");
     }
-    // shortcut: depth and stencil planes copy out in typeless formats of
-    // their own; refused until a title is seen reading one back.
     if desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
-        refused!("a depth or stencil texture");
+        let family = crate::resource::family(desc.Format.0 as u32);
+        // R32 and R16 have one depth plane with the ordinary row layout.
+        if !matches!(family, 39 | 53) || crate::resource::family(dst.footprint.format) != family {
+            refused!("a depth or stencil format outside a compatible single-plane family");
+        }
+        // Depth copies to a buffer take a whole single-sampled subresource.
+        let subresources = u32::from(desc.MipLevels.max(1)) * u32::from(desc.DepthOrArraySize);
+        if desc.SampleDesc.Count != 1
+            || b.is_some()
+            || at != [0; 3]
+            || src.footprint.offset as u32 >= subresources
+        {
+            refused!("a depth copy outside one whole single-sampled subresource");
+        }
     }
     // The host copies into a footprint only within a buffer that holds all
     // of it, so readback memory spans the footprint, not just the region.

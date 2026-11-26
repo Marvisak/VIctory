@@ -3021,6 +3021,114 @@ mod tests {
         assert!(read == want.as_slice(), "the region's rows, and nothing else");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn single_plane_depth_read_back_reaches_the_title_buffer() {
+        use crate::object::IUNKNOWN;
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        type Copy =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+
+        const COPY_DEST: u32 = 0x400;
+        const BUFFER_SIZE: usize = 1024;
+        const DEST_OFFSET: usize = 512;
+        const ROW_PITCH: usize = 256;
+        let null = std::ptr::null();
+        let make = |desc: &ResourceDesc, state| {
+            let mut resource = null;
+            assert_eq!(
+                create_committed(
+                    null, &PROPERTIES, 0, desc, state, null.cast(), &RESOURCE_IIDS[0], &mut resource,
+                ),
+                S_OK
+            );
+            resource
+        };
+        let mut failures = Vec::new();
+        for format in [40, 39, 55, 53] {
+            let bytes_per_pixel = element(format).unwrap().0 as usize;
+            let desc = ResourceDesc {
+                flags: DEPTH,
+                ..texture(4, 2, format, 1)
+            };
+            let image = make(&desc, COPY_DEST);
+            let source = make(&buffer(BUFFER_SIZE as u64), 0);
+            let target = make(&buffer(BUFFER_SIZE as u64), 0);
+            let (data, _) = buffer_bytes(source).unwrap();
+            let (out, _) = buffer_bytes(target).unwrap();
+            // SAFETY: the two title buffers each hold BUFFER_SIZE bytes.
+            let input = unsafe {
+                std::ptr::write_bytes(out, 0xee, BUFFER_SIZE);
+                std::slice::from_raw_parts_mut(data, BUFFER_SIZE)
+            };
+            let (left, right) = if bytes_per_pixel == 4 {
+                (0.25_f32.to_bits(), 0.75_f32.to_bits())
+            } else {
+                (0x4000, 0xbfff)
+            };
+            let mut want = [0xee; BUFFER_SIZE];
+            for row in 0..2 {
+                let from = row * ROW_PITCH;
+                let to = DEST_OFFSET + from;
+                let bytes = 4 * bytes_per_pixel;
+                for (x, value) in [left, left, right, right].into_iter().enumerate() {
+                    let at = from + x * bytes_per_pixel;
+                    input[at..at + bytes_per_pixel]
+                        .copy_from_slice(&value.to_le_bytes()[..bytes_per_pixel]);
+                }
+                want[to..to + bytes].copy_from_slice(&input[from..from + bytes]);
+            }
+
+            let (mut queue, mut allocator, mut list) = (null, null, null);
+            let queue_desc = [0u32; 4];
+            assert_eq!(crate::queue::create(null, queue_desc.as_ptr().cast(), &IUNKNOWN, &mut queue), S_OK);
+            assert_eq!(crate::list::create_allocator(null, 0, &IUNKNOWN, &mut allocator), S_OK);
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &IUNKNOWN, &mut list),
+                S_OK
+            );
+            let rows = PlacedFootprint {
+                offset: 0,
+                format,
+                width: 4,
+                height: 2,
+                depth: 1,
+                row_pitch: ROW_PITCH as u32,
+            };
+            let image_at = Location { resource: image, kind: 0, footprint: rows };
+            let from_source = Location { resource: source, kind: 1, footprint: rows };
+            let into_target = Location {
+                resource: target,
+                kind: 1,
+                footprint: PlacedFootprint { offset: DEST_OFFSET as u64, ..rows },
+            };
+            let copy = slot::<Copy>(list, 0x80);
+            copy(list, &image_at, 0, 0, 0, &from_source, null.cast());
+            copy(list, &into_target, 0, 0, 0, &image_at, null.cast());
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+            slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+            // SAFETY: the submission has run and the title buffer is live.
+            let read = unsafe { std::slice::from_raw_parts(out, BUFFER_SIZE) };
+            if read != want {
+                failures.push((format, read.iter().all(|&byte| byte == 0xee)));
+            }
+            for object in [list, allocator, queue, image, source, target] {
+                assert_eq!(slot::<Release>(object, 0x10)(object), 0);
+            }
+        }
+        assert!(failures.is_empty(), "(format, untouched buffer): {failures:?}");
+        println!("Four single-plane depth readbacks preserve texels and padding");
+    }
+
     /// Two queues, as Grand Theft Auto VI's: a compute list copies a buffer,
     /// then waits for a value a graphics list writes at its end, then reads
     /// back the texture that graphics list fills. Submitted first, its first
