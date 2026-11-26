@@ -1087,6 +1087,14 @@ fn v_fract_f16_never_returns_one() {
             ),
         }
     });
+
+    let upward = build_valu_cs(&[
+        0xBFA4_0004, // s_round_mode 4
+        vop1(0x05F, 0, vgpr(1)),
+    ]);
+    run_cases(&upward, &[[0x8E00, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got as u16, below_one, "{backend}: fract(-3 * 2^-13)");
+    });
 }
 
 /// RDNA2's flt16_to_snorm16 / flt16_to_unorm16: clamp, scale by 32767 or
@@ -2176,6 +2184,60 @@ fn packed_fmac_accumulates_each_half() {
             assert_eq!(got, 0x4700_4480, "{backend}");
         },
     );
+}
+
+#[test]
+fn v_cvt_f16_f32_obeys_all_four_rounding_modes() {
+    // Positive f32 bits and expected positive halves in MODE order: nearest,
+    // +infinity, -infinity, zero. Negative inputs exchange the directed modes.
+    let values = [
+        (0x0000_0000, [0x0000, 0x0000, 0x0000, 0x0000]), // zero
+        (0x0080_0000, [0x0000, 0x0001, 0x0000, 0x0000]), // smallest normal f32
+        (0x3300_0000, [0x0000, 0x0001, 0x0000, 0x0000]), // half a minimum subnormal
+        (0x3380_0000, [0x0001, 0x0001, 0x0001, 0x0001]), // minimum subnormal
+        (0x387F_FFFF, [0x0400, 0x0400, 0x03FF, 0x03FF]), // just below minimum normal
+        (0x3880_0000, [0x0400, 0x0400, 0x0400, 0x0400]), // minimum normal
+        (0x3F7F_FFFF, [0x3C00, 0x3C00, 0x3BFF, 0x3BFF]), // just below 1
+        (0x3F80_0000, [0x3C00, 0x3C00, 0x3C00, 0x3C00]), // 1
+        (0x3F80_0001, [0x3C00, 0x3C01, 0x3C00, 0x3C00]), // just above 1
+        (0x3F80_1000, [0x3C00, 0x3C01, 0x3C00, 0x3C00]), // midpoint
+        (0x3F80_1001, [0x3C01, 0x3C01, 0x3C00, 0x3C00]), // just above midpoint
+        (0x477F_E000, [0x7BFF, 0x7BFF, 0x7BFF, 0x7BFF]), // max finite half
+        (0x477F_E001, [0x7BFF, 0x7C00, 0x7BFF, 0x7BFF]), // just above max
+        (0x477F_F000, [0x7C00, 0x7C00, 0x7BFF, 0x7BFF]), // nearest-even overflow
+        (0x7F7F_FFFF, [0x7C00, 0x7C00, 0x7BFF, 0x7BFF]), // max finite f32
+        (0x7F80_0000, [0x7C00, 0x7C00, 0x7C00, 0x7C00]), // infinity
+        (0x7FC0_0000, [0x7E00, 0x7E00, 0x7E00, 0x7E00]), // quiet NaN
+    ];
+    let inputs: Vec<_> = values
+        .iter()
+        .flat_map(|&(bits, _)| {
+            [
+                [bits, 0, 0, 0xABCD_1234],
+                [bits | 0x8000_0000, 0, 0, 0xABCD_1234],
+            ]
+        })
+        .collect();
+
+    for mode in [1usize, 2, 0, 3] {
+        let shader = build_valu_cs(&[
+            0xBFA5_000F,                      // s_denorm_mode 15
+            0xBFA4_0000 | (mode as u32) << 2, // s_round_mode mode << 2
+            vop1(0x001, 0, vgpr(4)),          // v_mov_b32 v0, v4
+            vop1(0x00A, 0, vgpr(1)),          // v_cvt_f16_f32 v0, v1
+        ]);
+        run_cases(&shader, &inputs, |backend, i, input, got| {
+            let negative = i % 2 != 0;
+            let column = if negative { [0, 2, 1, 3][mode] } else { mode };
+            let half = values[i / 2].1[column] | (u32::from(negative) << 15);
+            assert_eq!(
+                got,
+                0xABCD_0000 | half,
+                "{backend}: mode {mode}, input {:#010x}",
+                input[0]
+            );
+        });
+    }
 }
 
 /// `src_scc` reads SCC as 0 or 1, in scalar and vector instructions.
