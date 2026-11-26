@@ -28,6 +28,15 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      # Includes xtask's repository_passes_policy, the asset-policy check.
-      - name: Tests
-        run: cargo test --workspace --locked
+      # `test-gate` runs `cargo test` with `--jobs 1`: one test binary at a
+      # time is what lets it attribute each report to the binary that wrote
+      # it. That flag serializes compilation as well, so build the suite in
+      # parallel here, where the 60-minute limit is, and let the gate below
+      # run the already-built binaries -- it only needs their order.
+      - name: Tests, build
+        run: cargo test --workspace --locked --no-run
+      # Runs the binaries the step above built, so nothing is compiled one
+      # rustc at a time, and fails on a run that executed nothing. The suite
+      # includes xtask's repository_passes_policy, the asset-policy check.
+      - name: Tests, gate
+        run: cargo xtask test-gate --workspace --locked

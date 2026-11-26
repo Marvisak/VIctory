@@ -44,7 +44,7 @@ title's), so a run finds them under the names it gives them itself.
 | `victory-pipeline` | converter trait, content-addressed cache |
 | `victory-game` | Grand Theft Auto VI-specific formats, build identities, hooks |
 | `apps/victory` | command-line front end |
-| `xtask` | asset-policy check, git hooks |
+| `xtask` | asset-policy check, workflow shape check, test gate, git hooks |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |
 
 Everything except `victory-game` is platform-level and can be tested with

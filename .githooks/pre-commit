@@ -1,3 +1,12 @@
 #!/bin/sh
-# Enforces the asset policy on every commit. Install with: cargo xtask install-hooks
-exec cargo xtask policy --staged
+# Enforces the asset policy on every commit, and that the workflow files pass
+# the shape checks this repository can make. GitHub reads those files before it
+# creates a job, so one it cannot load produces no run at all. CI's own
+# `every_workflow_in_the_repository_loads` test catches that for the other
+# workflow files; this hook is the only place `ci.yml` itself can be caught.
+# Install with: cargo xtask install-hooks
+command -v cargo >/dev/null 2>&1 || {
+    echo "pre-commit: cargo not on PATH; skipping policy checks" >&2
+    exit 0
+}
+cargo xtask policy --staged && cargo xtask workflows --staged

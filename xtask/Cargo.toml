@@ -11,6 +11,10 @@ publish.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 walkdir.workspace = true
+yaml-rust2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
