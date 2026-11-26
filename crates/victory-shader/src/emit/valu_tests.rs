@@ -1999,6 +1999,67 @@ fn image_atomics_of_64_bits() {
     }
 }
 
+/// One texture UAV read as float data (`image_load`) and changed by a
+/// 32-bit integer atomic in the same block, in both orders. The two
+/// accesses annotate the same descriptor with different component types
+/// (four F32 and one U32), so each needs its own handle: sharing the one
+/// annotated first gave the other access the wrong component type, which
+/// dxil.dll does not catch. Checked in the module `dxc -dumpbin` prints,
+/// where dxc is installed.
+#[test]
+fn a_load_and_an_atomic_of_one_texture_have_their_own_handles() {
+    let v0 = vgpr(0);
+    let image_load = |vdata: u8| image_atomic(0x00, vdata, 3, 8, 1, false);
+    let Some(dxc) = validator::Validator::default_path().map(|p| p.with_file_name("dxc.exe"))
+    else {
+        eprintln!("no Windows SDK; skipped");
+        return;
+    };
+    if !dxc.exists() {
+        eprintln!("no dxc.exe; skipped");
+        return;
+    }
+    for atomic_first in [true, false] {
+        let mut words = vec![s_mov_b32(5, 0x80)];
+        // s_load_dwordx8 s[8:15], s[4:5], 0: the texture's descriptor.
+        words.extend([0x3D << 26 | 0x03 << 18 | 8 << 6 | 4 >> 1, 125 << 25]);
+        // v[3:4] = (l, 0); v1 = 1.
+        words.extend([vop1(0x001, 3, v0), vop1(0x001, 4, 128), vop1(0x001, 1, 129)]);
+        if atomic_first {
+            words.extend(image_atomic(0x11, 1, 3, 8, 1, false));
+            words.extend(image_load(8));
+        } else {
+            words.extend(image_load(8));
+            words.extend(image_atomic(0x11, 1, 3, 8, 1, false));
+        }
+        // The loaded dword goes back through the atomic, so it is used.
+        words.extend(image_atomic(0x11, 8, 3, 8, 1, false));
+        words.push(S_ENDPGM);
+        let shader = lower_cs32(&words, &[(4, ResourceType::Uav, 0, 8)], true);
+        let file = std::env::temp_dir().join(format!(
+            "victory-handles-{}-{atomic_first}.dxil",
+            std::process::id()
+        ));
+        std::fs::write(&file, &shader.dxil).unwrap();
+        let out = std::process::Command::new(&dxc)
+            .arg("-dumpbin")
+            .arg(&file)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&file);
+        assert!(out.status.success(), "dxc -dumpbin failed");
+        let text = String::from_utf8_lossy(&out.stdout);
+        // A 2D texture UAV (kind 2 | 0x1000): four F32 (0x409) for the
+        // load, one U32 (0x105) for the atomics.
+        for props in ["i32 4098, i32 1033", "i32 4098, i32 261"] {
+            assert!(
+                text.contains(props),
+                "atomic first: {atomic_first}: no handle annotated {{ {props} }}"
+            );
+        }
+    }
+}
+
 #[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
