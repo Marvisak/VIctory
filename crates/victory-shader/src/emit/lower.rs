@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+#[cfg(test)]
+mod interp_guard_tests;
 
 type Why = &'static str;
 
@@ -72,6 +74,9 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Constant integer false-arms of written `select` instructions.
+    #[cfg(test)]
+    pub select_false_ints: Vec<Option<i64>>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1412,6 +1417,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            select_false_ints: self.s.m.written_select_false_ints(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2743,19 +2750,29 @@ impl<'a> Lower<'a> {
 
     /// [`Self::write`] of a dword already placed (SDWA applied).
     fn write_placed(&mut self, inst: &Inst, reg: Reg, x: V, guard: Option<V>) {
+        self.write_placed_with_old(inst, reg, x, guard, inst.read(reg));
+    }
+
+    fn write_placed_with_old(
+        &mut self,
+        inst: &Inst,
+        reg: Reg,
+        x: V,
+        guard: Option<V>,
+        old_val: Option<Value>,
+    ) {
         let Some(new) = inst.write(reg) else { return };
         let x = match (guard, reg) {
             (Some(g), Reg::V(_)) => {
-                let o = inst.read(reg);
-                let read = o.is_some_and(|o| self.read_phis.contains(&o));
-                let old = match o.map(|o| self.i32_of(o)) {
+                let read = old_val.is_some_and(|o| self.read_phis.contains(&o));
+                let old = match old_val.map(|o| self.i32_of(o)) {
                     Some(Ok(o)) => o,
                     // The validator refuses reads of undef.
                     _ => self.s.m.i32(0),
                 };
                 // What lanes keep is zero where it has no DXIL form (as
                 // above), so keeping a phi does not make it live.
-                if let Some(o) = o.filter(|_| !read) {
+                if let Some(o) = old_val.filter(|_| !read) {
                     self.read_phis.remove(&o);
                 }
                 self.s.m.select(self.cur, g, x, old)
@@ -6858,6 +6875,23 @@ impl<'a> Lower<'a> {
     /// half, or its high half with op_sel bit 3 (or an SDWA WORD_1 select);
     /// the other half is kept (GFX10).
     fn write_half(&mut self, inst: &Inst, x: V, guard: Option<V>) -> Result<(), Why> {
+        let old_val = match &inst.fields {
+            Fields::Valu(v) => match v.dst {
+                Some(Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
+                _ => None,
+            },
+            _ => None,
+        };
+        self.write_half_with_old(inst, x, guard, old_val)
+    }
+
+    fn write_half_with_old(
+        &mut self,
+        inst: &Inst,
+        x: V,
+        guard: Option<V>,
+        guard_old: Option<Value>,
+    ) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -6893,7 +6927,7 @@ impl<'a> Lower<'a> {
             let o = self.s.m.bin(c, Bin::And, old, keep);
             self.s.m.bin(c, Bin::Or, o, x)
         };
-        self.write_placed(inst, Reg::V(reg), r, guard);
+        self.write_placed_with_old(inst, Reg::V(reg), r, guard, guard_old);
         Ok(())
     }
 
@@ -8152,7 +8186,9 @@ impl<'a> Lower<'a> {
                     // omod and clamp are part of the f16 instruction; op_sel[3]
                     // picks the destination half.
                     let lo = self.half_modifiers(inst, lo);
-                    return self.write_half(inst, lo, None);
+                    let guard = self.guard(site.0, site.1)?;
+                    let old_val = self.interp_old_val(site, inst, reg, interp, guard);
+                    return self.write_half_with_old(inst, lo, guard, old_val);
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
                     let z = self.s.m.i32(0);
@@ -8166,9 +8202,37 @@ impl<'a> Lower<'a> {
                 }
             }
         };
-        // A pixel interpolates in every lane; guards only hide inactive ones.
-        self.write(inst, Reg::V(reg), x, None);
+        let guard = self.guard(site.0, site.1)?;
+        let old_val = self.interp_old_val(site, inst, reg, interp, guard);
+        self.write_placed_with_old(inst, Reg::V(reg), x, guard, old_val);
         Ok(())
+    }
+
+    /// Prior VGPR value to keep on inactive lanes for a guarded interpolation.
+    /// For a two-instruction VINTRP pair writing the same VGPR under the same
+    /// guard, steps back over p1 (whose SSA output is `Val::Missing`) to
+    /// recover the true pre-p1 value.
+    fn interp_old_val(
+        &self,
+        site: Site,
+        inst: &Inst,
+        reg: u8,
+        interp: &Interp,
+        guard: Option<V>,
+    ) -> Option<Value> {
+        let mut old_val = inst.read(Reg::V(reg));
+        if guard.is_some()
+            && let Some(v) = old_val
+            && let Interp::Interpolated { first, .. } = interp
+            && let &[p1] = &first[..]
+            && self.x.st.guards[p1.0][p1.1] == self.x.st.guards[site.0][site.1]
+        {
+            let p1_inst = &self.x.p.blocks[p1.0].insts[p1.1];
+            if p1_inst.write(Reg::V(reg)) == Some(v) {
+                old_val = p1_inst.read(Reg::V(reg));
+            }
+        }
+        old_val
     }
 
     /// Whether no lane that runs the instruction at `site` has been where

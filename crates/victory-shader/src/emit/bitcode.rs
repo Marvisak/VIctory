@@ -319,6 +319,21 @@ impl Module {
         self.consts.iter().any(|(_, c)| *c == want)
     }
 
+    /// Constant integer false-arms of every live written `select` instruction.
+    #[cfg(test)]
+    pub fn written_select_false_ints(&self) -> Vec<Option<i64>> {
+        let plan = self.plan();
+        plan.layout
+            .iter()
+            .flat_map(|&b| &self.blocks[b].body)
+            .filter(|&&i| plan.live[i as usize])
+            .filter_map(|&i| match self.insts[i as usize].op {
+                Op::Select(_, _, f) => Some(self.int_value(f)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
