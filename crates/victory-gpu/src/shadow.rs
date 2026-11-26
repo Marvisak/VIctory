@@ -17,6 +17,7 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -78,9 +79,11 @@ pub(crate) struct Shadow {
     /// title memory there is older than the copy.
     pending: Mutex<std::collections::HashSet<(usize, usize)>>,
     /// The copy's bytes before the submission ran where its shaders write:
-    /// what the GPU wrote differs. Disjoint segments (offset, bytes) in
+    /// what the GPU wrote differs. Disjoint segments (offset, bytes, epoch) in
     /// order, and the 64 KiB pieces (by title address) already compared.
     before: Mutex<Snapshot>,
+    /// The epoch at which this copy's title memory was last refreshed or updated.
+    refreshed_epoch: AtomicU64,
     /// Its first bit in the buffer views' written-pages bitmap, one per
     /// 64 KiB title page it touches (tracked memory only): writes through
     /// views of it are marked there ([`Shadow::mark_entry`]).
@@ -92,8 +95,8 @@ pub(crate) struct Shadow {
     slice: Option<Slice>,
 }
 
-/// Snapshot segments (offset, bytes) and the pieces compared.
-type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
+/// Snapshot segments (offset, bytes, epoch) and the pieces compared.
+type Snapshot = (Vec<(usize, Vec<u8>, u64)>, std::collections::HashSet<usize>);
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
@@ -225,13 +228,17 @@ impl Shadow {
         if !crate::host::read_into(from as *const u8, &mut title) || title == host {
             return 0;
         }
-        {
-            let _writing = crate::watch::writing(from, n);
+        #[cfg(test)]
+        tests::before_copy_back_write();
+        let epoch = self.refreshed_epoch.load(Ordering::Acquire);
+        if !crate::watch::write_back(self.tracked.as_ref(), from, n, epoch, || {
             crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
+        }) {
+            return 0;
         }
         // Our write is not the title's: the copy holds the page as it is.
         if let Some(t) = &self.tracked {
-            t.taken(&[page / PAGE]);
+            t.taken(&[page / PAGE], epoch);
         }
         n
     }
@@ -261,6 +268,7 @@ impl Shadow {
             tracked,
             pending: Mutex::default(),
             before: Mutex::default(),
+            refreshed_epoch: AtomicU64::new(crate::watch::current_epoch()),
             marks,
             base: slice.map_or(0, |s| s.offset),
             slice,
@@ -340,17 +348,22 @@ impl Shadow {
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let segments = &mut before.0;
+        let refreshed_epoch = self.refreshed_epoch.load(Ordering::Acquire);
         // The segments the range overlaps or touches.
-        let first = segments.partition_point(|(at, bytes)| at + bytes.len() < from);
-        let last = first + segments[first..].iter().take_while(|(at, _)| *at <= to).count();
-        if let [(at, bytes)] = &segments[first..last]
+        let first = segments.partition_point(|(at, bytes, _)| at + bytes.len() < from);
+        let last = first + segments[first..].iter().take_while(|(at, _, _)| *at <= to).count();
+        if let [(at, bytes, _)] = &segments[first..last]
             && *at <= from
             && to <= at + bytes.len()
         {
             return;
         }
+        let epoch = segments[first..last]
+            .iter()
+            .map(|(_, _, ep)| *ep)
+            .fold(refreshed_epoch, u64::min);
         let start = segments.get(first).filter(|_| first < last).map_or(from, |s| s.0.min(from));
-        let end = segments[first..last].last().map_or(to, |(at, bytes)| (at + bytes.len()).max(to));
+        let end = segments[first..last].last().map_or(to, |(at, bytes, _)| (at + bytes.len()).max(to));
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SnapshotUs);
         #[cfg(feature = "diagnostics")]
@@ -360,14 +373,14 @@ impl Shadow {
         // Parts newly covered from the copy, the rest as it was taken.
         let mut grown = pooled(end - start);
         let mut at = start;
-        for (taken, bytes) in segments.drain(first..last) {
+        for (taken, bytes, _) in segments.drain(first..last) {
             grown.extend_from_slice(host(at, taken));
             grown.extend_from_slice(&bytes);
             at = taken + bytes.len();
             give_back(bytes);
         }
         grown.extend_from_slice(host(at, end));
-        segments.insert(first, (start, grown));
+        segments.insert(first, (start, grown, epoch));
     }
 
     /// `[address, address + len)` expanded outward to 64 KiB page
@@ -411,10 +424,13 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
+        if let Some((taken, before, snapshot_epoch)) = segments
+            .iter()
+            .find(|(at, bytes, _)| *at <= from && to <= at + bytes.len())
             && back
             && from < to
         {
+            let snapshot_epoch = *snapshot_epoch;
             let before = &before[from - taken..to - taken];
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
@@ -438,17 +454,35 @@ impl Shadow {
                     at += n;
                     continue;
                 }
+                if self
+                    .tracked
+                    .as_ref()
+                    .is_some_and(|t| t.was_remapped_since((start + at) / PAGE, snapshot_epoch))
+                {
+                    at += n;
+                    continue;
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
                     if merge_writeback(title, host, old) {
-                        let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                        #[cfg(test)]
+                        tests::before_copy_back_write();
+                        if crate::watch::write_back(self.tracked.as_ref(), start + at, n, snapshot_epoch, || {
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                        }) {
+                            written += n;
+                            synced.push((start + at) / PAGE);
+                        }
+                    } else if self
+                        .tracked
+                        .as_ref()
+                        .is_none_or(|t| !t.was_remapped_since((start + at) / PAGE, snapshot_epoch))
+                    {
+                        synced.push((start + at) / PAGE);
                     }
-                    synced.push((start + at) / PAGE);
                 }
                 at += n;
             }
@@ -458,7 +492,7 @@ impl Shadow {
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
             if let Some(t) = &self.tracked {
                 let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
-                t.taken(&whole);
+                t.taken(&whole, snapshot_epoch);
             }
         }
         // Every submitted step that declared the range is done with it (one
@@ -467,7 +501,7 @@ impl Shadow {
         pending.remove(&(address, address + len));
         if pending.is_empty() {
             compared.clear();
-            for (_, bytes) in segments.drain(..) {
+            for (_, bytes, _) in segments.drain(..) {
                 give_back(bytes);
             }
             if let Some(t) = &self.tracked {
@@ -499,6 +533,7 @@ impl Shadow {
         }
         // Our own write below must not save the page for this copy again.
         t.unarm(page / PAGE);
+        let arm_epoch = self.refreshed_epoch.load(Ordering::Acquire);
         let saved = t.saved(page / PAGE);
         if saved.is_none() && t.changed(page / PAGE) {
             #[cfg(feature = "diagnostics")]
@@ -521,13 +556,20 @@ impl Shadow {
                 merge_writeback(&mut title, host, before).then_some(title.as_ptr())
             }
         };
+        #[cfg(test)]
+        tests::before_copy_back_write();
         if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
+            if !crate::watch::write_back(Some(t), from, n, arm_epoch, || {
+                crate::host::write_mapped(from as *mut u8, bytes, n);
+            }) {
+                return 0;
+            }
+        } else if t.was_remapped_since(page / PAGE, arm_epoch) {
+            return 0;
         }
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
-            t.taken(&[page / PAGE]);
+            t.taken(&[page / PAGE], arm_epoch);
         }
         written.map_or(0, |_| n)
     }
@@ -548,6 +590,7 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        self.refreshed_epoch.store(crate::watch::current_epoch(), Ordering::Release);
         if self.clean() {
             return 0;
         }
@@ -618,7 +661,7 @@ impl Shadow {
         let mut sync_before = |a: usize, b: usize| {
             let Some(before) = &mut before else { return };
             let (a, b) = (a - start, b - start);
-            for (at, bytes) in before.0.iter_mut() {
+            for (at, bytes, _) in before.0.iter_mut() {
                 let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
                 if s < e {
                     // SAFETY: inside the mapping.
@@ -1453,7 +1496,7 @@ pub(crate) mod tests {
             return; // no host GPU here
         };
         copy.update(p, len);
-        let bytes = |s: &Shadow| s.before.lock().unwrap().0.iter().map(|(_, b)| b.len()).sum::<usize>();
+        let bytes = |s: &Shadow| s.before.lock().unwrap().0.iter().map(|(_, b, _)| b.len()).sum::<usize>();
         copy.writing(p + 16, 64, false);
         copy.writing(p + 3 * PAGE, 100, false);
         assert_eq!(bytes(&copy), 164, "two segments");
@@ -1557,6 +1600,104 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
+    /// Memory the title frees while shaders write its copy, and allocates
+    /// again at the same address with new bytes, keeps the new bytes once
+    /// the free is reported (as `XMemFreeDefault` reports it, before the
+    /// host can hand the memory out again), whichever copy-back would have
+    /// put the shaders' there: a declared range's snapshot, a marked page, a
+    /// page at a computed address. Unreported, the shaders' bytes land in
+    /// the new memory on all three: the control.
+    #[test]
+    fn memory_freed_and_allocated_again_keeps_the_new_bytes_once_reported() {
+        use crate::watch::tests::{MEM_WRITE_WATCH, free, pool};
+        use crate::watch::title_memory_remapped;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        // Nothing else takes the marks set below.
+        let _one = crate::host::tests::no_submission();
+        let len = 3 * PAGE;
+        for report in [false, true] {
+            // Another test may allocate at the address between the free and
+            // the new allocation: then tried again elsewhere.
+            let mut tries = 0;
+            let (p, copy, b) = loop {
+                tries += 1;
+                assert!(tries <= 8, "an address allocated again");
+                let p = pool(3);
+                register(p, p as u64, len as u64);
+                let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
+                    unregister(p, p as u64);
+                    free(p);
+                    return; // no host GPU here
+                };
+                // The submission begins.
+                copy.update(p, len);
+                // Page 0 declared (a snapshot), 1 marked, 2 neither
+                // (written at a computed address). The shaders write a byte
+                // in each.
+                copy.writing(p, PAGE, false);
+                copy.writing(p + PAGE, PAGE, true);
+                for k in 0..3 {
+                    copy.write_host((p + k * PAGE + 10) as u64, &[0x99]);
+                }
+                // Meanwhile the title frees the memory and allocates it
+                // again at the same address.
+                if report {
+                    title_memory_remapped(p, len);
+                }
+                free(p);
+                // SAFETY: a fresh allocation where ours was, freed below.
+                let again = unsafe {
+                    VirtualAlloc(
+                        p as *const _,
+                        len,
+                        MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                        PAGE_READWRITE,
+                    )
+                } as usize;
+                if again == p {
+                    break (p, copy, b);
+                }
+                if again != 0 {
+                    free(again);
+                }
+                unregister(p, p as u64);
+            };
+            // The title fills the new memory.
+            // SAFETY: our new allocation, read-write.
+            unsafe { (p as *mut u8).write_bytes(0xee, len) };
+            let n = copy.marks.expect("tracked memory gets mark bits") as usize + 1;
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *(b.data as *mut u32).add(n / 32) |= 1 << (n % 32) };
+            copy_back_marks(&[], false);
+            copy.copy_back(p, PAGE);
+            copy.copy_back_page(p + 2 * PAGE);
+            // SAFETY: a byte of our allocation.
+            let read = |k: usize| unsafe { ((p + k * PAGE + 10) as *const u8).read_volatile() };
+            let got = [read(0), read(1), read(2)];
+            if report {
+                assert_eq!(
+                    got,
+                    [0xee; 3],
+                    "reported: the new memory keeps the title's bytes (snapshot, marked page, computed address)"
+                );
+                // The copy takes the new memory at its next refresh.
+                assert!(copy.update(p, len) >= len);
+                assert_eq!(copy.read_host((p + 8) as u64, 1)[0].to_le_bytes()[2], 0xee);
+            } else {
+                assert_eq!(
+                    got,
+                    [0x99; 3],
+                    "unreported, the shaders' bytes land in the new memory (the control)"
+                );
+            }
+            unregister(p, p as u64);
+            drop(copy);
+            free(p);
+        }
+    }
+
     /// What a frame withheld leaves every host copy of its memory at the
     /// frame's end (run textures9's shape): in frame N a program using title
     /// memory writes a record into the copies and the frame misses, so it
@@ -1656,5 +1797,306 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// Remapping or freeing a title memory range while a submission's
+    /// declared copy-back is pending must not overwrite the new mapping with
+    /// stale GPU bytes, and must leave the remapped page dirty for the next
+    /// refresh.
+    #[test]
+    fn remapping_while_copy_back_is_pending_keeps_new_title_bytes() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        // SAFETY: our pool.
+        unsafe {
+            (p as *mut u8).write_volatile(0x11);
+            ((p + PAGE) as *mut u8).write_volatile(0x33);
+        }
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        copy.writing(p, len, false);
+        copy.write_host(p as u64, &[0xaa]);
+        copy.write_host((p + PAGE) as u64, &[0xbb]);
+        // Title remaps page 0 while the submission is pending and writes 0x22.
+        crate::watch::title_memory_remapped(p, PAGE);
+        // SAFETY: our pool.
+        unsafe { (p as *mut u8).write_volatile(0x22) };
+        assert_eq!(copy.copy_back(p, len), PAGE, "only unremapped page 1 writes back");
+        // SAFETY: our pool.
+        let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
+        assert_eq!(title(p), 0x22, "remapped page keeps the new mapping's bytes");
+        assert_eq!(title(p + PAGE), 0xbb, "other page keeps the GPU write");
+        assert!(!copy.clean(), "remapped page remains changed for next update");
+        // Subsequent submission sees the new bytes after update and copies back.
+        copy.update(p, PAGE);
+        assert_eq!(copy.read_host(p as u64, 1)[0] & 0xff, 0x22);
+        copy.writing(p, PAGE, false);
+        copy.write_host(p as u64, &[0xcc]);
+        assert_eq!(copy.copy_back(p, PAGE), PAGE);
+        assert_eq!(title(p), 0xcc);
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// A title write before remapping saves pre-write bytes on an armed page;
+    /// remapping discards them so `copy_back_marked` does not overwrite the new
+    /// mapping with stale GPU writes.
+    #[test]
+    fn remapping_after_title_write_discards_saved_bytes_for_marked_copy_back() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, PAGE as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, true);
+        // Title writes first (populating Saved::bytes), GPU writes, then title remaps.
+        // SAFETY: our pool.
+        unsafe { ((p + 40) as *mut u8).write_volatile(0x11) };
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        // SAFETY: mapped bitmap dword.
+        unsafe { *(b.data as *mut u32).add(base / 32) |= 1 << (base % 32) };
+        crate::watch::title_memory_remapped(p, PAGE);
+        // SAFETY: our pool.
+        unsafe { ((p + 10) as *mut u8).write_volatile(0x22) };
+        copy_back_marks(&[], false);
+        assert_eq!(copy.copy_back(p, PAGE), 0);
+        // SAFETY: our pool.
+        let byte10 = unsafe { ((p + 10) as *const u8).read_volatile() };
+        assert_eq!(byte10, 0x22, "remapped page is not overwritten by marked write");
+        assert!(!copy.clean(), "remapped page stays changed");
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    thread_local! {
+        static BEFORE_COPY_BACK_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) fn before_copy_back_write() {
+        let hook = BEFORE_COPY_BACK_WRITE.with(|cell| cell.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Pausing `copy_back_or_not` after its initial `was_remapped` check while
+    /// another thread remaps the page (and finishes under `title_memory_remapping`)
+    /// prevents `write_mapped` from landing in the replacement mapping.
+    #[test]
+    fn remapping_after_copy_back_check_before_write_skips_write_back() {
+        let p = crate::watch::tests::pool(1);
+        // SAFETY: our pool.
+        unsafe { (p as *mut u8).write_volatile(0x11) };
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, false);
+        copy.write_host(p as u64, &[0xaa]);
+        BEFORE_COPY_BACK_WRITE.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move || {
+                std::thread::spawn(move || {
+                    let _remap = crate::watch::title_memory_remapping();
+                    // SAFETY: our pool.
+                    unsafe { (p as *mut u8).write_volatile(0x22) };
+                    crate::watch::title_memory_remapped(p, PAGE);
+                })
+                .join()
+                .unwrap();
+            }));
+        });
+        assert_eq!(copy.copy_back(p, PAGE), 0);
+        // SAFETY: our pool.
+        let title = unsafe { (p as *const u8).read_volatile() };
+        assert_eq!(title, 0x22, "paused copy-back must not overwrite remapped page");
+        assert!(!copy.clean(), "remapped page remains dirty");
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// Pausing `copy_back_marked` after `t.saved()` has moved the pre-write
+    /// snapshot out while another thread remaps the page prevents `write_mapped`
+    /// from overwriting the replacement mapping.
+    #[test]
+    fn remapping_after_marked_snapshot_taken_before_write_skips_write_back() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, true);
+        // Title writes first (populating Saved::bytes), then GPU writes.
+        // SAFETY: our pool.
+        unsafe { ((p + 40) as *mut u8).write_volatile(0x11) };
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        BEFORE_COPY_BACK_WRITE.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move || {
+                std::thread::spawn(move || {
+                    let _remap = crate::watch::title_memory_remapping();
+                    // SAFETY: our pool.
+                    unsafe { ((p + 10) as *mut u8).write_volatile(0x22) };
+                    crate::watch::title_memory_remapped(p, PAGE);
+                })
+                .join()
+                .unwrap();
+            }));
+        });
+        assert_eq!(copy.copy_back_marked(p), 0);
+        assert_eq!(copy.copy_back(p, PAGE), 0);
+        // SAFETY: our pool.
+        let byte10 = unsafe { ((p + 10) as *const u8).read_volatile() };
+        assert_eq!(byte10, 0x22, "paused marked copy-back must not overwrite remapped page");
+        assert!(!copy.clean(), "remapped page remains dirty");
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// A copy-back write waits while `title_memory_remapping()` is held (as
+    /// across OS map/unmap + `title_memory_remapped`), then sees the remap.
+    #[test]
+    fn copy_back_write_waits_for_in_flight_remapping_guard() {
+        let p = crate::watch::tests::pool(1);
+        // SAFETY: our pool.
+        unsafe { (p as *mut u8).write_volatile(0x11) };
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, false);
+        copy.write_host(p as u64, &[0xaa]);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (remap_done_tx, remap_done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _remap = crate::watch::title_memory_remapping();
+            entered_tx.send(()).unwrap();
+            // Wait until copy-back has passed the pre-write hook and is waiting on MAPPING.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // SAFETY: our pool.
+            unsafe { (p as *mut u8).write_volatile(0x22) };
+            crate::watch::title_memory_remapped(p, PAGE);
+            drop(_remap);
+            remap_done_tx.send(()).unwrap();
+        });
+        BEFORE_COPY_BACK_WRITE.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move || {
+                entered_rx.recv().unwrap();
+            }));
+        });
+        assert_eq!(copy.copy_back(p, PAGE), 0);
+        remap_done_rx.recv().unwrap();
+        handle.join().unwrap();
+        // SAFETY: our pool.
+        let title = unsafe { (p as *const u8).read_volatile() };
+        assert_eq!(title, 0x22);
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// A prior remap (before submission S1 starts) must not drop valid
+    /// partial-page unmarked GPU copy-backs in S1.
+    #[test]
+    fn unmarked_partial_page_copy_back_after_prior_remap_keeps_gpu_bytes() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return;
+        };
+        copy.update(p, len);
+        // Remap happens BEFORE S1 starts, then title initializes [p + 0x1000, p + 0x2000).
+        crate::watch::title_memory_remapped(p, PAGE);
+        // SAFETY: our pool.
+        unsafe { ((p + 0x1000) as *mut u8).write_bytes(0x11, 0x1000) };
+        // S1: unmarked declared partial-page UAV (no remap occurs during S1).
+        copy.update(p + 0x1000, 0x1000);
+        copy.writing(p + 0x1000, 0x1000, false);
+        copy.write_host((p + 0x1000) as u64, &[0xCC]);
+        let written = copy.copy_back(p + 0x1000, 0x1000);
+        assert_eq!(written, 4096, "partial-page copy-back must succeed after prior remap");
+        // SAFETY: our pool.
+        let got = unsafe { ((p + 0x1000) as *const u8).read_volatile() };
+        assert_eq!(got, 0xCC, "GPU bytes must land in title memory");
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// Merging adjacent/overlapping snapshot segments must not discard the earlier
+    /// segment's snapshot epoch, so a remap of the earlier segment is not overwritten.
+    #[test]
+    fn merging_overlapping_snapshot_segments_preserves_earlier_epoch() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        // S1 snapshots page 0:
+        copy.writing(p, PAGE, false);
+        // Page 0 is remapped!
+        crate::watch::title_memory_remapped(p, PAGE);
+        // SAFETY: our pool.
+        unsafe { (p as *mut u8).write_volatile(0x22) };
+        // S1 now snapshots touching page 1, merging with page 0:
+        copy.writing(p + PAGE, PAGE, false);
+        // GPU writes to page 0:
+        copy.write_host(p as u64, &[0xAA]);
+        // Copy back:
+        copy.copy_back(p, 2 * PAGE);
+        // SAFETY: our pool.
+        let title0 = unsafe { (p as *const u8).read_volatile() };
+        assert_eq!(title0, 0x22, "remapped page 0 must not be overwritten after merge");
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// Remapping title memory after `copy.update` but before `copy.writing` must
+    /// be respected, because `self.data` holds bytes from `refreshed_epoch`.
+    #[test]
+    fn remap_between_update_and_writing_preserves_new_title_bytes() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        copy.update(p, PAGE);
+        // Remap happens AFTER update:
+        crate::watch::title_memory_remapped(p, PAGE);
+        // SAFETY: our pool.
+        unsafe { (p as *mut u8).write_volatile(0x22) };
+        // Now writing is called:
+        copy.writing(p, PAGE, false);
+        copy.write_host(p as u64, &[0xAA]);
+        copy.copy_back(p, PAGE);
+        // SAFETY: our pool.
+        let title = unsafe { (p as *const u8).read_volatile() };
+        assert_eq!(title, 0x22, "remap between update and writing must not be overwritten");
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
     }
 }

@@ -32,7 +32,10 @@
 //!
 //! shortcut: a system call writing into a guarded block fails; the known
 //! ones (file reads, DirectStorage) open their blocks first. Memory freed
-//! and allocated again while a tracker holds it is not seen.
+//! and allocated again while a tracker holds it is not seen, unless the
+//! runtime frees it (`XMemFreeDefault`, of its 32-bit blocks) or allocates
+//! it (`XMemVirtualAlloc`): both report it as remapped. Memory no tracker
+//! holds (the C heap's) keeps no remap state at all.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -113,6 +116,10 @@ struct Saved {
     /// Pages of those runs that are not armed any more.
     unarmed: BTreeSet<usize>,
     bytes: std::collections::HashMap<usize, Box<[u8]>>,
+    /// Pages unmapped or remapped mapped to the epoch at which they were
+    /// remapped. Pending copy-backs check this against their snapshot/refresh
+    /// epoch to skip only remaps that occurred after the write was prepared.
+    remapped: std::collections::HashMap<usize, u64>,
 }
 
 impl Saved {
@@ -152,7 +159,20 @@ impl Saved {
 impl Changed {
     /// Page `page` was taken: what it saved of it is stale.
     fn taken(&self, page: usize) {
-        self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
+        let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        saved.bytes.remove(&page);
+        saved.remapped.remove(&page);
+    }
+
+    /// Page `page` was unmapped or remapped at `epoch`: drop any armed/saved pre-write
+    /// snapshot and record the remap epoch so pending declared copy-backs skip it.
+    fn remapped(&self, page: usize, epoch: u64) {
+        let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        if saved.armed(page) {
+            saved.unarmed.insert(page);
+        }
+        saved.bytes.remove(&page);
+        saved.remapped.insert(page, epoch);
     }
 
     /// Page `page` is about to change for the first time since it was
@@ -541,11 +561,24 @@ impl Tracked {
     }
 
     /// The caller made pages (page numbers) of its copy equal to title
-    /// memory itself (what shaders wrote went back): taken and guarded.
-    pub(crate) fn taken(&self, pages: &[usize]) {
+    /// memory itself (what shaders wrote went back): taken and guarded,
+    /// skipping pages unmapped or remapped after `since_epoch`.
+    ///
+    /// Locks `MAPPING` non-reentrantly; must not be called while holding a
+    /// [`Remapping`] guard.
+    pub(crate) fn taken(&self, pages: &[usize], since_epoch: u64) {
+        let _remap = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+        let pages: Vec<usize> = pages
+            .iter()
+            .copied()
+            .filter(|&p| !self.was_remapped_since(p, since_epoch))
+            .collect();
+        if pages.is_empty() {
+            return;
+        }
         let mut g = guards();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        let others = aliases(&g, pages);
+        let others = aliases(&g, &pages);
         let unguarded = guard_aliases(&mut g, &others);
         let pages: Vec<usize> = pages
             .iter()
@@ -588,7 +621,11 @@ impl Tracked {
     pub(crate) fn arm(&self, from: usize, to: usize) {
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from < to {
-            self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).arm(from / PAGE, to.div_ceil(PAGE));
+            self.changed
+                .1
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .arm(from / PAGE, to.div_ceil(PAGE));
         }
     }
 
@@ -607,6 +644,25 @@ impl Tracked {
         saved.armed.clear();
         saved.unarmed.clear();
         saved.bytes.clear();
+        saved.remapped.clear();
+    }
+
+    /// Whether `page` (a page number) was unmapped or remapped since `since_epoch`.
+    pub(crate) fn was_remapped_since(&self, page: usize, since_epoch: u64) -> bool {
+        self.changed
+            .1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remapped
+            .get(&page)
+            .is_some_and(|&epoch| epoch > since_epoch)
+    }
+
+    /// Whether `page` (a page number) was unmapped or remapped since it was
+    /// taken or the previous submission finished.
+    #[cfg(test)]
+    pub(crate) fn was_remapped(&self, page: usize) -> bool {
+        self.was_remapped_since(page, 0)
     }
 
     /// The bytes page `page` (a page number) held when it was first written
@@ -808,13 +864,90 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+/// Serializes title virtual memory map/unmap operations and remap
+/// notifications against copy-back writes so a mapping cannot change between a
+/// remap check and `write_mapped`.
+static MAPPING: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static REMAPPING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Guard keeping title memory mappings stable against copy-back writes for its
+/// lifetime (reentrant on the same thread).
+pub struct Remapping {
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+    _local: std::marker::PhantomData<*const ()>,
+}
+
+/// Acquires the mapping lock for the duration of a title memory map/unmap
+/// operation and its [`title_memory_remapped`] notification.
+pub fn title_memory_remapping() -> Remapping {
+    let depth = REMAPPING.with(|d| {
+        let n = d.get();
+        d.set(n + 1);
+        n
+    });
+    let _guard = (depth == 0).then(|| MAPPING.lock().unwrap_or_else(|e| e.into_inner()));
+    Remapping {
+        _guard,
+        _local: std::marker::PhantomData,
+    }
+}
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        REMAPPING.with(|d| d.set(d.get() - 1));
+    }
+}
+
+static REMAP_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// The current remap generation counter.
+pub(crate) fn current_epoch() -> u64 {
+    REMAP_EPOCH.load(Ordering::Acquire)
+}
+
+/// Runs `write` to copy bytes back into `[at, at + len)` while holding
+/// [`MAPPING`] so a concurrent remap cannot race between the remap check and
+/// the copy-back write. Returns `false` if any page in `[at, at + len)` was
+/// remapped since `since_epoch`.
+///
+/// Locks `MAPPING` non-reentrantly; must not be called while holding a
+/// [`Remapping`] guard.
+pub(crate) fn write_back(
+    tracked: Option<&Tracked>,
+    at: usize,
+    len: usize,
+    since_epoch: u64,
+    write: impl FnOnce(),
+) -> bool {
+    let _remap = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    if let Some(t) = tracked
+        && (first..last).any(|p| t.was_remapped_since(p, since_epoch))
+    {
+        return false;
+    }
+    let _writing = writing(at, len);
+    write();
+    true
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    let _remap = title_memory_remapping();
+    let epoch = REMAP_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
+    for (&page, holders) in g.holders.range(first..last) {
+        for c in holders {
+            c.remapped(page, epoch);
+        }
+    }
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -1417,7 +1550,7 @@ pub(crate) mod tests {
         assert!(t.changed(a / PAGE));
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert!(t.changed(a / PAGE), "take must leave the page changed");
-        t.taken(&[a / PAGE]);
+        t.taken(&[a / PAGE], 0);
         assert!(t.changed(a / PAGE), "taken must leave the page changed");
         // SAFETY: the second view of the page, kept open by `write`.
         unsafe { (b as *mut u32).write_volatile(0x1234) };
@@ -1437,6 +1570,69 @@ pub(crate) mod tests {
         drop(busy_c);
     }
 
+    /// Memory freed while a tracker holds it and allocated again at the same
+    /// address (the title's `VirtualFree`, which we do not see, then
+    /// `XMemVirtualAlloc`, which reports what it allocates as remapped): the
+    /// new memory has no guard, so a write there does not fault. Reported, it
+    /// is taken again and guarded again, so a later write counts; unreported,
+    /// the write is missed.
+    #[test]
+    fn memory_allocated_again_is_taken_again_once_reported() {
+        for report in [false, true] {
+            // Another test may allocate at the address between the free and
+            // the new allocation: then tried again elsewhere.
+            let (p, t) = (0..8)
+                .find_map(|_| {
+                    let p = pool(1);
+                    let t = track_copy(p, PAGE, true).expect("pool memory is tracked");
+                    assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+                    free(p);
+                    // SAFETY: a fresh allocation where ours was, freed below.
+                    let again = unsafe {
+                        VirtualAlloc(
+                            p as *const _,
+                            PAGE,
+                            MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                            PAGE_READWRITE,
+                        )
+                    } as usize;
+                    if again == p {
+                        return Some((p, t));
+                    }
+                    if again != 0 {
+                        free(again);
+                    }
+                    None
+                })
+                .expect("an address allocated again");
+            if report {
+                title_memory_remapped(p, PAGE);
+            }
+            // SAFETY: our new allocation, read-write: no fault.
+            unsafe { ((p + 8) as *mut u8).write_volatile(7) };
+            if !report {
+                assert!(
+                    t.take(p, p + PAGE).is_empty(),
+                    "unreported, the write is missed"
+                );
+                drop(t);
+                free(p);
+                continue;
+            }
+            assert_eq!(
+                t.take(p, p + PAGE),
+                [(p, p + PAGE)],
+                "the new memory is taken"
+            );
+            assert!(t.clean());
+            // SAFETY: as above, guarded again by the take: the handler opens it.
+            unsafe { ((p + 9) as *mut u8).write_volatile(8) };
+            assert!(t.changed(p / PAGE), "a later write counts");
+            drop(t);
+            free(p);
+        }
+    }
+
     /// A write or mapping that runs past the end of the address space (a
     /// title's `fread` with a huge count) covers up to the end; the sum used
     /// to overflow. Up there no test has guarded blocks.
@@ -1445,5 +1641,27 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// Remapping clears any armed/saved pre-write snapshot and records the
+    /// page until taken or disarmed.
+    #[test]
+    fn remapping_clears_saved_bytes_and_marks_page_remapped() {
+        let p = pool(1);
+        let t = track_copy(p, PAGE, true).expect("pool memory is tracked");
+        let page = p / PAGE;
+        assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+        t.arm(p, p + PAGE);
+        // SAFETY: committed page of ours, guarded: triggers save() before write.
+        unsafe { (p as *mut u8).write_volatile(0x55) };
+        title_memory_remapped(p, PAGE);
+        assert!(t.was_remapped(page));
+        assert!(t.saved(page).is_none(), "pre-remap saved bytes discarded");
+        assert!(t.changed(page));
+        t.disarm();
+        assert!(!t.was_remapped(page));
+        assert!(t.changed(page), "disarm does not clear changed");
+        drop(t);
+        free(p);
     }
 }

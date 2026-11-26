@@ -153,6 +153,7 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    let _remap = victory_gpu::title_memory_remapping();
     let mut at = allocate(&mut parameter);
     // A 32-bit request that found no room below 4 GiB: the guards there
     // make way for it.
@@ -172,6 +173,12 @@ pub extern "system" fn XMemVirtualAlloc(
                 "XMemVirtualAlloc refused"
             );
         }
+    } else {
+        // New memory where the title may have freed memory the GPU side's
+        // copies still hold (with the host's `VirtualFree`, which they do not
+        // see): what they took of it is gone, and so are their guards.
+        let end = base.max(at) as usize + size;
+        victory_gpu::title_memory_remapped(at as usize, end - at as usize);
     }
     if base.is_null() {
         tracing::debug!(
@@ -331,6 +338,17 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
 }
 
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
+///
+/// A 32-bit block's reservation is reported to the GPU side's copies first
+/// ([`victory_gpu::title_memory_remapped`]): what reuses it next may not
+/// report itself, and a copy-back still pending for the freed memory would
+/// otherwise land in the new memory.
+///
+/// shortcut: a heap block is not reported. The GPU side tracks only the
+/// runtime's write-watched pools and page views, so no tracker holds the
+/// host heap's memory, and a report would reach no copy. A copy-back still
+/// pending for a freed heap block can still land in what takes it next.
+/// Closing that needs remap state that copies without a tracker check.
 pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
         return;
@@ -339,6 +357,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            // Held across the report and the free: a copy-back checks under
+            // it, so it writes before the report or skips the memory.
+            let _remap = victory_gpu::title_memory_remapping();
+            freed(address as usize, reservation_len(address));
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -348,6 +370,43 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
         );
+    }
+}
+
+/// Tells the GPU side's copies that title memory `[at, at + len)` was
+/// freed: what it shows next is new.
+fn freed(at: usize, len: usize) {
+    #[cfg(test)]
+    FREED.with(|f| f.borrow_mut().push((at, len)));
+    victory_gpu::title_memory_remapped(at, len);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The ranges this thread's frees reported to the GPU side.
+    static FREED: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The bytes of the reservation at `base` (one `VirtualAlloc`'s): its
+/// regions, which guards and protection changes split, up to the first that
+/// belongs to no allocation or another.
+fn reservation_len(base: *mut c_void) -> usize {
+    let mut len = 0;
+    loop {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: a query into our own structure, of its size.
+        let got = unsafe {
+            VirtualQueryEx(
+                GetCurrentProcess(),
+                base.cast::<u8>().wrapping_add(len).cast(),
+                &mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if got == 0 || info.AllocationBase != base || info.RegionSize == 0 {
+            return len;
+        }
+        len += info.RegionSize;
     }
 }
 
@@ -706,6 +765,7 @@ pub extern "system" fn XMemMapPhysicalPages(
 ) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
+    let _remap = victory_gpu::title_memory_remapping();
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -773,6 +833,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
+    let _remap = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -1088,6 +1149,32 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `XMemFreeDefault` tells the GPU side's copies a 32-bit block's memory
+    /// is gone, before the host can hand it out again: its whole
+    /// reservation, even split by a protection change (as a guard makes).
+    /// Heap blocks are not reported (no tracker holds heap memory).
+    #[test]
+    fn freed_memory_is_reported_to_the_gpu_side() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        const HOST_PAGE: usize = 4 << 10;
+        let reported = || FREED.with(|f| std::mem::take(&mut *f.borrow_mut()));
+        reported();
+        let a = XMemAllocDefault(3 * HOST_PAGE, ALLOC_32BIT);
+        assert!(!a.is_null());
+        let mut old = 0;
+        let middle = a.cast::<u8>().wrapping_add(HOST_PAGE).cast();
+        // SAFETY: the middle page of our block.
+        let protected = unsafe { VirtualProtect(middle, HOST_PAGE, PAGE_READONLY, &mut old) };
+        assert_ne!(protected, 0);
+        XMemFreeDefault(a, ALLOC_32BIT);
+        assert_eq!(reported(), [(a as usize, 3 * HOST_PAGE)], "a 32-bit block");
+        let aligned = 16 << ALIGNMENT_SHIFT;
+        let b = XMemAllocDefault(5 << 16, aligned);
+        assert!(!b.is_null());
+        XMemFreeDefault(b, aligned);
+        assert!(reported().is_empty(), "a heap block");
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
