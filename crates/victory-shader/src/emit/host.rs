@@ -599,14 +599,14 @@ impl Host {
     /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
     /// does not, their results can differ in kind (NaN where an overflowing
     /// product meets an infinity, 0 where the fused result is tiny). Runs
-    /// the lowered `v_fma_f32` of (1 - 2^-24, 1 + 2^-23, -1) once: 2^-24 -
-    /// 2^-47 fused, 0 not.
+    /// the lowered `v_fma_f32` of (1 + 2^-23, 1 - 2^-23, -1) once: -2^-46
+    /// fused, 0 not.
     pub fn fuses_fmad(&self) -> Result<bool, String> {
         let shader = fmad_probe().map_err(|e| e.to_string())?;
         let (root, pso) = self.compute_pipeline(&shader)?;
         // Taken after the pipeline, which takes it itself.
         let _guard = self.lock_warp();
-        let operands = [0x3F7F_FFFF, 0x3F80_0001, 0xBF80_0000];
+        let operands: [u32; 3] = [0x3F80_0001, 0x3F7F_FFFE, 0xBF80_0000];
         let mut user_data = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
             if u.root == crate::native::RootType::Constants {

@@ -1183,7 +1183,7 @@ fn arithmetic_probes() -> Vec<Probe> {
         probe([vop2(0x05, 5, v(1), 2)], ab, F32, |i| {
             vec![add(i[1], i[0] ^ 0x8000_0000)]
         }),
-        // v_fmac_f32, v_mac_f32 and v_mac_legacy_f32 accumulate into v5 = c.
+        // v_fmac_f32, v_mac_f32 and v_fmac_legacy_f32 accumulate into v5 = c.
         accumulate(0x2B, fma, mad),
         accumulate(0x1F, mad, mad),
         accumulate(0x06, mad_legacy, mad_legacy),
