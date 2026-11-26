@@ -2562,6 +2562,11 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+/// [`read_into`] a buffer not yet written: on true every byte of `dst` is.
+pub(crate) fn read_into_uninit(src: *const u8, dst: &mut [std::mem::MaybeUninit<u8>]) -> bool {
+    read(src, dst.as_mut_ptr().cast(), dst.len())
+}
+
 /// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
 /// page is not readable or a destination page not writable (the bytes
 /// before that page may have been copied).
@@ -2611,7 +2616,7 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 
 #[cfg(test)]
 mod title_copies {
-    use super::{copy_mapped, write_mapped};
+    use super::{copy_mapped, read_into_uninit, write_mapped};
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
         VirtualAlloc, VirtualFree, VirtualProtect,
@@ -2648,6 +2653,24 @@ mod title_copies {
 
     fn pattern() -> Vec<u8> {
         (0..3 * BLOCK).map(|i| (i % 251) as u8 + 1).collect()
+    }
+
+    #[test]
+    fn read_into_uninit_rejects_unreadable_source_and_fills_entire_buffer() {
+        let source = holed(0x5a);
+
+        let mut unreadable = Box::<[u8]>::new_uninit_slice(BLOCK);
+        // SAFETY: the middle block is reserved but not committed; the kernel
+        // checks the source range and reports the failed read.
+        assert!(!read_into_uninit(unsafe { source.add(BLOCK) }, &mut unreadable));
+
+        let mut readable = Box::<[u8]>::new_uninit_slice(BLOCK);
+        assert!(read_into_uninit(source, &mut readable));
+        // SAFETY: a successful ReadProcessMemory call wrote every byte.
+        let readable = unsafe { readable.assume_init() };
+        assert!(readable.iter().all(|&byte| byte == 0x5a));
+
+        release(source);
     }
 
     #[test]
