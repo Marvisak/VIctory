@@ -257,7 +257,9 @@ unsafe extern "system" fn on_thread(_: *mut c_void, reason: u32, _: *mut c_void)
     // process if their per-thread state was touched first (the current
     // thread's id, which our logging asks for when title code calls us).
     // That state is put back as the thread started.
-    let saved = (reason == DLL_THREAD_ATTACH && started_by_rust()).then(OwnTls::save);
+    let saved = (reason == DLL_THREAD_ATTACH && started_by_rust())
+        .then(OwnTls::save)
+        .flatten();
     // Starts in load order, ends in reverse, as the Windows loader does.
     let notify_one = |(image, dll_main): &(Arc<LoadedImage>, bool)| {
         // SAFETY: attached images have their imports bound.
@@ -296,26 +298,53 @@ unsafe extern "C" {
 }
 
 impl OwnTls {
-    fn save() -> OwnTls {
+    fn save() -> Option<OwnTls> {
         let array: *const *mut u8;
         // SAFETY: reads TEB.ThreadLocalStoragePointer; the directory is our
         // image's, and Windows set up its block on this thread before
         // calling TLS callbacks.
-        let (block, len) = unsafe {
+        unsafe {
             std::arch::asm!("mov {}, gs:[0x58]", out(reg) array, options(nostack, readonly));
-            let dir = &raw const _tls_used;
-            let block = *array.add((*dir).index.read() as usize);
-            (block, (*dir).end - (*dir).start + (*dir).zero_fill as usize)
-        };
-        // SAFETY: the block is `len` bytes, live for the thread's life.
-        let saved = unsafe { std::slice::from_raw_parts(block, len) }.to_vec();
-        OwnTls { block, saved }
+            save_from(array, &raw const _tls_used)
+        }
     }
 
     fn restore(self) {
+        if self.block.is_null() || self.saved.is_empty() {
+            return;
+        }
         // SAFETY: the same block on the same thread, no reference to it held.
         unsafe { std::ptr::copy_nonoverlapping(self.saved.as_ptr(), self.block, self.saved.len()) };
     }
+}
+
+/// # Safety
+/// If non-null, `array` and `dir` must point to valid memory for static TLS reads.
+unsafe fn save_from(array: *const *mut u8, dir: *const TlsDirectory) -> Option<OwnTls> {
+    if array.is_null() || dir.is_null() {
+        return None;
+    }
+    // SAFETY: `dir` was checked non-null.
+    if unsafe { (*dir).index.is_null() } {
+        return None;
+    }
+    // SAFETY: `dir` was checked non-null.
+    let len = unsafe { (*dir).end }
+        .checked_sub(unsafe { (*dir).start })?
+        .checked_add(unsafe { (*dir).zero_fill as usize })?;
+    if len == 0 {
+        return None;
+    }
+    // SAFETY: `(*dir).index` was checked non-null.
+    let slot = unsafe { (*dir).index.read() as usize };
+    // SAFETY: `array` was checked non-null.
+    let block = unsafe { *array.add(slot) };
+    if block.is_null() {
+        return None;
+    }
+    // SAFETY: `block` was checked non-null and points to at least `len` bytes.
+    let saved = unsafe { std::slice::from_raw_parts(block, len) }.to_vec();
+    Some(OwnTls { block, saved })
 }
 
 /// Whether Rust's std started this thread (its start routine is in our
@@ -435,5 +464,127 @@ mod tests {
             out.status.success() && text.contains("ENDED KEPT"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn own_tls_save_rejects_null_pointers() {
+        let slot: u32 = 0;
+        let mut block = [1u8, 2, 3];
+        let mut array = [block.as_mut_ptr()];
+        let dir = super::TlsDirectory {
+            start: 0x1000,
+            end: 0x1003,
+            index: &raw const slot,
+            callbacks: 0,
+            zero_fill: 0,
+            characteristics: 0,
+        };
+
+        // Null array
+        // SAFETY: synthetic test passing null array.
+        assert!(unsafe { super::save_from(std::ptr::null(), &dir) }.is_none());
+        // Null dir
+        // SAFETY: synthetic test passing null directory.
+        assert!(unsafe { super::save_from(array.as_mut_ptr(), std::ptr::null()) }.is_none());
+        // Null dir.index
+        let null_index_dir = super::TlsDirectory {
+            index: std::ptr::null(),
+            ..dir
+        };
+        // SAFETY: synthetic test passing directory with null index.
+        assert!(unsafe { super::save_from(array.as_mut_ptr(), &null_index_dir) }.is_none());
+        // Null slot (*array.add(slot))
+        let mut null_slot_array = [std::ptr::null_mut()];
+        // SAFETY: synthetic test passing array with null block pointer.
+        assert!(unsafe { super::save_from(null_slot_array.as_mut_ptr(), &dir) }.is_none());
+    }
+
+    #[test]
+    fn own_tls_save_rejects_invalid_bounds_and_lengths() {
+        let slot: u32 = 0;
+        let mut block = [1u8, 2, 3];
+        let mut array = [block.as_mut_ptr()];
+
+        // Invalid bounds (end < start)
+        let inverted_dir = super::TlsDirectory {
+            start: 0x2000,
+            end: 0x1000,
+            index: &raw const slot,
+            callbacks: 0,
+            zero_fill: 0,
+            characteristics: 0,
+        };
+        // SAFETY: synthetic test passing inverted TLS bounds.
+        assert!(unsafe { super::save_from(array.as_mut_ptr(), &inverted_dir) }.is_none());
+
+        // Size overflow: end - start + zero_fill overflows usize
+        let overflow_dir = super::TlsDirectory {
+            start: 0,
+            end: usize::MAX,
+            index: &raw const slot,
+            callbacks: 0,
+            zero_fill: 1,
+            characteristics: 0,
+        };
+        // SAFETY: synthetic test passing overflowing TLS size.
+        assert!(unsafe { super::save_from(array.as_mut_ptr(), &overflow_dir) }.is_none());
+
+        // Zero-length TLS (end == start && zero_fill == 0)
+        let zero_len_dir = super::TlsDirectory {
+            start: 0x1000,
+            end: 0x1000,
+            index: &raw const slot,
+            callbacks: 0,
+            zero_fill: 0,
+            characteristics: 0,
+        };
+        // SAFETY: synthetic test passing zero-length TLS directory.
+        assert!(unsafe { super::save_from(array.as_mut_ptr(), &zero_len_dir) }.is_none());
+    }
+
+    #[test]
+    fn own_tls_save_and_restore_preserves_state() {
+        let mut block_data = vec![0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let original = block_data.clone();
+        let slot: u32 = 2;
+        let mut array: Vec<*mut u8> = vec![std::ptr::null_mut(); 4];
+        array[slot as usize] = block_data.as_mut_ptr();
+
+        let dir = super::TlsDirectory {
+            start: 0x1000,
+            end: 0x1004,
+            index: &raw const slot,
+            callbacks: 0,
+            zero_fill: 2,
+            characteristics: 0,
+        };
+
+        // len = (0x1004 - 0x1000) + 2 = 6
+        // SAFETY: array has 4 valid pointers and slot 2 points to block_data of 6 bytes.
+        let saved = unsafe { super::save_from(array.as_mut_ptr(), &dir) };
+        assert!(saved.is_some());
+        let saved = saved.unwrap();
+        assert_eq!(saved.saved, original);
+
+        // Overwrite the synthetic TLS block with different values
+        block_data.fill(0xAA);
+        assert_ne!(block_data, original);
+
+        // Restore and assert it matches original bytes exactly
+        saved.restore();
+        assert_eq!(block_data, original);
+
+        // Guard against null block or empty saved buffer on restore
+        let empty_tls = super::OwnTls {
+            block: block_data.as_mut_ptr(),
+            saved: Vec::new(),
+        };
+        empty_tls.restore();
+
+        let null_tls = super::OwnTls {
+            block: std::ptr::null_mut(),
+            saved: vec![1, 2, 3],
+        };
+        null_tls.restore();
     }
 }
