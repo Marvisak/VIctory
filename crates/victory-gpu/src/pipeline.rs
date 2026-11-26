@@ -20,6 +20,8 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 #[cfg(windows)]
 use std::sync::OnceLock;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
@@ -65,6 +67,8 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    claimed: AtomicBool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -95,6 +99,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            claimed: AtomicBool::new(false),
         }
     }
 
@@ -115,6 +121,22 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    pub(super) fn is_unstarted(&self) -> bool {
+        !self.claimed.load(Ordering::Acquire) && self.translated.get().is_none()
+    }
+
+    pub(super) fn is_done(&self) -> bool {
+        self.translated.get().is_some()
+    }
+
+    pub(super) fn try_claim(&self) -> bool {
+        !self.is_done() && !self.claimed.swap(true, Ordering::AcqRel)
+    }
+
+    pub(super) fn finish_translate(&self) {
+        self.translated();
+    }
+
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
