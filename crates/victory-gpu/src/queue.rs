@@ -535,13 +535,9 @@ extern "system" fn present(
         && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
-        use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
-        use windows::core::Interface;
-
-        const COPY_SOURCE: u32 = 0x800;
         // SAFETY: the title passes the plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
-        let mut resources: Vec<(This, ID3D12Resource, u32, bool)> =
+        let mut resources: Vec<(This, std::sync::Arc<crate::resource::HostTexture>)> =
             Vec::with_capacity(slice.len());
         for plane in slice {
             if plane.count == 0 || plane.resources.is_null() {
@@ -549,34 +545,20 @@ extern "system" fn present(
             }
             // SAFETY: the plane lists `count` resources.
             let resource = unsafe { *plane.resources };
-            if let Some(texture) = crate::resource::host_resource(resource) {
-                // Distinct title resources may refer to one host texture.
-                // Keep its original state for every plane and restore it once.
-                let prior = resources.iter().find_map(|(_, earlier, state, _)| {
-                    (earlier.as_raw() == texture.as_raw()).then_some(*state)
-                });
-                let state = prior.unwrap_or_else(|| {
-                    crate::resource::host_transition(resource, COPY_SOURCE)
-                        .map_or(COPY_SOURCE, |(_, before)| before)
-                });
-                resources.push((resource, texture, state, prior.is_none()));
+            if let Some(copy) = crate::resource::host_copy(resource) {
+                resources.push((resource, copy));
             }
         }
         if !resources.is_empty() {
-            let sources: Vec<(&_, u32)> = resources
+            let sources: Vec<_> = resources
                 .iter()
-                .map(|(_, tex, state, _)| (tex, *state))
+                .map(|(_, copy)| crate::host::PresentPlane::Tracked(copy))
                 .collect();
-            let shown = host.present(&sources, frame);
-            for &(resource, _, state, first) in &resources {
-                if first {
-                    crate::resource::host_transition(resource, state);
-                }
-            }
+            let (shown, state) = host.present_planes(&sources, frame);
             #[cfg(feature = "diagnostics")]
-            blinks(frame, resources[0].0, resources[0].2, shown);
+            blinks(frame, resources[0].0, state, shown);
             #[cfg(not(feature = "diagnostics"))]
-            let _ = shown;
+            let _ = (shown, state);
         }
     }
     #[cfg(not(windows))]
@@ -830,6 +812,134 @@ mod tests {
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(restored, TARGET, "the two planes share one rendering state");
+    }
+
+    /// Presenting a texture while another queue submits work on it must never
+    /// expose a phantom COPY_SOURCE state, emit a stale before-state barrier,
+    /// or clobber the state left by the concurrent submission.
+    #[cfg(windows)]
+    #[test]
+    fn present_does_not_expose_copy_source_or_clobber_concurrent_state() {
+        use std::collections::HashMap;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET,
+        };
+        use windows::core::Interface;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const TARGET: u32 = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        const SHADER: u32 = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32;
+        let address = crate::watch::tests::pool(1);
+        let null = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        #[repr(align(8))]
+        struct TextureWords([u32; 14]);
+        let desc = TextureWords([3, 0, 0, 0, 32, 0, 32, 1 | 1 << 16, 28, 1, 0, 1, 1, 0]);
+        let mut resource = null;
+        assert_eq!(
+            crate::resource::create_at_address(
+                null,
+                address as u64,
+                desc.0.as_ptr().cast(),
+                0,
+                null.cast(),
+                &iid,
+                &mut resource,
+            ),
+            S_OK
+        );
+        let copy = crate::resource::host_copy(resource).unwrap();
+        let raw = copy.texture.as_raw() as usize;
+        let setup = host.new_list().unwrap();
+        crate::list::ensure_state(&setup, resource, TARGET);
+        // SAFETY: live render target on an open list.
+        unsafe {
+            setup.list.ClearRenderTargetView(
+                host.rtv(&copy.texture, None),
+                &[0.2, 0.4, 0.6, 1.0],
+                None,
+            );
+        }
+        setup.close();
+        host.execute(&[&setup]);
+        assert_eq!(copy.state.load(Ordering::Relaxed), TARGET);
+
+        // Hold the presenter lock while another thread enters `present`, so a
+        // concurrent `Host::execute` runs between entering `present` and the
+        // present copy executing.
+        let hold = crate::host::tests::hold_presenter(host);
+        let (started_tx, started_rx) = mpsc::channel();
+        let resource_addr = resource as usize;
+        let presenter_thread = std::thread::spawn(move || {
+            let resource = resource_addr as This;
+            let plane = Plane {
+                token: 0,
+                count: 1,
+                resources: std::ptr::from_ref(&resource),
+                _rest: [0; 6],
+            };
+            let _ = crate::host::tests::issued();
+            started_tx.send(()).unwrap();
+            let hr = present(std::ptr::null(), 1, &plane, std::ptr::null());
+            (hr, crate::host::tests::issued())
+        });
+        started_rx.recv().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while copy.state.load(Ordering::Relaxed) == TARGET && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let observed_during_present = copy.state.load(Ordering::Relaxed);
+
+        let mut gpu_states = HashMap::from([(raw, TARGET)]);
+        let _ = crate::host::tests::issued();
+        let concurrent = host.new_list().unwrap();
+        crate::list::ensure_state(&concurrent, resource, SHADER);
+        concurrent.close();
+        host.execute(&[&concurrent]);
+        let concurrent_barriers = crate::host::tests::issued();
+        let concurrent_replay = crate::host::tests::replay(&concurrent_barriers, &mut gpu_states);
+
+        drop(hold);
+        let (hr, present_barriers) = presenter_thread.join().unwrap();
+        let present_replay = crate::host::tests::replay(&present_barriers, &mut gpu_states);
+        let state_after_present = copy.state.load(Ordering::Relaxed);
+
+        let _ = crate::host::tests::issued();
+        let followup = host.new_list().unwrap();
+        crate::list::ensure_state(&followup, resource, TARGET);
+        followup.close();
+        host.execute(&[&followup]);
+        let followup_barriers = crate::host::tests::issued();
+        let followup_replay = crate::host::tests::replay(&followup_barriers, &mut gpu_states);
+
+        let release = slot::<extern "system" fn(This) -> u32>(resource, 0x10);
+        assert_eq!(release(resource), 0);
+        drop((setup, concurrent, followup, copy));
+        crate::watch::tests::free(address);
+
+        assert_eq!(hr, S_OK);
+        assert_eq!(
+            observed_during_present, TARGET,
+            "present must not mutate tracked state before acquiring the submission lock"
+        );
+        assert_eq!(concurrent_replay, Ok(()), "concurrent submission barriers");
+        assert_eq!(present_replay, Ok(()), "present copy barriers");
+        assert_eq!(
+            state_after_present, SHADER,
+            "present must not clobber the state left by a concurrent submission"
+        );
+        assert_eq!(followup_replay, Ok(()), "follow-up submission barriers");
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
