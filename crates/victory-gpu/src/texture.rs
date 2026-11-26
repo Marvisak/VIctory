@@ -69,6 +69,15 @@ struct Last {
     hashes: Vec<Option<blake3::Hash>>,
 }
 
+/// Whether a texture in `layout` at `memory` has a base pipe/bank XOR. In an
+/// XOR layout the GPU takes one from base-address bits 8-15 of the
+/// texture's descriptor: Mesa ORs a surface's `tile_swizzle` into them
+/// (`va |= tile_swizzle << 8`). The render-target XOR tables assume none,
+/// so they hold only for a texture at a 64 KiB boundary.
+fn pipe_bank_xor(memory: *const u8, layout: &victory_formats::texture::Layout) -> bool {
+    layout.desc.swizzle.xor() && memory as usize & 0xFFFF != 0
+}
+
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
 /// are its mips), the bytes of the texture's memory it lies in, rounded out
 /// to the layout's blocks; empty if the layout cannot say.
@@ -793,8 +802,18 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         );
         return None;
     };
-    if layout.desc.swizzle.xor() {
+    // Render-target XOR layouts of one 2D slice and mip have addresses
+    // (`Layout::addressable`); the other XOR modes do not.
+    if !layout.addressable() {
         once!(?desc, "texture contents in an XOR mode not uploaded");
+        return None;
+    }
+    if pipe_bank_xor(memory, &layout) {
+        once!(
+            ?desc,
+            ?memory,
+            "texture contents in an XOR mode with a base pipe/bank XOR not uploaded"
+        );
         return None;
     }
     let host = host()?;
@@ -844,6 +863,129 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A title-written texture in a render-target XOR layout (256x256
+    /// RGBA8, `SW_64KB_R_X`) is staged: the bytes read back from the upload
+    /// buffer are the formats crate's detile of its memory.
+    #[test]
+    fn a_render_target_xor_texture_is_staged() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        let Some(host) = host() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 256,
+            height: 256,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_R_X,
+        })
+        .unwrap();
+        assert!(layout.addressable());
+        let d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let (mut rows, mut total) = (0u32, 0);
+        // SAFETY: outputs for one subresource.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                Some(&mut rows),
+                None,
+                Some(&mut total),
+            );
+        }
+        let memory: Vec<u8> = (0..layout.size as usize)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect();
+        let staging = Staging {
+            size: total,
+            spans: spans(&layout, 1, 1),
+            footprints: vec![footprint],
+            rows: vec![rows],
+            layout,
+            mips: 1,
+            memory: memory.as_ptr(),
+            tracked: None,
+            last: Mutex::default(),
+            uploads: Default::default(),
+            copied: Default::default(),
+        };
+        let (_, upload) = staging.refresh_now();
+        let (buffer, at, list) = upload.expect("staged");
+        assert_eq!(list, [0]);
+        let pitch = footprint.Footprint.RowPitch as usize;
+        let mut want = vec![0; pitch * rows as usize];
+        let len = want.len();
+        staging
+            .layout
+            .detile(&memory, 0, 0, &mut want, pitch, len)
+            .unwrap();
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: an upload buffer, mapped to read what was staged.
+        unsafe { buffer.Map(0, None, Some(&mut mapped)) }.unwrap();
+        let at = (footprint.Offset + at) as usize;
+        for row in 0..rows as usize {
+            // SAFETY: the staged rows of the subresource.
+            let got = unsafe {
+                std::slice::from_raw_parts(mapped.cast::<u8>().add(at + row * pitch), 256 * 4)
+            };
+            assert_eq!(got, &want[row * pitch..][..256 * 4], "row {row}");
+        }
+        // SAFETY: unmaps what was mapped above.
+        unsafe { buffer.Unmap(0, None) };
+    }
+
+    /// A render-target XOR texture off a 64 KiB boundary has a base
+    /// pipe/bank XOR the tables do not include, and is not staged; one on
+    /// a boundary, and linear textures anywhere, have none.
+    #[test]
+    fn a_base_pipe_bank_xor_is_refused() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let layout = |swizzle| {
+            Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width: 256,
+                height: 256,
+                depth: 1,
+                mips: 1,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle,
+            })
+            .unwrap()
+        };
+        let (xor, linear) = (layout(Swizzle::SW_64KB_R_X), layout(Swizzle::LINEAR));
+        let at = |address: usize| address as *const u8;
+        assert!(!pipe_bank_xor(at(0x3_0000), &xor));
+        assert!(pipe_bank_xor(at(0x3_0100), &xor));
+        assert!(pipe_bank_xor(at(0x3_8000), &xor));
+        assert!(!pipe_bank_xor(at(0x3_0100), &linear));
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {

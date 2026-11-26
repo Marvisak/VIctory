@@ -46,6 +46,7 @@ static SERIES_S: AtomicBool = AtomicBool::new(false);
 
 /// Set before the title starts.
 pub fn set(console: Console) {
+    victory_formats::texture::set_series_s_tiling(console == Console::SeriesS);
     SERIES_S.store(console == Console::SeriesS, Ordering::Relaxed);
 }
 
@@ -54,5 +55,34 @@ pub fn current() -> Console {
         Console::SeriesS
     } else {
         Console::SeriesX
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+
+    /// The console chosen picks the render-target XOR addresses a layout
+    /// gives: element 8 of a 4-byte `SW_64KB_R_X` row toggles bit 3 of x,
+    /// at 0x2000 on the Series X and 0x800 on the Series S.
+    #[test]
+    fn the_console_set_chooses_render_target_xor_addresses() {
+        let desc = Desc {
+            dimension: Dimension::Tex2d,
+            width: 256,
+            height: 256,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_R_X,
+        };
+        let at = || Layout::new(&desc).unwrap().offset(0, 8, 0, 0).unwrap();
+        set(Console::SeriesS);
+        let series_s = at();
+        set(Console::SeriesX);
+        assert_eq!((series_s, at()), (0x800, 0x2000));
     }
 }

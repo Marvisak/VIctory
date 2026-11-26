@@ -264,6 +264,83 @@ fn shared_pattern(kind: usize, element_log2: u32, block_log2: u32) -> &'static S
         .get_or_init(|| pattern(kind, element_log2, block_log2).map(|bits| spread(&bits)))
 }
 
+/// Whether render-target XOR layouts ([`Swizzle::SW_64KB_R_X`]) follow
+/// the Series S's pipes instead of the Series X's ([`set_series_s_tiling`]).
+static SERIES_S_TILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sets the console whose render-target XOR layouts [`Layout::new`] makes:
+/// the Series X and S route the pipe and bank bits of an address
+/// differently. Set with the emulated console, before any title texture.
+pub fn set_series_s_tiling(series_s: bool) {
+    SERIES_S_TILING.store(series_s, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The byte offsets inside a 64 KiB block of [`Swizzle::SW_64KB_R_X`] for
+/// each x and y (the low bits of each coordinate): GFX10
+/// `SW_64K_R_X_1xaa_RBPLUS` without a base pipe XOR, for 32 pipes and 8
+/// packers (Series X) or 8 pipes and 4 packers (Series S). Each table
+/// entry is the offset one coordinate bit toggles; bits past a block's
+/// side pick the pipe of the neighbouring blocks. Two-, four- and
+/// eight-byte elements only (none for others).
+fn render_xor_pattern(series_s: bool, element_bytes: u32) -> &'static SwizzlePattern {
+    static PATTERNS: [[OnceLock<SwizzlePattern>; 3]; 2] =
+        [const { [const { OnceLock::new() }; 3] }; 2];
+    let (index, x, y): (usize, &[u32], &[u32]) = match (series_s, element_bytes) {
+        (false, 2) => (
+            0,
+            &[2, 4, 8, 0x80, 0x200, 0x800, 0x1400, 0x8100, 0x1000],
+            &[
+                0x10, 0x20, 0x40, 0x2000, 0x300, 0x400, 0x4800, 0x8100, 0x1000,
+            ],
+        ),
+        (false, 4) => (
+            1,
+            &[4, 8, 0x40, 0x2000, 0x200, 0x800, 0x1400, 0x8100, 0x1000],
+            &[
+                0x10, 0x20, 0x80, 0x4000, 0x300, 0x400, 0x8800, 0x100, 0x1000,
+            ],
+        ),
+        (false, 8) => (
+            2,
+            &[8, 0x20, 0x40, 0x4000, 0x200, 0x800, 0x1400, 0x8100, 0x1000],
+            &[
+                0x10, 0x80, 0x2000, 0x8000, 0x300, 0x400, 0x800, 0x100, 0x1000,
+            ],
+        ),
+        (true, 2) => (
+            0,
+            &[2, 4, 8, 0x80, 0x200, 0x1400, 0x2100, 0x8000, 0x4000],
+            &[
+                0x10, 0x20, 0x40, 0x800, 0x300, 0x400, 0x4100, 0x8000, 0x2000,
+            ],
+        ),
+        (true, 4) => (
+            1,
+            &[4, 8, 0x40, 0x800, 0x200, 0x2400, 0x4100, 0x8000],
+            &[
+                0x10, 0x20, 0x80, 0x1000, 0x300, 0x400, 0x8100, 0x4000, 0x2000,
+            ],
+        ),
+        (true, 8) => (
+            2,
+            &[8, 0x20, 0x40, 0x1000, 0x200, 0x4400, 0x8100, 0x2000],
+            &[0x10, 0x80, 0x800, 0x2000, 0x300, 0x400, 0x8100, 0x4000],
+        ),
+        _ => return &EMPTY_PATTERN,
+    };
+    // Every combination of the bits: entry i is the XOR of the offsets of
+    // i's set bits.
+    let offsets = |basis: &[u32]| {
+        let mut offsets = vec![0];
+        for &value in basis {
+            let toggled: Vec<u32> = offsets.iter().map(|o| o ^ value).collect();
+            offsets.extend(toggled);
+        }
+        offsets
+    };
+    PATTERNS[usize::from(series_s)][index].get_or_init(|| [offsets(x), offsets(y), Vec::new()])
+}
+
 const MAX_MIPS: u32 = 16;
 
 /// The largest width, height and depth (or array size) accepted, in texels.
@@ -279,7 +356,14 @@ const BLOCK_256_3D: [[u32; 3]; 5] = [[8, 4, 8], [4, 4, 8], [4, 4, 4], [4, 2, 4],
 const BLOCK_1K_3D: [[u32; 3]; 5] = [[16, 8, 8], [8, 8, 8], [8, 8, 4], [8, 4, 4], [4, 4, 4]];
 
 impl Layout {
+    /// The layout of `desc`, render-target XOR ones as on the console
+    /// [`set_series_s_tiling`] chose.
     pub fn new(desc: &Desc) -> Result<Layout, Error> {
+        let series_s = SERIES_S_TILING.load(std::sync::atomic::Ordering::Relaxed);
+        Self::new_for_model(desc, series_s)
+    }
+
+    fn new_for_model(desc: &Desc, series_s: bool) -> Result<Layout, Error> {
         let d = *desc;
         let block_log2 = d.swizzle.block_log2().ok_or(Error::Invalid)?;
         let valid = (1..=MAX_EXTENT).contains(&d.width)
@@ -302,7 +386,7 @@ impl Layout {
         if block_log2 == 0 {
             Ok(Layout::linear(d))
         } else {
-            Ok(Layout::tiled(d, block_log2))
+            Ok(Layout::tiled(d, block_log2, series_s))
         }
     }
 
@@ -344,7 +428,7 @@ impl Layout {
         }
     }
 
-    fn tiled(d: Desc, block_log2: u32) -> Layout {
+    fn tiled(d: Desc, block_log2: u32, series_s: bool) -> Layout {
         let element_log2 = d.element_bytes.trailing_zeros();
         let bpe = u64::from(d.element_bytes);
         let block_bytes = 1u64 << block_log2;
@@ -509,6 +593,14 @@ impl Layout {
                 usize::from(d.swizzle.display())
             };
             shared_pattern(kind, element_log2, block_log2)
+        } else if d.swizzle == Swizzle::SW_64KB_R_X
+            && d.dimension == Dimension::Tex2d
+            && d.depth == 1
+            && d.mips == 1
+            && d.samples == 1
+            && d.block == 1
+        {
+            render_xor_pattern(series_s, d.element_bytes)
         } else {
             &EMPTY_PATTERN
         };
@@ -570,7 +662,21 @@ impl Layout {
             let row = u64::from(y) * u64::from(m.pitch) + u64::from(x);
             return Ok(base + row * u64::from(self.desc.element_bytes));
         }
+        if self.desc.swizzle == Swizzle::SW_64KB_R_X {
+            return Ok(self.render_xor_offset(m, x, y));
+        }
         Ok(base + self.row(m, y, z) + self.column(m, x))
+    }
+
+    /// [`Layout::offset`] of element (`x`, `y`) of a render-target XOR
+    /// layout (one 2D slice and mip): its block's, and the XOR of what its
+    /// coordinates' bits toggle.
+    fn render_xor_offset(&self, m: &Mip, x: u32, y: u32) -> u64 {
+        let [w, h, _] = self.block;
+        let block = u64::from(y / h) * u64::from(m.pitch / w) + u64::from(x / w);
+        let [ox, oy, _] = self.pattern;
+        let inside = ox[x as usize & (ox.len() - 1)] ^ oy[y as usize & (oy.len() - 1)];
+        block * self.alignment + u64::from(inside)
     }
 
     /// The part of an address that depends on the row (and depth in a
@@ -678,6 +784,18 @@ impl Layout {
             .ok_or(Error::TooSmall)?;
         if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
+        }
+        if self.desc.swizzle == Swizzle::SW_64KB_R_X {
+            // The low four address bits are column bits only (in every
+            // table): runs of 16 bytes, the last of a row maybe shorter.
+            for y in 0..m.height {
+                for x in (0..m.width).step_by(16 / n) {
+                    let at = x as usize * n;
+                    let tiled = self.render_xor_offset(m, x, y) as usize;
+                    copy(tiled, y as usize * row_pitch + at, 16.min(bytes - at));
+                }
+            }
+            return Ok(());
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
@@ -1364,5 +1482,93 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    /// Render-target XOR layouts against addresses AMD's address library
+    /// gives (`Addr2ComputeSurfaceAddrFromCoord`, GFX10.3, PAL c5e8000, as
+    /// DexNom computed them): FNV-1a of every element's offset in row
+    /// order, for a square of whole blocks and one of odd sides (high
+    /// coordinate bits, a last partial run). Tiling and detiling move each
+    /// element to and from its offset.
+    #[test]
+    fn render_xor_layouts_match_the_address_library() {
+        for (series_s, n, hashes) in [
+            (false, 2, [0x1051_4417_061b_8725, 0x11a5_5308_ad39_a7b9]),
+            (false, 4, [0xd455_6429_b544_c925, 0x7a23_0211_6719_e58f]),
+            (false, 8, [0x30aa_2558_9f79_5b25, 0xb5f4_83c6_ddf1_1404]),
+            (true, 2, [0x67cd_e4ff_6e72_8f25, 0x2eb4_8d52_f015_da36]),
+            (true, 4, [0xce79_8e86_f5ab_1d25, 0x6cdd_f048_fc97_e768]),
+            (true, 8, [0xe107_baa8_9506_c525, 0x7b7f_2a81_2bdc_611b]),
+        ] {
+            for ((w, h), expected) in [(256, 256), (513, 357)].into_iter().zip(hashes) {
+                let d = desc(w, h, 1, n, Swizzle::SW_64KB_R_X);
+                let l = Layout::new_for_model(&d, series_s).unwrap();
+                assert!(l.addressable());
+                let n = n as usize;
+                let pitch = w as usize * n + 32;
+                let mut linear = vec![0x55; pitch * h as usize];
+                let mut reference = vec![0xee; l.size as usize];
+                let mut hash = 0xcbf2_9ce4_8422_2325u64;
+                for y in 0..h {
+                    for x in 0..w {
+                        let at = l.offset(0, x, y, 0).unwrap() as u32;
+                        for b in at.to_le_bytes() {
+                            hash = (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+                        }
+                        let seed = u64::from(x + w * y).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                        let seed = &seed.to_le_bytes()[..n];
+                        let src = y as usize * pitch + x as usize * n;
+                        linear[src..][..n].copy_from_slice(seed);
+                        reference[at as usize..][..n].copy_from_slice(seed);
+                    }
+                }
+                assert_eq!(hash, expected, "series S {series_s}, {n} bytes, {w}x{h}");
+                let mut tiled = vec![0xee; l.size as usize];
+                l.tile(&mut tiled, 0, 0, &linear, pitch, 0).unwrap();
+                assert_eq!(tiled, reference);
+                let mut output = vec![0x55; linear.len()];
+                l.detile(&tiled, 0, 0, &mut output, pitch, 0).unwrap();
+                assert_eq!(linear, output);
+            }
+        }
+    }
+
+    /// Each 64 KiB block of a render-target XOR layout holds each of its
+    /// elements once, wherever the block lies (the coordinate bits past a
+    /// block's side change the pipe, not the set of offsets); other element
+    /// sizes, mips, arrays and samples stay unaddressable.
+    #[test]
+    fn render_xor_blocks_hold_each_element_once() {
+        for series_s in [false, true] {
+            for n in [2u32, 4, 8] {
+                let d = desc(1024, 512, 1, n, Swizzle::SW_64KB_R_X);
+                let l = Layout::new_for_model(&d, series_s).unwrap();
+                let [bw, bh, _] = l.block;
+                for (bx, by) in [(0, 0), (1, 0), (0, 1), (1, 1), (3, 2)] {
+                    let mut seen = vec![false; (l.alignment / u64::from(n)) as usize];
+                    let first = l.offset(0, bx * bw, by * bh, 0).unwrap();
+                    let base = first - first % l.alignment;
+                    for y in by * bh..(by + 1) * bh {
+                        for x in bx * bw..(bx + 1) * bw {
+                            let inside = l.offset(0, x, y, 0).unwrap() - base;
+                            assert!(inside < l.alignment && inside.is_multiple_of(u64::from(n)));
+                            let slot = &mut seen[(inside / u64::from(n)) as usize];
+                            assert!(!*slot, "series S {series_s}, {n} bytes: ({x}, {y}) twice");
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+            for d in [
+                desc(256, 256, 1, 16, Swizzle::SW_64KB_R_X),
+                desc(256, 256, 2, 4, Swizzle::SW_64KB_R_X),
+                Desc {
+                    depth: 2,
+                    ..desc(256, 256, 1, 4, Swizzle::SW_64KB_R_X)
+                },
+            ] {
+                assert!(!Layout::new_for_model(&d, series_s).unwrap().addressable());
+            }
+        }
     }
 }
