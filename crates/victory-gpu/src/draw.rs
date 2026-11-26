@@ -651,10 +651,9 @@ impl State {
                 self.apply_depth_bounds(list);
             }
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
-            // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            // The title may release the pipeline before it submits the list;
+            // one the list has already kept is kept (and named) once.
+            list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding(&p.name);
