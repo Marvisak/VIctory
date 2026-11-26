@@ -1027,7 +1027,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&lists[0], &lists[1]]);
         assert_eq!(read(), [0x100, 0x101, 0x102, 0x103, 0x200, 0x201, 0x202, 0x203]);
         let pairs = (pair_of(OURS, &a).unwrap(), pair_of(OURS, &b).unwrap());
-        assert!(pairs.0 >= 1 << 18 && pairs.1 >= 1 << 18, "past the dynamic slots");
+        // Past the dynamic slots, however many the host's heap took.
+        let past = views.address_slots();
+        assert!(pairs.0 >= past && pairs.1 >= past, "past the dynamic slots: {pairs:?}, {past}");
         // A second submission, after a third copy came.
         let c = copy(memory[2], 1);
         for list in &lists {
