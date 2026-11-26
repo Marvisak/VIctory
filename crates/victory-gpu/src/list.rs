@@ -1082,22 +1082,16 @@ extern "system" fn clear_dsv(
 }
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
-/// are title memory, copied at submission like buffer copies (if mapped).
+/// are title memory, copied at submission with the buffer copies: a copy
+/// the list's shaders write the source or destination of runs after the
+/// copy-backs, and one past a deferred copy's destination chains after it.
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
     {
-        let len = len as usize;
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        list.defer_copy(dst as *mut u8, src as *const u8, len as usize);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
@@ -2045,5 +2039,58 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    /// A `CopyMemoryToMemoryX` of memory the list's shaders write copies
+    /// after the copy-backs, like the buffer copies: it reads what the GPU
+    /// wrote, not the old bytes.
+    #[cfg(windows)]
+    #[test]
+    fn a_memory_copy_past_a_gpu_write_sees_what_it_wrote() {
+        use crate::watch::PAGE;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let Some(host_list) = host_list(list) else {
+            assert_eq!(release(list), 0);
+            assert_eq!(release(allocator), 0);
+            return;
+        };
+        let pools = [crate::watch::tests::pool(1), crate::watch::tests::pool(1)];
+        // SAFETY: our pool, not guarded yet.
+        unsafe { (pools[0] as *mut u8).write_volatile(0xAA) };
+        crate::shadow::register(pools[0], pools[0] as u64, PAGE as u64);
+        let copy = crate::shadow::find(pools[0] as u64, PAGE as u64).unwrap();
+        // The program writes the first page of pool 0: the declaration
+        // first, the shader's write after.
+        copy.refresh(host_list, pools[0] as u64, PAGE as u64);
+        copy.gpu_writes(host_list, pools[0] as u64, PAGE as u64, false);
+        let c = copy.clone();
+        host_list.defer_host(move || c.write_host(pools[0] as u64, &[0xBB]));
+        copy_memory(list, pools[1] as u64, pools[0] as u64, PAGE as u64, 0);
+        close(list);
+        host.execute(&[host_list]);
+        // SAFETY: a byte of our pool.
+        let at = unsafe { (pools[1] as *const u8).read_volatile() };
+        assert_eq!(at, 0xBB, "the copy sees what the shaders wrote");
+        crate::shadow::unregister(pools[0], pools[0] as u64);
+        drop(copy);
+        for &p in &pools {
+            crate::watch::tests::free(p);
+        }
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
     }
 }
