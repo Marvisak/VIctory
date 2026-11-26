@@ -422,7 +422,8 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
     Some((footprint, u32::try_from(height / block).ok()?, row_size))
 }
 
-/// Places subresources at 512-byte boundaries in an upload buffer.
+/// Places subresources at 512-byte boundaries relative to the supplied base.
+/// The base is added to each relative offset as given.
 /// Row pitch is aligned to 512 bytes for depth/stencil planes and 256 bytes
 /// otherwise. Unknown sizes give the documented all-ones values.
 pub(crate) extern "system" fn copyable_footprints(
@@ -445,7 +446,7 @@ pub(crate) extern "system" fn copyable_footprints(
         let one = desc.and_then(|d| subresource(d, first + i));
         let (layout, row_count, row_size) = match one {
             Some((mut footprint, row_count, row_size)) => {
-                footprint.offset = end.next_multiple_of(PLACEMENT);
+                footprint.offset = base + (end - base).next_multiple_of(PLACEMENT);
                 let pitch = u64::from(footprint.row_pitch);
                 let lines = u64::from(row_count) * u64::from(footprint.depth);
                 end = footprint.offset + pitch * lines.saturating_sub(1) + row_size;
@@ -2702,6 +2703,65 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    #[test]
+    fn copyable_footprints_add_the_exact_base_offset() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_DESC,
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+        let desc = texture(10, 6, 28, 2);
+        let native = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 10,
+            Height: 6,
+            DepthOrArraySize: 1,
+            MipLevels: 2,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        for base in [0, 1, 255, 512, 513] {
+            let mut layouts = [NO_FOOTPRINT; 2];
+            let mut total = 0;
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                0,
+                2,
+                base,
+                layouts.as_mut_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut total,
+            );
+            let offsets = layouts.map(|layout| layout.offset);
+            let expected = [base, base + 1536];
+            if let Some(host) = crate::host::host() {
+                let mut native_layouts = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
+                let mut native_total = 0;
+                // SAFETY: a valid description and two writable output entries.
+                unsafe {
+                    host.device.GetCopyableFootprints(
+                        &native,
+                        0,
+                        2,
+                        base,
+                        Some(native_layouts.as_mut_ptr()),
+                        None,
+                        None,
+                        Some(&mut native_total),
+                    );
+                }
+                assert_eq!(native_layouts.map(|layout| layout.Offset), expected);
+                assert_eq!(native_total, 2068);
+            }
+            assert_eq!(offsets, expected, "base {base}");
+            assert_eq!(total, 2068, "base {base}");
+        }
     }
 
     #[test]
