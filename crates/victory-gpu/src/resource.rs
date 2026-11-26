@@ -2954,7 +2954,10 @@ mod tests {
         // WARP/D3D12 allocation could otherwise expire it and let the test
         // pass through the ordinary shared-cache path.
         let forced_deadline = now_ms().saturating_add(30_000);
-        a.refused_until.store(forced_deadline, std::sync::atomic::Ordering::Relaxed);
+        a.refused_until.store(
+            forced_deadline,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         let shared = host_copy(succeeds).expect("second Resource creates the shared texture");
         assert!(
