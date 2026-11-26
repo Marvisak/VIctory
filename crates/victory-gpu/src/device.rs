@@ -373,6 +373,24 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// Device methods 0x1c8 (graphics) and 0x218 (compute): `(desc, iid, out)`,
+/// a pipeline from the title's cache of precompiled native code. On failure
+/// Grand Theft Auto VI makes the same pipeline from its ordinary
+/// description (0x2b0, 0x1f0), which we translate; native-only pipelines
+/// we could not, so these fail on purpose.
+extern "system" fn precompiled_pipeline(
+    _: This,
+    _desc: *const c_void,
+    _iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { *out = std::ptr::null() };
+    }
+    E_NOTIMPL
+}
+
 /// The host device's state: the console's device is removed when the host's is.
 extern "system" fn removed_reason(_: This) -> HRESULT {
     #[cfg(windows)]
@@ -422,8 +440,10 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
+    f[57] = precompiled_pipeline as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
+    f[67] = precompiled_pipeline as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
@@ -592,6 +612,21 @@ mod tests {
             check(device, 8, waves.as_mut_ptr().cast(), 16),
             E_INVALIDARG
         );
+    }
+
+    #[test]
+    fn precompiled_pipelines_fail_with_no_object() {
+        type Load = extern "system" fn(This, *const c_void, *const Iid, *mut This) -> HRESULT;
+        let device = device();
+        for offset in [0x1c8, 0x218] {
+            let mut out = device;
+            let load = slot::<Load>(device, offset);
+            assert_eq!(
+                load(device, std::ptr::null(), std::ptr::null(), &mut out),
+                E_NOTIMPL
+            );
+            assert!(out.is_null());
+        }
     }
 
     #[test]
