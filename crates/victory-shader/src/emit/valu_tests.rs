@@ -306,12 +306,12 @@ fn v_fma_f16_rounds_once_and_preserves_other_half() {
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
         let adapter: IDXGIAdapter1 = factory
-            .EnumAdapterByLuid(host.device.GetAdapterLuid())
+            .EnumAdapterByLuid(host.device().GetAdapterLuid())
             .unwrap();
         let desc = adapter.GetDesc1().unwrap();
         let name = String::from_utf16_lossy(&desc.Description);
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-        host.device
+        host.device()
             .CheckFeatureSupport(
                 D3D12_FEATURE_D3D12_OPTIONS1,
                 (&raw mut options).cast(),

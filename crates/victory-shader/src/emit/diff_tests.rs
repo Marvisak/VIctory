@@ -1289,7 +1289,7 @@ fn cube_gradients_pick_the_level() {
         );
         // SAFETY: the PC container carries its root signature.
         let root_p: ID3D12RootSignature =
-            unsafe { host.device.CreateRootSignature(0, &cs_p) }.unwrap();
+            unsafe { host.device().CreateRootSignature(0, &cs_p) }.unwrap();
         let pso_p = host.compute_pipeline_with(&root_p, &cs_p).unwrap();
         let table = |sampler, index| Root::Table { sampler, index };
         let theirs = run(

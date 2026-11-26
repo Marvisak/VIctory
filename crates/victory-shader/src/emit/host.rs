@@ -15,7 +15,8 @@ use super::container::SigElement;
 use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
-    pub device: ID3D12Device,
+    device: ID3D12Device,
+    queue: OnceLock<ID3D12CommandQueue>,
     warp: bool,
 }
 
@@ -64,12 +65,33 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
-/// A D3D12 device kept alive for the process so concurrent callers do not
-/// race creating and tearing down the same singleton adapter device.
-struct SharedDevice(ID3D12Device);
+/// One device and command queue per adapter kind, kept alive for the process.
+/// They are always handed out as a pair, so a queue cannot outlive a different
+/// device. Every vkd3d-proton queue starts a fence thread; thousands of queues
+/// make Wine's process teardown exceed wineserver's 0.5 s kill timeout.
+struct SharedDevice {
+    device: ID3D12Device,
+    queue: ID3D12CommandQueue,
+}
 
-// SAFETY: `ID3D12Device` is free-threaded; cloning increments its COM
-// reference count.
+impl SharedDevice {
+    /// COM clones keep both halves alive after the cache replaces this pair.
+    fn pair(&self) -> Self {
+        Self {
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+        }
+    }
+
+    /// D3D12 reports device removal here; a removed device is unusable.
+    fn removed(&self) -> bool {
+        // SAFETY: a plain query on a live device handle.
+        unsafe { self.device.GetDeviceRemovedReason() }.is_err()
+    }
+}
+
+// SAFETY: `ID3D12Device` and its queue are free-threaded; cloning increments
+// their COM reference counts.
 unsafe impl Send for SharedDevice {}
 // SAFETY: as above.
 unsafe impl Sync for SharedDevice {}
@@ -105,6 +127,24 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
         }
         Ok(device)
     }
+}
+
+fn create_queue(device: &ID3D12Device) -> Result<ID3D12CommandQueue, String> {
+    // SAFETY: a direct queue with a valid out pointer.
+    unsafe {
+        device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+            .map_err(err)
+    }
+}
+
+fn create_shared(warp: bool) -> Result<SharedDevice, String> {
+    let device = create_device(warp)?;
+    let queue = create_queue(&device)?;
+    Ok(SharedDevice { device, queue })
 }
 
 /// Whether `device` runs on a software adapter (WARP); `true` when that
@@ -157,8 +197,80 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
 /// Serializes WARP (`d3d10warp.dll`) operations across threads: concurrent
 /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
 static WARP_LOCK: Mutex<()> = Mutex::new(());
+static HARDWARE_DEVICE: Mutex<Option<SharedDevice>> = Mutex::new(None);
+static WARP_DEVICE: Mutex<Option<SharedDevice>> = Mutex::new(None);
+
+/// The live device/queue pair for an adapter kind. A removed device is
+/// discarded and recreated on the next call. Creation failures are not
+/// cached: `Host::new(false)` retried on every call before the cache, and a
+/// driver or adapter that appears later must remain usable.
+fn shared(warp: bool) -> Result<SharedDevice, String> {
+    let slot = if warp { &WARP_DEVICE } else { &HARDWARE_DEVICE };
+    let mut cache = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(current) = cache.as_ref() {
+        if !current.removed() {
+            return Ok(current.pair());
+        }
+        // Existing Hosts keep their own clones and see the removal in their
+        // completion checks; only new ones get a fresh pair.
+        *cache = None;
+    }
+    let _warp = warp.then(|| WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let made = create_shared(warp)?;
+    let pair = made.pair();
+    *cache = Some(made);
+    Ok(pair)
+}
+
+/// Signals `value` on the queue and waits until the fence reaches it, before
+/// any readback is mapped. A removed device reports `u64::MAX` as the
+/// completed value: that is removal, not completion, so check the device on
+/// both sides of the last fence read.
+fn wait_for_completion(
+    device: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    fence: &ID3D12Fence,
+    value: u64,
+) -> Result<(), String> {
+    // SAFETY: the device, queue and fence are live for the whole call.
+    unsafe {
+        queue.Signal(fence, value).map_err(err)?;
+        loop {
+            if let Err(e) = device.GetDeviceRemovedReason() {
+                return Err(format!("device removed: {}", err(e)));
+            }
+            let completed = fence.GetCompletedValue();
+            if completed == u64::MAX {
+                return Err("device removed: fence completion is u64::MAX".into());
+            }
+            if completed >= value {
+                if let Err(e) = device.GetDeviceRemovedReason() {
+                    return Err(format!("device removed: {}", err(e)));
+                }
+                return Ok(());
+            }
+            std::thread::yield_now();
+        }
+    }
+}
 
 impl Host {
+    /// The device this host's queue belongs to.
+    pub fn device(&self) -> &ID3D12Device {
+        &self.device
+    }
+
+    fn queue(&self) -> Result<&ID3D12CommandQueue, String> {
+        if let Some(queue) = self.queue.get() {
+            return Ok(queue);
+        }
+        // Cache successes only. A transient creation error (or one while the
+        // device was removed) must not stick for this host's lifetime.
+        let queue = create_queue(&self.device)?;
+        let _ = self.queue.set(queue); // another thread may have won the race
+        Ok(self.queue.get().expect("queue just set"))
+    }
+
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
         self.warp
             .then(|| WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
@@ -169,23 +281,19 @@ impl Host {
     /// refused, so hardware-only checks never run on WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-        if warp {
-            static WARP: OnceLock<Result<SharedDevice, String>> = OnceLock::new();
-            let shared = WARP.get_or_init(|| {
-                let _guard = WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                create_device(true).map(SharedDevice)
-            });
-            return shared
-                .as_ref()
-                .map(|d| Host {
-                    device: d.0.clone(),
-                    warp: true,
-                })
-                .map_err(Clone::clone);
-        }
+        Self::new_for(warp)
+    }
+
+    /// A host on the chosen adapter kind, ignoring `VICTORY_WARP` so a test
+    /// that needs the hardware path cannot silently get WARP instead.
+    fn new_for(warp: bool) -> Result<Self, String> {
+        let pair = shared(warp)?;
+        let queue = OnceLock::new();
+        queue.set(pair.queue.clone()).expect("fresh queue cell");
         Ok(Host {
-            device: create_device(false)?,
-            warp: false,
+            device: pair.device,
+            queue,
+            warp,
         })
     }
 
@@ -193,7 +301,11 @@ impl Host {
     /// serialised as WARP's is when the device runs on a software adapter.
     pub fn from_device(device: ID3D12Device) -> Self {
         let warp = on_software_adapter(&device);
-        Host { device, warp }
+        Host {
+            device,
+            queue: OnceLock::new(),
+            warp,
+        }
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -617,12 +729,7 @@ impl Host {
         // SAFETY: D3D12 calls with descriptions that outlive them; the
         // resources stay alive until the fence says the GPU is done.
         unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
+            let queue = self.queue()?;
             let alloc: ID3D12CommandAllocator = dev
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .map_err(err)?;
@@ -716,13 +823,7 @@ impl Host {
             list.Close().map_err(err)?;
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-            queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
+            wait_for_completion(dev, queue, &fence, 1)?;
             let mut p = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut p)).map_err(err)?;
             let bits = p.cast::<u32>().read();
@@ -783,12 +884,17 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
+    lower_native(&native)
+}
+
+/// Lowers a synthetic compute program as the title's programs are lowered.
+fn lower_native(native: &crate::native::NativeProgram) -> Result<HostShader, crate::ShaderError> {
     let p = crate::ir::build(&native.code, native.wave64, native.vgprs)?;
     let st = crate::structure::structure(&p)?;
     let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    let io = crate::io::raise(&p, &native)?;
+    let io = crate::io::raise(&p, native)?;
     let lowered = super::lower::lower(&super::lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -800,7 +906,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         view_marks: false,
     })?;
     Ok(HostShader {
-        stage: HwStage::Cs,
+        stage: native.stage,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
         samplers: lowered.samplers,
@@ -967,12 +1073,7 @@ impl Host {
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // are kept alive until the fence says the GPU is done.
         unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
+            let queue = self.queue()?;
             let alloc: ID3D12CommandAllocator = dev
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .map_err(err)?;
@@ -1243,19 +1344,7 @@ impl Host {
             list.Close().map_err(err)?;
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-            queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if dev.GetDeviceRemovedReason().is_err() {
-                    return Err(format!(
-                        "device removed: {}",
-                        err(dev.GetDeviceRemovedReason().unwrap_err())
-                    ));
-                }
-                std::thread::yield_now();
-            }
-            if let Err(e) = dev.GetDeviceRemovedReason() {
-                return Err(format!("device removed: {}", err(e)));
-            }
+            wait_for_completion(dev, queue, &fence, 1)?;
             let mut p = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut p)).map_err(err)?;
             let mut out = Vec::with_capacity((w * h) as usize);
@@ -1407,12 +1496,7 @@ impl Host {
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
         unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
+            let queue = self.queue()?;
             let alloc: ID3D12CommandAllocator = dev
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .map_err(err)?;
@@ -1986,13 +2070,7 @@ impl Host {
             list.Close().map_err(err)?;
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-            queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
+            wait_for_completion(dev, queue, &fence, 1)?;
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
                 let mut p = std::ptr::null_mut();
@@ -2037,7 +2115,11 @@ mod tests {
             return;
         };
         let second = Host::new(true).expect("second WARP Host::new");
-        assert_eq!(first.device, second.device, "WARP device should be shared");
+        assert_eq!(
+            first.device(),
+            second.device(),
+            "WARP device should be shared"
+        );
 
         let ps = stub_ps();
         let vs = stub_vs(&ps).expect("stub_vs");
@@ -2067,6 +2149,141 @@ mod tests {
                             .expect("WARP draw");
                         assert_eq!(out.len(), 16);
                     }
+                });
+            }
+        });
+    }
+
+    /// A one-thread compute shader that copies root-constant dword 0 into
+    /// dword 0 of the raw UAV at heap index 0.
+    fn constant_probe() -> HostShader {
+        use crate::native::{
+            ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo,
+            UsedResource,
+        };
+
+        let words: [u32; 7] = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xFA00_0000,
+            0x7E00_0200, // v_mov_b32 v0, s0
+            0xE070_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0x8002_0000,
+            0xBF81_0000, // s_endpgm
+        ];
+        let param = |root, user_data, sgprs, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                param(RootType::Constants, 0, 4, 0),
+                param(RootType::Table, 4, 1, 1),
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        lower_native(&native).expect("constant probe")
+    }
+
+    /// The hardware path uses one queue for every host. Several threads
+    /// dispatch on it at once, each checking its own readback token.
+    /// Skipped only without a hardware SM 6.6 device; a queue that cannot be
+    /// made on one fails.
+    #[test]
+    fn parallel_hardware_dispatches_on_shared_queue() {
+        let first = match Host::new_for(false) {
+            Ok(host) => host,
+            Err(shared) => {
+                // `shared()` makes the device before the queue. When the
+                // device can still be made, this is a queue failure: report
+                // it rather than hiding it behind an unrelated skip. Only
+                // skip when no SM 6.6 device can be made either, printing
+                // both errors so the original failure stays visible.
+                match create_device(false) {
+                    Err(device) => {
+                        eprintln!(
+                            "no hardware SM 6.6 adapter ({device}); skipped; shared queue: {shared}"
+                        );
+                        return;
+                    }
+                    Ok(_) => panic!("hardware device made, shared queue failed: {shared}"),
+                }
+            }
+        };
+        let second = Host::new_for(false).expect("second hardware Host::new");
+        assert_eq!(
+            first.device(),
+            second.device(),
+            "hardware device should be shared"
+        );
+        let queue = first.queue().expect("first hardware queue");
+        assert_eq!(
+            queue,
+            second.queue().expect("second hardware queue"),
+            "hardware queue should be shared"
+        );
+        // Workers compare addresses: `first` keeps this queue alive.
+        let queue = queue.as_raw() as usize;
+
+        let shader = constant_probe();
+        let threads = 8;
+        let barrier = Barrier::new(threads);
+        let shader = &shader;
+        let barrier = &barrier;
+        std::thread::scope(|s| {
+            for i in 0..threads {
+                let token = 0xA5A5_0000 | i as u32;
+                s.spawn(move || {
+                    let setup = Host::new_for(false).map(|host| {
+                        let pipeline = host.compute_pipeline(shader);
+                        (host, pipeline)
+                    });
+                    // A worker with a setup error must still release its peers.
+                    barrier.wait();
+                    let (host, pipeline) = setup.expect("hardware Host::new");
+                    let (root, pso) = pipeline.expect("hardware pipeline");
+                    let own = host.queue().expect("worker hardware queue");
+                    assert_eq!(own.as_raw() as usize, queue, "thread {i} has its own queue");
+                    let mut user_data = vec![0; shader.user_data_dwords().max(1) as usize];
+                    for u in &shader.user_data {
+                        if u.root == crate::native::RootType::Constants {
+                            user_data[u.index as usize] = token;
+                        }
+                    }
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![(0, Root::Constants(user_data))],
+                                views: &[View::RawUav(1)],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .expect("hardware dispatch");
+                    assert_eq!(out, vec![vec![token]], "thread {i} read back another token");
                 });
             }
         });

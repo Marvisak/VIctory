@@ -429,7 +429,7 @@ fn run(pick: &dyn Fn(&str) -> bool) -> Vec<String> {
             let pc_cs = compile(&pc, &dir, &text, "cs", "cs_6_5").unwrap();
             // SAFETY: the PC container carries its root signature.
             let root_p: ID3D12RootSignature =
-                unsafe { host.device.CreateRootSignature(0, &pc_cs) }.unwrap();
+                unsafe { host.device().CreateRootSignature(0, &pc_cs) }.unwrap();
             let pso_p = host.compute_pipeline_with(&root_p, &pc_cs).unwrap();
             let table = |index| Root::Table {
                 sampler: false,
@@ -528,7 +528,7 @@ fn run(pick: &dyn Fn(&str) -> bool) -> Vec<String> {
             );
             // SAFETY: the PC container carries its root signature.
             let root_p: ID3D12RootSignature =
-                unsafe { host.device.CreateRootSignature(0, &ps_p) }.unwrap();
+                unsafe { host.device().CreateRootSignature(0, &ps_p) }.unwrap();
             let pso_p = host.pipeline_with(&root_p, &vs_p, &ps_p).unwrap();
             let want = host
                 .draw(

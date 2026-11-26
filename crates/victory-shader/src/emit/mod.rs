@@ -1250,7 +1250,7 @@ mod tests {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
             // SAFETY: the query writes the structure of the given size.
             let queried = unsafe {
-                host.device.CheckFeatureSupport(
+                host.device().CheckFeatureSupport(
                     D3D12_FEATURE_D3D12_OPTIONS7,
                     (&raw mut options).cast(),
                     size_of_val(&options) as u32,

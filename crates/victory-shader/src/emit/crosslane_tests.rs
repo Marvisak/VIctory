@@ -446,7 +446,7 @@ fn wave32_hardware_info(host: &Host) -> Option<String> {
     // SAFETY: plain D3D12/DXGI capability queries on a live device.
     unsafe {
         let mut opts1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-        host.device
+        host.device()
             .CheckFeatureSupport(
                 D3D12_FEATURE_D3D12_OPTIONS1,
                 (&raw mut opts1).cast(),
@@ -457,13 +457,13 @@ fn wave32_hardware_info(host: &Host) -> Option<String> {
             return None;
         }
         let mut opts5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
-        let _ = host.device.CheckFeatureSupport(
+        let _ = host.device().CheckFeatureSupport(
             D3D12_FEATURE_D3D12_OPTIONS5,
             (&raw mut opts5).cast(),
             size_of_val(&opts5) as u32,
         );
         let mut opts7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
-        let _ = host.device.CheckFeatureSupport(
+        let _ = host.device().CheckFeatureSupport(
             D3D12_FEATURE_D3D12_OPTIONS7,
             (&raw mut opts7).cast(),
             size_of_val(&opts7) as u32,
@@ -471,12 +471,12 @@ fn wave32_hardware_info(host: &Host) -> Option<String> {
         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_8,
         };
-        let _ = host.device.CheckFeatureSupport(
+        let _ = host.device().CheckFeatureSupport(
             D3D12_FEATURE_SHADER_MODEL,
             (&raw mut sm).cast(),
             size_of_val(&sm) as u32,
         );
-        let luid = host.device.GetAdapterLuid();
+        let luid = host.device().GetAdapterLuid();
         let mut name = String::from("unknown");
         if let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             && let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid)
