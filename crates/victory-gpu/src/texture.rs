@@ -18,13 +18,42 @@
 //! 0 is uploaded (every mip and array slice), depth and stencil planes are
 //! not.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
 use windows::core::Interface;
+
+/// Number of top texture mip levels to drop on pure sampled textures to save VRAM
+/// (`VICTORY_TEXTURE_MIP_DROP=0..=3`, default `0`).
+pub(crate) fn texture_mip_drop() -> u32 {
+    static DROP: OnceLock<u32> = OnceLock::new();
+    *DROP.get_or_init(|| {
+        if let Ok(val) = std::env::var("VICTORY_TEXTURE_MIP_DROP") {
+            let parsed = val.trim().parse::<u32>().unwrap_or(0).min(3);
+            if parsed > 0 {
+                tracing::info!(mip_drop = parsed, "texture mip drop enabled");
+            }
+            return parsed;
+        }
+        0
+    })
+}
+
+/// Minimum width and height a texture must have to qualify for mip dropping
+/// (`VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`, default `1024`).
+pub(crate) fn texture_mip_drop_min_size() -> u64 {
+    static MIN_SIZE: OnceLock<u64> = OnceLock::new();
+    *MIN_SIZE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1024)
+    })
+}
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -45,8 +74,10 @@ pub(crate) struct Staging {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
-    /// Mips per array slice.
+    /// Host mips per array slice.
     mips: u32,
+    /// Number of top console mips dropped in the host texture.
+    mip_drop: u32,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
@@ -72,13 +103,14 @@ struct Last {
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
 /// are its mips), the bytes of the texture's memory it lies in, rounded out
 /// to the layout's blocks; empty if the layout cannot say.
-fn spans(layout: &victory_formats::texture::Layout, count: u32, mips: u32) -> Vec<(usize, usize)> {
+fn spans(layout: &victory_formats::texture::Layout, count: u32, mips: u32, mip_drop: u32) -> Vec<(usize, usize)> {
     use victory_formats::texture::Dimension;
     let d = &layout.desc;
     let block = layout.alignment.max(256);
     (0..count)
         .map(|i| {
-            let (mip, slice) = (i % mips, i / mips);
+            let (host_mip, slice) = (i % mips, i / mips);
+            let mip = host_mip + mip_drop;
             let m = layout.mips.get(mip as usize)?;
             let (z0, z1) = if d.dimension == Dimension::Tex3d { (0, m.depth.max(1) - 1) } else { (slice, slice) };
             let first = layout.offset(mip, 0, 0, z0).ok()?;
@@ -228,7 +260,7 @@ pub(crate) fn host_writes(list: &HostList, resource: This) {
 
 fn is_host_written(resource: This) -> bool {
     crate::resource::host_copy(resource)
-        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Relaxed))
+        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -685,7 +717,8 @@ impl Staging {
         }
         for &i in subresources {
             let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
-            let (mip, slice) = (i % self.mips, i / self.mips);
+            let (host_mip, slice) = (i % self.mips, i / self.mips);
+            let console_mip = host_mip + self.mip_drop;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
@@ -695,9 +728,9 @@ impl Staging {
             let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
             if let Err(e) =
                 self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
+                    .detile(tiled, console_mip, slice, linear, pitch, pitch * rows as usize)
             {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
+                tracing::warn!(?e, console_mip, slice, "texture not detiled");
                 return None;
             }
         }
@@ -800,6 +833,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    let mip_drop = u32::from(copy.mip_drop);
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -821,15 +855,16 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
             Some(&mut total),
         );
     }
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    tracing::debug!(?desc, total, mip_drop, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
-    let spans = spans(&layout, count, u32::from(d.MipLevels));
+    let spans = spans(&layout, count, u32::from(d.MipLevels), mip_drop);
     let s = Arc::new(Staging {
         size: total,
         footprints,
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        mip_drop,
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         spans,
