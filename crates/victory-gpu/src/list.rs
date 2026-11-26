@@ -296,10 +296,7 @@ fn leave(to: Option<std::sync::Arc<crate::host::HostList>>, uploads: Vec<Upload>
     // SAFETY: only dropped, with the host list, after it has run.
     unsafe impl Send for Kept {}
     if let Some(held) = to {
-        let kept = Kept(uploads, state);
-        held.defer_after(move || {
-            let _ = &kept;
-        });
+        held.keep_until_reset(Box::new(Kept(uploads, state)));
     }
 }
 
@@ -1192,8 +1189,8 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
+/// their own work and the host queue runs submissions in order, so there is
+/// nothing to do.
 extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only

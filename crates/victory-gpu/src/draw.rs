@@ -674,6 +674,7 @@ impl State {
                 return false;
             };
             list.keep(table);
+            list.marking();
             // SAFETY: an open list; the table lives while the list holds it,
             // the bitmap for good.
             unsafe {
