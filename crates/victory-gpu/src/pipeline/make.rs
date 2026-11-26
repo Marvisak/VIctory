@@ -12,7 +12,9 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //! Pipelines a draw waits for go ahead of those started early (at the
-//! title's creation, because an earlier run drew them).
+//! title's creation, because an earlier run drew them), and one whose
+//! dropped draw left a presented image unwritten goes ahead of them all
+//! (`hurry`, `crate::shown`).
 //!
 //! shortcut: the budget (half a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
@@ -31,9 +33,11 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
-    /// Whether it went into the queue of pipelines a draw waits for, and
-    /// whether a worker took it (it may be in both queues).
+    /// Whether it went into the queue of pipelines a draw waits for, to its
+    /// head (`hurry`), and whether a worker took it (it may be in both
+    /// queues, and twice in the first).
     now: AtomicBool,
+    first: AtomicBool,
     taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     #[cfg(feature = "diagnostics")]
@@ -76,6 +80,7 @@ impl Pending {
             graphics,
             queued: AtomicBool::new(false),
             now: AtomicBool::new(false),
+            first: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             made,
             #[cfg(feature = "diagnostics")]
@@ -205,12 +210,37 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
+/// Whether `p` has no answer yet (neither a host pipeline nor a refusal).
+pub(crate) fn being_made(p: &Pending) -> bool {
+    p.made.get().is_none()
+}
+
 /// Queues `p` for the workers: once, and once more ahead of the early
 /// starts if a draw waits for it (`now`) while it is still queued.
 fn start(p: &Arc<Pending>, now: bool) {
     if let Some(now) = enqueue(p, now) {
-        queue(p.clone(), now);
+        queue(p.clone(), if now { Place::Now } else { Place::Early });
     }
+}
+
+/// Puts `p`, queued for a draw, at the head of the workers' queue if no
+/// worker has it yet: a draw into an image the title presents was dropped
+/// for it (`crate::shown`), and the frame's other new pipelines (~1,900 in
+/// Grand Theft Auto VI's first world frame) can wait behind it.
+pub(crate) fn hurry(p: &Arc<Pending>) {
+    if hurried(p) {
+        tracing::info!(shaders = ?p.shaders, "made first: a presented image waits for it");
+        queue(p.clone(), Place::First);
+    }
+}
+
+/// Whether `p` goes to the head of the queue now: queued, not made, not
+/// taken by a worker, and not put there before.
+fn hurried(p: &Pending) -> bool {
+    p.made.get().is_none()
+        && p.queued.load(Ordering::Relaxed)
+        && !p.taken.load(Ordering::Relaxed)
+        && !p.first.swap(true, Ordering::Relaxed)
 }
 
 /// Which queue `p` goes into now (true: the one draws wait for), if any.
@@ -259,9 +289,28 @@ fn wait(p: &Pending, frame: u64) {
 static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
     (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
 
+/// Where a pipeline goes in the workers' queues.
+#[derive(Clone, Copy)]
+enum Place {
+    /// Before everything (`hurry`).
+    First,
+    /// After the pipelines draws wait for, before the early starts.
+    Now,
+    /// Last.
+    Early,
+}
+
+fn place(queues: &mut [VecDeque<Arc<Pending>>; 2], p: Arc<Pending>, place: Place) {
+    match place {
+        Place::First => queues[0].push_front(p),
+        Place::Now => queues[0].push_back(p),
+        Place::Early => queues[1].push_back(p),
+    }
+}
+
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
-fn queue(p: Arc<Pending>, now: bool) {
+fn queue(p: Arc<Pending>, at: Place) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
         let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
@@ -286,7 +335,7 @@ fn queue(p: Arc<Pending>, now: bool) {
         return;
     }
     let (lock, work) = &QUEUES;
-    lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
+    place(&mut lock.lock().unwrap_or_else(|e| e.into_inner()), p, at);
     work.notify_one();
 }
 
@@ -385,6 +434,38 @@ mod tests {
         assert_eq!(enqueue(&r, false), None);
         // Counted as waiting by `enqueue`, never handed to a worker.
         WAITING.fetch_sub(3, Ordering::Relaxed);
+    }
+
+    /// The pipeline of a draw into a presented image goes before the
+    /// frame's other new pipelines, once, and only while no worker has it.
+    #[test]
+    fn a_pipeline_a_presented_image_waits_for_goes_first() {
+        let new = || {
+            Arc::new(Pending::new(
+                Vec::new(),
+                None,
+                #[cfg(feature = "diagnostics")]
+                &[],
+            ))
+        };
+        let (early, a, b, last) = (new(), new(), new(), new());
+        let mut queues = [VecDeque::new(), VecDeque::new()];
+        place(&mut queues, early.clone(), Place::Early);
+        place(&mut queues, a.clone(), Place::Now);
+        place(&mut queues, b.clone(), Place::Now);
+        for p in [&a, &b, &last] {
+            p.queued.store(true, Ordering::Relaxed);
+        }
+        assert!(hurried(&last));
+        place(&mut queues, last.clone(), Place::First);
+        assert!(!hurried(&last), "once");
+        let order: Vec<_> = queues.iter().flatten().map(Arc::as_ptr).collect();
+        assert_eq!(order, [&last, &a, &b, &early].map(Arc::as_ptr));
+        b.taken.store(true, Ordering::Relaxed);
+        assert!(!hurried(&b), "a worker has it");
+        let _ = a.made.set(None);
+        assert!(!hurried(&a), "made");
+        assert!(!hurried(&early), "not queued for a draw");
     }
 
     /// A first use queues the pipeline and, within the budget, gets the

@@ -534,6 +534,8 @@ extern "system" fn present(
     if planes > 0
         && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
+        // SAFETY: the title passes the plane descriptions.
+        && !holds(frame, unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) })
     {
         use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
         use windows::core::Interface;
@@ -583,6 +585,46 @@ extern "system" fn present(
     let _ = (planes, plane_parameters);
     S_OK
 }
+
+/// Whether frame `frame` is not shown: a draw dropped for a pipeline being
+/// made left one of its `planes` unwritten, so it holds an older frame and
+/// the window keeps the last one shown, for a while ([`crate::shown`]).
+/// Logs where a run of held frames starts and ends, and a hold given up.
+#[cfg(windows)]
+fn holds(frame: u64, planes: &[Plane]) -> bool {
+    use crate::shown::Frame;
+    let images = planes
+        .iter()
+        .filter(|plane| plane.count != 0 && !plane.resources.is_null())
+        // SAFETY: the plane lists `count` resources.
+        .map(|plane| unsafe { *plane.resources } as usize);
+    match crate::shown::frame(images) {
+        Frame::Show => false,
+        Frame::ShowAgain { held } => {
+            tracing::info!(frame, held, "frames shown again");
+            false
+        }
+        Frame::Hold { first } => {
+            if first {
+                tracing::info!(
+                    frame,
+                    "frames held: a draw into the presented image waits for its pipeline"
+                );
+            }
+            true
+        }
+        Frame::GiveUp { held, waited_for } => {
+            tracing::warn!(
+                frame,
+                held,
+                waited_for,
+                "frames shown again unwritten: their pipeline was not made in time to hold for it"
+            );
+            false
+        }
+    }
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]

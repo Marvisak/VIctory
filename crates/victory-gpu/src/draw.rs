@@ -536,6 +536,7 @@ impl State {
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            crate::pipeline::dropped_into(self.pipeline as This, &self.targets);
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1732,6 +1733,9 @@ impl State {
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+            if kind != DISPATCH {
+                crate::pipeline::dropped_into(self.pipeline as This, &self.targets);
+            }
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             why("no host pipeline");

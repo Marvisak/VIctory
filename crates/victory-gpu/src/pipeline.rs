@@ -256,6 +256,22 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// A draw with `this` into `targets` (title resources) was dropped for want
+/// of a host pipeline: if that pipeline is being made and a target is an
+/// image the title presents, the image is not shown until written again
+/// and the pipeline goes to the head of the workers' queue
+/// ([`crate::shown`]).
+#[cfg(windows)]
+pub(crate) fn dropped_into(this: This, targets: &[usize]) {
+    if this.is_null() {
+        return;
+    }
+    let p = pipeline(this);
+    if make::being_made(&p.host) && crate::shown::dropped(targets, || format!("{:?}", p.shaders)) {
+        make::hurry(&p.host);
+    }
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
