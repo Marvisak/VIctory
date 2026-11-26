@@ -1790,6 +1790,21 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 /// one memory, and views of buffers are not matched.
 #[cfg(windows)]
 pub(crate) fn alias_source(placed: This) -> Option<This> {
+    // A shader view of no resource (a null view) has no memory.
+    if placed.is_null() {
+        return None;
+    }
+    let copy = made(resource(placed))?;
+    alias_source_for(placed, &copy)
+}
+
+/// [`alias_source`] against a host copy the caller already holds, so a
+/// concurrent eviction clearing `placed`'s slot cannot hide its writer.
+#[cfg(windows)]
+pub(crate) fn alias_source_for(
+    placed: This,
+    placed_copy: &std::sync::Arc<HostTexture>,
+) -> Option<This> {
     const WRITTEN: u32 = 0x7; // render target, depth, unordered access
     // A shader view of no resource (a null view) has no memory.
     if placed.is_null() {
@@ -1812,7 +1827,7 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
             let a = resource(r);
             a.desc.flags & WRITTEN != 0
                 && bytes(&a.desc) == Some(want)
-                && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
+                && made(a).is_some_and(|x| !std::sync::Arc::ptr_eq(&x, placed_copy))
         })
 }
 
