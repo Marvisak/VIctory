@@ -830,7 +830,7 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
         for &g in guards.iter().flatten() {
             t.guarded += 1;
             let support = s.bools.support(g);
-            t.opaque += usize::from(support.iter().any(|a| matches!(a, Atom::Opaque(_))));
+            t.opaque += usize::from(support.iter().any(|a| matches!(a, Atom::Opaque(..))));
         }
     }
     for exit in &s.exits {
@@ -838,7 +838,7 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
             if s.bools
                 .support(when)
                 .iter()
-                .all(|a| matches!(a, Atom::Uniform(_)))
+                .all(|a| matches!(a, Atom::Uniform(_) | Atom::Nonzero(..) | Atom::Any(_)))
             {
                 t.uniform_branches += 1;
             } else {

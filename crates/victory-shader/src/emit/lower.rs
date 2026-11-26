@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod scalar_vcc;
 
 type Why = &'static str;
 
@@ -595,7 +596,7 @@ impl<'a> Lower<'a> {
                     x.st.bools
                         .support(g)
                         .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                        .any(|a| matches!(a, Atom::Opaque(..) | Atom::Constant(_)))
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
@@ -2592,12 +2593,14 @@ impl<'a> Lower<'a> {
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
-            Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
-                    Some(h) => Some(self.get(h)?),
-                    None => None,
+            Atom::Opaque(lo, hi) if self.console_lanes => {
+                // The pair's own dwords: lanes 32-63 test the high one.
+                let hi = if self.x.native.wave64 {
+                    Some(self.get(hi)?)
+                } else {
+                    None
                 };
-                let lo = self.get(v)?;
+                let lo = self.get(lo)?;
                 let word = |w: Val| match w {
                     Val::I32(x) => Ok(x),
                     _ => Err("an opaque lane mask"),
@@ -2611,8 +2614,24 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
-            Atom::Opaque(_) => Err("an opaque lane mask"),
+            Atom::Opaque(..) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
+            // The pair as a whole is not zero: one value for the wave.
+            Atom::Nonzero(lo, hi) => {
+                self.check_scalar_vcc_joins(lo, hi)?;
+                let word = |w: Val| match w {
+                    Val::I32(x) => Ok(x),
+                    _ => Err("an opaque lane mask"),
+                };
+                let mut x = word(self.get(lo)?)?;
+                if self.x.native.wave64 && hi != lo {
+                    let h = word(self.get(hi)?)?;
+                    x = self.s.m.bin(at, Bin::Or, x, h);
+                }
+                let z = self.s.m.i32(0);
+                Ok(self.s.m.cmp(at, pred::NE, x, z))
+            }
+            Atom::Any(mask) => self.any_bit(at, mask),
         }
     }
 
@@ -2669,38 +2688,6 @@ impl<'a> Lower<'a> {
         let t = self.s.m.bin(at, Bin::LShr, word, sh);
         let t = self.s.m.bin(at, Bin::And, t, one);
         self.s.m.cmp(at, pred::NE, t, z)
-    }
-
-    /// The value of the high dword of the wave64 register pair whose low
-    /// dword holds `lo` (none in wave32).
-    fn pair_high(&self, lo: Value) -> Option<Value> {
-        if !self.x.native.wave64 {
-            return None;
-        }
-        let p = self.x.p;
-        let pick = |reg: Reg| match reg {
-            Reg::S(c) => Some(Reg::S(c + 1)),
-            _ => None,
-        };
-        if let Some(&(reg, _)) = p.inputs.iter().find(|i| i.1 == lo) {
-            let h = pick(reg)?;
-            return p.inputs.iter().find(|i| i.0 == h).map(|i| i.1);
-        }
-        if let Some(&(b, i)) = self.phi_at.get(&lo) {
-            let h = pick(p.blocks[b].phis[i].reg)?;
-            return p.blocks[b]
-                .phis
-                .iter()
-                .find(|q| q.reg == h)
-                .map(|q| q.value);
-        }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
-        let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -8251,7 +8238,10 @@ impl<'a> Lower<'a> {
         let preds = &self.x.p.blocks[b].preds;
         preds.iter().filter(|&&q| self.block[q].is_some()).all(|&q| match st.exits[q] {
             LaneExit::Branch { when, taken, not_taken } if taken != not_taken => {
-                st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
+                st.bools
+                    .support(when)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(_) | Atom::Nonzero(..) | Atom::Any(_)))
             }
             _ => true,
         })
@@ -10424,12 +10414,25 @@ impl<'a> Lower<'a> {
                 continue;
             }
             let v = match atom {
-                Atom::Lane(v)
-                | Atom::Uniform(v)
-                | Atom::Phi(v)
-                | Atom::Quad(v)
-                | Atom::Opaque(v) => Some(v),
+                Atom::Lane(v) | Atom::Uniform(v) | Atom::Phi(v) | Atom::Quad(v) => Some(v),
+                // Both dwords name the mask; either may be tainted.
+                Atom::Opaque(lo, hi) => {
+                    if [lo, hi].iter().any(|v| tainted.contains(v)) {
+                        return true;
+                    }
+                    Some(lo)
+                }
+                // Not a compare of its own: both ways stay open.
+                Atom::Nonzero(lo, hi) => {
+                    if [lo, hi].iter().any(|v| tainted.contains(v)) {
+                        return true;
+                    }
+                    None
+                }
                 Atom::Constant(_) => None,
+                // Every atom of the mask is read to build its words.
+                Atom::Any(mask) if self.touches(mask, &HashMap::new(), tainted) => return true,
+                Atom::Any(_) => None,
             };
             if v.is_some_and(|v| tainted.contains(&v)) {
                 return true;

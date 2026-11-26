@@ -1027,3 +1027,194 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
     // never spinning to LOOP_LIMIT (1 << 20).
     assert_eq!(pixels, vec![[0.0; 4], [0.0; 4], [1.0; 4], [1.0; 4]]);
 }
+
+/// `s_cbranch_vccz` / `s_cbranch_vccnz` with VCC's dwords written apart by
+/// `s_mov_b32`, in a full wave64 group: v4 = 17, the branch skips
+/// `v_mov_b32 v4, 43` when taken, every lane stores v4 at lane × 4.
+fn vcc_branch_program(op: u32, lo: u32, hi: u32) -> Vec<u32> {
+    vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0000, // s_load_dwordx4 s[40:43], s[4:5], 0x0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3428_0082, // v_lshlrev_b32 v20, 2, v0
+        0xBEEA_0300 | lo, // s_mov_b32 vcc_lo, lo
+        0xBEEB_0300 | hi, // s_mov_b32 vcc_hi, hi
+        0x7E08_0291, // v_mov_b32 v4, 17
+        0xBF80_0001 | op << 16, // s_cbranch_vccz/vccnz +1
+        0x7E08_02AB, // v_mov_b32 v4, 43
+        0xE070_1000,
+        0x800A_0414, // buffer_store_dword v4, v20, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]
+}
+
+/// [`vcc_branch_program`] with `setup` writing VCC in place of the two
+/// `s_mov_b32`.
+fn vcc_setup_program(op: u32, setup: &[u32]) -> Vec<u32> {
+    let mut words = vcc_branch_program(op, 0x80, 0x80);
+    words.splice(6..8, setup.iter().copied());
+    words
+}
+
+#[test]
+fn vcc_branch_refuses_a_lane_local_scalar_source() {
+    for (low, high) in [(0xbeea_030c, 0xbeeb_0380), (0xbeea_0380, 0xbeeb_030c)] {
+        let mut words = vcc_branch_program(7, 0x80, 0x80);
+        words[3] = 0xfa00_0040; // build_wave's UAV is at table dword 16
+        words.splice(6..8, [
+            0xbe8c_0380, // s12 = 0
+            0x7da4_0081, // EXEC = lane 1
+            0xbf88_0001, // s_cbranch_execz skips the scalar write only if EXEC is empty
+            0xbe8c_0381, // s12 = 1 for the wave
+            0xbefe_04c1, // restore EXEC
+            low, high, // place s12 in just one VCC word
+        ]);
+        assert!(matches!(
+            build_wave(&words, true),
+            Err(crate::ShaderError::Unsupported {
+                what: "a scalar VCC branch depending on a divergent scalar join",
+                ..
+            })
+        ));
+    }
+}
+
+/// `s_cbranch_vccz` and `s_cbranch_vccnz` test VCC as a whole (RDNA2 ISA,
+/// 12.5: one decision for the wave), also when only its high dword holds a
+/// bit and VCC was written by halves, or by scalar operations over masks,
+/// constants and SCC: every lane takes the same path.
+#[test]
+fn vcc_branches_test_the_whole_mask() {
+    let range = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+    const VCCZ: u32 = 6;
+    const VCCNZ: u32 = 7;
+    // VCC by halves: vcc_lo, vcc_hi as inline constants 0x80 + n.
+    let halves = |lo: u32, hi: u32| vec![0xBEEA_0300 | lo, 0xBEEB_0300 | hi];
+    let pair = |lo: u32, hi: u32| [0xBE8C_0300 | lo, 0xBE8D_0300 | hi]; // s12, s13
+    let [s1, s0] = [0xBF06_8080, 0xBF06_8180]; // s_cmp_eq_u32 0, 0 / 0, 1
+    // (op, the writes of VCC, what it holds, value stored when taken).
+    let cases: Vec<(u32, Vec<u32>, &str, u32)> = vec![
+        (VCCZ, halves(0x80, 0x81), "hi 1", 43), // VCC_HI = 1: not zero, not taken
+        (VCCZ, halves(0x80, 0x80), "0", 17),    // VCC = 0: taken
+        (VCCZ, halves(0x81, 0x80), "lo 1", 43),
+        (VCCNZ, halves(0x80, 0x81), "hi 1", 17), // VCC_HI = 1: taken
+        (VCCNZ, halves(0x80, 0x80), "0", 43),    // VCC = 0: not taken
+        (VCCNZ, halves(0x81, 0x80), "lo 1", 17),
+        (VCCZ, vec![0xBEEA_0481], "s_mov_b64 1", 43),
+        (VCCNZ, vec![0xBEEA_0481], "s_mov_b64 1", 17),
+        // s_cselect_b64 vcc, 1, 2 with SCC clear: 2, lane 1's bit alone.
+        (VCCNZ, vec![s0, 0x85EA_8281], "s_cselect_b64 2", 17),
+        // s_cselect_b64 vcc, 0, 1 with SCC set: 0.
+        (VCCZ, vec![s1, 0x85EA_8180], "s_cselect_b64 0", 17),
+        // s_not_b64 vcc, s[12:13] of (-1, -2): lane 32's bit alone.
+        (VCCZ, [&pair(0xC1, 0xC2)[..], &[0xBEEA_080C]].concat(), "s_not_b64 hi 1", 43),
+        (VCCNZ, [&pair(0xC1, 0xC2)[..], &[0xBEEA_080C]].concat(), "s_not_b64 hi 1", 17),
+        (VCCZ, [&pair(0xC1, 0xC1)[..], &[0xBEEA_080C]].concat(), "s_not_b64 0", 17),
+        // s_and_b64 vcc, s[12:13], 3 of (2, 0): lane 1's bit alone.
+        (VCCNZ, [&pair(0x82, 0x80)[..], &[0x87EA_830C]].concat(), "s_and_b64 2", 17),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Per adapter: a device that runs one case runs them all, so a case
+    // whose pipeline fails cannot pass unseen.
+    let mut ran = [0usize; 2];
+    for (op, setup, held, want) in &cases {
+        let (op, want) = (*op, *want);
+        let words = vcc_setup_program(op, setup);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 32,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![range],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let name = if op == VCCZ { "vccz" } else { "vccnz" };
+        let label = format!("{name}, VCC {held}");
+        let l = lowered(&native).unwrap_or_else(|e| panic!("{label}: lower: {e:?}"));
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: l.dxil,
+            user_data: l.user_data,
+            static_samplers: Vec::new(),
+            samplers: l.samplers,
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            memory: l.memory,
+            memory_writes: l.memory_writes,
+            view_addresses: l.view_addresses,
+            heap: l.heap,
+            heap_writes: l.heap_writes,
+            view_marks: l.view_marks,
+        };
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
+            && let Err(e) = v.validate(&mut shader.dxil.clone())
+        {
+            panic!("{label}: DXIL validation failed: {e:?}");
+        }
+        let views = [View::RawUav(64 * 4)];
+        for (i, (adapter, warp)) in [("hardware", false), ("warp", true)].into_iter().enumerate() {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {adapter} device; skipped");
+                continue;
+            };
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+                eprintln!("{label} {adapter}: no pipeline; skipped");
+                continue;
+            };
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} {adapter}: dispatch failed: {e}"));
+            ran[i] += 1;
+            let got = &out[0][..64];
+            let taken = got.iter().filter(|&&x| x == 17).count();
+            eprintln!("{label} {adapter}: {taken} of 64 lanes took the branch");
+            assert!(
+                got.iter().all(|&x| x == want),
+                "{label} {adapter}: lanes stored {got:?}, every lane should store {want}"
+            );
+        }
+    }
+    for (adapter, n) in ["hardware", "warp"].into_iter().zip(ran) {
+        assert!(
+            n == 0 || n == cases.len(),
+            "{adapter}: {n} of {} cases ran; the others made no pipeline",
+            cases.len()
+        );
+    }
+    assert!(ran.iter().sum::<usize>() > 0, "no host device ran the test");
+}

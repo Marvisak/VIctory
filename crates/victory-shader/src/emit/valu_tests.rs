@@ -79,6 +79,10 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 }
 
 fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
+    try_build_valu_cs_wave(body, false)
+}
+
+fn try_build_valu_cs_wave(body: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderError> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -95,7 +99,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 16,
         layout: vec![
             RootParam {
@@ -2280,4 +2284,36 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
             inp[0], inp[1],
         );
     });
+}
+
+/// A wave64 lane mask held as a number, its two dwords written apart
+/// (LLVM splits a 64-bit constant that is not inline into two `s_mov_b32`,
+/// and `vcc_lo`/`vcc_hi` are written apart the same way): lanes 32-63 test
+/// the high dword's bits, not the low dword's again.
+#[test]
+fn a_half_written_mask_tests_its_high_dword() {
+    // s_mov_b32 s12, 0; s_mov_b32 s13, -1 | 0;
+    // v_mbcnt_lo_u32_b32 v1, -1, 0; v_cndmask_b32 v1, 0, -1, s[12:13];
+    // v_mov_b32 v0, v1
+    let variant = |s13: u8| {
+        let [c, d] = vop3(0x101, 1, 0x80, 0x1C1, sgpr(12));
+        try_build_valu_cs_wave(
+            &[
+                s_mov_b32(12, 0x80),
+                s_mov_b32(13, s13),
+                0xD765_0001,
+                0x0001_00C1,
+                c,
+                d,
+                vop1(0x001, 0, vgpr(1)),
+            ],
+            true,
+        )
+    };
+    let (neg, zero) = (variant(0xC1), variant(0x80));
+    let (neg, zero) = (neg.expect("hi of -1"), zero.expect("hi of 0"));
+    assert_ne!(
+        neg.dxil, zero.dxil,
+        "lanes 32-63 read the mask's high dword"
+    );
 }
