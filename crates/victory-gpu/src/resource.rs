@@ -1654,7 +1654,7 @@ impl Resource {
             if n == 1 {
                 tracing::warn!(desc = ?self.desc, "no host texture: out of memory, asked for again later");
             }
-            self.refused_until.store(now_ms().saturating_add(retry_wait(n)), Relaxed);
+            self.refused_until.fetch_max(now_ms().saturating_add(retry_wait(n)), Relaxed);
             // Close the race where another caller stored success just after
             // the first check. A success after this check is still safe:
             // the bindless slot is re-armed below and sees the cached copy.
