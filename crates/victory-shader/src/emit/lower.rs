@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod lds;
 
 type Why = &'static str;
 
@@ -87,6 +88,7 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    pub host_wave32: bool,
 }
 
 enum Stop {
@@ -280,6 +282,8 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Loop latches' barriers still ahead (`lds::Plan::drains`).
+    drains: HashMap<usize, usize>,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
@@ -601,7 +605,9 @@ impl<'a> Lower<'a> {
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
+                // A host of 32-lane waves runs each console wave as two
+                // halves (`x.host_wave32`).
+                s.wave_size = Some(if x.host_wave32 { 32 } else { wave });
             }
         }
         let mut no_barrier = HashSet::new();
@@ -723,6 +729,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            drains: HashMap::new(),
             round16: round16(p),
             mode16: Some(0),
         }
@@ -1195,6 +1202,9 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::And, r, low);
                 // Lane `hi` runs the section on the console even where it is
                 // elsewhere on the host; there it holds the identity.
+                if self.host_wave() < self.wave() {
+                    return Err("a cross-half wave scan on a 32-lane host");
+                }
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let b = self
@@ -1319,6 +1329,25 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
+        // One console wave run as two host waves: its halves meet at a
+        // barrier between LDS phases (`lds_barriers`).
+        let mut meet = HashSet::new();
+        if let Some(threads) = self.s.threads
+            && self.x.native.wave64
+            && self.x.host_wave32
+            && threads.iter().product::<u32>() <= 64
+            && self.s.lds_dwords > 0
+        {
+            let sections = &self.sections;
+            let inside = |b: usize, i: usize| {
+                sections
+                    .get(&b)
+                    .is_some_and(|s| s.iter().any(|(&start, sec)| start < i && i < sec.end))
+            };
+            let plan = lds::barriers(p, &self.x.st.exits, inside).map_err(|w| unsupported(0, w))?;
+            meet.extend(plan.at);
+            self.drains = plan.drains;
+        }
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
@@ -1354,6 +1383,9 @@ impl<'a> Lower<'a> {
             let mut i = 0;
             self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
+                if meet.contains(&(b, i)) {
+                    self.lds_barrier();
+                }
                 if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
                     // A pixel's discard: the lanes stay on as helpers.
                     let at = self.cur;
@@ -1374,6 +1406,9 @@ impl<'a> Lower<'a> {
                     continue;
                 }
                 i += 1;
+            }
+            if meet.contains(&(b, p.blocks[b].insts.len())) {
+                self.lds_barrier();
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
@@ -1836,6 +1871,9 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = bit?;
+                if self.host_wave() < self.wave() {
+                    return Err("a 64-bit wave mask read as data on a 32-lane host");
+                }
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
@@ -2901,6 +2939,9 @@ impl<'a> Lower<'a> {
         if self.s.threads.is_none() && !(quad && self.s.pixel) {
             return Err("a cross-lane operation outside compute");
         }
+        if !quad && self.host_wave() < self.wave() {
+            return Err("a cross-half operation on a 32-lane host");
+        }
         debug_assert!(self.s.threads.is_none() || self.console_lanes);
         self.s.flags |= flags::WAVE_OPS;
         Ok(())
@@ -3015,6 +3056,23 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 { 64 } else { 32 }
     }
 
+    /// The lanes of a host wave running this program: the console's, or
+    /// 32 on a host of 32-lane waves (`self.x.host_wave32`).
+    fn host_wave(&self) -> u32 {
+        if self.x.host_wave32 { 32 } else { self.wave() }
+    }
+
+    /// A lane number as the host wave can take it: on a host of 32-lane
+    /// waves a console lane 32-63 names the same lane of the other half,
+    /// which this host wave stands for.
+    fn host_lane(&mut self, lane: V) -> V {
+        if self.host_wave() == self.wave() {
+            return lane;
+        }
+        let m = self.s.m.i32(self.host_wave() - 1);
+        self.s.m.bin(self.cur, Bin::And, lane, m)
+    }
+
     fn lane_index(&mut self) -> V {
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
@@ -3091,6 +3149,7 @@ impl<'a> Lower<'a> {
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
+        let lane = self.host_lane(lane);
         self.s.op(
             self.cur,
             "waveReadLaneAt.i32",
@@ -6671,6 +6730,7 @@ impl<'a> Lower<'a> {
                 };
                 self.cross_lane(false)?;
                 let me = self.lane_index();
+                let lane = self.host_lane(lane);
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
@@ -10155,7 +10215,7 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
+                let abort = self.lds_abort(b);
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
@@ -10983,6 +11043,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_wave32: false,
         })
         .map(|_| ())
     }
@@ -11034,6 +11095,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_wave32: false,
         })
     }
 
@@ -11254,6 +11316,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            host_wave32: false,
         })
         .unwrap();
 
@@ -12176,6 +12239,7 @@ mod tests {
                 prims: vec![],
                 mesh_stride: 0,
                 view_marks: false,
+                host_wave32: false,
             })
             .unwrap();
             assert!(lowered.wave_ops);
