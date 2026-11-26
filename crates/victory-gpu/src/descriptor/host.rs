@@ -55,7 +55,10 @@ pub(crate) struct HostHeap {
     /// in), the console descriptor's dwords 0-3 as far as the host knows
     /// them (shaders reading a descriptor as data, `crate::memory`;
     /// [`write_address`]): the buffer, its mapping and host address, made on
-    /// first use.
+    /// first use. Shaders clamp the heap index they read it at to
+    /// `HEAP_VIEWS` - 1, so it has 16 bytes for each slot below the larger
+    /// of its title and dynamic slots and `HEAP_VIEWS`, as the view-stride
+    /// table has a dword (those past the dynamic slots read 0).
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
@@ -570,8 +573,11 @@ impl HostHeap {
             // every slot a table can lie in, the dynamic ones too (a table
             // made afresh on a host whose heap is smaller than the title's
             // read past the title slots' entries: whatever followed the
-            // buffer, or a GPU fault).
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.address_slots()) * 16)?;
+            // buffer, or a GPU fault). Shaders clamp the heap index they
+            // read it at to `HEAP_VIEWS` - 1, so it also has an entry for
+            // each slot below that.
+            let slots = self.address_slots().max(victory_shader::emit::HEAP_VIEWS);
+            let (buffer, data) = host()?.upload_buffer(u64::from(slots) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -584,6 +590,14 @@ impl HostHeap {
             for i in self.count..self.address_slots() {
                 write_address(data, i as usize, None);
             }
+            // Nothing writes the entries past the dynamic slots: they read 0
+            // whatever the new allocation held.
+            let end = self.address_slots() as usize;
+            // SAFETY: the mapped entries from `end` to `slots`, the buffer's
+            // last.
+            unsafe {
+                std::ptr::write_bytes((data + 16 * end) as *mut u8, 0, 16 * (slots as usize - end))
+            };
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             Some((buffer, data, gpu))
@@ -591,8 +605,8 @@ impl HostHeap {
         made.as_ref().map(|m| m.2)
     }
 
-    /// The slots the view addresses have an entry for: the title's and the
-    /// dynamic ones.
+    /// The slots the view addresses enter views for: the title's and the
+    /// dynamic ones (the entries past them, up to `HEAP_VIEWS`, read 0).
     fn address_slots(&self) -> u32 {
         self.count + self.dynamic
     }
@@ -1080,7 +1094,7 @@ fn write_address(data: usize, index: usize, view: Option<&View>) {
         None => [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0],
     };
     // SAFETY: the mapped view addresses hold 16 bytes per title and dynamic
-    // slot (below `address_slots`).
+    // slot (below `address_slots`, and more, up to `HEAP_VIEWS`).
     unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
 }
 
@@ -2188,27 +2202,21 @@ mod tests {
         heap.raw_pair_at(first, None, 0);
         assert_eq!(heap.address_at(first), Some(0), "a view pair");
         assert_eq!(heap.address_at(first + 1), Some(0), "a view pair");
-        // Slots past the dynamic ones (host copies' view pairs) have no
-        // entry, and nothing is written past the last: a mark there (the
-        // buffer's allocation reaches past it) stays.
-        assert_eq!(heap.address_at(end), None);
+        // Shaders clamp the heap index to `HEAP_VIEWS` - 1 (past the
+        // dynamic slots), so there is an entry for each slot below it. Slots
+        // past the dynamic ones (host copies' view pairs) read 0, to the
+        // last, and are not written; past the last there is no entry.
+        let slots = victory_shader::emit::HEAP_VIEWS;
+        assert!(end < slots);
+        assert_eq!(heap.address_at(end), Some(0));
+        assert_eq!(heap.address_at(slots - 1), Some(0));
+        assert_eq!(heap.address_at(slots), None);
         let host = host().unwrap();
-        let (buffer, data, _) = heap.addresses.get().unwrap().as_ref().unwrap();
-        // SAFETY: plain queries of a live buffer.
-        let (desc, size) = unsafe {
-            let desc = buffer.GetDesc();
-            let info = host.device.GetResourceAllocationInfo(0, &[desc]);
-            (desc, info.SizeInBytes)
-        };
-        assert_eq!(desc.Width, 16 * u64::from(end));
-        assert!(size >= desc.Width + 8, "room for the mark");
-        let past = (data + 16 * end as usize) as *mut u64;
-        let mark = 0x5a5a_5a5a_5a5a_5a5a;
-        // SAFETY: mapped memory of the buffer's allocation (checked).
-        unsafe { past.write_unaligned(mark) };
+        let (buffer, _, _) = heap.addresses.get().unwrap().as_ref().unwrap();
+        // SAFETY: a plain query of a live buffer.
+        assert_eq!(unsafe { buffer.GetDesc() }.Width, 16 * u64::from(slots));
         heap.note_address(end, Some(&view));
-        // SAFETY: as above.
-        assert_eq!(unsafe { past.read_unaligned() }, mark);
+        assert_eq!(heap.address_at(end), Some(0), "not written");
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
