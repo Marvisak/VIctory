@@ -207,8 +207,20 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
+        // VICTORY_NO_TDR (any build): create the direct queue without the
+        // GPU timeout. The title's frames can hold one indivisible, several-
+        // second GPU workload; the default two-second watchdog then removes
+        // the device (DXGI_ERROR_DEVICE_HUNG / 0x887A0007). D3D12's
+        // DISABLE_GPU_TIMEOUT queue flag opts this one queue out, so Windows
+        // keeps TDR for every other process on the machine.
+        let no_tdr = crate::switch::on("VICTORY_NO_TDR");
         let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+            Flags: if no_tdr {
+                D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT
+            } else {
+                D3D12_COMMAND_QUEUE_FLAG_NONE
+            },
             ..Default::default()
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;

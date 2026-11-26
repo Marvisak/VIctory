@@ -620,6 +620,11 @@ impl Host {
             let queue: ID3D12CommandQueue = dev
                 .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                     Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    Flags: if std::env::var_os("VICTORY_NO_TDR").is_some_and(|v| v != "0") {
+                        D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT
+                    } else {
+                        D3D12_COMMAND_QUEUE_FLAG_NONE
+                    },
                     ..Default::default()
                 })
                 .map_err(err)?;
@@ -970,6 +975,11 @@ impl Host {
             let queue: ID3D12CommandQueue = dev
                 .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                     Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    Flags: if std::env::var_os("VICTORY_NO_TDR").is_some_and(|v| v != "0") {
+                        D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT
+                    } else {
+                        D3D12_COMMAND_QUEUE_FLAG_NONE
+                    },
                     ..Default::default()
                 })
                 .map_err(err)?;
@@ -1410,6 +1420,11 @@ impl Host {
             let queue: ID3D12CommandQueue = dev
                 .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                     Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    Flags: if std::env::var_os("VICTORY_NO_TDR").is_some_and(|v| v != "0") {
+                        D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT
+                    } else {
+                        D3D12_COMMAND_QUEUE_FLAG_NONE
+                    },
                     ..Default::default()
                 })
                 .map_err(err)?;
