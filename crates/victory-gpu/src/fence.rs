@@ -121,27 +121,47 @@ pub(crate) fn set(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
+    let (mut count, mut elapsed_us) = (0, 0);
     waiters.retain(|&(wanted, event, since)| {
         let reached = wanted <= value;
         if reached {
             set_event(event);
-            WAITED.0.fetch_add(1, Ordering::Relaxed);
-            WAITED.1.fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+            count += 1;
+            elapsed_us += since.elapsed().as_micros() as u64;
         }
         !reached
     });
+    drop(waiters);
+    if count != 0 {
+        WAITED.record(count, elapsed_us);
+    }
     S_OK
 }
 
+#[derive(Default)]
+struct WaitStats(Mutex<(u64, u64)>);
+
+impl WaitStats {
+    fn record(&self, count: u64, elapsed_us: u64) {
+        let (events, micros) = &mut *self.0.lock().unwrap_or_else(|e| e.into_inner());
+        *events += count;
+        *micros += elapsed_us;
+    }
+
+    fn take(&self) -> (u64, std::time::Duration) {
+        let (count, elapsed_us) =
+            std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
+        (count, std::time::Duration::from_micros(elapsed_us))
+    }
+}
+
 /// Events the title waited on for a fence value, and their summed waits in
-/// microseconds (the held-work frame line: work held back shows here as the
-/// title's own waits).
-static WAITED: (AtomicU64, AtomicU64) = (AtomicU64::new(0), AtomicU64::new(0));
+/// microseconds. They belong to the same report window.
+static WAITED: WaitStats = WaitStats(Mutex::new((0, 0)));
 
 /// Events set since the last call and how long they waited, summed.
 pub(crate) fn take_waited() -> (u64, std::time::Duration) {
-    let n = WAITED.0.swap(0, Ordering::Relaxed);
-    (n, std::time::Duration::from_micros(WAITED.1.swap(0, Ordering::Relaxed)))
+    WAITED.take()
 }
 
 /// A fence's value.
@@ -185,6 +205,46 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn report_windows_keep_their_fence_counts_and_durations_together() {
+        use std::sync::Barrier;
+        use std::time::Duration;
+
+        const EVENTS: u64 = 32_768;
+        const WAIT_US: u64 = 1_250;
+        let stats = WaitStats::default();
+        let start = Barrier::new(2);
+        let (mut count, mut micros, mut split) = (0_u64, 0_u128, 0_u64);
+
+        let mut sample = || {
+            let (n, time) = stats.take();
+            count += n;
+            micros += time.as_micros();
+            split += u64::from(time.as_micros() != u128::from(n) * u128::from(WAIT_US));
+        };
+
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                start.wait();
+                for _ in 0..EVENTS {
+                    stats.record(1, WAIT_US);
+                }
+            });
+            start.wait();
+            for _ in 0..EVENTS {
+                sample();
+            }
+            writer.join().unwrap();
+        });
+
+        sample();
+        assert_eq!(stats.take(), (0, Duration::ZERO));
+        assert_eq!(count, EVENTS);
+        assert_eq!(micros, u128::from(EVENTS) * u128::from(WAIT_US));
+        eprintln!("events={count}, total_us={micros}, mismatched report windows={split}");
+        assert_eq!(split, 0, "every sampled count must match its elapsed time");
+    }
 
     #[cfg(windows)]
     #[test]
