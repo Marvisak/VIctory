@@ -283,6 +283,12 @@ fn process_memory() -> (u64, u64) {
     (c.PagefileUsage as u64, c.WorkingSetSize as u64)
 }
 
+/// Whether the host device is the software adapter (diagnostics builds
+/// with `VICTORY_D3D12_WARP`).
+pub(crate) fn software() -> bool {
+    cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP")
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {

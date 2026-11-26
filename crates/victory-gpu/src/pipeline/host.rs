@@ -645,21 +645,36 @@ impl HostPipeline {
         let state = g.describe();
         let depth_with_bounds = g.depth_with_bounds(host);
         if mesh.is_some() {
+            // The software adapter loses the device at the first draw of a
+            // mesh pipeline without a pixel shader (the world's depth-only
+            // passes); with one that outputs nothing the draws run and
+            // write the same depth (`victory_shader::emit::empty_ps`).
+            static EMPTY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+            let pixel = match code(1) {
+                none if none.pShaderBytecode.is_null() && crate::host::software() => {
+                    let empty = EMPTY.get_or_init(victory_shader::emit::empty_ps);
+                    D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: empty.as_ptr().cast(),
+                        BytecodeLength: empty.len(),
+                    }
+                }
+                given => given,
+            };
             let name = super::library::name(
                 "mesh",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[&code_bytes(&code(0)), &code_bytes(&pixel)],
                 &state,
             );
             let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0));
             let made = match depth_with_bounds {
                 Some(depth) => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
+                    &host.device, &root, ms, pixel, g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
                     &name,
                 ),
                 None => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
+                    &host.device, &root, ms, pixel, g,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
                     &name,
                 ),
