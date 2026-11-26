@@ -116,8 +116,6 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
 /// Size of an IMAGE_IMPORT_DESCRIPTOR in the PE file.
 const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
 
-/// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
-/// RVA it patches). Empty if the image has no readable relocation table.
 /// The address a DIR64 relocation entry names. A malformed block can put the
 /// page base near `u32::MAX`; the entry then has no address, and is skipped
 /// instead of panicking in debug builds or wrapping in release ones.
@@ -125,6 +123,8 @@ fn reloc_address(page: u32, entry: u16) -> Option<u32> {
     page.checked_add(u32::from(entry & 0xFFF))
 }
 
+/// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
+/// RVA it patches). Empty if the image has no readable relocation table.
 fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     const DIR64: u16 = 10;
     let mut out = Vec::new();
