@@ -116,15 +116,23 @@ impl Port {
         port
     }
 
-    fn submit(&self, task: Task) {
+    fn submit(&self, task: Task, terminated: &AtomicBool) -> bool {
         match self.mode {
             Mode::Immediate => task.run(false),
             Mode::ThreadPool => POOL.submit(task),
             Mode::Manual | Mode::Serialized => {
-                lock(&self.tasks).push_back(task);
+                let mut tasks = lock(&self.tasks);
+                // Termination sets the submitting queue's flag before draining
+                // this port. Other queues can still submit to the shared port.
+                if terminated.load(Ordering::Acquire) {
+                    return false;
+                }
+                tasks.push_back(task);
+                drop(tasks);
                 self.ready.notify_one();
             }
         }
+        true
     }
 
     /// The next queued task, waiting up to `timeout_ms`, or until `ended`
@@ -190,6 +198,9 @@ impl Pool {
     }
 }
 
+#[cfg(test)]
+type DelayedDeliveryHook = Box<dyn FnOnce(Box<dyn FnOnce()>) + Send>;
+
 /// A queue handle is `Arc::into_raw` of this; duplicating and closing a
 /// handle add and drop a reference.
 pub struct Queue {
@@ -199,6 +210,8 @@ pub struct Queue {
     /// Delayed callbacks still waiting out their delay, in submission
     /// order: terminating the queue cancels them with the queued ones.
     delayed: Mutex<BTreeMap<u64, Task>>,
+    #[cfg(test)]
+    delayed_delivery_hook: Mutex<Option<DelayedDeliveryHook>>,
 }
 
 impl Queue {
@@ -208,6 +221,8 @@ impl Queue {
             monitors: Mutex::default(),
             terminated: AtomicBool::new(false),
             delayed: Mutex::default(),
+            #[cfg(test)]
+            delayed_delivery_hook: Mutex::default(),
         })
     }
 
@@ -239,6 +254,14 @@ impl Queue {
             // Gone if the queue was terminated meanwhile, which canceled it.
             let task = lock(&queue.delayed).remove(&id);
             if let Some(task) = task {
+                #[cfg(test)]
+                {
+                    let hook = lock(&queue.delayed_delivery_hook).take();
+                    if let Some(hook) = hook {
+                        hook(Box::new(move || queue.deliver(port, task)));
+                        return;
+                    }
+                }
                 queue.deliver(port, task);
             }
         });
@@ -246,10 +269,19 @@ impl Queue {
     }
 
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
-        self.ports[port as usize].submit(task);
+        if self.terminated.load(Ordering::Acquire)
+            || !self.ports[port as usize].submit(task, &self.terminated)
+        {
+            task.run(true);
+            return;
+        }
         // Copied out: a monitor may unregister itself.
         let monitors = lock(&self.monitors).clone();
         for (_, context, callback) in monitors {
+            // Immediate tasks and earlier monitors can terminate the queue.
+            if self.terminated.load(Ordering::Acquire) {
+                return;
+            }
             // SAFETY: stored from a `MonitorCallback` in `register_monitor`.
             let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
             callback(context as *mut c_void, Arc::as_ptr(self), port);
@@ -1665,6 +1697,97 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(*lock(&EVENTS), ["canceled", "terminated"]);
         XTaskQueueCloseHandle(q);
+    }
+
+    type DeliveryEvents = Mutex<Vec<&'static str>>;
+
+    fn record_delivery_event(context: *mut c_void, event: &'static str) {
+        // SAFETY: these callbacks receive a pointer to their test's static event log.
+        let events = unsafe { &*context.cast::<DeliveryEvents>() };
+        lock(events).push(event);
+    }
+
+    extern "system" fn record_delivery(context: *mut c_void, canceled: bool) {
+        record_delivery_event(context, if canceled { "canceled" } else { "ran" });
+    }
+
+    extern "system" fn record_monitor(context: *mut c_void, _: *const Queue, _: u32) {
+        record_delivery_event(context, "monitor");
+    }
+
+    extern "system" fn record_termination(context: *mut c_void) {
+        record_delivery_event(context, "terminated");
+    }
+
+    fn monitor_deliveries(queue: &Arc<Queue>, events: &'static DeliveryEvents) -> *mut c_void {
+        let handle = Arc::as_ptr(queue);
+        let context = std::ptr::from_ref(events).cast_mut().cast();
+        let mut token = 0;
+        assert_eq!(
+            XTaskQueueRegisterMonitor(handle, context, Some(record_monitor), &mut token),
+            S_OK
+        );
+        context
+    }
+
+    #[test]
+    fn delivery_after_termination_cancels_without_notifying_monitors() {
+        static EVENTS: [DeliveryEvents; 4] = [const { Mutex::new(Vec::new()) }; 4];
+        let modes = [
+            Mode::Manual,
+            Mode::Serialized,
+            Mode::ThreadPool,
+            Mode::Immediate,
+        ];
+        for (mode, events) in modes.into_iter().zip(&EVENTS) {
+            let queue = Queue::new([Port::new(mode), Port::new(Mode::Manual)]);
+            let handle = Arc::as_ptr(&queue);
+            let context = monitor_deliveries(&queue, events);
+            assert_eq!(
+                XTaskQueueTerminate(handle, true, context, Some(record_termination)),
+                S_OK
+            );
+
+            queue.deliver(WORK, Task::new(context, record_delivery));
+
+            assert!(!XTaskQueueDispatch(handle, WORK, 0), "{mode:?}");
+            assert_eq!(*lock(events), ["terminated", "canceled"], "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn termination_cancels_a_delayed_callback_during_delivery_handoff() {
+        use std::sync::mpsc::channel;
+
+        static EVENTS: DeliveryEvents = Mutex::new(Vec::new());
+        let queue = Queue::new([Port::new(Mode::Manual), Port::new(Mode::Manual)]);
+        let handle = Arc::as_ptr(&queue);
+        let context = monitor_deliveries(&queue, &EVENTS);
+        let (removed, removal) = channel();
+        let (resume, resumed) = channel();
+        let (delivered, delivery) = channel();
+        // Pause the timer after it takes the task out of the delayed map.
+        *lock(&queue.delayed_delivery_hook) = Some(Box::new(move |deliver| {
+            let _ = removed.send(());
+            let _ = resumed.recv();
+            deliver();
+            let _ = delivered.send(());
+        }));
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(handle, WORK, 1, context, Some(record_delivery)),
+            S_OK
+        );
+        let timeout = Duration::from_secs(5);
+        removal.recv_timeout(timeout).unwrap();
+        assert_eq!(
+            XTaskQueueTerminate(handle, true, context, Some(record_termination)),
+            S_OK
+        );
+        resume.send(()).unwrap();
+        delivery.recv_timeout(timeout).unwrap();
+
+        assert!(!XTaskQueueDispatch(handle, WORK, 0));
+        assert_eq!(*lock(&EVENTS), ["terminated", "canceled"]);
     }
 
     /// The call a test provider looks at in its cleanup, and what it saw
