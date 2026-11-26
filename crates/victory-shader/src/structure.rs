@@ -1042,7 +1042,8 @@ impl<'a> Lanes<'a> {
             }
         };
         Some(match *op {
-            Operand::Scalar { code, .. } if code != NULL => {
+            Operand::Scalar { code: NULL, .. } => (Bool::FALSE, false),
+            Operand::Scalar { code, .. } => {
                 let k = self.key(|r| inst.read(r), code)?;
                 self.mask(k)
             }
@@ -1658,6 +1659,26 @@ mod tests {
         // compare needs testing, and the scalar move never needs a guard.
         assert_eq!(s.bools.node(b), Some((lane(1, 1), Bool::FALSE, Bool::TRUE)));
         assert_eq!(s.guards[1], [None, None, Some(b), None, Some(b)]);
+    }
+
+    #[test]
+    fn null_scalar_operand_is_zero_mask() {
+        let p = build(
+            &[
+                0xBE80_3C7D, // s_and_saveexec_b32 s0, null
+                0x7E02_0280, // v_mov_b32 v1, 0 (exec is FALSE)
+                0xBEFE_0300, // s_mov_b32 exec_lo, s0 (restores TRUE)
+                0x7E04_0280, // v_mov_b32 v2, 0 (all lanes active again)
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        assert_eq!(
+            s.guards[0],
+            [None, Some(Bool::FALSE), None, None, None],
+            "null should decode as Bool::FALSE rather than turning exec opaque"
+        );
     }
 
     #[test]
