@@ -1335,6 +1335,234 @@ fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, O
     (kept, MARK.with(std::cell::Cell::take))
 }
 
+/// The default concrete format for a view of a typeless resource, if any.
+pub(crate) fn concrete_format_for(resource: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
+    use crate::resource::first_concrete;
+    let own = resource.Format.0 as u32;
+    let format = match resource.Format {
+        // The shader view must identify the depth or stencil plane.
+        DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_R24G8_TYPELESS => return None,
+        DXGI_FORMAT_R16_TYPELESS
+            if resource.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 =>
+        {
+            DXGI_FORMAT_R16_UNORM
+        }
+        _ => {
+            let concrete = first_concrete(own);
+            if concrete == 0 {
+                return None;
+            }
+            DXGI_FORMAT(concrete as i32)
+        }
+    };
+    once!(
+        own,
+        concrete = format.0,
+        "selected concrete format for typeless resource"
+    );
+    Some(format)
+}
+
+fn default_srv_desc(
+    resource: &D3D12_RESOURCE_DESC,
+    format: DXGI_FORMAT,
+) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        ..Default::default()
+    };
+    match resource.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            if resource.DepthOrArraySize > 1 {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
+                desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_SRV {
+                    MipLevels: u32::MAX,
+                    ArraySize: resource.DepthOrArraySize as u32,
+                    ..Default::default()
+                };
+            } else {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
+                desc.Anonymous.Texture1D = D3D12_TEX1D_SRV {
+                    MipLevels: u32::MAX,
+                    ..Default::default()
+                };
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            let multisampled = resource.SampleDesc.Count > 1;
+            if resource.DepthOrArraySize > 1 {
+                if multisampled {
+                    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+                    desc.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV {
+                        ArraySize: resource.DepthOrArraySize as u32,
+                        ..Default::default()
+                    };
+                } else {
+                    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                    desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV {
+                        MipLevels: u32::MAX,
+                        ArraySize: resource.DepthOrArraySize as u32,
+                        ..Default::default()
+                    };
+                }
+            } else if multisampled {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                desc.Anonymous.Texture2DMS = D3D12_TEX2DMS_SRV::default();
+            } else {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                    MipLevels: u32::MAX,
+                    ..Default::default()
+                };
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_SRV {
+                MipLevels: u32::MAX,
+                ..Default::default()
+            };
+        }
+        _ => {
+            let multisampled = resource.SampleDesc.Count > 1;
+            if multisampled {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                desc.Anonymous.Texture2DMS = D3D12_TEX2DMS_SRV::default();
+            } else {
+                desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                desc.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+                    MipLevels: u32::MAX,
+                    ..Default::default()
+                };
+            }
+        }
+    }
+    once!(
+        format = format.0,
+        dimension = desc.ViewDimension.0,
+        samples = resource.SampleDesc.Count,
+        "synthesized default srv for typeless texture"
+    );
+    desc
+}
+
+fn default_uav_desc(
+    resource: &D3D12_RESOURCE_DESC,
+    format: DXGI_FORMAT,
+) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: format,
+        ..Default::default()
+    };
+    match resource.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            if resource.DepthOrArraySize > 1 {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+                desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                    ArraySize: resource.DepthOrArraySize as u32,
+                    ..Default::default()
+                };
+            } else {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+                desc.Anonymous.Texture1D = D3D12_TEX1D_UAV::default();
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            if resource.DepthOrArraySize > 1 {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                    ArraySize: resource.DepthOrArraySize as u32,
+                    ..Default::default()
+                };
+            } else {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                desc.Anonymous.Texture2D = D3D12_TEX2D_UAV::default();
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                WSize: u32::MAX,
+                ..Default::default()
+            };
+        }
+        _ => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+            desc.Anonymous.Texture2D = D3D12_TEX2D_UAV::default();
+        }
+    }
+    once!(
+        format = format.0,
+        dimension = desc.ViewDimension.0,
+        "synthesized default uav for typeless texture"
+    );
+    desc
+}
+
+/// Adapts the requested view format to a format compatible with host D3D12.
+///
+/// Returns `true` if the view is permitted, mutating `format` to a valid typed format
+/// when necessary (e.g. mapping a typeless view on a typeless texture to its primary
+/// concrete format). Returns `false` if the view format belongs to an incompatible
+/// family or cannot be created.
+pub(crate) fn adapt_view_format(
+    resource: &D3D12_RESOURCE_DESC,
+    mut format: Option<&mut DXGI_FORMAT>,
+    unordered: bool,
+) -> bool {
+    use crate::resource::{DEPTH_FORMATS, family, is_typeless};
+    let own = resource.Format.0 as u32;
+    let typeless = is_typeless(own);
+    if let Some(format) = format.as_deref_mut()
+        && unordered
+        && let Some(&(_, linear)) = crate::resource::SRGB
+            .iter()
+            .find(|&&(s, _)| s == format.0 as u32)
+    {
+        format.0 = linear as i32;
+    }
+    let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    if view == 0 && format.is_none() {
+        if !typeless {
+            return !unordered || typed_store(own);
+        }
+        return concrete_format_for(resource).is_some();
+    }
+    if DEPTH_FORMATS.iter().any(|&(typed, _)| typed == view) {
+        once!(unordered, view, own, "view the host does not allow");
+        return false;
+    }
+    if view != 0 && family(view) != family(own) {
+        once!(view, own, "view format of another family");
+        return false;
+    }
+    if let Some(target) = format.as_deref_mut() {
+        if !typeless {
+            *target = DXGI_FORMAT(own as i32);
+        } else if view == 0 || is_typeless(view) {
+            let Some(concrete) = concrete_format_for(resource) else {
+                return false;
+            };
+            once!(
+                own,
+                view,
+                concrete = concrete.0,
+                "typeless view on typeless resource remapped to concrete format"
+            );
+            *target = concrete;
+        }
+    }
+    if unordered {
+        let effective = format.as_ref().map_or(own, |f| f.0 as u32);
+        if !typed_store(effective) {
+            once!(view = effective, own, "an unordered view in a format the host cannot store");
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -1363,56 +1591,25 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         );
         return false;
     }
-    // Every family has more than one format, its typeless one first.
-    let is_typeless = |f: u32| family(f) == f && family(f + 1) == f;
-    let typeless = is_typeless(own);
-    if let Some(format) = format.as_deref_mut()
-        && unordered
-        && let Some(&(_, linear)) = crate::resource::SRGB
-            .iter()
-            .find(|&&(s, _)| s == format.0 as u32)
-    {
-        format.0 = linear as i32;
+    if let Some(f) = format.as_deref_mut() {
+        let view = f.0 as u32;
+        if view != 0 && castable.contains(&view) && family(view) != family(own) {
+            if unordered {
+                if let Some(&(_, linear)) = crate::resource::SRGB
+                    .iter()
+                    .find(|&&(s, _)| s == view)
+                {
+                    f.0 = linear as i32;
+                }
+                if !typed_store(f.0 as u32) {
+                    once!(view, own, "an unordered view in a format the host cannot store");
+                    return false;
+                }
+            }
+            return true;
+        }
     }
-    let view = format.as_ref().map_or(0, |f| f.0 as u32);
-    // A typed unordered view in a format the host cannot store to
-    // (B5G5R5A1_UNORM on NVIDIA) removes the device when made, in the
-    // texture's own format too: the slot stays null, its writes dropped.
-    // The format checked is the one the view is made in: a typed
-    // texture's own unless the requested one is castable (below).
-    let typed = if view == 0 || (!typeless && !castable.contains(&view)) { own } else { view };
-    if unordered && !(view == 0 && typeless) && !typed_store(typed) {
-        once!(view = typed, own, "an unordered view in a format the host cannot store");
-        return false;
-    }
-    if view == 0 {
-        return !typeless && (!unordered || typed_store(own));
-    }
-    if DEPTH_FORMATS.iter().any(|&(typed, _)| typed == view) || is_typeless(view) {
-        once!(unordered, view, own, "view the host does not allow");
-        return false;
-    }
-    let cast = castable.contains(&view);
-    if family(view) != family(own) && !cast {
-        once!(view, own, "view format of another family");
-        return false;
-    }
-    let effective = if typeless || cast { view } else { own };
-    if unordered && !typed_store(effective) {
-        once!(
-            view = effective,
-            own,
-            "an unordered view in a format the host cannot store"
-        );
-        return false;
-    }
-    if let Some(format) = format
-        && !typeless
-        && !cast
-    {
-        *format = d.Format;
-    }
-    true
+    adapt_view_format(&d, format, unordered)
 }
 
 /// Whether a view without a description of `resource` (a title texture)
@@ -1495,10 +1692,21 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if let Some(copy) = crate::resource::host_copy(resource) {
                 copy.viewed.store(true, std::sync::atomic::Ordering::Relaxed);
                 let texture = &copy.texture;
-                let mut desc = desc.as_ref().map(srv_desc);
-                if desc.is_none() && !default_view(resource) {
-                    return None;
-                }
+                // SAFETY: a live texture.
+                let d = unsafe { texture.GetDesc() };
+                let mut desc = match desc.as_ref().map(srv_desc) {
+                    Some(d) => Some(d),
+                    None if crate::resource::is_typeless(d.Format.0 as u32) => {
+                        let concrete = concrete_format_for(&d)?;
+                        Some(default_srv_desc(&d, concrete))
+                    }
+                    None => {
+                        if !default_view(resource) {
+                            return None;
+                        }
+                        None
+                    }
+                };
                 if let Some(desc) = desc.as_mut()
                     && desc.Format.0 == 0
                     && let Some(format) = crate::resource::view_format(resource)
@@ -1539,14 +1747,24 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let texture = &copy.texture;
             // A depth texture's unordered views write its twin.
             // SAFETY: a live resource.
-            if unsafe { texture.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
+            let d = unsafe { texture.GetDesc() };
+            if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
                 return crate::twin::uav(resource, &copy, desc.as_ref(), at)
                     .map(|twin| Some((twin, None)));
             }
-            let mut desc = desc.as_ref().map(uav_desc);
-            if desc.is_none() && !default_view(resource) {
-                return None;
-            }
+            let mut desc = match desc.as_ref().map(uav_desc) {
+                Some(d) => Some(d),
+                None if crate::resource::is_typeless(d.Format.0 as u32) => {
+                    let concrete = concrete_format_for(&d)?;
+                    Some(default_uav_desc(&d, concrete))
+                }
+                None => {
+                    if !default_view(resource) {
+                        return None;
+                    }
+                    None
+                }
+            };
             if let Some(desc) = desc.as_mut()
                 && desc.Format.0 == 0
                 && let Some(format) = crate::resource::view_format(resource)
@@ -2406,7 +2624,7 @@ mod tests {
             (55u32, 55u32, 4u32, false),    // D16_UNORM + UAV flag (no depth flag) -> null fallback
             (39u32, 40u32, 4u32, false),    // R32_TYPELESS + D32_FLOAT view -> null fallback
             (53u32, 55u32, 4u32, false),    // R16_TYPELESS + D16_UNORM view -> null fallback
-            (27u32, 27u32, 4u32, false),    // R8G8B8A8_TYPELESS + typeless view -> null fallback
+            (27u32, 27u32, 4u32, true),     // R8G8B8A8_TYPELESS + typeless view -> concrete 28
         ];
         let mut slots = [[0u32; 8]; 24];
         for (idx, (res_fmt, view_fmt, flags, expect_real)) in cases.into_iter().enumerate() {
@@ -2461,5 +2679,193 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    /// typed SRV and the linear conversion for an sRGB UAV.
+    #[test]
+    fn typeless_view_on_typeless_resource_remaps_to_concrete_format() {
+        let adapt = |format, view: Option<&mut DXGI_FORMAT>, unordered| {
+            adapt_view_format(
+                &D3D12_RESOURCE_DESC {
+                    Format: DXGI_FORMAT(format),
+                    ..Default::default()
+                },
+                view,
+                unordered,
+            )
+        };
+        // R8G8B8A8_TYPELESS (27) with R8G8B8A8_TYPELESS view (27) -> R8G8B8A8_UNORM (28)
+        let mut fmt = DXGI_FORMAT(27);
+        assert!(adapt(27, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 28);
+
+        // B8G8R8A8_TYPELESS (90) with B8G8R8A8_TYPELESS view (90) -> B8G8R8A8_UNORM (87)
+        let mut fmt = DXGI_FORMAT(90);
+        assert!(adapt(90, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 87);
+
+        // R32_TYPELESS (39) with R32_TYPELESS view (39) -> R32_FLOAT (41)
+        let mut fmt = DXGI_FORMAT(39);
+        assert!(adapt(39, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 41);
+
+        // UNKNOWN view (0) on typeless texture -> first concrete format
+        let mut fmt = DXGI_FORMAT(0);
+        assert!(adapt(27, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 28);
+
+        // Typed view (29 = R8G8B8A8_UNORM_SRGB) on typeless texture (27) stays 29
+        let mut fmt = DXGI_FORMAT(29);
+        assert!(adapt(27, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 29);
+
+        // Typeless view (27) on typed texture (28) adopts texture's format (28)
+        let mut fmt = DXGI_FORMAT(27);
+        assert!(adapt(28, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 28);
+
+        // Typeless texture with None format maps to concrete
+        assert!(adapt(27, None, false));
+
+        // Incompatible family is refused
+        let mut fmt = DXGI_FORMAT(10);
+        assert!(!adapt(27, Some(&mut fmt), false));
+
+        // UAV with sRGB (29) converts to linear (28)
+        let mut fmt = DXGI_FORMAT(29);
+        assert!(adapt(27, Some(&mut fmt), true));
+        assert_eq!(fmt.0, 28);
+    }
+
+    #[test]
+    fn typeless_resource_with_none_or_zero_view_format_maps_to_concrete() {
+        let resource = D3D12_RESOURCE_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            ..Default::default()
+        };
+        // format is None (e.g. view == 0 / omitted desc)
+        assert!(adapt_view_format(&resource, None, false));
+
+        // format is Some(0) / UNKNOWN
+        let mut fmt = DXGI_FORMAT_UNKNOWN;
+        assert!(adapt_view_format(&resource, Some(&mut fmt), false));
+        assert_eq!(fmt, DXGI_FORMAT_R8G8B8A8_UNORM);
+
+        // format is Some(R8G8B8A8_TYPELESS)
+        let mut fmt = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        assert!(adapt_view_format(&resource, Some(&mut fmt), false));
+        assert_eq!(fmt, DXGI_FORMAT_R8G8B8A8_UNORM);
+
+        // typed resource with None format still allowed
+        let typed_resource = D3D12_RESOURCE_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ..Default::default()
+        };
+        assert!(adapt_view_format(&typed_resource, None, false));
+
+        // planar depth typeless with None or 0 format is rejected (requires explicit plane format)
+        let planar_depth = D3D12_RESOURCE_DESC {
+            Format: DXGI_FORMAT_R24G8_TYPELESS,
+            ..Default::default()
+        };
+        assert!(!adapt_view_format(&planar_depth, None, false));
+        let mut fmt = DXGI_FORMAT_UNKNOWN;
+        assert!(!adapt_view_format(&planar_depth, Some(&mut fmt), false));
+    }
+
+    #[test]
+    fn default_srv_desc_handles_multisampled_textures() {
+        let single_sample = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            DepthOrArraySize: 1,
+            ..Default::default()
+        };
+        let srv = default_srv_desc(&single_sample, DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(srv.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2D);
+
+        let msaa4x = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 4,
+                Quality: 0,
+            },
+            DepthOrArraySize: 1,
+            ..Default::default()
+        };
+        let srv = default_srv_desc(&msaa4x, DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(srv.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DMS);
+
+        let msaa4x_array = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 4,
+                Quality: 0,
+            },
+            DepthOrArraySize: 4,
+            ..Default::default()
+        };
+        let srv = default_srv_desc(&msaa4x_array, DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(srv.ViewDimension, D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY);
+        // SAFETY: inspecting union field initialized for Texture2DMSArray
+        let array_size = unsafe { srv.Anonymous.Texture2DMSArray.ArraySize };
+        assert_eq!(array_size, 4);
+    }
+
+    #[test]
+    fn planar_depth_shader_views_require_a_readable_plane_format() {
+        for (format, readable) in [
+            (
+                DXGI_FORMAT_R32G8X24_TYPELESS,
+                [
+                    DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+                    DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
+                ],
+            ),
+            (
+                DXGI_FORMAT_R24G8_TYPELESS,
+                [
+                    DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                    DXGI_FORMAT_X24_TYPELESS_G8_UINT,
+                ],
+            ),
+        ] {
+            let resource = D3D12_RESOURCE_DESC {
+                Format: format,
+                ..Default::default()
+            };
+            for mut inferred in [DXGI_FORMAT_UNKNOWN, format] {
+                assert!(!adapt_view_format(&resource, Some(&mut inferred), false));
+            }
+            for typed in readable {
+                let mut requested = typed;
+                assert!(adapt_view_format(&resource, Some(&mut requested), false));
+                assert_eq!(requested, typed);
+            }
+        }
+    }
+
+    #[test]
+    fn r16_typeless_shader_view_distinguishes_depth_from_color() {
+        let mut resource = D3D12_RESOURCE_DESC {
+            Format: DXGI_FORMAT_R16_TYPELESS,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        for (flags, expected) in [
+            (
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                DXGI_FORMAT_R16_UNORM,
+            ),
+            (D3D12_RESOURCE_FLAG_NONE, DXGI_FORMAT_R16_FLOAT),
+        ] {
+            resource.Flags = flags;
+            let mut requested = DXGI_FORMAT_R16_TYPELESS;
+            assert!(adapt_view_format(&resource, Some(&mut requested), false));
+            assert_eq!(requested, expected);
+        }
     }
 }
