@@ -596,6 +596,9 @@ pub(crate) fn module() -> HleModule {
         dlls: &[
             "api-ms-win-core-psm-appnotify-*",
             "ext-ms-win-rtcore-ntuser-window-*",
+            // GetProcAddress sees the host DLLs these API sets load.
+            "twinapi.appcore.dll",
+            "user32.dll",
         ],
         exports: vec![
             hle_export!(RegisterAppStateChangeNotification),
@@ -612,6 +615,75 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const APP_NOTIFICATIONS: &[&str] = &[
+        "RegisterAppStateChangeNotification",
+        "UnregisterAppStateChangeNotification",
+        "RegisterAppConstrainedChangeNotification",
+        "UnregisterAppConstrainedChangeNotification",
+    ];
+    const WINDOW_FUNCTIONS: &[&str] = &["CreateWindowExW", "CreateWindowExA", "ShowWindow"];
+
+    fn assert_hle_imports(dll: &str, names: &[&str]) {
+        let resolver = crate::HleResolver::new(crate::HostPolicy::none());
+        for &name in names {
+            let symbol = victory_pe::ImportSymbol::Name {
+                hint: 0,
+                name: name.into(),
+            };
+            assert_eq!(
+                resolver.classify(dll, &symbol),
+                Some(victory_loader::Provenance::Hle),
+                "{dll}!{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn appcore_notifications_resolve_to_hle() {
+        assert_hle_imports("twinapi.appcore.dll", APP_NOTIFICATIONS);
+    }
+
+    #[test]
+    fn user32_window_functions_resolve_to_hle() {
+        assert_hle_imports("user32.dll", WINDOW_FUNCTIONS);
+    }
+
+    #[cfg(windows)]
+    fn assert_api_set_overrides(api_set: &str, names: &[&str]) {
+        use crate::modules::kernel::{FreeLibrary, GetProcAddress, LoadLibraryW};
+
+        let wide: Vec<u16> = api_set.encode_utf16().chain(Some(0)).collect();
+        let module = LoadLibraryW(wide.as_ptr());
+        assert!(!module.is_null(), "could not load {api_set}");
+        for &name in names {
+            let symbol = std::ffi::CString::new(name).unwrap();
+            assert_eq!(
+                GetProcAddress(module, symbol.as_ptr().cast()) as usize,
+                crate::registry::lookup(api_set, name).unwrap(),
+                "{api_set}!{name}"
+            );
+        }
+        assert_ne!(FreeLibrary(module), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn appnotify_api_set_lookups_get_our_overrides() {
+        assert_api_set_overrides(
+            "api-ms-win-core-psm-appnotify-l1-1-0.dll",
+            APP_NOTIFICATIONS,
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ntuser_window_api_set_lookups_get_our_overrides() {
+        assert_api_set_overrides(
+            "ext-ms-win-rtcore-ntuser-window-l1-1-0.dll",
+            WINDOW_FUNCTIONS,
+        );
+    }
 
     extern "system" fn noop(_: u8, _: *mut c_void) {}
 

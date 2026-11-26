@@ -372,6 +372,8 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
+            // The host CRT behind api-ms-win-crt-runtime-*.
+            "ucrtbase.dll",
         ],
         exports: vec![
             hle_export!(GetModuleHandleW),
@@ -672,6 +674,45 @@ mod tests {
 
     fn w(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    const CRT_TERMINATION_FUNCTIONS: &[&str] = &[
+        "exit",
+        "abort",
+        "terminate",
+        "_invalid_parameter_noinfo_noreturn",
+    ];
+
+    #[test]
+    fn ucrtbase_termination_functions_resolve_to_hle() {
+        let resolver = crate::HleResolver::default();
+        for &name in CRT_TERMINATION_FUNCTIONS {
+            let symbol = victory_pe::ImportSymbol::Name {
+                hint: 0,
+                name: name.into(),
+            };
+            assert_eq!(
+                resolver.classify("ucrtbase.dll", &symbol),
+                Some(victory_loader::Provenance::Hle),
+                "ucrtbase.dll!{name}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn crt_runtime_api_set_lookups_get_our_overrides() {
+        let module = LoadLibraryW(w("api-ms-win-crt-runtime-l1-1-0.dll").as_ptr());
+        assert!(!module.is_null(), "could not load the CRT runtime API set");
+        for &name in CRT_TERMINATION_FUNCTIONS {
+            let symbol = std::ffi::CString::new(name).unwrap();
+            assert_eq!(
+                GetProcAddress(module, symbol.as_ptr().cast()) as usize,
+                crate::registry::lookup("ucrtbase.dll", name).unwrap(),
+                "ucrtbase.dll!{name}"
+            );
+        }
+        assert_ne!(FreeLibrary(module), 0);
     }
 
     #[cfg(windows)]
