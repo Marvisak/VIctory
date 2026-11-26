@@ -13,14 +13,16 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
-/// parameter) of the view-stride table: dword `i` is the byte stride of
-/// the buffer view at view-heap index `i` ([`VIEW_STRIDE_BITS`]), with
-/// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats.
+/// parameter) of a table with the buffer stride and integer kind or the
+/// texture rounding tag at each view-heap index.
 pub const VIEW_STRIDES: u8 = 255;
-/// The bits of a view-stride table dword holding the stride.
-pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
-/// In a view-stride table dword: a typed buffer view of an integer format
-/// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
+/// The bits of a view-table dword holding the buffer stride.
+pub const VIEW_STRIDE_BITS: u32 = (1 << 27) - 1;
+/// Normalized texture formats read as nearest-even f16.
+pub(super) const VIEW_NORMALIZED: u32 = 1 << 29;
+pub(super) const VIEW_UNORM16: u32 = VIEW_NORMALIZED | 1 << 28;
+pub(super) const VIEW_SNORM16: u32 = VIEW_UNORM16 | 1 << 27;
+/// A typed buffer view of an integer format, whose D16 accesses pass bits.
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
@@ -129,8 +131,8 @@ pub(crate) struct Shader {
     /// handles, once a write through a view is marked.
     pub view_marks: Option<V>,
     pub view_writes: Option<V>,
-    /// The heap index of each handle of an unordered buffer view (writes
-    /// through it are marked by the index's view-mark entry).
+    /// The heap index of each texture handle (for its format tag) and
+    /// unordered buffer handle (for strides and write marks).
     pub view_index: std::collections::HashMap<V, V>,
     /// The heap index of each handle of a texture shader view (its reads
     /// are marked, `emit` "Read marks"), and those the instruction being
@@ -555,10 +557,10 @@ impl Shader {
             &[index, s, n],
         );
         let h = self.annotate(block, h, props.0, props.1);
-        // Unordered typed, raw and structured buffers (kinds 10-12), and
-        // typed buffers read (their format kind, `Lower::view_word`).
+        // Track texture formats for D16 reads, and typed buffer formats
+        // and unordered buffer writes for the view-stride table.
         let kind = props.0 & 0xFF;
-        if !sampler && (kind == 10 || props.0 & 0x1000 != 0 && (11..=12).contains(&kind)) {
+        if !sampler && ((1..=10).contains(&kind) || props.0 & 0x1000 != 0 && (11..=12).contains(&kind)) {
             self.view_index.insert(h, index);
         }
         // Texture shader views (kinds 1-9).

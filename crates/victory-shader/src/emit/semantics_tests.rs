@@ -957,7 +957,7 @@ fn to_i32_floor(x: u32, half: bool) -> u32 {
 }
 
 /// A value to f16, to nearest even (or toward zero), denormals made.
-fn to_f16(x: f64, toward_zero: bool) -> u32 {
+pub(super) fn to_f16(x: f64, toward_zero: bool) -> u32 {
     let b = x.to_bits();
     let sign = (b >> 48) as u32 & 0x8000;
     if x.is_nan() {

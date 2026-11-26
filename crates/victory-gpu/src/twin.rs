@@ -263,7 +263,7 @@ pub(crate) fn uav(
     copy: &Arc<HostTexture>,
     words: Option<&[u32; 10]>,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
-) -> Option<ID3D12Resource> {
+) -> Option<(ID3D12Resource, DXGI_FORMAT)> {
     let console = crate::resource::title_format(resource)?;
     let twin = copy.twin.get_or_init(|| make(console, &copy.texture)).as_ref()?;
     let mut words = *words?;
@@ -306,7 +306,7 @@ pub(crate) fn uav(
     let desc = unsafe { std::ptr::from_ref(&words).cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>().read_unaligned() };
     // SAFETY: a live texture and a slot of our heap.
     unsafe { host()?.device.CreateUnorderedAccessView(&texture.texture, None, Some(&desc), at) };
-    Some(texture.texture.clone())
+    Some((texture.texture.clone(), desc.Format))
 }
 
 /// Whether a format holds integers (`_UINT`, `_SINT`).

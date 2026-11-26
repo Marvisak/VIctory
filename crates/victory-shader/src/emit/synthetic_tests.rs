@@ -69,7 +69,19 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
 }
 
 fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderError> {
-    let wave = if wave64 { 64 } else { 32 };
+    build_compute(words, wave64, if wave64 { 64 } else { 32 }, false)
+}
+
+fn build_with_threads(words: &[u32], threads: u32) -> Result<HostShader, crate::ShaderError> {
+    build_compute(words, false, threads, true)
+}
+
+fn build_compute(
+    words: &[u32],
+    wave64: bool,
+    threads: u32,
+    group_id: bool,
+) -> Result<HostShader, crate::ShaderError> {
     let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
@@ -98,8 +110,8 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
             range(ResourceType::Uav, 16, 4, 0),
         ],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 1 << 1,
-            threads: [wave, 1, 1],
+            rsrc2: 1 << 1 | u32::from(group_id) << 7,
+            threads: [threads, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -775,6 +787,482 @@ fn relative_moves_in_waterfall_loops_reach_each_lane_s_element() {
         assert_eq!(out[0], want, "{label}");
     }
 }
+#[test]
+fn d16_image_load_rounds_normalized_texels_to_nearest() {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    use super::host::texture_rounding;
+    use super::semantics_tests::to_f16;
+
+    // One group per row, one thread per texel, four D16 channels in two dwords.
+    let shader = build_with_threads(
+        &[
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x7E02_0201, // v_mov_b32 v1, s1
+            0x3408_0288, // v_lshlrev_b32 v4, 8, v1
+            0x4A08_0900, // v_add_nc_u32 v4, v0, v4
+            0x3408_0883, // v_lshlrev_b32 v4, 3, v4
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF000_1F08,
+            0x8003_0200, // image_load v[2:3], v[0:1], s[12:19] dmask:0xf dim:2D d16
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE074_1000,
+            0x800A_0204, // buffer_store_dwordx2 v[2:3], v4, s[40:43], 0 offen
+            0xBF81_0000, // s_endpgm
+        ],
+        256,
+    )
+    .expect("lower a D16 image load");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("validate a D16 image load");
+    }
+
+    assert_eq!(shader.root_srvs, [super::VIEW_STRIDES]);
+    let x = 1.0 + 3.0 / 2048.0;
+    let floats = [[x, -x, 70_000.0, -70_000.0]; 256];
+    let pack = |v: [f64; 4], truncate| {
+        let [r, g, b, a] = v.map(|f| to_f16(f, truncate));
+        [r | g << 16, b | a << 16]
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut failures = Vec::new();
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = match host.compute_pipeline(&shader) {
+            Ok(pipeline) => pipeline,
+            Err(e) if warp => {
+                eprintln!("{label}: no pipeline for a wave of 32; skipped: {e}");
+                continue;
+            }
+            Err(e) => panic!("{label}: pipeline failed: {e}"),
+        };
+        let read = |view: View<'_>, format, rows| {
+            let words = 512 * rows;
+            let output = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (
+                                0,
+                                Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]),
+                            ),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: vec![texture_rounding(format), 16, 4],
+                                },
+                            ),
+                        ],
+                        views: &[
+                            view,
+                            View::Buffer {
+                                data: &[0; 4],
+                                stride: Stride::Structured(16),
+                            },
+                            View::RawUav(words),
+                        ],
+                        samplers: &[],
+                        groups: [rows, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"))
+                .remove(0);
+            assert_eq!(output.len(), words as usize, "{label}: readback length");
+            output
+        };
+        let out = read(
+            View::Texture(256, 1, &floats),
+            DXGI_FORMAT_R32G32B32A32_FLOAT,
+            1,
+        );
+        let float_want = pack(floats[0].map(f64::from), true);
+        assert!(
+            out.as_chunks::<2>().0.iter().all(|&got| got == float_want),
+            "{label}: FLOAT control"
+        );
+        let packed = DXGI_FORMAT_A4B4G4R4_UNORM;
+        let mut support =
+            windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: packed,
+                ..Default::default()
+            };
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_FORMAT_SUPPORT, D3D12_FORMAT_SUPPORT1_SHADER_LOAD,
+            D3D12_FORMAT_SUPPORT1_TEXTURE2D,
+        };
+        // SAFETY: the query writes the supplied format support structure.
+        let supported = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support
+                .Support1
+                .contains(D3D12_FORMAT_SUPPORT1_TEXTURE2D | D3D12_FORMAT_SUPPORT1_SHADER_LOAD);
+        if supported {
+            // The same four bits in each channel exercise every UNORM code.
+            let data: Vec<_> = (0..256u16)
+                .flat_map(|i| ((i & 15) * 0x1111).to_le_bytes())
+                .collect();
+            let view = View::TextureBits {
+                size: [256, 1],
+                format: packed,
+                data: &data,
+                texel_bytes: 2,
+            };
+            let out = read(view, packed, 1);
+            for (x, &got) in out.as_chunks::<2>().0.iter().enumerate() {
+                let want = pack([(x % 16) as f64 / 15.0; 4], false);
+                assert_eq!(got, want, "{label}: A4B4G4R4_UNORM code {}", x % 16);
+            }
+            eprintln!("{label}: all A4B4G4R4_UNORM codes matched");
+        } else {
+            eprintln!("{label}: no A4B4G4R4_UNORM texture load support");
+        }
+
+        // A real sRGB view linearizes the RGB channels before D16 packing.
+        // Use the same view with truncating metadata as the legacy control.
+        let srgb = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        let srgb_data: Vec<_> = (0..=u8::MAX)
+            .flat_map(|code| [code, u8::MAX - code, code, u8::MAX])
+            .collect();
+        let srgb_view = || View::TextureBits {
+            size: [256, 1],
+            format: srgb,
+            data: &srgb_data,
+            texel_bytes: 4,
+        };
+        let srgb_legacy = read(srgb_view(), DXGI_FORMAT_R32G32B32A32_FLOAT, 1);
+        let srgb_actual = read(srgb_view(), srgb, 1);
+        for (code, (got, want)) in srgb_actual
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(srgb_legacy.as_chunks::<2>().0)
+            .enumerate()
+        {
+            assert_eq!(got, want, "{label}: sRGB code {code}");
+        }
+
+        for (format, bits, signed) in [
+            (DXGI_FORMAT_R8G8B8A8_UNORM, 8, false),
+            (DXGI_FORMAT_R8G8B8A8_SNORM, 8, true),
+            (DXGI_FORMAT_R16G16B16A16_UNORM, 16, false),
+            (DXGI_FORMAT_R16G16B16A16_SNORM, 16, true),
+        ] {
+            let count = 1u32 << bits;
+            let rows = count / 256;
+            let texel = |code| [code, count - 1 - code, 0, 1 << (bits - 1)];
+            let bytes_per_channel = (bits / 8) as usize;
+            let mut data = Vec::new();
+            for code in 0..count {
+                for channel in texel(code) {
+                    data.extend_from_slice(&channel.to_le_bytes()[..bytes_per_channel]);
+                }
+            }
+            let view = View::TextureBits {
+                size: [256, rows],
+                format,
+                data: &data,
+                texel_bytes: 4 * bits / 8,
+            };
+            let out = read(view, format, rows);
+            let mut mismatches = 0;
+            let mut first = None;
+            for (code, &got) in (0..count).zip(out.as_chunks::<2>().0) {
+                let expected = texel(code).map(|channel| {
+                    if signed {
+                        let shift = 32 - bits;
+                        let value = ((channel << shift) as i32) >> shift;
+                        (f64::from(value) / f64::from(count / 2 - 1)).max(-1.0)
+                    } else {
+                        f64::from(channel) / f64::from(count - 1)
+                    }
+                });
+                let want = pack(expected, false);
+                if got != want {
+                    mismatches += 1;
+                    first.get_or_insert_with(|| format!("code {code}: {got:08x?} vs {want:08x?}"));
+                }
+            }
+            let name = if signed { "SNORM" } else { "UNORM" };
+            if mismatches != 0 {
+                failures.push(format!(
+                    "{label} RGBA{bits}_{name}: {mismatches}/{count} mismatches, first: {}",
+                    first.unwrap()
+                ));
+            } else {
+                eprintln!("{label} RGBA{bits}_{name}: all {count} texels matched");
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device ran the image loads");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn d16_point_and_linear_samples_round_correctly() {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_R16G16B16A16_SNORM, DXGI_FORMAT_R16G16B16A16_UNORM,
+    };
+
+    let shader = |d16, filter| {
+        build_with_threads(
+            &[
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF40C_0302,
+                0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+                0xF408_0A02,
+                0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+                0xB008_01B6, // s_movk_i32 s8, 0x1b6 (border, transparent black)
+                0xBE89_03FF,
+                0x00C0_0000, // s_mov_b32 s9, 0xc00000
+                0xBE8A_03FF,
+                filter,      // s_mov_b32 s10, sampler filters
+                0xBE8B_0380, // s_mov_b32 s11, 0
+                0x7E00_02F0, // v_mov_b32 v0, 0.5
+                0x7E02_02F0, // v_mov_b32 v1, 0.5
+                0x7E08_0280, // v_mov_b32 v4, 0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xF09C_0108,
+                0x0043_0200 | u32::from(d16) << 31, // image_sample_lz v2, v[0:1], s[12:19], s[8:11] dmask:1 dim:2D
+                0xBF8C_3F70,                        // s_waitcnt vmcnt(0)
+                0xE070_1000,
+                0x800A_0204, // buffer_store_dword v2, v4, s[40:43], 0 offen
+                0xBF81_0000, // s_endpgm
+            ],
+            1,
+        )
+        .expect("lower a D16 image sample")
+    };
+    let format = DXGI_FORMAT_R16G16B16A16_UNORM;
+    let views = [
+        View::TextureBits {
+            size: [2, 1],
+            format,
+            data: &[0, 0, 0, 0, 0, 0, 0, 0, 9, 0, 9, 0, 9, 0, 9, 0],
+            texel_bytes: 8,
+        },
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(1),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let read = |d16, filter, views: &[View<'_>], format| {
+            let shader = shader(d16, filter);
+            let (root, pso) = host.compute_pipeline(&shader).expect("sampling pipeline");
+            let mut roots = vec![(
+                0,
+                Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]),
+            )];
+            if d16 {
+                roots.push((
+                    1,
+                    Root::View {
+                        srv: true,
+                        data: vec![super::host::texture_rounding(format), 16, 4],
+                    },
+                ));
+            }
+            host.dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots,
+                    views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"))[0][0]
+        };
+        // Use the host's own filtered F32 result as the reference. A
+        // hardware sampler may round the interpolation in the source format.
+        let f = f32::from_bits(read(false, 0x1850_0000, &views, format));
+        assert!(f > 0.0 && f < 9.0 / 65535.0, "{label}: sample {f}");
+        assert_eq!(
+            read(true, 0x1850_0000, &views, format),
+            super::semantics_tests::to_f16(f64::from(f), false),
+            "{label}"
+        );
+        let point_cases = [
+            (DXGI_FORMAT_R16G16B16A16_UNORM, 65455u16, 0x3bfd),
+            (DXGI_FORMAT_R16G16B16A16_UNORM, 65519, 0x3bff),
+            (DXGI_FORMAT_R16G16B16A16_SNORM, 32759, 0x3bff),
+            (DXGI_FORMAT_R16G16B16A16_SNORM, (-32759i16) as u16, 0xbbff),
+        ];
+        for (format, code, expected) in point_cases {
+            let texel = code.to_le_bytes().repeat(4);
+            let point_views = [
+                View::TextureBits {
+                    size: [1, 1],
+                    format,
+                    data: &texel,
+                    texel_bytes: 8,
+                },
+                View::Buffer {
+                    data: &[0; 4],
+                    stride: Stride::Structured(16),
+                },
+                View::RawUav(1),
+            ];
+            assert_eq!(
+                read(true, 0x0400_0000, &point_views, format),
+                expected,
+                "{label} point sample {format:?}, stored code {code:#x}"
+            );
+        }
+        eprintln!("{label}: four point-sample edge cases and the linear control matched");
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device ran the samples");
+}
+
+#[test]
+fn d16_samples_follow_immediate_sampler_choice() {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_UNORM;
+
+    const POINT: u32 = 0x0400_0000;
+    const LINEAR: u32 = 0x1850_0000;
+    let shader = |d16: bool, [zero, nonzero]: [u32; 2]| {
+        build_with_threads(
+            &[
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF40C_0302,
+                0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+                0xF408_0A02,
+                0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+                0xB008_01B6, // s_movk_i32 s8, 0x1b6 (transparent black border)
+                0xBE89_03FF,
+                0x00C0_0000, // s_mov_b32 s9, 0xc00000
+                0xBE8B_0380, // s_mov_b32 s11, 0
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0 (group id)
+                0xBF85_0003, // s_cbranch_scc1 to the group-zero sampler
+                0xBE8A_03FF,
+                nonzero,     // s_mov_b32 s10, other group's sampler
+                0xBF82_0002, // s_branch to the sample
+                0xBE8A_03FF,
+                zero,        // s_mov_b32 s10, group-zero sampler
+                0x7E00_02F0, // v_mov_b32 v0, 0.5
+                0x7E02_02F0, // v_mov_b32 v1, 0.5
+                0x7E08_0201, // v_mov_b32 v4, s1
+                0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xF09C_0108,
+                0x0043_0200 | u32::from(d16) << 31, // image_sample_lz v2, v[0:1], s[12:19], s[8:11]
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0xE070_1000,
+                0x800A_0204, // buffer_store_dword v2, v4, s[40:43], 0 offen
+                0xBF81_0000, // s_endpgm
+            ],
+            1,
+        )
+        .expect("lower two immediate sampler choices")
+    };
+    let format = DXGI_FORMAT_R16G16B16A16_UNORM;
+    let texels: Vec<u8> = [32u16; 4]
+        .into_iter()
+        .chain([65455u16; 4])
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let views = [
+        View::TextureBits {
+            size: [2, 1],
+            format,
+            data: &texels,
+            texel_bytes: 8,
+        },
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(2),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let read = |d16, filters| {
+            let shader = shader(d16, filters);
+            assert_eq!(shader.static_samplers.len(), 2);
+            let (root, pso) = host.compute_pipeline(&shader).expect("sampling pipeline");
+            let mut roots = vec![(
+                0,
+                Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]),
+            )];
+            if d16 {
+                roots.push((
+                    1,
+                    Root::View {
+                        srv: true,
+                        data: vec![super::host::texture_rounding(format), 16, 4],
+                    },
+                ));
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots,
+                        views: &views,
+                        samplers: &[],
+                        groups: [2, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            [out[0][0], out[0][1]]
+        };
+        for (filters, point) in [([POINT, LINEAR], 0), ([LINEAR, POINT], 1)] {
+            let full = read(false, filters).map(f32::from_bits);
+            let linear = 1 - point;
+            assert!(full[point] > 0.99 && full[linear] > 0.49 && full[linear] < 0.5);
+            let mut want = [0; 2];
+            want[point] = 0x3bfd;
+            want[linear] = super::semantics_tests::to_f16(f64::from(full[linear]), false);
+            assert_eq!(read(true, filters), want, "{label}: filters {filters:08x?}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device ran the sampler choices");
+}
+
 #[test]
 fn ordered_pixel_sections_use_rasterizer_ordered_views() {
     // A pixel program's ordered section (POPS) as the title's compiler

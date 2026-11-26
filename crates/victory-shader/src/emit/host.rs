@@ -19,6 +19,46 @@ pub struct Host {
     warp: bool,
 }
 
+/// View-table tag for normalized texture reads that round D16 results to nearest.
+/// sRGB reads linearize the texel before packing and keep truncating until
+/// console measurements define their rounding.
+pub fn texture_rounding(format: DXGI_FORMAT) -> u32 {
+    use super::shader::{VIEW_NORMALIZED, VIEW_SNORM16, VIEW_UNORM16};
+    match format {
+        DXGI_FORMAT_R16_UNORM | DXGI_FORMAT_R16G16_UNORM | DXGI_FORMAT_R16G16B16A16_UNORM => {
+            VIEW_UNORM16
+        }
+        DXGI_FORMAT_R16_SNORM | DXGI_FORMAT_R16G16_SNORM | DXGI_FORMAT_R16G16B16A16_SNORM => {
+            VIEW_SNORM16
+        }
+        DXGI_FORMAT_R8_UNORM
+        | DXGI_FORMAT_R8_SNORM
+        | DXGI_FORMAT_A8_UNORM
+        | DXGI_FORMAT_R1_UNORM
+        | DXGI_FORMAT_R8G8_UNORM
+        | DXGI_FORMAT_R8G8_SNORM
+        | DXGI_FORMAT_R8G8B8A8_UNORM
+        | DXGI_FORMAT_R8G8B8A8_SNORM
+        | DXGI_FORMAT_B8G8R8A8_UNORM
+        | DXGI_FORMAT_B8G8R8X8_UNORM
+        | DXGI_FORMAT_B5G6R5_UNORM
+        | DXGI_FORMAT_B5G5R5A1_UNORM
+        | DXGI_FORMAT_B4G4R4A4_UNORM
+        | DXGI_FORMAT_A4B4G4R4_UNORM
+        | DXGI_FORMAT_R10G10B10A2_UNORM
+        | DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+        | DXGI_FORMAT_BC1_UNORM
+        | DXGI_FORMAT_BC2_UNORM
+        | DXGI_FORMAT_BC3_UNORM
+        | DXGI_FORMAT_BC4_UNORM
+        | DXGI_FORMAT_BC4_SNORM
+        | DXGI_FORMAT_BC5_UNORM
+        | DXGI_FORMAT_BC5_SNORM
+        | DXGI_FORMAT_BC7_UNORM => VIEW_NORMALIZED,
+        _ => 0,
+    }
+}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
@@ -1299,6 +1339,13 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// A typed texture SRV with tightly packed texels in the view's format.
+    TextureBits {
+        size: [u32; 2],
+        format: DXGI_FORMAT,
+        data: &'a [u8],
+        texel_bytes: u32,
+    },
     /// An RGBA32F texture SRV with mips (width, height, levels, texels of
     /// each level in turn).
     Mipped(u32, u32, u32, &'a [[f32; 4]]),
@@ -1462,29 +1509,27 @@ impl Host {
                 Flags: flags,
                 ..Default::default()
             };
-            // Texel words: 4 for RGBA32F, 1 for R32_UINT, 2 for R32G32_UINT.
-            let footprint_as =
-                |r: &ID3D12Resource, w: u32, h: u32, words: u32| D3D12_TEXTURE_COPY_LOCATION {
+            let footprint_as = |r: &ID3D12Resource, w: u32, h: u32, format, texel_bytes: u32| {
+                D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(r),
                     Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: match words {
-                                    1 => DXGI_FORMAT_R32_UINT,
-                                    2 => DXGI_FORMAT_R32G32_UINT,
-                                    _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
-                                },
+                                Format: format,
                                 Width: w,
                                 Height: h,
                                 Depth: 1,
-                                RowPitch: (w * 4 * words).next_multiple_of(256),
+                                RowPitch: (w * texel_bytes).next_multiple_of(256),
                             },
                         },
                     },
-                };
-            let footprint = |r: &ID3D12Resource, w: u32, h: u32| footprint_as(r, w, h, 4);
+                }
+            };
+            let footprint = |r: &ID3D12Resource, w: u32, h: u32| {
+                footprint_as(r, w, h, DXGI_FORMAT_R32G32B32A32_FLOAT, 16)
+            };
             let subresource = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(r),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -1524,7 +1569,7 @@ impl Host {
                     Some((w, h)) => {
                         let pitch = (w * 4 * n).next_multiple_of(256);
                         let zeros = upload(&vec![0; (pitch * h / 4) as usize])?;
-                        let from = footprint_as(&zeros, w, h, n);
+                        let from = footprint_as(&zeros, w, h, r.GetDesc().Format, 4 * n);
                         list.CopyTextureRegion(&subresource(r), 0, 0, 0, &from, None);
                         zeros
                     }
@@ -1562,15 +1607,32 @@ impl Host {
                     View::Texture(..)
                     | View::Cube(..)
                     | View::Mipped(..)
-                    | View::MippedCube(..) => {
-                        let (w0, h0, mut texels, faces, levels) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1, 1),
-                            View::Mipped(w, h, l, t) => (w, h, t, 1, l),
-                            View::Cube(n, t) => (n, n, t, 6, 1),
-                            View::MippedCube(n, l, t) => (n, n, t, 6, l),
+                    | View::MippedCube(..)
+                    | View::TextureBits { .. } => {
+                        let rgba32 = |t: &[[f32; 4]]| {
+                            (
+                                t.as_ptr().cast::<u8>(),
+                                size_of_val(t),
+                                DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                16,
+                            )
+                        };
+                        let (w0, h0, faces, levels, (pixels, len, format, texel_bytes)) = match *v {
+                            View::Texture(w, h, t) => (w, h, 1, 1, rgba32(t)),
+                            View::Mipped(w, h, l, t) => (w, h, 1, l, rgba32(t)),
+                            View::Cube(n, t) => (n, n, 6, 1, rgba32(t)),
+                            View::MippedCube(n, l, t) => (n, n, 6, l, rgba32(t)),
+                            View::TextureBits {
+                                size: [w, h],
+                                format,
+                                data,
+                                texel_bytes,
+                            } => (w, h, 1, 1, (data.as_ptr(), data.len(), format, texel_bytes)),
                             _ => unreachable!(),
                         };
-                        let mut desc = texture(w0, h0, D3D12_RESOURCE_FLAG_NONE);
+                        // Each variant borrows initialized texture bytes from the dispatch.
+                        let mut texels = std::slice::from_raw_parts(pixels, len);
+                        let mut desc = texture_as(w0, h0, D3D12_RESOURCE_FLAG_NONE, format);
                         desc.DepthOrArraySize = faces as u16;
                         desc.MipLevels = levels as u16;
                         let tex = make(
@@ -1582,7 +1644,8 @@ impl Host {
                         for face in 0..(faces * levels) as usize {
                             let level = face as u32 % levels;
                             let (w, h) = ((w0 >> level).max(1), (h0 >> level).max(1));
-                            let pitch = (w as usize * 16).next_multiple_of(256);
+                            let row_len = (w * texel_bytes) as usize;
+                            let pitch = row_len.next_multiple_of(256);
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
                                 &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
@@ -1591,14 +1654,14 @@ impl Host {
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
                             for y in 0..h as usize {
-                                let row = &texels[y * w as usize..(y + 1) * w as usize];
+                                let row = &texels[y * row_len..(y + 1) * row_len];
                                 std::ptr::copy_nonoverlapping(
-                                    row.as_ptr().cast::<u8>(),
+                                    row.as_ptr(),
                                     p.cast::<u8>().add(y * pitch),
-                                    row.len() * 16,
+                                    row.len(),
                                 );
                             }
-                            texels = &texels[(w * h) as usize..];
+                            texels = &texels[row_len * h as usize..];
                             upload.Unmap(0, None);
                             let mut at_face = subresource(&tex);
                             at_face.Anonymous.SubresourceIndex = face as u32;
@@ -1607,7 +1670,7 @@ impl Host {
                                 0,
                                 0,
                                 0,
-                                &footprint(&upload, w, h),
+                                &footprint_as(&upload, w, h, format, texel_bytes),
                                 None,
                             );
                             keep.push(upload);
@@ -1618,7 +1681,7 @@ impl Host {
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         )]);
                         let cube = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                            Format: format,
                             ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
                             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
@@ -1973,7 +2036,7 @@ impl Host {
                 )]);
                 match size {
                     Some((w, h)) => list.CopyTextureRegion(
-                        &footprint_as(rb, *w, *h, *n),
+                        &footprint_as(rb, *w, *h, r.GetDesc().Format, *n * 4),
                         0,
                         0,
                         0,
