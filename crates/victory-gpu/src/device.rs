@@ -329,6 +329,10 @@ extern "system" fn check_feature_support(
         SHADER_MODEL => {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<u32>() };
+            // The defined query values are shader model 5.1 and 6.0–6.10.
+            if !matches!(*q, 0x51 | 0x60..=0x6a) {
+                return E_INVALIDARG;
+            }
             // The highest asked for, up to 6.6 (the AMD upscaler asks).
             *q = (*q).min(0x66);
             S_OK
@@ -568,6 +572,23 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    #[test]
+    fn shader_model_query_rejects_unknown_requests_without_writing() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let query = |mut requested: u32| {
+            let hr = check(device, 7, (&raw mut requested).cast(), 4);
+            (hr, requested)
+        };
+        for unknown in [0, 0x50, 0x52, 0x5f, 0x6b, 0x70, u32::MAX] {
+            assert_eq!(query(unknown), (E_INVALIDARG, unknown), "{unknown:#x}");
+        }
+        for known in std::iter::once(0x51).chain(0x60..=0x6a) {
+            assert_eq!(query(known), (S_OK, known.min(0x66)), "{known:#x}");
+        }
     }
 
     /// The queries the AMD upscaler's capability check makes.
