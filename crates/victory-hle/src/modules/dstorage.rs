@@ -1035,15 +1035,18 @@ fn into_destination(
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
-        return Ok(());
-    }
+    let mut refused = match super::xmem::write_physical(pages, offset, &data[..n]) {
+        Ok(()) => return Ok(()),
+        Err(refused) => refused,
+    };
     // Page number 0 is no page (numbers start at 0x10_0000): a list naming
     // it is one the title has not filled yet. The title writes a request's
     // page list after enqueueing it, and a queue half full is submitted on
     // its own, so a read can start first. Read the list again for a few
     // milliseconds before failing: the title never looks at a request's
     // result, so a failed one is a model or texture left unwritten.
+    // The list as last read: one filled late replaces the first reading.
+    let mut list = pages;
     if pages.contains(&0) {
         for _ in 0..LATE_LIST_TRIES {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -1051,24 +1054,56 @@ fn into_destination(
             let again = unsafe {
                 std::slice::from_raw_parts(request.destination.cast::<usize>(), pages.len())
             };
-            if !again.contains(&0) && super::xmem::write_physical(again, offset, &data[..n]) {
-                let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
-                if late.is_power_of_two() {
-                    tracing::info!(
-                        late,
-                        "dstorage: a page list filled after its request started: written late"
-                    );
-                }
-                return Ok(());
+            list = again;
+            if again.contains(&0) {
+                continue;
             }
+            refused = match super::xmem::write_physical(again, offset, &data[..n]) {
+                Ok(()) => {
+                    let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
+                    if late.is_power_of_two() {
+                        tracing::info!(
+                            late,
+                            "dstorage: a page list filled after its request started: written late"
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(refused) => refused,
+            };
         }
     }
+    // Every page known and still not written: the host refused a view of
+    // them. Tried again a few times, waiting longer each time, while the
+    // refusal is for want of memory (address space or commit short for a
+    // moment while a load maps many at once), before the request fails;
+    // unknown pages and other refusals fail at once. The list as last
+    // read: a late one that filled in but met a refusal is retried.
+    match with_retries(HOST_RETRIES, refused, std::thread::sleep, || {
+        super::xmem::write_physical(list, offset, &data[..n])
+    }) {
+        Ok(tries) => {
+            let retried = HOST_RETRIED.fetch_add(1, Ordering::Relaxed) + 1;
+            if retried.is_power_of_two() {
+                tracing::info!(
+                    retried,
+                    tries,
+                    error = refused,
+                    "dstorage: physical pages written after the host refused a view"
+                );
+            }
+            return Ok(());
+        }
+        Err(last) => refused = last,
+    }
+    let error = refused.map(|e| std::io::Error::from_raw_os_error(e as i32));
     tracing::warn!(
         offset,
         len,
         pages = pages.len(),
-        unknown = super::xmem::unknown_pages(pages),
-        list = format_args!("{:x?}", &pages[..pages.len().min(8)]),
+        unknown = super::xmem::unknown_pages(list),
+        error = error.as_ref().map(tracing::field::display),
+        list = format_args!("{:x?}", &list[..list.len().min(8)]),
         options = format_args!("{:#x}", request.options),
         file = source_name(request),
         file_offset = request.offset,
@@ -1091,6 +1126,47 @@ static AUTO_SUBMITS: AtomicU32 = AtomicU32::new(0);
 
 /// Milliseconds a page list naming page 0 is read again for.
 const LATE_LIST_TRIES: u32 = 8;
+/// Writes of known physical pages tried again after the host refused a
+/// view of them for want of memory, waiting 2, 4, ... 128 ms before each
+/// (254 ms in all).
+const HOST_RETRIES: u32 = 7;
+/// Requests whose physical pages were written after a retry.
+static HOST_RETRIED: AtomicU32 = AtomicU32::new(0);
+
+/// Whether a Windows error refusing a view is for want of memory, which
+/// can pass.
+fn short_of_memory(error: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_COMMITMENT_LIMIT, ERROR_NO_SYSTEM_RESOURCES, ERROR_NOT_ENOUGH_MEMORY,
+    };
+    matches!(
+        error,
+        ERROR_NOT_ENOUGH_MEMORY | ERROR_NO_SYSTEM_RESOURCES | ERROR_COMMITMENT_LIMIT
+    )
+}
+
+/// Runs `write` up to `tries` more times while it fails for want of
+/// memory (`refused` is the first failure), `sleep`ing 2 ms before the
+/// first and twice as long before each next (at most 128 ms): the try it
+/// succeeded at (from 1), or the last failure.
+fn with_retries(
+    tries: u32,
+    mut refused: Option<u32>,
+    mut sleep: impl FnMut(std::time::Duration),
+    mut write: impl FnMut() -> Result<(), Option<u32>>,
+) -> Result<u32, Option<u32>> {
+    for k in 1..=tries {
+        if !refused.is_some_and(short_of_memory) {
+            break;
+        }
+        sleep(std::time::Duration::from_millis(1 << k.min(7)));
+        refused = match write() {
+            Ok(()) => return Ok(k),
+            Err(refused) => refused,
+        };
+    }
+    Err(refused)
+}
 /// Page lists filled after their request started (written late).
 static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
 
@@ -1126,6 +1202,63 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    /// A write the host refuses for want of memory is tried again after 2,
+    /// 4, 8 ms..., at most `tries` times: one that succeeds on its third
+    /// retry waited 2 + 4 + 8 ms; one that never does, all seven (254 ms),
+    /// and fails with the last error.
+    #[test]
+    fn host_refusals_are_retried_with_longer_waits() {
+        const SHORT: Option<u32> = Some(1455); // ERROR_COMMITMENT_LIMIT
+        let mut waits = Vec::new();
+        let mut left = 3;
+        let tries = with_retries(
+            HOST_RETRIES,
+            SHORT,
+            |d| waits.push(d.as_millis()),
+            || {
+                left -= 1;
+                if left == 0 { Ok(()) } else { Err(SHORT) }
+            },
+        );
+        assert_eq!((tries, &waits[..]), (Ok(3), &[2, 4, 8][..]));
+        waits.clear();
+        // ERROR_NOT_ENOUGH_MEMORY every time.
+        let never = with_retries(
+            HOST_RETRIES,
+            SHORT,
+            |d| waits.push(d.as_millis()),
+            || Err(Some(8)),
+        );
+        assert_eq!(never, Err(Some(8)));
+        assert_eq!(waits, [2, 4, 8, 16, 32, 64, 128]);
+    }
+
+    /// Unknown pages and refusals not for want of memory fail at once, or
+    /// as soon as a retry meets one.
+    #[test]
+    fn other_refusals_are_not_retried() {
+        let run = |first, then| {
+            let (mut waits, mut writes) = (0, 0);
+            let result = with_retries(
+                HOST_RETRIES,
+                first,
+                |_| waits += 1,
+                || {
+                    writes += 1;
+                    Err(then)
+                },
+            );
+            (result, waits, writes)
+        };
+        assert_eq!(run(None, None), (Err(None), 0, 0));
+        // ERROR_ACCESS_DENIED; ERROR_NO_SYSTEM_RESOURCES, then
+        // ERROR_INVALID_PARAMETER.
+        assert_eq!(run(Some(5), None), (Err(Some(5)), 0, 0));
+        assert_eq!(run(Some(1450), Some(87)), (Err(Some(87)), 1, 1));
+        assert!([8, 1450, 1455].into_iter().all(short_of_memory));
+        assert!(![0, 5, 87, 487].into_iter().any(short_of_memory));
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.

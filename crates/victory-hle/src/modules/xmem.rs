@@ -565,8 +565,10 @@ struct View {
 }
 
 impl View {
-    /// Maps `n` slices from `slice` on.
-    fn map(slice: &Slice, n: usize) -> Option<View> {
+    /// Maps `n` slices from `slice` on; the Windows error if the host
+    /// refuses.
+    fn map(slice: &Slice, n: usize) -> Result<View, u32> {
+        use windows_sys::Win32::Foundation::GetLastError;
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
         // SAFETY: slices of a section we own; the view is ours until dropped.
@@ -580,10 +582,11 @@ impl View {
             )
         };
         if at.Value.is_null() {
-            return None;
+            // SAFETY: no other call since the one that failed.
+            return Err(unsafe { GetLastError() });
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        commit(at.Value as usize, len).map(|()| view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -631,23 +634,26 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
 /// costs a map, a commit and an unmap (which flushes every core's TLB).
-/// False if a page is unknown or the host fails.
-pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
+/// `Err(None)` if a page is unknown; `Err(Some(error))`, the Windows
+/// error, if the host refuses a view.
+pub(crate) fn write_physical(
+    pages: &[usize],
+    offset: usize,
+    data: &[u8],
+) -> Result<(), Option<u32>> {
     let Some(runs) = runs(pages, offset, data.len()) else {
-        return false;
+        return Err(None);
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
-            return false;
-        };
+        let mut view = View::map(slice, *n).map_err(Some)?;
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
     // Where the pages show once written (see `PageWindow`).
     report_written(&shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[])));
-    true
+    Ok(())
 }
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
@@ -690,7 +696,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         return None;
     };
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view: View::map(slice, *n).ok()?,
         within: offset % PAGE,
         len,
         pages: pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]).to_vec(),
@@ -831,7 +837,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if commit(base, len).is_err() {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -848,17 +854,20 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     true
 }
 
-/// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize) -> bool {
+/// Commits the section pages a view shows (once per page, whichever view);
+/// the Windows error if the host refuses.
+fn commit(base: usize, len: usize) -> Result<(), u32> {
     if on_wine() {
-        return true; // sections are committed whole there
+        return Ok(()); // sections are committed whole there
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
-        return true;
+        return Ok(());
     }
-    commit_refused(len, "physical pages", std::io::Error::last_os_error());
-    false
+    let error = std::io::Error::last_os_error();
+    let code = error.raw_os_error().unwrap_or_default() as u32;
+    commit_refused(len, "physical pages", error);
+    Err(code)
 }
 
 /// Reports memory the host would not give: at the Windows commit limit to
@@ -1268,7 +1277,7 @@ mod tests {
         assert_eq!(others(at(b, 1)), [at(a, 2) as usize]);
         assert!(others(a).is_empty());
         // Writes into pages (DirectStorage's) show through their views.
-        assert!(write_physical(&pages[2..], 1, &[9]));
+        assert_eq!(write_physical(&pages[2..], 1, &[9]), Ok(()));
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { at(b, 1).cast::<u8>().add(1).read() }, 9);
 
@@ -1404,14 +1413,15 @@ mod tests {
         let data: Vec<u8> = (0..2 * PAGE + 64).map(|i| (i * 7 % 251) as u8).collect();
         let offset = PAGE - 32;
         // Past the third page: the second run is too short.
-        assert!(!write_physical(&pages, offset, &data));
-        assert!(write_physical(&pages, offset, &data[..2 * PAGE]));
+        assert_eq!(write_physical(&pages, offset, &data), Err(None));
+        assert_eq!(write_physical(&pages, offset, &data[..2 * PAGE]), Ok(()));
         let seen: Vec<u8> = pages.iter().flat_map(|&p| page_bytes(p)).collect();
         assert!(seen[..offset].iter().all(|&b| b == 0), "before the offset");
         assert_eq!(seen[offset..offset + 2 * PAGE], data[..2 * PAGE]);
         assert!(seen[offset + 2 * PAGE..].iter().all(|&b| b == 0), "after");
-        assert!(
-            !write_physical(&[a[0], 0x10], 0, &data[..PAGE + 1]),
+        assert_eq!(
+            write_physical(&[a[0], 0x10], 0, &data[..PAGE + 1]),
+            Err(None),
             "unknown page"
         );
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
@@ -1441,7 +1451,7 @@ mod tests {
         assert_eq!(unsafe { b.cast::<u8>().read() }, 3);
         // `write_physical` the same way.
         REPORTED.with(|r| r.borrow_mut().clear());
-        assert!(write_physical(&pages, 0, &[4]));
+        assert_eq!(write_physical(&pages, 0, &[4]), Ok(()));
         assert_eq!(REPORTED.with(|r| r.borrow().clone()), [b as usize]);
         assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
         assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
