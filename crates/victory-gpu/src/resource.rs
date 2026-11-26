@@ -2077,7 +2077,16 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // Its host texture is made without the map's lock: the textures of the
     // slots a submission's shaders read are made several at a time.
     drop(map);
-    resource(out).host().is_some().then_some(out)
+    if resource(out).host().is_some() {
+        return Some(out);
+    }
+    // A resource with no host texture is no answer: the slot it just took
+    // is given back so a later ask can try again.
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    if map.get(&(address, *desc)) == Some(&(out as usize)) {
+        map.remove(&(address, *desc));
+    }
+    None
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -2380,6 +2389,32 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    /// A resource whose host texture cannot be made is not kept in the
+    /// map: a later ask for the same description can make one then.
+    #[cfg(windows)]
+    #[test]
+    fn a_placed_texture_without_a_host_texture_is_not_kept() {
+        let Some(_host) = crate::host::host() else { return };
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let key = |mut w: [u32; 14]| {
+            (w[1], w[13]) = (0, 0);
+            (address, w)
+        };
+        // The usual case caches its resource.
+        let good = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        assert!(texture_at(address, &good).is_some());
+        assert!(PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&key(good)));
+        // A texture of no width: its host texture cannot be made, and the
+        // slot the resource took is given back.
+        let bad = [3, 0, 0, 0, 0, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        assert!(texture_at(address, &bad).is_none());
+        assert!(
+            !PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&key(bad)),
+            "the failed texture is not kept"
+        );
     }
 
     /// A title texture's host texture is made when first asked for, and a
