@@ -91,12 +91,25 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    virtual_alloc_aligned(base, size, kind, flags, protect, 0)
+}
+
+fn virtual_alloc_aligned(
+    base: *mut c_void,
+    size: usize,
+    kind: u32,
+    flags: u64,
+    protect: u32,
+    align: usize,
+) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
         Alignment: if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
             2 * MIB
+        } else if align > 0x10000 {
+            align
         } else {
             0
         },
@@ -297,18 +310,19 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
+    let Some(layout) = layout(size, attributes) else {
+        return std::ptr::null_mut();
+    };
     if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
+        return virtual_alloc_aligned(
             std::ptr::null_mut(),
             size,
             MEM_RESERVE | MEM_COMMIT,
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
+            layout.align(),
         );
     }
-    let Some(layout) = layout(size, attributes) else {
-        return std::ptr::null_mut();
-    };
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
     // (Grand Theft Auto VI uses its GPU heap). Sub-allocate from a
@@ -1467,6 +1481,25 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn alloc_default_32bit_honours_alignment() {
+        for shift in [17u64, 18, 20, 21] {
+            // 128 KiB, 256 KiB, 1 MiB, 2 MiB
+            let expected_align = 1usize << shift;
+            let attributes = ALLOC_32BIT | (shift << 24);
+            let ptr = XMemAllocDefault(0x1000, attributes);
+            assert!(!ptr.is_null(), "32-bit allocation failed for shift {shift}");
+            let addr = ptr as usize;
+            assert!(addr <= u32::MAX as usize, "address {addr:#x} is not 32-bit");
+            assert_eq!(
+                addr % expected_align,
+                0,
+                "address {addr:#x} is not aligned to {expected_align:#x}"
+            );
+            XMemFreeDefault(ptr, attributes);
+        }
     }
 }
 
