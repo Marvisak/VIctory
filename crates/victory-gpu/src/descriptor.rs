@@ -210,7 +210,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     // a texture takes up to milliseconds; title threads waited 1-6 s a frame,
     // runs evict2, noevict1). They are never released, so they outlive it;
     // the lock is held only to look the slots up and to make the views.
-    let placed: Vec<View> = {
+    let placed: Vec<PinnedView> = {
         let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps
             .iter()
@@ -228,6 +228,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     crate::texture::in_parallel(placed.len(), |i| {
         let _ = host::placed_texture(&placed[i]);
     });
+    drop(placed);
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -534,12 +535,88 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
-/// The view of entry `i` if `generation` is still its own.
+/// A resolved [`View`] that holds COM references to any `Resource` objects it
+/// names so a concurrent [`crate::resource::resource_release`] cannot free
+/// them while the caller inspects the view or builds host descriptors from it.
 #[cfg(windows)]
-fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+pub(crate) struct PinnedView {
+    view: View,
+    resources: [usize; 2],
+}
+
+#[cfg(windows)]
+impl std::ops::Deref for PinnedView {
+    type Target = View;
+
+    fn deref(&self) -> &View {
+        &self.view
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for PinnedView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.view.fmt(f)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PinnedView {
+    fn drop(&mut self) {
+        for r in self.resources {
+            if r != 0 {
+                crate::resource::resource_release(r as This);
+            }
+        }
+    }
+}
+
+/// Resolves entry `i` if `generation` is still current, pinning any `Resource`
+/// objects it names while `VIEWS` is held. Drops `views` before releasing any
+/// partial pin so `resource_release` never re-enters `VIEWS`.
+#[cfg(windows)]
+fn pin_entry(
+    views: std::sync::MutexGuard<'_, Views>,
+    i: u32,
+    generation: u32,
+) -> Option<PinnedView> {
     let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    if *current != generation {
+        return None;
+    }
+    let [r0, r1] = view.resources();
+    let unique = [r0, if r1 == r0 { 0 } else { r1 }];
+    let mut pinned = [0usize; 2];
+    for (slot, r) in pinned.iter_mut().zip(unique) {
+        if r == 0 {
+            continue;
+        }
+        if object::try_add_ref(r as This) {
+            *slot = r;
+        } else {
+            drop(views);
+            for prev in pinned {
+                if prev != 0 {
+                    crate::resource::resource_release(prev as This);
+                }
+            }
+            return None;
+        }
+    }
+    let view = view.clone();
+    drop(views);
+    Some(PinnedView {
+        view,
+        resources: pinned,
+    })
+}
+
+/// The view of entry `i` if `generation` is still its own, pinning its
+/// resources against concurrent release until the returned guard drops.
+#[cfg(windows)]
+fn view_at(i: u32, generation: u32) -> Option<PinnedView> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    pin_entry(views, i, generation)
 }
 
 /// For each record (tag, index, generation): whether it names a view that
@@ -554,7 +631,24 @@ fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
         .collect()
 }
 
+/// The view recorded at `handle`, if one is (and its resource is alive),
+/// pinning any referenced `Resource` objects until the guard drops.
+#[cfg(windows)]
+pub(crate) fn pinned_view(handle: u64) -> Option<PinnedView> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag != VIEW_TAG {
+        return None;
+    }
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    pin_entry(views, i, generation)
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
         return None;
