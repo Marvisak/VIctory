@@ -1559,8 +1559,100 @@ pub mod low_guards {
         );
     }
 
+    /// Whether every address in `[from, to)` is currently `MEM_FREE`.
+    fn is_free(from: usize, to: usize) -> bool {
+        let mut at = from;
+        while at < to {
+            // SAFETY: plain data filled in by the query.
+            let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            if unsafe { VirtualQuery(at as *const _, &mut m, size_of_val(&m)) } == 0 {
+                return false;
+            }
+            if m.State != MEM_FREE {
+                return false;
+            }
+            let next = (m.BaseAddress as usize).saturating_add(m.RegionSize);
+            if next <= at {
+                return false;
+            }
+            at = next;
+        }
+        true
+    }
+
+    /// Sort key: smallest fitting span first, then smaller spans descending.
+    fn retry_order(span: usize, bytes: usize) -> (bool, usize) {
+        let fits = span >= bytes;
+        (!fits, if fits { span } else { usize::MAX - span })
+    }
+
+    /// Groups guards that are adjacent or separated only by `MEM_FREE` space,
+    /// returning only multi-guard clusters (single guards are tried first).
+    fn coalesceable_clusters(guards: &[(usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+        let mut sorted = guards.to_vec();
+        sorted.sort_unstable_by_key(|&(base, _)| base);
+        let mut clusters: Vec<Vec<(usize, usize)>> = Vec::new();
+        for (base, size) in sorted {
+            match clusters.last_mut() {
+                Some(cluster)
+                    if cluster.last().is_some_and(|&(prev_base, prev_size)| {
+                        let prev_end = prev_base.saturating_add(prev_size);
+                        base >= prev_end && is_free(prev_end, base)
+                    }) =>
+                {
+                    cluster.push((base, size));
+                }
+                _ => clusters.push(vec![(base, size)]),
+            }
+        }
+        clusters.retain(|c| c.len() >= 2);
+        clusters
+    }
+
+    /// Total address span covered by a base-sorted guard cluster.
+    fn cluster_span(cluster: &[(usize, usize)]) -> usize {
+        match (cluster.first(), cluster.last()) {
+            (Some(&(first, _)), Some(&(last_base, last_size))) => {
+                last_base.saturating_add(last_size).saturating_sub(first)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Re-guards remaining free space within our released guard intervals,
+    /// coalescing strictly adjacent released intervals without claiming
+    /// unguarded free gaps between non-adjacent guards.
+    fn reguard_ranges(guards: &mut Vec<(usize, usize)>, released: &[(usize, usize)]) {
+        let mut iter = released.iter().copied();
+        let Some((mut start, first_size)) = iter.next() else {
+            return;
+        };
+        let mut end = start.saturating_add(first_size);
+        let mut reguard = |from: usize, to: usize| {
+            for (free_start, len) in free_runs(from, to) {
+                if guard(free_start, len) {
+                    guards.push((free_start, len));
+                }
+            }
+        };
+        for (base, size) in iter {
+            let next_end = base.saturating_add(size);
+            if base <= end {
+                end = end.max(next_end);
+            } else {
+                reguard(start, end);
+                start = base;
+                end = next_end;
+            }
+        }
+        reguard(start, end);
+    }
+
     /// Try the smallest fitting guards first, then try smaller guards in
-    /// descending size order. A replacement guard cannot be retried here.
+    /// descending size order. If no single guard suffices, retry with each
+    /// cluster of adjacent or free-gap-separated guards released together.
+    /// A replacement guard cannot be retried here.
     pub(crate) fn retry(
         bytes: usize,
         mut allocate: impl FnMut() -> *mut std::ffi::c_void,
@@ -1572,10 +1664,7 @@ pub mod low_guards {
         let mut error = unsafe { GetLastError() };
         let mut guards = guards();
         let mut candidates = guards.clone();
-        candidates.sort_unstable_by_key(|&(_, size)| {
-            let fits = size >= bytes;
-            (!fits, if fits { size } else { usize::MAX - size })
-        });
+        candidates.sort_unstable_by_key(|&(_, size)| retry_order(size, bytes));
         for (base, size) in candidates {
             // SAFETY: our own reservation, with no allocations inside it.
             if unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) } == 0 {
@@ -1590,6 +1679,33 @@ pub mod low_guards {
                     guards.push((start, len));
                 }
             }
+            if !at.is_null() {
+                return at;
+            }
+        }
+        let mut clusters = coalesceable_clusters(&guards);
+        clusters.sort_unstable_by_key(|c| retry_order(cluster_span(c), bytes));
+        for cluster in clusters {
+            let mut released = Vec::with_capacity(cluster.len());
+            for (base, size) in cluster {
+                // SAFETY: our own reservation, with no allocations inside it.
+                if unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) } != 0 {
+                    guards.retain(|&(b, _)| b != base);
+                    released.push((base, size));
+                }
+            }
+            if released.is_empty() {
+                continue;
+            }
+            let at = if released.len() >= 2 {
+                let at = allocate();
+                // SAFETY: reads this thread's last-error value.
+                error = unsafe { GetLastError() };
+                at
+            } else {
+                std::ptr::null_mut()
+            };
+            reguard_ranges(&mut guards, &released);
             if !at.is_null() {
                 return at;
             }
@@ -1656,6 +1772,314 @@ pub mod low_guards {
                 VirtualFree(taken as *mut _, 0, MEM_RELEASE);
                 VirtualFree((hole + GRANULE) as *mut _, 0, MEM_RELEASE);
             }
+        }
+
+        struct HoleGuards {
+            start: usize,
+            end: usize,
+        }
+
+        impl Drop for HoleGuards {
+            fn drop(&mut self) {
+                let mut g = guards();
+                let mut owned = Vec::new();
+                g.retain(|&(base, size)| {
+                    if base >= self.start && base + size <= self.end {
+                        owned.push(base);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                drop(g);
+                for base in owned {
+                    // SAFETY: guards created within this test's hole.
+                    unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+                }
+            }
+        }
+
+        fn reserve_hole(bytes: usize) -> usize {
+            // SAFETY: a fresh reservation, released at once to carve a known hole.
+            let hole = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE, PAGE_NOACCESS) };
+            assert!(!hole.is_null());
+            // SAFETY: ours.
+            let freed = unsafe { VirtualFree(hole, 0, MEM_RELEASE) };
+            assert_ne!(freed, 0);
+            hole as usize
+        }
+
+        fn alloc_in(low: usize, high: usize, bytes: usize, align: usize) -> *mut std::ffi::c_void {
+            let mut requirements = super::super::MEM_ADDRESS_REQUIREMENTS {
+                LowestStartingAddress: low as *mut _,
+                HighestEndingAddress: (high - 1) as *mut _,
+                Alignment: align,
+            };
+            let mut parameter = super::super::MEM_EXTENDED_PARAMETER::default();
+            parameter.Anonymous1._bitfield =
+                super::super::MemExtendedParameterAddressRequirements as u64;
+            parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+            // SAFETY: `requirements` outlives the call and bounds are granule-aligned.
+            unsafe {
+                super::super::VirtualAlloc2(
+                    super::super::GetCurrentProcess(),
+                    std::ptr::null(),
+                    bytes,
+                    MEM_RESERVE,
+                    PAGE_NOACCESS,
+                    &mut parameter,
+                    1,
+                )
+            }
+        }
+
+        /// Two guards separated only by a free gap (e.g. a previously freed
+        /// allocation that had split a guard) coalesce to satisfy a larger
+        /// request, leave the unguarded gap free on refusal, and re-guard the
+        /// unused remainder of our guards on success.
+        #[test]
+        fn retry_coalesces_guards_separated_by_a_free_gap() {
+            let _one = TEST.lock().unwrap_or_else(|e| e.into_inner());
+            let total = 8 * GRANULE;
+            let hole = reserve_hole(total);
+            let _cleanup = HoleGuards {
+                start: hole,
+                end: hole + 6 * GRANULE,
+            };
+            // SAFETY: cap usable space at 6 granules so a 7-granule request is refused.
+            let blocker = unsafe {
+                VirtualAlloc(
+                    (hole + 6 * GRANULE) as *const _,
+                    2 * GRANULE,
+                    MEM_RESERVE,
+                    PAGE_NOACCESS,
+                )
+            };
+            assert_eq!(blocker as usize, hole + 6 * GRANULE);
+            assert!(guard(hole, 2 * GRANULE));
+            assert!(guard(hole + 4 * GRANULE, 2 * GRANULE));
+            {
+                let mut g = guards();
+                g.push((hole, 2 * GRANULE));
+                g.push((hole + 4 * GRANULE, 2 * GRANULE));
+            }
+
+            // A refused coalesced retry must restore both guards and must not
+            // claim the unguarded free gap between them.
+            let refused = retry(7 * GRANULE, || alloc_in(hole, hole + total, 7 * GRANULE, 0));
+            assert!(refused.is_null());
+            assert!(guards().contains(&(hole, 2 * GRANULE)));
+            assert!(guards().contains(&(hole + 4 * GRANULE, 2 * GRANULE)));
+            assert!(is_free(hole + 2 * GRANULE, hole + 4 * GRANULE));
+
+            let taken =
+                retry(5 * GRANULE, || alloc_in(hole, hole + total, 5 * GRANULE, 0)) as usize;
+            assert_ne!(taken, 0);
+            assert!(taken >= hole && taken + 5 * GRANULE <= hole + 6 * GRANULE);
+
+            let remainder = if taken == hole {
+                (hole + 5 * GRANULE, GRANULE)
+            } else {
+                (hole, GRANULE)
+            };
+            assert!(guards().contains(&remainder));
+            // SAFETY: the allocation returned by `retry` and our blocker.
+            let freed_taken = unsafe { VirtualFree(taken as *mut _, 0, MEM_RELEASE) };
+            assert_ne!(freed_taken, 0);
+            // SAFETY: our blocker reservation.
+            let freed_blocker = unsafe { VirtualFree(blocker, 0, MEM_RELEASE) };
+            assert_ne!(freed_blocker, 0);
+        }
+
+        /// Adjacent guards coalesce to satisfy a request spanning their
+        /// boundary, and a refused retry restores the guards and preserves
+        /// the allocation error.
+        #[test]
+        fn retry_coalesces_adjacent_guards_and_restores_on_refusal() {
+            use windows_sys::Win32::Foundation::GetLastError;
+
+            let _one = TEST.lock().unwrap_or_else(|e| e.into_inner());
+
+            // Success across two adjacent guards.
+            let total = 4 * GRANULE;
+            let hole = reserve_hole(total);
+            {
+                let _cleanup = HoleGuards {
+                    start: hole,
+                    end: hole + total,
+                };
+                assert!(guard(hole, 2 * GRANULE));
+                assert!(guard(hole + 2 * GRANULE, 2 * GRANULE));
+                {
+                    let mut g = guards();
+                    g.push((hole, 2 * GRANULE));
+                    g.push((hole + 2 * GRANULE, 2 * GRANULE));
+                }
+
+                let taken =
+                    retry(3 * GRANULE, || alloc_in(hole, hole + total, 3 * GRANULE, 0)) as usize;
+                assert_ne!(taken, 0);
+                assert!(taken >= hole && taken + 3 * GRANULE <= hole + total);
+                let remainder = if taken == hole {
+                    (hole + 3 * GRANULE, GRANULE)
+                } else {
+                    (hole, GRANULE)
+                };
+                assert!(guards().contains(&remainder));
+                // SAFETY: the allocation returned by `retry`, ours.
+                let freed = unsafe { VirtualFree(taken as *mut _, 0, MEM_RELEASE) };
+                assert_ne!(freed, 0);
+            }
+
+            // Refusal across two adjacent guards preserves guards and last error.
+            let total = 6 * GRANULE;
+            let hole = reserve_hole(total);
+            let _cleanup = HoleGuards {
+                start: hole,
+                end: hole + total,
+            };
+            // SAFETY: reserve the top 2 granules so a 5-granule request within
+            // `[hole, hole + 6 * GRANULE)` genuinely runs out of room.
+            let blocker = unsafe {
+                VirtualAlloc(
+                    (hole + 4 * GRANULE) as *const _,
+                    2 * GRANULE,
+                    MEM_RESERVE,
+                    PAGE_NOACCESS,
+                )
+            };
+            assert_eq!(blocker as usize, hole + 4 * GRANULE);
+            assert!(guard(hole, 2 * GRANULE));
+            assert!(guard(hole + 2 * GRANULE, 2 * GRANULE));
+            {
+                let mut g = guards();
+                g.push((hole, 2 * GRANULE));
+                g.push((hole + 2 * GRANULE, 2 * GRANULE));
+            }
+
+            let mut expected_error = 0;
+            let result = retry(5 * GRANULE, || {
+                let at = alloc_in(hole, hole + total, 5 * GRANULE, 0);
+                if at.is_null() {
+                    // SAFETY: reads this thread's last-error value.
+                    expected_error = unsafe { GetLastError() };
+                }
+                at
+            });
+            // SAFETY: reads this thread's last-error value.
+            let actual_error = unsafe { GetLastError() };
+            assert!(result.is_null());
+            assert_ne!(expected_error, 0);
+            assert_eq!(actual_error, expected_error);
+
+            // All 4 granules in `[hole, hole + 4 * GRANULE)` must remain guarded.
+            let guarded_bytes: usize = guards()
+                .iter()
+                .filter(|&&(b, s)| b >= hole && b + s <= hole + 4 * GRANULE)
+                .map(|&(_, s)| s)
+                .sum();
+            assert_eq!(guarded_bytes, 4 * GRANULE);
+
+            // SAFETY: our blocker reservation.
+            let freed = unsafe { VirtualFree(blocker, 0, MEM_RELEASE) };
+            assert_ne!(freed, 0);
+        }
+
+        /// A 2 MiB-aligned (`PAGES_2M`) request whose aligned window straddles
+        /// two adjacent 2 MiB guards succeeds once both guards are released
+        /// together, and both flanking remainders are guarded again.
+        #[test]
+        fn retry_coalesces_guards_straddling_two_mib_alignment() {
+            let _one = TEST.lock().unwrap_or_else(|e| e.into_inner());
+            let two_mib = 2 * super::super::MIB;
+            let hole = reserve_hole(4 * two_mib);
+            // `VirtualAlloc2` requires address bounds aligned to `Alignment`.
+            let low = hole.next_multiple_of(two_mib);
+            let high = low + 3 * two_mib;
+            assert!(high <= hole + 4 * two_mib);
+
+            let aligned = low + two_mib;
+            let start = aligned - GRANULE;
+            let end = start + 2 * two_mib;
+
+            // Block `[low, start)` and `[end, high)` so `[aligned, aligned + 2 MiB)`
+            // is the only valid 2 MiB-aligned placement inside `[low, high)`.
+            // SAFETY: fresh reservations inside our carved hole.
+            let lower_blocker =
+                unsafe { VirtualAlloc(low as *const _, start - low, MEM_RESERVE, PAGE_NOACCESS) };
+            assert_eq!(lower_blocker as usize, low);
+            // SAFETY: fresh reservation inside our carved hole.
+            let upper_blocker =
+                unsafe { VirtualAlloc(end as *const _, high - end, MEM_RESERVE, PAGE_NOACCESS) };
+            assert_eq!(upper_blocker as usize, end);
+
+            let _cleanup = HoleGuards { start, end };
+            assert!(guard(start, two_mib));
+            assert!(guard(start + two_mib, two_mib));
+            {
+                let mut g = guards();
+                g.push((start, two_mib));
+                g.push((start + two_mib, two_mib));
+            }
+
+            let taken = retry(two_mib, || alloc_in(low, high, two_mib, two_mib)) as usize;
+            assert_eq!(taken, aligned);
+            assert!(guards().contains(&(start, GRANULE)));
+            assert!(guards().contains(&(aligned + two_mib, two_mib - GRANULE)));
+
+            // SAFETY: the allocation returned by `retry` and our blockers.
+            let freed_taken = unsafe { VirtualFree(taken as *mut _, 0, MEM_RELEASE) };
+            assert_ne!(freed_taken, 0);
+            // SAFETY: our lower blocker reservation.
+            let freed_lower = unsafe { VirtualFree(lower_blocker, 0, MEM_RELEASE) };
+            assert_ne!(freed_lower, 0);
+            // SAFETY: our upper blocker reservation.
+            let freed_upper = unsafe { VirtualFree(upper_blocker, 0, MEM_RELEASE) };
+            assert_ne!(freed_upper, 0);
+        }
+
+        /// Guards separated by an active (non-free) allocation cannot form one
+        /// contiguous span and are not released together in a second pass.
+        #[test]
+        fn retry_does_not_coalesce_guards_separated_by_an_allocation() {
+            let _one = TEST.lock().unwrap_or_else(|e| e.into_inner());
+            let total = 6 * GRANULE;
+            let hole = reserve_hole(total);
+            let _cleanup = HoleGuards {
+                start: hole,
+                end: hole + total,
+            };
+            // SAFETY: reserve the middle 2 granules as an active allocation.
+            let blocker = unsafe {
+                VirtualAlloc(
+                    (hole + 2 * GRANULE) as *const _,
+                    2 * GRANULE,
+                    MEM_RESERVE,
+                    PAGE_NOACCESS,
+                )
+            };
+            assert_eq!(blocker as usize, hole + 2 * GRANULE);
+            assert!(guard(hole, 2 * GRANULE));
+            assert!(guard(hole + 4 * GRANULE, 2 * GRANULE));
+            {
+                let mut g = guards();
+                g.push((hole, 2 * GRANULE));
+                g.push((hole + 4 * GRANULE, 2 * GRANULE));
+            }
+
+            let mut attempts = 0;
+            let result = retry(5 * GRANULE, || {
+                attempts += 1;
+                std::ptr::null_mut()
+            });
+            assert!(result.is_null());
+            assert_eq!(attempts, 2);
+            assert!(guards().contains(&(hole, 2 * GRANULE)));
+            assert!(guards().contains(&(hole + 4 * GRANULE, 2 * GRANULE)));
+
+            // SAFETY: our blocker reservation.
+            let freed = unsafe { VirtualFree(blocker, 0, MEM_RELEASE) };
+            assert_ne!(freed, 0);
         }
     }
 }
