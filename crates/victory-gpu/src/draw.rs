@@ -1257,8 +1257,9 @@ impl State {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
+        // host's limit, 1,000,000 views on NVIDIA, 2,048 samplers anywhere)
+        // are made afresh too: the title's slots there have no host slot of
+        // their own.
         for u in used.iter().filter(tables) {
             if fresh.contains(&u.slot) {
                 continue;

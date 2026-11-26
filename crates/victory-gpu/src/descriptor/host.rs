@@ -17,10 +17,11 @@ pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
-    /// Slots mirroring the title's; view heaps have `dynamic` more.
+    /// Slots mirroring the title's; view heaps have `dynamic` more, and a
+    /// sampler heap capped at 2,048 has [`SAMPLER_DYNAMIC`].
     count: u32,
-    /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// Dynamic slots past `count`: [`DYNAMIC`] / [`MIN_DYNAMIC`] in a view
+    /// heap, [`SAMPLER_DYNAMIC`] in a capped sampler heap, else none.
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -99,6 +100,10 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// Dynamic slots of a sampler heap capped at `HEAP_SAMPLERS` (2,048): tables
+/// reaching past the title slots it keeps are made afresh here (#65).
+const SAMPLER_DYNAMIC: u32 = 256;
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -143,11 +148,28 @@ impl HostHeap {
         // `HEAP_SAMPLERS`: slots up to there exist and stay null.
         let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
         let (heap, count, extra) = if sampler {
-            match make(count.max(samplers)) {
-                Ok(heap) => (heap, count, 0),
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
+            // Cap past the D3D12 sampler limit up front (every binding tier):
+            // keep the first `samplers - SAMPLER_DYNAMIC` title slots and the
+            // rest as dynamic so `State::tables` can remake tables past the
+            // cap (#65). Drivers that accept larger heaps still get the cap
+            // so behaviour does not depend on the host.
+            if count > samplers {
+                tracing::warn!(count, "host sampler heap capped at {samplers}");
+                let title = samplers - SAMPLER_DYNAMIC;
+                match make(samplers) {
+                    Ok(heap) => (heap, title, SAMPLER_DYNAMIC),
+                    Err(e) => {
+                        tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                        return None;
+                    }
+                }
+            } else {
+                match make(count.max(samplers)) {
+                    Ok(heap) => (heap, count, 0),
+                    Err(e) => {
+                        tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                        return None;
+                    }
                 }
             }
         } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
@@ -310,10 +332,22 @@ pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
 }
 
 impl HostHeap {
-    /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
+    /// `n` consecutive free dynamic slots (view heaps and capped sampler
+    /// heaps), taken until [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > self.dynamic {
+        if n == 0 || self.dynamic == 0 {
+            return None;
+        }
+        if n > self.dynamic {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    n,
+                    spare = self.dynamic,
+                    sampler = self.sampler,
+                    "a table larger than the dynamic slots is not made"
+                );
+            });
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
@@ -2461,5 +2495,48 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    /// A sampler heap past the D3D12 limit is capped, not lost, and keeps
+    /// dynamic slots for tables reaching past what it holds (#65).
+    ///
+    /// The oversized request must come back as a *heap*, not `None`: that
+    /// return is the bug this guards. Skipping when there is no device is
+    /// done by asking for the host first, so that on a machine with one, a
+    /// regression here fails instead of quietly passing.
+    #[test]
+    fn large_sampler_heap_is_capped() {
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let heap = HostHeap::new(true, 4 * victory_shader::emit::HEAP_SAMPLERS)
+            .expect("an oversized sampler heap is capped, not dropped");
+        let count = victory_shader::emit::HEAP_SAMPLERS - SAMPLER_DYNAMIC;
+        assert_eq!(heap.count(), count);
+        // SAFETY: a live heap.
+        unsafe {
+            assert_eq!(heap.heap.GetDesc().NumDescriptors, victory_shader::emit::HEAP_SAMPLERS);
+        }
+        assert_eq!(heap.dynamic(SAMPLER_DYNAMIC + 1), None);
+        let a = heap.dynamic(SAMPLER_DYNAMIC).unwrap();
+        assert_eq!(a, count);
+        assert_eq!(heap.dynamic(1), None);
+        heap.release(a, 8);
+        assert_eq!(heap.dynamic(8), Some(count));
+    }
+
+    /// A sampler heap within the limit has a slot per title slot and no
+    /// dynamic ones.
+    #[test]
+    fn small_sampler_heap_has_no_dynamic_slots() {
+        let Some(heap) = HostHeap::new(true, 16) else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.count(), 16);
+        assert_eq!(heap.dynamic(1), None);
+        // SAFETY: a live heap sized for every index shaders can clamp to.
+        unsafe {
+            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
+        }
     }
 }
