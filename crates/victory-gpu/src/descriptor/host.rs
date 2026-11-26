@@ -6,6 +6,7 @@
 //! reads it through a table and finds the slot changed.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -25,6 +26,13 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Per title slot, its record once the slot is made from it and holds
+    /// what a draw reads (a texture's view not left null, and not of a
+    /// texture placed in memory, which a draw checks again), else 0: what
+    /// [`HostHeap::mirror`] finds without the `made` lock, which every
+    /// title thread binding or writing views would otherwise wait on. Set
+    /// last, under that lock, once the slot is made; cleared first.
+    ready: Box<[AtomicU64]>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -195,6 +203,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            ready: (0..count).map(|_| AtomicU64::new(0)).collect(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
@@ -738,12 +747,21 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // Made from this record already and readable as it is (what the
+        // checks below find under the lock): nothing to make.
+        if tag == VIEW_TAG
+            && self.ready[index as usize].load(Ordering::Acquire) == key
+            && let Some(view) = view_at(i, generation)
+        {
+            return Some(view);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
+                self.ready[index as usize].store(0, Ordering::Relaxed);
                 made[index as usize] = 0;
                 self.make_null(index);
                 self.note_address(index, None);
@@ -808,6 +826,7 @@ impl HostHeap {
             }
         }
         {
+            self.ready[index as usize].store(0, Ordering::Relaxed);
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             if later {
@@ -827,7 +846,17 @@ impl HostHeap {
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
-            self.keep(index, kept.flatten());
+            let kept = kept.flatten();
+            // A texture's view left null is made again when a draw reads it,
+            // and a placed texture's whenever its memory's host texture
+            // changed since (`needs_remake`): neither is ever ready.
+            let ready = if is_texture(&view) && (kept.is_none() || is_placed_texture(&view)) {
+                0
+            } else {
+                key
+            };
+            self.keep(index, kept);
+            self.ready[index as usize].store(ready, Ordering::Release);
         }
         Some(view)
     }
@@ -865,18 +894,26 @@ impl HostHeap {
     /// slots had its list searched each time; 62,000 slots a frame, run
     /// evict3).
     pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
+        let gives_up = |k: &Kept| {
+            k.as_ref().is_some_and(|k| {
+                k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize))
+            })
+        };
         let slots: Vec<u32> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            (0..kept.len() as u32)
-                .filter(|&i| {
-                    kept[i as usize]
-                        .as_ref()
-                        .is_some_and(|k| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
-                })
-                .collect()
+            (0..kept.len() as u32).filter(|&i| gives_up(&kept[i as usize])).collect()
         };
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // A title slot made again since it was picked (a title thread wrote a
+        // view there, which takes `made` too) views something else: it stays.
+        let slots: Vec<u32> = {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            slots.into_iter().filter(|&i| gives_up(&kept[i as usize])).collect()
+        };
         for index in slots {
+            if let Some(ready) = self.ready.get(index as usize) {
+                ready.store(0, Ordering::Relaxed);
+            }
             let key = made.get(index as usize).copied().unwrap_or(0);
             let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
             match &view {
