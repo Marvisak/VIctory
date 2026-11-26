@@ -123,6 +123,7 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        min_lanes: lowered.min_lanes,
     })
 }
 
@@ -913,6 +914,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             heap: l.heap,
             heap_writes: l.heap_writes,
             view_marks: false,
+            min_lanes: l.min_lanes,
         }
     };
 

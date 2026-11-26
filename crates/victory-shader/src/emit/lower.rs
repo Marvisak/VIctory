@@ -21,6 +21,9 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod lanes;
+
+use lanes::lane_group;
 
 type Why = &'static str;
 
@@ -54,6 +57,8 @@ pub(crate) struct Lowered {
     pub view_marks: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// [`super::HostShader::min_lanes`].
+    pub min_lanes: u32,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -92,14 +97,19 @@ pub(crate) struct Parts<'a> {
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
+    /// Code reading lanes in narrow groups also needs the whole wave (or
+    /// did not translate so): redo declaring the console's wave size.
+    Wide,
     Fail(ShaderError),
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let mut wide = false;
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, wide).run() {
             Ok(l) => return Ok(l),
+            Err(Stop::Wide) => wide = true,
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
@@ -238,8 +248,16 @@ struct Lower<'a> {
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
-    /// lanes, so lane n is console lane n.
+    /// lanes, so lane n is console lane n (mod the host's wave size, if
+    /// it declares none).
     console_lanes: bool,
+    /// [`Lowered::min_lanes`]: compute reading lanes only within aligned
+    /// groups of this many, declaring no wave size (0: none).
+    min_lanes: u32,
+    /// Such a program read a lane mask as data: lowered again as whole-wave.
+    needs_wave: bool,
+    /// [`Lower::lane_thread`], once made.
+    lane_thread: Option<V>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -541,7 +559,7 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, wide: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -560,21 +578,19 @@ impl<'a> Lower<'a> {
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
+        let mut min_lanes = 0;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
-                let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
-                    || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
-            }) || {
+            let wave = if x.native.wave64 { 64 } else { 32 };
+            let group = insts()
+                .map(|i| lane_group(x.st, i, wave))
+                .max()
+                .unwrap_or(0);
+            let masks = group < wave && {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
                 let whens = x.st.exits.iter().filter_map(|e| match *e {
@@ -598,9 +614,42 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
-            let wave = if x.native.wave64 { 64 } else { 32 };
+            console_lanes = group > 0 || masks;
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            let shared = one_wave && s.lds_dwords > 0;
+            // The first active lane is the host wave's. A barrier where some
+            // host wave has no lane left would hang the host (the console's
+            // wave still arrives).
+            let whole = insts().any(|i| {
+                i.name().starts_with("v_permlane")
+                    || i.name() == "s_barrier"
+                    || i.name() == "v_readfirstlane_b32"
+                        && !i
+                            .writes
+                            .first()
+                            .is_some_and(|w| x.res.waterfall.reads.contains(&w.1))
+            });
+            // LDS exchanged within the console's wave has no barrier, so it
+            // races across host waves narrower than it.
+            let lds = s.lds_dwords > 0
+                || insts().any(|i| match &i.fields {
+                    Fields::Ds { .. } => i.name() != "ds_swizzle_b32",
+                    Fields::Buffer { lds, .. } | Fields::Flat { lds, .. } => *lds,
+                    _ => false,
+                });
+            // Reads within aligned groups narrower than the wave hold on any
+            // host wave of whole groups: no wave size, thread ids by the
+            // host's (`lane_thread`). Only 1-D groups: hosts tile 2-D groups
+            // into waves (4×4 on Intel, 16×2 on NVIDIA), so a wave's ids are
+            // not one run from its first.
+            let one_d = cs.threads[1] == 1 && cs.threads[2] == 1;
+            if console_lanes
+                && group < wave
+                && one_d
+                && !(wide || masks || shared || whole || lds)
+            {
+                min_lanes = group;
+            } else if console_lanes || shared {
                 s.wave_size = Some(wave);
             }
         }
@@ -691,6 +740,9 @@ impl<'a> Lower<'a> {
             heap: [false; 2],
             src0: None,
             console_lanes,
+            min_lanes,
+            needs_wave: false,
+            lane_thread: None,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -1292,7 +1344,16 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
-    fn run(mut self) -> Result<Lowered, Stop> {
+    fn run(self) -> Result<Lowered, Stop> {
+        // Narrowing never stops a program that translates whole-wave.
+        let narrow = self.min_lanes > 0;
+        match self.lower_program() {
+            Err(Stop::Fail(_)) if narrow => Err(Stop::Wide),
+            r => r,
+        }
+    }
+
+    fn lower_program(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1319,6 +1380,10 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
+        // Sections run over the console's whole wave.
+        if self.min_lanes > 0 && !self.sections.is_empty() {
+            return Err(Stop::Wide);
+        }
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
@@ -1380,6 +1445,9 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if self.needs_wave {
+            return Err(Stop::Wide);
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -1415,6 +1483,7 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            min_lanes: self.min_lanes,
         })
     }
 
@@ -1817,6 +1886,10 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        if self.min_lanes > 0 {
+            self.needs_wave = true;
+            return Err(LANE_MASK);
+        }
         if !self.x.st.active.contains(&lo) && !self.ballots.contains_key(&lo) {
             let xy = self.mask_number(lo)?;
             self.ballots.insert(lo, xy);
@@ -2652,6 +2725,7 @@ impl<'a> Lower<'a> {
             111,
             &[],
         );
+        let lane = self.console_lane(lane);
         let (k31, k32, one, z) = (
             self.s.m.i32(31),
             self.s.m.i32(32),
@@ -2914,6 +2988,9 @@ impl<'a> Lower<'a> {
     fn thread_id(&mut self, c: u8) -> Val {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
+        }
+        if self.min_lanes > 0 {
+            return self.narrow_thread_id(c);
         }
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
@@ -5949,7 +6026,9 @@ impl<'a> Lower<'a> {
             }
         }
         if let Some((rows, banks)) = masks {
-            // Row (16 lanes) and bank (4 lanes of a row) write masks.
+            // Row (16 lanes) and bank (4 lanes of a row) write masks, by
+            // the console wave's rows.
+            let lane = self.console_lane(lane);
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
             let ri = self.s.m.bin(c, Bin::LShr, lane, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
