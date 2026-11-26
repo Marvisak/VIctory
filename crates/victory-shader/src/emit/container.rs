@@ -166,6 +166,10 @@ pub(crate) struct Psv<'a> {
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
+    /// Input-to-output dependency table in `dx.viewIdState` row-major layout:
+    /// `ni * no.div_ceil(32)` dwords (`ni`, `no` scalar counts), or empty to
+    /// fall back to all-ones (or when either is 0).
+    pub io_deps: &'a [u32],
 }
 
 /// `PSV0` with runtime info version 2 (validator 1.6).
@@ -277,8 +281,8 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend([1, start, cols, e.kind, e.sig_comp() as u8, e.interp, 0, 0]);
         }
     }
-    // Input-to-output dependencies, as the view-id state declares them:
-    // every output scalar on every input scalar.
+    // Input-to-output dependencies, as `dx.viewIdState` declares them
+    // (zero-padded for scalar rows >= ni and output bits >= no).
     if in_vectors > 0 && out_vectors > 0 {
         let scalars = |els: &[SigElement]| {
             els.iter()
@@ -288,19 +292,28 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         };
         let (ni, no) = (scalars(p.inputs), scalars(p.outputs));
         let per = (out_vectors * 4).div_ceil(32);
+        let words = no.div_ceil(32);
+        if !p.io_deps.is_empty() {
+            debug_assert_eq!(p.io_deps.len(), (ni * words) as usize);
+        }
         for i in 0..in_vectors * 4 {
             for k in 0..per {
-                let bits = if i < ni {
-                    no.saturating_sub(32 * k).min(32)
+                let word = if i < ni && k < words {
+                    let bits = no.saturating_sub(32 * k).min(32);
+                    let valid = if bits == 32 {
+                        u32::MAX
+                    } else {
+                        (1u32 << bits) - 1
+                    };
+                    if p.io_deps.is_empty() {
+                        valid
+                    } else {
+                        p.io_deps[(i * words + k) as usize] & valid
+                    }
                 } else {
                     0
                 };
-                let mask = if bits == 32 {
-                    u32::MAX
-                } else {
-                    (1u32 << bits) - 1
-                };
-                u32s(&mut out, &[mask]);
+                u32s(&mut out, &[word]);
             }
         }
     }
@@ -439,5 +452,102 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    fn sig(name: &str, row: u32, col: u8, cols: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col,
+            cols,
+            usage: ((1u8 << cols) - 1),
+            half: false,
+        }
+    }
+
+    #[test]
+    fn psv_writes_exact_sparse_io_deps() {
+        let inputs = [sig("A", 0, 0, 4), sig("B", 1, 0, 2)];
+        let outputs = [sig("C", 0, 0, 4), sig("D", 1, 0, 2)];
+        // ni = 6, no = 6; rows 6..8 zeroed, unused bits >= 6 masked off.
+        let io_deps = [0xFFFF_FFFF, 1 << 1, 0, 1 << 5, 0, 0];
+        let bytes = psv(&Psv {
+            stage: 1,
+            flag: false,
+            inputs: &inputs,
+            outputs: &outputs,
+            prims: &[],
+            mesh: None,
+            gs: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+            io_deps: &io_deps,
+        });
+        let table: Vec<u32> = bytes[bytes.len() - 8 * 4..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect();
+        assert_eq!(table, [0x3F, 1 << 1, 0, 1 << 5, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn psv_masks_and_pads_multiword_outputs() {
+        let inputs = [sig("IN", 0, 0, 2)];
+        // out_vectors = 9 -> per = 2 words per input row; no = 34 -> words = 2.
+        let outputs = [sig("OUT", 8, 0, 2)];
+        let io_deps = [0x0000_0005, 0xFFFF_FFFF, 0x0000_0002, 0x0000_0001];
+        let bytes = psv(&Psv {
+            stage: 1,
+            flag: false,
+            inputs: &inputs,
+            outputs: &outputs,
+            prims: &[],
+            mesh: None,
+            gs: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+            io_deps: &io_deps,
+        });
+        let table: Vec<u32> = bytes[bytes.len() - 4 * 2 * 4..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect();
+        assert_eq!(table, [5, 0b11, 2, 1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn psv_falls_back_to_all_ones_when_io_deps_empty() {
+        let inputs = [sig("A", 0, 0, 4), sig("B", 1, 0, 2)];
+        let outputs = [sig("C", 0, 0, 4), sig("D", 1, 0, 2)];
+        let bytes = psv(&Psv {
+            stage: 1,
+            flag: false,
+            inputs: &inputs,
+            outputs: &outputs,
+            prims: &[],
+            mesh: None,
+            gs: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+            io_deps: &[],
+        });
+        let table: Vec<u32> = bytes[bytes.len() - 8 * 4..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect();
+        assert_eq!(table, [0x3F, 0x3F, 0x3F, 0x3F, 0x3F, 0x3F, 0, 0]);
     }
 }

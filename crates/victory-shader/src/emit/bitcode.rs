@@ -129,7 +129,7 @@ pub(crate) mod pred {
 }
 
 #[derive(Debug, Clone)]
-enum Op {
+pub(crate) enum Op {
     Bin(Bin, V, V),
     Cast(Cast, V),
     Cmp(u8, V, V),
@@ -715,6 +715,42 @@ impl Module {
             plan.pos[b] = n as u64;
         }
         plan
+    }
+
+    pub(crate) fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub(crate) fn block_phis(&self, block: usize) -> &[u32] {
+        &self.blocks[block].phis
+    }
+
+    pub(crate) fn block_body(&self, block: usize) -> &[u32] {
+        &self.blocks[block].body
+    }
+
+    pub(crate) fn block_term(&self, block: usize) -> Option<Term> {
+        self.term(block)
+    }
+
+    pub(crate) fn inst_count(&self) -> usize {
+        self.insts.len()
+    }
+
+    pub(crate) fn inst_op(&self, inst: u32) -> &Op {
+        &self.insts[inst as usize].op
+    }
+
+    pub(crate) fn func_name(&self, func: u32) -> &str {
+        &self.funcs[func as usize].name
+    }
+
+    pub(crate) fn global_count(&self) -> usize {
+        self.globals.len()
+    }
+
+    pub(crate) fn live_insts(&self) -> Vec<bool> {
+        self.live()
     }
 
     pub fn write(&self) -> Vec<u8> {
