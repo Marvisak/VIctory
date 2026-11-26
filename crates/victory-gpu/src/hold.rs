@@ -141,6 +141,12 @@ impl<S> Held<S> {
                     let ready = match items.front_mut() {
                         None => false,
                         Some((Item::Segment(_, waits), since, fresh)) => {
+                            // Earlier segments on this queue may write the
+                            // memory this wait reads, so run them first.
+                            if !waits.is_empty() && !piece.is_empty() {
+                                (w.run)(*queue, std::mem::take(&mut piece));
+                                done.pieces += 1;
+                            }
                             let mut ok = true;
                             for wait in waits.iter() {
                                 match wait.holds(w.read) {
@@ -166,6 +172,10 @@ impl<S> Held<S> {
                             true
                         }
                         Some((Item::FenceWait(fence, value), _, fresh)) => {
+                            if !piece.is_empty() {
+                                (w.run)(*queue, std::mem::take(&mut piece));
+                                done.pieces += 1;
+                            }
                             let ok = (w.fence)(*fence) >= *value;
                             if !ok {
                                 *fresh = false;
@@ -257,10 +267,22 @@ mod tests {
         log: Vec<String>,
         /// Bottom-of-pipe writes of each segment: (address, value).
         writes: HashMap<&'static str, Vec<(u64, u64)>>,
+        /// Direct writes to fence memory (`fence::gpu_address`): (fence, value).
+        fence_writes: HashMap<&'static str, Vec<(usize, u64)>>,
     }
 
     fn ge(address: u64, reference: u64) -> ValueWait {
         ValueWait { address, bytes: 8, comparison: GREATER_EQUAL, reference, mask: u64::MAX }
+    }
+
+    fn eq(address: u64, reference: u64) -> ValueWait {
+        ValueWait {
+            address,
+            bytes: 8,
+            comparison: EQUAL,
+            reference,
+            mask: u64::MAX,
+        }
     }
 
     fn pump(held: &mut Held<&'static str>, fake: &RefCell<Fake>) -> Pumped {
@@ -271,6 +293,9 @@ mod tests {
             for s in &segments {
                 for (a, v) in f.writes.get(s).cloned().unwrap_or_default() {
                     f.memory.insert(a, v);
+                }
+                for (fence, v) in f.fence_writes.get(s).cloned().unwrap_or_default() {
+                    f.fences.insert(fence, v);
                 }
             }
             f.log.push(format!("q{q}: {}", segments.join(" ")));
@@ -438,5 +463,66 @@ mod tests {
         assert_eq!(forced, [(2, vec![ge(0x100, 1)])]);
         pump(&mut held, &fake);
         assert_eq!(fake.borrow().log, ["q2: stuck"]);
+    }
+
+    /// A wait after an earlier segment on the same queue must see the memory
+    /// left by that segment: resetting a previously-set word before waiting
+    /// for another queue to set it again must hold until the peer runs.
+    #[test]
+    fn a_wait_runs_the_work_before_it_first() {
+        let fake = RefCell::new(Fake::default());
+        {
+            let mut f = fake.borrow_mut();
+            f.memory.insert(0x100, 1);
+            f.writes.insert("reset", vec![(0x100, 0), (0x200, 1)]);
+            f.writes.insert("peer", vec![(0x100, 1)]);
+        }
+        let mut held = Held::default();
+        held.push(1, Item::Segment("reset", vec![]));
+        held.push(1, Item::Segment("after", vec![eq(0x100, 1)]));
+        held.push(2, Item::Segment("peer", vec![ge(0x200, 1)]));
+        let p = pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q1: reset", "q2: peer", "q1: after"]);
+        assert_eq!((p.pieces, p.segments), (3, 3));
+        assert!(held.is_empty());
+    }
+
+    /// A wait satisfied by an earlier segment on the same queue runs right
+    /// after that segment without falsely recording a stall.
+    #[test]
+    fn a_wait_for_an_earlier_segment_on_the_same_queue_does_not_stall() {
+        let fake = RefCell::new(Fake::default());
+        fake.borrow_mut().writes.insert("produce", vec![(0x100, 1)]);
+        let mut held = Held::default();
+        held.push(1, Item::Segment("produce", vec![]));
+        held.push(1, Item::Segment("consume", vec![ge(0x100, 1)]));
+        let p = pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q1: produce", "q1: consume"]);
+        assert_eq!((p.pieces, p.segments), (2, 2));
+        assert!(p.waited.is_empty());
+    }
+
+    /// A FenceWait keeps its place behind earlier segments on the same queue:
+    /// a segment that rewrites a fence's value in memory runs before the wait
+    /// tests that fence.
+    #[test]
+    fn a_fence_wait_runs_the_work_before_it_first() {
+        let fake = RefCell::new(Fake::default());
+        {
+            let mut f = fake.borrow_mut();
+            f.fences.insert(5, 1);
+            f.fence_writes.insert("rewind", vec![(5, 0)]);
+        }
+        let mut held = Held::default();
+        held.push(1, Item::Segment("rewind", vec![]));
+        held.push(1, Item::FenceWait(5, 1));
+        held.push(1, Item::Segment("after", vec![]));
+        pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q1: rewind"]);
+        assert!(held.holds_work(1));
+        held.push(2, Item::Signal(5, 1));
+        pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q1: rewind", "signal 5 1", "q1: after"]);
+        assert!(held.is_empty());
     }
 }

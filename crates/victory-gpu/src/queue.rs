@@ -910,4 +910,101 @@ mod tests {
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
     }
+
+    /// End-to-end guest-API regression: a single command list that resets a
+    /// flag with `Write64BitValueBottomOfPipeX`, waits for it to be set back
+    /// with `Wait64BitValueX`, and writes a result afterwards must run the
+    /// first segment before evaluating the wait, so the second segment stays
+    /// held until another queue sets the flag.
+    #[cfg(windows)]
+    #[test]
+    fn in_list_wait_sees_bottom_of_pipe_writes_before_it() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let words = crate::resource::test_buffer(256);
+        let (ptr, _) = crate::resource::buffer_bytes(words).unwrap();
+        let flag = ptr.cast::<u64>();
+        // SAFETY: `words` is a 256-byte committed buffer.
+        let result = unsafe { flag.add(1) };
+        // SAFETY: initialize `flag = 1`, `result = 0`.
+        unsafe {
+            flag.write_volatile(1);
+            result.write_volatile(0);
+        }
+
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut primary, mut peer, mut allocator, mut first, mut second) =
+            (null, null, null, null, null);
+        for (kind, out) in [(0u32, &mut primary), (2u32, &mut peer)] {
+            let desc = QueueDesc {
+                kind,
+                priority: 0,
+                flags: 0,
+                nodes: 0,
+            };
+            assert_eq!(create(null, &desc, &QUEUE_IIDS[0], out), S_OK);
+        }
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        for (kind, out) in [(0u32, &mut first), (2u32, &mut second)] {
+            assert_eq!(
+                crate::list::create_list(null, 0, kind, allocator, null, &list_iid, out),
+                S_OK
+            );
+        }
+
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+        type Release = extern "system" fn(This) -> u32;
+        const EQUAL: u32 = 3;
+
+        // `first`: reset `flag` to 0, wait for `flag == 1`, then write `0xCAFE` to `result`.
+        crate::list::write64(first, flag as u64, 0, 0, 0);
+        crate::list::wait64(first, flag as u64, EQUAL, 1, 0);
+        crate::list::write64(first, result as u64, 0xCAFE, 0, 0);
+        assert_eq!(slot::<Close>(first, 0x48)(first), S_OK);
+
+        // `second`: set `flag` back to 1 on the peer queue.
+        crate::list::write64(second, flag as u64, 1, 0, 0);
+        assert_eq!(slot::<Close>(second, 0x48)(second), S_OK);
+
+        // Submitting `first` runs segment 0 (clearing `flag` to 0) and holds segment 1.
+        slot::<Execute>(primary, 0x50)(primary, 1, &first);
+        // SAFETY: `flag` and `result` live in our committed buffer.
+        let (flag_mid, result_mid) = unsafe { (flag.read_volatile(), result.read_volatile()) };
+        assert_eq!(flag_mid, 0, "segment 0 cleared flag");
+        assert_eq!(
+            result_mid, 0,
+            "segment 1 must wait until peer sets flag back to 1"
+        );
+
+        // Submitting `second` sets `flag = 1`, releasing segment 1 on `primary`.
+        slot::<Execute>(peer, 0x50)(peer, 1, &second);
+        // SAFETY: `flag` and `result` live in our committed buffer.
+        let (flag_end, result_end) = unsafe { (flag.read_volatile(), result.read_volatile()) };
+        assert_eq!(flag_end, 1);
+        assert_eq!(result_end, 0xCAFE);
+
+        let release = |o: This| slot::<Release>(o, 0x10)(o);
+        for object in [first, second, allocator, primary, peer, words] {
+            assert_eq!(release(object), 0);
+        }
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
 }
