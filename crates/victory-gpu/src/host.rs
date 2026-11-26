@@ -2502,16 +2502,18 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if whole {
         return;
     }
-    // The copy stopped at an unmapped page. One of a title destination ends
-    // it: the retries below write the destination themselves (zeros for
-    // what cannot be read), and would fault there.
-    if title_dst && !crate::texture::committed(dst, len) {
+    // The copy stopped at an unmapped or non-writable page. One of a title
+    // destination ends it: the retries below write zeros for unreadable
+    // source pages, and a direct write to a non-writable title page would
+    // fault.
+    if title_dst && !writable(dst, len) {
         return;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     #[cfg(feature = "diagnostics")]
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FallbackUs);
+    static ZERO_4K: [u8; 4 << 10] = [0; 4 << 10];
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
@@ -2522,12 +2524,54 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    if title_dst {
+                        read(ZERO_4K.as_ptr(), to, n);
+                    } else {
+                        // SAFETY: inside the host destination, which is mapped and writable.
+                        unsafe { to.write_bytes(0, n) };
+                    }
                 }
             });
         }
     });
+}
+
+/// Whether `[at, at + len)` is committed, writable memory (so a title
+/// destination with read-only or unmapped pages stops `copy_mapped` instead
+/// of falling back to zero-filling it).
+fn writable(at: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    let mut p = at as usize;
+    let Some(end) = p.checked_add(len) else {
+        return false;
+    };
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let base = info.Protect & 0xff;
+        let can_write = matches!(
+            base,
+            PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+        );
+        if n == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0
+            || !can_write
+        {
+            return false;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= p {
+            return false;
+        }
+        p = next;
+    }
+    true
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -2646,6 +2690,35 @@ mod title_copies {
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
         release(holes);
+    }
+
+    #[test]
+    fn title_copies_do_not_fault_on_read_only_destinations() {
+        let from = pattern();
+        // SAFETY: a fresh committed 3-block reservation of ours.
+        let to = unsafe {
+            let base =
+                VirtualAlloc(std::ptr::null(), 3 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                    .cast::<u8>();
+            assert!(!base.is_null());
+            base.write_bytes(0xee, 3 * BLOCK);
+            base
+        };
+        let mut old = 0;
+        // SAFETY: the middle block is committed and owned by this test.
+        let protected =
+            unsafe { VirtualProtect(to.add(BLOCK).cast(), BLOCK, PAGE_READONLY, &mut old) };
+        assert_ne!(protected, 0);
+        // Single read-only block: stops cleanly without writing or faulting.
+        // SAFETY: the middle block.
+        copy_mapped(unsafe { to.add(BLOCK) }, from.as_ptr(), BLOCK, true);
+        assert!(block(to, 1).iter().all(|&b| b == 0xee));
+        // Spanning a read-only block: stops cleanly without faulting or
+        // reaching past the read-only block.
+        copy_mapped(to, from.as_ptr(), 3 * BLOCK, true);
+        assert!(block(to, 1).iter().all(|&b| b == 0xee));
+        assert!(block(to, 2).iter().all(|&b| b == 0xee));
+        release(to);
     }
 
     #[test]
