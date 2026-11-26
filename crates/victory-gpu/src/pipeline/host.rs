@@ -384,6 +384,39 @@ pub(crate) struct HostPipeline {
     pub(crate) marks: Option<(u32, u32)>,
 }
 
+impl HostPipeline {
+    /// A command of it the frame budget times: its kind and groups, and
+    /// how its programs reach memory (`crate::frame_budget::Traits`).
+    pub(crate) fn timed(
+        &self,
+        kind: crate::frame_budget::Kind,
+        groups: Option<[u32; 3]>,
+    ) -> crate::frame_budget::Command {
+        use crate::frame_budget::Traits;
+        let mut traits = 0;
+        for s in &self.stages {
+            if s.memory.is_some() {
+                traits |= Traits::MEMORY;
+            }
+            if s.view_addresses.is_some() {
+                traits |= Traits::VIEW_ADDRESSES;
+            }
+            if s.shader.translated().is_some_and(|t| t.host.heap) {
+                traits |= Traits::HEAP;
+            }
+        }
+        if self.marks.is_some() {
+            traits |= Traits::VIEW_MARKS;
+        }
+        crate::frame_budget::Command {
+            pipeline: self.name.clone(),
+            kind,
+            groups,
+            traits,
+        }
+    }
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());

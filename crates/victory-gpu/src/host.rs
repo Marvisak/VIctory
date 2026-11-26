@@ -43,6 +43,8 @@ pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
     queue: ID3D12CommandQueue,
+    /// The queue's timestamp ticks a second, asked once.
+    frequency: OnceLock<u64>,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
@@ -251,6 +253,7 @@ fn create() -> windows::core::Result<Host> {
             device,
             depth_bounds_supported,
             queue,
+            frequency: OnceLock::new(),
             fence,
             submitted: Mutex::new(0),
             event,
@@ -837,7 +840,16 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// The frame budget's timed commands (`crate::frame_budget`): a timestamp
+    /// before and after each, where they are read back, and each one's
+    /// command.
+    timing: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    timed: Mutex<Vec<crate::frame_budget::Command>>,
 }
+
+/// Timestamps per list for the frame budget (two per timed command);
+/// commands past them are not timed.
+const TIMED: u32 = 1024;
 
 // SAFETY: D3D12 objects are free-threaded; a host list is recorded by the
 // title list's one recording thread, then run by one submission at a time
@@ -854,6 +866,50 @@ pub(crate) fn warn_depth_bounds() {
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
+
+/// A timestamp query heap of `count` and a read-back buffer for it.
+fn timestamps(count: u32) -> Option<(ID3D12QueryHeap, ID3D12Resource)> {
+    let device = &host()?.device;
+    let mut heap: Option<ID3D12QueryHeap> = None;
+    let mut back: Option<ID3D12Resource> = None;
+    let readback = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_READBACK,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: u64::from(count) * 8,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let heap_desc = D3D12_QUERY_HEAP_DESC {
+        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+        Count: count,
+        NodeMask: 0,
+    };
+    // SAFETY: plain object creation.
+    unsafe {
+        device.CreateQueryHeap(&heap_desc, &mut heap).ok()?;
+        device
+            .CreateCommittedResource(
+                &readback,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut back,
+            )
+            .ok()?;
+    }
+    Some((heap?, back?))
+}
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -1148,8 +1204,16 @@ impl Host {
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                timing: OnceLock::new(),
+                timed: Mutex::default(),
             })
         }
+    }
+
+    /// The queue's timestamp ticks a second.
+    pub(crate) fn timestamp_frequency(&self) -> u64 {
+        // SAFETY: a plain query.
+        *self.frequency.get_or_init(|| unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1))
     }
 
     /// Runs closed lists and waits for them.
@@ -1172,6 +1236,7 @@ impl Host {
         crate::descriptor::sync_heaps();
         #[cfg(feature = "diagnostics")]
         drop(syncing);
+        let synced = std::time::Instant::now();
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -1208,6 +1273,7 @@ impl Host {
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(uploading);
+        let uploaded = std::time::Instant::now();
         let runs: Vec<&HostList> = uploads
             .as_ref()
             .map(|u| u.list())
@@ -1289,14 +1355,12 @@ impl Host {
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let frequency = self.timestamp_frequency();
                 gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX));
             }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let frequency = self.timestamp_frequency();
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
                 tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
                 for (ms, op) in runs[i].slowest(frequency, 6) {
@@ -1311,6 +1375,13 @@ impl Host {
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
+        // The frame budget's timed commands: only lists that timed some
+        // are read back.
+        if crate::frame_budget::timing() {
+            for r in runs {
+                r.report_timed(self);
+            }
+        }
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
@@ -1416,6 +1487,13 @@ impl Host {
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        crate::frame_budget::submitted(crate::frame_budget::Phases {
+            sync: synced - started,
+            uploads: uploaded - synced,
+            refresh: prepared - uploaded,
+            gpu,
+            copy_back: copying.elapsed(),
+        });
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
         for list in runs {
@@ -1668,44 +1746,7 @@ impl HostList {
         if !timing() {
             return None;
         }
-        self.stamps
-            .get_or_init(|| {
-                let device = &host()?.device;
-                let mut heap: Option<ID3D12QueryHeap> = None;
-                let mut back: Option<ID3D12Resource> = None;
-                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
-                let desc = D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: u64::from(STAMPS) * 8,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    ..Default::default()
-                };
-                // SAFETY: plain object creation.
-                unsafe {
-                    device
-                        .CreateQueryHeap(
-                            &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0 },
-                            &mut heap,
-                        )
-                        .ok()?;
-                    device
-                        .CreateCommittedResource(
-                            &readback,
-                            D3D12_HEAP_FLAG_NONE,
-                            &desc,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            None,
-                            &mut back,
-                        )
-                        .ok()?;
-                }
-                Some((heap?, back?))
-            })
-            .as_ref()
+        self.stamps.get_or_init(|| timestamps(STAMPS)).as_ref()
     }
 
     /// The noted commands that took longest on the GPU, longest first, as
@@ -1760,7 +1801,108 @@ impl HostList {
             || node_is_list(None, ansi.as_deref(), &pointers, &name)
     }
 
+    /// The frame budget's timestamp heap and its read-back buffer, made
+    /// at the list's first timed command and kept across resets.
+    fn timing(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
+        self.timing.get_or_init(|| timestamps(TIMED)).as_ref()
+    }
+
+    /// The frame budget's timestamp heap and its read-back buffer if the
+    /// list made them.
+    fn timing_made(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
+        self.timing.get().and_then(Option::as_ref)
+    }
+
+    /// The frame budget's timestamp heap, if the list made it.
+    #[cfg(test)]
+    pub(crate) fn timestamp_heap(&self) -> Option<ID3D12QueryHeap> {
+        self.timing_made().map(|(heap, _)| heap.clone())
+    }
+
+    /// Before a command the frame budget times (`crate::frame_budget`): its
+    /// number, None where commands are not timed (or no room is left).
+    pub(crate) fn time_start(&self) -> Option<u32> {
+        if !crate::frame_budget::timing() {
+            return None;
+        }
+        let k = self.timed.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+        let (heap, _) = self.timing()?;
+        if 2 * k + 1 >= TIMED {
+            return None;
+        }
+        // SAFETY: an open list and our query heap.
+        unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k) };
+        Some(k)
+    }
+
+    /// After timed command `k` (from [`HostList::time_start`]), which was
+    /// `command`.
+    pub(crate) fn time_end(&self, k: u32, command: crate::frame_budget::Command) {
+        let Some((heap, _)) = self.timing_made() else {
+            return;
+        };
+        // SAFETY: an open list and our query heap.
+        unsafe {
+            self.list
+                .EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * k + 1)
+        };
+        let mut timed = self.timed.lock().unwrap_or_else(|e| e.into_inner());
+        debug_assert_eq!(timed.len() as u32, k);
+        timed.push(command);
+    }
+
+    /// After the list ran on `host`: each timed command's GPU time to the
+    /// frame budget. A list that timed none reads nothing back.
+    fn report_timed(&self, host: &Host) {
+        if self.timed.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            return;
+        }
+        crate::frame_budget::ran(self.timed_ms(host.timestamp_frequency()));
+    }
+
+    /// After the list ran: each timed command and its GPU time in ms.
+    pub(crate) fn timed_ms(&self, frequency: u64) -> Vec<(crate::frame_budget::Command, f64)> {
+        let timed = self.timed.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_, back)) = self.timing_made().filter(|_| !timed.is_empty()) else {
+            return Vec::new();
+        };
+        let n = 2 * timed.len();
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE {
+            Begin: 0,
+            End: n * 8,
+        };
+        // SAFETY: a read-back buffer the finished list resolved into.
+        let stamps: Vec<u64> = unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return Vec::new();
+            }
+            let s = std::slice::from_raw_parts(data.cast::<u64>(), n).to_vec();
+            back.Unmap(0, None);
+            s
+        };
+        timed
+            .iter()
+            .enumerate()
+            .map(|(k, command)| {
+                let ticks = stamps[2 * k + 1].saturating_sub(stamps[2 * k]);
+                let ms = ticks as f64 * 1e3 / frequency.max(1) as f64;
+                (command.clone(), ms)
+            })
+            .collect()
+    }
+
     pub(crate) fn close(&self) {
+        let timed = self.timed.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+        if timed > 0
+            && let Some((heap, back)) = self.timing_made()
+        {
+            // SAFETY: an open list, our heap and read-back buffer.
+            unsafe {
+                self.list
+                    .ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2 * timed, back, 0)
+            };
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1785,6 +1927,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.timed.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -3184,6 +3327,8 @@ impl Host {
     /// captures are on). `None` if nothing was shown; else, in diagnostics
     /// builds, whether the frame was black.
     pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
+        // A frame ends: the frame budget reports it if it was slow.
+        crate::frame_budget::presented();
         self.present_with_compositor(
             planes,
             frame,
