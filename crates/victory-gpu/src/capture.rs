@@ -122,6 +122,62 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
+/// Most texels a target dump decodes: 512 MiB as the RGBA it writes. A
+/// footprint naming more is no copy of a texture this title has.
+const MAX_TEXELS: u64 = 1 << 27;
+
+/// Most bytes a target's read-back buffer takes.
+const MAX_READBACK: u64 = 1 << 30;
+
+/// The bytes `rows` rows take `pitch` bytes apart: every row pitched but
+/// the last, which the runtime leaves unpadded (a block-compressed
+/// footprint's rows are rows of blocks). What a copy's total covers and what
+/// its mapping spans. `None` when the footprint names no row at all, or a
+/// row longer than its pitch.
+fn row_bytes(pitch: u64, rows: u32, row: u64) -> Option<u64> {
+    let rows = u64::from(rows);
+    (rows > 0 && row > 0 && row <= pitch).then(|| pitch * (rows - 1) + row)
+}
+
+/// Whether `f` is a copy of `d`'s first subresource: a format with a known
+/// element ([`crate::resource::element`]), the description's own extent at
+/// mip 0 (block-aligned), a row pitch holding a row, a third dimension of
+/// the copy as deep as the description is, no more texels than a dump
+/// decodes, and nothing multi-sampled (a multi-sampled resource is not
+/// copied out at all). What the host gives for a texture it cannot copy is a
+/// footprint of 0xFF in every field — the format included — and no total:
+/// sizing anything from that is what aborted a capture run (0xFFFFFFFF by
+/// 0xFFFFFFFF texels named 103,079,215,080 bytes of PNG rows).
+fn footprint_fits(d: &D3D12_RESOURCE_DESC, f: &D3D12_SUBRESOURCE_FOOTPRINT) -> bool {
+    let Some((element, block)) = crate::resource::element(f.Format.0 as u32) else {
+        return false;
+    };
+    let (Some(width), Some(height)) = (
+        d.Width.checked_next_multiple_of(block),
+        u64::from(d.Height).checked_next_multiple_of(block),
+    ) else {
+        return false;
+    };
+    // A third dimension is the copy's own extent; an array's layers are not.
+    let depth = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        u64::from(d.DepthOrArraySize)
+    } else {
+        1
+    };
+    let (w, h) = (u64::from(f.Width), u64::from(f.Height));
+    let texels = (w / block)
+        .checked_mul(h / block)
+        .and_then(|t| t.checked_mul(depth));
+    d.SampleDesc.Count == 1
+        && width > 0
+        && height > 0
+        && w == width
+        && h == height
+        && u64::from(f.Depth) == depth
+        && texels.is_some_and(|t| t <= MAX_TEXELS)
+        && u64::from(f.RowPitch) >= width / block * element
+}
+
 /// Records a copy of `texture` (in the copy-source state) into a
 /// readback buffer.
 pub(crate) fn read_back(
@@ -131,6 +187,7 @@ pub(crate) fn read_back(
 ) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
+    let (mut rows, mut row) = (0u32, 0u64);
     // SAFETY: a live texture; outputs for one subresource.
     unsafe {
         let desc = texture.GetDesc();
@@ -140,10 +197,35 @@ pub(crate) fn read_back(
             1,
             0,
             Some(&mut footprint),
-            None,
-            None,
+            Some(&mut rows),
+            Some(&mut row),
             Some(&mut total),
         );
+        // Footprints the host cannot give are not copies: refuse them here,
+        // where a buffer would take their size, rather than at whichever
+        // arithmetic reads them later (the title aborts on that allocation).
+        // Rows of no rows (or of none) are refused by name, not left to the
+        // subtraction.
+        let f = footprint.Footprint;
+        let expected = row_bytes(u64::from(f.RowPitch), rows, row);
+        let copyable = footprint_fits(&desc, &f)
+            && expected.is_some_and(|expected| total >= expected && total <= MAX_READBACK);
+        if !copyable {
+            tracing::info!(
+                resource =
+                    format_args!("{:#x}", windows::core::Interface::as_raw(texture) as usize),
+                format = desc.Format.0,
+                width = f.Width,
+                height = f.Height,
+                depth = f.Depth,
+                pitch = f.RowPitch,
+                rows,
+                row,
+                total,
+                "target not read back: the host gives no copyable footprint"
+            );
+            return None;
+        }
     }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_READBACK,
@@ -542,19 +624,56 @@ fn dump_one(
     host.execute(&[&list]);
     let Some((buffer, footprint)) = read else { return };
     let f = footprint.Footprint;
+    if !footprint_fits(d, &f) {
+        tracing::info!(
+            ?resource,
+            format = f.Format.0,
+            width = f.Width,
+            height = f.Height,
+            pitch = f.RowPitch,
+            "target not dumped: its footprint names no copy of it"
+        );
+        return;
+    }
+    // One row of a format this dump decodes is a row of texels; a
+    // block-compressed footprint's rows are rows of blocks, which this dump
+    // (as before) does not decode.
+    let Some((texel, 1)) = crate::resource::element(f.Format.0 as u32) else {
+        tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
+        return;
+    };
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished; the mapping spans the footprint's rows.
+    // SAFETY: the copy finished; the mapping spans the rows read below.
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        let row = f.Width as usize * texel as usize;
+        // The buffer's own bytes, not `pitch * height`: a copy stops at the
+        // last row's own size (a 1x1 target fills 4 bytes of a 256-byte
+        // pitch), so the pitch-named bytes past it are not there.
+        let len = (buffer.GetDesc().Width as usize).min(MAX_READBACK as usize);
+        let Some(span) = row_bytes(f.RowPitch as u64, f.Height, row as u64)
+            .map(|bytes| bytes as usize)
+            .filter(|&bytes| bytes <= len)
+        else {
+            tracing::info!(
+                format = f.Format.0,
+                ?resource,
+                pitch,
+                height = f.Height,
+                buffer = len,
+                "target not dumped: its rows do not fit its read-back"
+            );
+            buffer.Unmap(0, None);
+            return;
+        };
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), span);
         // Tiny targets (exposure, averages): their values as they are.
-        if f.Width * f.Height <= 16 {
-            let texel = crate::resource::element(f.Format.0 as u32).map_or(4, |(b, _)| b as usize);
+        if u64::from(f.Width) * u64::from(f.Height) <= 16 {
             let words: Vec<String> = (0..f.Height as usize)
-                .flat_map(|y| rows[y * pitch..][..f.Width as usize * texel].chunks(4))
+                .flat_map(|y| rows[y * pitch..][..row].chunks(4))
                 .map(|c| {
                     let w = u32::from_le_bytes(c.try_into().unwrap_or_default());
                     format!("{w:#x}={}", f32::from_bits(w))
@@ -611,11 +730,34 @@ fn small_float(bits: u32, man: u32) -> f32 {
     }
 }
 
+/// The format a dump decodes `format` as: a typeless format as the value its
+/// bits hold — its family's typed twin (R32_TYPELESS as R32_FLOAT, R24G8 as
+/// D24_UNORM_S8, R16_TYPELESS as R16_FLOAT, the B8G8R8A8 typelesses as
+/// their sRGB twins, whose bytes are the same) — and everything else as
+/// itself. Block-compressed and video formats stay as they are: [`to_rgba`]
+/// decodes those not at all and says so.
+fn readable(format: u32) -> u32 {
+    use crate::resource::family;
+    // A typeless format starts its family, and so does the member after it.
+    let typeless = family(format) == format && family(format.saturating_add(1)) == format;
+    if typeless {
+        format.saturating_add(1)
+    } else {
+        format
+    }
+}
+
 /// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
 /// as channel values scaled so the largest finite one is white (single
 /// channels: lowest black, highest white, as grey). `None` for formats not
-/// handled.
+/// handled, and for an extent no dump sizes (a footprint this dump did not
+/// vouch for must never size an allocation).
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
+    let format = readable(format);
+    let texels = (w as u64).checked_mul(h as u64)?;
+    if texels == 0 || texels > MAX_TEXELS {
+        return None;
+    }
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
@@ -668,6 +810,9 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         11..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),
         33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0])),
         1..=2 => (16, Box::new(move |b| {
+            [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
+        })),
+        5..=6 => (12, Box::new(move |b| {
             [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
         })),
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
@@ -966,6 +1111,119 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    /// A typeless host format is decoded as the value its bits hold: its
+    /// family's typed twin. Typed formats and the 0xFF the host leaves when
+    /// it has no footprint at all stay as they are.
+    #[test]
+    fn typeless_formats_read_as_the_value_they_hold() {
+        use super::readable;
+
+        for (typeless, typed) in [
+            (1, 2),   // R32G32B32A32: float
+            (9, 10),  // R16G16B16A16: half
+            (23, 24), // R10G10B10A2: unorm
+            (27, 28), // R8G8B8A8: unorm
+            (39, 40), // R32: float (depth copied out of a typeless 32)
+            (44, 45), // R24G8: D24_UNORM_S8
+            (53, 54), // R16: half
+            (60, 61), // R8: unorm
+            (90, 91), // B8G8R8A8: its sRGB twin, the same bytes
+        ] {
+            assert_eq!(readable(typeless), typed, "typeless {typeless}");
+        }
+        for typed in [2, 10, 16, 28, 40, 41, 42, 45, 54, 61, 87, 91] {
+            assert_eq!(readable(typed), typed);
+        }
+        assert_eq!(readable(u32::MAX), u32::MAX);
+    }
+
+    /// A footprint the host could not give (every field 0xFF) fits no
+    /// description; one of the description's own shape does.
+    #[test]
+    fn footprints_of_failed_copies_are_refused() {
+        use super::{MAX_READBACK, footprint_fits};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 2560,
+            Height: 1440,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+        };
+        let copy = |format: i32, width: u32, height: u32, depth: u32, pitch: u32| {
+            D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: DXGI_FORMAT(format),
+                Width: width,
+                Height: height,
+                Depth: depth,
+                RowPitch: pitch,
+            }
+        };
+        // R8_UNORM 2560x1440: 2560-byte rows, pitched to the same.
+        assert!(footprint_fits(&desc, &copy(61, 2560, 1440, 1, 2560)));
+        // What vkd3d-proton leaves when it cannot give one: 0xFF everywhere,
+        // the format included — 4 Gi texels a side, no format at all.
+        assert!(!footprint_fits(
+            &desc,
+            &copy(-1, u32::MAX, u32::MAX, u32::MAX, u32::MAX)
+        ));
+        // Another description's shape, and a pitch too short for a row.
+        assert!(!footprint_fits(&desc, &copy(61, 1280, 720, 1, 1280)));
+        assert!(!footprint_fits(&desc, &copy(61, 2560, 1440, 1, 1024)));
+        // Nothing multi-sampled is copied out, whatever its footprint says.
+        let msaa = D3D12_RESOURCE_DESC {
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 4,
+                Quality: 0,
+            },
+            ..desc
+        };
+        assert!(!footprint_fits(&msaa, &copy(61, 2560, 1440, 1, 2560)));
+        const {
+            assert!(MAX_READBACK >= 2560 * 1440);
+        }
+    }
+
+    /// 6 x 0xFFFFFFFF texels are 103,079,215,080 bytes of PNG rows: no
+    /// extent a title texture has, and nothing this dump allocates for.
+    #[test]
+    fn an_implausible_extent_is_not_allocated_for() {
+        assert_eq!(super::to_rgba(61, 6, u32::MAX as usize, 256, &[]), None);
+        assert_eq!(super::to_rgba(61, u32::MAX as usize, 6, 256, &[]), None);
+        assert_eq!(super::to_rgba(u32::MAX, 0, 0, 0, &[]), None);
+    }
+
+    /// A mapped copy spans its rows, not its pitch: the last row is its own
+    /// size (the read-back buffers a live matrix measured: a 1x1 target's
+    /// 4 bytes in a 256-byte pitch, D24 64x64's 32,512, BC7 64x64's 4,096).
+    #[test]
+    fn a_mapping_spans_its_rows_and_not_its_pitch() {
+        use super::row_bytes;
+
+        // R8G8B8A8_UNORM 1x1: 4 bytes, not 256.
+        assert_eq!(row_bytes(256, 1, 4), Some(4));
+        // R8_UNORM 2560x1440: every row pitched but the last.
+        assert_eq!(row_bytes(2560, 1440, 2560), Some(1439 * 2560 + 2560));
+        // D24_UNORM_S8_UINT 64x64: 32,512 bytes, not 64 * 512.
+        assert_eq!(row_bytes(512, 64, 256), Some(63 * 512 + 256));
+        // BC7_UNORM 64x64: 16 rows of blocks, 4,096 bytes, not 64 * 256.
+        assert_eq!(row_bytes(256, 16, 256), Some(15 * 256 + 256));
+        // No rows, no row, or a row longer than the pitch it sits in.
+        assert_eq!(row_bytes(256, 0, 4), None);
+        assert_eq!(row_bytes(256, 1, 0), None);
+        assert_eq!(row_bytes(256, 1, 300), None);
     }
 }
 
