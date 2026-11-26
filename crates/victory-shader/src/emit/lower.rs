@@ -924,7 +924,9 @@ impl<'a> Lower<'a> {
 
     /// A global store or atomic (`global_store_*`, `global_atomic_*`)
     /// through a root view at the address the title sets, or into title
-    /// memory at an address the program computes.
+    /// memory at an address the program computes. A byte or a half
+    /// (`global_store_byte`, `_short`, and the `_d16_hi` forms, which store
+    /// from bit 16) changes only its own bytes of the dword holding it.
     fn flat_write(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Flat {
             dst, data, cache, ..
@@ -940,12 +942,17 @@ impl<'a> Lower<'a> {
         if a.param == CODE {
             return Err("a global store into the code");
         }
-        let n = match name.strip_prefix("global_store_") {
-            None => 1,
-            Some("dword") => 1,
-            Some("dwordx2") => 2,
-            Some("dwordx3") => 3,
-            Some("dwordx4") => 4,
+        // Dwords, and for a byte or a half its width and first bit.
+        let (n, sub) = match name.strip_prefix("global_store_") {
+            None => (1, None),
+            Some("dword") => (1, None),
+            Some("dwordx2") => (2, None),
+            Some("dwordx3") => (3, None),
+            Some("dwordx4") => (4, None),
+            Some("byte") => (1, Some((8, 0))),
+            Some("byte_d16_hi") => (1, Some((8, 16))),
+            Some("short") => (1, Some((16, 0))),
+            Some("short_d16_hi") => (1, Some((16, 16))),
             Some(_) => return Err(name),
         };
         // DXIL atomic operations: add, and, or, xor, signed and unsigned min
@@ -1009,11 +1016,38 @@ impl<'a> Lower<'a> {
         // Title memory is looked up (and its pages marked written) only in
         // the lanes that write.
         let at = self.begin_guarded(guard);
+        let bytes = sub.map_or(4 * u32::from(n), |(width, _)| width / 8);
         let (h, off) = match (memory, root) {
-            (Some((lo, hi)), _) => self.memory(lo, hi, 4 * u32::from(n), true, None),
+            (Some((lo, hi)), _) => self.memory(lo, hi, bytes, true, None),
             (_, Some(r)) => r,
             _ => unreachable!(),
         };
+        if let Some((width, from)) = sub {
+            // The field of the dword holding it, by two atomics on that dword
+            // (clear, then set), as `buffer_store_byte` and kin: other lanes'
+            // fields in it are left alone.
+            // shortcut: the field is taken not to cross a dword.
+            let c = self.cur;
+            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+            let word = self.s.m.bin(c, Bin::And, off, not3);
+            let byte = self.s.m.bin(c, Bin::And, off, three);
+            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
+            let (field, from) = (self.s.m.i32((1 << width) - 1), self.s.m.i32(from));
+            let x = self.s.m.bin(c, Bin::LShr, vals[0], from);
+            let x = self.s.m.bin(c, Bin::And, x, field);
+            let x = self.s.m.bin(c, Bin::Shl, x, sh);
+            let mask = self.s.m.bin(c, Bin::Shl, field, sh);
+            let all = self.s.m.i32(u32::MAX);
+            let keep = self.s.m.bin(c, Bin::Xor, mask, all);
+            for (op, v) in [(1, keep), (2, x)] {
+                let args = [h, self.s.m.i32(op), word, iu, iu, v];
+                self.s
+                    .op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+            }
+            self.mark_view_write(h, word, 4, None);
+            self.end_guarded(at, &[]);
+            return Ok(());
+        }
         if name.starts_with("global_store_") {
             let mut args = vec![h, off, iu];
             args.extend(&vals);
