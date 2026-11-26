@@ -288,6 +288,9 @@ pub(crate) fn held_times() -> Vec<(u64, f64, f64)> {
 /// (page, other page) for the pages (page numbers) showing the same memory
 /// as `pages` elsewhere.
 fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
+    if g.alias_of.is_empty() {
+        return Vec::new();
+    }
     pages
         .iter()
         .flat_map(|&p| g.alias_of.get(&p).into_iter().flatten().map(move |&a| (p, a)))
@@ -712,8 +715,16 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+    if first.checked_add(1) == Some(last) && !g.alias_of.contains_key(&first) {
+        mark_changed(g, first, last, save);
+        return open(g, first);
+    }
     let guarded = g.protected.range(first..last).next().is_some();
-    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    let others: Vec<usize> = if g.alias_of.is_empty() {
+        Vec::new()
+    } else {
+        g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect()
+    };
     #[cfg(feature = "diagnostics")]
     {
         let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
@@ -733,11 +744,47 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     guarded
 }
 
-/// Gives write access back to the pages of `[first, last)` we guarded.
+/// Gives write access back to the pages of `[first, last)` we guarded,
+/// batching contiguous runs into single `VirtualProtect` calls.
 fn open_guarded(g: &mut Guards, first: usize, last: usize) {
+    if first.checked_add(1) == Some(last) {
+        open(g, first);
+        return;
+    }
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for page in guarded {
-        open(g, page);
+    if guarded.is_empty() {
+        return;
+    }
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    let mut i = 0;
+    while i < guarded.len() {
+        let start = guarded[i];
+        while i + 1 < guarded.len() && guarded[i + 1] == guarded[i] + 1 {
+            i += 1;
+        }
+        let end = guarded[i] + 1;
+        i += 1;
+        let mut old = 0;
+        // SAFETY: blocks we made read-only (failing harmlessly if gone).
+        let ok = unsafe {
+            VirtualProtect(
+                (start * PAGE) as *const _,
+                (end - start) * PAGE,
+                PAGE_READWRITE,
+                &mut old,
+            ) != 0
+        };
+        if ok {
+            for page in start..end {
+                g.protected.remove(&page);
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::OpenPages, (end - start) as u64);
+        } else {
+            for page in start..end {
+                open(g, page);
+            }
+        }
     }
 }
 
