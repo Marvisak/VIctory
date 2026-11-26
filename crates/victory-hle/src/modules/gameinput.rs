@@ -872,7 +872,7 @@ fn forget(this: This, token: u64) {
 extern "system" fn stop_callback(this: This, token: u64) {
     forget(this, token);
 }
-/// Stops the callback, then waits up to `timeout` µs for a call of it that
+/// Stops the callback, then waits up to `timeout` Âµs for a call of it that
 /// is running; false on time-out, or from inside that callback (it cannot
 /// wait for itself), as documented. Either way it is never called again.
 extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> bool {
@@ -1199,9 +1199,30 @@ mod host {
         }
     }
 
-    #[derive(Default)]
+    /// XInput pads, and `VICTORY_NO_HOST_PAD` to ignore them: a host pad the
+    /// title mis-handles would otherwise keep the keyboard stand-in unplugged.
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        hide_pads: bool,
+    }
+
+    /// Whether `VICTORY_NO_HOST_PAD`'s value turns the switch on: set, and
+    /// not `0`, like the other on/off switches.
+    pub(super) fn switch_on(value: Option<&std::ffi::OsStr>) -> bool {
+        value.is_some_and(|v| v != std::ffi::OsStr::new("0"))
+    }
+
+    impl Default for Host {
+        fn default() -> Self {
+            let hide_pads = switch_on(std::env::var_os("VICTORY_NO_HOST_PAD").as_deref());
+            if hide_pads {
+                tracing::info!("VICTORY_NO_HOST_PAD: ignoring XInput pads");
+            }
+            Host {
+                empty_until: [None; PADS],
+                hide_pads,
+            }
+        }
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1217,6 +1238,9 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            if self.hide_pads {
+                return None;
+            }
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1317,6 +1341,17 @@ mod host {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
         }
+    }
+
+    #[test]
+    fn host_pads_can_be_hidden_for_the_keyboard_stand_in() {
+        let mut host = Host {
+            empty_until: [None; PADS],
+            hide_pads: true,
+        };
+        // No XInput call is made, whatever the slots are.
+        assert!(host.pad(0).is_none());
+        assert!(host.pad(3).is_none());
     }
 
     #[test]
@@ -1884,5 +1919,12 @@ mod tests {
         let back = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(back).buttons, A);
         release(back);
+    }
+    fn the_no_host_pad_switch_is_off_when_zero() {
+        use std::ffi::OsStr;
+        assert!(super::host::switch_on(Some(OsStr::new("1"))));
+        assert!(super::host::switch_on(Some(OsStr::new("yes"))));
+        assert!(!super::host::switch_on(Some(OsStr::new("0"))));
+        assert!(!super::host::switch_on(None));
     }
 }
