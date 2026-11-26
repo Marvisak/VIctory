@@ -1081,14 +1081,31 @@ pub(crate) fn host_resource(this: This) -> Option<windows::Win32::Graphics::Dire
     resource(this).host().map(|h| h.texture.clone())
 }
 
+/// Whether `resource` is a live title texture object.
+#[cfg(windows)]
+pub(crate) fn is_live_texture(resource: usize) -> bool {
+    resource != 0
+        && TEXTURES_AT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(resource)
+}
+
 /// A title texture's host copy if it is made, without making it: for work
 /// that is no use of the title's (uploads of what heap slots view).
+/// Checks [`TEXTURES_AT`] under lock before dereferencing `this` so callers
+/// holding a view across a concurrent [`Resource`] release do not read
+/// freed memory.
 #[cfg(windows)]
 pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.lock().unwrap_or_else(|e| e.into_inner()).clone().flatten()
+    let textures = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+    if !textures.contains(this as usize) {
+        return None;
+    }
+    made(resource(this))
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -1237,7 +1254,13 @@ fn shared_texture(
     let mut d = d;
     if let Some(k) = key {
         let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-        for r in at.get(&address).into_iter().flatten().map(|&r| resource(r as This)) {
+        for r in at
+            .by_memory
+            .get(&address)
+            .into_iter()
+            .flatten()
+            .map(|&r| resource(r as This))
+        {
             if memory_key(address, &r.desc) == Some(k) {
                 d.flags |= host_desc(&r.desc).map_or(0, |h| h.flags & USES);
             }
@@ -1648,7 +1671,7 @@ pub(crate) fn evict_among(
 fn candidates() -> Vec<Owned> {
     let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
     let mut by: std::collections::HashMap<usize, Owned> = std::collections::HashMap::new();
-    for &r in at.values().flatten() {
+    for &r in at.by_memory.values().flatten() {
         if let Some(t) = made(resource(r as This)).filter(|t| evictable(t)) {
             by.entry(std::sync::Arc::as_ptr(&t) as usize).or_insert_with(|| (t, Vec::new())).1.push(r);
         }
@@ -1695,13 +1718,12 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
         crate::descriptor::evict(&raws);
     }
     let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let live: std::collections::HashSet<usize> = at.values().flatten().copied().collect();
     let mut given = GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
     let given = given.get_or_insert_with(Default::default);
     given.retain(|_, &mut f| frame.saturating_sub(f) <= SOON_FRAMES);
     let bytes = gone.iter().map(|(t, _)| t.bytes).sum();
     for (t, owners) in gone {
-        for &r in owners.iter().filter(|r| live.contains(r)) {
+        for &r in owners.iter().filter(|&&r| at.contains(r)) {
             let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, t)) {
                 *h = None;
@@ -1765,20 +1787,64 @@ fn hand_out_resource(
         crate::shadow::register(at, resource.data() as u64, desc.width);
     } else if host_desc(&desc).is_some() {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-        map.entry(resource.data() as u64).or_default().push(at);
+        TEXTURES_AT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(resource.data() as u64, at);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
 
-/// Title textures with a host copy, by the console memory they start at.
+#[cfg(windows)]
+struct LiveTextures {
+    by_memory: std::collections::BTreeMap<u64, Vec<usize>>,
+    live: Option<std::collections::HashSet<usize>>,
+}
+
+#[cfg(windows)]
+impl LiveTextures {
+    const fn new() -> Self {
+        Self {
+            by_memory: std::collections::BTreeMap::new(),
+            live: None,
+        }
+    }
+
+    fn insert(&mut self, memory: u64, resource: usize) {
+        self.by_memory.entry(memory).or_default().push(resource);
+        self.live
+            .get_or_insert_with(Default::default)
+            .insert(resource);
+    }
+
+    fn remove(&mut self, memory: u64, resource: usize) {
+        if let Some(live) = self.live.as_mut() {
+            live.remove(&resource);
+        }
+        if let Some(list) = self.by_memory.get_mut(&memory) {
+            list.retain(|&r| r != resource);
+            if list.is_empty() {
+                self.by_memory.remove(&memory);
+            }
+        }
+    }
+
+    fn contains(&self, resource: usize) -> bool {
+        self.live
+            .as_ref()
+            .is_some_and(|live| live.contains(&resource))
+    }
+}
+
+/// Title textures with a host copy, by the console memory they start at,
+/// alongside the set of live texture resource pointers for O(1) liveness
+/// checks before dereferencing raw pointers held across locks.
 /// Title textures of one memory share a host texture where the host can
 /// view it in each one's format; where it cannot (block-compressed against
 /// plain formats, a cast the host refused, a host texture replaced),
 /// [`alias_source`] finds the one the GPU writes.
 #[cfg(windows)]
-static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static TEXTURES_AT: std::sync::Mutex<LiveTextures> = std::sync::Mutex::new(LiveTextures::new());
 
 /// For a texture made for a placed view (`texture_at`): a title texture
 /// the GPU writes (render target, depth or unordered access) at the same
@@ -1804,7 +1870,8 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         Some((d.dimension, d.width.div_ceil(block) * size, rows, d.depth_or_array_size, d.sample_count, swizzle))
     };
     let want = bytes(&b.desc)?;
-    map.get(&(b.data() as u64))?
+    map.by_memory
+        .get(&(b.data() as u64))?
         .iter()
         .map(|&r| r as This)
         .filter(|&r| r != placed)
@@ -1819,6 +1886,7 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        let at = std::ptr::from_ref::<Resource>(self) as usize;
         #[cfg(feature = "diagnostics")]
         if made(self).is_some_and(|h| std::sync::Arc::strong_count(&h) > 2)
         {
@@ -1839,23 +1907,20 @@ impl Drop for Resource {
             use windows::core::Interface;
             life::note(h.texture.as_raw() as usize, life::RELEASED, 0, life::holders(&h.texture));
         }
-        crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        // Invalidate descriptor records and the live texture set before
+        // draining bindless registries so a concurrent `Viewed::set` either
+        // inserts before `bindless::forget` removes it, or sees `at` gone
+        // once it acquires `Viewed::inner`.
+        crate::descriptor::forget(at);
         if self.desc.dimension != BUFFER {
-            let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-            let at = self.data() as u64;
-            if let Some(list) = map.get_mut(&at) {
-                list.retain(|&r| r != std::ptr::from_ref::<Resource>(self) as usize);
-                if list.is_empty() {
-                    map.remove(&at);
-                }
-            }
+            TEXTURES_AT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(self.data() as u64, at);
         }
-        crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        crate::bindless::forget(at);
         if self.desc.dimension == BUFFER {
-            crate::shadow::unregister(
-                std::ptr::from_ref::<Resource>(self) as usize,
-                self.data() as u64,
-            );
+            crate::shadow::unregister(at, self.data() as u64);
         }
     }
 }
