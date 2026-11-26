@@ -583,16 +583,27 @@ extern "system" fn present(
     let _ = (planes, plane_parameters);
     S_OK
 }
-/// Diagnostics: logs a presented frame that is black after one that was
-/// not, with what was presented and how many draws ran since.
+/// Diagnostics: logs the first observed black frame and later transitions
+/// to black, with what was presented and how many draws ran since.
+#[cfg(any(all(windows, feature = "diagnostics"), test))]
+fn black_frame_message(previous: Option<bool>, shown: Option<bool>) -> Option<&'static str> {
+    if shown != Some(true) || previous == Some(true) {
+        return None;
+    }
+    Some(if previous == Some(false) {
+        "a black frame after a frame that was not"
+    } else {
+        "first observed black frame"
+    })
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
-    static LAST: std::sync::Mutex<(bool, u64, u64)> = std::sync::Mutex::new((false, 0, 0));
+    static LAST: std::sync::Mutex<(Option<bool>, u64, u64)> = std::sync::Mutex::new((None, 0, 0));
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     let drawn = crate::draw::drawn();
-    let black = shown.unwrap_or(false);
     let draws = crate::draw::take_frame();
-    if black && !last.0 {
+    if let Some(message) = black_frame_message(last.0, shown) {
         last.2 += 1;
         tracing::warn!(
             frame,
@@ -602,7 +613,7 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
             copied = shown.is_some(),
             black_frames = last.2,
             levels = ?crate::capture::recent_levels(),
-            "a black frame after a frame that was not"
+            "{message}"
         );
         for d in draws {
             tracing::warn!("black frame {frame}: {d}");
@@ -614,7 +625,27 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
     if AFTER.load(Ordering::Relaxed) == frame {
         tracing::warn!(frame, levels = ?crate::capture::recent_levels(), "levels after the black frame");
     }
-    *last = (black, drawn, last.2);
+    *last = (shown.or(last.0), drawn, last.2);
+}
+
+#[cfg(test)]
+mod black_frame_tests {
+    use super::black_frame_message;
+
+    #[test]
+    fn first_black_frame_is_not_reported_as_a_transition() {
+        assert_eq!(
+            black_frame_message(None, Some(true)),
+            Some("first observed black frame")
+        );
+        assert_eq!(
+            black_frame_message(Some(false), Some(true)),
+            Some("a black frame after a frame that was not")
+        );
+        assert_eq!(black_frame_message(Some(true), Some(true)), None);
+        assert_eq!(black_frame_message(None, Some(false)), None);
+        assert_eq!(black_frame_message(Some(false), None), None);
+    }
 }
 
 /// A run of destination pages: how they are mapped (0 pool pages from
