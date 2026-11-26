@@ -274,15 +274,28 @@ impl State {
     /// Fixed-function state, straight onto the host list (and kept for the
     /// list's next segment).
     pub(crate) fn viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+        let max = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize;
+        let viewports = &viewports[..viewports.len().min(max)];
         self.fixed.viewports = Some(viewports.to_vec());
-        // SAFETY: an open list.
+        // SAFETY: an open list; count is within D3D12's 16-viewport limit.
         unsafe { list.list.RSSetViewports(viewports) };
     }
 
     pub(crate) fn scissors(&mut self, list: &HostList, rects: &[RECT]) {
-        self.fixed.scissors = Some(rects.to_vec());
-        // SAFETY: an open list.
-        unsafe { list.list.RSSetScissorRects(rects) };
+        let max = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize;
+        let rects: Vec<RECT> = rects[..rects.len().min(max)]
+            .iter()
+            .map(|r| RECT {
+                left: r.left,
+                top: r.top,
+                right: r.right.max(r.left),
+                bottom: r.bottom.max(r.top),
+            })
+            .collect();
+        // SAFETY: an open list; count is within D3D12's 16-rect limit and
+        // every rect has `left <= right` and `top <= bottom`.
+        unsafe { list.list.RSSetScissorRects(&rects) };
+        self.fixed.scissors = Some(rects);
     }
 
     pub(crate) fn blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
@@ -3906,5 +3919,108 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(host.log_messages(), None, "case {case} D3D12 debug errors");
             let _ = kept_obj;
         }
+    }
+
+    #[test]
+    fn viewports_and_scissors_clamp_count_and_inverted_rects() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+
+        let max = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as usize;
+        let viewports: Vec<D3D12_VIEWPORT> = (0..max + 4)
+            .map(|i| D3D12_VIEWPORT {
+                TopLeftX: i as f32,
+                TopLeftY: 0.0,
+                Width: 64.0,
+                Height: 32.0,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            })
+            .collect();
+        let mut rects: Vec<RECT> = (0..max + 4)
+            .map(|i| RECT {
+                left: i as i32,
+                top: 2,
+                right: i as i32 + 32,
+                bottom: 16,
+            })
+            .collect();
+        // Inside-out rects (right < left, bottom < top, and negative empty) must be
+        // normalized to non-inverted empty rects rather than triggering D3D12 errors.
+        rects[0] = RECT {
+            left: 64,
+            top: 0,
+            right: 10,
+            bottom: 64,
+        };
+        rects[1] = RECT {
+            left: 0,
+            top: 32,
+            right: 64,
+            bottom: 8,
+        };
+        rects[2] = RECT {
+            left: -10,
+            top: -5,
+            right: -20,
+            bottom: -15,
+        };
+
+        let list1 = host.new_list().unwrap();
+        let mut state = State::default();
+        // Empty slices are also legal in D3D12.
+        state.viewports(&list1, &[]);
+        state.scissors(&list1, &[]);
+        state.viewports(&list1, &viewports);
+        state.scissors(&list1, &rects);
+
+        let kept_vp = state.fixed.viewports.as_deref().unwrap();
+        assert_eq!(kept_vp.len(), max);
+        assert_eq!(kept_vp[0].TopLeftX, 0.0);
+        assert_eq!(kept_vp[max - 1].TopLeftX, (max - 1) as f32);
+
+        let kept_sc = state.fixed.scissors.as_deref().unwrap();
+        assert_eq!(kept_sc.len(), max);
+        assert_eq!(
+            kept_sc[0],
+            RECT {
+                left: 64,
+                top: 0,
+                right: 64,
+                bottom: 64,
+            }
+        );
+        assert_eq!(
+            kept_sc[1],
+            RECT {
+                left: 0,
+                top: 32,
+                right: 64,
+                bottom: 32,
+            }
+        );
+        assert_eq!(
+            kept_sc[2],
+            RECT {
+                left: -10,
+                top: -5,
+                right: -10,
+                bottom: -5,
+            }
+        );
+        assert_eq!(kept_sc[3], rects[3]);
+
+        // Replaying across a segment cut must also stay within D3D12 bounds.
+        let list2 = host.new_list().unwrap();
+        state.cut(&list2);
+
+        // SAFETY: both lists are open; check Close() directly instead of aborting via `list.close()`.
+        let (close1, close2) = unsafe { (list1.list.Close(), list2.list.Close()) };
+        assert!(close1.is_ok());
+        assert!(close2.is_ok());
+        host.execute(&[&list1, &list2]);
+        assert_eq!(host.log_messages(), None);
     }
 }
