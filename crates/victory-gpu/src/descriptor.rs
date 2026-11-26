@@ -858,6 +858,23 @@ pub(crate) mod tests {
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
     }
 
+    /// Creates a shader-visible view heap with `count` title descriptors.
+    pub(crate) fn shader_visible_views(count: u32) -> This {
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        h
+    }
+
     /// A released view heap takes its title memory page table with it, also
     /// when no heap is made at its address afterwards (else the table, its
     /// 16.8 MiB mapping and the copies it names live on).

@@ -991,10 +991,11 @@ enum Step {
     /// Brings every buffer range a view heap's views reach up to date
     /// (`crate::bindless`).
     Heap(std::sync::Arc<crate::bindless::Viewed>),
-    /// Shaders read title memory through a view heap's page table (the
-    /// heap's key, `crate::memory`): the table names every copy, each
-    /// brought up to date.
-    Memory(usize),
+    /// Shaders read title memory through a view heap's page table
+    /// (`crate::memory`): the table names every copy, each brought up to
+    /// date, and the binding keeps the table's layout alive if the heap is
+    /// released.
+    Memory(crate::memory::Binding),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2111,10 +2112,10 @@ impl HostList {
         }
     }
 
-    /// Shaders of the list read title memory through the page table of
-    /// view heap `heap` (`crate::memory::prepare` at submission).
-    pub(crate) fn defer_memory(&self, heap: usize) {
-        self.deferred().copies.push(Step::Memory(heap));
+    /// Shaders of the list read title memory through a view heap's page
+    /// table (`crate::memory::prepare` at submission).
+    pub(crate) fn defer_memory(&self, binding: crate::memory::Binding) {
+        self.deferred().copies.push(Step::Memory(binding));
     }
 
     /// After the list has run, before its writes go back: `check` says
@@ -2371,8 +2372,8 @@ impl HostList {
                     crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
-                &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                Step::Memory(binding) => {
+                    crate::memory::prepare(binding, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
             };
@@ -3976,6 +3977,7 @@ mod withholding {
     /// along.
     #[test]
     fn only_programs_using_title_memory_are_withheld() {
+        let _guard = crate::memory::tests::gpu_test_lock();
         use crate::watch::PAGE;
         let Some(host) = super::host() else {
             return; // no host GPU here

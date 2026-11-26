@@ -103,6 +103,18 @@ struct Layout {
     owner: Vec<u32>,
 }
 
+/// A list's binding to a view heap's page table: keeps the table's layout
+/// (and the host copies it names) alive until the list is reset, even if
+/// the view heap is released or another is made at its address.
+pub(crate) struct Binding {
+    key: usize,
+    layout: Arc<Mutex<Arc<Layout>>>,
+}
+
+fn current_layout(layout: &Mutex<Arc<Layout>>) -> Arc<Layout> {
+    layout.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// A 256 KiB dirty-page bitmap buffer kept zeroed while in [`BITMAP_POOL`].
 struct Bitmap {
     _resource: ID3D12Resource,
@@ -213,7 +225,9 @@ struct Shared {
     pairs: HashMap<usize, u32>,
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
-    layout: Arc<Layout>,
+    /// Shared with every [`Binding`] to this table so bound lists see table
+    /// rewrites while the heap lives and retain the final layout after release.
+    layout: Arc<Mutex<Arc<Layout>>>,
 }
 
 // SAFETY: `data` is the persistent mapping of `table`, written only under
@@ -227,9 +241,9 @@ fn shared() -> std::sync::MutexGuard<'static, Vec<(usize, Shared)>> {
     SHARED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// View heap `key` was released: its page table goes with it (lists that
-/// name it hold the table), and a heap made later at its address starts
-/// with none of its state.
+/// View heap `key` was released: its page table leaves [`SHARED`] (lists
+/// already bound to it hold the table and its layout until reset), and a
+/// heap made later at its address starts with none of its state.
 #[cfg(windows)]
 pub(crate) fn release(key: usize) {
     shared().retain(|(k, _)| *k != key);
@@ -485,6 +499,18 @@ impl Shared {
         crate::host::name(&table, || "title memory page table".into());
         let null = heap.pair()?;
         heap.raw_pair_at(null, None, 0);
+        // Point every level-1 region at block 0 and fill block 0 with `null`
+        // so a table whose heap is released before its first `prepare` still
+        // routes every lookup to the null views (matching `Layout::default`).
+        // SAFETY: `data` is the persistent mapping of `table`, with room for
+        // `TABLE_DWORDS` dwords.
+        let out = unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), TABLE_DWORDS) };
+        out[..LEVEL1].fill(0);
+        let (null_slots, _) = out[LEVEL1..LEVEL1 + BLOCK * 2].as_chunks_mut::<2>();
+        for slot in null_slots {
+            slot[0] = null;
+            slot[1] = 0;
+        }
         // SAFETY: a live buffer.
         let gpu = unsafe { table.GetGPUVirtualAddress() };
         Some(Shared {
@@ -495,7 +521,7 @@ impl Shared {
             null,
             pairs: HashMap::new(),
             generation: u64::MAX,
-            layout: Arc::default(),
+            layout: Arc::new(Mutex::new(Arc::default())),
         })
     }
 
@@ -539,7 +565,7 @@ impl Shared {
         let out = unsafe { std::slice::from_raw_parts_mut(self.data as *mut u32, TABLE_DWORDS) };
         let (_, blocks, owner) = write_table(&ranges, &slots, self.null, out);
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
-        self.layout = Arc::new(Layout {
+        *self.layout.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
             blocks,
@@ -550,40 +576,32 @@ impl Shared {
     }
 }
 
-/// The page table of view heap `key`, as the last submission using it
-/// left it.
-fn layout(key: usize) -> Arc<Layout> {
-    shared()
-        .iter()
-        .find(|(k, _)| *k == key)
-        .map(|(_, s)| s.layout.clone())
-        .unwrap_or_default()
-}
-
-/// At submission, for a list using title memory with view heap `key`
-/// bound: the heap's page table names every host copy there is, each
-/// brought up to date (`add` takes a copy's range, once per submission
-/// until a step writes title memory).
-pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    let layout = with_heap(key, |heap| {
+/// At submission, for a list using title memory through `binding`: if the
+/// bound view heap still owns this page table, the table is rewritten to
+/// name every host copy there is; either way, every dirty copy named in
+/// the table's layout is brought up to date (`add` takes a copy's range,
+/// once per submission until a step writes title memory).
+pub(crate) fn prepare(binding: &Binding, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+    let layout = with_heap(binding.key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
-        let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
+        let (_, s) = shared.iter_mut().find(|(k, s)| {
+            *k == binding.key && s.host == host && Arc::ptr_eq(&s.layout, &binding.layout)
+        })?;
         let now = crate::shadow::generation();
         if s.generation != now {
             s.rewrite(heap, now);
         }
-        Some(s.layout.clone())
+        Some(current_layout(&s.layout))
     })
-    .flatten();
+    .flatten()
+    .unwrap_or_else(|| current_layout(&binding.layout));
     // Copies the title has not written since they took it are passed by
     // without touching them (the table names every copy, ~4,700 in the world).
-    for l in layout.iter() {
-        for (c, bit) in l.copies.iter().zip(&l.bits) {
-            if !crate::watch::clean_bit(*bit) {
-                let (start, len) = c.range();
-                add(c, start as usize, len as usize);
-            }
+    for (c, bit) in layout.copies.iter().zip(&layout.bits) {
+        if !crate::watch::clean_bit(*bit) {
+            let (start, len) = c.range();
+            add(c, start as usize, len as usize);
         }
     }
 }
@@ -612,37 +630,55 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
 /// brought up to date at each submission of the list, its written pages
 /// copied back after.
 pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
-    let table = with_heap(key, |heap| {
+    let (table, binding) = with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
         if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host) {
             list.keep(&s.table);
-            return Some(s.gpu);
+            return Some((
+                s.gpu,
+                Binding {
+                    key,
+                    layout: Arc::clone(&s.layout),
+                },
+            ));
         }
         // A released heap's table goes with it (lists that name it hold it).
         shared.retain(|(k, _)| *k != key);
         let s = Shared::new(heap)?;
         list.keep(&s.table);
         let gpu = s.gpu;
+        let binding = Binding {
+            key,
+            layout: Arc::clone(&s.layout),
+        };
         shared.push((key, s));
-        Some(gpu)
+        Some((gpu, binding))
     })
     .flatten()?;
     let pooled = Arc::new(PooledBitmap::new(Bitmap::acquire()?));
     let dirty = pooled.gpu();
-    list.defer_memory(key);
+    let missed_layout = Arc::clone(&binding.layout);
+    let after_layout = Arc::clone(&binding.layout);
+    list.defer_memory(binding);
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
     let missed_bitmap = Arc::clone(&pooled);
     list.defer_missed(move || {
-        let l = layout(key);
+        let l = current_layout(&missed_layout);
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks =
             unsafe { std::slice::from_raw_parts(missed_bitmap.data() as *const u32, BITMAP_WORDS) };
         has_missed(marks, &l)
     });
     list.defer_after(move || {
-        let Layout { copies, blocks, owner, .. } = &*layout(key);
+        let l = current_layout(&after_layout);
+        let Layout {
+            copies,
+            blocks,
+            owner,
+            ..
+        } = &*l;
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks =
@@ -713,7 +749,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Writes of lists using title memory are held back from a frame with a
@@ -829,7 +865,7 @@ mod tests {
         assert!(has_missed(&marks, &l));
     }
 
-    fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1159,5 +1195,402 @@ void main() {
         }
         crate::shadow::unregister(p, p as u64);
         drop(copy);
+    }
+
+    /// Releasing a view heap while bound command lists are still pending drops
+    /// its `SHARED` entry, but the bound lists keep the page table's layout
+    /// (and the host copies it names) alive so refreshes, miss checks, and
+    /// copy-backs still use the layout matching the retained page table.
+    #[test]
+    fn a_released_view_heap_keeps_its_layout_and_copies_for_bound_lists() {
+        let _guard = gpu_test_lock();
+        use crate::object::{This, slot};
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let ((write_root, writer), (read_root, reader)) = (pipeline(WRITE), pipeline(SOURCE));
+        let (out, out_cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: a live buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+        let p = (0..256u64)
+            .map(|k| 0x60_0000_0000 + (k << 28))
+            // SAFETY: a fresh allocation where nothing is mapped, or none.
+            .map(|hint| unsafe {
+                VirtualAlloc(
+                    hint as *const _,
+                    PAGE,
+                    MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                ) as usize
+            })
+            .find(|&p| p != 0)
+            .expect("memory below 2^40");
+        let at = p + 16;
+        // SAFETY: our pool.
+        unsafe { (at as *mut u32).write_volatile(0x11) };
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        let weak = Arc::downgrade(&copy);
+
+        let h = crate::descriptor::tests::shader_visible_views(1000);
+        let key = h as usize;
+        let (host_heap, gpu_start) = {
+            let views = crate::descriptor::heap(h).host().expect("a host heap");
+            (views.heap.clone(), views.gpu(0))
+        };
+
+        // Advance past any withholding window from earlier tests.
+        log_frame();
+        log_frame();
+        assert!(!withholding());
+
+        let record_write = |list: &HostList, value: u32| {
+            let map = bind(list, key).expect("a page table");
+            list.keep(&host_heap);
+            let constants = [at as u32, (at >> 32) as u32, value, 0, 0];
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(host_heap.clone())]);
+                list.list.SetComputeRootSignature(&write_root);
+                list.list.SetComputeRootDescriptorTable(0, gpu_start);
+                list.list.SetComputeRootShaderResourceView(1, map.table);
+                list.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+                list.list
+                    .SetComputeRoot32BitConstants(3, 5, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&writer);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+        };
+        let record_read = |list: &HostList| {
+            let map = bind(list, key).expect("a page table");
+            list.keep(&host_heap);
+            let constants = [at as u32, (at >> 32) as u32, 0];
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(host_heap.clone())]);
+                list.list.SetComputeRootSignature(&read_root);
+                list.list.SetComputeRootDescriptorTable(0, gpu_start);
+                list.list.SetComputeRootShaderResourceView(1, map.table);
+                list.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+                list.list
+                    .SetComputeRoot32BitConstants(3, 3, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&reader);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+        };
+        // SAFETY: our pool.
+        let title = || unsafe { (at as *const u32).read_volatile() };
+
+        // Prime the heap's page table so it names `copy`.
+        let prime = host.new_list().unwrap();
+        record_write(&prime, 0x22);
+        host.execute(&[&prime]);
+        prime.reset();
+        assert_eq!(title(), 0x22);
+        assert!(!withholding());
+        assert!(has_table(key));
+
+        // Record two lists bound to `h`, then release `h` and unregister `copy`
+        // before either list is submitted.
+        let reader_list = host.new_list().unwrap();
+        let writer_list = host.new_list().unwrap();
+        record_read(&reader_list);
+        record_write(&writer_list, 0x33);
+
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+
+        assert!(!has_table(key), "table entry leaves SHARED with its heap");
+        assert!(
+            weak.upgrade().is_some(),
+            "bound lists keep the retained page table's host copies alive"
+        );
+
+        // Title writes after heap release must still refresh into the retained copy.
+        // SAFETY: our pool.
+        unsafe { (at as *mut u32).write_volatile(0x44) };
+        host.execute(&[&reader_list]);
+        // SAFETY: mapped output, GPU done.
+        let seen = unsafe { out_cpu.cast::<u32>().read_volatile() };
+        assert_eq!(
+            seen, 0x44,
+            "prepare refreshes dirty copies from the retained layout"
+        );
+
+        // Writing through the retained table must copy back without a false miss.
+        host.execute(&[&writer_list]);
+        assert!(
+            !withholding(),
+            "completion uses the retained layout and does not report a false miss"
+        );
+        assert_eq!(
+            title(),
+            0x33,
+            "writes from a released heap's bound list still copy back"
+        );
+
+        reader_list.reset();
+        writer_list.reset();
+    }
+
+    /// When a new page table is created at a released heap's key (even with
+    /// the same host-heap pointer, as happens on `Box<Heap>` address reuse),
+    /// a list bound to the old table neither touches the new table in `prepare`
+    /// nor decodes its bitmap against the new table's layout.
+    #[test]
+    fn a_new_heap_at_a_released_key_does_not_steal_a_bound_lists_layout() {
+        let _guard = gpu_test_lock();
+        use crate::object::{This, slot};
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (write_root, writer) = pipeline(WRITE);
+        let alloc_pool = |base: u64| -> usize {
+            (0..256u64)
+                .map(|k| base + (k << 28))
+                // SAFETY: a fresh allocation where nothing is mapped, or none.
+                .map(|hint| unsafe {
+                    VirtualAlloc(
+                        hint as *const _,
+                        PAGE,
+                        MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
+                        PAGE_READWRITE,
+                    ) as usize
+                })
+                .find(|&p| p != 0)
+                .expect("memory below 2^40")
+        };
+        // Two distinct 256 MiB regions so block 1 maps to p1 in the old table
+        // and to p2 in the replacement table.
+        let p1 = alloc_pool(0x70_0000_0000);
+        let p2 = alloc_pool(0x78_0000_0000);
+        let (at1, at2) = (p1 + 16, p2 + 16);
+        // SAFETY: our pools.
+        unsafe {
+            (at1 as *mut u32).write_volatile(0x10);
+            (at2 as *mut u32).write_volatile(0x10);
+        }
+        crate::shadow::register(p1, p1 as u64, PAGE as u64);
+        let copy1 = crate::shadow::find(p1 as u64, PAGE as u64).unwrap();
+
+        let h = crate::descriptor::tests::shader_visible_views(1000);
+        let key = h as usize;
+        let (host_heap, gpu_start) = {
+            let views = crate::descriptor::heap(h).host().expect("a host heap");
+            (views.heap.clone(), views.gpu(0))
+        };
+
+        log_frame();
+        log_frame();
+        assert!(!withholding());
+
+        let record_write = |list: &HostList, address: usize, value: u32| {
+            let map = bind(list, key).expect("a page table");
+            list.keep(&host_heap);
+            let constants = [address as u32, (address >> 32) as u32, value, 0, 0];
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(host_heap.clone())]);
+                list.list.SetComputeRootSignature(&write_root);
+                list.list.SetComputeRootDescriptorTable(0, gpu_start);
+                list.list.SetComputeRootShaderResourceView(1, map.table);
+                list.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+                list.list
+                    .SetComputeRoot32BitConstants(3, 5, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&writer);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+        };
+
+        // Populate the original page table with `copy1`, then bind `old_list`.
+        let prime = host.new_list().unwrap();
+        record_write(&prime, at1, 0x20);
+        host.execute(&[&prime]);
+        prime.reset();
+        // SAFETY: our pool.
+        assert_eq!(unsafe { (at1 as *const u32).read_volatile() }, 0x20);
+
+        let old_list = host.new_list().unwrap();
+        record_write(&old_list, at1, 0x30);
+
+        // Simulate releasing the heap and creating a replacement heap at the
+        // exact same `key` and inline `HostHeap` address, now naming only `copy2`.
+        release(key);
+        crate::shadow::unregister(p1, p1 as u64);
+        drop(copy1);
+        crate::shadow::register(p2, p2 as u64, PAGE as u64);
+        let copy2 = crate::shadow::find(p2 as u64, PAGE as u64).unwrap();
+
+        let new_list = host.new_list().unwrap();
+        record_write(&new_list, at2, 0x55);
+        host.execute(&[&new_list]);
+        new_list.reset();
+        assert!(!withholding());
+        // SAFETY: our pool.
+        assert_eq!(unsafe { (at2 as *const u32).read_volatile() }, 0x55);
+
+        // Registering a third copy advances `shadow::generation()`: executing
+        // `old_list` must neither rewrite the replacement table nor decode its
+        // bitmap against the replacement table's layout (`p2`).
+        let gen_before = shared()
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, s)| s.generation);
+        let p3 = alloc_pool(0x74_0000_0000);
+        crate::shadow::register(p3, p3 as u64, PAGE as u64);
+        let copy3 = crate::shadow::find(p3 as u64, PAGE as u64).unwrap();
+        assert_ne!(gen_before, Some(crate::shadow::generation()));
+
+        host.execute(&[&old_list]);
+        old_list.reset();
+        let gen_after = shared()
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, s)| s.generation);
+        assert_eq!(
+            gen_after, gen_before,
+            "old list's prepare must not rewrite the replacement heap's page table"
+        );
+        assert!(!withholding());
+        // SAFETY: our pools.
+        unsafe {
+            assert_eq!(
+                (at1 as *const u32).read_volatile(),
+                0x30,
+                "old list writes back through its own layout"
+            );
+            assert_eq!(
+                (at2 as *const u32).read_volatile(),
+                0x55,
+                "replacement table's copy is not disturbed"
+            );
+        }
+
+        crate::shadow::unregister(p3, p3 as u64);
+        drop(copy3);
+        crate::shadow::unregister(p2, p2 as u64);
+        drop(copy2);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+    }
+
+    /// A page table whose view heap is released before its very first `prepare`
+    /// still routes every address through its null view (not descriptor slot 0)
+    /// and reports a miss if shaders mark it.
+    #[test]
+    fn an_unprepared_released_heap_routes_reads_to_null_and_marks_a_miss() {
+        let _guard = gpu_test_lock();
+        use crate::object::{This, slot};
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let ((write_root, writer), (read_root, reader)) = (pipeline(WRITE), pipeline(SOURCE));
+        let (out, out_cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: a live buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+        // Fill output with a sentinel so reading 0 proves the shader ran and read null.
+        // SAFETY: mapped output buffer, 256 bytes.
+        unsafe { std::slice::from_raw_parts_mut(out_cpu.cast::<u32>(), 4).fill(0xAAAA_AAAA) };
+
+        // Populate descriptor slot 0 with a non-zero buffer so an uninitialized
+        // zeroed page table would read 0xDEAD_BEEF instead of 0 from `null`.
+        let (slot0_buf, slot0_cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: mapped sentinel buffer, 256 bytes.
+        unsafe { std::slice::from_raw_parts_mut(slot0_cpu.cast::<u32>(), 64).fill(0xDEAD_BEEF) };
+
+        let h = crate::descriptor::tests::shader_visible_views(1000);
+        let key = h as usize;
+        let (host_heap, gpu_start) = {
+            let views = crate::descriptor::heap(h).host().expect("a host heap");
+            views.raw_pair_at(0, Some(&slot0_buf), 256);
+            (views.heap.clone(), views.gpu(0))
+        };
+
+        let target: u64 = 0x80_0000_0010;
+        let read_list = host.new_list().unwrap();
+        let read_map = bind(&read_list, key).expect("a page table");
+        read_list.keep(&host_heap);
+        let read_consts = [target as u32, (target >> 32) as u32, 0];
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            read_list
+                .list
+                .SetDescriptorHeaps(&[Some(host_heap.clone())]);
+            read_list.list.SetComputeRootSignature(&read_root);
+            read_list.list.SetComputeRootDescriptorTable(0, gpu_start);
+            read_list
+                .list
+                .SetComputeRootShaderResourceView(1, read_map.table);
+            read_list.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+            read_list
+                .list
+                .SetComputeRoot32BitConstants(3, 3, read_consts.as_ptr().cast(), 0);
+            read_list.list.SetPipelineState(&reader);
+            read_list.list.Dispatch(1, 1, 1);
+        }
+        read_list.close();
+
+        let write_list = host.new_list().unwrap();
+        let write_map = bind(&write_list, key).expect("a page table");
+        write_list.keep(&host_heap);
+        let write_consts = [target as u32, (target >> 32) as u32, 0x77, 0, 0];
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            write_list
+                .list
+                .SetDescriptorHeaps(&[Some(host_heap.clone())]);
+            write_list.list.SetComputeRootSignature(&write_root);
+            write_list.list.SetComputeRootDescriptorTable(0, gpu_start);
+            write_list
+                .list
+                .SetComputeRootShaderResourceView(1, write_map.table);
+            write_list
+                .list
+                .SetComputeRootUnorderedAccessView(2, write_map.dirty);
+            write_list
+                .list
+                .SetComputeRoot32BitConstants(3, 5, write_consts.as_ptr().cast(), 0);
+            write_list.list.SetPipelineState(&writer);
+            write_list.list.Dispatch(1, 1, 1);
+        }
+        write_list.close();
+
+        // Release the heap before any `prepare` has ever written its table.
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+        assert!(!has_table(key));
+
+        host.execute(&[&read_list]);
+        read_list.reset();
+        // SAFETY: mapped output buffer, GPU done.
+        let got = unsafe { std::slice::from_raw_parts(out_cpu.cast::<u32>(), 4).to_vec() };
+        assert_eq!(
+            got,
+            [0, 0, 0, 0],
+            "unprepared released table routes reads to null, not slot 0"
+        );
+
+        log_frame();
+        log_frame();
+        assert!(!withholding());
+        host.execute(&[&write_list]);
+        write_list.reset();
+        assert!(
+            withholding(),
+            "writes against an unprepared released table mark a missing region"
+        );
+        // Clear withholding so subsequent tests start clean.
+        log_frame();
+        log_frame();
     }
 }
