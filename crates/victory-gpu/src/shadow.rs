@@ -923,11 +923,26 @@ pub(crate) fn forget_read(slot: u32) {
 /// ([`forget_read`]); removes the test's entry so it cannot affect another test.
 #[cfg(test)]
 pub(crate) fn take_forgotten(slot: u32) -> bool {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
+    let mut maps: Vec<&mut [u32]> = [false, true]
+        .into_iter()
+        .filter_map(bitmap)
+        .map(|b| unsafe {
+            std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words)
+        })
+        .collect();
     let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(at) = reads.1.iter().position(|&s| s == slot) else {
         return false;
     };
     reads.1.remove(at);
+    let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
+    if w < words {
+        maps.iter_mut().for_each(|bits| bits[w] &= !bit);
+        reads.0.resize(words, 0);
+        reads.0[w] &= !bit;
+    }
     true
 }
 
