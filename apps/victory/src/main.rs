@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod coverage;
 mod inspect;
 mod prebuild;
 mod run;
@@ -101,6 +102,13 @@ enum Command {
         #[arg(long, conflicts_with_all = ["validate", "list"])]
         cache: bool,
     },
+    /// Compare runtime shader failures with offline emission of matching containers.
+    ShaderCoverage {
+        /// Runtime tracing log (plain UTF-8 text).
+        log: PathBuf,
+        /// Files or directories to scan; defaults to the configured title paths.
+        paths: Vec<PathBuf>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -189,6 +197,7 @@ fn main() -> Result<()> {
             list,
             jobs.map(NonZeroUsize::get),
         ),
+        Command::ShaderCoverage { log, paths } => coverage::run(&log, paths),
         Command::Run {
             exe,
             unimplemented,
