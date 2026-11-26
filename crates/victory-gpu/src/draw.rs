@@ -1339,19 +1339,34 @@ impl State {
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
-            // used-resource list names (descriptor arrays).
+            // used-resource list names (descriptor arrays). Copied from the
+            // views of the title's slots past the host's where the heap
+            // keeps them, made one by one otherwise.
+            let mut copied = heap
+                .index(table)
+                .and_then(|index| host.copy_overflow(first, index, n, table))
+                .map(|(_, views)| views.into_iter());
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                // The views the overflow copy looked up, else each looked up.
+                let view = match copied.as_mut() {
+                    Some(views) => views.next().flatten(),
+                    None => crate::descriptor::view(table + u64::from(k) * 32),
+                };
+                match view {
                     Some(view) => {
-                        host.make_at(index, &view);
+                        if copied.is_none() {
+                            host.make_at(index, &view);
+                        }
                         if let Some(u) = used {
                             readable(list, u, &view, true);
                         }
                     }
                     None => {
-                        host.make_null(index);
+                        if copied.is_none() {
+                            host.make_null(index);
+                        }
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
@@ -2700,6 +2715,266 @@ uint ps() : SV_Target { return 1; }
         }
     }
 
+    /// A view heap made from now on keeping `kept` title slots of the
+    /// title's (`count` in its description), as a capped heap does.
+    fn heap_keeping(kept: u32, count: u32) -> This {
+        use crate::descriptor::host::TEST_TITLE_SLOTS;
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, count, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        TEST_TITLE_SLOTS.set(kept);
+        let made = crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap);
+        // The host heap is made at its first use: now, while the title slots
+        // it keeps are set.
+        let host = (made == S_OK).then(|| crate::descriptor::heap(heap).host().is_some());
+        TEST_TITLE_SLOTS.set(0);
+        assert_eq!(made, S_OK);
+        assert_eq!(host, Some(true), "a host view heap");
+        heap
+    }
+
+    /// A table past the host's title slots, copied from the overflow heap,
+    /// views what made one by one it views: a dispatch through it writes
+    /// the buffer the title's record names, and the new one once the title
+    /// writes another record at that slot; an unchanged slot is copied,
+    /// not made again.
+    #[test]
+    fn a_table_past_the_title_slots_reads_the_same_views_copied_or_made() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let heap = heap_keeping(4, 16);
+        let title_heap = crate::descriptor::heap(heap);
+        let heap_host = title_heap.host().expect("a host view heap");
+        assert_eq!(heap_host.count(), 4, "title slots 4.. are past the host's");
+        let (src, a, b) = (buffer(4096), buffer(256), buffer(256));
+        let bytes = |r: This| crate::resource::buffer_bytes(r).unwrap().0 as u64;
+        let uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        // Title slot 8: past the host's.
+        let slot = title_heap.start + 8 * 32;
+        crate::descriptor::create_uav(null, a, null, &uav, slot);
+        let (root, pso) = compile();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_view(true, 0, bytes(src));
+        let list = host.new_list().unwrap();
+        let (srv, at) = state.root_view(&list, true, 0, false).expect("a root view");
+        let dispatch = |list: &HostList, table: u32, offset: u32| {
+            let constants = [at, offset];
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(srv));
+                list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(table));
+                list.list.SetComputeRoot32BitConstants(2, 2, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+        };
+        let dynamic = || heap_host.dynamic(1).unwrap();
+        let (d1, d2, d3, d4) = (dynamic(), dynamic(), dynamic(), dynamic());
+        assert_eq!(heap_host.copy_overflow(d1, 8, 1, slot).map(|c| c.0), Some(1), "made at its first use");
+        dispatch(&list, d1, 0);
+        // The title writes another record there.
+        crate::descriptor::create_uav(null, b, null, &uav, slot);
+        assert_eq!(heap_host.copy_overflow(d2, 8, 1, slot).map(|c| c.0), Some(1), "made again: its record changed");
+        assert_eq!(heap_host.copy_overflow(d3, 8, 1, slot).map(|c| c.0), Some(0), "copied: unchanged");
+        dispatch(&list, d3, 4);
+        list.close();
+        // SAFETY: inside the title buffer.
+        let words = unsafe { std::slice::from_raw_parts_mut(bytes(src) as *mut u32, 1024) };
+        for (k, w) in words.iter_mut().enumerate() {
+            *w = 0x5000 + k as u32;
+        }
+        host.execute(&[&list]);
+        let read = |r: This| crate::shadow::find(bytes(r), 256).expect("a copy").read_host(bytes(r), 16);
+        let want = |offset: u32| (0..16).map(|k| 0x5000 + (at + offset) / 4 + 16 * k).collect::<Vec<u32>>();
+        assert_eq!(read(a), want(0), "the first record's buffer, through the copy");
+        assert_eq!(read(b), want(4), "the new record's buffer, through the copy");
+        // Made one by one from the same record: the same buffer.
+        let list = host.new_list().unwrap();
+        heap_host.make_at(d4, &crate::descriptor::view(slot).expect("a view"));
+        dispatch(&list, d4, 8);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(read(b), want(8), "the new record's buffer, made one by one");
+        for d in [d1, d2, d3, d4] {
+            heap_host.release(d, 1);
+        }
+    }
+
+    #[test]
+    fn an_overflow_srv_follows_a_replaced_texture_without_a_new_record() {
+        let Some(host) = crate::host::host() else { return };
+        let guest_heap = heap_keeping(4, 16);
+        let title_heap = crate::descriptor::heap(guest_heap);
+        let heap = title_heap.host().unwrap();
+        let slots = Slots::from_heap(heap.heap.clone());
+        let shader = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let address = crate::watch::tests::pool(1) as u64;
+        let words = texture_words(64, 64, 28, 0x100, 0); // linear RGBA8
+        // SAFETY: the first texel lies in the committed pool page.
+        unsafe { (address as *mut [u8; 4]).write([255, 0, 0, 255]) };
+        let View::Placed(_, _, desc) = placed_view(address, words) else { unreachable!() };
+        let slot = title_heap.start + 8 * 32;
+        crate::descriptor::create_placed_srv(std::ptr::null(), &words, &desc, slot);
+        let view = crate::descriptor::view(slot).unwrap();
+        // SAFETY: slot 8 is inside the title heap and holds a 3-word view record.
+        let record = || unsafe { (slot as *const [u32; 3]).read_unaligned() };
+        let original = record();
+
+        let read_slot = |index| {
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Srv), &view, false);
+            // SAFETY: the previous submission has completed; clear its mapped output.
+            unsafe { data.cast::<[f32; 4]>().write([0.0; 4]) };
+            run(&list, &slots, &shader, index, Some(&out), (1, 1));
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the dispatch wrote its first float4 here and has completed.
+            unsafe { data.cast::<[f32; 4]>().read() }
+        };
+        let copied = heap.dynamic(1).unwrap();
+        let fresh = heap.dynamic(1).unwrap();
+        let copy_and_read = || {
+            let (made, _) = heap.copy_overflow(copied, 8, 1, slot).expect("overflow table");
+            (made, read_slot(copied))
+        };
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let green = [0.0, 1.0, 0.0, 1.0];
+        let placed = crate::resource::texture_at(address, &words).unwrap();
+        let old = crate::resource::host_resource(placed).unwrap();
+        assert_eq!(copy_and_read(), (1, red));
+
+        // Request render-target use at the same address only after sampling the red texture.
+        // The host now needs a different resource; the title's SRV was never rewritten.
+        let writable = texture_at_address(address, &texture_words(64, 64, 28, 0x100, 1));
+        let new = crate::resource::host_copy(writable).unwrap();
+        assert_ne!(old, new.texture);
+        let list = host.new_list().unwrap();
+        // SAFETY: the RTV describes this live render target; the list tracks its state.
+        unsafe {
+            if let Some(barrier) = list.move_texture(&new, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32) {
+                list.list.ResourceBarrier(&[barrier]);
+            }
+            list.list.ClearRenderTargetView(host.rtv(&new.texture, None), &green, None);
+        }
+        crate::texture::host_writes(&list, writable);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(record(), original);
+        heap.make_at(fresh, &view);
+        assert_eq!(read_slot(fresh), green, "freshly made SRV");
+        assert_eq!(copy_and_read(), (1, green), "replacement remade once");
+        assert_eq!(copy_and_read(), (0, green), "unchanged replacement reused");
+        heap.release(copied, 1);
+        heap.release(fresh, 1);
+        type Release = extern "system" fn(This) -> u32;
+        crate::object::slot::<Release>(guest_heap, 0x10)(guest_heap);
+        crate::object::slot::<Release>(writable, 0x10)(writable);
+    }
+
+    /// A texture fed from title memory, read through an overflow table and
+    /// then given up (`resource::give_up_now`): the overflow slot lets go
+    /// of it, so the next copy makes its view again, of the texture made
+    /// again with the title's new bytes, not of the one given up.
+    #[test]
+    fn an_overflow_table_reads_a_texture_given_up_as_made_again() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let guest_heap = heap_keeping(4, 16);
+        let title_heap = crate::descriptor::heap(guest_heap);
+        let heap = title_heap.host().unwrap();
+        let slots = Slots::from_heap(heap.heap.clone());
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let address = crate::watch::tests::pool(1) as u64;
+        let object = texture_at_address(address, &texture_words(64, 64, 28, 0x100, 0));
+        // SAFETY: the texture's memory, 256-byte rows of 64 texels.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        // Title slot 8: past the host's title slots.
+        let slot = title_heap.start + 8 * 32;
+        crate::descriptor::create_srv(std::ptr::null(), object, &desc, slot);
+        let view = crate::descriptor::view(slot).unwrap();
+        let copied = heap.dynamic(1).unwrap();
+        let copy_and_read = || {
+            let (made, _) = heap.copy_overflow(copied, 8, 1, slot).expect("an overflow table");
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Srv), &view, false);
+            // SAFETY: no submission runs; the mapped output.
+            unsafe { data.cast::<[f32; 4]>().write([0.0; 4]) };
+            run(&list, &slots, &read, copied, Some(&out), (1, 1));
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the dispatch wrote its first texel there and has run.
+            (made, unsafe { data.cast::<[f32; 4]>().read() }[0])
+        };
+        let (made, texel) = copy_and_read();
+        assert_eq!(made, 1);
+        assert!((texel - 64.0 / 255.0).abs() < 1e-6, "{texel}");
+        assert!(crate::resource::give_up_now(object), "fed from title memory");
+        // SAFETY: the texture's memory: the title writes new bytes.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x80, 64 * 64 * 4) };
+        let (made, texel) = copy_and_read();
+        assert_eq!(made, 1, "made again: its texture was given up");
+        assert!((texel - 128.0 / 255.0).abs() < 1e-6, "the new bytes, through the texture made again: {texel}");
+        heap.release(copied, 1);
+        type Release = extern "system" fn(This) -> u32;
+        crate::object::slot::<Release>(guest_heap, 0x10)(guest_heap);
+    }
+
+    /// Fresh tables of 8 past the host's title slots, per 1,000: made one
+    /// view at a time (`VICTORY_OVERFLOW_VIEWS=0`), against copied from the
+    /// overflow heap at their first use (its views made) and with their
+    /// records unchanged (copied only).
+    #[test]
+    #[ignore = "benchmark; run with --ignored --nocapture"]
+    fn fresh_tables_made_or_copied_per_1000() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const TABLES: u32 = 1000;
+        let null = std::ptr::null();
+        let heap = heap_keeping(16, 16 + 8 * TABLES);
+        let title_heap = crate::descriptor::heap(heap);
+        let host = title_heap.host().expect("a host view heap");
+        let target = buffer(1 << 16);
+        let uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let slot = |t: u32| title_heap.start + u64::from(16 + 8 * t) * 32;
+        for k in 0..8 * TABLES {
+            crate::descriptor::create_uav(null, target, null, &uav, slot(0) + u64::from(k) * 32);
+        }
+        let time = |each: &dyn Fn(u32, u32)| {
+            let started = std::time::Instant::now();
+            for t in 0..TABLES {
+                let first = host.dynamic(8).unwrap();
+                each(first, t);
+                host.release(first, 8);
+            }
+            started.elapsed().as_secs_f64() * 1e3
+        };
+        let one_by_one = time(&|first, t| {
+            for k in 0..8 {
+                let view = crate::descriptor::view(slot(t) + u64::from(k) * 32).expect("a view");
+                host.make_at(first + k, &view);
+            }
+        });
+        let copy = |first, t| assert!(host.copy_overflow(first, 16 + 8 * t, 8, slot(t)).is_some());
+        let first_use = time(&copy);
+        let unchanged = time(&copy);
+        eprintln!(
+            "fresh tables of 8, per {TABLES}: views made one by one {one_by_one:.1} ms; copied from the overflow heap, \
+             first use (views made there) {first_use:.1} ms, records unchanged {unchanged:.1} ms"
+        );
+    }
+
     /// Title memory of `bytes` (64 KiB aligned) for textures at an address.
     fn title_memory(bytes: usize) -> u64 {
         let layout = std::alloc::Layout::from_size_align(bytes, 1 << 16).unwrap();
@@ -2756,6 +3031,11 @@ uint ps() : SV_Target { return 1; }
             };
             // SAFETY: plain creation.
             let heap = unsafe { host.device.CreateDescriptorHeap(&desc) }.unwrap();
+            Self::from_heap(heap)
+        }
+
+        fn from_heap(heap: ID3D12DescriptorHeap) -> Self {
+            let host = crate::host::host().unwrap();
             // SAFETY: a plain query.
             let step = unsafe { host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
             Slots(heap, step)
