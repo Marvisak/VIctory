@@ -1,15 +1,19 @@
 # VIctory
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+I run Grand Theft Auto VI (Xbox Series X|S) on Windows and Linux/Proton,
+from files the user supplies.
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can (shaders and pipelines too, see Getting started) and on first use
-otherwise. See [docs/architecture.md](docs/architecture.md).
+I keep the title's x86-64 code unchanged inside the VIctory process. VIctory
+supplies the platform underneath it and converts the title's data, ahead of
+time where it can (shaders and pipelines too, see Getting started) and on
+first use otherwise. See [docs/architecture.md](docs/architecture.md).
 
-## Status (2026-11-25)
+## Windows status (2026-11-25)
 
+**Not playable yet, but I can get into the game.** I observed the title boot,
+run its menus at its own 30 fps, load the world, play the intro cutscene and
+reach the **prologue**, the mission after it, with the graphics fully
+displayed, at about **1 frame per second**.
 **Not playable yet, because of the framerate: about 1 frame per second in the
 world.** Nothing else keeps the game from working: the title boots, runs its
 menus at its own 30 fps, loads the world, plays the intro cutscene and
@@ -37,11 +41,81 @@ Tested on one machine: Windows 11, AMD RX 6700 XT (12 GB).
 > diagnostics build with `VICTORY_D3D12_WARP=1` renders on the software
 > adapter instead (too slow to reach the world in minutes).
 
+## Linux / Proton status (2026-11-25)
+
+**Not playable yet, but I got the title to a partial visible world under
+Proton.** I am treating Linux/Proton as a major supported target of this
+fork, not an aside.
+
+### My measured visible-world run
+
+In controlled run `20261125_220632`, I reached a **partial visible world** on
+2026-11-25. I saw Lucia, grass, ground, a fence, lighting, LOD structures,
+trees, a car scene, a left-side GUI, and the minimap. The copy on the left
+later looked as though it had rendered into a better picture, but everything
+on screen was still **STATIC**; it did not behave like a normal animated
+world. Rendering remained choppy and broken-looking, square artifacts were
+visible, audio became silent, and the late scene ran at about 0.1-0.2 FPS.
+I stopped the still-running process with the enforced 480-second cap (exit
+`124`), so this was not a spontaneous crash.
+
+- Exact source: `facfb30b829083ac9a86212ef4222ec06e607d39`, clean tree.
+- Exact MSVC binary SHA-256:
+  `0c6b1215a551e2b9af6777a186ec797a811ceddb9376e7dc3e2734a522d3d87a`.
+- Measured stack: NVIDIA GeForce RTX 4060 Ti, Proton Experimental build
+  `26621173`, Wine `11.0`, DXVK `v3.1.1-209-g1039f682058fa71`, and
+  vkd3d-proton `3.2.0`.
+
+| Metric | Linux/Proton run | MSVC baseline `20261125_094753` |
+|--------|------------------|---------------|
+| Shader translation failures | 4 | 439 |
+| Host pipeline refusals | 4 | 117 |
+| Descriptor heap caps | 1 | 1 |
+| Descriptor slot overruns | 507,329 | 310,720 |
+| Device removals | 0 | 0 |
+| Panics | 0 | 0 |
+| FPS | median 0.1 overall; about 0.2 in the late scene | median 0.2 |
+
+### My current limitations
+
+- I have **not** proven stable, correct, and playable visible-world rendering.
+- Descriptor slot overruns remain at 507,329.
+- Late frames are dominated by host-side texture refresh, title-memory remap
+  waits, preparation, and copy-back; the GPU is mostly idle.
+- What I saw was choppy/broken, the scene stayed static, and audio became
+  silent late in the run.
+
+## What I added in this fork
+
+My current branch adds five Linux/Proton code commits on top of the tracked
+`theDVNVS/main` baseline:
+
+| Commit | Linux/Proton work |
+|--------|-------------------|
+| `95d1f4f` | Compiles the indirect-execution clamp with Wine's shader compiler instead of assuming the native compiler's byte-address-buffer support. |
+| `2e74fc8` | Requests an empty host pipeline library with a null blob, which vkd3d-proton accepts. |
+| `3dde136` | Fails missing `WSAConnectByList` and `GetAddrInfoExA` calls cleanly instead of panicking when Wine does not export them. |
+| `185373d` | Lowers shaders to one shared return block, avoiding invalid SPIR-V structured exits under vkd3d-proton. |
+| `f9a4cbc` | Adds `scripts/proton-run.sh` to run the MSVC build and test suite under Proton's Wine with vkd3d-proton and DXVK. |
+
+At the revisions I audited for this README, none of those five commits was
+contained in `origin/main`, `fxceless/main`, `victory-perf/main`, or
+`theDVNVS/main`. This describes my exact patch combination; it is not a
+claim that another project cannot implement an equivalent fix.
+
+I also prepared a separate branch, `experiment/pr2121-nemotron` at commit
+`66c0992`, which adapts upstream PR #2121's 256-slot view-heap paging onto
+`facfb30`. It keeps 1,245,184 title slots logical while mapping them through
+pages on hosts with a smaller physical descriptor heap, and is enabled with
+`VICTORY_VIEW_PAGES=1`. Focused paging tests, 224 `victory-shader` tests, and
+156 `victory-gpu` tests pass. This branch is prepared but **not live-validated**
+and is intentionally not merged into my current Linux/Proton branch.
+
 What each part does today and what it still needs:
 
 | Subsystem | Today | Needs |
 |-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
+| Loader | Runs the title's executable and its DLLs in my process; crash reports name the faulting code and are kept in `crashes.log` | – |
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
@@ -59,11 +133,11 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
-To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
-the installer from https://rustup.rs). The first `cargo` command in this
-repository then fetches the pinned toolchain. Building needs the MSVC C++
-build tools: Visual Studio or its Build Tools with the "Desktop development
-with C++" workload.
+I install Rust with rustup (`winget install --id Rustlang.Rustup -e`, or the
+installer from https://rustup.rs). The first `cargo` command in this
+repository then fetches the pinned toolchain. On Windows, the build needs the
+MSVC C++ build tools: Visual Studio or its Build Tools with the "Desktop
+development with C++" workload.
 
 Keep the build paths short. From a checkout about 170 characters deep, the
 `blake3` dependency's build script fails in `ml64.exe` with
@@ -74,10 +148,11 @@ in `C:\vt\release` instead of `target\release`), or check out the
 repository nearer the drive's root.
 
 A run in the world takes about 33 GB of Windows commit (RAM plus paging
-file) and about 10 GB of video memory. The tested machine has 32 GB of RAM
-and a commit limit of about 80 GB. Check **Committed** under **Task Manager →
-Performance → Memory**. If `crashes.log` reports Windows error 1455, close
-other applications or increase the Windows paging file size, then retry.
+file) and about 10 GB of video memory. My tested Windows machine has 32 GB of
+RAM and a commit limit of about 80 GB. I check **Committed** under **Task
+Manager → Performance → Memory**. If `crashes.log` reports Windows error
+1455, I close other applications or increase the Windows paging file size,
+then retry.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
@@ -108,31 +183,31 @@ early, it keeps what it made. Without it, a run makes the pipelines it needs
 on worker threads and keeps them, so the first runs after a translator
 change are slower and show missing draws for a while.
 
-To get into the game, press A (Enter) on each first-boot screen and again on
+To get into the game, I press A (Enter) on each first-boot screen and again on
 the start screen. Loading the world takes about a minute; the intro cutscene
 plays, then the prologue starts.
 
-Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
-it with the PC build on your GPU instead of the console build, get the
+For Series S-mode upscaling, I use AMD FidelityFX. When I want to run it
+with the PC build on my GPU instead of the console build, I get the
 [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
 and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
 `Kits/FidelityFX/signedbin` folder, which holds
 `amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
-upscaler for your GPU (the log says so), the title's own DLLs run.
+upscaler for my GPU (the log says so), the title's own DLLs run.
 
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
+The window caption shows the framerate. I keep saves, settings, and
+`crashes.log` under the data folder (default `%LOCALAPPDATA%\victory\data`),
+with derived data under the cache folder.
 
-Set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit the title's
-top-level window to that bounding box. Smaller windows keep their size,
-larger windows keep their proportions, and the monitor's work area still
-limits them. This scales the displayed image; it does not change the
+I set `VICTORY_WINDOW_MAX=1920x1080` before launching when I want to limit
+the title's top-level window to that bounding box. Smaller windows keep their
+size, larger windows keep their proportions, and the monitor's work area
+still limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+I use XInput pads. With none connected, I can use the keyboard as a pad
+while the title's window has focus:
 
 | Keys | Pad |
 |------|-----|
@@ -142,6 +217,67 @@ title's window has focus:
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
+
+## Run it under Linux / Proton
+
+I build the Windows binary from Linux with `cargo xwin`, then run it under
+Proton's Wine with `scripts/proton-run.sh`.
+
+I need the pinned Rust toolchain, `cargo-xwin`, a Proton installation, and
+the user's game files outside this repository. My measured run used Proton
+Experimental build `26621173` from this path:
+
+```bash
+export PROTON="/mnt/ssd2/SteamLibrary/steamapps/common/Proton - Experimental"
+```
+
+I build the exact locked MSVC release with:
+
+```bash
+cargo xwin build --locked --release -p victory \
+  --target x86_64-pc-windows-msvc
+```
+
+I can use the runner's defaults, or override the Proton folder, prefix, and
+VIctory executable:
+
+```bash
+# Defaults:
+# PROTON: Proton - Experimental in a standard Steam/Flatpak location
+# PREFIX: ~/.local/share/victory/proton
+# VICTORY_EXE: target/x86_64-pc-windows-msvc/release/victory.exe
+scripts/proton-run.sh config
+
+# Or set them explicitly:
+PROTON="/path/to/Proton - Experimental" \
+PREFIX="$HOME/.local/share/victory/proton" \
+VICTORY_EXE="$PWD/target/x86_64-pc-windows-msvc/release/victory.exe" \
+  scripts/proton-run.sh config
+```
+
+I launch the title through VIctory, not directly through Wine:
+
+```bash
+PROTON="/path/to/Proton - Experimental" \
+PREFIX="$HOME/.local/share/victory/proton" \
+VICTORY_EXE="$PWD/target/x86_64-pc-windows-msvc/release/victory.exe" \
+VICTORY_KEYBOARD_ONLY=1 \
+  scripts/proton-run.sh run "/path/to/game/game_scarlett_master.exe" --execute
+```
+
+For an exact run in the same style as my measured build, I also used
+`DXVK_CONFIG=dxgi_custom_device_id=10de:2803` for the RTX 4060 Ti.
+
+I use the same runner for the Windows test suite:
+
+```bash
+CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER="$PWD/scripts/proton-run.sh" \
+  cargo xwin test --locked --workspace \
+  --target x86_64-pc-windows-msvc
+```
+
+The Windows translation and run commands above work under Proton as well;
+I substitute the runner for the direct `victory.exe` invocation.
 
 ## Commands
 
@@ -183,7 +319,7 @@ the translated shaders do not require it at runtime.
 
 ## Debugging
 
-A release build has no debugging aids. Build them in with
+A release build has no debugging aids. I build them in with
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
@@ -219,10 +355,11 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
-`crashes.log` in the title's data folder.
+`crashes.log` in the title's data folder, so I keep it with the console
+output.
 
-For a startup breakpoint (`0x80000003`), run the diagnostics build with
-`VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
+For a startup breakpoint (`0x80000003`), I run the diagnostics build with
+`VICTORY_CRASH_BREAKPOINTS=1` and keep the console output along with the new
 `crashes.log` entries. A host DLL refusal includes the caller stack in the
 console output. The refusal is expected for DLLs outside the host policy,
 including `rpcrt4.dll`.
@@ -232,10 +369,10 @@ On Series 1.0.2.1, a missing `appdata0.rpf` reproduced the breakpoint at
 package beside the title executable. `run --execute` checks that it can
 read the RPF9 header before starting this build.
 
-To compare hardware and software rendering, repeat with
+To compare hardware and software rendering, I repeat the run with
 `VICTORY_D3D12_WARP=1` and check the console for
 `host device on the software adapter (WARP)` to confirm the WARP device was
-created. Compare the exception's module and offset, stack frames, and
+created. I compare the exception's module and offset, stack frames, and
 preceding messages across the two runs.
 
 ## License
