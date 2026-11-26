@@ -563,11 +563,46 @@ extern "system" fn present(
             }
         }
         if !resources.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            let fallback_copy = if crate::capture::present_1440p_on() {
+                if let Some(candidate) = crate::capture::take_1440p_target() {
+                    if let Some(candidate_res) =
+                        crate::resource::host_resource(candidate.resource as This)
+                    {
+                        if is_candidate_4k_primary(&resources[0].1, &candidate_res) {
+                            let state = crate::host::legal_state(&candidate_res, COPY_SOURCE);
+                            Some((candidate_res, state))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            #[cfg(feature = "diagnostics")]
+            let mut sources: Vec<(&_, u32)> = resources
+                .iter()
+                .map(|(_, tex, state, _)| (tex, *state))
+                .collect();
+            #[cfg(not(feature = "diagnostics"))]
             let sources: Vec<(&_, u32)> = resources
                 .iter()
                 .map(|(_, tex, state, _)| (tex, *state))
                 .collect();
+            #[cfg(feature = "diagnostics")]
+            if let Some((ref cand_res, cand_state)) = fallback_copy {
+                sources[0] = (cand_res, cand_state);
+            }
             let shown = host.present(&sources, frame);
+            #[cfg(feature = "diagnostics")]
+            if let Some((ref cand_res, before)) = fallback_copy {
+                crate::host::legal_state(cand_res, before);
+            }
             for &(resource, _, state, first) in &resources {
                 if first {
                     crate::resource::host_transition(resource, state);
@@ -616,6 +651,20 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
     }
     *last = (black, drawn, last.2);
 }
+
+
+#[cfg(feature = "diagnostics")]
+fn is_candidate_4k_primary(
+    primary: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    candidate: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> bool {
+    // SAFETY: a live host texture.
+    let desc = unsafe { primary.GetDesc() };
+    desc.Width == 3840
+        && desc.Height == 2160
+        && primary != candidate
+}
+
 
 /// A run of destination pages: how they are mapped (0 pool pages from
 /// `start` on, 1 pool page `start` each, 2 unmapped, 3 left as they are)
@@ -909,5 +958,118 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[test]
+    #[cfg(feature = "diagnostics")]
+    fn present_1440p_switch_and_candidate_gate() {
+        // SAFETY: single-threaded test context.
+        unsafe { std::env::set_var("VICTORY_PRESENT_1440P", "1") };
+        assert!(crate::capture::present_1440p_on());
+        assert!(crate::capture::take_1440p_target().is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "diagnostics")]
+    fn present_fallback_uses_completed_work_once_and_only_at_4k() {
+        // SAFETY: single-threaded test context.
+        unsafe { std::env::set_var("VICTORY_PRESENT_1440P", "1") };
+        assert!(crate::capture::present_1440p_on());
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null_mut();
+        let make = |width, height| {
+            let heap = windows::Win32::Graphics::Direct3D12::D3D12_HEAP_PROPERTIES {
+                Type: windows::Win32::Graphics::Direct3D12::D3D12_HEAP_TYPE_DEFAULT,
+                CreationNodeMask: 1,
+                VisibleNodeMask: 1,
+                ..Default::default()
+            };
+            let desc = windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC {
+                Dimension: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: width,
+                Height: height,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let iid = guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 4, 15, 0xad],
+            );
+            let mut out: This = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const heap).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    0,
+                    std::ptr::null(),
+                    &iid,
+                    &raw mut out,
+                ),
+                S_OK
+            );
+            out
+        };
+        let record = |list: &crate::host::HostList, r, color| {
+            crate::list::ensure_state(list, r, windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+            let rtv = host.rtv(&crate::resource::host_resource(r).unwrap(), None);
+            // SAFETY: live RTV in render-target state when the list executes.
+            unsafe { list.list.ClearRenderTargetView(rtv, &color, None) };
+            list.note_1440p_target(r);
+        };
+        let black = make(3840, 2160);
+        let overlay = make(3840, 2160);
+        let small = make(32, 32);
+        let red = make(2560, 1440);
+        let green = make(2560, 1440);
+        let list = host.new_list().unwrap();
+        let discarded = host.new_list().unwrap();
+        record(&list, black, [0.0, 0.0, 0.0, 1.0]);
+        record(&list, overlay, [0.0, 0.0, 0.5, 0.5]);
+        record(&list, small, [0.0, 1.0, 0.0, 1.0]);
+        record(&list, red, [1.0, 0.0, 0.0, 1.0]);
+        record(&discarded, green, [0.0, 1.0, 0.0, 1.0]);
+        list.close();
+        discarded.close();
+        assert!(crate::capture::take_1440p_target().is_none());
+        host.execute(&[&list]);
+        discarded.reset();
+        discarded.close();
+        host.execute(&[&discarded]);
+        let plane = |resources: *const This| Plane {
+            token: 0,
+            count: 1,
+            resources,
+            _rest: [0; 6],
+        };
+        let black_res = black;
+        let p_black = plane(&raw const black_res);
+        assert_eq!(present(null, 1, &p_black, null.cast()), S_OK);
+        assert!(crate::capture::take_1440p_target().is_none());
+
+        list.reset();
+        record(&list, red, [1.0, 0.0, 0.0, 1.0]);
+        list.close();
+        host.execute(&[&list]);
+        let small_res = small;
+        let p_small = plane(&raw const small_res);
+        assert_eq!(present(null, 1, &p_small, null.cast()), S_OK);
+        assert!(crate::capture::take_1440p_target().is_none());
+        for resource in [black, overlay, small, red, green] {
+            let release = object::slot::<extern "system" fn(This) -> u32>(resource, 0x10);
+            assert_eq!(release(resource), 0);
+        }
     }
 }
