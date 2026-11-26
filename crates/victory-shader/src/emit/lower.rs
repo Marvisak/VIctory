@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+#[cfg(test)]
+mod typed_store_tests;
 
 type Why = &'static str;
 
@@ -9672,7 +9674,7 @@ impl<'a> Lower<'a> {
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
-                if count != 4 || *offen || *offset != 0 {
+                if count != 4 || *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
                 let h = typed_h.ok_or("a typed buffer store")?;
