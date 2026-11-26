@@ -1033,6 +1033,22 @@ struct Deferred {
 }
 
 impl Host {
+    /// Waits until the host queue has done all work submitted so far,
+    /// presents included (tests).
+    #[cfg(test)]
+    pub(crate) fn wait_idle(&self) {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        *submitted += 1;
+        // SAFETY: the queue, fence and event are ours and alive.
+        unsafe {
+            self.queue.Signal(&self.fence, *submitted).unwrap();
+            self.fence
+                .SetEventOnCompletion(*submitted, self.event)
+                .unwrap();
+            WaitForSingleObject(self.event, INFINITE);
+        }
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
@@ -2239,6 +2255,14 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The list's indirect work so far, after it has run.
+    #[cfg(test)]
+    pub(crate) fn budget_spent(&self) -> Option<u32> {
+        let &(_, data) = self.budget.get()?.as_ref()?;
+        // SAFETY: the list's own mapped word; the list has run.
+        Some(unsafe { (data as *const u32).read_volatile() })
     }
 
     /// The list's argument buffer, at least `bytes` long, common between

@@ -3,8 +3,9 @@
 //! translate wrongly leaves whatever the memory held, and a draw of four
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So every record is clamped on the GPU,
-//! just before its execution, by a compute shader of ours (HLSL compiled by
-//! the system's compiler; a 5.1 shader with its root signature inside).
+//! just before its execution, by a compute shader of ours ([`crate::compute`],
+//! which Wine's compiler builds too: without the clamp every indirect
+//! execution is dropped).
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -16,55 +17,63 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
+use crate::compute::{compute, constants, root_view};
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0)"
 cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
 // The title's records, read only; the clamped ones go to the list's own.
-ByteAddressBuffer args : register(t0);
-RWByteAddressBuffer dest : register(u0);
+// In words: the caller refuses addresses and strides not multiples of 4.
+StructuredBuffer<uint> args : register(t0);
+RWStructuredBuffer<uint> dest : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
-RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-// Clamps the record at `at` into `dest`; its cost.
+uint3 load3(uint at) {
+    return uint3(args[at], args[at + 1], args[at + 2]);
+}
+void store3(uint at, uint3 v) {
+    dest[at] = v.x;
+    dest[at + 1] = v.y;
+    dest[at + 2] = v.z;
+}
+// Clamps the record at word `at` into `dest`; its cost.
 uint clamped(uint at) {
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        uint count = min(args[at], 1u << 24);
+        uint instances = min(args[at + 1], (1u << 26) / max(count, 1u));
         cost = count * instances;
-        dest.Store2(at, uint2(count, instances));
+        dest[at] = count;
+        dest[at + 1] = instances;
         // The rest of the record as it is: first vertex and instance (4 words
         // in all), or first index, base vertex and first instance (5).
+        dest[at + 2] = args[at + 2];
+        dest[at + 3] = args[at + 3];
         if (kind == 1) {
-            dest.Store3(at + 8, args.Load3(at + 8));
-        } else {
-            dest.Store2(at + 8, args.Load2(at + 8));
+            dest[at + 4] = args[at + 4];
         }
     } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+        uint3 g = min(load3(at), uint3(65535, 65535, 65535));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
-        dest.Store3(at, g);
+        store3(at, g);
     } else {
         // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
+        uint3 g = load3(at);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
-        dest.Store3(at, g);
+        store3(at, g);
     }
     return cost;
 }
@@ -75,16 +84,15 @@ groupshared uint costs[64];
 // record, then the first lane charges the tile's records in order. No
 // other group shares the budget: a shared add wraps once enough records
 // are rejected, and a compare-exchange retries more the more records fit.
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint lane : SV_GroupIndex) {
     uint left = 0;
     if (lane == 0) {
-        left = BUDGET - min(budget.Load(0), BUDGET);
+        left = BUDGET - min(budget[0], BUDGET);
     }
     for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
         uint record = tile * 64 + lane;
-        uint at = record * stride;
+        uint at = record * (stride / 4);
         uint cost = 0;
         if (record < records) {
             cost = clamped(at);
@@ -106,11 +114,11 @@ void main(uint lane : SV_GroupIndex) {
         GroupMemoryBarrierWithGroupSync();
         if (costs[lane] == PAST) {
             // Draws keep their layout with no vertices; groups become zero.
-            dest.Store(at, 0);
+            dest[at] = 0;
         }
     }
     if (lane == 0) {
-        budget.Store(0, BUDGET - left);
+        budget[0] = BUDGET - left;
     }
 }
 "#;
@@ -138,51 +146,18 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
+/// The clamp, its root signature the record (b0), the title's records
+/// (t0), the budget (u1) and the clamped records (u0), as [`bound`] binds.
 fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
-            };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
-    unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
-            },
-            ..Default::default()
-        })?;
-        Ok(Clamp { root, pso })
-    }
+    let params = [
+        constants(0, 4),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1, 0),
+        root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0),
+    ];
+    let (root, pso) = compute(device, s!("argument clamp"), SOURCE, 0, &params)?;
+    Ok(Clamp { root, pso })
 }
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
@@ -268,6 +243,85 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// Clamps the records of `kind` in `title`, `per` words apart, in a
+    /// list of their own: every record word of the list's argument buffer
+    /// after, and the list's budget spent. `None` without a host GPU.
+    fn every_word(kind: u32, per: usize, title: &[u32]) -> Option<(Vec<u32>, u32)> {
+        let host = super::host()?;
+        let records = (title.len() / per) as u32;
+        let (buffer, data) = host
+            .shared_buffer(std::mem::size_of_val(title) as u64)
+            .unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: our mapped buffer, written before the list runs; the
+        // list's argument buffer read after it has.
+        unsafe {
+            data.cast::<u32>()
+                .copy_from_nonoverlapping(title.as_ptr(), title.len());
+            let out = super::bound(
+                &list,
+                buffer.GetGPUVirtualAddress(),
+                (kind, per as u32 * 4, records),
+            )
+            .unwrap();
+            super::done(&list, &out);
+            list.close();
+            host.execute(&[&list]);
+            let mut p = std::ptr::null_mut();
+            out.Map(0, None, Some(&mut p)).unwrap();
+            let words = std::slice::from_raw_parts(p.cast::<u32>(), title.len()).to_vec();
+            Some((words, list.budget_spent().unwrap()))
+        }
+    }
+
+    /// Every word the clamp writes, of each kind: counts and groups
+    /// bounded, the rest of a record copied as it is (5-word records
+    /// 20 bytes apart: no words of one land in another), the work charged
+    /// to the list's budget; records past it run empty with their other
+    /// words kept, and one of no work still runs.
+    #[test]
+    fn clamped_records_hold_every_word() {
+        const MANY: u32 = 1 << 24;
+        // Draws: vertex count, instances, first vertex, first instance.
+        let Some(draws) = every_word(0, 4, &[MANY + 7, 5, 11, 13, 3, 2, 1, 9]) else {
+            return; // no host GPU here
+        };
+        assert_eq!(draws, (vec![MANY, 4, 11, 13, 3, 2, 1, 9], (1 << 26) + 6));
+        // Indexed: index count, instances, first index, base vertex, first
+        // instance.
+        let indexed = every_word(
+            1,
+            5,
+            &[10, 3, 100, -16i32 as u32, 7, u32::MAX, u32::MAX, 1, 2, 3],
+        )
+        .unwrap();
+        assert_eq!(
+            indexed,
+            (
+                vec![10, 3, 100, -16i32 as u32, 7, MANY, 4, 1, 2, 3],
+                (1 << 26) + 30
+            )
+        );
+        // Dispatches: each dimension bounded, and a dispatch of more than
+        // 2^20 groups none.
+        let dispatches = every_word(2, 3, &[3, 2, 1, 65_536, 17, 2, 70_000, 7, 2]).unwrap();
+        assert_eq!(
+            dispatches,
+            (vec![3, 2, 1, 0, 0, 0, 65_535, 7, 2], (6 + 65_535 * 14) * 64)
+        );
+        // Mesh dispatches: one-dimensional.
+        let meshes = every_word(10, 3, &[70_000, 7, 2, 5, 0, 3]).unwrap();
+        assert_eq!(meshes, (vec![65_535, 1, 1, 5, 0, 1], 65_535 * 128));
+        // Two draws of 2^26 vertex instances spend the budget; a third, a
+        // small one after it, run empty; one of no work runs.
+        let mut title = [MANY, 4, 0, 0].repeat(3);
+        title.extend([1, 1, 5, 6, 0, 9, 1, 2]);
+        let past = every_word(0, 4, &title).unwrap();
+        let mut want = [MANY, 4, 0, 0].repeat(2);
+        want.extend([0, 4, 0, 0, 0, 1, 5, 6, 0, 9, 1, 2]);
+        assert_eq!(past, (want, 1 << 27));
     }
 
     /// Clamps `records` records of `kind`, filled by repeating `words`,

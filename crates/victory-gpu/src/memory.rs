@@ -715,6 +715,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_DESCRIPTOR_RANGE_TYPE, D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+    };
 
     /// Writes of lists using title memory are held back from a frame with a
     /// miss through the next one, then go back again.
@@ -879,12 +883,10 @@ mod tests {
     /// table and the heap's views, as translated shaders do, into `dst`
     /// from byte `at`.
     const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=unbounded)), SRV(t0, space=2), UAV(u0), RootConstants(num32BitConstants=3, b0)"
 ByteAddressBuffer views[] : register(t0);
 ByteAddressBuffer table : register(t0, space2);
 RWByteAddressBuffer dst : register(u0);
 cbuffer c : register(b0) { uint lo; uint hi; uint at; }
-[RootSignature(RS)]
 [numthreads(4, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint a = lo + id.x * 4;
@@ -897,51 +899,38 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-    fn pipeline(source: &str) -> (
+    /// A compute shader of `source`, its root signature a table of
+    /// unbounded `views` from register 0, the page table (t0, space 2), the
+    /// output (u0 of `space`) and `constants` root constants, as the tests
+    /// bind them.
+    fn pipeline(
+        source: &str,
+        views: D3D12_DESCRIPTOR_RANGE_TYPE,
+        space: u32,
+        constants: u32,
+    ) -> (
         windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
         windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
     ) {
-        use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES, D3DCompile};
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use crate::compute::{compute, range, root_view, table};
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES;
         use windows::Win32::Graphics::Direct3D12::*;
-        use windows::core::s;
+        let ranges = [range(views, 0, 0, u32::MAX)];
+        let params = [
+            table(&ranges),
+            root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0, 2),
+            root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0, space),
+            crate::compute::constants(0, constants),
+        ];
         let host = crate::host::host().unwrap();
-        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
-        // SAFETY: the source and names outlive the call; the errors are text.
-        unsafe {
-            let made = D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("memory"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES,
-                0,
-                &mut code,
-                Some(&mut errors),
-            );
-            let text = errors.map(|e| String::from_utf8_lossy(std::slice::from_raw_parts(e.GetBufferPointer().cast::<u8>(), e.GetBufferSize())).into_owned());
-            assert!(made.is_ok(), "{text:?}");
-        }
-        let code = code.unwrap();
-        // SAFETY: the blob's own bytes; a compiled shader with its root
-        // signature inside.
-        unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
-            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            };
-            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
-            (root, pso)
-        }
+        compute(
+            &host.device,
+            windows::core::s!("memory"),
+            source,
+            D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES,
+            &params,
+        )
+        .unwrap()
     }
 
     /// A copy's view pair, in view heap `key`'s table.
@@ -966,7 +955,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
-        let (root, pso) = pipeline(SOURCE);
+        if victory_shader::emit::host::under_wine() {
+            eprintln!("Wine's shader compiler has no shader model 5.1 resource arrays. Skipping.");
+            return;
+        }
+        let (root, pso) = pipeline(SOURCE, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 3);
         let (out, at) = host.shared_buffer(256).unwrap();
         // SAFETY: a live buffer.
         let out_gpu = unsafe { out.GetGPUVirtualAddress() };
@@ -1050,7 +1043,6 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// page as translated shaders do, and with `missing_hi` non-zero reads
     /// (`missing_lo`, `missing_hi`), marking it if no copy holds it.
     const WRITE: &str = r#"
-#define RS "DescriptorTable(UAV(u0, numDescriptors=unbounded)), SRV(t0, space=2), UAV(u0, space=2), RootConstants(num32BitConstants=5, b0)"
 RWByteAddressBuffer views[] : register(u0);
 ByteAddressBuffer table : register(t0, space2);
 RWByteAddressBuffer dirty : register(u0, space2);
@@ -1070,7 +1062,6 @@ void access(uint a, uint h, bool write) {
         views[NonUniformResourceIndex(e.x + 1)].Store(a - e.y, value);
     }
 }
-[RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
     access(lo, hi, true);
@@ -1093,7 +1084,15 @@ void main() {
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
-        let ((write_root, writer), (read_root, reader)) = (pipeline(WRITE), pipeline(SOURCE));
+        if victory_shader::emit::host::under_wine() {
+            eprintln!("Wine's shader compiler has no shader model 5.1 resource arrays. Skipping.");
+            return;
+        }
+        let write = pipeline(WRITE, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 5);
+        let ((write_root, writer), (read_root, reader)) = (
+            write,
+            pipeline(SOURCE, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 3),
+        );
         let (out, out_cpu) = host.shared_buffer(256).unwrap();
         // SAFETY: a live buffer.
         let out_gpu = unsafe { out.GetGPUVirtualAddress() };
