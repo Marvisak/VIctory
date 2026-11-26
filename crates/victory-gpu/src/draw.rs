@@ -3408,6 +3408,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             crate::pipeline::Translated {
                 host: host_shader,
                 used: used_entries,
+                atomics64: false,
             },
         );
         let hp = HostPipeline::new(&[shader], None).expect("compute host pipeline");

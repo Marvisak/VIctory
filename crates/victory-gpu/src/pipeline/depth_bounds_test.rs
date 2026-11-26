@@ -73,6 +73,7 @@ fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[
             view_marks: false,
         },
         used: Vec::new(),
+        atomics64: false,
     }));
     shader
 }
@@ -125,13 +126,15 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
         topology: [u32; 2],
         dsv: [u32; 2],
     }
+    let shader_bytes = shader.container_bytes();
+    let ps_bytes = ps.as_ref().map(|ps| ps.container_bytes());
     let stream = Stream {
         shader_kind: if mesh { 24 } else { 1 },
-        shader: Bytecode { code: shader.container.as_ptr(), size: shader.container.len() },
+        shader: Bytecode { code: shader_bytes.as_ptr(), size: shader_bytes.len() },
         ps_kind: 2,
-        ps: ps.as_ref().map_or(
+        ps: ps_bytes.as_ref().map_or(
             Bytecode { code: std::ptr::null(), size: 0 },
-            |ps| Bytecode { code: ps.container.as_ptr(), size: ps.container.len() },
+            |b| Bytecode { code: b.as_ptr(), size: b.len() },
         ),
         depth: Depth1(21, D3D12_DEPTH_STENCIL_DESC1 {
             DepthEnable: true.into(),

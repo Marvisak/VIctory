@@ -29,7 +29,7 @@ use super::host::{GraphicsState, HostPipeline};
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
-    pub(crate) graphics: Option<Box<GraphicsState>>,
+    pub(crate) graphics: Mutex<Option<Box<GraphicsState>>>,
     queued: AtomicBool,
     /// Whether it went into the queue of pipelines a draw waits for, and
     /// whether a worker took it (it may be in both queues).
@@ -73,7 +73,7 @@ impl Pending {
         Pending {
             key,
             shaders,
-            graphics,
+            graphics: Mutex::new(graphics),
             queued: AtomicBool::new(false),
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
@@ -87,7 +87,12 @@ impl Pending {
     fn make(&self) {
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            let graphics = self
+                .graphics
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            let made = HostPipeline::new(&self.shaders, graphics.as_deref());
             #[cfg(feature = "diagnostics")]
             log_built(&self.key);
             let (user, kernel) = super::thread_cpu_since(cpu);
@@ -412,8 +417,10 @@ mod tests {
         let hashes = crate::pipeline::parse_skip_hashes(" 0123456789ABCDEF ");
         let shader = Arc::new(Shader {
             stage: "compute",
+            full_hash: [0; 32],
             hash: "0123456789abcdef".into(),
-            container: Vec::new(),
+            container_len: 0,
+            container: Mutex::new(crate::pipeline::Container::Empty),
             translated: OnceLock::new(),
         });
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
@@ -431,5 +438,18 @@ mod tests {
         assert!(matches!(cold.made.get(), Some(None)));
         assert!(matches!(warm.made.get(), Some(None)));
         assert!(shader.translated.get().is_none());
+    }
+
+    #[test]
+    fn graphics_state_is_released_after_make() {
+        let p = Pending::new(
+            Vec::new(),
+            Some(Box::new(GraphicsState::default())),
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
+        assert!(p.graphics.lock().unwrap().is_some());
+        p.make();
+        assert!(p.graphics.lock().unwrap().is_none());
     }
 }

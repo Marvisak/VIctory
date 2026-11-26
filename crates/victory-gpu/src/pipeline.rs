@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 #[cfg(windows)]
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -58,11 +58,34 @@ pub(crate) struct ComputeHead {
 
 /// A shader container a title passed, shared by every pipeline with the
 /// same bytes.
+pub(crate) enum Container {
+    Empty,
+    Raw(Vec<u8>),
+    Compressed(Vec<u8>),
+}
+
+const COMPRESS_MIN_BYTES: usize = 1024;
+
+fn pack_container(bytes: &[u8]) -> Container {
+    if bytes.is_empty() {
+        return Container::Empty;
+    }
+    if bytes.len() >= COMPRESS_MIN_BYTES {
+        let deflated = miniz_oxide::deflate::compress_to_vec(bytes, 1);
+        if deflated.len() < bytes.len() {
+            return Container::Compressed(deflated);
+        }
+    }
+    Container::Raw(bytes.to_vec())
+}
+
 pub(crate) struct Shader {
     pub(crate) stage: &'static str,
+    full_hash: [u8; 32],
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
-    container: Vec<u8>,
+    container_len: usize,
+    container: Mutex<Container>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -73,28 +96,60 @@ impl std::fmt::Debug for Shader {
     }
 }
 
-/// Every container seen, by full content hash.
-static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None);
+/// Every live container seen, by full content hash, with the size at which
+/// dead entries are pruned.
+#[allow(clippy::type_complexity)]
+static SHADERS: Mutex<Option<(usize, HashMap<[u8; 32], Weak<Shader>>)>> = Mutex::new(None);
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
+    {
+        let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, map) = shaders.get_or_insert_with(|| (0, HashMap::new()));
+        if let Some(existing) = map.get(full.as_bytes()).and_then(Weak::upgrade) {
+            return existing;
+        }
+    }
+    // Hash once and compress outside the global `SHADERS` lock.
+    let created = Arc::new(Shader::new_with_hash(stage, bytes, full));
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
-        .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
-        .or_insert_with(|| Arc::new(Shader::new(stage, bytes)))
-        .clone()
+    let (prune_at, map) = shaders.get_or_insert_with(|| (0, HashMap::new()));
+    if let Some(existing) = map.get(full.as_bytes()).and_then(Weak::upgrade) {
+        return existing;
+    }
+    if map.len() >= *prune_at {
+        map.retain(|_, w| w.strong_count() > 0);
+        *prune_at = (2 * map.len()).max(1024);
+    }
+    map.insert(*full.as_bytes(), Arc::downgrade(&created));
+    created
 }
 
 impl Shader {
     fn new(stage: &'static str, bytes: &[u8]) -> Shader {
+        Self::new_with_hash(stage, bytes, blake3::hash(bytes))
+    }
+
+    fn new_with_hash(stage: &'static str, bytes: &[u8], full: blake3::Hash) -> Shader {
         Shader {
             stage,
-            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
-            container: bytes.to_vec(),
+            full_hash: *full.as_bytes(),
+            hash: full.to_hex()[..16].to_owned(),
+            container_len: bytes.len(),
+            container: Mutex::new(pack_container(bytes)),
             #[cfg(windows)]
             translated: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn container_bytes(&self) -> Vec<u8> {
+        match &*self.container.lock().unwrap_or_else(|e| e.into_inner()) {
+            Container::Empty => Vec::new(),
+            Container::Raw(bytes) => bytes.clone(),
+            Container::Compressed(deflated) => {
+                miniz_oxide::inflate::decompress_to_vec(deflated).unwrap_or_default()
+            }
         }
     }
 
@@ -111,7 +166,67 @@ impl Shader {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    pub(crate) atomics64: bool,
 }
+
+#[cfg(windows)]
+fn has_atomics64(dxil: &[u8]) -> bool {
+    victory_shader::Container::parse(dxil)
+        .ok()
+        .and_then(|c| {
+            c.part(victory_shader::FourCC::SFI0)?
+                .data
+                .get(..4)?
+                .try_into()
+                .ok()
+        })
+        .is_some_and(|b: [u8; 4]| u32::from_le_bytes(b) & 0x1040_0000 != 0)
+}
+
+#[cfg(windows)]
+const DXIL_CACHE_BYTES: usize = 32 << 20;
+
+#[cfg(windows)]
+struct DxilCache {
+    entries: HashMap<[u8; 32], Arc<[u8]>>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    bytes: usize,
+    cap: usize,
+}
+
+#[cfg(windows)]
+impl DxilCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+            cap,
+        }
+    }
+
+    fn get(&self, key: &[u8; 32]) -> Option<Arc<[u8]>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: [u8; 32], dxil: Arc<[u8]>) {
+        if dxil.len() > self.cap || self.entries.contains_key(&key) {
+            return;
+        }
+        self.bytes += dxil.len();
+        self.entries.insert(key, dxil);
+        self.order.push_back(key);
+        while self.bytes > self.cap {
+            let Some(old) = self.order.pop_front() else { break };
+            if let Some(removed) = self.entries.remove(&old) {
+                self.bytes -= removed.len();
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+static DXIL_CACHE: Mutex<Option<DxilCache>> = Mutex::new(None);
 
 #[cfg(windows)]
 impl Shader {
@@ -121,7 +236,8 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let (done, cached) = translate(&self.container);
+                let container = self.container_bytes();
+                let (mut done, cached) = translate(&container);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
@@ -136,20 +252,76 @@ impl Shader {
                         kernel_ms,
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        cached,
-                        ms,
-                        user_ms,
-                        kernel_ms,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        // `self.translated`'s `OnceLock` caches `None` for the
+                        // rest of the shader's life, so `container_bytes()` is
+                        // never needed again.
+                        *self.container.lock().unwrap_or_else(|e| e.into_inner()) = Container::Empty;
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            cached,
+                            ms,
+                            user_ms,
+                            kernel_ms,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                    }
+                }
+                // Only evict DXIL to the bounded cache when a disk shader cache
+                // is active (`counts` > 0) and the DXIL fits in the cap; without
+                // a disk cache or for oversized DXIL, keep it resident to avoid
+                // re-translation during pipeline creation.
+                let (hits, misses) = crate::shader_cache::counts();
+                let has_disk_cache = hits + misses > 0;
+                if let Ok(t) = &mut done
+                    && has_disk_cache
+                    && !t.host.dxil.is_empty()
+                    && t.host.dxil.len() <= DXIL_CACHE_BYTES
+                    && !container.is_empty()
+                {
+                    let dxil: Arc<[u8]> = Arc::from(std::mem::take(&mut t.host.dxil));
+                    DXIL_CACHE
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_insert_with(|| DxilCache::new(DXIL_CACHE_BYTES))
+                        .insert(self.full_hash, dxil);
                 }
                 done.ok()
             })
             .as_ref()
+    }
+
+    /// Translated DXIL bytecode, from the bounded RAM cache or reloaded from
+    /// the disk shader cache if evicted.
+    pub(crate) fn dxil(&self) -> Option<Arc<[u8]>> {
+        let t = self.translated()?;
+        if !t.host.dxil.is_empty() {
+            return Some(Arc::from(t.host.dxil.as_slice()));
+        }
+        if let Some(dxil) = DXIL_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|c| c.get(&self.full_hash))
+        {
+            return Some(dxil);
+        }
+        let container = self.container_bytes();
+        if container.is_empty() {
+            return None;
+        }
+        let (Ok(host), _) = crate::shader_cache::host_shader(&container) else {
+            return None;
+        };
+        let dxil: Arc<[u8]> = Arc::from(host.dxil);
+        DXIL_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| DxilCache::new(DXIL_CACHE_BYTES))
+            .insert(self.full_hash, dxil.clone());
+        Some(dxil)
     }
 }
 
@@ -188,6 +360,7 @@ fn with_resources(
     host: victory_shader::emit::HostShader,
 ) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
+    let atomics64 = has_atomics64(&host.dxil);
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let used = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => victory_shader::native_programs(part.data)
@@ -203,7 +376,7 @@ fn with_resources(
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    Ok(Translated { host, used })
+    Ok(Translated { host, used, atomics64 })
 }
 
 #[repr(C)]
@@ -241,7 +414,7 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container_len, hash = %shader.hash, "first bind");
     }
 }
 
@@ -743,7 +916,7 @@ mod tests {
         pipeline(p)
             .shaders
             .iter()
-            .map(|s| (s.stage, s.container.clone()))
+            .map(|s| (s.stage, s.container_bytes()))
             .collect()
     }
 
@@ -834,7 +1007,8 @@ mod tests {
         assert_eq!(shaders(p), [("mesh", ms.to_vec()), ("pixel", ps.to_vec())]);
         #[cfg(windows)]
         {
-            let g = pipeline(p).host.graphics.as_deref().unwrap();
+            let graphics = pipeline(p).host.graphics.lock().unwrap();
+            let g = graphics.as_deref().unwrap();
             assert_eq!(g.topology.0, 3);
             assert_eq!(
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
@@ -889,13 +1063,82 @@ mod tests {
         let pre = unsafe { Prebuild::graphics(&stream) };
         let title = pipeline(p);
         assert_eq!(pre.key(), title.host.key);
-        let state = title.host.graphics.as_deref().unwrap().describe();
+        let state = title.host.graphics.lock().unwrap().as_deref().unwrap().describe();
         assert!(state.contains(r#"\"TEXCOORD\" 2 16 1 8 0 0"#), "{state}");
         assert_eq!(pre.describe(), format!("{:?}\t{state}", title.shaders));
         // Another state is another pipeline.
         put(&mut stream, 0x1e0, 10 | 2 << 32);
         // SAFETY: as above.
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
+    }
+
+    #[test]
+    fn unreferenced_shaders_are_released_from_cache() {
+        let s = shader("pixel", b"unique-weak-shader-cache-test");
+        let weak = Arc::downgrade(&s);
+        assert!(weak.upgrade().is_some());
+        drop(s);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dxil_cache_evicts_oldest_past_cap() {
+        let mut cache = DxilCache::new(16);
+        let (k1, k2, k3) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        cache.insert(k1, Arc::from([0u8; 8].as_slice()));
+        cache.insert(k2, Arc::from([0u8; 8].as_slice()));
+        assert!(cache.get(&k1).is_some() && cache.get(&k2).is_some());
+        cache.insert(k3, Arc::from([0u8; 8].as_slice()));
+        assert!(cache.get(&k1).is_none());
+        assert!(cache.get(&k2).is_some() && cache.get(&k3).is_some());
+        assert_eq!(cache.bytes, 16);
+    }
+
+    #[test]
+    fn large_shader_containers_are_stored_compressed() {
+        let raw = vec![0x42u8; 8192];
+        let s = Shader::new("pixel", &raw);
+        let stored_len = match &*s.container.lock().unwrap() {
+            Container::Compressed(c) => c.len(),
+            Container::Raw(r) => panic!("expected compressed, got raw {}", r.len()),
+            Container::Empty => panic!("expected compressed, got empty"),
+        };
+        assert!(stored_len < raw.len());
+        assert_eq!(s.container_bytes(), raw);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dxil_stays_resident_when_not_evicted() {
+        let mut cache = DxilCache::new(8);
+        cache.insert([9u8; 32], Arc::from([1u8; 16].as_slice()));
+        assert!(cache.get(&[9u8; 32]).is_none(), "oversized DXIL is not cached");
+
+        let shader = Shader::for_test(
+            "pixel",
+            Translated {
+                host: victory_shader::emit::HostShader {
+                    stage: victory_shader::HwStage::Ps,
+                    dxil: vec![1, 2, 3, 4],
+                    user_data: Vec::new(),
+                    samplers: Vec::new(),
+                    static_samplers: Vec::new(),
+                    root_cbvs: Vec::new(),
+                    root_srvs: Vec::new(),
+                    root_uavs: Vec::new(),
+                    memory: false,
+                    memory_writes: false,
+                    view_addresses: false,
+                    heap: false,
+                    heap_writes: false,
+                    view_marks: false,
+                },
+                used: Vec::new(),
+                atomics64: false,
+            },
+        );
+        assert_eq!(shader.dxil().as_deref(), Some(&[1, 2, 3, 4][..]));
     }
 }
 
