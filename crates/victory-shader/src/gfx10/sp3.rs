@@ -909,6 +909,30 @@ mod tests {
     }
 
     #[test]
+    fn interp_f16_attr63_w_disassembles_without_literal() {
+        assert_eq!(
+            one(&[0xD742_0002, 0x0002_00FF], false),
+            "v_interp_p1ll_f16 v2, v0, attr63.w"
+        );
+        assert_eq!(
+            one(&[0xD743_0002, 0x040E_00FF], false),
+            "v_interp_p1lv_f16 v2, v0, attr63.w, v3"
+        );
+        assert_eq!(
+            one(&[0xD75A_0002, 0x040A_02FF], false),
+            "v_interp_p2_f16 v2, v1, attr63.w, v2"
+        );
+        assert_eq!(
+            one(&[0xD75A_0002, 0x040A_03FF], false),
+            "v_interp_p2_f16 v2, v1, attr63.w, v2 high"
+        );
+        assert_eq!(
+            one(&[0xD742_0002, 0x0001_FEFF, 0x3F00_0000], false),
+            "v_interp_p1ll_f16 v2, lit(0x3f000000), attr63.w"
+        );
+    }
+
+    #[test]
     fn image_d16_data_is_packed() {
         // Three f16 channels occupy two VGPRs; NSA lists the addresses.
         let words = [0xF09C_070A, 0x8024_0801, 0x0000_0005];

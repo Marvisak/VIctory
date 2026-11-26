@@ -253,12 +253,25 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
             ),
         }
     } else {
-        let vop3 =
-            |w1: u32| 2 + usize::from([w1, w1 >> 9, w1 >> 18].iter().any(|s| s & 0x1FF == 0xFF));
+        let vop3 = |w1: u32, attr: bool| {
+            let srcs = if attr {
+                &[w1 >> 9, w1 >> 18][..]
+            } else {
+                &[w1, w1 >> 9, w1 >> 18][..]
+            };
+            2 + usize::from(srcs.iter().any(|s| s & 0x1FF == 0xFF))
+        };
         match w >> 26 {
             0x32 => (Encoding::Vintrp, (w >> 16) & 0x3, 1),
-            0x33 => (Encoding::Vop3p, (w >> 16) & 0x7F, vop3(word(1)?)),
-            0x35 => (Encoding::Vop3, (w >> 16) & 0x3FF, vop3(word(1)?)),
+            0x33 => (Encoding::Vop3p, (w >> 16) & 0x7F, vop3(word(1)?, false)),
+            0x35 => {
+                let op = (w >> 16) & 0x3FF;
+                // v_interp_*_f16 hold an attribute and channel in src0, where
+                // attr63.w (low half) encodes as 0xFF.
+                let attr =
+                    name(Encoding::Vop3, op as u16).is_some_and(|n| n.starts_with("v_interp_"));
+                (Encoding::Vop3, op, vop3(word(1)?, attr))
+            }
             0x36 => (Encoding::Ds, (w >> 18) & 0xFF, 2),
             0x37 => {
                 let encoding = match (w >> 14) & 3 {
@@ -493,6 +506,31 @@ mod tests {
                 (20, "s_addc_u32"),
                 (24, "s_setpc_b64"),
             ]
+        );
+    }
+
+    #[test]
+    fn vop3_f16_interp_attr63_w_is_not_a_literal() {
+        // src0 of v_interp_*_f16 is high << 8 | chan << 6 | attr, so attr63.w
+        // (low half) encodes as 0xFF without a trailing literal dword; src1
+        // and src2 still take 0xFF as a literal.
+        for (op, name, w1) in [
+            (0x342u32, "v_interp_p1ll_f16", 0x0002_00FFu32),
+            (0x343, "v_interp_p1lv_f16", 0x040E_00FF),
+            (0x35A, "v_interp_p2_f16", 0x040A_02FF),
+        ] {
+            let code = [0xD400_0002 | op << 16, w1, S_ENDPGM];
+            assert_eq!(summary(&code), [(0, 2, name), (8, 1, "s_endpgm")]);
+        }
+        let lit_src1 = [0xD742_0002, 0x0001_FEFF, 0x3F00_0000, S_ENDPGM];
+        assert_eq!(
+            summary(&lit_src1),
+            [(0, 3, "v_interp_p1ll_f16"), (12, 1, "s_endpgm")]
+        );
+        let lit_src2 = [0xD75A_0002, 0x03FC_02FF, 0x3F00_0000, S_ENDPGM];
+        assert_eq!(
+            summary(&lit_src2),
+            [(0, 3, "v_interp_p2_f16"), (12, 1, "s_endpgm")]
         );
     }
 

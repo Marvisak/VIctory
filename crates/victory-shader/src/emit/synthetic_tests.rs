@@ -1027,3 +1027,138 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
     // never spinning to LOOP_LIMIT (1 << 20).
     assert_eq!(pixels, vec![[0.0; 4], [0.0; 4], [1.0; 4], [1.0; 4]]);
 }
+
+#[test]
+fn f16_interpolation_of_attr63_w_draws_on_gpu() {
+    use super::bitcode::{Attr, Term};
+    use super::container::{self, SigElement};
+    use super::host::Draw;
+    use super::shader::Shader;
+    use crate::dxbc::{Container, FourCC};
+    use crate::native::{PsInput, Usage};
+
+    // Interpolates attr63.w (src0 == 0xFF in both VOP3 instructions), widens
+    // the low f16 result to f32, and writes it to SV_Target0.
+    let words = [
+        0xD742_0002u32,
+        0x0002_00FF, // v_interp_p1ll_f16 v2, v0, attr63.w
+        0xD75A_0002,
+        0x040A_02FF, // v_interp_p2_f16 v2, v1, attr63.w, v2
+        0x7E04_1702, // v_cvt_f32_f16 v2, v2
+        0xF800_180F,
+        0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 4,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ps {
+            inputs: vec![PsInput {
+                usage: Usage::Generic,
+                row: 1,
+                mask: 0b1000,
+                attr: 63,
+                flat: false,
+                fp16: true,
+                pack2: false,
+                row2: 0,
+            }],
+            input_addr: 1 << 1, // PerspectiveCenter in v0, v1
+            db_shader_control: 0,
+            patches: Vec::new(),
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let el = |name: &str, kind, interp, row, usage, half| SigElement {
+        name: name.into(),
+        index: 0,
+        kind,
+        comp: 9,
+        interp,
+        row: Some(row),
+        col: 0,
+        cols: 4,
+        usage,
+        half,
+    };
+    let isg1 = container::signature(
+        &[
+            el("SV_Position", 3, 4, 0, 0, false),
+            el("TEXCOORD", 0, 2, 1, 0, true),
+        ],
+        true,
+    );
+    let osg1 = container::signature(&[el("SV_Target", 16, 0, 0, 0xF, false)], false);
+    let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+    let c = Container::parse(&bytes).unwrap();
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let ps = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+
+    let vs = {
+        let mut s = Shader::new(false);
+        let b = s.entry;
+        s.inputs = vec![
+            el("POSITION", 0, 0, 0, 0xF, false),
+            el("TEXCOORD", 0, 0, 1, 0xF, false),
+        ];
+        s.outputs = vec![
+            el("SV_Position", 3, 4, 0, 0xF, false),
+            el("TEXCOORD", 0, 2, 1, 0xF, false),
+        ];
+        for id in 0..2u32 {
+            for col in 0..4u8 {
+                let load_args = [s.m.i32(id), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &load_args);
+                let store_args = [s.m.i32(id), s.m.i32(0), s.m.i8(col), v];
+                s.op(
+                    b,
+                    "storeOutput.f32",
+                    Attr::NoUnwind,
+                    s.t.void,
+                    5,
+                    &store_args,
+                );
+            }
+        }
+        s.m.terminate(b, Term::Ret);
+        s.finish()
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut ps.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+
+    #[rustfmt::skip]
+    let vertices = [
+        -1.0,  1.0, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0,
+        -1.0, -3.0, 0.5, 1.0, 0.0, 0.0, 0.0, 2.0,
+         3.0,  1.0, 0.5, 1.0, 0.0, 0.0, 0.0, 4.0,
+    ];
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let root = host.root_signature_for(&[]).unwrap();
+        let pso = host.pipeline_with(&root, &vs, &ps.dxil).unwrap();
+        let draw = Draw {
+            roots: Vec::new(),
+            textures: &[],
+            samplers: &[],
+            vertices: &vertices,
+            stride: 32,
+            size: (4, 4),
+            mesh_groups: 0,
+        };
+        let texels = host.draw(&root, &pso, &draw).unwrap();
+        for (i, t) in texels.iter().enumerate() {
+            let (x, y) = (i % 4, i / 4);
+            let want = (4 * x + 2 * y + 3) as f32 / 8.0;
+            assert_eq!(*t, [want; 4], "warp {warp} pixel ({x}, {y})");
+        }
+    }
+}
