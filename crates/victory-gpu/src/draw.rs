@@ -414,16 +414,42 @@ impl State {
         self.targets.clear();
         let mut rtvs = Vec::new();
         for &h in handles {
+            // A slot that yields no view keeps its index: binding the views
+            // that are left compacted would move every later target down and
+            // send the shader's `SV_TargetN` writes to the wrong texture. A
+            // null descriptor is a slot D3D12 discards writes to, which is
+            // what the draw was doing anyway.
+            let null = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: 0 };
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
-                    "render target without a recorded view"
+                    "render target without a recorded view; the slot is left empty"
                 );
+                rtvs.push(null);
                 continue;
             };
             let Some(texture) = crate::resource::host_resource(record.resource) else {
+                once!(
+                    resource = format_args!("{:#x}", record.resource as usize),
+                    "render target without a host copy; the slot is left empty"
+                );
+                rtvs.push(null);
                 continue;
             };
+            // The host copy can have lost the permission the title asked for:
+            // a render target view of a texture without
+            // `ALLOW_RENDER_TARGET` is not a view at all (the call that makes
+            // it returns nothing and D3D12 binds an empty descriptor), so it
+            // is left empty here and said once.
+            // SAFETY: a live resource.
+            if unsafe { texture.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0 {
+                once!(
+                    resource = format_args!("{:#x}", record.resource as usize),
+                    "render target without the render-target permission; the slot is left empty"
+                );
+                rtvs.push(null);
+                continue;
+            }
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
@@ -432,6 +458,17 @@ impl State {
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
+            // The same permission rule for depth: a copy that lost
+            // `ALLOW_DEPTH_STENCIL` takes no depth view, and the draw runs
+            // without depth rather than with a view the host refused.
+            // SAFETY: a live resource.
+            if unsafe { texture.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0 {
+                once!(
+                    resource = format_args!("{:#x}", record.resource as usize),
+                    "depth target without the depth permission; the draw runs without depth"
+                );
+                return None;
+            }
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
