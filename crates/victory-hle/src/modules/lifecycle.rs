@@ -270,6 +270,30 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     )
 }
 
+fn hidden_window_mode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("VICTORY_HIDDEN_WINDOW").as_deref() == Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// `VICTORY_HIDDEN_WINDOW=1`: keep presentation active on a top-level
+/// stand-in, but keep it off the visible desktop and out of activation/taskbar.
+fn hidden_window_mode(ex_style: u32, x: i32, y: i32) -> (u32, i32, i32) {
+    apply_hidden_window_mode(hidden_window_mode_enabled(), ex_style, x, y)
+}
+
+fn apply_hidden_window_mode(enabled: bool, ex_style: u32, x: i32, y: i32) -> (u32, i32, i32) {
+    if !enabled {
+        return (ex_style, x, y);
+    }
+    (
+        ex_style | wm::WS_EX_TOOLWINDOW | wm::WS_EX_NOACTIVATE,
+        -32_000,
+        -32_000,
+    )
+}
+
 /// Shows a stand-in for the top-level title window `title` (see
 /// [`STAND_IN`]); `ShowWindow` on `title` then shows or hides the stand-in.
 fn stand_in(title: HWND, ex_style: u32, style: u32, x: i32, y: i32, width: i32, height: i32) {
@@ -277,6 +301,7 @@ fn stand_in(title: HWND, ex_style: u32, style: u32, x: i32, y: i32, width: i32, 
         return;
     }
     let (x, y, width, height) = fit(std::ptr::null_mut(), x, y, width, height);
+    let (ex_style, x, y) = hidden_window_mode(ex_style, x, y);
     let mut text = vec![0u16; 512];
     // SAFETY: a window this thread just created; the buffer holds 512
     // characters. Its icon, if its class has one.
@@ -736,6 +761,25 @@ mod tests {
         ] {
             assert_eq!(parse_window_limit(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn hidden_window_mode_leaves_normal_windows_alone() {
+        let ex_style = wm::WS_EX_APPWINDOW;
+        let (style, x, y) = apply_hidden_window_mode(false, ex_style, 10, 20);
+        assert_eq!(style, ex_style);
+        assert_eq!((x, y), (10, 20));
+    }
+
+    #[test]
+    fn hidden_window_mode_moves_and_hides_window_without_touching_size() {
+        let ex_style = wm::WS_EX_APPWINDOW;
+        let (style, x, y) = apply_hidden_window_mode(true, ex_style, 10, 20);
+        assert_eq!(
+            style,
+            ex_style | wm::WS_EX_TOOLWINDOW | wm::WS_EX_NOACTIVATE
+        );
+        assert_eq!((x, y), (-32_000, -32_000));
     }
 
     #[test]
