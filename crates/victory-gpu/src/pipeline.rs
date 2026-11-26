@@ -104,6 +104,17 @@ impl Shader {
         let _ = shader.translated.set(Some(translated));
         Arc::new(shader)
     }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn register_test(
+        stage: &'static str,
+        bytes: &[u8],
+        translated: Translated,
+    ) -> Arc<Shader> {
+        let shader = shader(stage, bytes);
+        let _ = shader.translated.set(Some(translated));
+        shader
+    }
 }
 
 /// A translated shader and the console resources its code reads.

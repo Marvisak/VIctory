@@ -16,7 +16,9 @@ use crate::descriptor::View;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT,
+};
 use windows::core::Interface;
 
 use crate::host::HostList;
@@ -574,20 +576,8 @@ impl State {
                 l.IASetVertexBuffers(0, Some(&views[..count]));
             }
         }
-        if indexed {
-            let v = self.index;
-            let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
-                not_run("index buffer outside title buffers");
-                return false;
-            };
-            shadow.refresh(list, v.address, u64::from(v.size));
-            let view = D3D12_INDEX_BUFFER_VIEW {
-                BufferLocation: shadow.gpu(v.address),
-                SizeInBytes: v.size,
-                Format: DXGI_FORMAT(v.format as i32),
-            };
-            // SAFETY: an open list; the view names a live host buffer.
-            unsafe { l.IASetIndexBuffer(Some(&view)) };
+        if indexed && !self.bind_index(list) {
+            return false;
         }
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
@@ -603,6 +593,50 @@ impl State {
             unsafe { l.SetPipelineState(&p.pso) };
             (self.host_pipeline, self.host_roots[1]) = (p.pso.as_raw() as usize, 0);
         }
+        true
+    }
+
+    /// Binds `self.index` to `list`, or returns `false` if a non-empty view
+    /// has no backing buffer, an unsupported D3D12 index format, or an
+    /// unaligned host GPU address.
+    fn bind_index(&self, list: &HostList) -> bool {
+        let v = self.index;
+        if v.size == 0 {
+            // SAFETY: an open list; `None` clears the host index buffer.
+            unsafe { list.list.IASetIndexBuffer(None) };
+            return true;
+        }
+        if v.address == 0 {
+            not_run("null index buffer");
+            return false;
+        }
+        let format = DXGI_FORMAT(v.format as i32);
+        let align = match format {
+            DXGI_FORMAT_R16_UINT => 2u64,
+            DXGI_FORMAT_R32_UINT => 4u64,
+            _ => {
+                not_run("invalid index buffer format");
+                return false;
+            }
+        };
+        let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
+            not_run("index buffer outside title buffers");
+            return false;
+        };
+        let gpu = shadow.gpu(v.address);
+        if !gpu.is_multiple_of(align) {
+            not_run("unaligned index buffer");
+            return false;
+        }
+        shadow.refresh(list, v.address, u64::from(v.size));
+        let view = D3D12_INDEX_BUFFER_VIEW {
+            BufferLocation: gpu,
+            SizeInBytes: v.size,
+            Format: format,
+        };
+        // SAFETY: an open list; `view` names a live host buffer with a valid
+        // D3D12 index format (`R16_UINT` or `R32_UINT`) and aligned address.
+        unsafe { list.list.IASetIndexBuffer(Some(&view)) };
         true
     }
 
@@ -3906,5 +3940,290 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(host.log_messages(), None, "case {case} D3D12 debug errors");
             let _ = kept_obj;
         }
+    }
+
+    #[test]
+    fn prepare_validates_index_buffer_format_alignment_and_empty_views() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_R32_UINT, DXGI_FORMAT_UNKNOWN,
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+
+        // Build a real title graphics pipeline backed by a minimal vertex shader.
+        const VS_SRC: &str = r#"
+float4 main(uint id : SV_VertexID) : SV_Position {
+    return float4(0.0, 0.0, 0.0, 1.0);
+}
+"#;
+        let mut vs_blob: Option<ID3DBlob> = None;
+        // SAFETY: static source and entry/target strings.
+        unsafe {
+            D3DCompile(
+                VS_SRC.as_ptr().cast(),
+                VS_SRC.len(),
+                s!("ib_val"),
+                None,
+                None,
+                s!("main"),
+                s!("vs_5_1"),
+                0,
+                0,
+                &mut vs_blob,
+                None,
+            )
+        }
+        .unwrap();
+        let vs_blob = vs_blob.unwrap();
+        // SAFETY: the blob owns its bytecode bytes.
+        let vs_bytes = unsafe {
+            std::slice::from_raw_parts(
+                vs_blob.GetBufferPointer().cast::<u8>(),
+                vs_blob.GetBufferSize(),
+            )
+        };
+        let _shader = crate::pipeline::Shader::register_test(
+            "vertex",
+            vs_bytes,
+            crate::pipeline::Translated {
+                host: victory_shader::emit::HostShader {
+                    stage: victory_shader::HwStage::Vs,
+                    dxil: vs_bytes.to_vec(),
+                    user_data: Vec::new(),
+                    samplers: Vec::new(),
+                    static_samplers: Vec::new(),
+                    root_cbvs: Vec::new(),
+                    root_srvs: Vec::new(),
+                    root_uavs: Vec::new(),
+                    memory: false,
+                    memory_writes: false,
+                    view_addresses: false,
+                    heap: false,
+                    heap_writes: false,
+                    view_marks: false,
+                },
+                used: Vec::new(),
+            },
+        );
+
+        #[repr(C)]
+        struct Stream {
+            vs_kind: u64,
+            vs_ptr: *const u8,
+            vs_len: usize,
+            topology: [u32; 2],
+            rtv_kind: u32,
+            rtv_formats: [u32; 8],
+            rtv_count: u32,
+        }
+        let stream = Stream {
+            vs_kind: 1,
+            vs_ptr: vs_bytes.as_ptr(),
+            vs_len: vs_bytes.len(),
+            topology: [14, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 as u32],
+            rtv_kind: 15,
+            rtv_formats: [0; 8],
+            rtv_count: 0,
+        };
+        #[repr(C)]
+        struct StreamDesc {
+            size: usize,
+            stream: *const u8,
+        }
+        let desc = StreamDesc {
+            size: std::mem::size_of_val(&stream),
+            stream: (&raw const stream).cast(),
+        };
+        let pso_iid = crate::object::guid(
+            0x765a30f3,
+            0xf624,
+            0x4c6f,
+            [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45],
+        );
+        let mut pso = std::ptr::null();
+        assert_eq!(
+            crate::pipeline::create_stream(
+                std::ptr::null(),
+                (&raw const desc).cast(),
+                &pso_iid,
+                &mut pso,
+            ),
+            S_OK
+        );
+        let started = std::time::Instant::now();
+        while crate::pipeline::host_pipeline(pso).is_none() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "timed out waiting for host graphics pipeline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // Register a 64 KiB aligned title buffer for index data and bind a view heap.
+        let mem = title_memory(65536);
+        let title_buf = buffer_at_address(mem, 65536);
+        let (heap, _, _) = view_heap(8);
+        let _ = host.log_messages();
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_pipeline(pso);
+        state.set_topology(&list, 4); // D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+
+        // 1. Invalid formats and unaligned addresses (with non-zero size) must be rejected
+        //    before calling `IASetIndexBuffer` so D3D12 Debug Layer emits zero errors.
+        let invalid = [
+            (
+                "unknown_format",
+                IndexView {
+                    address: mem,
+                    size: 64,
+                    format: DXGI_FORMAT_UNKNOWN.0 as u32,
+                },
+            ),
+            (
+                "r32_float_format",
+                IndexView {
+                    address: mem,
+                    size: 64,
+                    format: DXGI_FORMAT_R32_FLOAT.0 as u32,
+                },
+            ),
+            (
+                "r8_uint_format",
+                IndexView {
+                    address: mem,
+                    size: 64,
+                    format: DXGI_FORMAT_R8_UINT.0 as u32,
+                },
+            ),
+            (
+                "r16_unaligned_1",
+                IndexView {
+                    address: mem + 1,
+                    size: 64,
+                    format: DXGI_FORMAT_R16_UINT.0 as u32,
+                },
+            ),
+            (
+                "r32_unaligned_2",
+                IndexView {
+                    address: mem + 2,
+                    size: 64,
+                    format: DXGI_FORMAT_R32_UINT.0 as u32,
+                },
+            ),
+            (
+                "null_addr_nonzero_size",
+                IndexView {
+                    address: 0,
+                    size: 64,
+                    format: DXGI_FORMAT_R32_UINT.0 as u32,
+                },
+            ),
+        ];
+        for (name, view) in invalid {
+            state.set_index_buffer(Some(&view));
+            let ok = state.prepare(&list, true);
+            assert_eq!(host.log_messages(), None, "D3D12 debug error on {name}");
+            assert!(!ok, "expected rejection for {name}");
+        }
+
+        // 2. Empty/cleared index buffers (`size == 0`) must be accepted and clear the host IB.
+        state.set_index_buffer(None);
+        assert!(
+            state.prepare(&list, true),
+            "None (empty) index buffer must succeed"
+        );
+        state.draw_indexed(&list, 0, 1, 0, 0, 0);
+        state.draw_indexed(&list, 3, 1, 0, 0, 0);
+
+        for (name, view) in [
+            (
+                "empty_r16",
+                IndexView {
+                    address: mem,
+                    size: 0,
+                    format: DXGI_FORMAT_R16_UINT.0 as u32,
+                },
+            ),
+            (
+                "empty_r32",
+                IndexView {
+                    address: mem,
+                    size: 0,
+                    format: DXGI_FORMAT_R32_UINT.0 as u32,
+                },
+            ),
+            (
+                "empty_unknown",
+                IndexView {
+                    address: mem,
+                    size: 0,
+                    format: DXGI_FORMAT_UNKNOWN.0 as u32,
+                },
+            ),
+        ] {
+            state.set_index_buffer(Some(&view));
+            assert!(
+                state.prepare(&list, true),
+                "empty index buffer {name} must succeed"
+            );
+        }
+
+        // 3. Valid aligned `R16_UINT` / `R32_UINT` views (including odd byte lengths) succeed.
+        for (name, view) in [
+            (
+                "r16_aligned_2",
+                IndexView {
+                    address: mem + 2,
+                    size: 64,
+                    format: DXGI_FORMAT_R16_UINT.0 as u32,
+                },
+            ),
+            (
+                "r16_odd_size_3",
+                IndexView {
+                    address: mem,
+                    size: 3,
+                    format: DXGI_FORMAT_R16_UINT.0 as u32,
+                },
+            ),
+            (
+                "r32_aligned_4",
+                IndexView {
+                    address: mem + 4,
+                    size: 64,
+                    format: DXGI_FORMAT_R32_UINT.0 as u32,
+                },
+            ),
+            (
+                "r32_odd_size_6",
+                IndexView {
+                    address: mem,
+                    size: 6,
+                    format: DXGI_FORMAT_R32_UINT.0 as u32,
+                },
+            ),
+        ] {
+            state.set_index_buffer(Some(&view));
+            assert!(
+                state.prepare(&list, true),
+                "valid index buffer {name} must succeed"
+            );
+            state.draw_indexed(&list, 3, 1, 0, 0, 0);
+        }
+
+        // SAFETY: open list; close and execute to verify full D3D12 validation.
+        let closed = unsafe { list.list.Close() };
+        assert!(closed.is_ok());
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None);
+
+        crate::shadow::unregister(title_buf as usize, mem);
+        crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10)(pso);
     }
 }
