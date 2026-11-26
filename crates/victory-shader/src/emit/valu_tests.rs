@@ -1999,6 +1999,58 @@ fn image_atomics_of_64_bits() {
     }
 }
 
+/// A 64-bit texture add: the R32G32 view's two dwords are one i64, so the 64
+/// additions every lane makes to texel (0, 0) carry into the high dword
+/// instead of wrapping in place the way two separate 32-bit atomics would.
+#[test]
+fn wide_image_atomic_add() {
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    // s_load_dwordx8 s[8:15], s[4:5], 0: the texture's descriptor.
+    words.extend([0x3D << 26 | 0x03 << 18 | 8 << 6 | 4 >> 1, 125 << 25]);
+    words.extend([
+        vop1(0x037, 2, vgpr(0)), // v_not_b32 v2, v0
+        vop1(0x001, 3, 128),     // v3 = 0, the high dword
+        vop1(0x001, 14, 128),
+        vop1(0x001, 15, 128),
+    ]);
+    words.extend(image_atomic(0x11, 2, 14, 8, 3, false));
+    words.extend(image_atomic(0x11, 2, 14, 8, 3, false));
+    words.push(S_ENDPGM);
+    let shader = lower_cs32(&words, &[(4, ResourceType::Uav, 0, 8)], true);
+
+    // Lane l adds !l twice: the low dwords alone would carry past 32 bits.
+    let sum: u64 = (0..32u32).map(|l| u64::from(!l)).sum::<u64>() * 2;
+    let want = [sum as u32, (sum >> 32) as u32];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            assert_eq!((u.root, u.slot), (RootType::Table, 1), "user data {u:?}");
+            ud[u.index as usize] = 0;
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::Uint2TextureUav(32, 4)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(&out[0][..2], &want, "{label}: texel (0, 0)");
+    }
+}
+
 #[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
