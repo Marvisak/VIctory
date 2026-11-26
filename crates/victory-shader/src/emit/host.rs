@@ -158,17 +158,31 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
 /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
 static WARP_LOCK: Mutex<()> = Mutex::new(());
 
+fn warp_forced() -> bool {
+    std::env::var("VICTORY_WARP").is_ok_and(|value| value == "1")
+}
+
 impl Host {
     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
         self.warp
             .then(|| WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// The backend cases a paired test should run. In WARP-only mode,
+    /// the hardware case would run on WARP as well.
+    #[cfg(test)]
+    pub(super) fn test_backends() -> impl Iterator<Item = (&'static str, bool)> {
+        let warp_only = warp_forced();
+        [("hardware", false), ("warp", true)]
+            .into_iter()
+            .filter(move |&(_, warp)| warp || !warp_only)
+    }
+
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     /// A software default adapter (a machine without a GPU, as CI) is
     /// refused, so hardware-only checks never run on WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
-        let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        let warp = warp || warp_forced();
         if warp {
             static WARP: OnceLock<Result<SharedDevice, String>> = OnceLock::new();
             let shared = WARP.get_or_init(|| {

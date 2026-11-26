@@ -548,8 +548,7 @@ fn defective(probes: Vec<Probe>, defect: &str) -> Vec<Probe> {
 /// (each with its first differing inputs).
 fn check(probes: &[Probe]) -> Vec<String> {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut hosts: Vec<(&str, bool, Host)> = [("hardware", false), ("warp", true)]
-        .into_iter()
+    let mut hosts: Vec<(&str, bool, Host)> = Host::test_backends()
         .filter_map(|(label, warp)| Host::new(warp).ok().map(|h| (label, warp, h)))
         .collect();
     assert!(!hosts.is_empty(), "no SM 6.6 device");
@@ -2994,12 +2993,16 @@ fn f16_results_round_as_the_mode_says() {
 #[test]
 fn hosts_that_do_not_fuse_are_named() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    if let Ok(warp) = Host::new(true) {
-        assert_eq!(warp.fuses_fmad(), Ok(false), "WARP");
-    }
-    if let Ok(hardware) = Host::new(false) {
-        let fuses = hardware.fuses_fmad().expect("the check runs");
-        eprintln!("hardware adapter fuses FMad: {fuses}");
+    for (label, warp) in Host::test_backends() {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let fuses = host.fuses_fmad().expect("the check runs");
+        if warp {
+            assert!(!fuses, "{label}");
+        } else {
+            eprintln!("{label} adapter fuses FMad: {fuses}");
+        }
     }
 }
 
