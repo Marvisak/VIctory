@@ -181,6 +181,13 @@ Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
 path when no SDK copy is found. This is a test/offline-validation dependency;
 the translated shaders do not require it at runtime.
 
+### Tests on files from outside the repository
+
+`VICTORY_BCPACK_TABLES`, `VICTORY_BCPACK_CASES`, `VICTORY_XMA_STREAMS` and
+`VICTORY_XMA_REFERENCE` point the `#[ignore]`d `victory-formats` tests at files
+kept outside the repository; each test's doc comment gives the layout it reads.
+`VICTORY_REF_PS`/`VICTORY_REF_VS` give the shader stub-pipeline test DXIL files.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
