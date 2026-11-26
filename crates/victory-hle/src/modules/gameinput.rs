@@ -1,7 +1,11 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3) and, in the slots XInput leaves empty, from HID
+//! ([`hid`]: DualShock 4, DualSense and generic HID gamepads); while none is
+//! connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
-//! too. A poll thread turns host state into readings (a new one per change)
+//! and also supplements the first connected pad, so connecting a controller
+//! does not disable keyboard controls.
+//! A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
@@ -20,6 +24,8 @@ use std::time::{Duration, Instant};
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
+
+mod hid;
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -139,6 +145,35 @@ fn fallback(keys: &[KeyState]) -> PadState {
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
         right_y: on(b'I') - on(b'K'),
+    }
+}
+
+/// A wireless receiver can answer for a switched-off XInput pad. HID
+/// enumeration identifies its connected pads separately.
+#[cfg(any(windows, test))]
+fn active_xinput(sample: Option<PadState>, seen_input: &mut bool) -> Option<PadState> {
+    let Some(pad) = sample else {
+        *seen_input = false;
+        return None;
+    };
+    *seen_input |= pad != PadState::default();
+    seen_input.then_some(pad)
+}
+
+/// Physical keyboard directions take priority while held.
+fn apply_keyboard(pad: &mut PadState, keys: PadState) {
+    pad.buttons |= keys.buttons;
+    pad.left_trigger = pad.left_trigger.max(keys.left_trigger);
+    pad.right_trigger = pad.right_trigger.max(keys.right_trigger);
+    for (axis, key) in [
+        (&mut pad.left_x, keys.left_x),
+        (&mut pad.left_y, keys.left_y),
+        (&mut pad.right_x, keys.right_x),
+        (&mut pad.right_y, keys.right_y),
+    ] {
+        if key != 0.0 {
+            *axis = key;
+        }
     }
 }
 
@@ -352,8 +387,6 @@ struct Slot {
 
 struct State {
     slots: [Slot; DEVICES],
-    /// Host slots that have reported non-rest input on their current connection.
-    seen_input: [bool; PADS],
     callbacks: Vec<Registration>,
     /// Asynchronous enumerations, delivered by the next poll.
     pending: Vec<Event>,
@@ -400,7 +433,6 @@ impl Hub {
             source: Mutex::new(source),
             state: Mutex::new(State {
                 slots: Default::default(),
-                seen_input: [false; PADS],
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
@@ -488,28 +520,21 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        pads: [Option<PadState>; PADS],
+        mut pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         scripted: &[KeyState],
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        // A wireless receiver answers for a switched-off pad with an all-zero
-        // report; ignore a slot until its current connection reports input.
-        let mut pads: [Option<PadState>; PADS] = std::array::from_fn(|slot| {
-            let Some(pad) = pads[slot] else {
-                self.seen_input[slot] = false;
-                return None;
-            };
-            if pad != PadState::default() {
-                self.seen_input[slot] = true;
-            }
-            self.seen_input[slot].then_some(pad)
-        });
         #[cfg(any(test, feature = "diagnostics"))]
         merge_scripted(&mut pads, scripted);
         #[cfg(not(any(test, feature = "diagnostics")))]
-        let _ = (&mut pads, scripted);
+        let _ = scripted;
+        if let Some(pad) = pads.iter_mut().flatten().next()
+            && !keys.is_empty()
+        {
+            apply_keyboard(pad, fallback(&keys));
+        }
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
@@ -523,6 +548,18 @@ impl State {
             Value::Pad(base)
         });
         self.update(devices, FALLBACK, fallback, now, &mut events);
+        #[cfg(any(test, feature = "diagnostics"))]
+        let keys = if scripted.is_empty() {
+            keys
+        } else {
+            let mut combined = scripted.to_vec();
+            for key in keys {
+                if !combined.iter().any(|k| k.virtual_key == key.virtual_key) {
+                    combined.push(key);
+                }
+            }
+            combined
+        };
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
     }
@@ -1202,6 +1239,11 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        seen_input: [bool; PADS],
+        /// Pads XInput does not list, and which of them sits in each slot
+        /// XInput leaves empty.
+        hid: super::hid::Pads,
+        hid_slots: [Option<u64>; PADS],
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1215,8 +1257,8 @@ mod host {
         }
     }
 
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+    impl Host {
+        fn xinput(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1230,22 +1272,45 @@ mod host {
             Some(convert(&state.Gamepad))
         }
 
-        fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
-            let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
-            if focused() {
-                // Left/right modifier keys only, as devices report them; no
-                // mouse buttons (below 0x08).
-                let held: Vec<u8> = (0x08..=0xFE_u8)
-                    .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
-                    // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
-                    .collect();
-                down.extend(held);
+        /// The HID pad in this slot: the one it had while that one is still
+        /// connected, else the oldest one in no slot yet.
+        fn hid(&mut self, slot: usize) -> Option<PadState> {
+            let connected = self.hid.connected();
+            let kept = self.hid_slots[slot].filter(|id| connected.iter().any(|(c, _)| c == id));
+            let id = kept.or_else(|| {
+                connected
+                    .iter()
+                    .map(|&(id, _)| id)
+                    .find(|id| !self.hid_slots.contains(&Some(*id)))
+            });
+            self.hid_slots[slot] = id;
+            connected.into_iter().find(|&(c, _)| Some(c) == id).map(|(_, pad)| pad)
+        }
+    }
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            let sample = self.xinput(slot);
+            if let Some(pad) = super::active_xinput(sample, &mut self.seen_input[slot]) {
+                // An XInput pad takes the slot; a HID pad there moves
+                // to a free one.
+                self.hid_slots[slot] = None;
+                return Some(pad);
             }
-            down.into_iter().map(key_state).collect()
+            self.hid(slot)
+        }
+
+        fn keys(&mut self) -> Vec<KeyState> {
+            if !focused() {
+                return Vec::new();
+            }
+            // Report left/right modifiers separately and omit mouse buttons.
+            (0x08..=0xFE_u8)
+                .filter(|vk| !(0x10..=0x12).contains(vk))
+                // SAFETY: plain query.
+                .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                .map(key_state)
+                .collect()
         }
 
         #[cfg(any(test, feature = "diagnostics"))]
@@ -1267,6 +1332,9 @@ mod host {
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+            if let Some(id) = self.hid_slots[slot] {
+                self.hid.rumble(id, low, high);
+            }
         }
     }
 
@@ -1354,6 +1422,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeHost {
+        seen_input: [bool; PADS],
+        hid_pads: [Option<PadState>; PADS],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         scripted: Vec<KeyState>,
@@ -1364,7 +1434,8 @@ mod tests {
 
     impl Source for Fake {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            self.0.lock().unwrap().pads[slot]
+            let mut host = self.0.lock().unwrap();
+            active_xinput(host.pads[slot], &mut host.seen_input[slot]).or(host.hid_pads[slot])
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
@@ -1588,15 +1659,16 @@ mod tests {
         hub.poll();
         let pad_a = current(hub, GAMEPAD_KIND, 1).unwrap();
         tick();
-        host.lock().unwrap().keys = vec![key(b'W')];
+        // An unmapped key produces a keyboard-only reading.
+        host.lock().unwrap().keys = vec![key(b'G')];
         hub.poll();
-        let w = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let g = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
         tick();
         host.lock().unwrap().pads[1].as_mut().unwrap().buttons = B;
         hub.poll();
         let pad_b = current(hub, GAMEPAD_KIND, 1).unwrap();
 
-        let order = [stand_in, no_keys, pad_a, w, pad_b];
+        let order = [stand_in, no_keys, pad_a, g, pad_b];
         for pair in order.windows(2) {
             assert_eq!(any(hub, 0x28, pair[0], both), Ok(pair[1]));
             assert_eq!(any(hub, 0x30, pair[1], both), Ok(pair[0]));
@@ -1612,6 +1684,54 @@ mod tests {
         for r in order {
             release(r);
         }
+    }
+
+    #[test]
+    fn keyboard_supplements_first_connected_pad_and_releases_cleanly() {
+        let (hub, host) = fake();
+        let physical = PadState {
+            buttons: B,
+            left_y: -0.5,
+            right_x: 0.25,
+            right_trigger: 0.4,
+            ..Default::default()
+        };
+        {
+            let mut source = host.lock().unwrap();
+            // First connected need not be XInput slot zero.
+            source.pads[2] = Some(physical);
+            // An idle receiver leaves this slot free for a neutral HID pad.
+            source.pads[3] = Some(PadState::default());
+            source.hid_pads[3] = Some(PadState::default());
+            source.keys = vec![key(0x0D), key(b'W'), key(b'C')];
+        }
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 2).unwrap();
+        assert_eq!(pad(r).buttons, A | B);
+        assert_eq!(pad(r).left_y, 1.0);
+        assert_eq!(pad(r).right_x, 0.25);
+        assert_eq!(pad(r).right_trigger, 1.0);
+        release(r);
+        let other = current(hub, GAMEPAD_KIND, 3).unwrap();
+        assert_eq!(pad(other), PadState::default());
+        release(other);
+
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 2).unwrap();
+        assert_eq!(pad(r), physical);
+        release(r);
+
+        {
+            let mut source = host.lock().unwrap();
+            source.pads = [None; PADS];
+            source.hid_pads = [None; PADS];
+            source.keys = vec![key(0x0D)];
+        }
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(r).buttons, A);
+        release(r);
     }
 
     #[test]
@@ -1766,6 +1886,7 @@ mod tests {
         let physical = PadState {
             buttons: B,
             left_x: -0.5,
+            left_y: -0.25,
             ..Default::default()
         };
         {
@@ -1782,7 +1903,7 @@ mod tests {
             PadState {
                 buttons: B | A,
                 left_x: -0.5,
-                left_y: 1.0,
+                left_y: 0.75,
                 right_trigger: 1.0,
                 ..Default::default()
             }

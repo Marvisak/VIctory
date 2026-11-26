@@ -195,7 +195,9 @@ pub(crate) fn presented() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log() {
     let [waits, at_once, shared] = [0, 1, 2].map(|i| WAITS[i].swap(0, Ordering::Relaxed));
-    tracing::info!("frame waits: {waits}, {at_once} of them ended at once; presents sharing a flip tick: {shared}");
+    tracing::info!(
+        "frame waits: {waits}, {at_once} of them ended at once; presents sharing a flip tick: {shared}"
+    );
 }
 
 /// Device method: no statistics are kept, so none are returned.
@@ -223,12 +225,18 @@ mod tests {
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);
-        let before = Instant::now();
         let mut second = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
-        assert!(second > first);
-        assert!(before.elapsed() <= Duration::from_millis(50));
+        assert_eq!(second, first + 1);
+
+        // Start a fresh interval of about 72 minutes for the polls: a busy
+        // host can pass a 2 ms tick between calls, making a poll succeed.
+        assert_eq!(set_interval(null, null, u32::MAX, 1, 0), S_OK);
+        let last = LAST[0].load(Ordering::Relaxed);
         assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
+        assert_eq!(second, first + 1);
+        assert_eq!(current(), second);
+        assert_eq!(LAST[0].load(Ordering::Relaxed), last);
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
         let flags = TOKEN_ON_TIMEOUT;
@@ -236,17 +244,20 @@ mod tests {
             wait(null, 0, 0, std::ptr::null(), flags, &mut early),
             TIMEOUT
         );
+        assert_eq!(early, second + 1);
+        assert_eq!(current(), early);
+        assert_eq!(LAST[0].load(Ordering::Relaxed), last);
+        assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut next = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut next), S_OK);
-        assert!(early == second + 1 && next == early + 1);
+        assert_eq!(next, early + 1);
         assert!(LAST[0].load(Ordering::Relaxed) >= 2);
 
         // The title's loop (the clock is global, so in the same test): an
         // origin poll that times out (and starts the frame), then a
-        // blocking flip wait. Each flip takes its own tick.
+        // blocking flip wait. Each flip takes a later tick; a delayed
+        // waiter can skip ticks.
         const FLIP: u32 = 2;
-        // 50 ms ticks: a thread woken 15-30 ms late on a busy host (seen with
-        // 5 ms ticks) still makes its tick.
         assert_eq!(set_interval(null, null, 50_000, 3, 0), S_OK);
         let mut token = 0;
         let flips: Vec<u64> = (0..4)
@@ -259,20 +270,21 @@ mod tests {
                 LAST[2].load(Ordering::Relaxed)
             })
             .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        assert!(flips.windows(2).all(|w| w[1] > w[0]), "{flips:?}");
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP, Duration::ZERO);
         assert!(tick > flips[3]);
-        // A flip wait begun after its tick passed (two ticks missed) ends at
-        // once, on the latest tick passed; the next one waits for the next.
+        // A late flip is ready without sleeping. Check the planned delay
+        // directly: measuring a call's runtime also measures host scheduling.
         std::thread::sleep(Duration::from_millis(110));
-        let before = Instant::now();
-        assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
-        assert!(before.elapsed() < Duration::from_millis(10), "{:?}", before.elapsed());
-        let late = LAST[2].load(Ordering::Relaxed);
+        let (late, delay) = next_tick(FLIP, Duration::ZERO);
+        assert_eq!(delay, Duration::ZERO);
         assert!(late >= flips[3] + 2, "{late} after {}", flips[3]);
-        assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
-        assert_eq!(LAST[2].load(Ordering::Relaxed), late + 1);
+        assert_eq!(
+            wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+            S_OK
+        );
+        assert!(LAST[2].load(Ordering::Relaxed) > late);
     }
 
     /// Two waits for one kind that begin together (two threads) take two
@@ -285,7 +297,13 @@ mod tests {
         let (first, _) = next_tick(VBLANK, long);
         let (second, _) = next_tick(VBLANK, long);
         assert!(second > first, "{second} after {first}");
-        next_tick(VBLANK, Duration::ZERO);
-        assert_eq!(last(VBLANK).load(Ordering::Relaxed), second);
+        let (poll, delay) = next_tick(VBLANK, Duration::ZERO);
+        assert!(poll > second);
+        // A delayed poll can take a tick that has passed; only a timeout
+        // leaves the last tick unchanged.
+        assert_eq!(
+            last(VBLANK).load(Ordering::Relaxed),
+            if delay.is_zero() { poll } else { second }
+        );
     }
 }
