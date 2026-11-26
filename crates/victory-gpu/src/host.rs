@@ -185,7 +185,7 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
+        if on_warp() {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -236,6 +236,10 @@ fn create() -> windows::core::Result<Host> {
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
+        // The view heap size before anything translates: the probe below
+        // translates a shader, which would otherwise fix the translator's
+        // clamp at `HEAP_VIEWS_MAX` (the heaps then fail on NVIDIA).
+        heap_views_on(&device);
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
@@ -281,6 +285,99 @@ fn process_memory() -> (u64, u64) {
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
     (c.PagefileUsage as u64, c.WorkingSetSize as u64)
+}
+
+/// Whether the host device is the software adapter (diagnostics,
+/// `VICTORY_D3D12_WARP=1`).
+pub(crate) fn on_warp() -> bool {
+    cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP")
+}
+
+/// The view heap size translated shaders clamp their indices below
+/// (`victory_shader::emit::heap_views`), from the adapter the host device
+/// is made on ([`on_warp`]): [`HEAP_VIEWS_MAX`] where it makes a
+/// shader-visible view heap that large, else [`HEAP_VIEWS_PORTABLE`]
+/// (NVIDIA). Decided once, and told to the translator before any
+/// translation: everything that translates or sizes a view heap asks here.
+/// The shader cache warm-up asks too, so its entries are the host's.
+///
+/// [`HEAP_VIEWS_MAX`]: victory_shader::emit::HEAP_VIEWS_MAX
+/// [`HEAP_VIEWS_PORTABLE`]: victory_shader::emit::HEAP_VIEWS_PORTABLE
+pub(crate) fn heap_views() -> u32 {
+    use victory_shader::emit::HEAP_VIEWS_MAX;
+    *HEAP_VIEWS.get_or_init(|| fix_heap_views(takes_view_heap(HEAP_VIEWS_MAX)))
+}
+
+/// [`heap_views`], asking `device` (the host's, from [`create`]) if the size
+/// is not fixed yet.
+fn heap_views_on(device: &ID3D12Device) -> u32 {
+    use victory_shader::emit::HEAP_VIEWS_MAX;
+    *HEAP_VIEWS.get_or_init(|| fix_heap_views(device_takes(device, HEAP_VIEWS_MAX)))
+}
+
+static HEAP_VIEWS: OnceLock<u32> = OnceLock::new();
+
+/// Tells the translator the view heap size: [`HEAP_VIEWS_MAX`] where the
+/// host takes a heap that large (`takes_max`), else [`HEAP_VIEWS_PORTABLE`].
+///
+/// [`HEAP_VIEWS_MAX`]: victory_shader::emit::HEAP_VIEWS_MAX
+/// [`HEAP_VIEWS_PORTABLE`]: victory_shader::emit::HEAP_VIEWS_PORTABLE
+fn fix_heap_views(takes_max: bool) -> u32 {
+    use victory_shader::emit::{HEAP_VIEWS_MAX, HEAP_VIEWS_PORTABLE};
+    let takes = if takes_max {
+        HEAP_VIEWS_MAX
+    } else {
+        HEAP_VIEWS_PORTABLE
+    };
+    let views = victory_shader::emit::set_heap_views(takes);
+    if views > takes {
+        tracing::warn!(
+            views,
+            takes,
+            "shaders translated before the view heap size was known: their indices can pass the host's heaps"
+        );
+    } else if views != HEAP_VIEWS_MAX {
+        tracing::info!(
+            views,
+            "the host caps view heaps: shader heap indices clamped below it"
+        );
+    }
+    views
+}
+
+/// Whether the host device's adapter (WARP or the default one, as
+/// [`create`] chooses) makes a shader-visible view heap of `count` slots.
+/// Without a device, yes: nothing draws then, and the heap size only keys
+/// the translations.
+fn takes_view_heap(count: u32) -> bool {
+    // SAFETY: plain device creation with a valid out pointer (the host's
+    // device itself where it is made: one device per adapter).
+    unsafe {
+        let mut device: Option<ID3D12Device> = None;
+        let made = if on_warp() {
+            warp_adapter().and_then(|a| D3D12CreateDevice(&a, D3D_FEATURE_LEVEL_12_0, &mut device))
+        } else {
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
+        };
+        device
+            .filter(|_| made.is_ok())
+            .is_none_or(|d| device_takes(&d, count))
+    }
+}
+
+/// Whether `device` makes a shader-visible view heap of `count` slots.
+fn device_takes(device: &ID3D12Device, count: u32) -> bool {
+    // SAFETY: plain heap creation with a valid description.
+    unsafe {
+        device
+            .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: count,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+            .is_ok()
+    }
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -438,7 +535,8 @@ pub(crate) mod tests {
         let Some(host) = host() else { return };
         // No submission takes the marks meanwhile.
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let (plain, memory) = (victory_shader::emit::HEAP_VIEWS - 2, victory_shader::emit::HEAP_VIEWS - 1);
+        let views = crate::host::heap_views();
+        let (plain, memory) = (views - 2, views - 1);
         crate::shadow::tests::mark_read(false, plain);
         crate::shadow::tests::mark_read(true, memory);
         let taken = crate::shadow::take_reads();
