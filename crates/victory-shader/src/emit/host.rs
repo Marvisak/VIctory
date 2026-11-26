@@ -1156,6 +1156,11 @@ impl Host {
             list.SetGraphicsRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
+                    Root::Constants(data) if data.is_empty() => {
+                        // As in dispatch: an empty list is not passed on to
+                        // SetGraphicsRoot32BitConstants, which does not survive a
+                        // count of 0 with a pointer into nothing on an NVIDIA card.
+                    }
                     Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
                         *param,
                         data.len() as u32,
@@ -1919,6 +1924,14 @@ impl Host {
             list.SetComputeRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
+                    Root::Constants(data) if data.is_empty() => {
+                        // A program that declares no user data leaves this root
+                        // unset: D3D12 leaves unset root constants undefined, not
+                        // zero, which is harmless only because such a program
+                        // reads none of them. Passing the empty list on - count
+                        // 0 with a pointer into nothing - takes the process down
+                        // inside `SetComputeRoot32BitConstants` on an NVIDIA card.
+                    }
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
                         *param,
                         data.len() as u32,
