@@ -42,6 +42,7 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    pub(crate) wave_lanes: Option<(u32, u32)>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -235,6 +236,10 @@ fn create() -> windows::core::Result<Host> {
             })?;
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        let wave_lanes = crate::device::query_wave_lane_limits(&device);
+        if let Some((min, max)) = wave_lanes {
+            tracing::info!(min, max, "host wave lane limits");
+        }
         tracing::info!("host D3D12 device ready");
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
@@ -250,6 +255,7 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             depth_bounds_supported,
+            wave_lanes,
             queue,
             fence,
             submitted: Mutex::new(0),
