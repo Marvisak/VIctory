@@ -146,9 +146,13 @@ extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
 /// Tells our prompts apart from other calls on the same block.
 static PROMPT: u8 = 0;
 
-/// There is nobody to ask: granted when the quota has room, else declined.
+/// Completes immediately with the space the title can use right now.
 extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
-    let hr = if bytes <= space().total_free {
+    finish_space_prompt(bytes, space(), block)
+}
+
+fn finish_space_prompt(bytes: u64, info: SpaceInfo, block: *mut AsyncBlock) -> HRESULT {
+    let hr = if bytes <= info.available_free {
         S_OK
     } else {
         E_ABORT
@@ -176,6 +180,48 @@ static VTABLE: Methods<8> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn prompt_rejects_space_the_host_cannot_supply() {
+        let disk_limited = SpaceInfo {
+            available_free: 300,
+            total_free: 900,
+            used: 100,
+            total: 1000,
+        };
+        let quota_limited = SpaceInfo {
+            available_free: 300,
+            total_free: 300,
+            used: 700,
+            total: 1000,
+        };
+        for (info, bytes, expected) in [
+            (disk_limited, 0, S_OK),
+            (disk_limited, 300, S_OK),
+            (quota_limited, 300, S_OK),
+            (disk_limited, 301, E_ABORT),
+            (disk_limited, 900, E_ABORT),
+            (quota_limited, 301, E_ABORT),
+            (quota_limited, u64::MAX, E_ABORT),
+        ] {
+            let mut block = AsyncBlock {
+                queue: std::ptr::null(),
+                context: std::ptr::null_mut(),
+                callback: None,
+                internal: [0; 4],
+            };
+            assert_eq!(finish_space_prompt(bytes, info, &mut block), S_OK);
+            let status = xasync::XAsyncGetStatus(&mut block, true);
+            let result = prompt_result(&OBJECT, &mut block);
+            assert_eq!(
+                (status, result),
+                (expected, expected),
+                "request={bytes}, available={}, quota remaining={}",
+                info.available_free,
+                info.total_free
+            );
+        }
+    }
 
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
