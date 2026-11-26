@@ -3181,3 +3181,141 @@ fn lds_out_of_bounds_reads_zero_and_drops_writes() {
         probe(masked, inputs, INT, |i| vec![if i[0] > i[1] { 0 } else { OLD }]),
     ]));
 }
+
+#[test]
+fn binary64_division_fixup_preserves_pair_bits_and_limits() {
+    const SIGN: u64 = 1 << 63;
+    const INF: u64 = 0x7ff0_0000_0000_0000;
+    const INVALID: u64 = 0xfff8_0000_0000_0000;
+    const MAX: u64 = INF - 1;
+    const ONE: u64 = 1.0f64.to_bits();
+    const QUOTIENT: u64 = 0xbfe0_1234_89ab_cdef;
+    const Q_MAG: u64 = QUOTIENT & !SIGN;
+    const DEN_NAN: u64 = 0x7ff0_0000_0000_02a1;
+    const NUM_NAN: u64 = 0xfff0_0100_0000_0312;
+
+    let inputs = |den: u64, num: u64| {
+        [
+            den as u32,
+            (den >> 32) as u32,
+            num as u32,
+            (num >> 32) as u32,
+        ]
+    };
+    let cases = |body: Vec<u32>, rows: &[(u64, u64, u64)]| {
+        let expected: Vec<_> = rows
+            .iter()
+            .map(|&(d, n, want)| (inputs(d, n), want))
+            .collect();
+        let rows = expected.iter().map(|&(i, _)| i).collect();
+        probe(body, rows, INT, move |i| {
+            let &(_, value) = expected
+                .iter()
+                .find(|&&(input, _)| input == i)
+                .expect("input row");
+            vec![value as u32, (value >> 32) as u32]
+        })
+    };
+    let code = |q: u64, round: u8, mods: M| {
+        let mut body = vec![
+            0xba80_0881,
+            u32::from(round), // MODE.FP_ROUND16_64
+            vop1(0x01, 14, 255),
+            q as u32,
+            vop1(0x01, 15, 255),
+            (q >> 32) as u32,
+        ];
+        body.extend(vop3(0x160, 5, [v(14), v(1), v(3)], mods));
+        body
+    };
+
+    // Measured RDNA2 rules from AnyPS5 #474, #2035, #7041 and #19563.
+    let mut probes = vec![cases(
+        code(QUOTIENT, 0, NONE),
+        &[
+            (ONE, ONE, Q_MAG),
+            (ONE, ONE | SIGN, QUOTIENT),
+            (SIGN, ONE, SIGN | INF),
+            (ONE, SIGN, SIGN),
+            (SIGN, 0, INVALID),
+            (INF, INF | SIGN, INVALID),
+            (INF, ONE | SIGN, SIGN),
+            (ONE | SIGN, INF, SIGN | INF),
+            (DEN_NAN, ONE, DEN_NAN),
+            (DEN_NAN, NUM_NAN, NUM_NAN),
+            (ONE, NUM_NAN, NUM_NAN),
+            (1, ONE, Q_MAG), // denormal denominator is retained
+            (ONE, SIGN | 1, QUOTIENT),
+            (1076 << 52, 1 << 52, Q_MAG), // exponent difference -1075
+            (1077 << 52, 1 << 52, 0),     // exponent difference -1076
+            (SIGN | (1077 << 52), 1 << 52, SIGN),
+        ],
+    )];
+
+    for (mode, (positive_limit, negative_limit, positive_tiny, negative_tiny)) in [
+        (INF, SIGN | INF, 0, SIGN),
+        (INF, SIGN | MAX, 1, SIGN),
+        (MAX, SIGN | INF, 0, SIGN | 1),
+        (MAX, SIGN | MAX, 0, SIGN),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        probes.push(cases(
+            code(DEN_NAN, mode as u8, NONE),
+            &[
+                (ONE, ONE, positive_limit),
+                (ONE, ONE | SIGN, negative_limit),
+                (1077 << 52, 1 << 52, positive_tiny), // Underflow precedes quotient repair.
+                (1077 << 52, SIGN | (1 << 52), negative_tiny),
+                (SIGN, ONE, SIGN | INF), // True division-by-zero infinity is never clamped by the mode.
+                (DEN_NAN, NUM_NAN, NUM_NAN),
+            ],
+        ));
+        probes.push(cases(
+            code(INF, mode as u8, NONE),
+            &[
+                (ONE, ONE, positive_limit),
+                (ONE, ONE | SIGN, negative_limit),
+            ],
+        ));
+    }
+
+    // Source modifiers apply before deriving the sign or forwarding NaNs.
+    let sign_mods = M {
+        abs: 4,
+        neg: 2,
+        ..NONE
+    };
+    probes.push(cases(
+        code(QUOTIENT, 0, sign_mods),
+        &[(ONE, ONE | SIGN, QUOTIENT), (ONE, NUM_NAN, NUM_NAN & !SIGN)],
+    ));
+    probes.push(cases(
+        code(QUOTIENT, 0, M { omod: 2, ..NONE }),
+        &[(ONE, ONE, Q_MAG)],
+    ));
+
+    // F64 omod is ignored. DX10 clamp preserves positive subnormals.
+    let clamp = M {
+        clamp: true,
+        omod: 1,
+        ..NONE
+    };
+    probes.push(cases(
+        code(1, 0, clamp),
+        &[(ONE, ONE, 1), (ONE, ONE | SIGN, 0)],
+    ));
+    probes.push(cases(
+        code(INF, 0, clamp),
+        &[(ONE, ONE, ONE), (ONE, NUM_NAN, 0)],
+    ));
+
+    let inline = vop3(0x160, 5, [248, v(1), v(3)], NONE).to_vec();
+    probes.push(cases(inline, &[(ONE, ONE, 0x3fc4_5f30_6dc9_c882)]));
+    let mut literal = vop3(0x160, 5, [255, v(1), v(3)], NONE).to_vec();
+    literal.push(0x3fe0_0000);
+    probes.push(cases(literal, &[(ONE, ONE, 0x3fe0_0000_0000_0000)]));
+
+    assert_clean(check(&probes));
+}

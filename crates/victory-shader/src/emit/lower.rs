@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod div_fixup;
 
 type Why = &'static str;
 
@@ -6040,6 +6041,7 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_div_fixup_f64" => self.div_fixup_f64(inst, guard),
             "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {
                 // Cube-map face coordinates (AMD's ISA): the major axis is z
                 // when |z| >= |x| and |z| >= |y|, else y when |y| >= |x|,
@@ -6762,13 +6764,21 @@ impl<'a> Lower<'a> {
             return Err("64-bit operand modifiers");
         }
         let op = *v.src.get(k).ok_or("a missing operand")?;
+        self.operand64_dwords(inst, op)
+    }
+
+    /// Read the encoded pair before applying any floating-point modifiers.
+    fn operand64_dwords(&mut self, inst: &Inst, op: Operand) -> Result<(V, V), Why> {
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
             let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
             let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
             Ok((lo, hi))
         };
         match op {
-            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1)),
+            Operand::Vector { reg, .. } => {
+                let next = reg.checked_add(1).ok_or("a missing operand high word")?;
+                pair(self, Reg::V(reg), Reg::V(next))
+            }
             Operand::Scalar { code, .. } if code != NULL => {
                 pair(self, Reg::S(code), Reg::S(code + 1))
             }
