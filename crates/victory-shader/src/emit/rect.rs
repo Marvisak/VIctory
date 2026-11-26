@@ -1,13 +1,11 @@
 //! The console's rectangle lists on the host. A rectangle comes as three
 //! corners in any order (the blits put the right angle at `v1`, the tiled
-//! lighting at `v0`), and the hardware adds the fourth opposite the right
-//! angle `vc`, at `va + vb - vc`, for the position and every attribute. The
-//! host has no such primitive; a geometry shader made for the vertex shader
-//! that feeds it takes each triangle `(v0, v1, v2)`, finds the right angle
-//! opposite its longest side, and emits the triangle with its completion
-//! `(va, vb, v3)` (`va` before `vc`, `vb` after it), both turning the same
-//! way. Integer outputs (which can only be flat) keep `va`'s value at the
-//! fourth corner.
+//! lighting at `v0`). The geometry shader finds the right angle `vc`
+//! opposite the longest side and adds the fourth corner `v3` at
+//! `va + vb - vc` for position and float attributes. Integer attributes
+//! take `v0`'s value at `v3`. The shader splits the rectangle along the
+//! diagonal through `v0` and emits both triangles in the input winding
+//! order, with `v0` leading each so flat attributes agree across the diagonal.
 
 use super::bitcode::{Attr, Bin, Term, V, pred};
 use super::shader::Shader;
@@ -94,31 +92,38 @@ pub fn rectangle_gs(vs: &[u8]) -> Result<Vec<u8>, ShaderError> {
         let x = s.m.select(b, at2, x2, x1);
         s.m.select(b, at0, x0, x)
     };
-    // The completing triangle (va, vb, v3), element by element.
-    let mut second: [Vec<Vec<V>>; 3] = Default::default();
+    // Split along the diagonal through v0 and keep the input winding:
+    // right angle at v0: (v0, v1, v3), (v0, v3, v2)
+    // right angle at v1: (v0, v1, v2), (v0, v2, v3)
+    // right angle at v2: (v0, v1, v2), (v0, v3, v1)
+    let at0_or_at2 = s.m.bin(b, Bin::Or, at0, at2);
+    let mut selected: [Vec<Vec<V>>; 3] = Default::default();
     for (id, e) in elements.iter().enumerate() {
         let mut cols: [Vec<V>; 3] = Default::default();
         let [c0, c1, c2] = [0, 1, 2].map(|k| &corners[k][id]);
         for ((&v0, &v1), &v2) in c0.iter().zip(c1).zip(c2) {
-            let va = pick(&mut s, [v2, v0, v1]);
-            let vb = pick(&mut s, [v1, v2, v0]);
             let v3 = if e.comp == 9 {
+                let va = pick(&mut s, [v2, v0, v1]);
+                let vb = pick(&mut s, [v1, v2, v0]);
                 let vc = pick(&mut s, [v0, v1, v2]);
                 let sum = s.m.bin(b, Bin::Add, va, vb);
                 s.m.bin(b, Bin::Sub, sum, vc)
             } else {
-                va
+                v0
             };
-            for (k, v) in [va, vb, v3].into_iter().enumerate() {
+            let first_last = s.m.select(b, at0, v3, v2);
+            let second_middle = s.m.select(b, at0_or_at2, v3, v2);
+            let second_last = pick(&mut s, [v2, v3, v1]);
+            for (k, v) in [first_last, second_middle, second_last].into_iter().enumerate() {
                 cols[k].push(v);
             }
         }
         for (k, c) in cols.into_iter().enumerate() {
-            second[k].push(c);
+            selected[k].push(c);
         }
     }
-    corners.extend(second);
-    for triangle in [[0, 1, 2], [3, 4, 5]] {
+    corners.extend(selected);
+    for triangle in [[0, 1, 3], [0, 4, 5]] {
         for k in triangle {
             for (id, e) in elements.iter().enumerate() {
                 let suffix = if e.comp == 9 { ".f32" } else { ".i32" };
@@ -161,7 +166,7 @@ mod rule_tests {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::super::bitcode::{Attr, Term};
+    use super::super::bitcode::{Attr, Cast, Term};
     use super::super::container::SigElement;
     use super::super::host::{Draw, Host};
     use super::super::shader::Shader;
@@ -267,6 +272,128 @@ mod tests {
                     let want = if inside { [u, v, 1.0, 1.0] } else { [0.0; 4] };
                     let near = t.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4);
                     assert!(near, "warp {warp} order {n} pixel ({x}, {y}): {t:?}, want {want:?}");
+                }
+            }
+        }
+    }
+
+    fn flat_shader(pixel: bool) -> Vec<u8> {
+        let mut s = Shader::new(pixel);
+        let b = s.entry;
+        let flat_uint = SigElement { comp: 5, ..element("FLATUINT", 0, 0, 1, 1) };
+        let flat_float = element("FLATFLOAT", 0, 0, 2, 1);
+        let position = element("SV_Position", 3, 0, 0, 4);
+        let (inputs, outputs) = if pixel {
+            (
+                vec![
+                    SigElement { interp: 1, ..flat_uint },
+                    SigElement { interp: 1, ..flat_float },
+                    SigElement { comp: 5, ..element("SV_IsFrontFace", 13, 1, 3, 1) },
+                ],
+                vec![element("SV_Target", 16, 0, 0, 4)],
+            )
+        } else {
+            (
+                vec![element("POSITION", 0, 0, 0, 4), flat_uint.clone(), flat_float.clone()],
+                vec![position, flat_uint, flat_float],
+            )
+        };
+        let load = |s: &mut Shader, id: usize, col: u8| {
+            let (op, ty) = if inputs[id].comp == 9 {
+                ("loadInput.f32", s.t.f32)
+            } else {
+                ("loadInput.i32", s.t.i32)
+            };
+            let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+            s.op(b, op, Attr::ReadNone, ty, 4, &args)
+        };
+        let values = if pixel {
+            let int = load(&mut s, 0, 0);
+            let float = load(&mut s, 1, 0);
+            let face = load(&mut s, 2, 0);
+            vec![vec![
+                s.m.cast(b, Cast::UiToFp, int, s.t.f32),
+                float,
+                s.m.cast(b, Cast::UiToFp, face, s.t.f32),
+                s.m.f32(1f32.to_bits()),
+            ]]
+        } else {
+            inputs
+                .iter()
+                .enumerate()
+                .map(|(id, e)| (0..e.cols).map(|col| load(&mut s, id, col)).collect())
+                .collect()
+        };
+        for (id, (e, values)) in outputs.iter().zip(values).enumerate() {
+            let op = if e.comp == 9 { "storeOutput.f32" } else { "storeOutput.i32" };
+            for (col, value) in (0..e.cols).zip(values) {
+                let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), value];
+                s.op(b, op, Attr::NoUnwind, s.t.void, 5, &args);
+            }
+        }
+        s.inputs = inputs;
+        s.outputs = outputs;
+        s.m.terminate(b, Term::Ret);
+        s.finish()
+    }
+
+    #[test]
+    fn flat_attributes_keep_v0_across_the_entire_rectangle() {
+        let (vs, ps) = (flat_shader(false), flat_shader(true));
+        let gs = super::rectangle_gs(&vs).unwrap();
+        if let Ok(mut v) =
+            super::super::validator::Validator::load(super::super::validator::Validator::default_path().as_deref())
+        {
+            for c in [&vs, &gs, &ps] {
+                v.validate(&mut c.clone()).unwrap();
+            }
+        }
+        let (tl, bl, tr) = ([-0.5, 0.5], [-0.5, -0.5], [0.5, 0.5]);
+        let positions = [[tl, bl, tr], [tr, tl, bl], [bl, tr, tl]];
+        let attributes = [(7, 0.25), (11, 0.5), (17, 0.875)];
+        for warp in [false, true] {
+            let host = match Host::new(warp) {
+                Ok(host) => host,
+                Err(e) => {
+                    eprintln!("skipping rectangle draw with warp {warp}: {e}");
+                    continue;
+                }
+            };
+            let root = host.root_signature_for(&[]).unwrap();
+            let pso = host.pipeline_gs(&root, &vs, &gs, &ps).unwrap();
+            let input_pso = host.pipeline_with(&root, &vs, &ps).unwrap();
+            for (vc, order) in positions.into_iter().enumerate() {
+                for mirror in [1.0, -1.0] {
+                    let xy = order.map(|[x, y]| [x * mirror, y]);
+                    assert_eq!(super::right_angle(xy), vc);
+                    let vertices = xy
+                        .into_iter()
+                        .zip(attributes)
+                        .flat_map(|([x, y], (int, float))| [x, y, 0.5, 1.0, f32::from_bits(int), float])
+                        .collect::<Vec<_>>();
+                    let draw = Draw {
+                        roots: Vec::new(),
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &vertices,
+                        stride: 24,
+                        size: (32, 32),
+                        mesh_groups: 0,
+                    };
+                    // Read the input triangle's facing with the same rasterizer state.
+                    let input = host.draw(&root, &input_pso, &draw).unwrap();
+                    let face = input.iter().find(|t| t[3] == 1.0).unwrap()[2];
+                    let texels = host.draw(&root, &pso, &draw).unwrap();
+                    assert_eq!(texels.len(), 32 * 32);
+                    for (i, t) in texels.into_iter().enumerate() {
+                        let (x, y) = (i % 32, i / 32);
+                        let want = if (8..24).contains(&x) && (8..24).contains(&y) {
+                            [attributes[0].0 as f32, attributes[0].1, face, 1.0]
+                        } else {
+                            [0.0; 4]
+                        };
+                        assert_eq!(t, want, "warp {warp} vc {vc} mirror {mirror} pixel ({x}, {y})");
+                    }
                 }
             }
         }
