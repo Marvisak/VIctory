@@ -190,11 +190,16 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            if let Some(adapter) = selected_adapter() {
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            } else {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        log_device_adapter(&device);
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -281,6 +286,123 @@ fn process_memory() -> (u64, u64) {
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
     (c.PagefileUsage as u64, c.WorkingSetSize as u64)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdapterSpec {
+    DefaultHighPerformance,
+    Preference(DXGI_GPU_PREFERENCE),
+    Index(u32),
+    NameSubstring(String),
+}
+
+fn parse_adapter_spec(raw: Option<&str>) -> AdapterSpec {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return AdapterSpec::DefaultHighPerformance;
+    };
+    if s.eq_ignore_ascii_case("dgpu") || s.eq_ignore_ascii_case("high-performance") {
+        AdapterSpec::Preference(DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+    } else if s.eq_ignore_ascii_case("igpu") || s.eq_ignore_ascii_case("minimum-power") {
+        AdapterSpec::Preference(DXGI_GPU_PREFERENCE_MINIMUM_POWER)
+    } else if let Ok(index) = s.parse::<u32>() {
+        AdapterSpec::Index(index)
+    } else {
+        AdapterSpec::NameSubstring(s.to_ascii_lowercase())
+    }
+}
+
+fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
+    let len = desc
+        .Description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(desc.Description.len());
+    String::from_utf16_lossy(&desc.Description[..len])
+}
+
+fn is_software_adapter(adapter: &IDXGIAdapter1) -> bool {
+    // SAFETY: plain DXGI adapter descriptor query.
+    unsafe { adapter.GetDesc1() }
+        .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+}
+
+/// Picks the host hardware adapter: `VICTORY_ADAPTER` when set (`dgpu` /
+/// `high-performance`, `igpu` / `minimum-power`, numeric DXGI index, or
+/// case-insensitive name substring, skipping software adapters), otherwise
+/// DXGI's high-performance hardware adapter.
+fn selected_adapter() -> Option<IDXGIAdapter> {
+    let raw = std::env::var("VICTORY_ADAPTER").ok();
+    let spec = parse_adapter_spec(raw.as_deref());
+    // SAFETY: plain DXGI adapter enumeration.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let by_pref = |pref| -> Option<IDXGIAdapter> {
+            let f6: IDXGIFactory6 = factory.cast().ok()?;
+            for i in 0.. {
+                let Ok(a) = f6.EnumAdapterByGpuPreference::<IDXGIAdapter1>(i, pref) else {
+                    break;
+                };
+                if !is_software_adapter(&a) {
+                    return a.cast().ok();
+                }
+            }
+            None
+        };
+        let picked = match &spec {
+            AdapterSpec::DefaultHighPerformance => return by_pref(DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE),
+            AdapterSpec::Preference(pref) => by_pref(*pref),
+            AdapterSpec::Index(index) => factory
+                .EnumAdapters1(*index)
+                .ok()
+                .filter(|a| !is_software_adapter(a))
+                .and_then(|a| a.cast().ok()),
+            AdapterSpec::NameSubstring(needle) => (0..)
+                .map_while(|i| factory.EnumAdapters1(i).ok())
+                .find_map(|a| {
+                    let desc = a.GetDesc1().ok()?;
+                    if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                        return None;
+                    }
+                    adapter_name(&desc)
+                        .to_ascii_lowercase()
+                        .contains(needle)
+                        .then(|| a.cast().ok())
+                        .flatten()
+                }),
+        };
+        if picked.is_some() {
+            return picked;
+        }
+        tracing::warn!(
+            adapter = raw.as_deref().unwrap_or_default(),
+            "VICTORY_ADAPTER matched no hardware GPU; falling back to high-performance default"
+        );
+        by_pref(DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+    }
+}
+
+/// Logs the adapter `device` actually opened on.
+fn log_device_adapter(device: &ID3D12Device) {
+    // SAFETY: plain DXGI queries for a live device's LUID.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return;
+        };
+        let luid = device.GetAdapterLuid();
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) else {
+            return;
+        };
+        let Ok(desc) = adapter.GetDesc1() else {
+            return;
+        };
+        let name = adapter_name(&desc);
+        tracing::info!(
+            name = %name,
+            vendor = format_args!("{:#06x}", desc.VendorId),
+            dedicated_mib = desc.DedicatedVideoMemory as u64 >> 20,
+            "host GPU"
+        );
+    }
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -675,6 +797,42 @@ pub(crate) mod tests {
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
+    }
+
+    #[test]
+    fn adapter_spec_parses_presets_indices_and_names() {
+        assert_eq!(parse_adapter_spec(None), AdapterSpec::DefaultHighPerformance);
+        assert_eq!(parse_adapter_spec(Some("   ")), AdapterSpec::DefaultHighPerformance);
+        assert_eq!(
+            parse_adapter_spec(Some("dGPU")),
+            AdapterSpec::Preference(DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE),
+        );
+        assert_eq!(
+            parse_adapter_spec(Some("High-Performance")),
+            AdapterSpec::Preference(DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE),
+        );
+        assert_eq!(
+            parse_adapter_spec(Some("igpu")),
+            AdapterSpec::Preference(DXGI_GPU_PREFERENCE_MINIMUM_POWER),
+        );
+        assert_eq!(
+            parse_adapter_spec(Some("minimum-power")),
+            AdapterSpec::Preference(DXGI_GPU_PREFERENCE_MINIMUM_POWER),
+        );
+        assert_eq!(parse_adapter_spec(Some(" 1 ")), AdapterSpec::Index(1));
+        assert_eq!(
+            parse_adapter_spec(Some("Radeon 780M")),
+            AdapterSpec::NameSubstring("radeon 780m".into()),
+        );
+    }
+
+    #[test]
+    fn adapter_name_trims_trailing_nulls() {
+        let mut desc = DXGI_ADAPTER_DESC1::default();
+        for (slot, ch) in desc.Description.iter_mut().zip("RTX 5050".encode_utf16()) {
+            *slot = ch;
+        }
+        assert_eq!(adapter_name(&desc), "RTX 5050");
     }
 
     /// A node of the device-removed data is a list by pointer or by name.
