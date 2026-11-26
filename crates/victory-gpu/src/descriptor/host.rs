@@ -99,6 +99,15 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// Number of entries in the per-slot view-stride and view-mark tables:
+/// covers every title slot, every dynamic slot past them, and every clamped
+/// shader index below `HEAP_VIEWS`.
+fn table_slots(count: u32, dynamic: u32) -> u32 {
+    count
+        .saturating_add(dynamic)
+        .max(victory_shader::emit::HEAP_VIEWS)
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -119,24 +128,6 @@ impl HostHeap {
                     })
             }
         };
-        // Every slot a shader can index (title slots, also past a capped
-        // heap, and dynamic ones): shaders read the table as a root view,
-        // which has no bounds, at indices clamped below `HEAP_VIEWS`.
-        let strides = (!sampler)
-            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
-            .flatten()
-            .map(|(buffer, data)| (buffer, data as usize));
-        let marks = (!sampler)
-            .then(|| {
-                let bytes = u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 8;
-                let (buffer, data) = host.upload_buffer(bytes)?;
-                crate::host::name(&buffer, || "view marks".into());
-                // Every slot unmarked (all ones) until a view is made there.
-                // SAFETY: our mapped buffer of `bytes` bytes.
-                unsafe { std::ptr::write_bytes(data, 0xFF, bytes as usize) };
-                Some((buffer, data as usize))
-            })
-            .flatten();
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
         // Translated shaders clamp their indices below `HEAP_VIEWS` or
@@ -150,25 +141,52 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
+        } else if let Some(want) = count.checked_add(DYNAMIC)
+            && let Ok(heap) = make(want.max(views))
+        {
             (heap, count, DYNAMIC)
         } else {
             // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
             // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
+            match count.checked_add(MIN_DYNAMIC) {
+                Some(want) => match make(want) {
+                    Ok(heap) => (heap, count, MIN_DYNAMIC),
+                    Err(e) if want > PORTABLE_VIEWS => {
+                        // shortcut: descriptors past the host's limit are left
+                        // out; a title that reaches them needs remapping.
+                        tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
+                        (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                        return None;
+                    }
+                },
+                None => {
+                    tracing::warn!(count, "host view heap count overflow; capped at {PORTABLE_VIEWS}");
                     (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
                 }
             }
         };
+        // Every slot a shader can index (title slots, dynamic slots past them,
+        // and clamped indices below `HEAP_VIEWS`): shaders read the tables as
+        // root views, which have no bounds.
+        let slots = u64::from(table_slots(count, extra));
+        let strides = (!sampler)
+            .then(|| host.upload_buffer(slots * 4))
+            .flatten()
+            .map(|(buffer, data)| (buffer, data as usize));
+        let marks = (!sampler)
+            .then(|| {
+                let bytes = slots * 8;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                crate::host::name(&buffer, || "view marks".into());
+                // Every slot unmarked (all ones) until a view is made there.
+                // SAFETY: our mapped buffer of `bytes` bytes.
+                unsafe { std::ptr::write_bytes(data, 0xFF, bytes as usize) };
+                Some((buffer, data as usize))
+            })
+            .flatten();
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
             (
@@ -500,11 +518,11 @@ impl HostHeap {
 
     fn write_stride(&self, index: u32, stride: u32) {
         let Some((_, data)) = &self.strides else { return };
-        if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
+        if index >= table_slots(self.count, self.dynamic) {
             return;
         }
         // SAFETY: a dword of the mapped table, which has one per slot below
-        // the larger of the title's count and `HEAP_VIEWS`.
+        // `table_slots(self.count, self.dynamic)`.
         unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
     }
 
@@ -518,12 +536,12 @@ impl HostHeap {
     /// none for anything else.
     pub(crate) fn set_mark(&self, index: u32, entry: Option<(u32, u32)>) {
         let Some((_, data)) = &self.marks else { return };
-        if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
+        if index >= table_slots(self.count, self.dynamic) {
             return;
         }
         let entry = entry.unwrap_or((victory_shader::emit::VIEW_MARK_NONE, 0));
         // SAFETY: two dwords of the mapped table, which has two per slot
-        // below the larger of the title's count and `HEAP_VIEWS`.
+        // below `table_slots(self.count, self.dynamic)`.
         unsafe {
             let at = (*data as *mut u32).add(2 * index as usize);
             at.write_volatile(entry.0);
@@ -2461,5 +2479,44 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn stride_and_mark_tables_cover_dynamic_slots_and_handle_overflow() {
+        let views = victory_shader::emit::HEAP_VIEWS;
+        assert_eq!(table_slots(4, DYNAMIC), views);
+        assert_eq!(table_slots(views - 1, DYNAMIC), views - 1 + DYNAMIC);
+        assert_eq!(table_slots(views, MIN_DYNAMIC), views + MIN_DYNAMIC);
+        assert_eq!(table_slots(u32::MAX, DYNAMIC), u32::MAX);
+
+        // Overflowing requested count caps cleanly instead of panicking or wrapping.
+        if let Some(capped) = HostHeap::new(false, u32::MAX) {
+            assert_eq!(capped.count(), PORTABLE_VIEWS - MIN_DYNAMIC);
+            assert_eq!(capped.dynamic, MIN_DYNAMIC);
+        }
+
+        // When the host accepts a heap whose dynamic slots extend past `HEAP_VIEWS`,
+        // `write_stride` and `set_mark` must write into the last dynamic slot.
+        let Some(heap) = HostHeap::new(false, views - 1024) else {
+            return; // no host GPU
+        };
+        let end = heap.count() + heap.dynamic;
+        let expected_slots = u64::from(table_slots(heap.count(), heap.dynamic));
+        let (stride_buf, stride_ptr) = heap.strides.as_ref().unwrap();
+        let (mark_buf, mark_ptr) = heap.marks.as_ref().unwrap();
+        // SAFETY: plain GetDesc queries on live upload buffers.
+        unsafe {
+            assert_eq!(stride_buf.GetDesc().Width, expected_slots * 4);
+            assert_eq!(mark_buf.GetDesc().Width, expected_slots * 8);
+        }
+        let last = end - 1;
+        heap.write_stride(last, 0x1234);
+        heap.set_mark(last, Some((7, 99)));
+        // SAFETY: `last < table_slots(heap.count(), heap.dynamic)` inside the mapped buffers.
+        unsafe {
+            assert_eq!((*stride_ptr as *const u32).add(last as usize).read_volatile(), 0x1234);
+            let m = (*mark_ptr as *const u32).add(2 * last as usize);
+            assert_eq!((m.read_volatile(), m.add(1).read_volatile()), (7, 99));
+        }
     }
 }
