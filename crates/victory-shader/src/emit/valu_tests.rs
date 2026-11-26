@@ -1477,6 +1477,87 @@ fn signed_64_bit_operands_sign_extend_their_literal() {
     check("s_ashr_i64", &ashr, &[([0; 4], u32::MAX)]);
 }
 
+/// The counts the 64-bit shift tests use: 0, 1, 31, 32, 33 and 63, and three
+/// past 63. Counts 32 and 33 check that the hardware's sixth count bit is
+/// preserved, and the counts past 63 check that higher bits are ignored.
+const SHIFT_CASES: [[u32; 4]; 9] = [
+    [0x0000_0001, 0x8000_0000, 0, 0],
+    [0x0000_0001, 0x8000_0000, 1, 0],
+    [0x0000_0001, 0x8000_0000, 31, 0],
+    [0x0000_0001, 0x8000_0000, 32, 0],
+    [0x0000_0001, 0x8000_0000, 33, 0],
+    [0x0000_0001, 0x8000_0000, 63, 0],
+    [0xFFFF_FFFF, 0xFFFF_FFFF, 64, 0],
+    [0xFFFF_FFFF, 0xFFFF_FFFF, 65, 0],
+    [0x0000_0000, 0x4000_0000, 0xFFFF_FFFF, 0],
+];
+
+/// Runs `cases` (the value's low dword, its high one, the count, unused)
+/// through a body that leaves the low dword of a 64-bit shift in `v0`, or the
+/// high one when `high`, comparing against `want`.
+fn run_shift64(
+    name: &str,
+    body: &[u32],
+    high: bool,
+    cases: &[[u32; 4]],
+    want: fn(u64, u32) -> u64,
+) {
+    let shader = build_valu_cs(body);
+    run_cases(&shader, cases, |backend, i, inp, got| {
+        let v = u64::from(inp[0]) | u64::from(inp[1]) << 32;
+        let r = want(v, inp[2]);
+        let want = if high { (r >> 32) as u32 } else { r as u32 };
+        assert_eq!(got, want, "{backend}: {name} case {i} {inp:x?}");
+    });
+}
+
+/// The 64-bit shifts of both forms, on the counts above: the hardware counts
+/// to six bits, and a count of 32 or more is not the same as 0 or 1.
+#[test]
+fn sixty_four_bit_shifts_count_to_six_bits() {
+    let shl = |v: u64, n: u32| v << (n & 63);
+    let shr = |v: u64, n: u32| v >> (n & 63);
+    let ashr = |v: u64, n: u32| ((v as i64) >> (n & 63)) as u64;
+    // SOP2 op s[6:7], s[0:1], s2 (the count is the third root constant).
+    let scalar = |op: u8, high: bool| {
+        let dst = if high { 7 } else { 6 };
+        vec![sop2(op, 6, 0, 2), vop1(0x001, 0, sgpr(dst))]
+    };
+    // VOP3 op v[5:6], v3 (the count), v[1:2] (the value).
+    let vector = |op: u16, high: bool| {
+        let dst = if high { 6 } else { 5 };
+        let mut words = vop3(op, 5, vgpr(3), vgpr(1), 0).to_vec();
+        words.push(vop1(0x001, 0, vgpr(dst)));
+        words
+    };
+    for high in [false, true] {
+        run_shift64("s_lshl_b64", &scalar(0x1F, high), high, &SHIFT_CASES, shl);
+        run_shift64("s_lshr_b64", &scalar(0x21, high), high, &SHIFT_CASES, shr);
+        run_shift64("s_ashr_i64", &scalar(0x23, high), high, &SHIFT_CASES, ashr);
+        run_shift64(
+            "v_lshlrev_b64",
+            &vector(0x2FF, high),
+            high,
+            &SHIFT_CASES,
+            shl,
+        );
+        run_shift64(
+            "v_lshrrev_b64",
+            &vector(0x300, high),
+            high,
+            &SHIFT_CASES,
+            shr,
+        );
+        run_shift64(
+            "v_ashrrev_i64",
+            &vector(0x301, high),
+            high,
+            &SHIFT_CASES,
+            ashr,
+        );
+    }
+}
+
 #[test]
 fn bfe_signed_and_unsigned_match_rdna2() {
     // v_bfe_i32 v0, v1, v2, v3 (VOP3 opcode 0x149)
