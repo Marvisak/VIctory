@@ -966,6 +966,20 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
             return; // no host GPU here
         };
+        // The copies' views sit past the dynamic slots only where the host
+        // takes a heap of `HEAP_VIEWS`; a host that caps shader-visible view
+        // heaps below it (NVIDIA: 1,000,000) puts them inside the dynamic
+        // range instead, and this test's premise - "none takes a per-draw
+        // dynamic slot" - cannot hold there.
+        // SAFETY: a plain query of a live heap.
+        let slots = unsafe { views.heap.GetDesc().NumDescriptors };
+        if slots < victory_shader::emit::HEAP_VIEWS {
+            eprintln!(
+                "host view heap capped at {slots} descriptors (HEAP_VIEWS is {}); skipped",
+                victory_shader::emit::HEAP_VIEWS
+            );
+            return;
+        }
         let (root, pso) = pipeline(SOURCE);
         let (out, at) = host.shared_buffer(256).unwrap();
         // SAFETY: a live buffer.

@@ -1919,6 +1919,12 @@ impl Host {
             list.SetComputeRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
+                    Root::Constants(data) if data.is_empty() => {
+                        // A program that declares no user data leaves this root
+                        // as it is: zeros. Passing an empty list on - count 0, a
+                        // pointer into nothing - takes the process down inside
+                        // `SetComputeRoot32BitConstants` on an NVIDIA card.
+                    }
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
                         *param,
                         data.len() as u32,
