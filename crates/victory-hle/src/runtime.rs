@@ -304,4 +304,26 @@ mod tests {
         assert_eq!(t.store_id, "9&C");
         assert_eq!(t.storage_bytes, 1024 << 20);
     }
+    #[cfg(windows)]
+    #[test]
+    fn efficiency_mode_controls_power_throttling_state() {
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        };
+        let both = PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+
+        let default = power_throttling_state("");
+        assert_eq!(default.Version, PROCESS_POWER_THROTTLING_CURRENT_VERSION);
+        assert_eq!(default.ControlMask, both);
+        assert_eq!(default.StateMask, 0);
+
+        let enabled = power_throttling_state("1");
+        assert_eq!(enabled.ControlMask, both);
+        assert_eq!(enabled.StateMask, both);
+        assert_eq!(power_throttling_state("true").StateMask, 0);
+        assert_eq!(power_throttling_state("0").StateMask, 0);
+    }
+
 }
