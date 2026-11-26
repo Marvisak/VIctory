@@ -173,9 +173,14 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
-    if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
-    }
+    let pipeline_adapter = if pipelines {
+        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        let label = host.adapter_label();
+        println!("adapter      {label}");
+        Some(label)
+    } else {
+        None
+    };
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -219,7 +224,14 @@ pub fn run(
                                     .flatten(),
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                                translate(job, entry.path(), &seen, &mut t, &mut checks);
+                                translate(
+                                    job,
+                                    entry.path(),
+                                    &seen,
+                                    &mut t,
+                                    &mut checks,
+                                    pipeline_adapter.as_deref(),
+                                );
                             }
                             lock(&total).merge(t);
                         })
@@ -288,6 +300,7 @@ pub fn run(
     );
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        let on = format!(" on {}", host.adapter_label());
         let kept = lock(&kept);
         let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
         for (v, p) in &pairs {
@@ -297,8 +310,8 @@ pub fn run(
                 } else {
                     host.pipeline(vs, ps)
                 }
-                .map(|_| "pipeline created".to_owned())
-                .unwrap_or_else(|e| e),
+                .map(|_| format!("pipeline created{on}"))
+                .unwrap_or_else(|e| format!("{e}{on}")),
                 _ => "not emitted".to_owned(),
             };
             println!("pair {v} + {p}: {made}");
@@ -482,6 +495,7 @@ fn translate(
     seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
     checks: &mut Checks,
+    adapter: Option<&str>,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
@@ -572,7 +586,7 @@ fn translate(
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
-                            check(shader, t, checks, label);
+                            check(shader, t, checks, label, adapter);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
                             .fail(format!("emit: {what}"), || {
@@ -599,6 +613,7 @@ fn check(
     t: &mut Tally,
     checks: &mut Checks,
     label: impl Fn() -> String,
+    adapter: Option<&str>,
 ) {
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
@@ -623,14 +638,15 @@ fn check(
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
+        let on = adapter.map(|a| format!(" on {a}")).unwrap_or_default();
         match made {
             Ok(()) => {
                 *counter(t, shader.stage, 3) += 1;
                 if t.list {
-                    t.lines.push(format!("{}  pipeline created", label()));
+                    t.lines.push(format!("{}  pipeline created{on}", label()));
                 }
             }
-            Err(e) => t.fail(format!("pipeline: {e}"), &label),
+            Err(e) => t.fail(format!("pipeline: {e}{on}"), &label),
         }
     }
     let Some(v) = checks.validator.as_mut() else {

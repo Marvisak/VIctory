@@ -2,7 +2,7 @@
 //! tests, drawing a full-screen triangle and reading the target back.
 
 use std::ffi::CString;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::OnceLock;
 
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -17,6 +17,14 @@ use crate::dxbc::{Container, FourCC};
 pub struct Host {
     pub device: ID3D12Device,
     warp: bool,
+    /// DXGI `EnumAdapters1` index of the adapter this device was created on,
+    /// `None` when this device was not made from an enumerated adapter (the
+    /// software adapter, a device handed in from outside). Never a stand-in
+    /// index: a caller that has no answer says so rather than printing `0`.
+    pub adapter_index: Option<u32>,
+    /// That adapter's description (UTF-8), empty when unknown. A verdict
+    /// naming no adapter is better than one naming the wrong one.
+    pub adapter_name: String,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -77,33 +85,14 @@ unsafe impl Sync for SharedDevice {}
 fn create_device(warp: bool) -> Result<ID3D12Device, String> {
     // SAFETY: plain D3D12/DXGI calls with valid out pointers.
     unsafe {
-        let mut device: Option<ID3D12Device> = None;
         let factory: IDXGIFactory4 =
             CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
         let adapter: IDXGIAdapter1 = if warp {
             factory.EnumWarpAdapter().map_err(err)?
         } else {
-            hardware_adapter(&factory).map_err(err)?
+            hardware_adapter(&factory).map_err(err)?.1
         };
-        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-        let device = device.ok_or("no device")?;
-        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-            HighestShaderModel: D3D_SHADER_MODEL_6_6,
-        };
-        device
-            .CheckFeatureSupport(
-                D3D12_FEATURE_SHADER_MODEL,
-                (&raw mut sm).cast(),
-                size_of_val(&sm) as u32,
-            )
-            .map_err(err)?;
-        if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-            return Err(format!(
-                "the device supports SM {:#x} only",
-                sm.HighestShaderModel.0
-            ));
-        }
-        Ok(device)
+        create_device_on(&adapter)
     }
 }
 
@@ -125,6 +114,60 @@ fn on_software_adapter(device: &ID3D12Device) -> bool {
     }
 }
 
+/// UTF-8 form of a DXGI adapter description (NUL-terminated UTF-16).
+fn adapter_description(desc: &DXGI_ADAPTER_DESC1) -> String {
+    let len = desc
+        .Description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(desc.Description.len());
+    String::from_utf16_lossy(&desc.Description[..len])
+}
+
+/// Whether two LUIDs name the same adapter.
+///
+/// Compared field by field: `LUID` carries padding between its two fields, so
+/// comparing the structs compares that padding too, and DXGI does not promise
+/// it is zeroed wherever one is handed out. A device then reports the adapter
+/// `GetDesc1` would show while the structs compare unequal, which silently
+/// turns "found it" into "not in the enumeration".
+fn same_adapter(a: windows::Win32::Foundation::LUID, b: windows::Win32::Foundation::LUID) -> bool {
+    a.LowPart == b.LowPart && a.HighPart == b.HighPart
+}
+
+/// The DXGI index and description of the adapter `device` runs on, matched by
+/// the device's own LUID. `None` when that adapter is not in the factory's
+/// enumeration, which is the normal case for a wrapped or software device.
+///
+/// The index is searched for, never assumed: a verdict that says adapter 0
+/// when the device is on adapter 1 is worse than one that names nothing,
+/// because it is the answer people compare against each other. The index
+/// follows `EnumAdapters1` order, which is what the `VICTORY_D3D12_ADAPTER`
+/// selection counts.
+fn describe_adapter(device: &ID3D12Device) -> (Option<u32>, String) {
+    // SAFETY: plain D3D12/DXGI queries with valid pointers. Each adapter is
+    // released by `IDXGIAdapter1`'s `Drop` when it leaves scope.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return (None, String::new());
+        };
+        let mut index = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(index) {
+            if adapter
+                .GetDesc1()
+                .is_ok_and(|d| same_adapter(d.AdapterLuid, luid))
+            {
+                let desc = adapter.GetDesc1().unwrap_or_default();
+                let name = adapter_description(&desc);
+                return (Some(index), name);
+            }
+            index += 1;
+        }
+        (None, String::new())
+    }
+}
+
 /// The first adapter that is a GPU: not flagged software, and with video
 /// memory of its own. A machine without one (GitHub's Windows runner has only
 /// `Microsoft Basic Render Driver`) has nothing to run the hardware-only
@@ -134,7 +177,7 @@ fn on_software_adapter(device: &ID3D12Device) -> bool {
 /// (`permutes_read_the_lane_named_and_zero_from_lanes_left_out`). WARP and the
 /// basic render driver report no dedicated video memory, which is what this
 /// asks for as well.
-fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapter1> {
+fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<(u32, IDXGIAdapter1)> {
     // SAFETY: plain DXGI adapter enumeration.
     unsafe {
         for index in 0.. {
@@ -144,7 +187,7 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
             let desc = adapter.GetDesc1()?;
             let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
             if !software && desc.DedicatedVideoMemory > 0 {
-                return Ok(adapter);
+                return Ok((index, adapter));
             }
         }
     }
@@ -156,44 +199,200 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
 
 /// Serializes WARP (`d3d10warp.dll`) operations across threads: concurrent
 /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
-static WARP_LOCK: Mutex<()> = Mutex::new(());
+static WARP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The SM 6.6 device `adapter` yields: the checks every adapter must pass,
+/// whichever one was chosen. Split out of `create_device` so a device made
+/// from a selected adapter is validated exactly as the default one is, rather
+/// than through a second copy of the same checks.
+fn create_device_on(adapter: &IDXGIAdapter1) -> Result<ID3D12Device, String> {
+    // SAFETY: plain D3D12 calls with valid out pointers.
+    unsafe {
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+        let device = device.ok_or("no device")?;
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+            .map_err(err)?;
+        if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+            return Err(format!(
+                "the device supports SM {:#x} only",
+                sm.HighestShaderModel.0
+            ));
+        }
+        Ok(device)
+    }
+}
+
+/// Whether a `VICTORY_D3D12_ADAPTER` selector picks the adapter at `index`:
+/// a decimal index matches that index only, anything else is a
+/// case-insensitive substring of the description. An empty or whitespace
+/// selector matches nothing, so an unset variable with stray spaces does not
+/// silently mean adapter 0.
+pub(crate) fn adapter_selector_matches(index: u32, name: &str, want: &str) -> bool {
+    if want.trim().is_empty() {
+        return false;
+    }
+    if let Ok(wanted) = want.trim().parse::<u32>() {
+        return wanted == index;
+    }
+    name.to_ascii_lowercase()
+        .contains(&want.trim().to_ascii_lowercase())
+}
+
+/// The adapter `VICTORY_D3D12_ADAPTER` names, or an error listing the ones
+/// that exist: a selector that matches nothing is a typo, and an error naming
+/// the available adapters is how the user sees it. A software adapter is
+/// refused even when it is named, because the checks on this path are
+/// hardware-only and WARP answers them wrongly.
+fn selected_adapter(
+    factory: &IDXGIFactory4,
+    want: &str,
+) -> windows::core::Result<(u32, IDXGIAdapter1)> {
+    // SAFETY: plain DXGI adapter enumeration.
+    unsafe {
+        let mut seen = Vec::new();
+        let mut index = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(index) {
+            let desc = adapter.GetDesc1()?;
+            let name = adapter_description(&desc);
+            let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            if adapter_selector_matches(index, &name, want) {
+                // The hardware-only checks are the reason this path exists,
+                // and a software device answers them wrongly in a way that
+                // looks like a pass. Naming one is refused rather than
+                // honoured, so a run cannot be pointed at WARP by accident.
+                if software {
+                    return Err(windows::core::Error::new(
+                        windows::Win32::Foundation::E_FAIL,
+                        format!(
+                            "VICTORY_D3D12_ADAPTER={want} names a software adapter \
+                             ({index} \"{name}\"); these checks need a GPU"
+                        ),
+                    ));
+                }
+                return Ok((index, adapter));
+            }
+            seen.push(format!("{index} \"{name}\""));
+            index += 1;
+        }
+        let seen = if seen.is_empty() {
+            "none".to_string()
+        } else {
+            seen.join(", ")
+        };
+        Err(windows::core::Error::new(
+            windows::Win32::Foundation::E_FAIL,
+            format!("VICTORY_D3D12_ADAPTER={want} matches no adapter (have {seen})"),
+        ))
+    }
+}
 
 impl Host {
-    fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
+    /// A short label for pipeline verdicts: `index "Description"`.
+    ///
+    /// The index is omitted rather than faked when the device's adapter is
+    /// not in the factory's enumeration, and the name is omitted when the
+    /// factory could not be created: a verdict that names no adapter is
+    /// better than one naming the wrong one, because these labels are what
+    /// people compare against each other when a result differs.
+    pub fn adapter_label(&self) -> String {
+        match (self.adapter_index, self.adapter_name.is_empty()) {
+            (Some(i), false) => format!("{i} \"{}\"", self.adapter_name),
+            (Some(i), true) => i.to_string(),
+            (None, false) => format!("\"{}\"", self.adapter_name),
+            (None, true) => "an unenumerated adapter".to_string(),
+        }
+    }
+    fn lock_warp(&self) -> Option<std::sync::MutexGuard<'static, ()>> {
         self.warp
             .then(|| WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
-    /// A software default adapter (a machine without a GPU, as CI) is
+    /// `VICTORY_D3D12_ADAPTER` (a decimal index or a case-insensitive
+    /// substring of the description) picks another adapter when set; a
+    /// software default adapter (a machine without a GPU, as CI) is
     /// refused, so hardware-only checks never run on WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+
         if warp {
             static WARP: OnceLock<Result<SharedDevice, String>> = OnceLock::new();
             let shared = WARP.get_or_init(|| {
                 let _guard = WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                 create_device(true).map(SharedDevice)
             });
+            // The WARP device is shared, so its adapter is named by the
+            // device itself rather than by a second enumeration that would
+            // have to agree with `create_device` about which one it is.
             return shared
                 .as_ref()
-                .map(|d| Host {
-                    device: d.0.clone(),
-                    warp: true,
+                .map(|d| {
+                    let (adapter_index, adapter_name) = describe_adapter(&d.0);
+                    Host {
+                        device: d.0.clone(),
+                        warp: true,
+                        adapter_index,
+                        adapter_name,
+                    }
                 })
                 .map_err(Clone::clone);
         }
+        let (device, adapter_index, adapter_name) = if let Ok(want) =
+            std::env::var("VICTORY_D3D12_ADAPTER")
+        {
+            // SAFETY: plain D3D12/DXGI calls with valid out pointers. The
+            // factory is dropped at the end of the block; the device holds
+            // its own reference to the adapter.
+            unsafe {
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                let (adapter_index, adapter) = selected_adapter(&factory, &want).map_err(err)?;
+                let adapter_name = adapter_description(&adapter.GetDesc1().map_err(err)?);
+                let device = create_device_on(&adapter)?;
+                (device, Some(adapter_index), adapter_name)
+            }
+        } else {
+            // The device is asked which adapter it landed on rather than the
+            // enumeration being asked which one it would have picked: the two
+            // can differ (a machine where the default adapter is not the first
+            // GPU), and the answer is what the verdict has to name.
+            let device = create_device(false)?;
+            let (adapter_index, adapter_name) = describe_adapter(&device);
+            (device, adapter_index, adapter_name)
+        };
         Ok(Host {
-            device: create_device(false)?,
+            device,
             warp: false,
+            adapter_index,
+            adapter_name,
         })
     }
 
     /// A host on a device made elsewhere (the GPU crate's). Its work is
     /// serialised as WARP's is when the device runs on a software adapter.
+    ///
+    /// The adapter is found by the device's own LUID rather than assumed, so
+    /// a verdict names the adapter the device actually runs on. A device the
+    /// factory does not list (a wrapped or software one) keeps an empty name
+    /// and no index.
     pub fn from_device(device: ID3D12Device) -> Self {
         let warp = on_software_adapter(&device);
-        Host { device, warp }
+        let (adapter_index, adapter_name) = describe_adapter(&device);
+        Host {
+            device,
+            warp,
+            adapter_index,
+            adapter_name,
+        }
     }
 
     /// The root signature translated shaders expect: user data per stage
@@ -439,7 +638,11 @@ impl Host {
                 BytecodeLength: ps.len(),
             },
             GS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
+                pShaderBytecode: if gs.is_empty() {
+                    std::ptr::null()
+                } else {
+                    gs.as_ptr().cast()
+                },
                 BytecodeLength: gs.len(),
             },
             SampleMask: u32::MAX,
@@ -1348,21 +1551,48 @@ pub enum View<'a> {
 #[cfg(test)]
 pub fn view_strides(views: &[View]) -> Vec<u32> {
     let kind = |f: DXGI_FORMAT| match f {
-        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R32G32_UINT
-        | DXGI_FORMAT_R10G10B10A2_UINT | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R16G16_UINT
-        | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R8_UINT => super::VIEW_INTEGER,
-        DXGI_FORMAT_R32G32B32A32_SINT | DXGI_FORMAT_R16G16B16A16_SINT | DXGI_FORMAT_R32G32_SINT
-        | DXGI_FORMAT_R8G8B8A8_SINT | DXGI_FORMAT_R16G16_SINT | DXGI_FORMAT_R32_SINT
-        | DXGI_FORMAT_R8G8_SINT | DXGI_FORMAT_R16_SINT | DXGI_FORMAT_R8_SINT => super::VIEW_INTEGER | super::VIEW_SIGNED,
+        DXGI_FORMAT_R32G32B32A32_UINT
+        | DXGI_FORMAT_R16G16B16A16_UINT
+        | DXGI_FORMAT_R32G32_UINT
+        | DXGI_FORMAT_R10G10B10A2_UINT
+        | DXGI_FORMAT_R8G8B8A8_UINT
+        | DXGI_FORMAT_R16G16_UINT
+        | DXGI_FORMAT_R32_UINT
+        | DXGI_FORMAT_R8G8_UINT
+        | DXGI_FORMAT_R16_UINT
+        | DXGI_FORMAT_R8_UINT => super::VIEW_INTEGER,
+        DXGI_FORMAT_R32G32B32A32_SINT
+        | DXGI_FORMAT_R16G16B16A16_SINT
+        | DXGI_FORMAT_R32G32_SINT
+        | DXGI_FORMAT_R8G8B8A8_SINT
+        | DXGI_FORMAT_R16G16_SINT
+        | DXGI_FORMAT_R32_SINT
+        | DXGI_FORMAT_R8G8_SINT
+        | DXGI_FORMAT_R16_SINT
+        | DXGI_FORMAT_R8_SINT => super::VIEW_INTEGER | super::VIEW_SIGNED,
         _ => 0,
     };
     views
         .iter()
         .map(|v| match *v {
-            View::Buffer { stride: Stride::Raw, .. } | View::RawUav(_) => 4,
-            View::Buffer { stride: Stride::Typed, .. } => 16,
-            View::Buffer { stride: Stride::Structured(n), .. } => n,
-            View::Buffer { stride: Stride::Format(f, n), .. } | View::TypedUav(f, _, n) => n | kind(f),
+            View::Buffer {
+                stride: Stride::Raw,
+                ..
+            }
+            | View::RawUav(_) => 4,
+            View::Buffer {
+                stride: Stride::Typed,
+                ..
+            } => 16,
+            View::Buffer {
+                stride: Stride::Structured(n),
+                ..
+            } => n,
+            View::Buffer {
+                stride: Stride::Format(f, n),
+                ..
+            }
+            | View::TypedUav(f, _, n) => n | kind(f),
             View::HalfUav(_) => 8,
             _ => 0,
         })
@@ -1691,9 +1921,12 @@ impl Host {
                                 e,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
-                            View::TypedUav(format, e, bytes) => {
-                                ((e * bytes).div_ceil(4), format, e, D3D12_BUFFER_UAV_FLAG_NONE)
-                            }
+                            View::TypedUav(format, e, bytes) => (
+                                (e * bytes).div_ceil(4),
+                                format,
+                                e,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
                             View::RawUav(n) => {
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
@@ -2070,5 +2303,82 @@ mod tests {
                 });
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod adapter_selector_tests {
+    use super::Host;
+    use super::adapter_selector_matches;
+
+    /// The default device's adapter is named, not left blank (#2456).
+    ///
+    /// This is the one that was wrong first: the default path created its
+    /// device and never asked that device which adapter it landed on, so
+    /// every verdict from a normal run printed no adapter at all while a
+    /// verdict from the `VICTORY_D3D12_ADAPTER` path printed a real one.
+    /// The pair is what makes the defect visible — a `None` here is only
+    /// wrong because the *other* path has an answer.
+    #[test]
+    fn the_default_device_names_its_adapter() {
+        let Ok(host) = Host::new(false) else {
+            return; // no host GPU
+        };
+        assert!(
+            host.adapter_index.is_some() && !host.adapter_name.is_empty(),
+            "the default device is on an enumerated adapter, so a verdict \
+             should name it: got index {:?}, name {:?}",
+            host.adapter_index,
+            host.adapter_name
+        );
+        assert!(
+            host.adapter_label().contains(&host.adapter_name),
+            "the label is what a verdict prints: {} vs {:?}",
+            host.adapter_label(),
+            host.adapter_name
+        );
+    }
+
+    #[test]
+    fn a_decimal_index_matches_only_that_adapter() {
+        assert!(adapter_selector_matches(1, "NVIDIA GeForce RTX 4090", "1"));
+        assert!(!adapter_selector_matches(0, "AMD Radeon(TM) Graphics", "1"));
+        assert!(adapter_selector_matches(0, "anything", "0"));
+    }
+
+    #[test]
+    fn a_description_substring_matches_case_insensitively() {
+        assert!(adapter_selector_matches(
+            1,
+            "NVIDIA GeForce RTX 4090",
+            "rtx 4090"
+        ));
+        assert!(adapter_selector_matches(
+            0,
+            "AMD Radeon(TM) Graphics",
+            "radeon"
+        ));
+        assert!(!adapter_selector_matches(
+            0,
+            "AMD Radeon(TM) Graphics",
+            "nvidia"
+        ));
+    }
+
+    #[test]
+    fn an_empty_or_whitespace_selector_matches_nothing() {
+        assert!(!adapter_selector_matches(0, "AMD Radeon(TM) Graphics", ""));
+        assert!(!adapter_selector_matches(
+            0,
+            "AMD Radeon(TM) Graphics",
+            "  "
+        ));
+    }
+
+    #[test]
+    fn an_index_string_is_not_treated_as_a_substring() {
+        // "0" is an index, not a description that happens to contain "0".
+        assert!(!adapter_selector_matches(1, "adapter 0 spare", "0"));
+        assert!(adapter_selector_matches(0, "adapter 0 spare", "0"));
     }
 }
