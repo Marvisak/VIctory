@@ -1131,6 +1131,27 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // A description that asks for unordered access on a format the host cannot
+    // use as a typed UAV — and cannot cast to one that it can — is refused
+    // whole: the debug layer states the rule and then removes the device (id
+    // 599, #1754). The permission goes before any device call names the
+    // description. Legal asks are kept: the answer covers every format of the
+    // same element the texture can be viewed as, and a typeless format is
+    // judged by those.
+    if d.flags & UNORDERED != 0
+        && uav_of_element(d.format) == Some(false)
+    {
+        d.flags &= !UNORDERED;
+        static NOTED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
+        if !noted.contains(&d.format) {
+            noted.push(d.format);
+            tracing::warn!(
+                format = d.format,
+                "dropping unordered access: neither this format nor one it can cast to takes a typed UAV"
+            );
+        }
+    }
     Some(d)
 }
 
@@ -1185,6 +1206,83 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
 /// formats among block formats of the same block size), but depth ones
 /// (refused in lists on the RX 6700 XT and WARP alike) and typeless ones
 /// (no view takes them).
+/// Whether the host takes a typed unordered access view of `format` or of a
+/// format the texture is castable to: D3D12 wants the flag legal for "the
+/// texture's format, or a format it can be cast to", so a description is
+/// refused only when the whole element refuses it (#1754, the debug layer's
+/// id 599). `None` when the host cannot be asked: an unknown answer leaves
+/// the description alone, because dropping a permission that was legal would
+/// silently lose a texture's writes.
+#[cfg(windows)]
+pub(crate) fn uav_of_element(format: u32) -> Option<bool> {
+    let mut candidates = castable(format);
+    candidates.push(format);
+    let mut unknown = false;
+    for f in candidates {
+        match typed_uav(f) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => unknown = true,
+        }
+    }
+    if unknown { None } else { Some(false) }
+}
+
+/// Without a host to ask, nothing is known either way.
+#[cfg(not(windows))]
+pub(crate) fn uav_of_element(_format: u32) -> Option<bool> {
+    None
+}
+
+/// Whether the host takes a typed unordered access view of `format` itself.
+/// `None` when the host cannot be asked.
+#[cfg(windows)]
+fn typed_uav(format: u32) -> Option<bool> {
+    use std::sync::Mutex;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static SUPPORT: Mutex<Vec<(u32, Option<bool>)>> = Mutex::new(Vec::new());
+    let mut known = SUPPORT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, yes)) = known.iter().find(|&&(f, _)| f == format) {
+        return yes;
+    }
+    // D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD, ..._STORE: either says the format
+    // can be a typed unordered access view.
+    const TYPED: u32 = 0x40 | 0x80;
+    let host = crate::host::host()?;
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: a plain query of the host device, which writes the structure's
+    // format-support fields.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            std::ptr::from_mut(&mut support).cast(),
+            size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+        )
+    };
+    let yes = match asked {
+        Ok(()) => (support.Support2.0 as u32) & TYPED != 0,
+        Err(e) => {
+            tracing::debug!(format, error = %e, "the host would not say whether a format takes a typed UAV");
+            return None;
+        }
+    };
+    tracing::debug!(format, yes, "typed unordered access support");
+    known.push((format, Some(yes)));
+    Some(yes)
+}
+
+/// Without a host to ask, nothing is known either way.
+#[cfg(not(windows))]
+fn typed_uav(_format: u32) -> Option<bool> {
+    None
+}
+
 pub(crate) fn castable(format: u32) -> Vec<u32> {
     const DEPTH_FAMILIES: [u32; 10] = [19, 20, 21, 22, 40, 44, 45, 46, 47, 55];
     let Some(e) = element(format) else {
@@ -2512,6 +2610,39 @@ mod tests {
 
     /// Castable formats: every format of the same element but typeless and
     /// depth ones; block formats among block formats of their block size.
+    /// A typeless format never takes a typed UAV itself, but the texture can
+    /// be viewed as every format of its element: dropping the permission for
+    /// the typeless spelling would lose writes the host allows.
+    #[test]
+    fn a_typeless_format_is_judged_by_the_formats_it_casts_to() {
+        for typeless in [27u32, 24, 16] {
+            let casts = castable(typeless);
+            assert!(!casts.is_empty(), "format {typeless} casts to nothing");
+            assert!(
+                casts.iter().any(|&f| family(f) != f),
+                "format {typeless} casts to no typed format"
+            );
+            // The permission is a property of the element, not of the
+            // spelling: a typeless view and its typed family answer alike.
+            let typed = casts.iter().find(|&&f| family(f) != f).copied();
+            if let Some(t) = typed {
+                assert_eq!(uav_of_element(typeless), uav_of_element(t));
+            }
+        }
+    }
+
+    /// A format whose own element is one the host cannot use as a typed UAV
+    /// keeps the permission only if some format of that element takes it, and
+    /// the answer is the same for a format and its castable neighbours.
+    #[test]
+    fn the_permission_follows_the_whole_element() {
+        // 115 (B4G4R4A4) and 86 (B5G5R5A1) are both two bytes a texel.
+        let (a, b) = (115u32, 86u32);
+        assert_eq!(element(a), element(b));
+        assert!(castable(a).contains(&b), "115 casts to 86");
+        assert_eq!(uav_of_element(a), uav_of_element(b));
+    }
+
     #[test]
     fn castable_formats_share_the_element() {
         let c = castable(42);
@@ -3180,3 +3311,4 @@ mod tests {
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
 }
+
