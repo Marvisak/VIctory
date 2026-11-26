@@ -595,6 +595,26 @@ impl Host {
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
 
+    /// Whether the device offers 64-bit atomics on typed resources
+    /// (`D3D12_FEATURE_D3D12_OPTIONS9`). An adapter without them refuses the
+    /// pipeline with `E_INVALIDARG`, and the debug layer names it. Not every
+    /// host that lacks them refuses the work — WARP runs these atomics with
+    /// the flag clear — so this is a reason to skip only after creation has
+    /// actually failed.
+    pub fn supports_atomic_int64_on_typed_resources(&self) -> Option<bool> {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+        // SAFETY: `options` is the structure the query fills, sized by
+        // `size_of_val`.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS9,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .ok()?;
+        Some(options.AtomicInt64OnTypedResourceSupported.as_bool())
+    }
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
     /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
     /// does not, their results can differ in kind (NaN where an overflowing

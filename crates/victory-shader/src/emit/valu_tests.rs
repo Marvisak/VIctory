@@ -1974,9 +1974,21 @@ fn image_atomics_of_64_bits() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = host
-            .compute_pipeline(&shader)
-            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        // `R32G32_UINT` atomics are not a given: an adapter without them
+        // refuses the pipeline with `E_INVALIDARG`, so ask first.
+        // 64-bit atomics on typed resources are not a given: an adapter
+        // without them refuses the pipeline with `E_INVALIDARG`. Skip only
+        // once creation has failed and the device says it has none — WARP
+        // runs them with the flag clear, so asking first would lose its
+        // coverage.
+        let pipeline = host.compute_pipeline(&shader);
+        if let Err(e) = &pipeline
+            && host.supports_atomic_int64_on_typed_resources() == Some(false)
+        {
+            eprintln!("{label}: no 64-bit atomics on typed resources; skipped: {e}");
+            continue;
+        }        let (root, pso) =
+            pipeline.unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
             assert_eq!((u.root, u.slot), (RootType::Table, 1), "user data {u:?}");
