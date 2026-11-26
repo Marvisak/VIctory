@@ -261,7 +261,7 @@ mod submission_completion_tests {
         let report = submission_failure_report(
             SUBMITTED,
             3,
-            &error,
+            &removed_hresult,
             true,
             "; page fault at 0x1234",
             "; list 0: Dispatch",
