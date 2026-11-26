@@ -928,6 +928,7 @@ pub(crate) fn take_forgotten(slot: u32) -> bool {
     let mut maps: Vec<&mut [u32]> = [false, true]
         .into_iter()
         .filter_map(bitmap)
+        // SAFETY: this test-only cleanup runs with no submission in flight.
         .map(|b| unsafe {
             std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words)
         })
