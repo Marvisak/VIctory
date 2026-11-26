@@ -1420,10 +1420,9 @@ mod host {
             a.held = None;
         }
         // The file is looked at ten times a second at most.
-        if now - a.looked < Duration::from_millis(100) {
+        if !poll_due(now, &mut a.looked) {
             return None;
         }
-        a.looked = now;
         let text = std::fs::read_to_string(file).ok()?;
         loop {
             let (line, next) = complete_line_at(&text, a.done)?;
@@ -1439,6 +1438,18 @@ mod host {
             tracing::info!(key = name, "a key was asked for (VICTORY_KEYS_FILE)");
             a.held = Some((now, vk));
             return Some(vk);
+        }
+    }
+
+    /// Whether the file poll interval has elapsed; a skipped poll leaves the
+    /// previous timestamp untouched.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn poll_due(now: Instant, looked: &mut Instant) -> bool {
+        if now - *looked < Duration::from_millis(100) {
+            false
+        } else {
+            *looked = now;
+            true
         }
     }
 
@@ -1501,7 +1512,23 @@ mod host {
         assert_eq!(key_named(crlf), Some(0x09));
         assert_eq!(next, 2);
 
-        assert_eq!(complete_line_at("X", next), None);
+        // A partial append stays pending across throttled polls and becomes
+        // consumable only after both the interval and terminating newline.
+        let start = Instant::now();
+        let mut looked = start;
+        let mut cursor = 0;
+        let first = start + Duration::from_millis(100);
+        assert!(poll_due(first, &mut looked));
+        assert_eq!(complete_line_at("Ent", cursor), None);
+        let appended = first + Duration::from_millis(50);
+        assert!(!poll_due(appended, &mut looked));
+        assert_eq!(cursor, 0);
+        let ready = first + Duration::from_millis(100);
+        assert!(poll_due(ready, &mut looked));
+        let (line, next) = complete_line_at("Enter\\n", cursor).unwrap();
+        assert_eq!(line, "Enter");
+        cursor = next;
+        assert_eq!(cursor, 1);
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
