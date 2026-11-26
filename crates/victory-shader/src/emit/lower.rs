@@ -72,6 +72,10 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    #[cfg(test)]
+    binary_i32_opcodes: Vec<i64>,
+    #[cfg(test)]
+    icmps_and_selects: (usize, usize),
 }
 
 pub(crate) struct Parts<'a> {
@@ -1412,6 +1416,10 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            binary_i32_opcodes: self.s.m.written_call_opcodes("dx.op.binary.i32"),
+            #[cfg(test)]
+            icmps_and_selects: self.s.m.written_icmps_and_selects(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -7642,30 +7650,28 @@ impl<'a> Lower<'a> {
             "v_min3_i32" | "v_max3_i32" | "v_min3_u32" | "v_max3_u32" | "v_med3_i32"
             | "v_med3_u32" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let signed = name.ends_with("i32");
-                let (lt, gt) = if signed {
-                    (pred::SLT, pred::SGT)
+                let (min, max) = if name.ends_with("i32") {
+                    (38, 37) // IMin / IMax
                 } else {
-                    (pred::IULT, pred::IUGT)
+                    (40, 39) // UMin / UMax
                 };
-                let pick = |l: &mut Self, p, x, y| {
-                    let t = l.s.m.cmp(c, p, x, y);
-                    l.s.m.select(c, t, x, y)
+                let pick = |l: &mut Self, opcode, x, y| {
+                    l.s.op(c, "binary.i32", Attr::ReadNone, l.s.t.i32, opcode, &[x, y])
                 };
                 match &name[2..6] {
                     "min3" => {
-                        let t = pick(self, lt, a, b);
-                        pick(self, lt, t, d)
+                        let t = pick(self, min, a, b);
+                        pick(self, min, t, d)
                     }
                     "max3" => {
-                        let t = pick(self, gt, a, b);
-                        pick(self, gt, t, d)
+                        let t = pick(self, max, a, b);
+                        pick(self, max, t, d)
                     }
                     _ => {
-                        let lo = pick(self, lt, a, b);
-                        let hi = pick(self, gt, a, b);
-                        let t = pick(self, lt, hi, d);
-                        pick(self, gt, lo, t)
+                        let lo = pick(self, min, a, b);
+                        let hi = pick(self, max, a, b);
+                        let t = pick(self, min, hi, d);
+                        pick(self, max, lo, t)
                     }
                 }
             }
@@ -11089,6 +11095,42 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn min3_max3_med3_use_dxil_integer_min_max() {
+        const I_MAX: i64 = 37;
+        const I_MIN: i64 = 38;
+        const U_MAX: i64 = 39;
+        const U_MIN: i64 = 40;
+        let cases: [(&str, u32, &[i64]); 6] = [
+            ("v_min3_i32", 0x152, &[I_MIN, I_MIN]),
+            ("v_min3_u32", 0x153, &[U_MIN, U_MIN]),
+            ("v_max3_i32", 0x155, &[I_MAX, I_MAX]),
+            ("v_max3_u32", 0x156, &[U_MAX, U_MAX]),
+            ("v_med3_i32", 0x158, &[I_MAX, I_MAX, I_MIN, I_MIN]),
+            ("v_med3_u32", 0x159, &[U_MAX, U_MAX, U_MIN, U_MIN]),
+        ];
+        // v_xor3_b32 v0, v1, v2, v3 keeps the same inputs and buffer store
+        // live. The shared setup and store contribute an icmp and a select.
+        let control = lower_valu(&[0xD578_0000, 0x040E_0501]).unwrap();
+        for (name, opcode, expected) in cases {
+            let lowered = lower_valu(&[
+                0xD400_0000 | opcode << 16, // VOP3 v0, v1, v2, v3
+                0x040E_0501,
+            ])
+            .unwrap();
+            let mut opcodes = lowered.binary_i32_opcodes;
+            opcodes.sort_unstable();
+            let mut expected_opcodes = control.binary_i32_opcodes.clone();
+            expected_opcodes.extend_from_slice(expected);
+            expected_opcodes.sort_unstable();
+            assert_eq!(
+                (opcodes, lowered.icmps_and_selects),
+                (expected_opcodes, control.icmps_and_selects),
+                "{name}: dx.op.binary.i32 opcodes and (icmp, select) counts"
+            );
+        }
     }
 
     #[test]

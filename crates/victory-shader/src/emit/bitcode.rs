@@ -590,15 +590,50 @@ impl Module {
         }
     }
 
+    /// Counts of integer compare and select instructions that [`Module::write`] writes.
+    #[cfg(test)]
+    pub fn written_icmps_and_selects(&self) -> (usize, usize) {
+        let (mut icmps, mut selects) = (0, 0);
+        for op in self.written_body_ops() {
+            match op {
+                Op::Cmp(pred::EQ.., ..) => icmps += 1,
+                Op::Select(..) => selects += 1,
+                _ => {}
+            }
+        }
+        (icmps, selects)
+    }
+
     /// Calls of functions named `name` that [`Module::write`] writes.
     #[cfg(test)]
     pub fn written_calls(&self, name: &str) -> usize {
+        self.written_call_args(name).count()
+    }
+
+    /// Opcodes (the first argument) of calls to the named DXIL intrinsic.
+    #[cfg(test)]
+    pub fn written_call_opcodes(&self, name: &str) -> Vec<i64> {
+        self.written_call_args(name)
+            .map(|args| self.int_value(args[0]).expect("DXIL call opcode"))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn written_call_args<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a [V]> {
+        self.written_body_ops().filter_map(move |op| match op {
+            Op::Call(f, args) if self.funcs[*f as usize].name == name => Some(args.as_slice()),
+            _ => None,
+        })
+    }
+
+    #[cfg(test)]
+    fn written_body_ops(&self) -> impl Iterator<Item = &Op> {
         let plan = self.plan();
-        let calls = plan.layout.iter().flat_map(|&b| &self.blocks[b].body);
-        calls
-            .filter(|&&i| plan.live[i as usize])
-            .filter(|&&i| matches!(self.insts[i as usize].op, Op::Call(f, _) if self.funcs[f as usize].name == name))
-            .count()
+        plan.layout
+            .into_iter()
+            .flat_map(|b| &self.blocks[b].body)
+            .filter(move |&&i| plan.live[i as usize])
+            .map(|&i| &self.insts[i as usize].op)
     }
 
     /// The globals and functions [`Module::write`] declares, each kept
