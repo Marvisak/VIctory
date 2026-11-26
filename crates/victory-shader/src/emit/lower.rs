@@ -7955,6 +7955,10 @@ impl<'a> Lower<'a> {
                 }
             }
             "u64" | "i64" => {
+                if matches!(op, "f" | "t") {
+                    self.lane(inst, Some(op == "t"));
+                    return Ok(());
+                }
                 // On the two dwords, not as i64: AMD's D3D12 shader compiler
                 // orders 64-bit integers as if their dwords were swapped
                 // (RX 9070 and gfx1036 alike; equality is unaffected), where
