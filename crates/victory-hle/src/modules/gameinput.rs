@@ -116,6 +116,12 @@ trait Source: Send {
     fn scripted_keys(&mut self) -> Vec<KeyState> {
         Vec::new()
     }
+    /// Scripted diagnostic pad (`VICTORY_SCRIPTED_INPUT`), independent of focus.
+    #[cfg(any(test, feature = "diagnostics"))]
+    fn scripted_pad(&mut self) -> Option<PadState> {
+        None
+    }
+
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -167,6 +173,90 @@ fn merge_scripted(pads: &mut [Option<PadState>; PADS], scripted: &[KeyState]) {
     if let Some(pad) = pads.iter_mut().flatten().next() {
         *pad = merge_pad(*pad, extra);
     }
+}
+
+/// Diagnostics: parses `VICTORY_SCRIPTED_INPUT` as `<frame>:<state>;...`.
+/// Each entry stays active until the next one; a state is `+`-separated
+/// tokens (`fwd`, `back`, `left`, `right`, `look_left`, `look_right`,
+/// `look_up`, `look_down`, `lt`, `rt`, buttons `a`...`y`, `menu`, `view`,
+/// `lb`, `rb`, `ls`, `rs`, d-pad `du`, `dd`, `dl`, `dr`, or `off`).
+/// An entry with an unknown token is dropped whole, leaving the last valid
+/// state active: applying the recognised tokens would invent a state the
+/// script never asked for (a typo in `look_rigth` would look like `off`).
+#[cfg(any(test, feature = "diagnostics"))]
+fn parse_script(text: &str) -> Vec<(u64, PadState)> {
+    let mut segments = Vec::new();
+    let mut warned = std::collections::HashSet::new();
+    for entry in text.split(';') {
+        let Some((at, state)) = entry.trim().split_once(':') else {
+            continue;
+        };
+        let Ok(frame) = at.trim().parse() else {
+            continue;
+        };
+        let mut pad = PadState::default();
+        let mut unknown = false;
+        let axis = |value: &mut f32, delta: f32| *value = (*value + delta).clamp(-1.0, 1.0);
+        for token in state.split(['+', ',']) {
+            let token = token.trim();
+            match token {
+                "fwd" => axis(&mut pad.left_y, 1.0),
+                "back" => axis(&mut pad.left_y, -1.0),
+                "left" => axis(&mut pad.left_x, -1.0),
+                "right" => axis(&mut pad.left_x, 1.0),
+                "look_left" | "turn_left" => axis(&mut pad.right_x, -1.0),
+                "look_right" | "turn_right" => axis(&mut pad.right_x, 1.0),
+                "look_up" => axis(&mut pad.right_y, 1.0),
+                "look_down" => axis(&mut pad.right_y, -1.0),
+                "lt" => pad.left_trigger = 1.0,
+                "rt" => pad.right_trigger = 1.0,
+                "menu" => pad.buttons |= MENU,
+                "view" => pad.buttons |= VIEW,
+                "a" => pad.buttons |= A,
+                "b" => pad.buttons |= B,
+                "x" => pad.buttons |= X,
+                "y" => pad.buttons |= Y,
+                "du" => pad.buttons |= UP,
+                "dd" => pad.buttons |= DOWN,
+                "dl" => pad.buttons |= LEFT,
+                "dr" => pad.buttons |= RIGHT,
+                "lb" => pad.buttons |= LEFT_SHOULDER,
+                "rb" => pad.buttons |= RIGHT_SHOULDER,
+                "ls" => pad.buttons |= LEFT_STICK,
+                "rs" => pad.buttons |= RIGHT_STICK,
+                "off" => {}
+                // `off` is an explicit neutral state; a bad token drops the
+                // whole entry so the previous state stays active.
+                _ => {
+                    unknown = true;
+                    if warned.insert(token) {
+                        tracing::warn!(
+                            token,
+                            entry = entry.trim(),
+                            "unknown scripted input token; entry ignored"
+                        );
+                    }
+                }
+            }
+        }
+        if !unknown {
+            segments.push((frame, pad));
+        }
+    }
+    // A stable sort keeps the last of two entries for one frame: below, the
+    // last segment at or before a frame wins.
+    segments.sort_by_key(|&(frame, _)| frame);
+    segments
+}
+
+/// The state active at `frame`, if any.
+#[cfg(any(test, feature = "diagnostics"))]
+fn scripted_pad_at(segments: &[(u64, PadState)], frame: u64) -> Option<PadState> {
+    segments
+        .iter()
+        .take_while(|(at, _)| *at <= frame)
+        .last()
+        .map(|(_, pad)| *pad)
 }
 
 #[repr(C)]
@@ -436,16 +526,22 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys, scripted) = {
+        let (pads, keys, scripted, scripted_pad) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             #[cfg(any(test, feature = "diagnostics"))]
             let scripted = source.scripted_keys();
             #[cfg(not(any(test, feature = "diagnostics")))]
             let scripted: [KeyState; 0] = [];
-            (pads, source.keys(), scripted)
+            #[cfg(any(test, feature = "diagnostics"))]
+            let scripted_pad = source.scripted_pad();
+            #[cfg(not(any(test, feature = "diagnostics")))]
+            let scripted_pad: Option<PadState> = None;
+            (pads, source.keys(), scripted, scripted_pad)
         };
-        let events = self.state().poll(&self.devices, pads, keys, &scripted);
+        let events = self
+            .state()
+            .poll(&self.devices, pads, keys, &scripted, scripted_pad);
         self.deliver(events);
     }
 
@@ -491,6 +587,7 @@ impl State {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         scripted: &[KeyState],
+        scripted_pad: Option<PadState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -509,16 +606,32 @@ impl State {
         #[cfg(any(test, feature = "diagnostics"))]
         merge_scripted(&mut pads, scripted);
         #[cfg(not(any(test, feature = "diagnostics")))]
-        let _ = (&mut pads, scripted);
+        let _ = (&mut pads, scripted, scripted_pad);
+        #[cfg(any(test, feature = "diagnostics"))]
+        let mut injected = scripted_pad;
+        #[cfg(any(test, feature = "diagnostics"))]
+        if let Some(extra) = scripted_pad
+            && let Some(pad) = pads.iter_mut().flatten().next()
+        {
+            *pad = merge_pad(*pad, extra);
+            injected = None;
+        }
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
         let fallback = (!any_pad).then(|| {
+            #[cfg(any(test, feature = "diagnostics"))]
+            let mut base = fallback(&keys);
+            #[cfg(not(any(test, feature = "diagnostics")))]
             let base = fallback(&keys);
             #[cfg(any(test, feature = "diagnostics"))]
             if !scripted.is_empty() {
-                return Value::Pad(merge_pad(base, fallback(scripted)));
+                base = merge_pad(base, fallback(scripted));
+            }
+            #[cfg(any(test, feature = "diagnostics"))]
+            if let Some(extra) = injected {
+                base = merge_pad(base, extra);
             }
             Value::Pad(base)
         });
@@ -1260,6 +1373,32 @@ mod host {
             }
         }
 
+        #[cfg(feature = "diagnostics")]
+        fn scripted_pad(&mut self) -> Option<PadState> {
+            static SCRIPT: LazyLock<Vec<(u64, PadState)>> = LazyLock::new(|| {
+                let text = std::env::var("VICTORY_SCRIPTED_INPUT").unwrap_or_default();
+                let segments = parse_script(&text);
+                if !segments.is_empty() {
+                    tracing::info!(segments = segments.len(), "VICTORY_SCRIPTED_INPUT");
+                }
+                segments
+            });
+            let frame = victory_gpu::frame::number();
+            let pad = scripted_pad_at(&SCRIPT, frame)?;
+            static LAST: Mutex<Option<PadState>> = Mutex::new(None);
+            if lock(&LAST).replace(pad) != Some(pad) {
+                tracing::info!(
+                    frame,
+                    buttons = format_args!("{:#x}", pad.buttons),
+                    left = format_args!("({}, {})", pad.left_x, pad.left_y),
+                    right = format_args!("({}, {})", pad.right_x, pad.right_y),
+                    triggers = format_args!("({}, {})", pad.left_trigger, pad.right_trigger),
+                    "scripted pad input"
+                );
+            }
+            Some(pad)
+        }
+
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
@@ -1357,6 +1496,7 @@ mod tests {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         scripted: Vec<KeyState>,
+        scripted_pad: Option<PadState>,
         rumble: Vec<(usize, u16, u16)>,
     }
 
@@ -1371,6 +1511,9 @@ mod tests {
         }
         fn scripted_keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().scripted.clone()
+        }
+        fn scripted_pad(&mut self) -> Option<PadState> {
+            self.0.lock().unwrap().scripted_pad
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
             self.0.lock().unwrap().rumble.push((slot, low, high));
@@ -1884,5 +2027,165 @@ mod tests {
         let back = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(back).buttons, A);
         release(back);
+    }
+
+    #[test]
+    fn scripted_input_timeline_holds_the_last_state() {
+        // `bad` has no frame, `40:fwd+bogus` and `50:look_rigth` have an
+        // unknown token: all three are dropped, so the last valid state wins.
+        let segments = parse_script(
+            "20:fwd;10:left+turn_right+a;bad;30:off;40:fwd+bogus;40:back;50:look_rigth",
+        );
+        assert_eq!(segments.len(), 4);
+        assert_eq!(scripted_pad_at(&segments, 9), None);
+        assert_eq!(
+            scripted_pad_at(&segments, 10),
+            Some(PadState {
+                buttons: A,
+                left_x: -1.0,
+                right_x: 1.0,
+                ..Default::default()
+            })
+        );
+        assert_eq!(scripted_pad_at(&segments, 19).unwrap().left_x, -1.0);
+        assert_eq!(
+            scripted_pad_at(&segments, 20),
+            Some(PadState {
+                left_y: 1.0,
+                ..Default::default()
+            })
+        );
+        assert_eq!(scripted_pad_at(&segments, 30), Some(PadState::default()));
+        assert_eq!(
+            scripted_pad_at(&segments, 40),
+            Some(PadState {
+                left_y: -1.0,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            scripted_pad_at(&segments, 49),
+            Some(PadState {
+                left_y: -1.0,
+                ..Default::default()
+            }),
+            "a typo must not turn the last good state off"
+        );
+        assert!(parse_script("").is_empty());
+    }
+
+    /// A bad token is reported once, at parse time, with the entry that
+    /// contained it (not on every frame that uses the timeline).
+    #[test]
+    fn scripted_input_warns_once_per_unknown_token() {
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Metadata, Subscriber, span};
+
+        #[derive(Default)]
+        struct Fields {
+            token: String,
+            entry: String,
+        }
+
+        impl Visit for Fields {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                match field.name() {
+                    "token" => self.token = value.to_owned(),
+                    "entry" => self.entry = value.to_owned(),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+        }
+
+        struct Capture(Arc<Mutex<Vec<(String, String)>>>);
+
+        impl Subscriber for Capture {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                metadata.is_event() && metadata.fields().field("token").is_some()
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                unreachable!()
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                assert_eq!(event.metadata().level(), &tracing::Level::WARN);
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0.lock().unwrap().push((fields.token, fields.entry));
+            }
+        }
+
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let dispatch = tracing::Dispatch::new(Capture(warnings.clone()));
+        let segments = tracing::dispatcher::with_default(&dispatch, || {
+            parse_script("10:fwd;20:fwd+look_rigth;30:fwrd+look_rigth;40:look_rigth;50:off")
+        });
+        assert_eq!(segments.len(), 2, "bad entries are dropped");
+        assert_eq!(
+            *warnings.lock().unwrap(),
+            [
+                ("look_rigth".to_owned(), "20:fwd+look_rigth".to_owned()),
+                ("fwrd".to_owned(), "30:fwrd+look_rigth".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn scripted_pad_reaches_the_stand_in_reading() {
+        let (hub, host) = fake();
+        let expected = PadState {
+            buttons: A,
+            left_y: 1.0,
+            right_x: -1.0,
+            ..Default::default()
+        };
+        host.lock().unwrap().scripted_pad = Some(expected);
+        hub.poll();
+        let reading = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(reading), expected);
+        release(reading);
+
+        host.lock().unwrap().scripted_pad = None;
+        hub.poll();
+        let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(rest), PadState::default());
+        release(rest);
+    }
+
+    #[test]
+    fn scripted_pad_overlays_a_host_pad() {
+        let (hub, host) = fake();
+        {
+            let mut h = host.lock().unwrap();
+            h.pads[0] = Some(PadState {
+                left_x: 0.5,
+                ..Default::default()
+            });
+            h.scripted_pad = Some(PadState {
+                buttons: A,
+                left_y: 1.0,
+                ..Default::default()
+            });
+        }
+        hub.poll();
+        let reading = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(
+            pad(reading),
+            PadState {
+                buttons: A,
+                left_x: 0.5,
+                left_y: 1.0,
+                ..Default::default()
+            }
+        );
+        release(reading);
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
     }
 }
