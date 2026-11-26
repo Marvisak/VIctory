@@ -270,6 +270,29 @@ mod tests {
         assert!(super::clamp().is_some());
     }
 
+    fn read_back_u32(host: &crate::host::Host, buffer: &super::ID3D12Resource, words: usize) -> Vec<u32> {
+        let bytes = (words * 4) as u64;
+        let (readback, ptr) = host.mapped_buffer(bytes, true).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: live buffers and open command list.
+        unsafe {
+            list.list.ResourceBarrier(&[super::transition(
+                buffer,
+                super::D3D12_RESOURCE_STATE_COMMON,
+                super::D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(&readback, 0, buffer, 0, bytes);
+            list.list.ResourceBarrier(&[super::transition(
+                buffer,
+                super::D3D12_RESOURCE_STATE_COPY_SOURCE,
+                super::D3D12_RESOURCE_STATE_COMMON,
+            )]);
+            list.close();
+            host.execute(&[&list]);
+            std::slice::from_raw_parts(ptr.cast::<u32>(), words).to_vec()
+        }
+    }
+
     /// Clamps `records` records of `kind`, filled by repeating `words`,
     /// `calls` times in one list: each record's first word in the list's
     /// argument buffer after (zero when it runs empty). The title's copy,
@@ -306,10 +329,8 @@ mod tests {
             for at in 0..all {
                 assert_eq!(data.add(at).read_volatile(), words[at % words.len()], "the title's copy as written");
             }
-            let mut out_data = std::ptr::null_mut();
-            out?.Map(0, None, Some(&mut out_data)).unwrap();
-            let first = |i: usize| out_data.cast::<u32>().add(i * per).read_volatile();
-            Some((0..records as usize).map(first).collect())
+            let clamped_words = read_back_u32(host, &out?, records as usize * per);
+            Some((0..records as usize).map(|i| clamped_words[i * per]).collect())
         }
     }
 
@@ -395,13 +416,8 @@ mod tests {
             assert!(run.iter().all(|t| t.0 != key(&title)), "the title's copy is never transitioned");
             assert!(states.values().all(|&s| s == 0), "all common again");
             for (out, _) in &recorded {
-                let mut p = std::ptr::null_mut();
-                // SAFETY: a mapped buffer of ours, the lists have run.
-                let clamped = unsafe {
-                    out.Map(0, None, Some(&mut p)).unwrap();
-                    p.cast::<[u32; 3]>().read_volatile()
-                };
-                assert_eq!(clamped, [65_535, 1, 1]);
+                let words = read_back_u32(host, out, 3);
+                assert_eq!([words[0], words[1], words[2]], [65_535, 1, 1]);
             }
             // SAFETY: as above.
             assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1], "the title's copy as written");

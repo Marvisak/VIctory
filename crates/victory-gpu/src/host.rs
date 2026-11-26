@@ -5,6 +5,8 @@
 //! overlap them with per-submission fences once more than clears run.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(feature = "diagnostics")]
+use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -42,6 +44,8 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    pub(crate) gpu_upload_supported: bool,
+    upload_vram_headroom: Mutex<Option<(Instant, u64, u64)>>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -204,6 +208,16 @@ fn create() -> windows::core::Result<Host> {
             )
             .is_ok()
             && options.DepthBoundsTestSupported.as_bool();
+        let mut options16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        let gpu_upload_supported = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS16,
+                (&raw mut options16).cast(),
+                size_of_val(&options16) as u32,
+            )
+            .is_ok()
+            && options16.GPUUploadHeapSupported.as_bool();
+        tracing::info!(gpu_upload_supported, "host GPU upload heap support");
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -250,6 +264,8 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             depth_bounds_supported,
+            gpu_upload_supported,
+            upload_vram_headroom: Mutex::new(None),
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -639,6 +655,14 @@ pub(crate) mod tests {
         list.reset();
         assert_eq!(list.scratch(512).unwrap(), first);
         list.close();
+    }
+
+    #[test]
+    fn upload_vram_fits_checks_80_percent_headroom() {
+        assert!(!upload_vram_fits(0, 0, 1024));
+        assert!(upload_vram_fits(790, 1000, 10));
+        assert!(!upload_vram_fits(790, 1000, 11));
+        assert!(!upload_vram_fits(u64::MAX, 1000, 1));
     }
 
     #[test]
@@ -1804,6 +1828,45 @@ impl HostList {
         }
     }
 
+    /// Trims only oversized buffers when a list stays in the hot spare pool
+    /// so normal indirect argument and scratch buffers are reused across frames.
+    pub(crate) fn trim_oversized_buffers(&self) {
+        const MAX_WARM_ARGUMENTS: u64 = 256 << 10;
+        const HOT_SCRATCH_CHUNKS: usize = 2;
+        {
+            let mut arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: a plain query on a live buffer.
+            if arguments.as_ref().is_some_and(|b| unsafe { b.GetDesc() }.Width > MAX_WARM_ARGUMENTS) {
+                *arguments = None;
+            }
+        }
+        let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if scratch.chunks.len() > HOT_SCRATCH_CHUNKS {
+            scratch.chunks.truncate(HOT_SCRATCH_CHUNKS);
+        }
+        scratch.current = 0;
+        scratch.used = 0;
+    }
+
+    /// Releases oversized buffers when a list is parked in the cold idle pool.
+    pub(crate) fn release_idle_buffers(&self) {
+        const IDLE_SCRATCH_SPARE: usize = 1;
+        *self.arguments.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let keep = if scratch
+            .chunks
+            .first()
+            .is_some_and(|c| c.capacity > FIRST_SCRATCH_CHUNK * 4)
+        {
+            0
+        } else {
+            IDLE_SCRATCH_SPARE
+        };
+        scratch.chunks.truncate(keep);
+        scratch.current = 0;
+        scratch.used = 0;
+    }
+
     /// Moves a title texture's host copy to `wanted` (a host state) in this
     /// list: the host texture and the state it leaves, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
@@ -2249,7 +2312,7 @@ impl HostList {
         if let Some(b) = arguments.as_ref().filter(|b| unsafe { b.GetDesc() }.Width >= bytes) {
             return Some(b.clone());
         }
-        let (made, _) = host()?.shared_buffer(bytes.next_power_of_two().max(1 << 16))?;
+        let made = host()?.default_uav_buffer(bytes.next_power_of_two().max(1 << 16))?;
         name(&made, || "indirect arguments".into());
         // Commands recorded earlier may still name the smaller one.
         if let Some(old) = arguments.replace(made.clone()) {
@@ -2678,12 +2741,136 @@ mod title_copies {
     }
 }
 
+/// Total bytes allocated in GPU_UPLOAD (VRAM) vs standard UPLOAD (RAM).
+#[cfg(feature = "diagnostics")]
+static UPLOAD_VRAM_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static UPLOAD_RAM_BYTES: AtomicU64 = AtomicU64::new(0);
+
+fn upload_vram_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("VICTORY_UPLOAD_VRAM").is_ok_and(|v| {
+            let v = v.trim();
+            v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no")
+        })
+    })
+}
+
+fn upload_vram_fits(local_used_bytes: u64, local_budget_bytes: u64, size: u64) -> bool {
+    local_budget_bytes > 0
+        && local_used_bytes
+            .saturating_add(size)
+            <= local_budget_bytes / 100 * 80 + (local_budget_bytes % 100) * 80 / 100
+}
+
 impl Host {
-    /// A buffer in the upload heap, mapped for writing.
     /// A GPU-only buffer of `size` bytes in the copy-destination state.
     pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.default_buffer_with(size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)
+    }
+
+    /// A GPU-only unordered-access buffer of `size` bytes in the common state.
+    pub(crate) fn default_uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.default_buffer_with(
+            size,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        )
+    }
+
+    fn default_buffer_with(
+        &self,
+        size: u64,
+        flags: D3D12_RESOURCE_FLAGS,
+        initial_state: D3D12_RESOURCE_STATES,
+    ) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                initial_state,
+                None,
+                &mut buffer,
+            )
+        };
+        made.ok().and(buffer)
+    }
+
+    fn upload_vram_has_headroom(&self, size: u64) -> bool {
+        let mut cache = self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let refresh = size >= (4 << 20)
+            || cache
+                .as_ref()
+                .is_none_or(|(at, _, _)| now.duration_since(*at) >= Duration::from_millis(250));
+        if refresh {
+            let Some([(local_mb, budget_mb), _]) = video_memory() else {
+                *cache = None;
+                return false;
+            };
+            let used = (local_mb.max(0.0) * 1e6) as u64;
+            let budget = (budget_mb.max(0.0) * 1e6) as u64;
+            *cache = Some((now, used, budget));
+        }
+        let Some((_, used, budget)) = &*cache else {
+            return false;
+        };
+        upload_vram_fits(*used, *budget, size)
+    }
+
+    fn note_upload_vram(&self, size: u64) {
+        let mut cache = self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, used, _)) = cache.as_mut() {
+            *used = used.saturating_add(size);
+        }
+    }
+
+    fn invalidate_upload_vram(&self) {
+        *self.upload_vram_headroom.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if self.gpu_upload_supported
+            && upload_vram_enabled()
+            && self.upload_vram_has_headroom(size)
+            && let Some(made) = self.upload_vram_buffer(size)
+        {
+            self.note_upload_vram(size);
+            #[cfg(feature = "diagnostics")]
+            UPLOAD_VRAM_BYTES.fetch_add(size, Ordering::Relaxed);
+            return Some(made);
+        }
+        let made = self.mapped_buffer(size, false)?;
+        #[cfg(feature = "diagnostics")]
+        UPLOAD_RAM_BYTES.fetch_add(size, Ordering::Relaxed);
+        Some(made)
+    }
+
+    fn upload_vram_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
             ..Default::default()
         };
         let desc = D3D12_RESOURCE_DESC {
@@ -2697,27 +2884,36 @@ impl Host {
             ..Default::default()
         };
         let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation.
+        let mut data = std::ptr::null_mut();
+        // SAFETY: GPU_UPLOAD buffers start in COMMON and are persistently mapped.
         let made = unsafe {
-            self.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut buffer,
-            )
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
         };
-        made.ok().and(buffer)
-    }
-
-    pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        self.mapped_buffer(size, false)
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                self.invalidate_upload_vram();
+                tracing::debug!(error = %e, size, "GPU_UPLOAD buffer fell back to UPLOAD");
+                None
+            }
+        }
     }
 
     /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
     /// readback memory in the copy-destination state.
-    fn mapped_buffer(&self, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
+    pub(crate) fn mapped_buffer(&self, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: if readback { D3D12_HEAP_TYPE_READBACK } else { D3D12_HEAP_TYPE_UPLOAD },
             ..Default::default()
@@ -3102,13 +3298,15 @@ impl Meter {
                     tracing::info!(
                         "video memory: {local:.0} MB of a {budget:.0} MB budget on the card, \
                          {system:.0} MB of {system_budget:.0} MB in system memory; process commit {:.0} MB, \
-                         working set {:.0} MB; Rust heap {:.0} MB; placed textures made {:.0} MB; list upload memory {} blocks {:.0} MB",
+                         working set {:.0} MB; Rust heap {:.0} MB; placed textures made {:.0} MB; list upload memory {} blocks {:.0} MB; upload VRAM {:.0} MB / RAM {:.0} MB",
                         commit as f64 / 1e6,
                         working_set as f64 / 1e6,
                         crate::copystat::HEAP_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
                         crate::resource::PLACED_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
                         crate::list::UPLOADS[0].load(Ordering::Relaxed),
                         crate::list::UPLOADS[1].load(Ordering::Relaxed) as f64 / 1e6,
+                        UPLOAD_VRAM_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+                        UPLOAD_RAM_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
                     );
                 }
                 let [gpu, title] = crate::resource::texture_census().map(|r| r.map(|b| b as f64 / 1e6));
