@@ -826,12 +826,39 @@ pub(crate) fn view_writes(memory: bool) -> Option<u64> {
 
 /// Heap slots whose texture views shaders read: the marks seen so far (a
 /// slot's stays set in the bitmap until [`forget_read`]), and the slots to
-/// clear at the next [`take_reads`].
+/// clear before the next submission.
 static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()));
+
+/// Clear forgotten read marks after the previous submission has finished and
+/// before the next one runs. Doing this before execution matters: clearing in
+/// [`take_reads`] would also erase a new mark written by that next submission.
+pub(crate) fn clear_forgotten() {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let first = (victory_shader::emit::VIEW_READS / 32) as usize;
+    let mut maps: Vec<&mut [u32]> = [false, true]
+        .into_iter()
+        .filter_map(bitmap)
+        // SAFETY: the previous submission is done and the next has not run.
+        .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
+        .collect();
+    if maps.is_empty() {
+        return;
+    }
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    let (seen, forgotten) = &mut *reads;
+    seen.resize(words, 0);
+    for slot in forgotten.drain(..) {
+        let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
+        if w < words {
+            maps.iter_mut().for_each(|bits| bits[w] &= !bit);
+            seen[w] &= !bit;
+        }
+    }
+}
 
 /// After a submission: the heap slots its shaders first read texture views
 /// at (`victory_shader::emit`, "Read marks"), each once until
-/// [`forget_read`]. Clears the slots forgotten since first.
+/// [`forget_read`].
 pub(crate) fn take_reads() -> Vec<u32> {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
@@ -847,15 +874,8 @@ pub(crate) fn take_reads() -> Vec<u32> {
         return Vec::new();
     }
     let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
-    let (seen, forgotten) = &mut *reads;
+    let (seen, _) = &mut *reads;
     seen.resize(words, 0);
-    for slot in forgotten.drain(..) {
-        let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
-        if w < words {
-            maps.iter_mut().for_each(|bits| bits[w] &= !bit);
-            seen[w] &= !bit;
-        }
-    }
     let mut new = Vec::new();
     for (w, s) in seen.iter_mut().enumerate() {
         let mut fresh = maps.iter().fold(0, |x, bits| x | bits[w]) & !*s;
