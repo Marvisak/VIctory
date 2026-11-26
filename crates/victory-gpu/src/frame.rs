@@ -253,7 +253,7 @@ mod tests {
         );
         assert_eq!(
             next_tick_at(0, interval, Duration::ZERO, 1, Duration::ZERO),
-            (2, interval, false),
+            (2, interval * 2, false),
             "a kind never takes the same tick twice"
         );
     }
