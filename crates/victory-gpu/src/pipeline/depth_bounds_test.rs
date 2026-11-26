@@ -79,7 +79,7 @@ fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[
 
 /// The host pipeline once a worker has made it (`make`): a first use waits
 /// for it only within the frame's budget, which other tests share.
-fn made(pso: This) -> &'static host::HostPipeline {
+fn made(pso: This) -> Arc<host::HostPipeline> {
     let started = std::time::Instant::now();
     loop {
         if let Some(p) = host_pipeline(pso) {

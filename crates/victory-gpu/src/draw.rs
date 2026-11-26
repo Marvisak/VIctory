@@ -63,6 +63,9 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    /// Host DXGI formats of the bound render targets, in `OMSetRenderTargets` order.
+    target_formats: [DXGI_FORMAT; 8],
+    target_count: usize,
     depth: usize,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
@@ -166,10 +169,10 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// (the reason [`not_run`] gave, if its pipeline has a host one) and notes
 /// it in the list (diagnostics).
 #[cfg(feature = "diagnostics")]
-fn dropped(list: &HostList, pipeline: usize, kind: &str) {
+fn dropped(list: &HostList, pipeline: usize, targets: &[DXGI_FORMAT], kind: &str) {
     let why = NOT_RUN.with(|w| w.replace(""));
-    if why.is_empty() || crate::pipeline::host_pipeline(pipeline as This).is_none() {
-        crate::pipeline::note_drop(pipeline as This);
+    if why.is_empty() || crate::pipeline::host_pipeline_for(pipeline as This, targets).is_none() {
+        crate::pipeline::note_drop_for(pipeline as This, targets);
     } else {
         crate::pipeline::note_why(format!("{kind}: {why} {}", crate::pipeline::shaders_of(pipeline as This)));
     }
@@ -231,6 +234,19 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// The host DXGI format of a render target view on `texture`.
+fn rtv_format(
+    texture: &ID3D12Resource,
+    desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
+) -> DXGI_FORMAT {
+    desc.map(|d| d.Format)
+        .filter(|&f| f != DXGI_FORMAT::default())
+        .unwrap_or_else(|| {
+            // SAFETY: a live resource.
+            unsafe { texture.GetDesc() }.Format
+        })
 }
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
@@ -412,6 +428,8 @@ impl State {
             return;
         };
         self.targets.clear();
+        self.target_formats = [DXGI_FORMAT::default(); 8];
+        self.target_count = 0;
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -427,7 +445,12 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
+            let desc = record.desc();
+            if self.target_count < self.target_formats.len() {
+                self.target_formats[self.target_count] = rtv_format(&texture, desc.as_ref());
+                self.target_count += 1;
+            }
+            rtvs.push(host.rtv(&texture, desc.as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -529,13 +552,25 @@ impl State {
         self.prepare_for(list, indexed, false)
     }
 
+    fn target_formats(&self) -> &[DXGI_FORMAT] {
+        &self.target_formats[..self.target_count]
+    }
+
+    fn host_pipeline(&self, compute: bool) -> Option<std::sync::Arc<HostPipeline>> {
+        if compute {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+        } else {
+            crate::pipeline::host_pipeline_for(self.pipeline as This, self.target_formats())
+        }
+    }
+
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.host_pipeline(false) else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -543,7 +578,7 @@ impl State {
             not_run("another kind of pipeline");
             return false;
         }
-        if !self.bind(list, p, false) {
+        if !self.bind(list, &p, false) {
             return false;
         }
         let l = &list.list;
@@ -1097,27 +1132,27 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            dropped(list, self.pipeline, "dispatch");
+            dropped(list, self.pipeline, &[], "dispatch");
             return;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.host_pipeline(true) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(list, self.pipeline, "dispatch");
+            dropped(list, self.pipeline, &[], "dispatch");
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        if !self.bind(list, &p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(list, self.pipeline, "dispatch");
+            dropped(list, self.pipeline, &[], "dispatch");
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -1138,7 +1173,7 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.host_pipeline(compute) else {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
@@ -1216,7 +1251,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(list, self.pipeline, "mesh");
+            dropped(list, self.pipeline, self.target_formats(), "mesh");
         }
     }
 
@@ -1410,7 +1445,7 @@ impl State {
         if !crate::capture::listed(crate::queue::presented() + 1) {
             return;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        let Some(p) = self.host_pipeline(compute) else { return };
         for stage in &p.stages {
             for u in &stage.translated().used {
                 let (RootType::Table, Some(Root::Table(table))) =
@@ -1445,7 +1480,7 @@ impl State {
         if !crate::capture::listed(crate::queue::presented() + 1) {
             return;
         }
-        let (Some(p), Some(host)) = (crate::pipeline::host_pipeline(self.pipeline as This), crate::host::host()) else {
+        let (Some(p), Some(host)) = (self.host_pipeline(true), crate::host::host()) else {
             return;
         };
         for stage in &p.stages {
@@ -1509,7 +1544,7 @@ impl State {
     /// builds).
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.host_pipeline(compute) else {
             return vec!["no host pipeline".into()];
         };
         let mut out = Vec::new();
@@ -1591,19 +1626,19 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(list, self.pipeline, "draw");
+            dropped(list, self.pipeline, self.target_formats(), "draw");
         }
     }
 
     /// Whether the bound pipeline's geometry shader completes rectangles.
     fn completes_rectangles(&self) -> bool {
-        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rectangles)
+        self.host_pipeline(false).is_some_and(|p| p.rectangles)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.host_pipeline(false) else {
             return false;
         };
         let rects = u64::from(count / 3);
@@ -1685,7 +1720,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(list, self.pipeline, "indexed");
+            dropped(list, self.pipeline, self.target_formats(), "indexed");
         }
     }
 }
@@ -1731,9 +1766,13 @@ impl State {
         // the arguments and dispatch a compute shader for records nothing
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
-        if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+        let compute = kind == DISPATCH;
+        if self.host_pipeline(compute).is_none() {
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            crate::pipeline::note_drop_for(
+                self.pipeline as This,
+                if compute { &[] } else { self.target_formats() },
+            );
             why("no host pipeline");
             return false;
         }
@@ -1778,8 +1817,8 @@ impl State {
                 }) && self.prepare(list, kind == INDEXED)
             }
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
+            DISPATCH => match self.host_pipeline(true) {
+                Some(p) if p.compute => self.bind(list, &p, true),
                 _ => false,
             },
             _ => false,
@@ -1787,9 +1826,12 @@ impl State {
         if !ran {
             crate::indirect::done(list, &clamped);
             #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
+            match self.host_pipeline(compute) {
                 None => {
-                    crate::pipeline::note_drop(self.pipeline as This);
+                    crate::pipeline::note_drop_for(
+                        self.pipeline as This,
+                        if compute { &[] } else { self.target_formats() },
+                    );
                     list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
                 }
                 Some(p) => why(&format!(

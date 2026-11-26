@@ -232,6 +232,50 @@ impl GraphicsState {
         }
     }
 
+    /// Render-target formats adjusted to the bound RTV formats `bound` where a
+    /// declared slot differs; `None` when every bound target already matches.
+    pub(crate) fn targets_for(&self, bound: &[DXGI_FORMAT]) -> Option<D3D12_RT_FORMAT_ARRAY> {
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let mut targets = self.targets;
+        let mut changed = false;
+        for (slot, &actual) in targets.RTFormats[..count].iter_mut().zip(bound) {
+            if *slot != DXGI_FORMAT_UNKNOWN && actual != DXGI_FORMAT_UNKNOWN && actual != *slot {
+                *slot = actual;
+                changed = true;
+            }
+        }
+        changed.then_some(targets)
+    }
+
+    /// A copy of this state with render-target formats replaced by `targets`,
+    /// re-pointing input element names into the cloned `names`.
+    pub(crate) fn with_targets(&self, targets: D3D12_RT_FORMAT_ARRAY) -> GraphicsState {
+        let names = self.names.clone();
+        let inputs = self
+            .inputs
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                ..*e
+            })
+            .collect();
+        GraphicsState {
+            blend: self.blend,
+            sample_mask: self.sample_mask,
+            rasterizer: self.rasterizer,
+            depth: self.depth,
+            depth_bounds: self.depth_bounds,
+            inputs,
+            names,
+            strip_cut: self.strip_cut,
+            topology: self.topology,
+            targets,
+            depth_format: self.depth_format,
+            samples: self.samples,
+        }
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
@@ -1041,5 +1085,109 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    #[test]
+    fn targets_for_overrides_only_mismatched_declared_slots() {
+        let state = GraphicsState {
+            targets: targets(&[DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM]),
+            ..GraphicsState::default()
+        };
+        // Matching or unbound targets reuse the base pipeline.
+        assert!(state.targets_for(&[]).is_none());
+        assert!(state.targets_for(&[DXGI_FORMAT_R10G10B10A2_UNORM]).is_none());
+        assert!(
+            state
+                .targets_for(&[DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM])
+                .is_none()
+        );
+        assert!(
+            state
+                .targets_for(&[DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R8G8B8A8_UNORM])
+                .is_none()
+        );
+
+        // Slot 0 differs: only slot 0 changes; slot 1 keeps its declared format.
+        let variant = state
+            .targets_for(&[DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM])
+            .expect("mismatch in slot 0");
+        assert_eq!(variant.NumRenderTargets, 2);
+        assert_eq!(variant.RTFormats[0], DXGI_FORMAT_R11G11B10_FLOAT);
+        assert_eq!(variant.RTFormats[1], DXGI_FORMAT_R8G8B8A8_UNORM);
+
+        // Extra bound slots past NumRenderTargets do not alter the pipeline.
+        let one = GraphicsState {
+            targets: targets(&[DXGI_FORMAT_R10G10B10A2_UNORM]),
+            ..GraphicsState::default()
+        };
+        assert!(
+            one.targets_for(&[DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM])
+                .is_none()
+        );
+
+        // Undeclared (UNKNOWN) slots stay UNKNOWN.
+        let gap = GraphicsState {
+            targets: targets(&[DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R8G8B8A8_UNORM]),
+            ..GraphicsState::default()
+        };
+        assert!(
+            gap.targets_for(&[DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM])
+                .is_none()
+        );
+        let gap_var = gap
+            .targets_for(&[DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT])
+            .expect("mismatch in slot 1");
+        assert_eq!(gap_var.RTFormats[0], DXGI_FORMAT_UNKNOWN);
+        assert_eq!(gap_var.RTFormats[1], DXGI_FORMAT_R16G16B16A16_FLOAT);
+
+        // Depth-only pipelines (0 render targets) never build RTV format variants.
+        let depth_only = GraphicsState::default();
+        assert!(depth_only.targets_for(&[DXGI_FORMAT_R11G11B10_FLOAT]).is_none());
+    }
+
+    #[test]
+    fn with_targets_repoints_input_names_and_updates_description() {
+        let mut original = GraphicsState {
+            blend: blending(false),
+            targets: targets(&[DXGI_FORMAT_R10G10B10A2_UNORM]),
+            ..GraphicsState::default()
+        };
+        let name = c"POSITION";
+        let input = D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(name.as_ptr().cast()),
+            SemanticIndex: 0,
+            Format: DXGI_FORMAT_R32G32B32_FLOAT,
+            InputSlot: 0,
+            AlignedByteOffset: 0,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        };
+        #[repr(C)]
+        struct InputLayoutSub {
+            kind: u64,
+            layout: D3D12_INPUT_LAYOUT_DESC,
+        }
+        let sub = InputLayoutSub {
+            kind: 12,
+            layout: D3D12_INPUT_LAYOUT_DESC {
+                pInputElementDescs: &input,
+                NumElements: 1,
+            },
+        };
+        // SAFETY: `sub` is a complete kind-12 input layout subobject.
+        unsafe { original.read(12, std::ptr::from_ref(&sub).cast()) };
+        let orig_desc = original.describe();
+        let new_targets = targets(&[DXGI_FORMAT_R8_UINT]);
+        let cloned = original.with_targets(new_targets);
+        drop(original);
+
+        assert_ne!(cloned.describe(), orig_desc);
+        assert_eq!(cloned.targets.RTFormats[0], DXGI_FORMAT_R8_UINT);
+        // SAFETY: SemanticName points into `cloned.names` after `original` was dropped.
+        let semantic = unsafe { CStr::from_ptr(cloned.inputs[0].SemanticName.0.cast()) };
+        assert_eq!(semantic, c"POSITION");
+        // Blending is disabled on the integer format variant too.
+        let host = host_blend(&cloned.blend, &cloned.targets);
+        assert!(!host.RenderTarget[0].BlendEnable.as_bool());
     }
 }

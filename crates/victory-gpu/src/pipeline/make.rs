@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
+use windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY;
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -35,13 +36,16 @@ pub(crate) struct Pending {
     /// whether a worker took it (it may be in both queues).
     now: AtomicBool,
     taken: AtomicBool,
-    made: OnceLock<Option<HostPipeline>>,
+    made: OnceLock<Option<Arc<HostPipeline>>>,
     #[cfg(feature = "diagnostics")]
     pub(super) skipped_shader: Option<String>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     pub(crate) key: String,
     used: AtomicBool,
+    /// Whether first use records `key` in the early-start list (false for
+    /// format variants made at draw time, which title creation never names).
+    record_early: bool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -81,13 +85,49 @@ impl Pending {
             #[cfg(feature = "diagnostics")]
             skipped_shader,
             used: AtomicBool::new(false),
+            record_early: true,
+        }
+    }
+
+    /// A format variant of this graphics pipeline, made lazily when bound
+    /// render targets differ from the declared `RTFormats`.
+    pub(crate) fn variant(&self, targets: D3D12_RT_FORMAT_ARRAY) -> Pending {
+        let graphics = self
+            .graphics
+            .as_deref()
+            .map(|g| Box::new(g.with_targets(targets)));
+        let key = key(&self.shaders, graphics.as_deref());
+        #[cfg(feature = "diagnostics")]
+        log("created", &key, || {
+            let state = graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
+            format!("{:?}\t{state}", self.shaders)
+        });
+        let made = OnceLock::new();
+        #[cfg(feature = "diagnostics")]
+        let skipped_shader = self.skipped_shader.clone();
+        #[cfg(feature = "diagnostics")]
+        if skipped_shader.is_some() {
+            let _ = made.set(None);
+        }
+        Pending {
+            key,
+            shaders: self.shaders.clone(),
+            graphics,
+            queued: AtomicBool::new(false),
+            now: AtomicBool::new(false),
+            taken: AtomicBool::new(false),
+            made,
+            #[cfg(feature = "diagnostics")]
+            skipped_shader,
+            used: AtomicBool::new(false),
+            record_early: false,
         }
     }
 
     fn make(&self) {
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref()).map(Arc::new);
             #[cfg(feature = "diagnostics")]
             log_built(&self.key);
             let (user, kernel) = super::thread_cpu_since(cpu);
@@ -190,11 +230,13 @@ pub(crate) fn waiting() -> u64 {
 
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
-pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+pub(crate) fn ready(p: &Arc<Pending>) -> Option<Arc<HostPipeline>> {
     // Listed for an early start in later runs from its first use, made or
     // not: one a run never got made is the one it should start early.
     if !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
+        if p.record_early {
+            super::library::note_used(&p.key);
+        }
         #[cfg(feature = "diagnostics")]
         log("used", &p.key, String::new);
     }
@@ -202,7 +244,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, true);
         wait(p, crate::frame::current());
     }
-    p.made.get()?.as_ref()
+    p.made.get()?.clone()
 }
 
 /// Queues `p` for the workers: once, and once more ahead of the early
@@ -431,5 +473,42 @@ mod tests {
         assert!(matches!(cold.made.get(), Some(None)));
         assert!(matches!(warm.made.get(), Some(None)));
         assert!(shader.translated.get().is_none());
+    }
+
+    #[test]
+    fn format_variant_does_not_record_early_and_inherits_skip() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] =
+            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM;
+        let base = Pending::new(
+            Vec::new(),
+            Some(Box::new(g)),
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
+        let mut alt = D3D12_RT_FORMAT_ARRAY {
+            NumRenderTargets: 1,
+            ..Default::default()
+        };
+        alt.RTFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R11G11B10_FLOAT;
+        let variant = base.variant(alt);
+        assert!(base.record_early);
+        assert!(!variant.record_early);
+        assert_ne!(variant.key, base.key);
+        #[cfg(feature = "diagnostics")]
+        {
+            let hashes = crate::pipeline::parse_skip_hashes(" 0123456789ABCDEF ");
+            let shader = Arc::new(Shader {
+                stage: "pixel",
+                hash: "0123456789abcdef".into(),
+                container: Vec::new(),
+                translated: OnceLock::new(),
+            });
+            let skipped = Pending::new(vec![shader], None, &hashes);
+            let skipped_variant = skipped.variant(alt);
+            assert!(skipped_variant.skipped_shader.is_some());
+            assert!(matches!(skipped_variant.made.get(), Some(None)));
+        }
     }
 }

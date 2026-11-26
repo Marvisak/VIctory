@@ -206,6 +206,10 @@ fn with_resources(
     Ok(Translated { host, used })
 }
 
+/// Render-target format key for lazy host pipeline variants: `(NumRenderTargets, RTFormats)`.
+#[cfg(windows)]
+type TargetFormatsKey = (u32, [i32; 8]);
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
@@ -218,6 +222,10 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    /// Lazy host pipeline variants keyed by bound RTV formats when a draw
+    /// binds formats that differ from the declared ones.
+    #[cfg(windows)]
+    variants: Mutex<Vec<(TargetFormatsKey, Arc<make::Pending>)>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -245,15 +253,59 @@ pub(crate) fn bound(this: This) {
     }
 }
 
+#[cfg(windows)]
+impl Pipeline {
+    /// Returns a cached (or lazily created) format variant when any bound
+    /// render-target format differs from the declared `RTFormats`.
+    fn variant_for(
+        &self,
+        targets: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT],
+    ) -> Option<Arc<make::Pending>> {
+        let g = self.host.graphics.as_deref()?;
+        let overridden = g.targets_for(targets)?;
+        let key = (overridden.NumRenderTargets, overridden.RTFormats.map(|f| f.0));
+        let mut variants = self.variants.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, existing)) = variants.iter().find(|(k, _)| *k == key) {
+            return Some(existing.clone());
+        }
+        tracing::info!(
+            shaders = ?self.shaders,
+            declared = ?&g.targets.RTFormats[..(g.targets.NumRenderTargets as usize).min(8)],
+            bound = ?&overridden.RTFormats[..(overridden.NumRenderTargets as usize).min(8)],
+            "pipeline render target format variant"
+        );
+        let variant = Arc::new(self.host.variant(overridden));
+        variants.push((key, variant.clone()));
+        Some(variant)
+    }
+}
+
 /// The host pipeline of a title pipeline; `None` if it is skipped, one of its
 /// shaders does not translate, the host refuses it, or it is still being made
 /// (its first use starts that, see [`make`]).
 #[cfg(windows)]
-pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+pub(crate) fn host_pipeline(this: This) -> Option<Arc<host::HostPipeline>> {
     if this.is_null() {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// As [`host_pipeline`], matching the bound render-target formats `targets`
+/// (building a format variant lazily if a declared target slot differs).
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for(
+    this: This,
+    targets: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT],
+) -> Option<Arc<host::HostPipeline>> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    match p.variant_for(targets) {
+        Some(variant) => make::ready(&variant),
+        None => make::ready(&p.host),
+    }
 }
 
 /// Host pipelines queued and not made yet.
@@ -326,6 +378,15 @@ pub(crate) fn shaders_of(this: This) -> String {
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_drop(this: This) {
+    note_drop_for(this, &[]);
+}
+
+/// As [`note_drop`], for a graphics draw with bound render-target formats.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_drop_for(
+    this: This,
+    targets: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT],
+) {
     let why = if this.is_null() {
         Some("no pipeline set".to_owned())
     } else {
@@ -334,7 +395,10 @@ pub(crate) fn note_drop(this: This) {
             .skipped_shader
             .as_deref()
             .map(|hash| format!("skipped shader {hash}"))
-            .or_else(|| make::missing(&p.host))
+            .or_else(|| match p.variant_for(targets) {
+                Some(variant) => make::missing(&variant),
+                None => make::missing(&p.host),
+            })
     };
     if let Some(why) = why {
         note_why(why);
@@ -392,6 +456,8 @@ fn hand_out(
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        variants: Mutex::new(Vec::new()),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -901,3 +967,5 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod depth_bounds_test;
+#[cfg(all(test, windows))]
+mod rtv_format_test;
