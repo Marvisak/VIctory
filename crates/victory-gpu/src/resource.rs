@@ -824,6 +824,9 @@ struct Resource {
     /// given up by [`evict`]); `Some(None)`: the host refused it.
     #[cfg(windows)]
     host: std::sync::Mutex<Option<Option<std::sync::Arc<HostTexture>>>>,
+    /// At most one caller makes the host texture for this resource at a time.
+    #[cfg(windows)]
+    making: std::sync::atomic::AtomicBool,
     /// The host had no memory for it ([`OUT_OF_MEMORY`]): not asked again
     /// before this [`now_ms`] (0: never).
     #[cfg(windows)]
@@ -1409,6 +1412,16 @@ thread_local! {
     static FAIL_NEXT: std::cell::Cell<Option<windows::core::HRESULT>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(windows)]
+struct HostMaking<'a>(&'a std::sync::atomic::AtomicBool);
+
+#[cfg(windows)]
+impl Drop for HostMaking<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// How long a texture the host had no memory for waits before it is asked
 /// for again ([`Resource::host`]), the first time.
 #[cfg(windows)]
@@ -1623,6 +1636,20 @@ impl Resource {
     #[cfg(windows)]
     fn host(&self) -> Option<std::sync::Arc<HostTexture>> {
         use std::sync::atomic::Ordering::Relaxed;
+        if let Some(made) = self.host.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            return made;
+        }
+        if now_ms() < self.refused_until.load(Relaxed) {
+            REFUSED_FOR_MEMORY.set(true);
+            return None;
+        }
+        if self.making.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            // Another caller is making it. Its result (or refusal) will be
+            // visible on the next read, without a duplicate allocation.
+            REFUSED_FOR_MEMORY.set(true);
+            return None;
+        }
+        let _making = HostMaking(&self.making);
         if let Some(made) = self.host.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             return made;
         }
@@ -1940,6 +1967,8 @@ fn hand_out_resource(
         backing,
         #[cfg(windows)]
         host: std::sync::Mutex::new(None),
+        #[cfg(windows)]
+        making: std::sync::atomic::AtomicBool::new(false),
         #[cfg(windows)]
         refused_until: std::sync::atomic::AtomicU64::new(0),
         #[cfg(windows)]
