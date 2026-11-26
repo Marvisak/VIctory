@@ -1504,6 +1504,8 @@ fn bfe_signed_and_unsigned_match_rdna2() {
         ([0xd2f9_0159, 28, 16, 0], 0xffff_fffd),
         ([0x8000_0000, 31, 4, 0], 0xffff_ffff),
         ([0x7000_0000, 28, 8, 0], 0x0000_0007),
+        // Field ends exactly at bit 31.
+        ([0x8000_0000, 28, 4, 0], 0xffff_fff8),
         // Normal fields inside 32 bits.
         ([0x0000_0080, 4, 4, 0], 0xffff_fff8),
         ([0x0000_0070, 4, 4, 0], 0x0000_0007),
@@ -1521,10 +1523,26 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
-    // v_bfe_{i32,u32} width is 5-bit (src2[4:0]), so width=32 wraps to 0.
-    for (name, shader) in [("v_bfe_i32", &v_signed), ("v_bfe_u32", &v_unsigned)] {
-        run_cases(shader, &[[0x8000_0000, 4, 32, 0]], |backend, _, _, got| {
-            assert_eq!(got, 0, "{backend}: {name} width 32 should mask to 0");
+    let vector_cases = [
+        // Only the low five bits of both offset and width are used.
+        ([0x8000_0000, 4, 32, 0], [0, 0]),
+        ([0x8000_0000, u32::MAX, 33, 0], [1, u32::MAX]),
+        ([0x0000_0080, 36, 36, 0], [8, 0xffff_fff8]),
+        ([0x8000_0000, 28, 4, 0], [8, 0xffff_fff8]),
+        ([0x8000_0000, 28, 5, 0], [8, 0xffff_fff8]),
+        ([0xffff_ffff, 0, 31, 0], [0x7fff_ffff, u32::MAX]),
+        ([0xffff_ffff, 31, 0, 0], [0, 0]),
+    ];
+    let inputs = vector_cases.map(|(input, _)| input);
+    for (signed, (name, shader)) in [("v_bfe_u32", &v_unsigned), ("v_bfe_i32", &v_signed)]
+        .into_iter()
+        .enumerate()
+    {
+        run_cases(shader, &inputs, |backend, i, input, got| {
+            assert_eq!(
+                got, vector_cases[i].1[signed],
+                "{backend}: {name} {input:x?}"
+            );
         });
     }
 
