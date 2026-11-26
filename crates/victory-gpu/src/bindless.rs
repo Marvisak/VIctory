@@ -159,18 +159,8 @@ fn seen(view: &View) -> Option<Seen> {
         return crate::texture::title_written(&texture.texture).then_some(Seen::Texture(*resource));
     }
     // The copy the host view reads.
-    let (shadow, address, len) = match *view {
-        View::Constant(address, size) => {
-            let len = u64::from(size);
-            ((len > 0).then(|| crate::shadow::find(address, len)).flatten()?, address, len)
-        }
-        _ => crate::descriptor::host::view_copy(view)?,
-    };
+    let (shadow, address, len) = crate::descriptor::host::view_copy(view)?;
     let uav = matches!(view, View::Unordered(..) | View::Placed(true, ..));
-    if len == 0 {
-        return None;
-    }
-    let len = len.min(shadow.left(address));
     Some(Seen::Buffer(shadow, address, len, uav))
 }
 
@@ -692,5 +682,211 @@ void main(uint3 id : SV_DispatchThreadID) {
                 assert_eq!(v, base + i as u32 + u32::from(texel), "round {round}, dword {i}");
             }
         }
+    }
+
+    /// Reads a constant buffer slot (made as a raw buffer SRV) at its first
+    /// 62 dwords, its last in-bounds dword (255), and an out-of-bounds dword
+    /// (300) past the registered buffer's end, or fills a raw UAV slot.
+    const CBV_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), DescriptorTable(SRV(t0), UAV(u0), UAV(u1))"
+cbuffer Mode : register(b0) { uint mode; uint seed; };
+ByteAddressBuffer cb : register(t0);
+RWByteAddressBuffer dst : register(u0);
+RWByteAddressBuffer cb_uav : register(u1);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint i = id.x;
+    if (mode == 1) {
+        cb_uav.Store(i * 4, seed + i);
+        if (i == 0) {
+            cb_uav.Store(255 * 4, seed + 255);
+        }
+        return;
+    }
+    uint v = (i == 62) ? cb.Load(255 * 4)
+           : (i == 63) ? cb.Load(300 * 4)
+           : cb.Load(i * 4);
+    dst.Store(i * 4, v);
+}
+"#;
+
+    fn compile_cbv() -> (ID3D12RootSignature, ID3D12PipelineState) {
+        let host = crate::host::host().unwrap();
+        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+        // SAFETY: the source and names outlive the call.
+        unsafe {
+            D3DCompile(
+                CBV_SOURCE.as_ptr().cast(),
+                CBV_SOURCE.len(),
+                s!("cbv_heap"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: the blob's own bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+        };
+        // SAFETY: a compiled shader with its root signature inside.
+        unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            };
+            let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(&desc).unwrap();
+            (root, pso)
+        }
+    }
+
+    /// A 64 KiB constant buffer view placed 1 KiB from the end of a 64 KiB
+    /// title buffer binds to and refreshes that buffer's host copy (not a
+    /// separate 4 MiB loose window), reads 0 past the buffer's end, and sees
+    /// GPU unordered-access writes into the same buffer's copy.
+    #[test]
+    fn overlong_constant_views_read_their_buffers_copy() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let cb = resource(1, 0x10000, 1, 0, 1);
+        let dst = resource(1, 256, 1, 0, 1);
+        let (cb_ptr, _) = crate::resource::buffer_bytes(cb).unwrap();
+        let (dst_ptr, _) = crate::resource::buffer_bytes(dst).unwrap();
+        let cb_base = cb_ptr as u64;
+        let cb_at = cb_base + 0xfc00;
+
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let slot = |i: u64| title_heap.start + 32 * i;
+        let cbv: [u32; 4] = [cb_at as u32, (cb_at >> 32) as u32, 65536, 0];
+        let dst_uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let cb_uav: [u32; 10] = [39, 1, 0xfc00 / 4, 0, 256, 0, 0, 0, 1, 0];
+        crate::descriptor::create_cbv(null, &cbv, slot(0));
+        crate::descriptor::create_uav(null, dst, null, &dst_uav, slot(1));
+
+        let heap_host = title_heap.host().expect("a host view heap");
+        let cb_copy = crate::shadow::find(cb_base, 0x10000).expect("the buffer's host copy");
+        let out = crate::shadow::find(dst_ptr as u64, 256).expect("the output's host copy");
+        let hulls = heap_host.viewed.ranges();
+        assert!(
+            hulls.iter().any(|(s, a, len, uav, _)| !*uav
+                && Arc::ptr_eq(s, &cb_copy)
+                && *a == cb_at
+                && *len == 1024),
+            "heap tracking must follow the clamped range on the buffer's copy"
+        );
+
+        let (root, pso) = compile_cbv();
+        let list = host.new_list().unwrap();
+        let write_cpu = |base: u32| {
+            // SAFETY: the last 1024 bytes (256 dwords) of the 64 KiB buffer.
+            unsafe {
+                let words = std::slice::from_raw_parts_mut(cb_at as *mut u32, 256);
+                for (i, w) in words.iter_mut().enumerate() {
+                    *w = base + i as u32;
+                }
+            }
+        };
+
+        for (round, base) in [0x1000u32, 0x4000].into_iter().enumerate() {
+            if round > 0 {
+                list.reset();
+            }
+            // SAFETY: an open list and live pipeline/heap objects.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRoot32BitConstants(0, 2, [0u32, 0].as_ptr().cast(), 0);
+                list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(0));
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            if round == 0 {
+                list.defer_heap(&heap_host.viewed);
+            } else {
+                let view = crate::descriptor::view(slot(0)).unwrap();
+                let (copy, at, len) = crate::descriptor::host::view_copy(&view).unwrap();
+                assert!(Arc::ptr_eq(&copy, &cb_copy));
+                assert_eq!((at, len), (cb_at, 1024));
+                copy.refresh(&list, at, len);
+            }
+            list.close();
+            write_cpu(base);
+            host.execute(&[&list]);
+
+            let words = out.read_host(dst_ptr as u64, 64);
+            for (i, &v) in words[..62].iter().enumerate() {
+                assert_eq!(v, base + i as u32, "round {round}, dword {i}");
+            }
+            assert_eq!(words[62], base + 255, "round {round}, last in-bounds dword");
+            assert_eq!(words[63], 0, "round {round}, past the clamped buffer end");
+        }
+
+        // A GPU unordered-access write to the buffer's copy (without touching
+        // title CPU memory) must also show through the constant buffer view.
+        crate::descriptor::create_uav(null, cb, null, &cb_uav, slot(2));
+        list.reset();
+        let gpu_seed = 0xdead_0000u32;
+        // SAFETY: an open list, live objects, and `barrier` dropped without releasing `cb_copy.buffer`.
+        unsafe {
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::transmute_copy(&cb_copy.buffer),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        StateAfter: D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    }),
+                },
+                ..Default::default()
+            };
+            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(0));
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRoot32BitConstants(0, 2, [1u32, gpu_seed].as_ptr().cast(), 0);
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[barrier]);
+            list.list.SetComputeRoot32BitConstants(0, 2, [0u32, 0].as_ptr().cast(), 0);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.defer_heap(&heap_host.viewed);
+        list.close();
+        host.execute(&[&list]);
+
+        let words = out.read_host(dst_ptr as u64, 64);
+        for (i, &v) in words[..62].iter().enumerate() {
+            assert_eq!(v, gpu_seed + i as u32, "gpu write dword {i}");
+        }
+        assert_eq!(words[62], gpu_seed + 255, "gpu write last in-bounds dword");
+        assert_eq!(words[63], 0, "gpu write past the clamped buffer end");
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
