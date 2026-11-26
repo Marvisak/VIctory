@@ -8,6 +8,7 @@ mod inspect;
 mod prebuild;
 mod run;
 mod shader;
+mod title_files;
 mod translate;
 
 use std::num::NonZeroUsize;
@@ -121,6 +122,19 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Make the shader cache and the pipeline library `run` reads, ahead
+    /// of a run (`cargo prebuild`): `translate --cache --pipelines` on the
+    /// title's shader archive, executable and DLLs, found in `game_dir`
+    /// (default: the configured game folder).
+    Prebuild {
+        game_dir: Option<PathBuf>,
+        /// Positive worker thread count (default: every logical core).
+        #[arg(long)]
+        jobs: Option<NonZeroUsize>,
+        /// Only the shader cache, not the pipelines.
+        #[arg(long)]
+        shaders_only: bool,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -204,6 +218,11 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Prebuild {
+            game_dir,
+            jobs,
+            shaders_only,
+        } => title_files::run(game_dir, jobs.map(NonZeroUsize::get), !shaders_only),
         Command::Config => show_config(),
     }
 }

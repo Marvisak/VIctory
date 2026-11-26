@@ -1,2 +1,6 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+# `cargo prebuild [game dir]`: the shader cache and pipeline library a run
+# reads, made ahead (`victory prebuild`; run it where you run the title, so
+# that both read the same victory.toml).
+prebuild = "run --release --quiet --package victory -- prebuild"

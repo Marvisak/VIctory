@@ -90,9 +90,16 @@ Run the title:
 
 ```powershell
 cargo build --release -p victory
-target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
+cargo prebuild                           # the shader cache and pipeline library, ahead of the run
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
+
+`cargo prebuild` (`victory prebuild [game dir]`) finds the title's shader
+archive, executable and DLLs in the configured game folder (or the one
+given) and runs `translate --cache --pipelines` on them; `--shaders-only`
+skips the pipelines, `--jobs N` uses N threads instead of every core. It
+shows the config file and the two cache folders it fills: run it from the
+folder you run the title from, so that both read the same `victory.toml`.
 
 The `translate --cache` step (minutes; again after a change of the shader
 translator) translates every shader the title can ask for into the cache
