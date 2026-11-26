@@ -2756,7 +2756,7 @@ mod tests {
             let _ = host.mirror(index, at, true);
             assert_eq!(FAIL_NEXT.get(), None, "the failure was not injected");
             assert!(!host.kept(index), "{error:?}: left null");
-            assert_eq!(crate::shadow::forgotten(index), again, "{error:?}: its next read marked again");
+            assert_eq!(crate::shadow::take_forgotten(index), again, "{error:?}: its next read marked again");
             if again {
                 std::thread::sleep(std::time::Duration::from_millis(RETRY_MS + RETRY_MS / 3));
                 let _ = host.mirror(index, at, true);
