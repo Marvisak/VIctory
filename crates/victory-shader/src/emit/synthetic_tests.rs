@@ -108,6 +108,7 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
+        table_views: lowered.table_views,
         static_samplers: lowered
             .samplers
             .iter()
@@ -913,6 +914,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             heap: l.heap,
             heap_writes: l.heap_writes,
             view_marks: false,
+            table_views: l.table_views,
         }
     };
 

@@ -57,6 +57,7 @@ fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[
     let shader = shader(stage, bytes);
     shader.translated.get_or_init(|| Some(Translated {
         host: victory_shader::emit::HostShader {
+            table_views: Vec::new(),
             stage: hw_stage,
             dxil: bytes.to_vec(),
             user_data: Vec::new(),
