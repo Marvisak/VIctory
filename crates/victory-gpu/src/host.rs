@@ -4131,3 +4131,6 @@ mod present_plane_tests {
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
 }
+
+#[cfg(test)]
+mod frame_bench;
