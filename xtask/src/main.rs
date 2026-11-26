@@ -1,6 +1,7 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod policy;
+mod refusals;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,12 +27,22 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Say what a run's log reports as refused, dropped, or untranslated:
+    /// refused pipelines grouped by shaders, the debug layer's reasons when
+    /// the run had `VICTORY_D3D12_DEBUG=1`, shaders the translator cannot
+    /// express, and the per-frame drop reasons.
+    Refusals {
+        /// The run's log: the diagnostics output of one run, e.g. the file a
+        /// launcher keeps of its stderr.
+        log: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::Refusals { log } => refusals::run(&log),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
