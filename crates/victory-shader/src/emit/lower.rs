@@ -581,6 +581,19 @@ impl<'a> Lower<'a> {
                     LaneExit::Branch { when, .. } => Some(when),
                     _ => None,
                 });
+                let cndmasks = insts().filter_map(|i| {
+                    if i.name() != "v_cndmask_b32" {
+                        return None;
+                    }
+                    let Fields::Valu(v) = &i.fields else {
+                        return None;
+                    };
+                    let &Operand::Scalar { code, .. } = v.src.get(2)? else {
+                        return None;
+                    };
+                    let m = i.read(Reg::S(code))?;
+                    x.st.masks.get(&m).or_else(|| x.st.other.get(&m)).copied()
+                });
                 let mut all: Vec<Bool> =
                     x.st.guards
                         .iter()
@@ -588,6 +601,7 @@ impl<'a> Lower<'a> {
                         .flatten()
                         .copied()
                         .chain(whens)
+                        .chain(cndmasks)
                         .collect();
                 all.sort_unstable();
                 all.dedup();
