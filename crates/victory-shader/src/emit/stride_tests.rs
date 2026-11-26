@@ -339,8 +339,17 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
             ud[u.index as usize] = u32::from(u.root == RootType::Constants);
         }
         let dispatch = Dispatch {
-            // Heap index 1 holds no buffer view: stride 0.
-            roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 0] })],
+            // Heap index 1 holds a texture tag, which must act like stride 0.
+            roots: vec![
+                (0, Root::Constants(ud)),
+                (
+                    1,
+                    Root::View {
+                        srv: true,
+                        data: vec![4, super::shader::VIEW_NORMALIZED],
+                    },
+                ),
+            ],
             views: &views,
             samplers: &[],
             groups: [1, 1, 1],

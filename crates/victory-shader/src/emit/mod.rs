@@ -67,10 +67,15 @@
 //!   resolves) read raw views this way. Buffers read by element through
 //!   the resource heap (no used-resource entry, so no stride) are raw too,
 //!   addressed at element × the view's stride + offset, the stride from
-//!   the view-stride table: root SRV `t`[`VIEW_STRIDES`] in
+//!   the view table: root SRV `t`[`VIEW_STRIDES`] in
 //!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`], whose dword
 //!   `i` the host keeps at the byte stride of the buffer view at heap
 //!   index `i`.
+//! * **D16 image reads** use the same table's upper bits for the bound
+//!   texture's format class. Integer loads keep integer channels and
+//!   saturate to the signed or unsigned 16-bit range.
+//!   Normalized texels round to nearest even.
+//!   Floating-point texels round toward zero regardless of the host.
 //! * **Constant buffers in the heap** (added 2026-11-24): scalar buffer
 //!   loads through a descriptor taken from the resource heap itself (root
 //!   type 5, so no used-resource entry) read a raw buffer view, not a
@@ -90,10 +95,10 @@
 //!   reads nothing instead of faulting the device.
 //! * **Buffer views at computed heap indices** (added 2026-11-24): a
 //!   buffer read through a descriptor the shader takes from the resource
-//!   heap itself first looks up the view-stride table (root SRV
+//!   heap itself first looks up the view table (root SRV
 //!   `t`[`VIEW_STRIDES`], which then covers every index below
-//!   [`HEAP_VIEWS`], dynamic slots too); where it holds 0 (no buffer view
-//!   there) the shader reads heap index [`NULL_BUFFER_VIEW`] instead (for
+//!   [`HEAP_VIEWS`], dynamic slots too); where the stride is 0 the shader
+//!   reads heap index [`NULL_BUFFER_VIEW`] instead (for
 //!   unordered access the index below), which the host keeps a null raw
 //!   buffer SRV (UAV). The index comes from data, and a texture descriptor
 //!   read as a buffer one is a wild address (the texture's shifted 8 bits

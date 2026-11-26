@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod image_rounding;
 
 type Why = &'static str;
 
@@ -2220,7 +2221,10 @@ impl<'a> Lower<'a> {
     // shortcut: rounding toward +-infinity, or a mode not known at this
     // point (paths that set it differently join), rounds to nearest even.
     fn narrow16(&mut self, f: V) -> V {
-        let rtz = self.mode16 == Some(3);
+        self.f32_to_f16(f, self.mode16 == Some(3))
+    }
+
+    fn f32_to_f16(&mut self, f: V, rtz: bool) -> V {
         let c = self.cur;
         let x = self.as_int(f);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -4604,8 +4608,7 @@ impl<'a> Lower<'a> {
         self.end_guarded(outer, &[]);
     }
 
-    /// The byte stride of the buffer view at heap index `index`, from the
-    /// view-stride table (`t`[`VIEW_STRIDES`]).
+    /// The byte stride at heap index `index`, zero for a texture tag.
     fn stride_at(&mut self, index: V) -> V {
         let word = self.view_word(index);
         let bits = self.s.m.i32(VIEW_STRIDE_BITS);
@@ -4613,7 +4616,7 @@ impl<'a> Lower<'a> {
     }
 
     /// Dword `index` of the view-stride table: the stride and the format
-    /// kind bits ([`VIEW_INTEGER`], [`VIEW_SIGNED`]).
+    /// kind bits ([`VIEW_INTEGER`], [`VIEW_SIGNED`]) or a texture tag.
     fn view_word(&mut self, index: V) -> V {
         let c = self.cur;
         let four = self.s.m.i32(4);
@@ -5266,24 +5269,7 @@ impl<'a> Lower<'a> {
             Source::Phi { .. } => return Err(WHY),
             _ => self.lane_heap_index(src, false)?,
         };
-        let c = self.cur;
-        let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
-        let table = self.s.root_srv_handle(VIEW_STRIDES);
-        let iu = self.s.m.undef(self.s.t.i32);
-        let mask = self.s.m.i8(1);
-        let r = self.s.op(
-            c,
-            "rawBufferLoad.f32",
-            Attr::ReadOnly,
-            self.s.t.res_ret,
-            139,
-            &[table, at, iu, mask, four],
-        );
-        let x = self.s.m.extract(c, r, 0);
-        let word = self.as_int(x);
-        let bits = self.s.m.i32(VIEW_STRIDE_BITS);
-        Ok(self.s.m.bin(c, Bin::And, word, bits))
+        Ok(self.stride_at(index))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -5552,13 +5538,7 @@ impl<'a> Lower<'a> {
         let last = self.s.m.i32(super::HEAP_VIEWS - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
-        let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
-        let table = self.s.root_srv_handle(VIEW_STRIDES);
-        let (iu, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1));
-        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, iu, mask, four]);
-        let x = self.s.m.extract(c, r, 0);
-        let stride = self.as_int(x);
+        let stride = self.stride_at(index);
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
@@ -8691,7 +8671,14 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
-        let r = if sample {
+        let channels: Vec<u32> = if op == 73 {
+            vec![0, 1, 2, 3]
+        } else {
+            (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
+        };
+        let mut xs = if sample {
+            let mut texel = op == 73;
+            let mut point_choice = None;
             let ss = self
                 .descriptors
                 .get(&(site, true))
@@ -8717,6 +8704,32 @@ impl<'a> Lower<'a> {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
             let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            // Immediate point samplers return one texel. When uniform
+            // control flow chooses an immediate sampler, use the same
+            // choice for sampling and for the normalized D16 conversion.
+            if *d16 && !texel && !cmp {
+                let is_point = |words: &[u32]| {
+                    words
+                        .get(..4)
+                        .and_then(|w| w.try_into().ok())
+                        .is_some_and(|w| super::sampler::StaticSampler::from_words(w).filter == 0)
+                };
+                if let Source::Constant(words) = ss {
+                    texel = is_point(words);
+                } else if let Source::Phi { args, .. } = ss
+                    && let [Source::Constant(a), Source::Constant(b)] = args.as_slice()
+                    && let Some(&(_, _, choose_first)) = self.s.sampler_choices
+                        .iter()
+                        .find(|&&(first, _, _)| first == sh)
+                {
+                    let (a, b) = (is_point(a), is_point(b));
+                    texel = a && b;
+                    if a != b {
+                        let (a, b) = (self.s.m.bool(a), self.s.m.bool(b));
+                        point_choice = Some(self.s.m.select(self.cur, choose_first, a, b));
+                    }
+                }
+            }
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -8802,7 +8815,7 @@ impl<'a> Lower<'a> {
             }
             let mut args = vec![h, sh];
             args.extend(&cs);
-            match op {
+            let r = match op {
                 60 => {
                     if offset_word {
                         // DXIL takes immediate offsets in -8..=7; the
@@ -8985,6 +8998,12 @@ impl<'a> Lower<'a> {
                         &args,
                     )
                 }
+            };
+            let values: Vec<_> = channels.iter().map(|&ch| self.s.m.extract(c, r, ch)).collect();
+            if *d16 {
+                self.image_d16(h, &values, texel, point_choice)?
+            } else {
+                values.into_iter().map(|x| self.as_int(x)).collect()
             }
         } else {
             let mut cs = vec![iu; 3];
@@ -9003,38 +9022,32 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
-            self.s.op(
-                c,
-                "textureLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                66,
-                &args,
-            )
+            if *d16 {
+                self.image_load_d16(h, props.0, &mut args, &channels)?
+            } else {
+                let r = self.s.op(
+                    c,
+                    "textureLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    66,
+                    &args,
+                );
+                channels
+                    .iter()
+                    .map(|&ch| {
+                        let x = self.s.m.extract(c, r, ch);
+                        self.as_int(x)
+                    })
+                    .collect()
+            }
         };
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
-        let channels: Vec<u32> = if op == 73 {
-            vec![0, 1, 2, 3]
-        } else {
-            (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
-        };
-        let mut xs = Vec::new();
-        for ch in channels {
-            let x = self.s.m.extract(c, r, ch);
-            xs.push(if *d16 {
-                // shortcut: d16 results are taken as floats (rounded to
-                // nearest even); integer formats would keep 16 bits.
-                let i32t = self.s.t.i32;
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
-            } else {
-                self.as_int(x)
-            });
-        }
         if *d16 {
             // Two channels per VGPR, low half first (an odd last high half 0).
+            let c = self.cur;
             let k16 = self.s.m.i32(16);
             xs = xs
                 .chunks(2)

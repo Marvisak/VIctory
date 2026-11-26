@@ -805,14 +805,14 @@ impl State {
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
                     if kind == 1 && slot == victory_shader::emit::VIEW_STRIDES {
-                        // The bound view heap's stride table; without one
+                        // The bound heap's view table; without one
                         // the shader would read an unbound root view.
                         let heap = (self.heaps[0] != 0)
                             .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                             .flatten();
-                        let Some(table) = heap.and_then(|h| h.strides()) else {
-                            once!("a shader reads view strides without a view heap: dropped");
-                            not_run("view strides without a view heap");
+                        let Some(table) = heap.and_then(|h| h.view_table()) else {
+                            once!("a shader reads view metadata without a view heap: dropped");
+                            not_run("view metadata without a view heap");
                             return false;
                         };
                         list.keep(table);
@@ -2727,6 +2727,54 @@ uint ps() : SV_Target { return 1; }
         desc[..6].copy_from_slice(&[words[8], 4, 0x1688, 0, 0, 1]);
         (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
         View::Placed(false, words, desc)
+    }
+
+    #[test]
+    fn texture_format_follows_the_view_in_a_reused_heap_slot() {
+        use victory_shader::emit::host::texture_view_tag;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_SINT, DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R32G32B32A32_FLOAT,
+        };
+
+        let Some(heap) = crate::descriptor::host::HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let slot = heap.dynamic(1).unwrap();
+        let table = heap.view_table().unwrap();
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the CPU-visible buffer stays live and mapped for this test.
+        unsafe { table.Map(0, None, Some(&mut data)) }.unwrap();
+        // SAFETY: the slot is in the mapped table.
+        let entry = || unsafe { data.cast::<u32>().add(slot as usize).read_volatile() };
+        let unorm = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let float = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        let texture = |format: DXGI_FORMAT| {
+            texture_at_address(
+                title_memory(1 << 16),
+                &texture_words(8, 8, format.0 as u32, 0x105, 0),
+            )
+        };
+        heap.make_at(slot, &View::Shader(texture(unorm) as usize, None));
+        let want = texture_view_tag(unorm);
+        assert_ne!(want, 0);
+        assert_eq!(entry(), want);
+        for format in [DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R8G8B8A8_SINT] {
+            heap.make_at(slot, &View::Shader(texture(format) as usize, None));
+            assert_eq!(entry(), texture_view_tag(format));
+        }
+        heap.make_at(slot, &View::Shader(texture(float) as usize, None));
+        assert_eq!(entry(), 0);
+        let placed = placed_view(
+            title_memory(1 << 16),
+            texture_words(8, 8, unorm.0 as u32, 0x105, 0),
+        );
+        heap.make_at(slot, &placed);
+        assert_eq!(entry(), want);
+        heap.make_null(slot);
+        assert_eq!(entry(), 0);
+        // SAFETY: balances the map above.
+        unsafe { table.Unmap(0, None) };
     }
 
     fn used(kind: ResourceType) -> UsedResource {
