@@ -354,22 +354,21 @@ extern "system" fn check_feature_support(
 fn feature_levels(data: *mut c_void) -> HRESULT {
     // SAFETY: the caller checked size and non-null.
     let query = unsafe { &mut *data.cast::<FeatureLevels>() };
-    if query.requested.is_null() {
+    if query.count == 0 || query.requested.is_null() {
         return E_INVALIDARG;
     }
     // SAFETY: the title passes `count` levels.
     let requested = unsafe { std::slice::from_raw_parts(query.requested, query.count as usize) };
-    match requested
+    query.highest = requested
         .iter()
         .copied()
         .filter(|&l| l <= HIGHEST_FEATURE_LEVEL)
         .max()
-    {
-        Some(level) => {
-            query.highest = level;
-            S_OK
-        }
-        None => UNSUPPORTED,
+        .unwrap_or(0);
+    if query.highest == 0 {
+        UNSUPPORTED
+    } else {
+        S_OK
     }
 }
 
@@ -555,19 +554,33 @@ mod tests {
         type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
         let device = device();
         let check = slot::<Check>(device, 0x68);
+        const UNTOUCHED: u32 = 0x1234;
         let query = |levels: &[u32], size| {
             let mut query = FeatureLevels {
                 count: levels.len() as u32,
                 requested: levels.as_ptr(),
-                highest: 0,
+                highest: UNTOUCHED,
             };
             let hr = check(device, 2, (&raw mut query).cast(), size);
             (hr, query.highest)
         };
         let levels = [0xb000, 0xb100, 0xc000, 0xc100, 0xd000];
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
-        assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
-        assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+        assert_eq!(query(&[0xb000, 0xb123], 0x18), (S_OK, 0xb123));
+        assert_eq!(query(&levels, 0x10), (E_INVALIDARG, UNTOUCHED));
+        assert_eq!(
+            [
+                query(&[], 0x18),
+                query(&levels[4..], 0x18),
+                query(&[0], 0x18)
+            ],
+            [
+                (E_INVALIDARG, UNTOUCHED),
+                (UNSUPPORTED, 0),
+                (UNSUPPORTED, 0)
+            ],
+            "feature-level failure results and status of the output"
+        );
     }
 
     /// The queries the AMD upscaler's capability check makes.
