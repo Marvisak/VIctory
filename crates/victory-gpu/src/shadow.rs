@@ -919,11 +919,16 @@ pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
 }
 
-/// Whether heap slot `slot`'s next read is to be marked again
-/// ([`forget_read`]).
+/// Take whether heap slot `slot` was queued to be marked again
+/// ([`forget_read`]); removes the test's entry so it cannot affect another test.
 #[cfg(test)]
-pub(crate) fn forgotten(slot: u32) -> bool {
-    READS.lock().unwrap_or_else(|e| e.into_inner()).1.contains(&slot)
+pub(crate) fn take_forgotten(slot: u32) -> bool {
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(at) = reads.1.iter().position(|&s| s == slot) else {
+        return false;
+    };
+    reads.1.remove(at);
+    true
 }
 
 /// After a submission: every page its shaders marked as written through
