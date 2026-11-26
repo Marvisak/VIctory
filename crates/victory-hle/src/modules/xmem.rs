@@ -443,20 +443,42 @@ fn shown_at(pages: &[usize]) -> Vec<usize> {
         .collect()
 }
 
-/// Reports writes into physical pages through our own views at every title
-/// view showing them (DirectStorage's page destinations).
+/// Opens the title views `shown` (addresses) for a write the guards do not
+/// see: their pages are marked changed and kept open until the returned
+/// guards drop, so an armed page keeps the bytes it had before the write.
+fn write_before(shown: &[usize]) -> Vec<victory_gpu::KernelWrite> {
+    #[cfg(test)]
+    OPENED.with(|o| o.borrow_mut().extend_from_slice(shown));
+    shown
+        .iter()
+        .map(|&page| victory_gpu::kernel_will_write(page, PAGE))
+        .collect()
+}
+
+/// Tells title views `shown` (addresses) mapped while such a write was under
+/// way, which could not be opened before it: they are marked changed, without
+/// keeping bytes (the bytes are the write's).
 fn report_written(shown: &[usize]) {
     for &page in shown {
         #[cfg(test)]
         REPORTED.with(|r| r.borrow_mut().push(page));
-        drop(victory_gpu::kernel_will_write(page, PAGE));
+        victory_gpu::title_memory_written(page, PAGE);
     }
+}
+
+/// Tells the title views in `after` (addresses) that were not opened in
+/// `told`: they were mapped while the write was under way.
+fn report_new(after: Vec<usize>, told: &[usize]) {
+    let new: Vec<usize> = after.into_iter().filter(|a| !told.contains(a)).collect();
+    report_written(&new);
 }
 
 #[cfg(test)]
 thread_local! {
     /// The title addresses this thread's writes into physical pages reported.
     static REPORTED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The title addresses this thread opened before writing into a page.
+    static OPENED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -636,6 +658,12 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
+    let written = pages
+        .get(offset / PAGE..(offset + data.len()).div_ceil(PAGE))
+        .unwrap_or(&[]);
+    // Opened before the bytes land: an armed page keeps what was there.
+    let told: Vec<usize> = shown_at(written);
+    let held = write_before(&told);
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -645,8 +673,9 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
-    // Where the pages show once written (see `PageWindow`).
-    report_written(&shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[])));
+    drop(held);
+    // Views mapped while the bytes landed could not be opened before them.
+    report_new(shown_at(written), &told);
     true
 }
 
@@ -658,17 +687,27 @@ pub(crate) struct PageWindow {
     within: usize,
     len: usize,
     /// The pages (page numbers) the bytes reach: the title views showing
-    /// them when the window is done are told. Looked up then, not when the
-    /// window opens: a decode takes milliseconds, and the title may map a
-    /// page at another address meanwhile (its GPU heap); a copy that took
-    /// the page there before the bytes landed would never hear of them. An
-    /// address that stops showing a page meanwhile was told by the unmap.
+    /// them when the window is done are told. Looked up then too, not only
+    /// when the window opens: a decode takes milliseconds, and the title may
+    /// map a page at another address meanwhile (its GPU heap); a copy that
+    /// took the page there before the bytes landed would never hear of them.
+    /// An address that stops showing a page meanwhile was told by the unmap.
     pages: Vec<usize>,
+    /// The title views showing the pages when the window opened (address),
+    /// with the guard that keeps each open until the bytes land: opened
+    /// before the write, so an armed page keeps what was there before it.
+    held: Vec<(usize, victory_gpu::KernelWrite)>,
 }
 
 impl Drop for PageWindow {
     fn drop(&mut self) {
-        report_written(&shown_at(&self.pages));
+        let held = std::mem::take(&mut self.held);
+        let told: Vec<usize> = held.iter().map(|&(a, _)| a).collect();
+        // The write is done: the views opened before it can be guarded again.
+        drop(held);
+        // Views mapped while it was open were not there to open before the
+        // write: they are told now, marked changed without keeping bytes.
+        report_new(shown_at(&self.pages), &told);
     }
 }
 
@@ -689,11 +728,21 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let view = View::map(slice, *n)?;
+    let pages = pages
+        .get(offset / PAGE..(offset + len).div_ceil(PAGE))
+        .unwrap_or(&[])
+        .to_vec();
+    // The title's views of the pages are opened before the bytes land.
+    let told = shown_at(&pages);
+    let held: Vec<(usize, victory_gpu::KernelWrite)> =
+        told.iter().copied().zip(write_before(&told)).collect();
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view,
         within: offset % PAGE,
         len,
-        pages: pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]).to_vec(),
+        pages,
+        held,
     })
 }
 
@@ -1439,11 +1488,43 @@ mod tests {
         assert_eq!(REPORTED.with(|r| r.borrow().clone()), [b as usize]);
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { b.cast::<u8>().read() }, 3);
-        // `write_physical` the same way.
+        // `write_physical` opens the view before its bytes, so nothing is
+        // reported afterwards (and armed bytes are the ones before it).
         REPORTED.with(|r| r.borrow_mut().clear());
+        OPENED.with(|o| o.borrow_mut().clear());
         assert!(write_physical(&pages, 0, &[4]));
-        assert_eq!(REPORTED.with(|r| r.borrow().clone()), [b as usize]);
+        assert_eq!(OPENED.with(|o| o.borrow().clone()), [b as usize]);
+        assert!(REPORTED.with(|r| r.borrow().is_empty()));
         assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+    }
+
+    /// The title views of the pages are opened before the window's bytes are
+    /// written (an armed page keeps what was there before them), and the
+    /// window does not report them again when it drops.
+    #[test]
+    fn a_window_opens_the_title_views_before_its_bytes() {
+        let pages = allocate(1);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!a.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        REPORTED.with(|r| r.borrow_mut().clear());
+        OPENED.with(|o| o.borrow_mut().clear());
+        let mut window = page_window(&pages, 0, 16).expect("one run");
+        assert_eq!(
+            OPENED.with(|o| o.borrow().clone()),
+            [a as usize],
+            "opened before the bytes"
+        );
+        window.bytes().fill(5);
+        drop(window);
+        assert!(
+            REPORTED.with(|r| r.borrow().is_empty()),
+            "held from the start, not reported again"
+        );
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { a.cast::<u8>().read() }, 5);
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 
