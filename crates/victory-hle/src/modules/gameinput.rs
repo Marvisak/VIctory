@@ -57,8 +57,8 @@ const FALLBACK: usize = PADS;
 const KEYBOARD: usize = PADS + 1;
 const DEVICES: usize = PADS + 2;
 
-/// Readings kept per device for next/previous lookups.
-const HISTORY: usize = 32;
+/// Per-device history for low frame rates, about two seconds at the `POLL` interval (8 ms).
+const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
@@ -1492,6 +1492,21 @@ mod tests {
         slot::<extern "system" fn(*const Reading) -> u32, _>(reading, 0x10)(reading);
     }
 
+    fn poll_pad_changes(count: usize) -> (&'static Hub, Vec<PadState>) {
+        let (hub, host) = fake();
+        let states: Vec<_> = (1..=count)
+            .map(|step| PadState {
+                left_x: step as f32 / count as f32,
+                ..Default::default()
+            })
+            .collect();
+        for &state in &states {
+            host.lock().unwrap().pads[0] = Some(state);
+            hub.poll();
+        }
+        (hub, states)
+    }
+
     #[test]
     fn ordinal_one_resolves_to_create() {
         let r = HleResolver::new(HostPolicy::none());
@@ -1561,6 +1576,57 @@ mod tests {
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    #[test]
+    fn history_walks_both_ways_after_many_pad_changes() {
+        // One initial reading followed by 100 changes between game frames.
+        const CHANGES: usize = 100;
+        let (hub, states) = poll_pad_changes(CHANGES + 1);
+        let newest = current(hub, GAMEPAD_KIND, 0).unwrap();
+        let mut reading = newest;
+        assert_eq!(pad(reading), states[CHANGES]);
+
+        for &expected in states[..CHANGES].iter().rev() {
+            let previous = walk(hub, 0x30, reading);
+            release(reading);
+            reading = previous.unwrap();
+            assert_eq!(pad(reading), expected);
+        }
+        for &expected in &states[1..] {
+            let next = walk(hub, 0x28, reading);
+            release(reading);
+            reading = next.unwrap();
+            assert_eq!(pad(reading), expected);
+        }
+        release(reading);
+        assert_eq!(reading, newest);
+    }
+
+    #[test]
+    fn history_evicts_the_oldest_pad_readings_at_capacity() {
+        let (hub, states) = poll_pad_changes(HISTORY + 10);
+        let first_retained = states.len() - HISTORY;
+        let last = states.len() - 1;
+        let mut reading = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(reading), states[last]);
+        assert_eq!(stamp(reading).1, last as u64 + 1);
+
+        // The current reading counts toward the retained total.
+        for index in (first_retained..last).rev() {
+            let previous = walk(hub, 0x30, reading);
+            release(reading);
+            reading = previous.unwrap();
+            assert_eq!(pad(reading), states[index]);
+            assert_eq!(stamp(reading).1, index as u64 + 1);
+        }
+
+        let before_oldest = walk(hub, 0x30, reading);
+        release(reading);
+        if let Ok(extra) = before_oldest {
+            release(extra);
+        }
+        assert_eq!(before_oldest, Err(READING_NOT_FOUND));
     }
 
     #[test]
