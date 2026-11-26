@@ -1447,6 +1447,75 @@ pub(crate) mod tests {
         title_memory_remapped(top, usize::MAX);
     }
 
+    /// Writers on several threads and a taker copying what it takes: at the
+    /// end, every page the taker's copy disagrees with title memory on is
+    /// still changed in its tracker (no write lost between a take's guard
+    /// and its copy), and no write faulted past the handler (the process
+    /// lives).
+    #[test]
+    fn concurrent_writes_and_takes_lose_no_write() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        const PAGES: usize = 32;
+        let p = pool(PAGES);
+        let trackers: Vec<Tracked> =
+            (0..PAGES / 4).map(|i| track_copy(p + i * 4 * PAGE, 4 * PAGE, true).expect("tracked")).collect();
+        let mut copy = vec![0u32; PAGES * PAGE / 4];
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            for w in 0..12u32 {
+                let stop = &stop;
+                s.spawn(move || {
+                    let mut x = 0x2545_f491_u32.wrapping_mul(w + 1);
+                    while !stop.load(Relaxed) {
+                        x ^= x << 13;
+                        x ^= x >> 17;
+                        x ^= x << 5;
+                        let at = p + (x as usize % PAGES) * PAGE + (x as usize >> 8 & 0xFFFC);
+                        // SAFETY: the pool's pages; a guarded one faults
+                        // into the handler, which opens it.
+                        unsafe { (at as *mut u32).write_volatile(x | 1) };
+                    }
+                });
+            }
+            // Enough rounds to catch a lost write or a stray fault in release
+            // (a guard race fell to it in 2 of 10 runs); fewer in debug.
+            for round in 0..if cfg!(debug_assertions) { 200 } else { 3000 } {
+                for (i, t) in trackers.iter().enumerate() {
+                    if (round + i) % 3 == 0 {
+                        t.arm(t.start, t.end);
+                    }
+                    for (a, b) in t.take(t.start, t.end) {
+                        for at in (a..b).step_by(4) {
+                            // SAFETY: the pool's pages, readable.
+                            copy[(at - p) / 4] = unsafe { (at as *const u32).read_volatile() };
+                        }
+                    }
+                    if round % 7 == 0 {
+                        t.taken(&[t.start / PAGE]);
+                        // The caller made its copy equal to memory first.
+                        for at in (t.start..t.start + PAGE).step_by(4) {
+                            // SAFETY: as above.
+                            copy[(at - p) / 4] = unsafe { (at as *const u32).read_volatile() };
+                        }
+                    }
+                    t.disarm();
+                }
+            }
+            stop.store(true, Relaxed);
+        });
+        for t in &trackers {
+            for page in t.start / PAGE..t.end / PAGE {
+                let base = page * PAGE;
+                // SAFETY: the pool's pages, no writer left.
+                let memory = unsafe { std::slice::from_raw_parts(base as *const u32, PAGE / 4) };
+                let held = &copy[(base - p) / 4..(base - p) / 4 + PAGE / 4];
+                assert!(memory == held || t.changed(page), "page {} differs from its copy and is not changed", page - p / PAGE);
+            }
+        }
+        drop(trackers);
+        free(p);
+    }
+
     /// What the title's threads wait for when they write guarded pages
     /// while a submission takes them again (issue #400: about 940 faults a
     /// frame at about 450 µs each, mostly waiting for the guard lock).
@@ -1460,7 +1529,8 @@ pub(crate) mod tests {
     ///
     /// `cargo test --release -p victory-gpu --lib guard_lock_contention_bench
     /// -- --ignored --nocapture --test-threads=1` (`GUARD_BENCH_MS` sets the
-    /// time per writer count, 1,500 by default).
+    /// time per writer count, 1,500 by default; `GUARD_BENCH_SPIN_US` has
+    /// each writer work that long between writes, 0 by default).
     #[test]
     #[ignore = "a benchmark: run alone, in release"]
     fn guard_lock_contention_bench() {
@@ -1469,6 +1539,7 @@ pub(crate) mod tests {
         const HOT: usize = 256;
         const PER_TRACKER: usize = 16;
         let millis: u64 = std::env::var("GUARD_BENCH_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
+        let spin = Duration::from_micros(std::env::var("GUARD_BENCH_SPIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
         let p = pool(HOT);
         let trackers: Vec<Tracked> = (0..HOT / PER_TRACKER)
             .map(|i| track_copy(p + i * PER_TRACKER * PAGE, PER_TRACKER * PAGE, true).expect("pool memory is tracked"))
@@ -1505,6 +1576,10 @@ pub(crate) mod tests {
                                 // one faults into the handler, which opens it.
                                 unsafe { (at as *mut u32).write_volatile(x) };
                                 let us = t0.elapsed().as_secs_f64() * 1e6;
+                                let until = Instant::now() + spin;
+                                while Instant::now() < until {
+                                    std::hint::spin_loop();
+                                }
                                 if us > 2.0 {
                                     slow.push(us);
                                 }
