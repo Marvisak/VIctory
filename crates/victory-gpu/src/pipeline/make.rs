@@ -251,7 +251,10 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let us = started.elapsed().as_micros() as u64;
+    WAITED_US.fetch_add(us, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    crate::framelog::add(crate::framelog::T::PipelineWaitUs, us);
 }
 
 /// Pipelines for the workers: those draws wait for, then those started

@@ -198,7 +198,33 @@ pub fn report_crashes() {
     }
 }
 
-/// What the vectored handler reports as it happens.
+/// Whether a breakpoint report at `at` is the title's own `int3`, which
+/// the handler steps over: only a real `0xCC` there counts, so a debugger's
+/// break elsewhere is left to it.
+///
+/// SAFETY: `at` is the reported address, or null.
+unsafe fn own_int3(at: *const u8) -> bool {
+    // SAFETY: the caller's.
+    !at.is_null() && unsafe { *at } == 0xCC
+}
+
+#[cfg(test)]
+mod breakpoint_tests {
+    use super::own_int3;
+
+    #[test]
+    fn only_a_cc_at_the_address_is_stepped_over() {
+        let cc = [0xCCu8];
+        let other = [0x90u8];
+        // SAFETY: both point at one live byte.
+        unsafe {
+            assert!(own_int3(cc.as_ptr()));
+            assert!(!own_int3(other.as_ptr()));
+            assert!(!own_int3(std::ptr::null()));
+        }
+    }
+}
+
 const FATAL: [i32; 6] = [
     EXCEPTION_ACCESS_VIOLATION,
     EXCEPTION_ILLEGAL_INSTRUCTION,
@@ -544,6 +570,22 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
+    // A title ends its watchdog path with an unconditional `int3` after
+    // writing a breadcrumb: it expects its own handler (or a debugger) to
+    // catch it. Without one, the breakpoint is fatal. Step over the byte
+    // instead; only a real `0xCC` in the title is stepped, so a debugger's
+    // break is left alone.
+    // SAFETY: as above.
+    unsafe {
+        let record = &*(*info).ExceptionRecord;
+        if record.ExceptionCode == EXCEPTION_BREAKPOINT {
+            let at = record.ExceptionAddress as *const u8;
+            if own_int3(at) {
+                (*(*info).ContextRecord).Rip += 1;
+                return -1; // EXCEPTION_CONTINUE_EXECUTION
+            }
+        }
     }
     // SAFETY: as above.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };

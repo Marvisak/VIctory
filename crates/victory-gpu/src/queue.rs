@@ -113,6 +113,18 @@ extern "system" fn release(this: This) -> u32 {
 /// Queues the lists' host lists behind what the queue holds, and runs what
 /// may run (`crate::hold`; decision 0007).
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let started = std::time::Instant::now();
+    execute_now(this, count, lists);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        let us = started.elapsed().as_micros() as u64;
+        crate::framelog::add(crate::framelog::T::ExecuteUs, us);
+        crate::framelog::here(crate::framelog::H::ExecuteUs, us);
+    }
+}
+
+fn execute_now(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -138,7 +150,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
 }
 
 /// What ran held work: the title's submission, a queue's Signal or Wait, a
-/// CPU fence call, PresentX, or our timer.
+/// CPU fence call, PresentX, our timer, or the thread that submits for us.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Why {
     Submission,
@@ -147,6 +159,8 @@ pub(crate) enum Why {
     Fence,
     Present,
     Timer,
+    /// The thread of [`behind`]: a submission or signal of ours ran.
+    Worker,
 }
 
 #[cfg(windows)]
@@ -183,6 +197,185 @@ pub(crate) fn pump_held_if_free(why: Why) {
     let _ = why;
 }
 
+/// Whether a submission is only put in its queue's line by the thread that
+/// submits it, and prepared and sent by a thread of ours
+/// (`VICTORY_ASYNC_SUBMIT=1`).
+///
+/// Why: the title's render thread stood inside the submit path for most of a
+/// frame on the profile this layer was measured with (257 of 292 ms);
+/// preparing a submission (the copies of title memory, texture uploads,
+/// descriptor sync) and waiting for the card are ours to do, in order, and
+/// the result is not needed by the thread that recorded the lists.
+///
+/// With the switch a submission's host lists go to a line of our own (a
+/// FIFO), and one thread of ours prepares and sends them in the order the
+/// queues gave them, while the title records on; a signal of a queue joins
+/// the line behind them, as it does behind held work.
+///
+/// What it assumes: title memory a submission reads is not rewritten by the
+/// title between its submit call and the moment our thread prepares it,
+/// some milliseconds later. On the console the card reads that memory when
+/// it runs the list, later still, so a title that rewrote it earlier would
+/// be wrong there too.
+#[cfg(windows)]
+fn behind() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1") && submitter().is_some();
+        if on {
+            tracing::info!("submissions are prepared and sent by a thread of ours, not by the thread that submits (VICTORY_ASYNC_SUBMIT=1)");
+        }
+        on
+    });
+    *ON
+}
+
+/// One thing for the thread of [`behind`], in the order the queues' lines
+/// gave them.
+#[cfg(windows)]
+enum Work {
+    /// A submission: its host lists, taken from the title's.
+    Run(Vec<std::sync::Arc<crate::host::HostList>>),
+    /// A fence (its address) and the value to set it to, behind the
+    /// submissions before it.
+    Signal(usize, u64),
+}
+
+/// What the thread of [`behind`] has been given, and something to look at.
+#[cfg(windows)]
+struct Submitter {
+    work: std::sync::Mutex<std::collections::VecDeque<Work>>,
+    ready: std::sync::Condvar,
+    /// Things given and not finished (the one running counts).
+    pending: std::sync::Mutex<u64>,
+    idle: std::sync::Condvar,
+}
+
+/// The thread of [`behind`], made at the first ask; `None` when it could
+/// not be made (submissions then stay on the title's thread).
+#[cfg(windows)]
+fn submitter() -> Option<&'static Submitter> {
+    static SUBMITTER: std::sync::LazyLock<Option<std::sync::Arc<Submitter>>> = std::sync::LazyLock::new(|| {
+        let submitter = std::sync::Arc::new(Submitter {
+            work: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            ready: std::sync::Condvar::new(),
+            pending: std::sync::Mutex::new(0),
+            idle: std::sync::Condvar::new(),
+        });
+        // The thread and the static share it; no owner is left to free it
+        // before the process ends.
+        let mine = std::sync::Arc::clone(&submitter);
+        match std::thread::Builder::new().name("victory-submit".into()).spawn(move || worker(mine)) {
+            Ok(_) => Some(submitter),
+            Err(e) => {
+                tracing::warn!(error = %e, "no submit thread (VICTORY_ASYNC_SUBMIT): submissions stay on the title's thread");
+                None
+            }
+        }
+    });
+    SUBMITTER.as_ref().map(std::sync::Arc::as_ref)
+}
+
+/// Gives the thread of [`behind`] one more thing, behind those before it.
+#[cfg(windows)]
+fn send(work: Work) {
+    let Some(submitter) = submitter() else { return };
+    *submitter.pending.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    submitter
+        .work
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back(work);
+    submitter.ready.notify_one();
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// This thread is the one of [`behind`].
+    static SUBMITTING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Before a submission of ours that is waited for (the present's copy):
+/// with [`behind`], what the thread of ours has been given runs first, so
+/// the submission keeps its place behind it. Called from the thread that
+/// makes that submission, not from the thread of [`behind`] itself.
+#[cfg(windows)]
+pub(crate) fn before_sync() {
+    if !behind() || SUBMITTING_HERE.get() {
+        return;
+    }
+    let Some(submitter) = submitter() else { return };
+    let mut pending = submitter.pending.lock().unwrap_or_else(|e| e.into_inner());
+    while *pending > 0 {
+        pending = submitter.idle.wait(pending).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// The thread of [`behind`]: prepares and sends what the queues gave it, in
+/// order, then lets what waited for it run.
+#[cfg(windows)]
+fn worker(submitter: std::sync::Arc<Submitter>) {
+    SUBMITTING_HERE.set(true);
+    #[cfg(feature = "diagnostics")]
+    crate::framelog::keep_on_fast_cores("victory-submit");
+    loop {
+        let work = {
+            let mut work_queue = submitter.work.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(work) = work_queue.pop_front() {
+                    break work;
+                }
+                work_queue = submitter.ready.wait(work_queue).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let (user, kernel) = crate::framelog::thread_times();
+        #[cfg(feature = "diagnostics")]
+        if crate::framelog::on() {
+            crate::framelog::add(crate::framelog::T::WorkerLooks, 1);
+            if crate::framelog::on_slow_core() {
+                crate::framelog::add(crate::framelog::T::WorkerSlow, 1);
+            }
+        }
+        match work {
+            Work::Run(lists) => {
+                let runs: Vec<&crate::host::HostList> = lists.iter().map(|l| &**l).collect();
+                if let Some(host) = crate::host::host() {
+                    host.execute(&runs);
+                }
+                drop(runs);
+                // They have run: their host lists are used again.
+                lists.into_iter().for_each(crate::list::recycle);
+            }
+            Work::Signal(fence, value) => {
+                if !crate::host::late_signal(fence, value) {
+                    crate::fence::set(fence as This, value);
+                    crate::fence::let_go(fence as This);
+                }
+            }
+        }
+        // What waited for that submission's fence or bottom-of-pipe write
+        // may run now (and joins the line before it is counted done, so a
+        // submission that follows this one does not pass it).
+        pump_held_if_free(Why::Worker);
+        #[cfg(feature = "diagnostics")]
+        {
+            let (user_now, kernel_now) = crate::framelog::thread_times();
+            crate::framelog::add(crate::framelog::T::WorkerUs, started.elapsed().as_micros() as u64);
+            crate::framelog::add(crate::framelog::T::WorkerUserUs, user_now.saturating_sub(user));
+            crate::framelog::add(crate::framelog::T::WorkerKernelUs, kernel_now.saturating_sub(kernel));
+        }
+        {
+            let mut pending = submitter.pending.lock().unwrap_or_else(|e| e.into_inner());
+            *pending = pending.saturating_sub(1);
+            if *pending == 0 {
+                submitter.idle.notify_all();
+            }
+        }
+    }
+}
+
 /// How long a queue's head may wait before it runs anyway.
 // shortcut: a safety valve against a wait nothing satisfies (a write we do
 // not make), which would hold the title's fences until its 30 s watchdog
@@ -205,16 +398,33 @@ fn pump(held: &mut Holding, why: Why) {
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
     let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
         let at = std::time::Instant::now();
-        host.execute(&lists);
+        if crate::host::relay() {
+            // Sent without a wait; the thread of `crate::host::relay` lands
+            // it, and the host lists are given back then.
+            host.execute_late(segments);
+        } else if behind() {
+            // Prepared and sent by the thread of ours, in this order.
+            send(Work::Run(segments));
+        } else {
+            let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
+            host.execute(&lists);
+            drop(lists);
+            segments.into_iter().for_each(crate::list::recycle);
+        }
         ran += at.elapsed();
-        drop(lists);
-        segments.into_iter().for_each(crate::list::recycle);
     };
     let mut signal = |f: usize, value: u64| {
-        crate::fence::set(f as This, value);
-        crate::fence::let_go(f as This);
+        if crate::host::late_signal(f, value) {
+            // Set behind the flights in the air (`crate::host`); the fence
+            // was kept when the queue's Signal was taken.
+        } else if behind() {
+            // Behind the submissions before it in the line.
+            send(Work::Signal(f, value));
+        } else {
+            crate::fence::set(f as This, value);
+            crate::fence::let_go(f as This);
+        }
     };
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
@@ -294,7 +504,7 @@ fn account_frame(frame: u64) {
         return;
     }
     let longest = a.released.iter().map(|r| r.1).max().unwrap_or_default();
-    let mut by = [0u32; 6];
+    let mut by = [0u32; 7];
     for r in &a.released {
         by[r.2 as usize] += 1;
     }
@@ -385,7 +595,20 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
             crate::fence::keep(fence);
             held.push(this as usize, Item::Signal(fence as usize, value));
         } else {
-            crate::fence::set(fence, value);
+            // Kept until it is set: behind the flights in the air
+            // (`crate::host::late`), behind this queue's submissions of the
+            // thread of ours (`behind`), or now.
+            crate::fence::keep(fence);
+            if crate::host::late_signal(fence as usize, value) {
+                // Set when the flights in the air are landed.
+            } else if behind() {
+                // Behind the submissions of this queue the thread of ours
+                // has not run yet.
+                send(Work::Signal(fence as usize, value));
+            } else {
+                crate::fence::set(fence, value);
+                crate::fence::let_go(fence);
+            }
         }
         // Another queue may wait for this fence.
         pump(&mut held, Why::Signal);
@@ -486,10 +709,20 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let presenting = std::time::Instant::now();
     // What may run before the frame is shown does.
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let line = std::time::Instant::now();
     pump_held(Why::Present);
+    // And what the queues sent without a wait: the frame's draws were on the
+    // card (`crate::host::late`). Every present settles, even one with no
+    // plane: the title is told the frame is done.
+    crate::host::settle_for_present();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::framelog::add(crate::framelog::T::PresentLineUs, line.elapsed().as_micros() as u64);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);
@@ -539,6 +772,10 @@ extern "system" fn present(
         use windows::core::Interface;
 
         const COPY_SOURCE: u32 = 0x800;
+        // The states below are read and moved here, on this thread, while
+        // the thread of `behind` may still run lists that use the same
+        // textures: let what it was given run before the first move.
+        before_sync();
         // SAFETY: the title passes the plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
         let mut resources: Vec<(This, ID3D12Resource, u32, bool)> =
@@ -581,6 +818,11 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
+        crate::framelog::frame();
+    }
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was

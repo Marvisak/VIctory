@@ -99,6 +99,19 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
+        // With submissions sent to the card and not waited for
+        // (`crate::host::late`) the signal may be behind them: they are
+        // settled, which sets it.
+        #[cfg(windows)]
+        if crate::host::late() {
+            drop(waiters);
+            crate::host::settle_for_fence();
+            if fence.value.load(Ordering::Acquire) >= value {
+                return S_OK;
+            }
+            tracing::warn!(value, "blocking fence wait not implemented");
+            return E_NOTIMPL;
+        }
         // shortcut: a null event means "block until reached"; nothing can
         // reach it while no GPU work runs, so fail instead of hanging.
         tracing::warn!(value, "blocking fence wait not implemented");

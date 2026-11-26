@@ -531,6 +531,60 @@ impl Tracked {
         (copy, zero)
     }
 
+    /// [`Tracked::take_split`] for a refresh where flights in the air may be
+    /// writing `skip` (ranges of title memory, `(from, to)`): pages any of
+    /// them touches are left as they are (not taken, not copied), so their
+    /// bytes stay for the flight's landing; the others as in
+    /// [`Tracked::take_split`].
+    pub(crate) fn take_skipping(&self, from: usize, to: usize, skip: &[(usize, usize)]) -> (Runs, Runs) {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to {
+            return (Vec::new(), Vec::new());
+        }
+        let pages: Vec<usize> = {
+            let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+            changed.range(from / PAGE..to.div_ceil(PAGE)).copied().collect()
+        };
+        let pages: Vec<usize> = pages
+            .into_iter()
+            .filter(|&p| {
+                let (a, b) = ((p * PAGE).max(self.start), ((p + 1) * PAGE).min(self.end));
+                !skip.iter().any(|&(s, e)| s < b && a < e)
+            })
+            .collect();
+        if pages.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let mut whole: Vec<usize> = pages
+            .iter()
+            .copied()
+            .filter(|&p| (p * PAGE).max(self.start) >= from && ((p + 1) * PAGE).min(self.end) <= to)
+            .collect();
+        let mut g = guards();
+        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        let others = aliases(&g, &whole);
+        let unguarded = guard_aliases(&mut g, &others);
+        whole.retain(|p| !unguarded.contains(p));
+        let mut unmapped = Vec::new();
+        for page in protect_noting(&mut g, &whole, &mut unmapped) {
+            changed.remove(&page);
+            self.changed.taken(page);
+        }
+        set_dirty(self.changed.2, !changed.is_empty());
+        drop(changed);
+        drop(g);
+        let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
+        for p in pages {
+            let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
+            let runs = if unmapped.contains(&p) { &mut zero } else { &mut copy };
+            match runs.last_mut() {
+                Some((_, end)) if *end == a => *end = b,
+                _ => runs.push((a, b)),
+            }
+        }
+        (copy, zero)
+    }
+
     /// Whether page `page` (a page number) changed since it was taken.
     pub(crate) fn changed(&self, page: usize) -> bool {
         self.changed
@@ -912,6 +966,8 @@ fn install() {
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            #[cfg(feature = "diagnostics")]
+            crate::framelog::add(crate::framelog::T::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {

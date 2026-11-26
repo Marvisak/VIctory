@@ -397,6 +397,8 @@ pub(crate) fn record_upload(
     list.keep(buffer);
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    crate::framelog::add(crate::framelog::T::Uploads, 1);
     list.move_texture(copy, SHADER_RESOURCE)
 }
 
@@ -532,6 +534,13 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
 }
 
 impl Staging {
+    /// The title memory the texture's bytes are in and their length
+    /// (0 where the texture is not mapped): what a submission that reads it
+    /// may wait for (`crate::host::late`).
+    pub(crate) fn memory(&self) -> (usize, usize) {
+        (self.memory as usize, self.layout.size as usize)
+    }
+
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {
@@ -546,8 +555,11 @@ impl Staging {
         let started = std::time::Instant::now();
         let (read, buffer) = self.refresh_now();
         let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        let us = started.elapsed().as_micros() as u64;
+        preparing[2].fetch_add(us, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::framelog::add(crate::framelog::T::RefreshUs, us);
         buffer
     }
 

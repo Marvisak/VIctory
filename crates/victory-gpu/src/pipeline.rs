@@ -587,6 +587,15 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+
+/// Host pipelines created and loaded from the library since the start
+/// (`crate::framelog`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn frame_log_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
+}
+
 #[cfg(all(test, windows, feature = "diagnostics"))]
 mod placed_uav_tests;
 

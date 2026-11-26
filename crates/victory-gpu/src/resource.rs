@@ -826,6 +826,9 @@ pub(crate) struct HostTexture {
     /// When the title last used it: presented frame and milliseconds since
     /// the first stamp ([`HostTexture::stamp`]).
     last: [std::sync::atomic::AtomicU64; 2],
+    /// How many times a list moved its state ([`crate::queue2`] tells a
+    /// fetch recorded before a later use from one recorded after it).
+    pub(crate) moves: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(windows)]
@@ -855,6 +858,7 @@ impl HostTexture {
             key: None,
             placement: None,
             last: [crate::queue::presented().into(), now_ms().into()],
+            moves: std::sync::atomic::AtomicU64::new(0),
         }
     }
 

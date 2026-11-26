@@ -279,6 +279,7 @@ pub(crate) fn recycle(list: std::sync::Arc<crate::host::HostList>) {
     const KEPT: usize = 64;
     if let Ok(list) = std::sync::Arc::try_unwrap(list) {
         list.reset();
+        list.set_title();
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         if spare.len() < KEPT {
             spare.push(list);
@@ -825,7 +826,11 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
             return;
         }};
     }
-    let (Some(host), Some(texture)) = (crate::host::host(), crate::resource::host_resource(src.resource)) else {
+    let (Some(host), Some(texture), Some(copy)) = (
+        crate::host::host(),
+        crate::resource::host_resource(src.resource),
+        crate::resource::host_copy(src.resource),
+    ) else {
         refused!("no host texture");
     };
     // SAFETY: the title's box (same layout as the host's) or null; a live texture.
@@ -889,18 +894,35 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
         }
         list.note_op(text);
     }
-    // SAFETY: an open list; both locations in the host's layout, naming live
-    // resources; the region lies in the footprint (checked).
-    unsafe {
-        list.list.CopyTextureRegion(
-            (&raw const to).cast(),
-            at[0],
-            at[1],
-            at[2],
-            (&raw const from).cast(),
-            b.map(std::ptr::from_ref),
-        )
-    };
+    // With `VICTORY_QUEUE2` bit 1 the copy goes to a copy queue of ours once
+    // this submission has run (`crate::queue2`); when the texture is used
+    // again after the read back, `crate::queue2` runs it on the direct queue
+    // instead. `None`: the switch is off, and it stays in the list.
+    let queued = crate::queue2::fetch(
+        &copy,
+        &buffer,
+        src.footprint.offset as u32,
+        to.footprint,
+        at,
+        b.copied(),
+        len,
+    )
+    .map(|fetch| list.defer_fetch(fetch))
+    .unwrap_or(false);
+    if !queued {
+        // SAFETY: an open list; both locations in the host's layout, naming live
+        // resources; the region lies in the footprint (checked).
+        unsafe {
+            list.list.CopyTextureRegion(
+                (&raw const to).cast(),
+                at[0],
+                at[1],
+                at[2],
+                (&raw const from).cast(),
+                b.map(std::ptr::from_ref),
+            )
+        };
+    }
     let (data, title) = (data as usize, title as usize);
     list.defer_after(move || {
         for &(at, n) in &rows {

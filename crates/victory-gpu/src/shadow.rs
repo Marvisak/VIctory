@@ -17,12 +17,148 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
+
+/// Whether the copy-back of what shaders wrote runs on a thread of its own,
+/// beside the submitting thread and outside the submission lock
+/// (`VICTORY_RELAY=1` or `2`; off by default). `crate::host::relay` says
+/// what it does; here it changes what a copy keeps:
+///
+/// - the ranges shaders may be writing are counted per submission
+///   ([`Flights`]): a range two flights declared stays closed to refreshes
+///   until both have been copied back;
+/// - a merge of what the card wrote never stores into memory the card may
+///   be writing ([`Shadow::relay_merge`]): what it learns goes into title
+///   memory and into the copy's reference (the snapshot) under that
+///   reference's lock;
+/// - ranges whose writes are found by the shaders' write marks stay closed
+///   until every flight in the air has landed and the marks are merged
+///   ([`marks_merged`]), so no refresh puts title bytes over a marked page
+///   a flight may be writing.
+static RELAY: LazyLock<bool> = LazyLock::new(|| {
+    // Off unless asked: without the variable the layer behaves as before.
+    // `VICTORY_RELAY=1`/`2` (stage 2 is not ported; both run stage 1). The
+    // crate's own tests run without it: several look at title memory right
+    // after a submission, which the relay's landing thread may still be
+    // writing.
+    !cfg!(test) && matches!(std::env::var("VICTORY_RELAY").as_deref(), Ok("1") | Ok("2"))
+});
+
+pub(crate) fn relay() -> bool {
+    *RELAY
+}
+
+/// The submission being prepared (its number among those started): what
+/// [`Shadow::writing`] counts a declared range for ([`Flights`]).
+static PREPARED: AtomicU64 = AtomicU64::new(0);
+
+/// A submission's preparing begins (`crate::host`, under the submission
+/// lock).
+pub(crate) fn preparing(number: u64) {
+    PREPARED.store(number, Ordering::Relaxed);
+}
+
+/// With [`relay`]: how many submissions that are not copied back yet
+/// declared each range shaders may be writing (range, count, the last
+/// submission that declared it).
+///
+/// Without it a range declared by two flights was one entry, and the end
+/// of the first flight's copy-back removed it while the second was still
+/// writing: the next refresh would have put title bytes over what the
+/// second flight's shaders were writing.
+#[derive(Default)]
+struct Flights(Vec<((usize, usize), u32, u64)>);
+
+impl Flights {
+    /// Submission `number` declares `range`: counted once for it, however
+    /// often it declares it.
+    fn declare(&mut self, range: (usize, usize), number: u64) {
+        match self.0.iter_mut().find(|f| f.0 == range) {
+            Some(f) => {
+                if f.2 != number {
+                    f.1 += 1;
+                    f.2 = number;
+                }
+            }
+            None => self.0.push((range, 1, number)),
+        }
+    }
+
+    /// One submission that declared `ranges` (each once) is copied back:
+    /// the ranges no other submission still holds.
+    fn done(&mut self, ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let mut free = Vec::new();
+        for range in ranges {
+            match self.0.iter().position(|f| f.0 == *range) {
+                Some(at) => {
+                    self.0[at].1 = self.0[at].1.saturating_sub(1);
+                    if self.0[at].1 == 0 {
+                        self.0.swap_remove(at);
+                        free.push(*range);
+                    }
+                }
+                // Not counted (declared before anything counted): free.
+                None => free.push(*range),
+            }
+        }
+        free
+    }
+}
+
+/// With [`relay`]: the copies holding marked ranges until the next settle,
+/// so that [`marks_merged`] reaches them (they may live in the arena of
+/// view copies, which [`all`] does not name).
+static LISTED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// `[from, to)` without the parts `busy` holds (in order).
+fn gaps(from: usize, to: usize, busy: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut busy: Vec<(usize, usize)> = busy.iter().copied().filter(|&(a, e)| a < to && e > from).collect();
+    busy.sort_unstable();
+    let mut out = Vec::new();
+    let mut at = from;
+    for (a, e) in busy {
+        let (a, e) = (a.max(from), e.min(to));
+        if a > at {
+            out.push((at, a));
+        }
+        at = at.max(e);
+    }
+    if at < to {
+        out.push((at, to));
+    }
+    out
+}
+
+/// The relay's merge of a stretch of a copy ([`relay`]). `now` is what the
+/// card's memory holds, read once; `held` is the copy's reference for the
+/// stretch (its snapshot): what the card's memory held when it was last
+/// looked at; `title` is title memory as just read. Every byte the card
+/// changed (`now` differs from `held`) goes into `title` and into `held`;
+/// every other byte of both stays as it is, so a byte the title wrote and
+/// the card did not keeps the title's value. Whether `title` changed.
+///
+/// Nothing is stored into `now`'s source: the card may be writing it for a
+/// later flight at this moment, and a store there, even of the value just
+/// read, could undo that write.
+fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let mut differs = 0u8;
+    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+        let wrote = 0u8.wrapping_sub(u8::from(*n != *h));
+        let merged = (*t & !wrote) | (*n & wrote);
+        differs |= merged ^ *t;
+        *t = merged;
+        // The reference is what the card's memory holds now; where it did
+        // not change that is what it held before.
+        *h = *n;
+    }
+    differs != 0
+}
 
 fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
     let mut changed = 0;
@@ -77,6 +213,16 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<std::collections::HashSet<(usize, usize)>>,
+    /// With [`relay`]: how many flights in the air declared each range
+    /// ([`Flights`]).
+    flights: Mutex<Flights>,
+    /// With [`relay`]: declared ranges whose writes are found by the
+    /// shaders' marks (no snapshot); they stay in `pending` until the marks
+    /// are merged (`marks_merged`).
+    marked_pending: Mutex<std::collections::HashSet<(usize, usize)>>,
+    /// With [`relay`]: listed in [`LISTED`] for the marks merge at the next
+    /// settle (set once per landing window).
+    listed: std::sync::atomic::AtomicBool,
     /// The copy's bytes before the submission ran where its shaders write:
     /// what the GPU wrote differs. Disjoint segments (offset, bytes) in
     /// order, and the 64 KiB pieces (by title address) already compared.
@@ -260,6 +406,9 @@ impl Shadow {
             len,
             tracked,
             pending: Mutex::default(),
+            flights: Mutex::default(),
+            marked_pending: Mutex::default(),
+            listed: std::sync::atomic::AtomicBool::new(false),
             before: Mutex::default(),
             marks,
             base: slice.map_or(0, |s| s.offset),
@@ -323,13 +472,36 @@ impl Shadow {
     /// With `marked`, nothing is kept: the pages are armed instead, so that
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
-    pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
+    pub(crate) fn writing(self: &Arc<Self>, address: usize, len: usize, marked: bool) {
+        let range = (address, address + len);
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert((address, address + len));
+            .insert(range);
+        // With the copy-back on its own thread: counted for this submission
+        // (once), whether or not an earlier one still holds the range.
+        if relay() {
+            self.flights
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .declare(range, PREPARED.load(Ordering::Relaxed));
+        }
         if marked && let Some(t) = &self.tracked {
             t.arm(address, address + len);
+            // The range stays closed to refreshes until the marks are
+            // merged, when nothing is in the air (`marks_merged`).
+            if relay() {
+                self.marked_pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(range);
+                if !self.listed.swap(true, Ordering::Relaxed) {
+                    LISTED
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(Arc::downgrade(self));
+                }
+            }
             return;
         }
         let (from, to) = self.inside(address, len);
@@ -463,18 +635,156 @@ impl Shadow {
         }
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.remove(&(address, address + len));
-        if pending.is_empty() {
-            compared.clear();
-            for (_, bytes) in segments.drain(..) {
-                give_back(bytes);
-            }
-            if let Some(t) = &self.tracked {
-                t.disarm();
+        // With the copy-back on its own thread several flights may hold a
+        // range: `copy_back_done` frees it when the last of them is done.
+        if !relay() {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.remove(&(address, address + len));
+            if pending.is_empty() {
+                compared.clear();
+                for (_, bytes) in segments.drain(..) {
+                    give_back(bytes);
+                }
+                if let Some(t) = &self.tracked {
+                    t.disarm();
+                }
             }
         }
         written
+    }
+
+    /// After [`Shadow::copy_back`] of a flight's ranges: every submitted
+    /// step that declared one of `ranges` (`(address, end)`, as declared) is
+    /// done with it. With the relay several flights may hold a range: it is
+    /// free when the last submission that declared it is ([`Flights`]); a
+    /// marked range stays closed until its marks are merged
+    /// ([`marks_merged`]).
+    pub(crate) fn copy_back_done(&self, ranges: &[(usize, usize)]) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if relay() {
+            let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
+            let marked = self.marked_pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.retain(|r| !free.contains(r) || marked.contains(r));
+        } else {
+            pending.retain(|r| !ranges.contains(r));
+        }
+        let empty = pending.is_empty();
+        drop(pending);
+        if empty {
+            self.let_snapshot_go();
+        }
+    }
+
+    /// With [`relay`], after the marks of every flight in the air have been
+    /// merged (`crate::shadow::copy_back_marks`): the marked ranges are done
+    /// with, and the snapshot of a copy no flight holds any more goes.
+    pub(crate) fn marks_merged(&self) {
+        let marked = std::mem::take(&mut *self.marked_pending.lock().unwrap_or_else(|e| e.into_inner()));
+        if marked.is_empty() {
+            return;
+        }
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|r| !marked.contains(r));
+        let empty = pending.is_empty();
+        drop(pending);
+        if empty {
+            self.let_snapshot_go();
+        }
+    }
+
+    /// Drops the snapshot and disarms the copy: no flight may write it.
+    fn let_snapshot_go(&self) {
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            return;
+        }
+        snapshot.1.clear();
+        for (_, bytes) in snapshot.0.drain(..) {
+            give_back(bytes);
+        }
+        if let Some(t) = &self.tracked {
+            t.disarm();
+        }
+    }
+
+    /// With [`relay`]: the 64 KiB pieces of `[from, to)` (cut on title
+    /// addresses) whose bytes differ from the snapshot, as (offset, bytes)
+    /// in order — the pieces a landing looks through before
+    /// [`Shadow::relay_merge`]. A piece no snapshot segment holds (a range
+    /// whose writes the shaders mark, or one not declared) is passed over.
+    /// Read without the copy's lock; a piece that changes meanwhile is found
+    /// now or by the flight that wrote it.
+    pub(crate) fn relay_differing(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let (from, to) = self.inside(from, to.saturating_sub(from));
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let (segments, _) = &mut *snapshot;
+        let mut found = Vec::new();
+        let mut piece = from;
+        while piece < to {
+            let n = (PAGE - (self.start as usize + piece) % PAGE).min(to - piece);
+            if let Some((at, bytes)) = segments.iter().find(|(at, bytes)| *at <= piece && piece + n <= at + bytes.len()) {
+                // SAFETY: inside the mapping.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(piece), n) };
+                let old = &bytes[piece - at..piece - at + n];
+                if host != old {
+                    found.push((piece, n));
+                }
+            }
+            piece += n;
+        }
+        found
+    }
+
+    /// With [`relay`], for a copy in the PC's memory: offsets `[at, at + n)`
+    /// are a piece of a declared range that differed from the snapshot. What
+    /// the card wrote there since the snapshot was last brought up goes into
+    /// title memory, from the first to the last such byte, and into the
+    /// snapshot, so that the next flight's merge finds only what the card
+    /// writes from now on. The copy is read once and never written: a later
+    /// flight's shaders may be writing it at this moment. `now` and `title`
+    /// are scratch memory. Returns the bytes written to title memory.
+    pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
+        if n == 0 || at + n > self.len as usize {
+            return 0;
+        }
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let (segments, _) = &mut *snapshot;
+        let Some((seg_at, bytes)) = segments.iter_mut().find(|(seg_at, bytes)| *seg_at <= at && at + n <= *seg_at + bytes.len()) else {
+            return 0;
+        };
+        now.clear();
+        now.reserve(n);
+        // SAFETY: inside the copy's mapping (checked above), read into
+        // room just reserved; the card may write the mapping meanwhile, and
+        // each byte read is one it held at some moment.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
+            now.set_len(n);
+        }
+        // SAFETY: the snapshot's allocation holds these offsets (writing
+        // took them for the declared range); nothing else touches them
+        // without the lock held here.
+        let held = &mut bytes[at - *seg_at..at - *seg_at + n];
+        let first = match now.iter().zip(held.iter()).position(|(a, b)| a != b) {
+            Some(first) => first,
+            None => return 0,
+        };
+        let last = now.iter().zip(held.iter()).rposition(|(a, b)| a != b).unwrap_or(first);
+        let (at, n) = (at + first, last + 1 - first);
+        let (now, held) = (&now[first..=last], &mut held[first..=last]);
+        title.clear();
+        title.resize(n, 0);
+        // Title memory not there: looked at again when the next flight that
+        // declared the range lands (the snapshot stays as it is).
+        if !crate::host::read_into((self.start as usize + at) as *const u8, title) {
+            return 0;
+        }
+        if !merge_piece(now, held, title) {
+            return 0;
+        }
+        let _writing = crate::watch::writing(self.start as usize + at, n);
+        crate::host::write_mapped((self.start as usize + at) as *mut u8, title.as_ptr(), n);
+        n
     }
 
     /// After a submission whose shaders marked the 64 KiB title page at
@@ -564,6 +874,29 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        if relay() && !busy.is_empty() {
+            // Flights in the air may be writing these ranges: no page they
+            // touch is taken or copied, so their bytes stay until their
+            // landing merges them (a title write there reaches the card a
+            // submission later). Pages outside them are refreshed as usual
+            // (only the pages the title changed).
+            if self.tracked.is_some() {
+                return self.update_tracked_skipping(from, to, &busy);
+            }
+            busy.sort_unstable();
+            let (mut at, mut bytes) = (from, 0);
+            for (a, e) in busy {
+                let (a, e) = (a.max(from), e.min(to));
+                if a > at {
+                    bytes += self.copy(at, a);
+                }
+                at = at.max(e);
+            }
+            if at < to {
+                bytes += self.copy(at, to);
+            }
+            return bytes;
+        }
         if self.tracked.is_some() {
             return self.update_tracked(from, to, !busy.is_empty());
         }
@@ -658,6 +991,50 @@ impl Shadow {
             add(C::Watches, 1);
             add(C::Checked, (to - from) as u64);
             add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+        }
+        copied
+    }
+
+    /// [`Shadow::update_tracked`] with flights in the air ([`relay`]):
+    /// pages that any of `busy` touches are left alone (`Tracked::take_skipping`),
+    /// and the bytes of the pages copied are put into the snapshot too, as
+    /// there.
+    fn update_tracked_skipping(&self, from: usize, to: usize, busy: &[(usize, usize)]) -> usize {
+        let Some(t) = &self.tracked else {
+            return 0;
+        };
+        let (runs, unmapped) = t.take_skipping(from, to, busy);
+        let start = self.start as usize;
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sync_before = |a: usize, b: usize| {
+            let (a, b) = (a - start, b - start);
+            for (at, bytes) in before.0.iter_mut() {
+                let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
+                if s < e {
+                    // SAFETY: inside the mapping.
+                    let host = unsafe { std::slice::from_raw_parts(self.data.add(s), e - s) };
+                    bytes[s - *at..e - *at].copy_from_slice(host);
+                }
+            }
+        };
+        let mut copied = 0;
+        for (a, b) in runs {
+            copied += self.copy(a, b);
+            sync_before(a, b);
+        }
+        for (a, b) in unmapped {
+            // SAFETY: inside the mapping (`take_skipping` cuts to the
+            // buffer).
+            unsafe { self.data.add(a - start).write_bytes(0, b - a) };
+            sync_before(a, b);
+        }
+        // Parts on memory that is not the runtime's: whole, but not where a
+        // flight may be writing.
+        for (a, b) in t.untracked(from, to) {
+            for (ga, gb) in gaps(a, b, busy) {
+                copied += self.copy(ga, gb);
+                sync_before(ga, gb);
+            }
         }
         copied
     }
@@ -961,6 +1338,43 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         }
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
+    }
+}
+
+/// With [`relay`], whether any marks were left by shaders since the last
+/// merge (write marks in either bitmap, or a copy holding marked ranges):
+/// whether a settle has anything to merge.
+pub(crate) fn marks_pending() -> bool {
+    if !LISTED.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        return true;
+    }
+    for memory in [false, true] {
+        let Some(b) = bitmap(memory) else {
+            continue;
+        };
+        let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
+        // SAFETY: the mapped bitmap; no flight is in the air when this is
+        // asked (`crate::host::settle`).
+        let bits = unsafe { std::slice::from_raw_parts(b.data as *const u32, words) };
+        let used = (marks().end as usize).div_ceil(32).min(words);
+        if bits[..used].iter().any(|&w| w != 0) {
+            return true;
+        }
+    }
+    false
+}
+
+/// With [`relay`], after the marks of every flight in the air have been
+/// merged (`crate::shadow::copy_back_marks`): the marked ranges are done
+/// with, and the snapshot of a copy no flight holds any more goes.
+pub(crate) fn marks_merged() {
+    if !relay() {
+        return;
+    }
+    let listed = std::mem::take(&mut *LISTED.lock().unwrap_or_else(|e| e.into_inner()));
+    for copy in listed.into_iter().filter_map(|weak| weak.upgrade()) {
+        copy.listed.store(false, Ordering::Relaxed);
+        copy.marks_merged();
     }
 }
 
@@ -1656,5 +2070,47 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::{Flights, merge_piece};
+
+    /// A range two flights declared is free only when both are done, in
+    /// either order; a submission that declares it many times counts once.
+    #[test]
+    fn a_range_stays_closed_until_every_flight_that_declared_it_is_done() {
+        let (a, b) = ((0x1000, 0x2000), (0x1800, 0x3000));
+        let mut flights = Flights::default();
+        for _ in 0..3 {
+            flights.declare(a, 7);
+        }
+        flights.declare(b, 7);
+        flights.declare(a, 8);
+        // Flight 7 lands: `a` is still flight 8's, `b` was only flight 7's.
+        assert_eq!(flights.done(&[a, b]), [b]);
+        assert_eq!(flights.done(&[a]), [a]);
+        assert!(flights.done(&[]).is_empty());
+        // A later flight first: the same.
+        flights.declare(b, 1);
+        flights.declare(b, 2);
+        assert_eq!(flights.done(&[b]), []);
+        assert_eq!(flights.done(&[b]), [b]);
+    }
+
+    /// What the card changed goes into title memory and the reference; a
+    /// byte the title wrote and the card did not keeps the title's.
+    #[test]
+    fn a_merge_takes_the_cards_bytes_and_keeps_the_titles_elsewhere() {
+        let mut held = [0x11u8, 0x22, 0x33];
+        let now = [0x11u8, 0x99, 0x33];
+        let mut title = [0x11u8, 0x22, 0x77];
+        assert!(merge_piece(&now, &mut held, &mut title));
+        assert_eq!(title, [0x11, 0x99, 0x77], "the card's byte, the title's where it did not write");
+        assert_eq!(held, [0x11, 0x99, 0x33], "the reference follows the card");
+        let mut held = [0x11u8, 0x99, 0x33];
+        let mut title = [0x11u8, 0x99, 0x33];
+        assert!(!merge_piece(&now, &mut held, &mut title), "nothing changed since the last look");
     }
 }

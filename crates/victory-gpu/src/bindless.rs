@@ -201,7 +201,12 @@ pub(crate) fn uploads(
 ) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
-    crate::texture::recycle();
+    // With submissions sent to the card without a wait (`crate::host::late`)
+    // the last submission's buffers may still be read by the card: they are
+    // given back once flights land and none is in the air (`crate::host`).
+    if !crate::host::late() {
+        crate::texture::recycle();
+    }
     match &guard.0 {
         // Closed by the last submission, which has run.
         Some(list) => list.reset(),
@@ -213,6 +218,33 @@ pub(crate) fn uploads(
         }
     }
     let list = guard.0.as_ref()?;
+    let recorded = bring_up(list, heaps, textures);
+    list.close();
+    // A list recording nothing is not run (its reset next time is fine).
+    recorded.then_some(Uploads(guard))
+}
+
+/// The upload list of a submission sent ahead (`crate::host::late`): a list
+/// of its own, held by the flight until it has run, since the one of
+/// [`uploads`] is reused by the next submission and that one is prepared
+/// while the flight is in the air.
+pub(crate) fn uploads_own(
+    heaps: &[Arc<Viewed>],
+    textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+) -> Option<Arc<HostList>> {
+    let list = Arc::new(crate::host::host()?.new_list().ok()?);
+    list.set_ours();
+    let recorded = bring_up(&list, heaps, textures);
+    list.close();
+    recorded.then_some(list)
+}
+
+/// Records into `list` the uploads [`uploads`] and [`uploads_own`] bring.
+fn bring_up(
+    list: &HostList,
+    heaps: &[Arc<Viewed>],
+    textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+) -> bool {
     // What to bring up: the textures lists read through tables, and those
     // the heaps view that shaders read lately. Collected under the heaps'
     // locks and brought up without them, several at a time: reading title
@@ -279,9 +311,7 @@ pub(crate) fn uploads(
         // SAFETY: an open list; the barriers name live textures.
         unsafe { list.list.ResourceBarrier(&readable) };
     }
-    list.close();
-    // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads(guard))
+    recorded
 }
 
 /// The upload list, used under its lock only.
