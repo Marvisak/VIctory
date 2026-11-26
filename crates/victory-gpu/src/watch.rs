@@ -439,6 +439,26 @@ impl Drop for Tracked {
     }
 }
 
+/// Splits strictly ascending `pages` into contiguous `(copy, zero)` byte runs
+/// clamped to `[from, to)`, given strictly ascending `unmapped` pages.
+fn split_runs(pages: &[usize], unmapped: &[usize], from: usize, to: usize) -> (Runs, Runs) {
+    let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
+    let mut u = 0;
+    for &p in pages {
+        while u < unmapped.len() && unmapped[u] < p {
+            u += 1;
+        }
+        let is_unmapped = unmapped.get(u) == Some(&p);
+        let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
+        let runs = if is_unmapped { &mut zero } else { &mut copy };
+        match runs.last_mut() {
+            Some((_, end)) if *end == a => *end = b,
+            _ => runs.push((a, b)),
+        }
+    }
+    (copy, zero)
+}
+
 /// Gives write access back to page `page` if we guarded it.
 fn open(g: &mut Guards, page: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
@@ -519,16 +539,7 @@ impl Tracked {
         set_dirty(self.changed.2, !changed.is_empty());
         drop(changed);
         drop(g);
-        let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
-        for p in pages {
-            let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
-            let runs = if unmapped.contains(&p) { &mut zero } else { &mut copy };
-            match runs.last_mut() {
-                Some((_, end)) if *end == a => *end = b,
-                _ => runs.push((a, b)),
-            }
-        }
-        (copy, zero)
+        split_runs(&pages, &unmapped, from, to)
     }
 
     /// Whether page `page` (a page number) changed since it was taken.
@@ -1445,5 +1456,27 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    #[test]
+    fn split_runs_merges_mapped_and_unmapped_in_linear_time() {
+        // Interleaved mapped and unmapped pages with clamped start/end bounds.
+        let pages = [10, 11, 12, 13, 15, 16];
+        let unmapped = [12, 13, 15];
+        let from = 10 * PAGE + 128;
+        let to = 16 * PAGE + 256;
+        let (copy, zero) = split_runs(&pages, &unmapped, from, to);
+        assert_eq!(copy, [(from, 12 * PAGE), (16 * PAGE, to)]);
+        assert_eq!(zero, [(12 * PAGE, 14 * PAGE), (15 * PAGE, 16 * PAGE)]);
+
+        // Large sparse reservation: 16,384 pages (1 GiB), half unmapped.
+        let n = 16_384usize;
+        let all: Vec<usize> = (1..=n).collect();
+        let half_unmapped: Vec<usize> = (1..=n).filter(|p| p % 2 == 0).collect();
+        let (copy, zero) = split_runs(&all, &half_unmapped, PAGE, (n + 1) * PAGE);
+        assert_eq!(copy.len(), n / 2);
+        assert_eq!(zero.len(), n / 2);
+        assert_eq!(copy[0], (PAGE, 2 * PAGE));
+        assert_eq!(zero[0], (2 * PAGE, 3 * PAGE));
     }
 }
