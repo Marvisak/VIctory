@@ -813,7 +813,10 @@ pub(crate) struct HostList {
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one.
-    prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    /// The list's state prelude, made the first time it has work to do (most
+    /// lists never touch a depth twin or a state: one allocator and list
+    /// fewer for each).
+    prelude: OnceLock<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// Which list this is, for the name that tells it apart in device-removed
@@ -1114,16 +1117,6 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude_allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let prelude: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &prelude_allocator,
-                None,
-            )?;
-            prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
             Ok(HostList {
@@ -1137,7 +1130,7 @@ impl Host {
                 rebind: false.into(),
                 ours: false.into(),
                 memory_writer: false.into(),
-                prelude: (prelude_allocator, prelude),
+                prelude: OnceLock::new(),
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
@@ -1948,7 +1941,38 @@ impl HostList {
             left();
             return None;
         }
-        let (allocator, list) = &self.prelude;
+        let (allocator, list) = self.prelude.get_or_init(|| {
+            let made = || -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+                let device = &host().expect("the list's host").device;
+                // SAFETY: plain object creation, the first time this list's
+                // prelude has work to do.
+                unsafe {
+                    let allocator: ID3D12CommandAllocator =
+                        device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList = device.CreateCommandList(
+                        0,
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        &allocator,
+                        None,
+                    )?;
+                    list.Close()?;
+                    Ok((allocator, list))
+                }
+            };
+            match made() {
+                Ok(prelude) => prelude,
+                // Unlike on `main`, where a failed creation came back from
+                // `new_list` as an `Err` the callers degrade through (the
+                // title's list then runs without a host backing, with a
+                // warning), it is fatal here: a list with a state or twin to
+                // move cannot run without its prelude. On a low-RAM machine
+                // near the commit limit that creation is likely to fail for
+                // memory pressure, so the report names the likely cause.
+                Err(e) => fail(format_args!(
+                    "a host state prelude was not made ({e}): likely memory pressure"
+                )),
+            }
+        });
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
