@@ -90,6 +90,11 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    /// Ranges (title addresses) where the copy holds what shaders wrote
+    /// and title memory does not ([`Shadow::keep_writes`]): a refresh
+    /// widened to whole pages stops short of them ([`Shadow::widen`]).
+    /// Disjoint, non-adjacent ranges keyed by their start.
+    kept: Mutex<BTreeMap<usize, usize>>,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
@@ -264,6 +269,7 @@ impl Shadow {
             marks,
             base: slice.map_or(0, |s| s.offset),
             slice,
+            kept: Mutex::default(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -402,7 +408,66 @@ impl Shadow {
     /// in the copy and does not go into title memory (they computed it
     /// from memory with no copy, `crate::memory`).
     pub(crate) fn keep_writes(&self, address: usize, len: usize) {
+        if len > 0 {
+            self.remember_kept(address, address + len);
+        }
         self.copy_back_or_not(address, len, false);
+    }
+
+    /// Adds a kept range to the union. Repeated declarations of all or
+    /// part of a range do not add interval records.
+    fn remember_kept(&self, mut from: usize, mut to: usize) {
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((&start, &end)) = kept.range(..=from).next_back()
+            && end >= from
+        {
+            if end >= to {
+                return;
+            }
+            from = start;
+        }
+        while let Some((&start, &end)) = kept.range(from..=to).next() {
+            to = to.max(end);
+            kept.remove(&start);
+        }
+        kept.insert(from, to);
+    }
+
+    /// `[from, to)` (inside the buffer) grown to the 64 KiB pages it
+    /// touches, cut to the buffer and short of ranges holding shaders'
+    /// kept writes. A page only partly inside a refreshed range is copied
+    /// in part and stays changed ([`crate::watch::Tracked::take`]), so it
+    /// was copied again at every later refresh reaching it: in the world,
+    /// about 80% of the bytes copied per frame (400-550 MB of 550-690 MB on
+    /// an RTX 4060 Ti). Taken whole, it is
+    /// guarded and copied again only once the title writes it.
+    fn widen(&self, from: usize, to: usize) -> (usize, usize) {
+        if self.tracked.is_none() {
+            return (from, to);
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let low = (from / PAGE * PAGE).max(start);
+        let high = to.div_ceil(PAGE).saturating_mul(PAGE).min(end);
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if kept.len() <= 1 {
+            return match kept.first_key_value() {
+                Some((_, &end)) if end <= from => (low.max(end), high),
+                Some((&start, _)) if start >= to => (low, high.min(start)),
+                Some(_) => (from, to),
+                None => (low, high),
+            };
+        }
+        let before = kept.range(..from).next_back();
+        let after = kept.range(from..).next();
+        if before.is_some_and(|(_, &end)| end > from)
+            || after.is_some_and(|(&start, _)| start < to)
+        {
+            // Kept writes inside the range itself: as asked, no more.
+            return (from, to);
+        }
+        let low = before.map_or(low, |(_, &end)| low.max(end));
+        let high = after.map_or(high, |(&start, _)| high.min(start));
+        (low, high)
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
@@ -556,6 +621,7 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        let (from, to) = self.widen(from, to);
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -1438,6 +1504,65 @@ pub(crate) mod tests {
         // Larger than a buffer: one of its own.
         let (_, _, _, d) = arena.take(CHUNK + 1, 4).unwrap();
         assert_eq!((arena.chunks.len(), d.chunk), (2, 1));
+    }
+
+    /// Small refreshes inside a page the title wrote take the whole page:
+    /// the next refreshes there copy nothing until the title writes again,
+    /// and bytes shaders' kept writes hold are not copied over.
+    #[test]
+    fn a_partial_refresh_takes_the_whole_page() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        // SAFETY: (all title writes below) bytes of our pool.
+        unsafe { ((p + 100) as *mut u8).write_volatile(7) };
+        assert_eq!(copy.update(p + 64, 16), PAGE, "the written page, whole");
+        assert_eq!(copy.update(p + 4096, 16), 0, "taken: nothing to copy");
+        assert_eq!(copy.update(p + 64, 16), 0, "nor again");
+        assert_eq!(copy.read_host((p + 100) as u64 & !3, 1)[0].to_le_bytes()[0], 7);
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + 100) as *mut u8).write_volatile(8) };
+        assert_eq!(copy.update(p + 64, 16), PAGE, "written again: copied again");
+        // Shaders' kept writes at the page's end: the refresh stops short.
+        copy.write_host((p + PAGE - 8) as u64, &[0xee]);
+        copy.keep_writes(p + PAGE - 16, 16);
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + 100) as *mut u8).write_volatile(9) };
+        assert_eq!(copy.update(p + 64, 16), PAGE - 16, "up to the kept writes");
+        assert_eq!(copy.read_host((p + PAGE - 8) as u64, 1)[0].to_le_bytes()[0], 0xee, "kept");
+        unregister(p, p as u64);
+    }
+
+    #[test]
+    fn overlapping_kept_writes_remember_their_union() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return;
+        };
+        assert!(copy.tracked.is_some());
+
+        // Declare overlapping writes in reverse order, plus one adjacent
+        // range. They keep one contiguous region.
+        for step in (0..128).rev() {
+            copy.keep_writes(p + 1024 + step * 16, 32);
+        }
+        copy.keep_writes(p + 3088, 16);
+        copy.keep_writes(p + 2000, 8); // already covered
+        copy.keep_writes(p + 8192, 16);
+        assert_eq!(copy.widen(p + 4096, p + 4112), (p + 3104, p + 8192));
+        // Explicitly requested bytes that overlap a kept write stay narrow.
+        assert_eq!(copy.widen(p + 2000, p + 2008), (p + 2000, p + 2008));
+        assert_eq!(copy.widen(p + PAGE + 12, p + PAGE + 16), (p + PAGE, p + len));
+        assert_eq!(copy.kept.lock().unwrap().len(), 2);
+        unregister(p, p as u64);
     }
 
     /// Ranges shaders write far apart are kept apart (not the copy between
