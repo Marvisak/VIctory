@@ -461,7 +461,10 @@ pub(crate) mod tests {
         let again = crate::shadow::take_reads();
         assert!(!again.contains(&plain) && !again.contains(&memory), "each once");
         crate::shadow::forget_read(memory);
-        assert!(!crate::shadow::take_reads().contains(&memory), "forgotten: its mark cleared");
+        // The next submission clears the old mark before the GPU writes a
+        // new one; clearing it in take_reads would lose that new mark.
+        crate::shadow::clear_forgotten();
+        assert!(!crate::shadow::take_reads().contains(&memory), "forgotten: its old mark cleared");
         crate::shadow::tests::mark_read(true, memory);
         assert!(crate::shadow::take_reads().contains(&memory), "read again after it was forgotten");
     }
