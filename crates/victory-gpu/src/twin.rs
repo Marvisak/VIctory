@@ -407,8 +407,31 @@ impl Twin {
     /// a prelude). True if it ran our conversion, which replaces the
     /// list's compute root signature and pipeline.
     pub(crate) fn copy(&self, l: &ID3D12GraphicsCommandList, depth: &Arc<HostTexture>, to_depth: bool, mv: &mut Mover) -> bool {
+        self.copy_with(l, depth, to_depth, mv, converter)
+    }
+
+    fn copy_with(
+        &self,
+        l: &ID3D12GraphicsCommandList,
+        depth: &Arc<HostTexture>,
+        to_depth: bool,
+        mv: &mut Mover,
+        get_converter: impl FnOnce() -> Option<&'static Converter>,
+    ) -> bool {
+        let converts = self.routes.iter().any(|r| r.depth.is_some());
+        let conv = if converts { get_converter() } else { None };
+        let active = |r: &Route| r.depth.is_none() || conv.is_some();
+        if !self.routes.iter().any(active) {
+            return false;
+        }
         let (src, dst) = if to_depth { (COPY_SOURCE, COPY_DEST) } else { (COPY_DEST, COPY_SOURCE) };
-        let mut barriers: Vec<_> = self.planes.iter().filter_map(|p| mv(p, src)).collect();
+        let mut barriers: Vec<_> = self
+            .planes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.routes.iter().any(|r| r.plane == *i && active(r)))
+            .filter_map(|(_, p)| mv(p, src))
+            .collect();
         barriers.extend(mv(depth, dst));
         let at = |r: &ID3D12Resource, sub: u32| D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the copy does not release.
@@ -422,7 +445,6 @@ impl Twin {
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
         };
-        let converts = self.routes.iter().any(|r| r.depth.is_some());
         let state = |from, to| transition(&self.scratch, D3D12_RESOURCE_STATES(from), D3D12_RESOURCE_STATES(to));
         let mut converted = false;
         // SAFETY: an open list; live resources in the states named (the
@@ -431,7 +453,7 @@ impl Twin {
             if !barriers.is_empty() {
                 l.ResourceBarrier(&barriers);
             }
-            for r in &self.routes {
+            for r in self.routes.iter().filter(|r| active(r)) {
                 let plane = &self.planes[r.plane].texture;
                 if to_depth {
                     l.CopyTextureRegion(&placed(r.twin), 0, 0, 0, &at(plane, r.twin_sub), None);
@@ -439,7 +461,7 @@ impl Twin {
                     l.CopyTextureRegion(&placed(r.depth.unwrap_or(r.twin)), 0, 0, 0, &at(&depth.texture, r.depth_sub), None);
                 }
             }
-            if converts && let Some(c) = converter() {
+            if let Some(c) = conv {
                 l.ResourceBarrier(&[state(COPY_DEST as i32, UNORDERED_ACCESS as i32)]);
                 l.SetComputeRootSignature(&c.root);
                 l.SetPipelineState(&c.pso);
@@ -456,7 +478,7 @@ impl Twin {
             } else {
                 l.ResourceBarrier(&[state(COPY_DEST as i32, COPY_SOURCE as i32)]);
             }
-            for r in &self.routes {
+            for r in self.routes.iter().filter(|r| active(r)) {
                 let plane = &self.planes[r.plane].texture;
                 if to_depth {
                     l.CopyTextureRegion(&at(&depth.texture, r.depth_sub), 0, 0, 0, &placed(r.depth.unwrap_or(r.twin)), None);
@@ -644,5 +666,40 @@ mod tests {
         // What the list left is what the next prelude starts from.
         assert_eq!(states[&key(&depth)], depth.state.load(Relaxed));
         assert_eq!(states[&key(&twin.planes[0])], twin.planes[0].state.load(Relaxed));
+    }
+
+    #[test]
+    fn copy_skips_converting_routes_when_converter_is_missing() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation; our out pointer.
+        unsafe { host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, None, &mut texture) }.unwrap();
+        let depth = Arc::new(HostTexture::new(texture.unwrap(), DEPTH_WRITE, Vec::new()));
+        // Console R16_TYPELESS (53) against host R32_TYPELESS requires conversion.
+        let twin = make(53, &depth.texture).unwrap();
+        assert!(twin.routes.iter().all(|r| r.depth.is_some()));
+
+        let list = host.new_list().unwrap();
+        let copies_before = COPIES.load(Relaxed);
+        let mut moved = false;
+        assert!(!twin.copy_with(&list.list, &depth, true, &mut |_, _| { moved = true; None }, || None));
+        assert!(!twin.copy_with(&list.list, &depth, false, &mut |_, _| { moved = true; None }, || None));
+        assert!(!moved, "no texture transitions should be requested when all routes require a missing converter");
+        assert_eq!(COPIES.load(Relaxed), copies_before);
+        list.close();
     }
 }
