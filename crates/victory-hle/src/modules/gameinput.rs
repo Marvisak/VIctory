@@ -316,6 +316,9 @@ struct Registration {
     status: u32,
     context: usize,
     callback: DeviceCallback,
+    /// True while `register_device` is synchronously delivering a blocking
+    /// enumeration snapshot on the caller's thread.
+    enumerating: bool,
 }
 
 impl Registration {
@@ -355,7 +358,8 @@ struct State {
     /// Host slots that have reported non-rest input on their current connection.
     seen_input: [bool; PADS],
     callbacks: Vec<Registration>,
-    /// Asynchronous enumerations, delivered by the next poll.
+    /// Asynchronous enumerations and transitions deferred while a blocking
+    /// enumeration is running on the registering thread.
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
@@ -387,6 +391,46 @@ static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// Microseconds, the clock of every timestamp we hand out.
 fn now() -> u64 {
     START.elapsed().as_micros() as u64
+}
+
+/// Tracks an active device callback invocation so `UnregisterCallback` waits
+/// for it to return and wakes waiters after releasing `Hub::state`.
+struct Running<'a> {
+    hub: &'a Hub,
+    token: u64,
+    thread: ThreadId,
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        {
+            let mut state = self.hub.state();
+            if let Some(i) = state
+                .running
+                .iter()
+                .rposition(|&x| x == (self.token, self.thread))
+            {
+                state.running.swap_remove(i);
+            }
+        }
+        self.hub.returned.notify_all();
+    }
+}
+
+/// Clears `Registration::enumerating` once blocking enumeration finishes on
+/// the caller's thread so the poll thread can deliver deferred transitions.
+struct Enumerating<'a> {
+    hub: &'a Hub,
+    token: u64,
+}
+
+impl Drop for Enumerating<'_> {
+    fn drop(&mut self) {
+        let mut state = self.hub.state();
+        if let Some(r) = state.callbacks.iter_mut().find(|r| r.token == self.token) {
+            r.enumerating = false;
+        }
+    }
 }
 
 impl Hub {
@@ -463,6 +507,11 @@ impl Hub {
                 }
                 state.running.push((r.token, me));
             }
+            let _running = Running {
+                hub: self,
+                token: r.token,
+                thread: me,
+            };
             (r.callback)(
                 r.token,
                 r.context as *mut c_void,
@@ -471,11 +520,6 @@ impl Hub {
                 e.current,
                 e.previous,
             );
-            let mut state = self.state();
-            if let Some(i) = state.running.iter().position(|&x| x == (r.token, me)) {
-                state.running.swap_remove(i);
-            }
-            self.returned.notify_all();
         }
     }
 
@@ -485,6 +529,12 @@ impl Hub {
 }
 
 impl State {
+    fn is_enumerating(&self, token: u64) -> bool {
+        self.callbacks
+            .iter()
+            .any(|r| r.token == token && r.enumerating)
+    }
+
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
@@ -493,7 +543,18 @@ impl State {
         scripted: &[KeyState],
     ) -> Vec<Event> {
         let now = now();
-        let mut events = std::mem::take(&mut self.pending);
+        let mut events = Vec::new();
+        if !self.pending.is_empty() {
+            let mut deferred = Vec::new();
+            for event in std::mem::take(&mut self.pending) {
+                if self.is_enumerating(event.registration.token) {
+                    deferred.push(event);
+                } else {
+                    events.push(event);
+                }
+            }
+            self.pending = deferred;
+        }
         // A wireless receiver answers for a switched-off pad with an all-zero
         // report; ignore a slot until its current connection reports input.
         let mut pads: [Option<PadState>; PADS] = std::array::from_fn(|slot| {
@@ -563,12 +624,18 @@ impl State {
             } else {
                 (STATUS_CONNECTED, 0)
             };
-            events.extend(
-                self.callbacks
-                    .iter()
-                    .filter(|r| r.matches(devices, index) && r.status & STATUS_CONNECTED != 0)
-                    .map(|r| r.event(index, now, current, previous)),
-            );
+            for r in self
+                .callbacks
+                .iter()
+                .filter(|r| r.matches(devices, index) && r.status & STATUS_CONNECTED != 0)
+            {
+                let event = r.event(index, now, current, previous);
+                if r.enumerating {
+                    self.pending.push(event);
+                } else {
+                    events.push(event);
+                }
+            }
         }
     }
 }
@@ -817,14 +884,20 @@ extern "system" fn register_device(
         return E_INVALIDARG;
     };
     let hub = hub(this);
-    let registration = Registration {
+    let mut registration = Registration {
         token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
         device: device as usize,
         kind,
         status,
         context: context as usize,
         callback,
+        enumerating: false,
     };
+    if !out.is_null() {
+        // SAFETY: checked non-null; publish the token before releasing
+        // `hub.state()` so concurrent poll callbacks observe it.
+        unsafe { out.write(registration.token) };
+    }
     let mut found = Vec::new();
     {
         let mut state = hub.state();
@@ -841,16 +914,20 @@ extern "system" fn register_device(
             devices = found.len(),
             "input device callback"
         );
-        state.callbacks.push(registration);
         if enumeration == ASYNC_ENUMERATION {
             state.pending.append(&mut found);
+        } else if !found.is_empty() {
+            registration.enumerating = true;
         }
+        state.callbacks.push(registration);
     }
-    if !out.is_null() {
-        // SAFETY: checked non-null.
-        unsafe { out.write(registration.token) };
+    if registration.enumerating {
+        let _enumerating = Enumerating {
+            hub,
+            token: registration.token,
+        };
+        hub.deliver(found);
     }
-    hub.deliver(found);
     S_OK
 }
 /// Guide button and keyboard layout callbacks: neither ever changes here.
@@ -864,23 +941,22 @@ extern "system" fn register_other(
     token(out)
 }
 
-fn forget(this: This, token: u64) {
-    let mut state = hub(this).state();
+fn forget_locked(state: &mut State, token: u64) {
     state.callbacks.retain(|r| r.token != token);
     state.pending.retain(|e| e.registration.token != token);
 }
 extern "system" fn stop_callback(this: This, token: u64) {
-    forget(this, token);
+    forget_locked(&mut hub(this).state(), token);
 }
 /// Stops the callback, then waits up to `timeout` µs for a call of it that
 /// is running; false on time-out, or from inside that callback (it cannot
 /// wait for itself), as documented. Either way it is never called again.
 extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> bool {
-    forget(this, token);
     let hub = hub(this);
     let me = std::thread::current().id();
     let deadline = Instant::now().checked_add(Duration::from_micros(timeout));
     let mut state = hub.state();
+    forget_locked(&mut state, token);
     loop {
         let running = state.running.iter().filter(|r| r.0 == token);
         if running.clone().any(|r| r.1 == me) {
@@ -1884,5 +1960,451 @@ mod tests {
         let back = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(back).buttons, A);
         release(back);
+    }
+
+    #[test]
+    fn blocking_enumeration_serializes_with_concurrent_poll_and_preserves_order() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+
+        struct Ctx {
+            events: Mutex<Vec<(usize, u32, u32)>>,
+            active: AtomicUsize,
+            max_active: AtomicUsize,
+            token_slot: AtomicU64,
+            token_mismatch: AtomicUsize,
+            entered_slot0: Barrier,
+            poll_done: Barrier,
+        }
+
+        extern "system" fn cb(
+            token: u64,
+            context: *mut c_void,
+            device: *const Device,
+            _timestamp: u64,
+            current: u32,
+            previous: u32,
+        ) {
+            // SAFETY: `context` points to `Ctx` alive until `register_device`
+            // and the final poll complete; `device` is one of `hub.devices`.
+            let (ctx, index) = unsafe { (&*(context as *const Ctx), (*device).index) };
+            let now_active = ctx.active.fetch_add(1, Ordering::SeqCst) + 1;
+            ctx.max_active.fetch_max(now_active, Ordering::SeqCst);
+            if ctx.token_slot.load(Ordering::Acquire) != token {
+                ctx.token_mismatch.fetch_add(1, Ordering::SeqCst);
+            }
+            ctx.events.lock().unwrap().push((index, current, previous));
+            if index == 0 && current == STATUS_CONNECTED {
+                ctx.entered_slot0.wait();
+                ctx.poll_done.wait();
+            }
+            ctx.active.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        let (hub, host) = fake();
+        {
+            let mut h = host.lock().unwrap();
+            h.pads[0] = Some(PadState {
+                buttons: A,
+                ..Default::default()
+            });
+            h.pads[1] = Some(PadState {
+                buttons: B,
+                ..Default::default()
+            });
+        }
+        hub.poll();
+
+        // An unrelated registration must still receive poll transitions while
+        // the new callback is in blocking enumeration.
+        let other_log = Log::default();
+        let other_token = register(hub, GAMEPAD_KIND, 0, &other_log);
+
+        let ctx = Arc::new(Ctx {
+            events: Mutex::new(Vec::new()),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            token_slot: AtomicU64::new(0),
+            token_mismatch: AtomicUsize::new(0),
+            entered_slot0: Barrier::new(2),
+            poll_done: Barrier::new(2),
+        });
+
+        let poller_ctx = Arc::clone(&ctx);
+        let poller_host = Arc::clone(&host);
+        let poller = std::thread::spawn(move || {
+            poller_ctx.entered_slot0.wait();
+            // Exercise multiple transitions across consecutive polls while
+            // blocking enumeration is still mid-flight on the caller's thread.
+            poller_host.lock().unwrap().pads[1] = None;
+            hub.poll();
+            poller_host.lock().unwrap().pads[1] = Some(PadState {
+                buttons: X,
+                ..Default::default()
+            });
+            hub.poll();
+            poller_host.lock().unwrap().pads[1] = None;
+            hub.poll();
+            poller_ctx.poll_done.wait();
+        });
+
+        type Register = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            Option<DeviceCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        let register_fn = slot::<Register, _>(&hub.object, 0x48);
+        let hr = register_fn(
+            &hub.object,
+            std::ptr::null(),
+            GAMEPAD_KIND,
+            STATUS_CONNECTED,
+            2,
+            Arc::as_ptr(&ctx).cast_mut().cast(),
+            Some(cb),
+            ctx.token_slot.as_ptr(),
+        );
+        poller.join().unwrap();
+
+        assert_eq!(hr, S_OK);
+        assert_eq!(ctx.token_mismatch.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            ctx.max_active.load(Ordering::SeqCst),
+            1,
+            "poll thread must not invoke callback concurrently with blocking enumeration"
+        );
+        assert_eq!(
+            *other_log.lock().unwrap(),
+            [
+                (1, 0, STATUS_CONNECTED),
+                (1, STATUS_CONNECTED, 0),
+                (1, 0, STATUS_CONNECTED),
+            ],
+            "unrelated registrations must not be stalled by blocking enumeration"
+        );
+        assert_eq!(
+            *ctx.events.lock().unwrap(),
+            [(0, STATUS_CONNECTED, 0), (1, STATUS_CONNECTED, 0)],
+            "blocking enumeration must deliver the initial snapshot before later transitions"
+        );
+
+        // Transitions observed during blocking enumeration are deferred in FIFO
+        // order, not dropped, and delivered on the next poll.
+        hub.poll();
+        assert_eq!(
+            *ctx.events.lock().unwrap(),
+            [
+                (0, STATUS_CONNECTED, 0),
+                (1, STATUS_CONNECTED, 0),
+                (1, 0, STATUS_CONNECTED),
+                (1, STATUS_CONNECTED, 0),
+                (1, 0, STATUS_CONNECTED),
+            ]
+        );
+
+        let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
+        assert!(unregister(
+            &hub.object,
+            ctx.token_slot.load(Ordering::Acquire),
+            u64::MAX
+        ));
+        assert!(unregister(&hub.object, other_token, u64::MAX));
+    }
+
+    #[test]
+    fn self_unregister_during_blocking_enumeration_cancels_remaining_and_deferred_events() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicBool;
+
+        struct Ctx {
+            hub: &'static Hub,
+            events: Mutex<Vec<(usize, u32, u32)>>,
+            self_unregister_result: AtomicBool,
+            entered_slot0: Barrier,
+            poll_done: Barrier,
+        }
+
+        extern "system" fn cb(
+            token: u64,
+            context: *mut c_void,
+            device: *const Device,
+            _timestamp: u64,
+            current: u32,
+            previous: u32,
+        ) {
+            // SAFETY: `context` points to `Ctx` alive across the call and
+            // `device` is one of `hub.devices`.
+            let (ctx, index) = unsafe { (&*(context as *const Ctx), (*device).index) };
+            ctx.events.lock().unwrap().push((index, current, previous));
+            if index == 0 {
+                ctx.entered_slot0.wait();
+                ctx.poll_done.wait();
+                let unregister =
+                    slot::<extern "system" fn(This, u64, u64) -> bool, _>(&ctx.hub.object, 0x68);
+                let waited = unregister(&ctx.hub.object, token, 0);
+                ctx.self_unregister_result.store(waited, Ordering::SeqCst);
+            }
+        }
+
+        let (hub, host) = fake();
+        {
+            let mut h = host.lock().unwrap();
+            h.pads[0] = Some(PadState {
+                buttons: A,
+                ..Default::default()
+            });
+            h.pads[1] = Some(PadState {
+                buttons: B,
+                ..Default::default()
+            });
+        }
+        hub.poll();
+
+        let ctx = Arc::new(Ctx {
+            hub,
+            events: Mutex::new(Vec::new()),
+            self_unregister_result: AtomicBool::new(true),
+            entered_slot0: Barrier::new(2),
+            poll_done: Barrier::new(2),
+        });
+        let poller_ctx = Arc::clone(&ctx);
+        let poller_host = Arc::clone(&host);
+        let poller = std::thread::spawn(move || {
+            poller_ctx.entered_slot0.wait();
+            poller_host.lock().unwrap().pads[1] = None;
+            hub.poll();
+            poller_ctx.poll_done.wait();
+        });
+
+        type Register = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            Option<DeviceCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        let mut token = 0;
+        let hr = slot::<Register, _>(&hub.object, 0x48)(
+            &hub.object,
+            std::ptr::null(),
+            GAMEPAD_KIND,
+            STATUS_CONNECTED,
+            2,
+            Arc::as_ptr(&ctx).cast_mut().cast(),
+            Some(cb),
+            &mut token,
+        );
+        poller.join().unwrap();
+
+        assert_eq!(hr, S_OK);
+        assert!(!ctx.self_unregister_result.load(Ordering::SeqCst));
+        assert_eq!(*ctx.events.lock().unwrap(), [(0, STATUS_CONNECTED, 0)]);
+
+        // Neither the deferred pad-1 disconnect nor later transitions run.
+        hub.poll();
+        host.lock().unwrap().pads[0] = None;
+        hub.poll();
+        assert_eq!(*ctx.events.lock().unwrap(), [(0, STATUS_CONNECTED, 0)]);
+    }
+
+    #[test]
+    fn concurrent_unregister_waits_for_blocking_enumeration_and_skips_remaining() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicBool;
+
+        struct Ctx {
+            hub: &'static Hub,
+            token_slot: AtomicU64,
+            events: Mutex<Vec<(usize, u32, u32)>>,
+            entered_slot0: Barrier,
+            leaving_slot0: AtomicBool,
+        }
+
+        extern "system" fn cb(
+            token: u64,
+            context: *mut c_void,
+            device: *const Device,
+            _timestamp: u64,
+            current: u32,
+            previous: u32,
+        ) {
+            // SAFETY: `context` points to `Ctx` alive until both threads join
+            // and `device` is one of `hub.devices`.
+            let (ctx, index) = unsafe { (&*(context as *const Ctx), (*device).index) };
+            ctx.events.lock().unwrap().push((index, current, previous));
+            if index == 0 {
+                ctx.entered_slot0.wait();
+                // Wait until the peer thread's `UnregisterCallback` has removed
+                // the callback and is waiting for this invocation to finish.
+                while ctx.hub.state().callbacks.iter().any(|c| c.token == token) {
+                    std::thread::yield_now();
+                }
+                ctx.leaving_slot0.store(true, Ordering::Release);
+            }
+        }
+
+        let (hub, host) = fake();
+        {
+            let mut h = host.lock().unwrap();
+            h.pads[0] = Some(PadState {
+                buttons: A,
+                ..Default::default()
+            });
+            h.pads[1] = Some(PadState {
+                buttons: B,
+                ..Default::default()
+            });
+        }
+        hub.poll();
+
+        let ctx = Arc::new(Ctx {
+            hub,
+            token_slot: AtomicU64::new(0),
+            events: Mutex::new(Vec::new()),
+            entered_slot0: Barrier::new(2),
+            leaving_slot0: AtomicBool::new(false),
+        });
+        let peer_ctx = Arc::clone(&ctx);
+        let peer = std::thread::spawn(move || {
+            peer_ctx.entered_slot0.wait();
+            let token = peer_ctx.token_slot.load(Ordering::Acquire);
+            assert_ne!(token, 0);
+            let unregister =
+                slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
+            let ok = unregister(&hub.object, token, u64::MAX);
+            (ok, peer_ctx.leaving_slot0.load(Ordering::Acquire))
+        });
+
+        type Register = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            Option<DeviceCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        let hr = slot::<Register, _>(&hub.object, 0x48)(
+            &hub.object,
+            std::ptr::null(),
+            GAMEPAD_KIND,
+            STATUS_CONNECTED,
+            2,
+            Arc::as_ptr(&ctx).cast_mut().cast(),
+            Some(cb),
+            ctx.token_slot.as_ptr(),
+        );
+        let (unregistered, saw_leave) = peer.join().unwrap();
+
+        assert_eq!(hr, S_OK);
+        assert!(unregistered);
+        assert!(saw_leave);
+        assert_eq!(*ctx.events.lock().unwrap(), [(0, STATUS_CONNECTED, 0)]);
+
+        host.lock().unwrap().pads[1] = None;
+        hub.poll();
+        assert_eq!(*ctx.events.lock().unwrap(), [(0, STATUS_CONNECTED, 0)]);
+    }
+
+    #[test]
+    fn out_token_is_visible_before_async_enumeration_callback_runs() {
+        use std::sync::atomic::AtomicBool;
+
+        struct Ctx {
+            token_slot: AtomicU64,
+            result: Mutex<Option<(u64, u64)>>,
+            done: Condvar,
+        }
+
+        extern "system" fn cb(
+            token: u64,
+            context: *mut c_void,
+            _device: *const Device,
+            _timestamp: u64,
+            _current: u32,
+            _previous: u32,
+        ) {
+            // SAFETY: `context` points to `Ctx` alive until unregistered.
+            let ctx = unsafe { &*(context as *const Ctx) };
+            let seen = ctx.token_slot.load(Ordering::Acquire);
+            {
+                let mut res = ctx.result.lock().unwrap();
+                if res.is_none() {
+                    *res = Some((token, seen));
+                }
+            }
+            ctx.done.notify_all();
+        }
+
+        let (hub, _host) = fake();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_poller = Arc::clone(&stop);
+        let poller = std::thread::spawn(move || {
+            while !stop_poller.load(Ordering::Acquire) {
+                hub.poll();
+                std::thread::yield_now();
+            }
+        });
+
+        type Register = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            Option<DeviceCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        let register_fn = slot::<Register, _>(&hub.object, 0x48);
+        let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
+
+        let mut mismatch = None;
+        for _ in 0..500 {
+            let ctx = Ctx {
+                token_slot: AtomicU64::new(0),
+                result: Mutex::new(None),
+                done: Condvar::new(),
+            };
+            let hr = register_fn(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                STATUS_CONNECTED,
+                ASYNC_ENUMERATION,
+                (&raw const ctx).cast_mut().cast(),
+                Some(cb),
+                ctx.token_slot.as_ptr(),
+            );
+            assert_eq!(hr, S_OK);
+            let (token, seen) = {
+                let mut guard = ctx.result.lock().unwrap();
+                while guard.is_none() {
+                    guard = ctx.done.wait(guard).unwrap();
+                }
+                guard.unwrap()
+            };
+            assert!(unregister(&hub.object, token, u64::MAX));
+            if seen != token || token == 0 {
+                mismatch = Some((token, seen));
+                break;
+            }
+        }
+
+        stop.store(true, Ordering::Release);
+        poller.join().unwrap();
+        assert_eq!(
+            mismatch, None,
+            "callback observed stale/zero *out token before register_device wrote it"
+        );
     }
 }
