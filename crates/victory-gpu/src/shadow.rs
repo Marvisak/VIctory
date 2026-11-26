@@ -82,8 +82,8 @@ pub(crate) struct Shadow {
     /// order, and the 64 KiB pieces (by title address) already compared.
     before: Mutex<Snapshot>,
     /// Its first bit in the buffer views' written-pages bitmap, one per
-    /// 64 KiB title page it touches (tracked memory only): writes through
-    /// views of it are marked there ([`Shadow::mark_entry`]).
+    /// 64 KiB title page it touches (wholly tracked memory only): writes
+    /// through views of it are marked there ([`Shadow::mark_entry`]).
     marks: Option<u32>,
     /// Where it starts in `buffer` (0 but for copies sharing a buffer), and
     /// the run of the shared buffer it holds ([`Arena`]), given back when it
@@ -251,7 +251,13 @@ impl Shadow {
     /// `gpu` are the run's).
     fn new_at(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, slice: Option<Slice>) -> Arc<Shadow> {
         let tracked = crate::watch::track_copy(start as usize, len as usize, true);
-        let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
+        // Write marks rely on page guards to save pre-submission bytes before a
+        // concurrent title write lands; a copy with untracked pages cannot guard
+        // those pages and must keep write snapshots instead.
+        let marks = tracked
+            .as_ref()
+            .filter(|t| t.untracked(start as usize, start as usize + len as usize).is_empty())
+            .and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
             buffer,
             data,
@@ -328,7 +334,10 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert((address, address + len));
-        if marked && let Some(t) = &self.tracked {
+        if marked
+            && self.marked()
+            && let Some(t) = &self.tracked
+        {
             t.arm(address, address + len);
             return;
         }
@@ -1656,5 +1665,188 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// A title buffer spanning both a write-watched pool and plain committed
+    /// memory cannot guard the untracked plain page to save pre-submission
+    /// bytes on concurrent CPU writes: it must not use write marks, so
+    /// shader writes on both halves go back through write snapshots while
+    /// concurrent CPU writes and unrefreshed neighbor bytes stay intact.
+    #[test]
+    fn mixed_tracked_and_untracked_buffer_uses_snapshots_and_preserves_cpu_writes() {
+        use crate::watch::tests::{MEM_WRITE_WATCH, free};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree, VirtualQuery,
+        };
+        let (pool, plain) = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh reservation, released at once; then
+                // adjacent pool + plain allocations where it was.
+                unsafe {
+                    let p = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
+                    let at = |q: usize, kind: u32| {
+                        VirtualAlloc(q as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | kind, PAGE_READWRITE) as usize
+                    };
+                    let (pool, plain) = (at(p, MEM_WRITE_WATCH), at(p + PAGE, 0));
+                    if p != 0 && pool == p && plain == p + PAGE {
+                        return Some((pool, plain));
+                    }
+                    [pool, plain].into_iter().filter(|&q| q != 0).for_each(free);
+                    None
+                }
+            })
+            .expect("two free adjacent pages");
+        let len = 2 * PAGE;
+        register(pool, pool as u64, len as u64);
+        let Some(copy) = find(pool as u64, len as u64) else {
+            unregister(pool, pool as u64);
+            [pool, plain].into_iter().for_each(free);
+            return; // no host GPU here
+        };
+        let write = |at: usize, v: u8| {
+            // SAFETY: a byte of our pool or plain allocation.
+            unsafe { (at as *mut u8).write_volatile(v) };
+        };
+        let read = |at: usize| {
+            // SAFETY: a byte of our pool or plain allocation.
+            unsafe { (at as *const u8).read_volatile() }
+        };
+        let protection = |p: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+
+        // Pre-existing title bytes on the untracked plain page: inside the
+        // 256-byte UAV range (+10, +40) and outside it (+4096).
+        write(plain + 10, 0x05);
+        write(plain + 40, 0x22);
+        write(plain + 4096, 0x77);
+        // Pre-existing title bytes on the tracked pool page too.
+        write(pool + 10, 0x06);
+        write(pool + 40, 0x44);
+
+        copy.update(plain, 256);
+        copy.writing(plain, 256, true);
+        // Simulate shader write to +10 and concurrent CPU write to +40.
+        copy.write_host((plain + 10) as u64, &[0xaa]);
+        write(plain + 40, 0x33);
+        if copy.marked() {
+            copy.copy_back_marked(plain);
+        }
+        copy.copy_back(plain, 256);
+
+        assert_eq!(read(plain + 10), 0xaa, "shader write on untracked page must copy back");
+        assert_eq!(
+            read(plain + 40),
+            0x33,
+            "concurrent CPU write on untracked page must survive copy-back"
+        );
+        assert_eq!(
+            read(plain + 4096),
+            0x77,
+            "unrefreshed neighbor byte on untracked page must not be clobbered"
+        );
+        assert_eq!(protection(plain), PAGE_READWRITE, "untracked page must stay writable");
+        assert!(!copy.marked(), "mixed shadow must not allocate write marks");
+        assert_eq!(copy.mark_entry(plain as u64), None);
+        assert_eq!(copy.mark_entry(pool as u64), None);
+
+        // Tracked half of the same mixed buffer also merges GPU + CPU writes cleanly.
+        copy.update(pool, 256);
+        copy.writing(pool, 256, true);
+        copy.write_host((pool + 10) as u64, &[0xbb]);
+        write(pool + 40, 0x55);
+        copy.copy_back(pool, 256);
+        assert_eq!(read(pool + 10), 0xbb, "shader write on tracked half must copy back");
+        assert_eq!(read(pool + 40), 0x55, "concurrent CPU write on tracked half must survive");
+
+        // Control: a wholly tracked buffer still gets write marks.
+        let pure = crate::watch::tests::pool(1);
+        register(pure, pure as u64, PAGE as u64);
+        let pure_copy = find(pure as u64, PAGE as u64).expect("host GPU is present");
+        assert!(pure_copy.marked(), "wholly tracked buffer must still use write marks");
+        assert!(pure_copy.mark_entry(pure as u64).is_some());
+        unregister(pure, pure as u64);
+        unregister(pool, pool as u64);
+    }
+
+    /// Memory outside any registered title buffer gets a 4 MiB loose window
+    /// copy (`shadow::loose`). When that window holds a plain committed
+    /// allocation alongside free/pool pages, the window has untracked parts
+    /// and must fall back to write snapshots through `Host::execute` instead
+    /// of write marks.
+    #[test]
+    fn loose_window_over_plain_allocation_uses_snapshots_through_execute() {
+        use crate::watch::tests::{MEM_WRITE_WATCH, free};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let window = WINDOW as usize;
+        let (foreign, _pool) = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh 2-window reservation, released at once;
+                // then plain + pool allocations in the aligned window.
+                unsafe {
+                    let p = VirtualAlloc(std::ptr::null(), 2 * window, MEM_RESERVE, PAGE_READWRITE) as usize;
+                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
+                    let base = p.next_multiple_of(window);
+                    let at = |offset: usize, kind: u32| {
+                        VirtualAlloc((base + offset) as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | kind, PAGE_READWRITE)
+                            as usize
+                    };
+                    let (foreign, pool) = (at(1 << 20, 0), at(2 << 20, MEM_WRITE_WATCH));
+                    if p != 0 && foreign == base + (1 << 20) && pool == base + (2 << 20) {
+                        return Some((foreign, pool));
+                    }
+                    [foreign, pool].into_iter().filter(|&q| q != 0).for_each(free);
+                    None
+                }
+            })
+            .expect("a free 4 MiB window");
+        let copy = find(foreign as u64, 256).expect("loose window shadow");
+        let write = |at: usize, v: u8| {
+            // SAFETY: a byte of our plain allocation.
+            unsafe { (at as *mut u8).write_volatile(v) };
+        };
+        let read = |at: usize| {
+            // SAFETY: a byte of our plain allocation.
+            unsafe { (at as *const u8).read_volatile() }
+        };
+        write(foreign + 10, 0x05);
+        write(foreign + 40, 0x22);
+        write(foreign + 4096, 0x77);
+
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, foreign as u64, 256);
+        copy.gpu_writes(&list, foreign as u64, 256, true);
+        let written_copy = copy.clone();
+        list.defer_host(move || {
+            written_copy.write_host((foreign + 10) as u64, &[0xcc]);
+            // SAFETY: a byte of our plain allocation (concurrent CPU write).
+            unsafe { ((foreign + 40) as *mut u8).write_volatile(0x99) };
+        });
+        list.close();
+        host.execute(&[&list]);
+
+        assert_eq!(read(foreign + 10), 0xcc, "GPU write through loose window must copy back");
+        assert_eq!(
+            read(foreign + 40),
+            0x99,
+            "concurrent CPU write in loose window must survive copy-back"
+        );
+        assert_eq!(
+            read(foreign + 4096),
+            0x77,
+            "neighbor byte outside UAV range in loose window must stay intact"
+        );
+        assert!(!copy.marked(), "loose window with untracked pages must not use write marks");
     }
 }
