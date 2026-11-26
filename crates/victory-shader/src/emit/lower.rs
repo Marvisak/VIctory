@@ -4489,10 +4489,16 @@ impl<'a> Lower<'a> {
         // The base's high dword holds address bits 32-47.
         let mask = self.s.m.i32(0xFFFF);
         let hi = self.s.m.bin(self.cur, Bin::And, hi, mask);
-        // The immediate is signed (21 bits), the offset register unsigned.
-        let mut extra = vec![(self.s.m.i32(offset as u32), offset < 0)];
+        // The base, the immediate and the offset register are truncated to
+        // dwords independently before they are added. The immediate is signed
+        // (21 bits), the offset register unsigned.
+        let align = self.s.m.i32(!3);
+        let lo = self.s.m.bin(self.cur, Bin::And, lo, align);
+        let mut extra = vec![(self.s.m.i32((offset as u32) & !3), offset < 0)];
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
-            extra.push((self.operand(inst, &soffset)?, false));
+            let so = self.operand(inst, &soffset)?;
+            let so = self.s.m.bin(self.cur, Bin::And, so, align);
+            extra.push((so, false));
         }
         let (mut lo, mut hi) = (lo, hi);
         for (x, negative) in extra {
