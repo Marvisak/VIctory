@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread::ThreadId;
 
 static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 
@@ -19,40 +20,92 @@ pub fn main_image() -> Option<usize> {
     }
 }
 
+struct ImagePath {
+    base: usize,
+    path: PathBuf,
+    /// `Some(thread)` while a late-loaded title DLL is still initialising on
+    /// `thread`: visible there (for `GetModuleFileName`, `GetModuleHandle`,
+    /// `FreeLibrary` and re-entrant `LoadLibrary` inside `DllMain`) and hidden
+    /// from other threads until published.
+    pending_on: Option<ThreadId>,
+}
+
+impl ImagePath {
+    fn visible_to(&self, thread: ThreadId) -> bool {
+        self.pending_on.is_none_or(|owner| owner == thread)
+    }
+}
+
 /// Original file of each title image we mapped, by base address.
-static IMAGE_PATHS: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
+static IMAGE_PATHS: Mutex<Vec<ImagePath>> = Mutex::new(Vec::new());
+
+fn insert_image_path(base: usize, path: &Path, pending_on: Option<ThreadId>) {
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    paths.retain(|e| e.base != base);
+    paths.push(ImagePath {
+        base,
+        path,
+        pending_on,
+    });
+}
 
 /// Records the file a title image was mapped from: the title asks for its
 /// own path (`GetModuleFileName`) to find its data, and must not get our
 /// cache copy.
 pub fn set_image_path(base: usize, path: &Path) {
-    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    insert_image_path(base, path, None);
+}
+
+/// Records the original file of a late-loaded title image while its `DllMain`
+/// is running on the calling thread: visible to this thread only until
+/// [`publish_images`] succeeds or [`forget_image`] rolls it back.
+pub fn stage_image_path(base: usize, path: &Path) {
+    insert_image_path(base, path, Some(std::thread::current().id()));
+}
+
+/// Makes staged title images visible to every thread once their `DllMain`s
+/// have all succeeded.
+pub fn publish_images(bases: &[usize]) {
+    if bases.is_empty() {
+        return;
+    }
     let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
-    paths.retain(|(b, _)| *b != base);
-    paths.push((base, path));
+    for entry in paths.iter_mut() {
+        if bases.contains(&entry.base) {
+            entry.pending_on = None;
+        }
+    }
 }
 
 /// Forgets a title image that was unmapped again.
 pub fn forget_image(base: usize) {
     let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
-    paths.retain(|(b, _)| *b != base);
+    paths.retain(|e| e.base != base);
 }
 
 pub fn image_path(base: usize) -> Option<PathBuf> {
+    let me = std::thread::current().id();
     let paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths
         .iter()
-        .find(|(b, _)| *b == base)
-        .map(|(_, p)| p.clone())
+        .find(|e| e.base == base && e.visible_to(me))
+        .map(|e| e.path.clone())
 }
 
 /// The title image whose original file is called `file` (any case).
 pub fn image_named(file: &str) -> Option<usize> {
+    let me = std::thread::current().id();
     let paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths
         .iter()
-        .find(|(_, p)| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(file)))
-        .map(|(b, _)| *b)
+        .find(|e| {
+            e.visible_to(me)
+                && e.path
+                    .file_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(file))
+        })
+        .map(|e| e.base)
 }
 
 /// Maps a title DLL the title loads itself (`LoadLibrary`) and returns its
@@ -285,5 +338,58 @@ mod tests {
         assert_eq!(t.id, 0x639A_A8DD);
         assert_eq!(t.store_id, "9&C");
         assert_eq!(t.storage_bytes, 1024 << 20);
+    }
+
+    #[test]
+    fn staged_images_are_thread_private_until_published_or_forgotten() {
+        let base_a = 0x7000_0001_0000usize;
+        let base_b = 0x7000_0002_0000usize;
+        let name_a = "staged_visibility_a.dll";
+        let name_b = "staged_visibility_b.dll";
+
+        stage_image_path(base_a, Path::new(name_a));
+        stage_image_path(base_b, Path::new(name_b));
+
+        // The staging thread sees both entries.
+        assert_eq!(image_named(name_a), Some(base_a));
+        assert_eq!(image_named(name_b), Some(base_b));
+        assert!(image_path(base_a).is_some());
+        assert!(image_path(base_b).is_some());
+
+        // Another thread sees neither while they are staged.
+        let other_before = std::thread::spawn(move || {
+            (
+                image_named(name_a),
+                image_named(name_b),
+                image_path(base_a).is_some(),
+                image_path(base_b).is_some(),
+            )
+        })
+        .join()
+        .unwrap();
+        assert_eq!(other_before, (None, None, false, false));
+
+        // Publishing only `base_b` leaves `base_a` private to the staging thread.
+        publish_images(&[base_b]);
+        let other_mid = std::thread::spawn(move || {
+            (
+                image_named(name_a),
+                image_named(name_b),
+                image_path(base_a).is_some(),
+                image_path(base_b).is_some(),
+            )
+        })
+        .join()
+        .unwrap();
+        assert_eq!(other_mid, (None, Some(base_b), false, true));
+
+        // Forgetting `base_a` drops it without ever exposing it to other threads.
+        forget_image(base_a);
+        assert_eq!(image_named(name_a), None);
+        assert_eq!(image_path(base_a), None);
+
+        forget_image(base_b);
+        assert_eq!(image_named(name_b), None);
+        assert_eq!(image_path(base_b), None);
     }
 }

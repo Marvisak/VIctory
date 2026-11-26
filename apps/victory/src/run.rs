@@ -354,7 +354,36 @@ impl LateDlls {
         file: &str,
         show: impl Fn(&str, victory_loader::BindReport),
     ) -> Result<Option<usize>> {
-        use victory_hle::runtime::{forget_image, image_named, set_image_path};
+        self.load_with(
+            file,
+            |wanted| victory_loader::load_title_dll(file, &self.title_dir, &self.cache_dir, wanted),
+            |name, dll, resolver| {
+                println!(
+                    "title dll      {name} at {:#x} (loaded by the title)",
+                    dll.base()
+                );
+                show(name, dll.bind_imports(resolver, self.policy)?);
+                Ok(())
+            },
+            |_, dll| {
+                // SAFETY: bound above, dependencies attached first.
+                unsafe { dll.attach() }
+            },
+        )
+    }
+
+    fn load_with(
+        &self,
+        file: &str,
+        map: impl FnOnce(&dyn Fn(&str) -> bool) -> Result<Vec<(String, victory_loader::LoadedImage)>>,
+        mut bind: impl FnMut(
+            &str,
+            &victory_loader::LoadedImage,
+            &dyn victory_loader::ImportResolver,
+        ) -> Result<()>,
+        mut attach: impl FnMut(&str, &victory_loader::LoadedImage) -> Result<()>,
+    ) -> Result<Option<usize>> {
+        use victory_hle::runtime::{forget_image, image_named, publish_images, stage_image_path};
         // Waits while another thread initialises a DLL; a `DllMain` that
         // loads another DLL re-enters.
         self.lock.hold(|| {
@@ -364,12 +393,7 @@ impl LateDlls {
             let new = {
                 let mut mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
                 let wanted = |dll: &str| title_dll(&self.host, dll) && image_named(dll).is_none();
-                let new = victory_loader::load_title_dll(
-                    file,
-                    &self.title_dir,
-                    &self.cache_dir,
-                    &wanted,
-                )?;
+                let new = map(&wanted)?;
                 let hle = victory_hle::HleResolver::new(self.host.clone());
                 let old = victory_loader::WithTitleDlls {
                     inner: &hle,
@@ -379,31 +403,43 @@ impl LateDlls {
                     inner: &old,
                     dlls: &new,
                 };
-                for (name, dll) in &new {
-                    println!(
-                        "title dll      {name} at {:#x} (loaded by the title)",
-                        dll.base()
-                    );
-                    show(name, dll.bind_imports(&resolver, self.policy)?);
-                    set_image_path(dll.base(), &self.title_dir.join(name));
+                let bound = (|| -> Result<()> {
+                    for (name, dll) in &new {
+                        bind(name, dll, &resolver)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = bound {
+                    for (_, dll) in new.into_iter().rev() {
+                        // SAFETY: never attached or published, so no title code holds it.
+                        unsafe { dll.unload() };
+                    }
+                    return Err(error);
                 }
-                // Visible before their `DllMain`s run, which may load more.
+                for (name, dll) in &new {
+                    stage_image_path(dll.base(), &self.title_dir.join(name));
+                }
+                // Visible to this thread before their `DllMain`s run (which
+                // may load more), and hidden from other threads until every
+                // `DllMain` in this batch succeeds.
                 mapped.extend(new.iter().cloned());
                 new
             };
+            if new.is_empty() {
+                return Ok(None);
+            }
             let failed = new.iter().enumerate().find_map(|(i, (name, dll))| {
-                // SAFETY: bound above, dependencies attached first.
-                let attached = unsafe { dll.attach() };
-                attached
+                attach(name, dll)
                     .err()
                     .map(|e| (i, e.context(format!("attaching {name}"))))
             });
+            let bases: Vec<_> = new.iter().map(|(_, d)| d.base()).collect();
             let Some((i, error)) = failed else {
+                publish_images(&bases);
                 return Ok(new.last().map(|(_, dll)| dll.base()));
             };
             // As `LoadLibrary` does when a `DllMain` fails: detach what this
             // load attached (the failed one too) and unmap all of it.
-            let bases: Vec<_> = new.iter().map(|(_, d)| d.base()).collect();
             self.mapped
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -412,9 +448,9 @@ impl LateDlls {
                 // SAFETY: attached (or failing to) on this thread just now.
                 unsafe { done.detach() };
             }
-            for (_, dll) in new {
+            for (_, dll) in new.into_iter().rev() {
                 forget_image(dll.base());
-                // SAFETY: detached, and no title code holds it yet.
+                // SAFETY: detached, and never published to any other thread.
                 unsafe { dll.unload() };
             }
             Err(error)
@@ -492,7 +528,489 @@ mod absent_tests {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("victory-late-dll-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Writes a real PE DLL (a copy of Windows' `version.dll` with a unique
+    /// trailing overlay tag so each test DLL gets its own prepared cache file
+    /// and its own distinct Windows `HMODULE` / base address).
+    fn write_unique_dll(dir: &Path, name: &str, tag: &[u8]) {
+        let mut bytes = std::fs::read(
+            PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\version.dll"),
+        )
+        .unwrap();
+        bytes.extend_from_slice(tag);
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+
+    fn load_prepared(
+        title_dir: &Path,
+        cache_dir: &Path,
+        name: &str,
+    ) -> victory_loader::LoadedImage {
+        let original = std::fs::read(title_dir.join(name)).unwrap();
+        let prepared = victory_loader::prepare(&original).unwrap();
+        victory_loader::load(&prepared, cache_dir).unwrap()
+    }
+
+    fn is_module_mapped(base: usize) -> bool {
+        const FROM_ADDRESS: u32 = 0x4;
+        const UNCHANGED_REFCOUNT: u32 = 0x2;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetModuleHandleExW(
+                flags: u32,
+                module_name: *const u16,
+                module: *mut *mut c_void,
+            ) -> i32;
+        }
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: `FROM_ADDRESS | UNCHANGED_REFCOUNT` queries whether `base`
+        // currently falls inside a mapped module without mutating refcounts.
+        unsafe {
+            GetModuleHandleExW(
+                FROM_ADDRESS | UNCHANGED_REFCOUNT,
+                base as *const u16,
+                &mut handle,
+            ) != 0
+        }
+    }
+
+    fn wide_nul(text: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    fn late_dlls(title_dir: &Path, cache_dir: &Path) -> Arc<super::LateDlls> {
+        let mut host = victory_hle::HostPolicy::default();
+        // `System32\version.dll` imports `msvcrt.dll`, which is outside the
+        // console's default UCRT allowlist.
+        host.allow.push("msvcrt.dll".to_owned());
+        Arc::new(super::LateDlls {
+            host,
+            title_dir: title_dir.to_owned(),
+            cache_dir: cache_dir.to_owned(),
+            policy: victory_loader::UnimplementedPolicy::ReturnZero,
+            mapped: Mutex::new(Vec::new()),
+            lock: super::LoaderLock::default(),
+        })
+    }
+
+    fn cleanup_loaded(late: &super::LateDlls, bases: &[usize]) {
+        let mut removed = Vec::new();
+        {
+            let mut mapped = late.mapped.lock().unwrap();
+            let mut i = 0;
+            while i < mapped.len() {
+                if bases.contains(&mapped[i].1.base()) {
+                    removed.push(mapped.remove(i).1);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for dll in removed.into_iter().rev() {
+            victory_hle::runtime::forget_image(dll.base());
+            // SAFETY: test teardown after all observer threads joined.
+            unsafe {
+                dll.detach();
+                dll.unload();
+            }
+        }
+    }
+
+    /// Serialises tests that inspect freed `HMODULE` addresses so a sibling
+    /// test cannot remap a freshly-unloaded address before the assertion runs.
+    static MODULE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn late_dll_stays_hidden_from_other_threads_during_attach_and_rolls_back_on_failure() {
+        let _serial = MODULE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use victory_hle::modules::kernel::{GetModuleFileNameW, GetModuleHandleW};
+        use victory_hle::runtime::{image_named, image_path};
+
+        let title = TempDir::new("fail-title");
+        let cache = TempDir::new("fail-cache");
+        let dep_name = "late_fail_dep.dll";
+        let top_name = "late_fail_top.dll";
+        write_unique_dll(title.path(), dep_name, b"late-fail-dep-1");
+        write_unique_dll(title.path(), top_name, b"late-fail-top-1");
+        let late = late_dlls(title.path(), cache.path());
+
+        let entered = Arc::new(Barrier::new(2));
+        let checked = Arc::new(Barrier::new(2));
+        let bases = Arc::new(Mutex::new((0usize, 0usize)));
+
+        let observer_entered = entered.clone();
+        let observer_checked = checked.clone();
+        let observer_bases = bases.clone();
+        let observer = std::thread::spawn(move || {
+            observer_entered.wait();
+            let (dep_base, top_base) = *observer_bases.lock().unwrap();
+            let seen = (
+                image_named(dep_name),
+                image_named(top_name),
+                GetModuleHandleW(wide_nul(dep_name).as_ptr()) as usize,
+                GetModuleHandleW(wide_nul(top_name).as_ptr()) as usize,
+                image_path(dep_base),
+                image_path(top_base),
+            );
+            observer_checked.wait();
+            seen
+        });
+
+        let title_dir = title.path().to_owned();
+        let cache_dir = cache.path().to_owned();
+        let outcome = late.load_with(
+            top_name,
+            |_| {
+                let dep = load_prepared(&title_dir, &cache_dir, dep_name);
+                let top = load_prepared(&title_dir, &cache_dir, top_name);
+                *bases.lock().unwrap() = (dep.base(), top.base());
+                Ok(vec![(dep_name.to_owned(), dep), (top_name.to_owned(), top)])
+            },
+            |_, dll, resolver| {
+                dll.bind_imports(resolver, late.policy)?;
+                Ok(())
+            },
+            |name, dll| {
+                // SAFETY: bound above; real `version.dll` attach so rollback detach is valid.
+                unsafe { dll.attach() }?;
+                if name == top_name {
+                    // The loading thread itself must still see both DLLs inside `DllMain`.
+                    let (dep_base, top_base) = *bases.lock().unwrap();
+                    assert_eq!(image_named(dep_name), Some(dep_base));
+                    assert_eq!(image_named(top_name), Some(top_base));
+                    let mut buf = [0u16; 512];
+                    let len = GetModuleFileNameW(
+                        dll.base() as *mut c_void,
+                        buf.as_mut_ptr(),
+                        buf.len() as u32,
+                    ) as usize;
+                    let reported = String::from_utf16_lossy(&buf[..len]);
+                    assert!(
+                        reported.to_ascii_lowercase().ends_with(top_name),
+                        "loading thread should see title path during DllMain, got {reported}"
+                    );
+                    entered.wait();
+                    checked.wait();
+                    anyhow::bail!("DllMain returned FALSE");
+                }
+                Ok(())
+            },
+        );
+
+        let (other_dep, other_top, other_dep_h, other_top_h, other_dep_path, other_top_path) =
+            observer.join().unwrap();
+        assert!(outcome.is_err(), "failed attach must propagate error");
+
+        assert_eq!(
+            other_dep, None,
+            "other thread observed dep before attach finished"
+        );
+        assert_eq!(
+            other_top, None,
+            "other thread observed top before attach finished"
+        );
+        assert_eq!(other_dep_h, 0, "GetModuleHandleW exposed unattached dep");
+        assert_eq!(other_top_h, 0, "GetModuleHandleW exposed unattached top");
+        assert_eq!(
+            other_dep_path, None,
+            "image_path exposed unattached dep to other thread"
+        );
+        assert_eq!(
+            other_top_path, None,
+            "image_path exposed unattached top to other thread"
+        );
+
+        let (dep_base, top_base) = *bases.lock().unwrap();
+        assert_eq!(image_named(dep_name), None);
+        assert_eq!(image_named(top_name), None);
+        assert_eq!(image_path(dep_base), None);
+        assert_eq!(image_path(top_base), None);
+        assert!(late.mapped.lock().unwrap().is_empty());
+        assert_eq!(victory_loader::disable_thread_calls(dep_base), None);
+        assert_eq!(victory_loader::disable_thread_calls(top_base), None);
+        assert!(
+            !is_module_mapped(dep_base),
+            "dep must be unmapped after rollback"
+        );
+        assert!(
+            !is_module_mapped(top_base),
+            "top must be unmapped after rollback"
+        );
+    }
+
+    #[test]
+    fn late_dll_publishes_to_other_threads_only_after_attach_succeeds() {
+        let _serial = MODULE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use victory_hle::modules::kernel::GetModuleHandleW;
+        use victory_hle::runtime::image_named;
+
+        let title = TempDir::new("ok-title");
+        let cache = TempDir::new("ok-cache");
+        let dll_name = "late_ok_pub.dll";
+        write_unique_dll(title.path(), dll_name, b"late-ok-pub-1");
+        let late = late_dlls(title.path(), cache.path());
+
+        let entered = Arc::new(Barrier::new(2));
+        let checked = Arc::new(Barrier::new(2));
+        let published = Arc::new(Barrier::new(2));
+
+        let o_entered = entered.clone();
+        let o_checked = checked.clone();
+        let o_published = published.clone();
+        let o_late = late.clone();
+        let observer = std::thread::spawn(move || {
+            o_entered.wait();
+            let during_named = image_named(dll_name);
+            let during_handle = GetModuleHandleW(wide_nul(dll_name).as_ptr()) as usize;
+            o_checked.wait();
+            o_published.wait();
+            let after_named = image_named(dll_name);
+            let after_handle = GetModuleHandleW(wide_nul(dll_name).as_ptr()) as usize;
+            let after_load = o_late.load(dll_name, |_, _| {}).unwrap();
+            (
+                during_named,
+                during_handle,
+                after_named,
+                after_handle,
+                after_load,
+            )
+        });
+
+        let title_dir = title.path().to_owned();
+        let cache_dir = cache.path().to_owned();
+        let loaded_base = late
+            .load_with(
+                dll_name,
+                |wanted| victory_loader::load_title_dll(dll_name, &title_dir, &cache_dir, wanted),
+                |_, dll, resolver| {
+                    dll.bind_imports(resolver, late.policy)?;
+                    Ok(())
+                },
+                |_, dll| {
+                    // SAFETY: bound above.
+                    unsafe { dll.attach() }?;
+                    entered.wait();
+                    checked.wait();
+                    Ok(())
+                },
+            )
+            .unwrap()
+            .expect("title DLL loaded");
+        published.wait();
+
+        let (during_named, during_handle, after_named, after_handle, after_load) =
+            observer.join().unwrap();
+        let mapped_count = late.mapped.lock().unwrap().len();
+        cleanup_loaded(&late, &[loaded_base]);
+
+        assert_eq!(
+            during_named, None,
+            "other thread saw DLL before attach finished"
+        );
+        assert_eq!(
+            during_handle, 0,
+            "GetModuleHandleW saw DLL before attach finished"
+        );
+        assert_eq!(after_named, Some(loaded_base));
+        assert_eq!(after_handle, loaded_base);
+        assert_eq!(after_load, Some(loaded_base));
+        assert_eq!(
+            mapped_count, 1,
+            "re-loading published DLL must not map a duplicate"
+        );
+        assert!(late.mapped.lock().unwrap().is_empty());
+        assert!(!is_module_mapped(loaded_base));
+    }
+
+    #[test]
+    fn late_dll_bind_failure_unloads_all_mapped_dlls_and_leaves_no_stale_paths() {
+        let _serial = MODULE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use victory_hle::runtime::{image_named, image_path};
+
+        let title = TempDir::new("bind-title");
+        let cache = TempDir::new("bind-cache");
+        let dep_name = "late_bind_dep.dll";
+        let top_name = "late_bind_top.dll";
+        write_unique_dll(title.path(), dep_name, b"late-bind-dep-1");
+        write_unique_dll(title.path(), top_name, b"late-bind-top-1");
+        let late = late_dlls(title.path(), cache.path());
+
+        let title_dir = title.path().to_owned();
+        let cache_dir = cache.path().to_owned();
+        let mut bases = (0usize, 0usize);
+        let outcome = late.load_with(
+            top_name,
+            |_| {
+                let dep = load_prepared(&title_dir, &cache_dir, dep_name);
+                let top = load_prepared(&title_dir, &cache_dir, top_name);
+                bases = (dep.base(), top.base());
+                Ok(vec![(dep_name.to_owned(), dep), (top_name.to_owned(), top)])
+            },
+            |name, dll, resolver| {
+                if name == top_name {
+                    anyhow::bail!("simulated bind failure on {name}");
+                }
+                dll.bind_imports(resolver, late.policy)?;
+                Ok(())
+            },
+            |_, _| panic!("attach must never run after bind failure"),
+        );
+
+        assert!(outcome.is_err(), "bind failure must return Err");
+        let (dep_base, top_base) = bases;
+        assert_eq!(
+            image_named(dep_name),
+            None,
+            "dep path leaked into IMAGE_PATHS after bind failure"
+        );
+        assert_eq!(image_named(top_name), None);
+        assert_eq!(image_path(dep_base), None);
+        assert_eq!(image_path(top_base), None);
+        assert!(late.mapped.lock().unwrap().is_empty());
+        assert_eq!(
+            victory_loader::disable_thread_calls(dep_base),
+            None,
+            "dep stayed in threads::IMAGES"
+        );
+        assert_eq!(
+            victory_loader::disable_thread_calls(top_base),
+            None,
+            "top stayed in threads::IMAGES"
+        );
+        assert!(
+            !is_module_mapped(dep_base),
+            "dep remained mapped after bind failure"
+        );
+        assert!(
+            !is_module_mapped(top_base),
+            "top remained mapped after bind failure"
+        );
+    }
+
+    #[test]
+    fn late_dll_reentrant_load_keeps_outer_hidden_and_inner_published_independently() {
+        let _serial = MODULE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use victory_hle::runtime::image_named;
+
+        let title = TempDir::new("reent-title");
+        let cache = TempDir::new("reent-cache");
+        let outer_name = "late_reent_outer.dll";
+        let inner_name = "late_reent_inner.dll";
+        write_unique_dll(title.path(), outer_name, b"late-reent-outer-1");
+        write_unique_dll(title.path(), inner_name, b"late-reent-inner-1");
+        let late = late_dlls(title.path(), cache.path());
+
+        let entered = Arc::new(Barrier::new(2));
+        let checked = Arc::new(Barrier::new(2));
+
+        let o_entered = entered.clone();
+        let o_checked = checked.clone();
+        let observer = std::thread::spawn(move || {
+            o_entered.wait();
+            let during = (image_named(outer_name), image_named(inner_name));
+            o_checked.wait();
+            during
+        });
+
+        let title_dir = title.path().to_owned();
+        let cache_dir = cache.path().to_owned();
+        let mut outer_base = 0usize;
+        let mut inner_base = 0usize;
+        let outcome = late.load_with(
+            outer_name,
+            |wanted| victory_loader::load_title_dll(outer_name, &title_dir, &cache_dir, wanted),
+            |_, dll, resolver| {
+                dll.bind_imports(resolver, late.policy)?;
+                Ok(())
+            },
+            |_, dll| {
+                // SAFETY: bound above.
+                unsafe { dll.attach() }?;
+                outer_base = dll.base();
+                // Re-entrant load of the attaching DLL itself returns the staged base.
+                assert_eq!(late.load(outer_name, |_, _| {}).unwrap(), Some(outer_base));
+                // Re-entrant load of an independent DLL attaches and publishes it.
+                inner_base = late
+                    .load(inner_name, |_, _| {})
+                    .unwrap()
+                    .expect("inner loaded");
+                assert_ne!(inner_base, outer_base);
+                entered.wait();
+                checked.wait();
+                anyhow::bail!("outer DllMain returned FALSE");
+            },
+        );
+
+        let (other_outer, other_inner) = observer.join().unwrap();
+        assert!(outcome.is_err());
+
+        let inner_still_visible = image_named(inner_name);
+        let outer_after = image_named(outer_name);
+        let mapped_bases: Vec<usize> = late
+            .mapped
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, d)| d.base())
+            .collect();
+        let outer_still_mapped = is_module_mapped(outer_base);
+        let inner_still_mapped = is_module_mapped(inner_base);
+        cleanup_loaded(&late, &[inner_base]);
+
+        assert_eq!(
+            other_outer, None,
+            "other thread saw outer while outer DllMain ran"
+        );
+        assert_eq!(
+            other_inner,
+            Some(inner_base),
+            "completed inner DLL should be published"
+        );
+        assert_eq!(outer_after, None, "failed outer DLL must be forgotten");
+        assert_eq!(
+            inner_still_visible,
+            Some(inner_base),
+            "inner DLL must stay published after outer rollback"
+        );
+        assert_eq!(mapped_bases, [inner_base]);
+        assert!(
+            !outer_still_mapped,
+            "outer DLL must be unmapped after rollback"
+        );
+        assert!(inner_still_mapped, "inner DLL must remain mapped");
+    }
 
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {
