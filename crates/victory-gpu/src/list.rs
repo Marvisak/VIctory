@@ -11,6 +11,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::mem::offset_of;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
@@ -115,6 +116,8 @@ struct List {
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Upload>>,
+    /// Closing a host segment at a wait leaves the title list open.
+    closed: AtomicBool,
     /// The host lists the calls record into, in order: one, and one more
     /// for every wait the title records after commands ([`wait`]). Shared
     /// with the queues that hold them until their waits hold
@@ -381,6 +384,7 @@ fn new_list(
         pipeline_shadow: [0; 8],
         newer: [0; 256],
         uploads: Default::default(),
+        closed: AtomicBool::new(false),
         #[cfg(windows)]
         hosts: std::sync::Mutex::new(
             crate::host::host()
@@ -448,6 +452,9 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    list.closed.store(true, Ordering::Relaxed);
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
@@ -460,13 +467,12 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     // A queue may still hold what the list recorded (`restart`, `leave`).
     // SAFETY: the title passes one of our lists.
-    let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    let uploads = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
+    let list = unsafe { &*this.cast::<List>() };
+    let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(windows)]
     {
         let held = restart(this);
-        // SAFETY: the title passes one of our lists.
-        let mut state = unsafe { &(*this.cast::<List>()).state }.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
         let old = std::mem::take(&mut *state);
         state.reset(pipeline);
         drop(state);
@@ -474,10 +480,32 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     #[cfg(not(windows))]
     drop(uploads);
+    list.closed.store(false, Ordering::Relaxed);
     crate::pipeline::bound(pipeline);
-    #[cfg(not(windows))]
-    let _ = this;
     S_OK
+}
+
+extern "system" fn clear_state(this: This, pipeline: This) {
+    const DIRECT: u32 = 0;
+    const COMPUTE: u32 = 2;
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    if !matches!(list.kind, DIRECT | COMPUTE) || list.closed.load(Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        if let Some(host) = host_list(this) {
+            // SAFETY: the current host segment is open. Draws and dispatches
+            // bind the translated pipeline on demand.
+            unsafe { host.list.ClearState(None) };
+        }
+        list.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear_state(pipeline);
+    }
+    crate::pipeline::bound(pipeline);
 }
 
 /// A resource barrier as titles pass it: type, flags, then a resource and
@@ -1736,13 +1764,14 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 53] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
     (8, list_type as *const ()),                  // 0x40
     (9, close as *const ()),                      // 0x48
     (10, reset as *const ()),                     // 0x50
+    (11, clear_state as *const ()),               // 0x58
     (12, state::draw as *const ()),               // 0x60 instanced
     (13, state::draw_indexed as *const ()),       // 0x68 indexed
     (14, state::dispatch as *const ()),           // 0x70
@@ -1962,6 +1991,14 @@ mod tests {
             }
         });
         assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn clear_state_has_the_same_slot_in_both_layouts() {
+        assert_eq!(newer_slot(11), 11);
+        for table in [&LIST_FUNCTIONS, &NEWER_LIST_FUNCTIONS] {
+            assert_eq!(table.0[0x58 / 8], clear_state as *const ());
+        }
     }
 
     /// ClearUnorderedAccessViewUint/Float and DiscardResource come before
