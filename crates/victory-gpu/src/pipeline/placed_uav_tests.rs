@@ -178,7 +178,7 @@ fn placed_uav_dispatch_writes_its_texture() {
 
     let expected = [1.0f32, 0.5, -0.25, 2.0];
     let list = host.new_list().unwrap();
-    crate::texture::upload(&list, placed, &texture);
+    crate::texture::upload(&list, placed, &texture, 0);
     let mut state = crate::draw::State::default();
     state.set_pipeline(pipeline.0);
     state.set_heaps(&[views.0]);

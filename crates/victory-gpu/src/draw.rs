@@ -1912,7 +1912,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         }
     }
     match (view, u.kind) {
-        (View::Shader(resource, _), ResourceType::Srv) => {
+        (View::Shader(resource, desc), ResourceType::Srv) => {
             // A view of memory the GPU writes through another title texture
             // whose host copy this one could not share reads that copy.
             if let Some(a) = crate::resource::alias_source(*resource as This) {
@@ -1921,7 +1921,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
             if let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(&t)
             {
-                crate::texture::upload(list, *resource as This, &t);
+                // Read from the view's first level on.
+                let first = crate::texture::first_level(desc.as_ref());
+                crate::texture::upload(list, *resource as This, &t, first);
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]
@@ -2928,6 +2930,63 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(n, 1, "written: uploaded again");
         assert!((x - 128.0 / 255.0).abs() < 1e-6);
         assert_eq!(submit(Some(0x80)).0, 0, "the same bytes in a shared page: not uploaded");
+    }
+
+    /// A texture a shader reads through a view of level 3 on (and through
+    /// nothing else) is staged and uploaded from level 3 on; one read
+    /// through a view of level 0 on is uploaded whole.
+    #[test]
+    fn a_shader_view_from_a_later_level_uploads_from_it() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // 256x256 RGBA8, 9 levels, in the title's default layout.
+        let words = crate::resource::texture_words(256, 256, 28, 9);
+        for (most_detailed, copied) in [(3u32, 6u64), (0, 9)] {
+            let p = crate::watch::tests::pool(8);
+            let object = texture_at_address(p as u64, &words);
+            let mut desc = [0u32; 10];
+            desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, most_detailed, 9 - most_detailed]);
+            let view = View::Shader(object as usize, Some(desc));
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Srv), &view, false);
+            let (first, read, whole) = crate::texture::staged_from(object).expect("staged");
+            assert_eq!(first, most_detailed, "staged from the view's level");
+            if most_detailed == 0 {
+                assert_eq!(read as u64, whole, "whole");
+            } else {
+                assert!(read as u64 * 16 < whole, "{read} of {whole} bytes read");
+            }
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(crate::texture::copied(object), copied, "levels {most_detailed} on copied");
+        }
+    }
+
+    /// One list reads a texture through a view of level 3 on, then through
+    /// a view of level 0 on: its submission uploads the texture whole.
+    #[test]
+    fn a_list_reading_an_earlier_level_later_uploads_it_whole() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let words = crate::resource::texture_words(256, 256, 28, 9);
+        let p = crate::watch::tests::pool(8);
+        let object = texture_at_address(p as u64, &words);
+        let view = |most_detailed: u32| {
+            let mut desc = [0u32; 10];
+            desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, most_detailed, 9 - most_detailed]);
+            View::Shader(object as usize, Some(desc))
+        };
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Srv), &view(3), false);
+        assert_eq!(crate::texture::staged_from(object).map(|s| s.0), Some(3));
+        readable(&list, &used(ResourceType::Srv), &view(0), false);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(crate::texture::staged_from(object).map(|s| s.0), Some(0), "staged from level 0");
+        assert_eq!(crate::texture::uploads(object), 1, "uploaded once");
+        assert_eq!(crate::texture::copied(object), 9, "every level copied");
     }
 
     /// A list recorded before another whose host copy writes a texture it

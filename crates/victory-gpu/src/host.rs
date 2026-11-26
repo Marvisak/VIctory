@@ -1012,8 +1012,9 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
-    /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    /// Textures whose contents the list brings up to date, and the earliest
+    /// level it asked for.
+    textures: std::collections::HashMap<usize, u32>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2268,7 +2269,17 @@ impl HostList {
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
-        self.deferred().textures.insert(key)
+        self.first_use_from(key, 0)
+    }
+
+    /// As [`HostList::first_use`], for a use that reads from level `first`
+    /// on: also true when the list asked before only from a later level.
+    pub(crate) fn first_use_from(&self, key: usize, first: u32) -> bool {
+        let mut deferred = self.deferred();
+        let asked = deferred.textures.entry(key).or_insert(u32::MAX);
+        let earlier = first < *asked;
+        *asked = (*asked).min(first);
+        earlier
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.

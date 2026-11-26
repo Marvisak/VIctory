@@ -220,17 +220,30 @@ pub(crate) fn uploads(
     // thread in a new shot, and title threads setting views waited on the
     // lock meanwhile (run evict5).
     let mut work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)> = Vec::new();
-    let mut staged = std::collections::HashSet::new();
+    // One staging per host texture: of a texture staged from a later level
+    // and staged again from an earlier one, the one from the earliest level.
+    let mut at: std::collections::HashMap<_, usize> = std::collections::HashMap::new();
     for (staging, copy) in textures {
         // A host copy wrote it in a submission made before this one (it
         // was not when the list was recorded).
         if copy.host_written.load(Relaxed) {
             continue;
         }
-        if staged.insert(Arc::as_ptr(staging)) {
-            work.push((staging.clone(), copy.clone()));
+        match at.entry(Arc::as_ptr(copy)) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let held = &mut work[*e.get()].0;
+                if staging.first < held.first {
+                    *held = staging.clone();
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(work.len());
+                work.push((staging.clone(), copy.clone()));
+            }
         }
     }
+    let mut staged: std::collections::HashSet<_> =
+        work.iter().map(|(s, _)| Arc::as_ptr(s)).collect();
     let mut done = std::collections::HashSet::new();
     for viewed in heaps {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
