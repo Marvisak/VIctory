@@ -65,6 +65,9 @@ pub(crate) struct Heap {
     written: Option<crate::watch::Tracked>,
 }
 
+#[cfg(windows)]
+pub use host::log_capped_high_water;
+#[cfg(windows)]
 pub(crate) use host::fallback_samplers;
 
 /// A title heap's host copy.

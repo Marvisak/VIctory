@@ -583,9 +583,13 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
-    // Compiled host pipelines kept for the next run.
+    // Compiled host pipelines kept for the next run, and any unreported
+    // capped-heap high-water mark flushed before TerminateProcess.
     #[cfg(windows)]
-    victory_gpu::pipeline::save_pipeline_cache();
+    {
+        victory_gpu::pipeline::save_pipeline_cache();
+        victory_gpu::descriptor::log_capped_high_water();
+    }
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }
