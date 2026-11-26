@@ -144,7 +144,8 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, path: name });
+    let patches = file_patch::for_file(&name, &file);
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file, path: name, patches });
     put(out, file)
 }
 
@@ -260,7 +261,196 @@ struct File {
     file: std::fs::File,
     /// As the title named it (diagnostics).
     path: String,
+    /// Byte ranges served from elsewhere (`VICTORY_FILE_PATCH`).
+    patches: Box<[file_patch::Patch]>,
 }
+
+/// Byte ranges of the title's files served from other files at read time
+/// (`VICTORY_FILE_PATCH=<list>`), so nothing on disk is changed. Each line of
+/// the list is `<file name> <offset> <blake3 of the original range> <file
+/// with the new bytes>` (`#` starts a comment; the offset is decimal or
+/// `0x` hex; a relative path is from the list's folder). The range is as
+/// long as the new bytes, and a patch applies only to a file whose name
+/// matches (case ignored) and whose bytes there have that hash, so another
+/// version of the file is left as it is. The repository holds no patches:
+/// a list and its bytes are the user's own, made from their copy.
+mod file_patch {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    pub(super) struct Patch {
+        offset: u64,
+        bytes: Box<[u8]>,
+        name: String,
+        /// Whether a read has been served from it yet (logged once).
+        used: AtomicBool,
+    }
+
+    /// The patches of the list `VICTORY_FILE_PATCH` names for the file at
+    /// `path`; none without the switch.
+    pub(super) fn for_file(path: &str, file: &std::fs::File) -> Box<[Patch]> {
+        match std::env::var_os("VICTORY_FILE_PATCH") {
+            Some(list) => load(std::path::Path::new(&list), path, file),
+            None => Box::default(),
+        }
+    }
+
+    fn base(path: &str) -> String {
+        path.rsplit(['\\', '/']).next().unwrap_or(path).to_ascii_lowercase()
+    }
+
+    struct Line<'a> {
+        target: &'a str,
+        offset: u64,
+        hash: [u8; 32],
+        data: &'a str,
+    }
+
+    fn parse(line: &str) -> Option<Line<'_>> {
+        let mut rest = line.trim();
+        let mut field = || {
+            let end = rest.find(char::is_whitespace)?;
+            let (word, tail) = rest.split_at(end);
+            rest = tail.trim_start();
+            Some(word)
+        };
+        let target = field()?;
+        let offset = field()?;
+        let hash = field()?;
+        let offset = match offset.strip_prefix("0x").or_else(|| offset.strip_prefix("0X")) {
+            Some(hex) => u64::from_str_radix(hex, 16).ok()?,
+            None => offset.parse().ok()?,
+        };
+        if hash.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = u8::from_str_radix(hash.get(2 * i..2 * i + 2)?, 16).ok()?;
+        }
+        let data = rest.trim_end();
+        (!data.is_empty()).then_some(Line { target, offset, hash: bytes, data })
+    }
+
+    pub(super) fn load(list: &std::path::Path, path: &str, file: &std::fs::File) -> Box<[Patch]> {
+        use std::os::windows::fs::FileExt;
+        let text = match std::fs::read_to_string(list) {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::warn!(list = %list.display(), %error, "file patch: the list could not be read");
+                return Box::default();
+            }
+        };
+        let name = base(path);
+        let mut out = Vec::new();
+        for (number, line) in text.lines().enumerate().map(|(i, l)| (i + 1, l.trim())) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some(line) = parse(line) else {
+                tracing::warn!(list = %list.display(), line = number, "file patch: a line is not `<file name> <offset> <blake3> <file>`");
+                continue;
+            };
+            if base(line.target) != name {
+                continue;
+            }
+            let data = list.parent().unwrap_or(std::path::Path::new("")).join(line.data);
+            let bytes = match std::fs::read(&data) {
+                Ok(bytes) if !bytes.is_empty() => bytes,
+                Ok(_) => continue,
+                Err(error) => {
+                    tracing::warn!(data = %data.display(), %error, "file patch: the new bytes could not be read");
+                    continue;
+                }
+            };
+            let mut original = vec![0u8; bytes.len()];
+            let mut done = 0;
+            while done < original.len() {
+                match file.seek_read(&mut original[done..], line.offset + done as u64) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => done += n,
+                }
+            }
+            if done < original.len() || *blake3::hash(&original).as_bytes() != line.hash {
+                tracing::warn!(
+                    path,
+                    offset = line.offset,
+                    len = bytes.len(),
+                    "file patch: the file's bytes there are not the ones the patch was made for; not applied"
+                );
+                continue;
+            }
+            tracing::info!(path, offset = line.offset, len = bytes.len(), data = %data.display(), "file patch: applies to this file");
+            out.push(Patch { offset: line.offset, bytes: bytes.into(), name: name.clone(), used: AtomicBool::new(false) });
+        }
+        out.into()
+    }
+
+    /// Puts the patches over `out`, the bytes read at `offset`.
+    pub(super) fn apply(patches: &[Patch], out: &mut [u8], offset: u64) {
+        let end = offset + out.len() as u64;
+        for patch in patches {
+            let patch_end = patch.offset + patch.bytes.len() as u64;
+            if patch.offset >= end || patch_end <= offset {
+                continue;
+            }
+            let (from, to) = (patch.offset.max(offset), patch_end.min(end));
+            out[(from - offset) as usize..(to - offset) as usize]
+                .copy_from_slice(&patch.bytes[(from - patch.offset) as usize..(to - patch.offset) as usize]);
+            if !patch.used.swap(true, Ordering::Relaxed) {
+                tracing::info!(file = patch.name, offset = patch.offset, read_at = offset, read_len = out.len(), "file patch: first read served from it");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::os::windows::fs::FileExt;
+
+        fn read(file: &std::fs::File, patches: &[super::Patch], at: usize, n: usize) -> Vec<u8> {
+            let mut out = vec![0u8; n];
+            let mut done = 0;
+            while done < n {
+                let k = file.seek_read(&mut out[done..], (at + done) as u64).unwrap();
+                super::apply(patches, &mut out[done..done + k], (at + done) as u64);
+                done += k;
+            }
+            out
+        }
+
+        /// A patch is served over every read that meets it, and only where
+        /// the file still has the bytes it was made for.
+        #[test]
+        fn patches_serve_their_range_when_the_file_matches() {
+            let plain: Vec<u8> = (0..100_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("Data.RPF");
+            std::fs::write(&path, &plain).unwrap();
+            let new: Vec<u8> = (0..3000u32).map(|i| (i % 13) as u8 ^ 0xa5).collect();
+            std::fs::write(dir.path().join("new.bin"), &new).unwrap();
+            let (at, len) = (40_000usize, new.len());
+            let good = blake3::hash(&plain[at..at + len]).to_hex();
+            let list = dir.path().join("patches.txt");
+            std::fs::write(
+                &list,
+                format!("# test\nother.rpf 0 {good} new.bin\ndata.rpf {at:#x} {good} new.bin\nnot a line\n"),
+            )
+            .unwrap();
+            let mut expected = plain.clone();
+            expected[at..at + len].copy_from_slice(&new);
+            let file = std::fs::File::open(&path).unwrap();
+            let patches = super::load(&list, r"G:\data.rpf", &file);
+            assert_eq!(patches.len(), 1);
+            for (from, n) in [(0, 100_000), (39_000, 1001), (39_999, 2), (41_000, 500), (42_999, 10), (43_000, 7), (10, 20)] {
+                assert!(read(&file, &patches, from, n) == expected[from..from + n], "{from} {n}");
+            }
+            // The file differs from the one the patch was made for: not applied.
+            let bad = blake3::hash(b"something else").to_hex();
+            std::fs::write(&list, format!("data.rpf {at} {bad} new.bin\n")).unwrap();
+            assert!(super::load(&list, "data.rpf", &file).is_empty());
+        }
+    }
+}
+
 
 static FILE_VTABLE: Methods<8> = Methods([
     missing::<0> as *const (),
@@ -981,9 +1171,8 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let state = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
+    let file = &state.file;
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
@@ -992,7 +1181,11 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         }
         match file.seek_read(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
-            Ok(n) => done += n,
+            Ok(n) => {
+                let at = request.offset + done as u64;
+                file_patch::apply(&state.patches, &mut out[done..done + n], at);
+                done += n;
+            }
             Err(error) => break Err(from_win32(&error)),
         }
     };

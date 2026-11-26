@@ -5,6 +5,8 @@
 
 pub mod cityhash;
 pub mod pipelines;
+pub mod prompt_glyphs;
+pub mod settings_diagram;
 pub mod sgd5;
 pub mod shaderpack;
 
