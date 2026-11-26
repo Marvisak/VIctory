@@ -795,6 +795,8 @@ impl HostHeap {
             // memory) is made without the slot lock, which title threads
             // binding and writing views wait on (run evict5).
             drop(made);
+            // Only attribute a refusal produced while preparing this slot.
+            let _ = crate::resource::take_refused_for_memory();
             prepare(&view);
             made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             // The title may have written another record there meanwhile (and
@@ -826,6 +828,12 @@ impl HostHeap {
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
+                // Bindless-only slots consume their read mark even when the
+                // descriptor remains null. Re-arm only transient OOM refusals;
+                // permanent failures must not retry on every shader read.
+                if !later && crate::resource::take_refused_for_memory() {
+                    crate::shadow::forget_read(index);
+                }
             }
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
