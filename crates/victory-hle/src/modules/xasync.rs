@@ -86,9 +86,21 @@ impl Task {
     }
 }
 
+struct PendingTask {
+    // The flag identifies the submitting queue and remains live until the task runs.
+    owner_terminated: Arc<AtomicBool>,
+    task: Task,
+}
+
+impl PendingTask {
+    fn run(self) {
+        self.task.run(self.owner_terminated.load(Ordering::Acquire));
+    }
+}
+
 struct Port {
     mode: Mode,
-    tasks: Mutex<VecDeque<Task>>,
+    tasks: Mutex<VecDeque<PendingTask>>,
     ready: Condvar,
 }
 
@@ -106,7 +118,7 @@ impl Port {
             std::thread::spawn(move || {
                 loop {
                     match worker.take(1000, || false) {
-                        Some(task) => task.run(false),
+                        Some(task) => task.run(),
                         None if Arc::strong_count(&worker) == 1 => break,
                         None => {}
                     }
@@ -116,21 +128,39 @@ impl Port {
         port
     }
 
-    fn submit(&self, task: Task) {
+    /// Queues or runs a task on behalf of the submitting queue. Returns false
+    /// if termination cancels it before it can be enqueued.
+    fn submit(&self, owner_terminated: &Arc<AtomicBool>, task: Task) -> bool {
         match self.mode {
-            Mode::Immediate => task.run(false),
-            Mode::ThreadPool => POOL.submit(task),
+            Mode::Immediate => {
+                task.run(false);
+                true
+            }
+            Mode::ThreadPool => {
+                POOL.submit(task);
+                true
+            }
             Mode::Manual | Mode::Serialized => {
-                lock(&self.tasks).push_back(task);
+                let mut tasks = lock(&self.tasks);
+                if owner_terminated.load(Ordering::Acquire) {
+                    drop(tasks);
+                    task.run(true);
+                    return false;
+                }
+                tasks.push_back(PendingTask {
+                    owner_terminated: Arc::clone(owner_terminated),
+                    task,
+                });
                 self.ready.notify_one();
+                true
             }
         }
     }
 
     /// The next queued task, waiting up to `timeout_ms`, or until `ended`
     /// (checked whenever the port is woken) says no task will come.
-    fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<Task> {
-        let waiting = |t: &mut VecDeque<Task>| t.is_empty() && !ended();
+    fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<PendingTask> {
+        let waiting = |t: &mut VecDeque<PendingTask>| t.is_empty() && !ended();
         let tasks = lock(&self.tasks);
         let mut tasks = if timeout_ms == INFINITE {
             self.ready
@@ -144,6 +174,23 @@ impl Port {
                 .0
         };
         tasks.pop_front()
+    }
+
+    /// Removes the submitting queue's pending tasks, preserving FIFO order
+    /// for both the removed tasks and the tasks that stay queued.
+    fn take_owned(&self, owner_terminated: &Arc<AtomicBool>) -> Vec<Task> {
+        let mut tasks = lock(&self.tasks);
+        let mut owned = Vec::new();
+        for _ in 0..tasks.len() {
+            if let Some(pending) = tasks.pop_front() {
+                if Arc::ptr_eq(&pending.owner_terminated, owner_terminated) {
+                    owned.push(pending.task);
+                } else {
+                    tasks.push_back(pending);
+                }
+            }
+        }
+        owned
     }
 }
 
@@ -195,7 +242,7 @@ impl Pool {
 pub struct Queue {
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
-    terminated: AtomicBool,
+    terminated: Arc<AtomicBool>,
     /// Delayed callbacks still waiting out their delay, in submission
     /// order: terminating the queue cancels them with the queued ones.
     delayed: Mutex<BTreeMap<u64, Task>>,
@@ -206,7 +253,7 @@ impl Queue {
         Arc::new(Queue {
             ports,
             monitors: Mutex::default(),
-            terminated: AtomicBool::new(false),
+            terminated: Arc::new(AtomicBool::new(false)),
             delayed: Mutex::default(),
         })
     }
@@ -246,7 +293,9 @@ impl Queue {
     }
 
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
-        self.ports[port as usize].submit(task);
+        if !self.ports[port as usize].submit(&self.terminated, task) {
+            return;
+        }
         // Copied out: a monitor may unregister itself.
         let monitors = lock(&self.monitors).clone();
         for (_, context, callback) in monitors {
@@ -368,7 +417,7 @@ pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> b
     }
     match port.take(timeout_ms, || queue.terminated.load(Ordering::Acquire)) {
         Some(task) => {
-            task.run(false);
+            task.run();
             true
         }
         None => false,
@@ -388,8 +437,8 @@ pub fn XTaskQueueSubmitDelayedCallback(
     }
 }
 
-/// Cancels what is still queued or waiting out a delay (callbacks see
-/// `canceled`), refuses new work, then calls `callback`.
+/// Cancels what is still queued for this queue or waiting out a delay
+/// (callbacks see `canceled`), refuses new work, then calls `callback`.
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
     _wait: bool,
@@ -401,7 +450,7 @@ pub fn XTaskQueueTerminate(
     };
     queue.terminated.store(true, Ordering::Release);
     for port in &queue.ports {
-        let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
+        let pending = port.take_owned(&queue.terminated);
         // Dispatches waiting on this queue end: nothing more will come.
         // (Those of other queues on the port see theirs is open and wait
         // on.) After the lock above, so none misses both flag and wake.
@@ -1665,6 +1714,298 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(*lock(&EVENTS), ["canceled", "terminated"]);
         XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn terminate_on_shared_manual_port_only_cancels_its_own_tasks() {
+        type Events = Mutex<Vec<(u32, bool)>>;
+        struct Entry {
+            log: *const Events,
+            tag: u32,
+        }
+        extern "system" fn record(context: *mut c_void, canceled: bool) {
+            // SAFETY: each entry lives for the entire test and points to `log`.
+            let entry = unsafe { &*context.cast::<Entry>() };
+            // SAFETY: `log` lives on the test stack until every callback ran.
+            let log = unsafe { &*entry.log };
+            lock(log).push((entry.tag, canceled));
+        }
+
+        let log = Events::default();
+        let entry = |tag| Entry { log: &log, tag };
+        let entries = [
+            entry(1),
+            entry(2),
+            entry(3),
+            entry(4),
+            entry(5),
+            entry(6),
+            entry(10),
+            entry(11),
+            entry(20),
+            entry(21),
+        ];
+        let ctx = |i: usize| (&raw const entries[i]).cast_mut().cast();
+
+        let (mut a, mut a_dup, mut b, mut c) = (
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        assert_eq!(XTaskQueueCreate(0, 0, &mut a), S_OK);
+        assert_eq!(XTaskQueueDuplicateHandle(a, &mut a_dup), S_OK);
+        let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueGetPort(a, WORK, &mut work), S_OK);
+        assert_eq!(XTaskQueueGetPort(a, COMPLETION, &mut completion), S_OK);
+        assert_eq!(XTaskQueueCreateComposite(work, completion, &mut b), S_OK);
+        // Both ports pointing at the same shared work port (common chaining pattern).
+        assert_eq!(XTaskQueueCreateComposite(work, work, &mut c), S_OK);
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(a, WORK, 0, ctx(0), Some(record)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(b, WORK, 0, ctx(1), Some(record)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(a_dup, WORK, 0, ctx(2), Some(record)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(c, WORK, 0, ctx(3), Some(record)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(b, WORK, 0, ctx(4), Some(record)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(c, COMPLETION, 0, ctx(5), Some(record)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(a, COMPLETION, 0, ctx(6), Some(record)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(b, COMPLETION, 0, ctx(7), Some(record)),
+            S_OK
+        );
+
+        let none = std::ptr::null_mut();
+        assert_eq!(XTaskQueueTerminate(b, true, none, None), S_OK);
+        assert_eq!(
+            *lock(&log),
+            [(2, true), (5, true), (11, true)],
+            "terminating b must cancel only b's tasks"
+        );
+        lock(&log).clear();
+
+        assert_eq!(XTaskQueueTerminate(c, true, none, None), S_OK);
+        assert_eq!(
+            *lock(&log),
+            [(4, true), (6, true)],
+            "terminating c must cancel both of c's tasks on the shared port and leave a's intact"
+        );
+        lock(&log).clear();
+
+        assert!(XTaskQueueDispatch(a, WORK, 0));
+        assert!(XTaskQueueDispatch(a, WORK, 0));
+        assert!(!XTaskQueueDispatch(a, WORK, 0));
+        assert!(XTaskQueueDispatch(a, COMPLETION, 0));
+        assert!(!XTaskQueueDispatch(a, COMPLETION, 0));
+        assert_eq!(
+            *lock(&log),
+            [(1, false), (3, false), (10, false)],
+            "a's tasks stay queued in FIFO order and run uncanceled"
+        );
+        lock(&log).clear();
+
+        // A duplicated handle refers to the same queue: terminating through one
+        // cancels tasks submitted through either handle.
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(a, WORK, 0, ctx(8), Some(record)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(a_dup, WORK, 0, ctx(9), Some(record)),
+            S_OK
+        );
+        assert_eq!(XTaskQueueTerminate(a_dup, true, none, None), S_OK);
+        assert_eq!(*lock(&log), [(20, true), (21, true)]);
+
+        XTaskQueueCloseHandle(c);
+        XTaskQueueCloseHandle(b);
+        XTaskQueueCloseHandle(a_dup);
+        XTaskQueueCloseHandle(a);
+    }
+
+    #[test]
+    fn terminate_on_shared_serialized_port_keeps_other_queues_tasks() {
+        struct Gate {
+            state: Mutex<(bool, bool)>,
+            changed: Condvar,
+        }
+        struct ReleaseGate(Arc<Gate>);
+        impl Drop for ReleaseGate {
+            fn drop(&mut self) {
+                let mut state = lock(&self.0.state);
+                state.1 = true;
+                self.0.changed.notify_all();
+            }
+        }
+        extern "system" fn hold(context: *mut c_void, _canceled: bool) {
+            // SAFETY: built from `Arc::into_raw` below; consumed once here.
+            let gate = unsafe { Arc::from_raw(context.cast::<Gate>()) };
+            let mut state = lock(&gate.state);
+            state.0 = true;
+            gate.changed.notify_all();
+            let _state = gate
+                .changed
+                .wait_while(state, |s| !s.1)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        struct Log {
+            events: Mutex<Vec<(u32, bool)>>,
+            pushed: Condvar,
+        }
+        struct Item {
+            log: Arc<Log>,
+            tag: u32,
+        }
+        extern "system" fn record(context: *mut c_void, canceled: bool) {
+            // SAFETY: built from `Box::into_raw` below; consumed once here.
+            let item = unsafe { Box::from_raw(context.cast::<Item>()) };
+            lock(&item.log.events).push((item.tag, canceled));
+            item.log.pushed.notify_all();
+        }
+
+        let gate = Arc::new(Gate {
+            state: Mutex::new((false, false)),
+            changed: Condvar::new(),
+        });
+        let _release = ReleaseGate(Arc::clone(&gate));
+        let log = Arc::new(Log {
+            events: Mutex::default(),
+            pushed: Condvar::new(),
+        });
+        let item = |tag| {
+            Box::into_raw(Box::new(Item {
+                log: Arc::clone(&log),
+                tag,
+            }))
+            .cast()
+        };
+
+        let (mut a, mut b) = (std::ptr::null(), std::ptr::null());
+        // Serialized work port (2), manual completion port (0).
+        assert_eq!(XTaskQueueCreate(2, 0, &mut a), S_OK);
+        let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueGetPort(a, WORK, &mut work), S_OK);
+        assert_eq!(XTaskQueueGetPort(a, COMPLETION, &mut completion), S_OK);
+        assert_eq!(XTaskQueueCreateComposite(work, completion, &mut b), S_OK);
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                a,
+                WORK,
+                0,
+                Arc::into_raw(Arc::clone(&gate)).cast_mut().cast(),
+                Some(hold)
+            ),
+            S_OK
+        );
+        {
+            let state = lock(&gate.state);
+            let _state = gate
+                .changed
+                .wait_while(state, |s| !s.0)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(a, WORK, 0, item(1), Some(record)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(b, WORK, 0, item(2), Some(record)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(a, WORK, 0, item(3), Some(record)),
+            S_OK
+        );
+
+        assert_eq!(
+            XTaskQueueTerminate(b, false, std::ptr::null_mut(), None),
+            S_OK
+        );
+        let after_terminate = lock(&log.events).clone();
+        drop(_release);
+        assert_eq!(
+            after_terminate,
+            [(2, true)],
+            "only b's queued callback should be canceled"
+        );
+
+        let events = lock(&log.events);
+        let (events, _) = log
+            .pushed
+            .wait_timeout_while(events, Duration::from_secs(5), |e| e.len() < 3)
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(*events, [(2, true), (1, false), (3, false)]);
+        drop(events);
+
+        assert_eq!(
+            XTaskQueueTerminate(a, true, std::ptr::null_mut(), None),
+            S_OK
+        );
+        XTaskQueueCloseHandle(b);
+        XTaskQueueCloseHandle(a);
+    }
+
+    #[test]
+    fn terminate_composite_queue_preserves_other_queues_async_calls() {
+        extern "system" fn succeed(_: *mut AsyncBlock) -> HRESULT {
+            S_OK
+        }
+        let (mut a, mut b) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueCreate(0, 0, &mut a), S_OK);
+        let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueGetPort(a, WORK, &mut work), S_OK);
+        assert_eq!(XTaskQueueGetPort(a, COMPLETION, &mut completion), S_OK);
+        assert_eq!(XTaskQueueCreateComposite(work, completion, &mut b), S_OK);
+
+        let mut block_a = AsyncBlock {
+            queue: a,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let mut block_b = AsyncBlock {
+            queue: b,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(XAsyncRun(&mut block_a, Some(succeed)), S_OK);
+        assert_eq!(XAsyncRun(&mut block_b, Some(succeed)), S_OK);
+
+        assert_eq!(
+            XTaskQueueTerminate(b, true, std::ptr::null_mut(), None),
+            S_OK
+        );
+        assert_eq!(XAsyncGetStatus(&mut block_b, false), E_ABORT);
+        assert_eq!(XAsyncGetStatus(&mut block_a, false), E_PENDING);
+
+        assert!(XTaskQueueDispatch(a, WORK, 0));
+        assert_eq!(XAsyncGetStatus(&mut block_a, false), S_OK);
+
+        XTaskQueueCloseHandle(b);
+        XTaskQueueCloseHandle(a);
     }
 
     /// The call a test provider looks at in its cleanup, and what it saw
