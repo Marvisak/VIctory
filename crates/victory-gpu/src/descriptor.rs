@@ -158,6 +158,55 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Mirrors a contiguous copy with one heap lookup and one pending lock.
+#[cfg(windows)]
+fn mirror_copy(dst: u64, count: u32, kind: u32, step: u64) {
+    let end = dst + u64::from(count) * step;
+    #[cfg(feature = "diagnostics")]
+    let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    drop(waited);
+    let Some(&(start, limit, at)) = heaps.iter().find(|&&(start, limit, _)| dst < limit && start < end) else {
+        return;
+    };
+    // SAFETY: registered heaps stay alive while the registry is locked.
+    let heap = unsafe { &*(at as *const Heap) };
+    if dst >= start && end <= limit && kind == heap.desc.kind && (dst - start).is_multiple_of(step) {
+        let first = ((dst - start) / step) as u32;
+        let last = first + count;
+        let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match heap.host.get() {
+            None => pending.extend(first..last),
+            Some(host) => {
+                drop(pending);
+                if let Some(host) = host {
+                    // Bound the scratch space used by sync_slots on large copies.
+                    const BATCH: u32 = 256;
+                    for from in (first..last).step_by(BATCH as usize) {
+                        let to = from.saturating_add(BATCH).min(last);
+                        if to - from < 8 {
+                            for i in from..to {
+                                host.mirror(i, start + u64::from(i) * step, false);
+                            }
+                        } else {
+                            host.sync_slots(from, to, start, step);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Preserve the per-handle lookup for a range crossing a heap boundary
+    // or using a different stride from the destination heap.
+    drop(heaps);
+    for i in 0..count {
+        mirror(dst + u64::from(i) * step);
+    }
+}
+
 /// Mirrors what the title wrote into its shader-visible heaps without a
 /// call: Grand Theft Auto VI copies descriptors (our records) into its heap
 /// as bytes, so only a change of its memory shows them. Each slot of a page
@@ -655,14 +704,16 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         return;
     };
     let len = u64::from(count) * step;
-    if dst != 0 && src != 0 {
-        // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
-        #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+    if count == 0 || dst == 0 || src == 0 {
+        return;
     }
+    if dst != src {
+        // SAFETY: both ranges are descriptor slots the title owns and may overlap.
+        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+    }
+    // A self-copy may still expose records that were written directly.
+    #[cfg(windows)]
+    mirror_copy(dst, count, kind, step);
 }
 
 /// Device method: ranges of descriptors (start and count each) gathered
@@ -981,6 +1032,45 @@ pub(crate) mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    #[test]
+    fn descriptor_copies_mirror_batched_slots_before_and_after_host_creation() {
+        let null = std::ptr::null();
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 320,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let mut h = null;
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut h), S_OK);
+        let dst = heap(h).start;
+        let mut source = [[0u64; 2]; 304];
+        let src = source.as_mut_ptr() as u64;
+        for i in [0, 255, 256, 303] {
+            create_sampler(null, &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0], src + i * 16);
+        }
+        copy_simple(null, 304, dst, src, SAMPLERS);
+        assert_eq!(heap(h).pending.lock().unwrap().len(), 304);
+        if crate::host::host().is_some() {
+            let host = heap(h).host().expect("host sampler heap");
+            for i in [0, 255, 256, 303] {
+                assert!(host.made(i));
+            }
+            // SAFETY: these are full descriptors in the live source and destination.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src as *const u8, (dst + 16) as *mut u8, 16);
+                (dst as *mut [u64; 2]).write_unaligned([0; 2]);
+            }
+            assert!(host.made(0));
+            assert!(!host.made(1));
+            copy_simple(null, 304, dst, dst, SAMPLERS);
+            assert!(!host.made(0), "a raw write cleared slot 0");
+            assert!(host.made(1), "a raw write installed slot 1");
+            assert!(host.made(303), "the final occupied slot survives");
+        }
+        release(h);
     }
 
     /// A record the title copies into its shader-visible heap as bytes (no
