@@ -572,20 +572,26 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
 }
 
+const D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT: u32 = 4096;
+const MAX_CBV_BYTES: u32 = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
+
+fn cbv_view(desc: Option<[u32; 4]>) -> View {
+    match desc {
+        Some([lo, hi, size, _]) if size != 0 => {
+            let address = u64::from(lo) | u64::from(hi) << 32;
+            View::Constant(address, size.min(MAX_CBV_BYTES))
+        }
+        _ => View::Constant(0, 0),
+    }
+}
+
 /// Device method.
 ///
-/// A null `desc` writes a null CBV (`Constant(0, 0)`), matching D3D12's
-/// `CreateConstantBufferView` with a null description. Leaving the slot
+/// A null or zero-size `desc` writes the zero CBV (`Constant(0, 0)`), so
+/// stale views and arbitrary host memory are not read. Leaving the slot
 /// untouched would keep a stale view active.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    let view = match words(desc) {
-        Some([lo, hi, size, _]) => {
-            let address = u64::from(lo) | u64::from(hi) << 32;
-            View::Constant(address, size)
-        }
-        None => View::Constant(0, 0),
-    };
-    record(handle, view);
+    record(handle, cbv_view(words(desc)));
 }
 
 /// Device method.
@@ -962,6 +968,23 @@ pub(crate) mod tests {
         assert_eq!(view(a), Some(View::Shader(0, None)));
         create_cbv(null, std::ptr::null(), a);
         assert_eq!(view(a), Some(View::Constant(0, 0)));
+    }
+
+    #[test]
+    fn cbv_sizes_are_capped_and_zero_sizes_use_the_zero_view() {
+        let null = std::ptr::null();
+        let slots = [0u64; 3 * 4];
+        let (a, b, c) = (
+            slots.as_ptr() as u64,
+            slots.as_ptr() as u64 + 32,
+            slots.as_ptr() as u64 + 64,
+        );
+        create_cbv(null, &[0x1000, 1, 70_000, 0], a);
+        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, MAX_CBV_BYTES)));
+        create_cbv(null, &[0x1000, 1, MAX_CBV_BYTES, 0], b);
+        assert_eq!(view(b), Some(View::Constant(0x1_0000_1000, MAX_CBV_BYTES)));
+        create_cbv(null, &[0x1000, 1, 0, 0], c);
+        assert_eq!(view(c), Some(View::Constant(0, 0)));
     }
 
     /// A released resource's views go stale; the same view of a new
