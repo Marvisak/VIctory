@@ -1,12 +1,16 @@
-//! Fences: a 64-bit value and the events waiting for it, moved by the
-//! title's Signals and its queues' (once the work before them has run).
+//! Fences: a 64-bit value and the events and threads waiting for it.
+//! The title's Signals, its queues' (once the work before them has run)
+//! and bottom-of-pipe writes to a fence's address (see [`written`]) move
+//! one.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard};
+use std::time::Duration;
 
-use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
+use crate::object::{self, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 pub(crate) const FENCE_IIDS: [Iid; 5] = [
@@ -36,8 +40,48 @@ struct Fence {
     value: AtomicU64,
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers),
-    /// and since when.
+    /// in the order they were asked for, and since when. Each is set once,
+    /// then dropped.
     waiters: Mutex<Vec<(u64, usize, std::time::Instant)>>,
+    /// Notified, with `waiters` locked, whenever the value changes: threads
+    /// blocked in a wait without an event look at it again.
+    changed: Condvar,
+}
+
+/// Every live fence by the address of its value, for bottom-of-pipe writes
+/// that land on one. Locked before a fence's `waiters`, never after.
+static FENCES: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+fn fences() -> MutexGuard<'static, BTreeMap<usize, usize>> {
+    FENCES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Fence {
+    fn waiters(&self) -> MutexGuard<'_, Vec<(u64, usize, std::time::Instant)>> {
+        self.waiters.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// With `waiters` locked, after the value changed: sets (once) the
+    /// events whose value it now reaches and wakes blocked waits.
+    fn reached(&self, waiters: &mut Vec<(u64, usize, std::time::Instant)>) {
+        let value = self.value.load(Ordering::Acquire);
+        waiters.retain(|&(wanted, event, since)| {
+            let reached = wanted <= value;
+            if reached {
+                set_event(event);
+                WAITED.0.fetch_add(1, Ordering::Relaxed);
+                WAITED.1.fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            !reached
+        });
+        self.changed.notify_all();
+    }
+}
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        fences().remove(&((&raw const self.value) as usize));
+    }
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -58,8 +102,32 @@ pub(crate) extern "system" fn create(
         value: AtomicU64::new(initial),
         flags,
         waiters: Mutex::new(Vec::new()),
+        changed: Condvar::new(),
     });
+    // Registered before it is handed out; if it is not, `hand_out` drops
+    // it and dropping unregisters it.
+    let at = (&raw const fence.value) as usize;
+    fences().insert(at, (&raw const *fence) as usize);
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
+}
+
+/// After `bytes` bytes were stored at `at` behind the fences' back (a
+/// list's bottom-of-pipe write, which titles point at a fence's GPU
+/// address): sets the events and wakes the waits of any fence whose value
+/// that touched.
+pub(crate) fn written(at: usize, bytes: usize) {
+    let fences = fences();
+    if fences.is_empty() {
+        return;
+    }
+    let first = at.saturating_sub(size_of::<u64>() - 1);
+    for (_, &fence) in fences.range(first..at.saturating_add(bytes)) {
+        // SAFETY: registered fences are alive: dropping one unregisters it,
+        // under the lock held here.
+        let fence = unsafe { &*(fence as *const Fence) };
+        let mut waiters = fence.waiters();
+        fence.reached(&mut waiters);
+    }
 }
 
 fn set_event(event: usize) {
@@ -88,23 +156,37 @@ extern "system" fn completed(this: This) -> u64 {
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     fence(this).value.load(Ordering::Acquire)
 }
+
+/// How often a blocked wait looks at the value again without being woken:
+/// the title may store it from the CPU at the fence's address.
+const RECHECK: Duration = Duration::from_millis(1);
+
+/// Sets `event` once the value reaches `value`; a null event blocks the
+/// calling thread until then. A wait never gives up: a removed host device
+/// ends the process (`host::fail`) and our submissions are done when they
+/// return, so, as on the console, only another thread's signal (the
+/// title's or a queue's) or a bottom-of-pipe write ends a wait for a value
+/// not yet reached.
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     let fence = fence(this);
-    let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-    if fence.value.load(Ordering::Acquire) >= value {
-        if !event.is_null() {
-            set_event(event as usize);
+    let mut waiters = fence.waiters();
+    if event.is_null() {
+        // The lock is let go while waiting, so signals get through.
+        while fence.value.load(Ordering::Acquire) < value {
+            waiters = fence
+                .changed
+                .wait_timeout(waiters, RECHECK)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
         return S_OK;
     }
-    if event.is_null() {
-        // shortcut: a null event means "block until reached"; nothing can
-        // reach it while no GPU work runs, so fail instead of hanging.
-        tracing::warn!(value, "blocking fence wait not implemented");
-        return E_NOTIMPL;
+    if fence.value.load(Ordering::Acquire) >= value {
+        set_event(event as usize);
+    } else {
+        waiters.push((value, event as usize, std::time::Instant::now()));
     }
-    waiters.push((value, event as usize, std::time::Instant::now()));
     S_OK
 }
 /// The title's Signal from the CPU: what queues hold behind a Wait for it
@@ -119,17 +201,9 @@ extern "system" fn signal(this: This, value: u64) -> HRESULT {
 /// Signal, when the work before it has run).
 pub(crate) fn set(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
-    let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+    let mut waiters = fence.waiters();
     fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event, since)| {
-        let reached = wanted <= value;
-        if reached {
-            set_event(event);
-            WAITED.0.fetch_add(1, Ordering::Relaxed);
-            WAITED.1.fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
-        !reached
-    });
+    fence.reached(&mut waiters);
     S_OK
 }
 
@@ -185,31 +259,80 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+    use std::sync::mpsc::{self, Receiver};
+
+    type Wait = extern "system" fn(This, u64, *mut c_void) -> HRESULT;
+    type Signal = extern "system" fn(This, u64) -> HRESULT;
+
+    /// Long enough for a woken wait to return; a broken one fails the test
+    /// after it instead of hanging it.
+    const WAKES: Duration = Duration::from_secs(10);
+    /// How long a wait that should still block is watched.
+    const BLOCKS: Duration = Duration::from_millis(50);
+
+    fn new_fence(initial: u64) -> This {
+        let mut f = std::ptr::null();
+        assert_eq!(
+            create(std::ptr::null(), initial, 0, &FENCE_IIDS[0], &mut f),
+            S_OK
+        );
+        f
+    }
+
+    fn release_fence(f: This) {
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    /// `SetEventOnCompletion(value, null)` on another thread; its result
+    /// arrives once it returns.
+    fn blocked_wait(f: This, value: u64) -> Receiver<HRESULT> {
+        let (done, result) = mpsc::channel();
+        let f = f as usize;
+        std::thread::spawn(move || {
+            let f = f as This;
+            let _ = done.send(slot::<Wait>(f, 0x48)(f, value, std::ptr::null_mut()));
+        });
+        result
+    }
+
+    #[cfg(windows)]
+    fn event() -> *mut c_void {
+        use windows_sys::Win32::System::Threading::CreateEventW;
+        // SAFETY: a plain auto-reset event.
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        assert!(!event.is_null());
+        event
+    }
+
+    /// Whether an auto-reset event is set (which resets it).
+    #[cfg(windows)]
+    fn is_set(event: *mut c_void) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        // SAFETY: a valid event.
+        unsafe { WaitForSingleObject(event, 0) == WAIT_OBJECT_0 }
+    }
+
+    #[cfg(windows)]
+    fn close(event: *mut c_void) {
+        // SAFETY: ours.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(event) };
+    }
 
     #[cfg(windows)]
     #[test]
     fn signals_set_waiting_events() {
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
-        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-
-        let mut f = std::ptr::null();
-        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let f = new_fence(1);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(f, 0x40)(f), 1);
-        // SAFETY: plain auto-reset event.
-        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
-        assert!(!event.is_null());
-        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
-        let signal = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
+        let event = event();
+        let wait = slot::<Wait>(f, 0x48);
+        let signal = slot::<Signal>(f, 0x50);
         assert_eq!(wait(f, 5, event), S_OK);
-        // SAFETY: a valid event.
-        assert_ne!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        assert!(!is_set(event));
         assert_eq!(signal(f, 5), S_OK);
-        // SAFETY: as above.
-        assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
+        assert!(is_set(event));
         assert_eq!(wait(f, 5, event), S_OK, "already reached");
-        // SAFETY: as above.
-        assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        assert!(is_set(event));
         // Grand Theft Auto VI reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
@@ -218,14 +341,136 @@ mod tests {
         assert_eq!(signal(f, 2), S_OK);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(f, 0x40)(f), 2);
         assert_eq!(wait(f, 4, event), S_OK);
-        // SAFETY: the event is still live.
-        assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_TIMEOUT);
+        assert!(!is_set(event));
         assert_eq!(signal(f, 4), S_OK);
-        // SAFETY: as above.
-        assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        // SAFETY: ours.
-        unsafe { CloseHandle(event) };
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+        assert!(is_set(event));
+        close(event);
+        release_fence(f);
+    }
+
+    /// Each event is set once, when the first signal reaches its value, in
+    /// the order asked for; a later signal does not set it again.
+    #[cfg(windows)]
+    #[test]
+    fn events_are_set_once_at_their_value() {
+        let f = new_fence(0);
+        let wait = slot::<Wait>(f, 0x48);
+        let signal = slot::<Signal>(f, 0x50);
+        let (three, five, again) = (event(), event(), event());
+        assert_eq!(wait(f, 5, five), S_OK);
+        assert_eq!(wait(f, 3, three), S_OK);
+        assert_eq!(wait(f, 5, again), S_OK);
+        assert_eq!(signal(f, 2), S_OK);
+        assert!(!is_set(three) && !is_set(five) && !is_set(again));
+        assert_eq!(signal(f, 4), S_OK);
+        assert!(is_set(three));
+        assert!(!is_set(five) && !is_set(again));
+        assert_eq!(signal(f, 6), S_OK);
+        assert!(is_set(five) && is_set(again));
+        assert!(!is_set(three), "set again by a later signal");
+        assert_eq!(signal(f, 9), S_OK);
+        assert!(!is_set(three) && !is_set(five) && !is_set(again));
+        assert!(fence(f).waiters().is_empty());
+        for e in [three, five, again] {
+            close(e);
+        }
+        release_fence(f);
+    }
+
+    #[test]
+    fn waits_without_an_event_return_at_once_when_reached() {
+        let f = new_fence(7);
+        let wait = slot::<Wait>(f, 0x48);
+        assert_eq!(wait(f, 0, std::ptr::null_mut()), S_OK);
+        assert_eq!(wait(f, 7, std::ptr::null_mut()), S_OK);
+        assert_eq!(blocked_wait(f, 6).recv_timeout(WAKES), Ok(S_OK));
+        release_fence(f);
+    }
+
+    /// Threads blocked for different values each wake at the first signal
+    /// that reaches theirs, and not before.
+    #[test]
+    fn blocked_waits_wake_when_another_thread_signals() {
+        let f = new_fence(1);
+        let signal = slot::<Signal>(f, 0x50);
+        let five = blocked_wait(f, 5);
+        let eight = blocked_wait(f, 8);
+        let also_eight = blocked_wait(f, 8);
+        assert!(five.recv_timeout(BLOCKS).is_err(), "returned before 5");
+        assert_eq!(signal(f, 4), S_OK);
+        assert!(five.recv_timeout(BLOCKS).is_err(), "returned at 4");
+        let f_ = f as usize;
+        // From yet another thread, as the title's render thread would.
+        std::thread::spawn(move || signal(f_ as This, 5))
+            .join()
+            .unwrap();
+        assert_eq!(five.recv_timeout(WAKES), Ok(S_OK));
+        assert!(eight.recv_timeout(BLOCKS).is_err(), "returned at 5");
+        assert_eq!(signal(f, 9), S_OK);
+        assert_eq!(eight.recv_timeout(WAKES), Ok(S_OK));
+        assert_eq!(also_eight.recv_timeout(WAKES), Ok(S_OK));
+        release_fence(f);
+    }
+
+    /// A queue's Signal ends a blocked wait as the title's does.
+    #[test]
+    fn queue_signals_end_blocked_waits() {
+        let f = new_fence(0);
+        let woken = blocked_wait(f, 2);
+        assert!(woken.recv_timeout(BLOCKS).is_err());
+        assert_eq!(crate::fence::signal(f, 2), S_OK);
+        assert_eq!(woken.recv_timeout(WAKES), Ok(S_OK));
+        release_fence(f);
+    }
+
+    /// Bottom-of-pipe writes to the fence's address (64 or 32 bits) set
+    /// its events and wake its waits; a write next to it does not.
+    #[cfg(windows)]
+    #[test]
+    fn bottom_of_pipe_writes_reach_fence_waiters() {
+        use crate::queue::Written;
+        let f = new_fence(0);
+        let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f) as *mut u8;
+        let event = event();
+        assert_eq!(slot::<Wait>(f, 0x48)(f, 3, event), S_OK);
+        let woken = blocked_wait(f, 3);
+        assert!(woken.recv_timeout(BLOCKS).is_err());
+        let mut elsewhere = [0u64; 2];
+        Written::Value(3).write(elsewhere.as_mut_ptr().cast(), 8);
+        assert!(!is_set(event));
+        Written::Value(3).write(at, 8);
+        assert!(is_set(event));
+        assert_eq!(woken.recv_timeout(WAKES), Ok(S_OK));
+
+        assert_eq!(slot::<Wait>(f, 0x48)(f, 4, event), S_OK);
+        let woken = blocked_wait(f, 4);
+        Written::Value(4).write(at, 4);
+        assert!(is_set(event));
+        assert_eq!(woken.recv_timeout(WAKES), Ok(S_OK));
+        assert_eq!(completed(f), 4);
+        close(event);
+        release_fence(f);
+    }
+
+    /// A store from the CPU straight to the value (no signal at all) still
+    /// ends a blocked wait.
+    #[test]
+    fn blocked_waits_see_stores_to_the_value() {
+        let f = new_fence(0);
+        let woken = blocked_wait(f, 1);
+        assert!(woken.recv_timeout(BLOCKS).is_err());
+        fence(f).value.store(1, Ordering::Release);
+        assert_eq!(woken.recv_timeout(WAKES), Ok(S_OK));
+        release_fence(f);
+    }
+
+    #[test]
+    fn released_fences_are_forgotten() {
+        let f = new_fence(0);
+        let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f) as usize;
+        assert!(fences().contains_key(&at));
+        release_fence(f);
+        assert!(!fences().contains_key(&at));
     }
 
     #[test]

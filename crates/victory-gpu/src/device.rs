@@ -233,6 +233,21 @@ extern "system" fn node_count(_: This) -> u32 {
     1
 }
 
+/// `MakeResident` and `Evict` `(count, objects)`: our objects are always
+/// where the title left them, and the host pages its own.
+extern "system" fn residency(_: This, count: u32, objects: *const This) -> HRESULT {
+    if count > 0 && objects.is_null() {
+        E_INVALIDARG
+    } else {
+        S_OK
+    }
+}
+
+/// `SetStablePowerState(enable)`: the host's clocks are its own business.
+extern "system" fn stable_power_state(_: This, _enable: i32) -> HRESULT {
+    S_OK
+}
+
 /// Feature query 2: the highest of the requested feature levels we support.
 #[repr(C)]
 struct FeatureLevels {
@@ -262,33 +277,54 @@ const OPTIONS: [u32; 16] = [
     2,  // resource heap tier
 ];
 
+/// Feature query ids, as on PC.
+const OPTIONS_QUERY: u32 = 0;
+const ARCHITECTURE: u32 = 1;
+const FEATURE_LEVELS: u32 = 2;
+const FORMAT_SUPPORT: u32 = 3;
+const MULTISAMPLE: u32 = 4;
+const FORMAT_INFO: u32 = 5;
+const GPU_VIRTUAL_ADDRESS: u32 = 6;
+const SHADER_MODEL: u32 = 7;
+const OPTIONS1: u32 = 8;
+const ARCHITECTURE1: u32 = 16;
+const OPTIONS4: u32 = 23;
+
+/// Bits of a GPU address in one resource, as in [`OPTIONS`].
+const ADDRESS_BITS_PER_RESOURCE: u32 = 40;
+
+/// `CheckFeatureSupport(feature, data, size)`. Ids are taken to be PC's, as
+/// the answers for 0-4 always took them; a size that is not the
+/// structure's fails with `E_INVALIDARG`, as on PC.
+///
+/// What the console's hardware or our memory model decides is answered
+/// here: the options (in the console's layout), the architecture, feature
+/// levels, GPU address bits, the shader model and the wave and 16-bit
+/// options (1 and 4). Formats are answered by the host, which
+/// is what makes and samples them, with the console's formats as the
+/// host's (`resource::pc_format`). Every other query goes to the host
+/// unchanged, which checks its size: our work runs there.
+/// shortcut: their console structures are taken to be PC's. Only the
+/// options are known to differ, and they are not passed on.
 extern "system" fn check_feature_support(
     _: This,
     feature: u32,
     data: *mut c_void,
     size: u32,
 ) -> HRESULT {
-    const OPTIONS_QUERY: u32 = 0;
-    const ARCHITECTURE: u32 = 1;
-    const FEATURE_LEVELS: u32 = 2;
-    const FORMAT_SUPPORT: u32 = 3;
-    const MULTISAMPLE: u32 = 4;
-    const SHADER_MODEL: u32 = 7;
-    const OPTIONS1: u32 = 8;
-    const OPTIONS4: u32 = 23;
     let expected = match feature {
         OPTIONS_QUERY => size_of_val(&OPTIONS),
         ARCHITECTURE => 16,
         FEATURE_LEVELS => size_of::<FeatureLevels>(),
         FORMAT_SUPPORT => 12,
         MULTISAMPLE => 16,
+        FORMAT_INFO => 8,
+        GPU_VIRTUAL_ADDRESS => 8,
         SHADER_MODEL => 4,
         OPTIONS1 => 24,
+        ARCHITECTURE1 => 20,
         OPTIONS4 => 12,
-        _ => {
-            tracing::warn!(feature, size, "device feature query not implemented");
-            return E_NOTIMPL;
-        }
+        _ => return host_feature(feature, data, size),
     };
     if data.is_null() || size as usize != expected {
         return E_INVALIDARG;
@@ -299,33 +335,51 @@ extern "system" fn check_feature_support(
             unsafe { data.cast::<[u32; 16]>().write_unaligned(OPTIONS) };
             S_OK
         }
-        ARCHITECTURE => {
-            // SAFETY: checked size and non-null.
-            let a = unsafe { &mut *data.cast::<[u32; 4]>() };
+        ARCHITECTURE | ARCHITECTURE1 => {
+            // SAFETY: checked size (16 or 20 bytes) and non-null.
+            let a = unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), expected / 4) };
             if a[0] != 0 {
                 return E_INVALIDARG; // one node only
             }
             // Not tile-based; unified, cache-coherent memory.
-            a[1..].copy_from_slice(&[0, 1, 1]);
+            a[1..4].copy_from_slice(&[0, 1, 1]);
+            if feature == ARCHITECTURE1 {
+                // Whether the GPU honours the CPU's page protections: the
+                // host GPU's business, which says so itself.
+                let mut host = [0u32; 5];
+                let hr = host_check(ARCHITECTURE1, host.as_mut_ptr().cast(), 20);
+                a[4] = if hr == Some(S_OK) { host[4] } else { 0 };
+            }
             S_OK
         }
-        FORMAT_SUPPORT => {
+        GPU_VIRTUAL_ADDRESS => {
+            // SAFETY: checked size and non-null.
+            let q = unsafe { &mut *data.cast::<[u32; 2]>() };
+            // GPU addresses are CPU addresses: all of user space.
+            let process = u64::BITS - user_space().1.leading_zeros();
+            *q = [ADDRESS_BITS_PER_RESOURCE, process];
+            S_OK
+        }
+        FORMAT_SUPPORT => host_format_feature(feature, data, expected).unwrap_or_else(|| {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<[u32; 3]>() };
-            // shortcut: every use of every format; answer from the host
-            // device once there is one.
+            // shortcut: without a host, every use of every format.
             q[1] = 0x7fff_ffff;
             q[2] = 0xffff;
             S_OK
-        }
-        MULTISAMPLE => {
+        }),
+        MULTISAMPLE => host_format_feature(feature, data, expected).unwrap_or_else(|| {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<[u32; 4]>() };
-            // Format, sample count, flags in; one quality level out for the
-            // counts the hardware has.
+            // Format, sample count, flags in; without a host, one quality
+            // level out for the counts the hardware has.
             q[3] = u32::from(matches!(q[1], 1 | 2 | 4 | 8));
             S_OK
-        }
+        }),
+        FORMAT_INFO => host_format_feature(feature, data, expected).unwrap_or_else(|| {
+            tracing::warn!("no host device for a format's plane count");
+            E_NOTIMPL
+        }),
         SHADER_MODEL => {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<u32>() };
@@ -349,6 +403,58 @@ extern "system" fn check_feature_support(
         }
         _ => feature_levels(data),
     }
+}
+
+/// A format query (format first, `size` bytes) as the host answers it for
+/// the format the host has in its place; the title's format stays in the
+/// structure. None without a host.
+fn host_format_feature(feature: u32, data: *mut c_void, size: usize) -> Option<HRESULT> {
+    // SAFETY: the caller checked `size` (8 to 16) and non-null.
+    let title = unsafe { std::slice::from_raw_parts_mut(data.cast::<u8>(), size) };
+    let mut query = [0u32; 4];
+    for (word, bytes) in query.iter_mut().zip(title.chunks(4)) {
+        *word = u32::from_ne_bytes(bytes.try_into().ok()?);
+    }
+    query[0] = resource::pc_format(query[0]);
+    let hr = host_check(feature, query.as_mut_ptr().cast(), size as u32)?;
+    // Everything after the format.
+    for (bytes, word) in title.chunks_mut(4).zip(query).skip(1) {
+        bytes.copy_from_slice(&word.to_ne_bytes());
+    }
+    Some(hr)
+}
+
+/// A query the host answers as it is (it checks the size); `E_NOTIMPL`
+/// without a host.
+fn host_feature(feature: u32, data: *mut c_void, size: u32) -> HRESULT {
+    host_check(feature, data, size).unwrap_or_else(|| {
+        tracing::warn!(feature, size, "device feature query without a host device");
+        E_NOTIMPL
+    })
+}
+
+/// The host device's `CheckFeatureSupport`, None without one.
+fn host_check(feature: u32, data: *mut c_void, size: u32) -> Option<HRESULT> {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_FEATURE;
+        // SAFETY: the title's structure of `size` bytes, as D3D12 takes it;
+        // the host checks the size and the pointer.
+        let result = unsafe {
+            host.device
+                .CheckFeatureSupport(D3D12_FEATURE(feature as i32), data, size)
+        };
+        let hr = result.map_or_else(|e| e.code().0, |()| S_OK);
+        tracing::debug!(
+            feature,
+            size,
+            hr,
+            "device feature query answered by the host"
+        );
+        return Some(hr);
+    }
+    let _ = (feature, data, size);
+    None
 }
 
 fn feature_levels(data: *mut c_void) -> HRESULT {
@@ -416,10 +522,13 @@ static FUNCTIONS: Table<160> = {
     f[27] = resource::create_committed as *const (); // 0xd8
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
+    f[34] = residency as *const (); // 0x110 make resident
+    f[35] = residency as *const (); // 0x118 evict
     f[36] = fence::create as *const (); // 0x120
     f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
+    f[40] = stable_power_state as *const (); // 0x140
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
@@ -599,5 +708,210 @@ mod tests {
         let device = device();
         let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
         assert_eq!(reason(device), S_OK);
+    }
+
+    /// The PC device methods between creating a placed resource and a
+    /// fence, and the one after creating a query heap, at their PC slots.
+    #[test]
+    fn residency_and_power_state_succeed_as_on_pc() {
+        type Residency = extern "system" fn(This, u32, *const This) -> HRESULT;
+        let device = device();
+        let mut fence = std::ptr::null();
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        assert_eq!(fence::create(device, 0, 0, fence_iid, &mut fence), S_OK);
+        for offset in [0x110, 0x118] {
+            let call = slot::<Residency>(device, offset);
+            assert_eq!(call(device, 1, &fence), S_OK, "{offset:#x}");
+            assert_eq!(call(device, 0, std::ptr::null()), S_OK, "{offset:#x}");
+            assert_eq!(call(device, 1, std::ptr::null()), E_INVALIDARG);
+        }
+        let stable = slot::<extern "system" fn(This, i32) -> HRESULT>(device, 0x140);
+        assert_eq!(stable(device, 1), S_OK);
+        assert_eq!(stable(device, 0), S_OK);
+        slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
+    }
+
+    type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+
+    /// `CheckFeatureSupport` through the device's table, on `N` words.
+    fn check<const N: usize>(feature: u32, words: &mut [u32; N], size: u32) -> HRESULT {
+        let device = device();
+        slot::<Check>(device, 0x68)(device, feature, words.as_mut_ptr().cast(), size)
+    }
+
+    /// Queries answered here fail on a size that is not their structure's
+    /// and on null data, as on PC, and leave the structure alone then.
+    #[test]
+    fn feature_queries_check_their_size() {
+        let sizes = [
+            (OPTIONS_QUERY, 64),
+            (ARCHITECTURE, 16),
+            (FEATURE_LEVELS, 24),
+            (FORMAT_SUPPORT, 12),
+            (MULTISAMPLE, 16),
+            (FORMAT_INFO, 8),
+            (GPU_VIRTUAL_ADDRESS, 8),
+            (SHADER_MODEL, 4),
+            (OPTIONS1, 24),
+            (ARCHITECTURE1, 20),
+            (OPTIONS4, 12),
+        ];
+        let device = device();
+        let check_raw = slot::<Check>(device, 0x68);
+        for (feature, size) in sizes {
+            for wrong in [size - 4, size + 4, 0] {
+                let mut words = [0x5a5a_5a5au32; 24];
+                assert_eq!(check(feature, &mut words, wrong), E_INVALIDARG, "{feature}");
+                assert!(words.iter().all(|&w| w == 0x5a5a_5a5a), "{feature}");
+            }
+            let null = std::ptr::null_mut();
+            assert_eq!(check_raw(device, feature, null, size), E_INVALIDARG);
+        }
+        // PC's options are a word shorter than the console's.
+        assert_eq!(check(OPTIONS_QUERY, &mut [0; 16], 60), E_INVALIDARG);
+    }
+
+    #[test]
+    fn local_feature_queries_answer_the_console() {
+        let mut options = [0; 16];
+        assert_eq!(check(OPTIONS_QUERY, &mut options, 64), S_OK);
+        assert_eq!(options, OPTIONS);
+        let mut architecture = [0, 7, 7, 7];
+        assert_eq!(check(ARCHITECTURE, &mut architecture, 16), S_OK);
+        assert_eq!(architecture, [0, 0, 1, 1]);
+        assert_eq!(check(ARCHITECTURE, &mut [1, 0, 0, 0], 16), E_INVALIDARG);
+        let mut architecture1 = [0, 7, 7, 7, 7];
+        assert_eq!(check(ARCHITECTURE1, &mut architecture1, 20), S_OK);
+        assert_eq!(architecture1[..4], [0, 0, 1, 1]);
+        assert!(architecture1[4] <= 1);
+        assert_eq!(check(ARCHITECTURE1, &mut [1, 0, 0, 0, 0], 20), E_INVALIDARG);
+
+        let mut address = [0; 2];
+        assert_eq!(check(GPU_VIRTUAL_ADDRESS, &mut address, 8), S_OK);
+        assert_eq!(address[0], OPTIONS[9]);
+        let (_, highest) = user_space();
+        // The process's bits cover user space, and no more.
+        assert!(highest < 1 << address[1] && highest >= 1 << (address[1] - 1));
+        #[cfg(all(windows, target_pointer_width = "64"))]
+        assert_eq!(address[1], 47);
+    }
+
+    /// The host answers the rest as it is; ours must match its own answer.
+    #[cfg(windows)]
+    #[test]
+    fn other_feature_queries_are_the_hosts() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FEATURE_D3D12_OPTIONS3, D3D12_FEATURE_D3D12_OPTIONS5,
+            D3D12_FEATURE_DATA_D3D12_OPTIONS3, D3D12_FEATURE_DATA_D3D12_OPTIONS5,
+            D3D12_FEATURE_DATA_ROOT_SIGNATURE, D3D12_FEATURE_ROOT_SIGNATURE,
+        };
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let device = device();
+        let check_raw = slot::<Check>(device, 0x68);
+        let ask = |feature: u32, data: *mut c_void, size: usize| {
+            check_raw(device, feature, data, size as u32)
+        };
+
+        // Options the console does not decide: the host's own answers.
+        let mut ours = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        let mut theirs = ours;
+        let feature = D3D12_FEATURE_D3D12_OPTIONS3.0 as u32;
+        assert_eq!(
+            ask(feature, (&raw mut ours).cast(), size_of_val(&ours)),
+            S_OK
+        );
+        // SAFETY: a plain query.
+        unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS3,
+                    (&raw mut theirs).cast(),
+                    size_of_val(&theirs) as u32,
+                )
+                .unwrap()
+        };
+        assert_eq!(ours, theirs);
+        assert_eq!(ask(feature, (&raw mut ours).cast(), 4), E_INVALIDARG);
+
+        let mut ours = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+        let mut theirs = ours;
+        let feature = D3D12_FEATURE_D3D12_OPTIONS5.0 as u32;
+        assert_eq!(
+            ask(feature, (&raw mut ours).cast(), size_of_val(&ours)),
+            S_OK
+        );
+        // SAFETY: a plain query.
+        unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS5,
+                    (&raw mut theirs).cast(),
+                    size_of_val(&theirs) as u32,
+                )
+                .unwrap()
+        };
+        assert_eq!(ours, theirs);
+        assert_eq!(ask(feature, (&raw mut ours).cast(), 4), E_INVALIDARG);
+
+        // Root signature 1.1 asked: 1.1, which our serializer (the host's)
+        // writes.
+        let mut root = D3D12_FEATURE_DATA_ROOT_SIGNATURE::default();
+        root.HighestVersion.0 = 2;
+        let feature = D3D12_FEATURE_ROOT_SIGNATURE.0 as u32;
+        assert_eq!(
+            ask(feature, (&raw mut root).cast(), size_of_val(&root)),
+            S_OK
+        );
+        assert_eq!(root.HighestVersion.0, 2);
+
+        // No such query.
+        assert!(ask(0xffff, (&raw mut root).cast(), 4) < 0);
+    }
+
+    /// Formats: the host's answer, the console's own depth formats answered
+    /// as the PC formats standing in for them.
+    #[cfg(windows)]
+    #[test]
+    fn format_queries_are_the_hosts() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const RGBA8: u32 = 28;
+        const D24S8: u32 = 45;
+        const CONSOLE_D16S8: u32 = 118;
+        const TEXTURE2D: u32 = 0x20;
+        const RENDER_TARGET: u32 = 0x4000;
+        const DEPTH_STENCIL: u32 = 0x10000;
+
+        let mut rgba = [RGBA8, 0, 0];
+        assert_eq!(check(FORMAT_SUPPORT, &mut rgba, 12), S_OK);
+        assert_eq!(rgba[0], RGBA8);
+        assert_ne!(rgba[1] & (TEXTURE2D | RENDER_TARGET), 0);
+        assert_eq!(rgba[1] & DEPTH_STENCIL, 0, "{:#x}", rgba[1]);
+        let mut depth = [CONSOLE_D16S8, 0, 0];
+        assert_eq!(check(FORMAT_SUPPORT, &mut depth, 12), S_OK);
+        assert_eq!(depth[0], CONSOLE_D16S8);
+        assert_ne!(depth[1] & DEPTH_STENCIL, 0);
+        let mut pc = [D24S8, 0, 0];
+        assert_eq!(check(FORMAT_SUPPORT, &mut pc, 12), S_OK);
+        assert_eq!(depth[1..], pc[1..]);
+
+        // Format, count, flags in; quality levels out.
+        let mut four = [RGBA8, 4, 0, 0];
+        assert_eq!(check(MULTISAMPLE, &mut four, 16), S_OK);
+        assert!(four[3] >= 1);
+        let mut three = [RGBA8, 3, 0, 7];
+        assert_eq!(check(MULTISAMPLE, &mut three, 16), S_OK);
+        assert_eq!(three[3], 0);
+
+        // Format in, plane count (a byte) out.
+        let mut info = [RGBA8, 0];
+        assert_eq!(check(FORMAT_INFO, &mut info, 8), S_OK);
+        assert_eq!(info[1] & 0xff, 1);
+        let mut info = [CONSOLE_D16S8, 0];
+        assert_eq!(check(FORMAT_INFO, &mut info, 8), S_OK);
+        assert_eq!((info[0], info[1] & 0xff), (CONSOLE_D16S8, 2));
     }
 }

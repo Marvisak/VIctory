@@ -4,6 +4,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::collections::BTreeMap;
+use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -144,16 +145,18 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
         Ok(1) => {
             let address = this as usize;
             let keys = (address, [u8::MIN; 16])..=(address, [u8::MAX; 16]);
+            let mut gone = Vec::new();
             {
                 let mut data = private_data();
                 // An object's IDs are contiguous in key order. Seek directly to
                 // them so releases don't visit private data held by other objects.
                 while let Some((&key, _)) = data.range(keys.clone()).next() {
-                    data.remove(&key);
+                    gone.extend(data.remove(&key));
                 }
             }
             // SAFETY: that was the last reference to a `Box<T>`.
             drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
+            gone.into_iter().for_each(Private::let_go);
             0
         }
         Ok(n) => n - 1,
@@ -161,10 +164,50 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
     }
 }
 
-/// Private data of every object, by object address and id.
-static PRIVATE: Mutex<BTreeMap<(usize, Iid), Vec<u8>>> = Mutex::new(BTreeMap::new());
+/// An object's private data: bytes, or an interface it holds a reference
+/// to (its address as the bytes).
+struct Private {
+    bytes: Vec<u8>,
+    interface: bool,
+}
 
-fn private_data() -> std::sync::MutexGuard<'static, BTreeMap<(usize, Iid), Vec<u8>>> {
+impl Private {
+    fn interface(unknown: usize) -> Private {
+        Private {
+            bytes: unknown.to_ne_bytes().to_vec(),
+            interface: true,
+        }
+    }
+
+    /// Drops the entry and the reference it holds. Not with the private
+    /// data locked: releasing an object of ours locks it.
+    fn let_go(self) {
+        if self.interface
+            && let Ok(bytes) = <[u8; 8]>::try_from(self.bytes.as_slice())
+        {
+            unknown_call(usize::from_ne_bytes(bytes), RELEASE);
+        }
+    }
+}
+
+const ADD_REF: usize = 1;
+const RELEASE: usize = 2;
+
+/// IUnknown's `AddRef` or `Release` on an interface the title gave us.
+fn unknown_call(unknown: usize, slot: usize) {
+    // SAFETY: a COM interface: its first field is its table, whose slots 1
+    // and 2 are AddRef and Release.
+    unsafe {
+        let table = *(unknown as *const *const *const ());
+        let method: extern "system" fn(usize) -> u32 = std::mem::transmute(*table.add(slot));
+        method(unknown);
+    }
+}
+
+/// Private data of every object, by object address and id.
+static PRIVATE: Mutex<BTreeMap<(usize, Iid), Private>> = Mutex::new(BTreeMap::new());
+
+fn private_data() -> std::sync::MutexGuard<'static, BTreeMap<(usize, Iid), Private>> {
     PRIVATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -183,7 +226,7 @@ extern "system" fn get_private_data(
         *size = 0;
         return NOT_FOUND;
     };
-    let len = value.len() as u32;
+    let len = value.bytes.len() as u32;
     let room = std::mem::replace(size, len);
     if data.is_null() {
         return S_OK;
@@ -192,7 +235,13 @@ extern "system" fn get_private_data(
         return MORE_DATA;
     }
     // SAFETY: the buffer holds `room` >= `len` bytes.
-    unsafe { data.copy_from_nonoverlapping(value.as_ptr(), value.len()) };
+    unsafe { data.copy_from_nonoverlapping(value.bytes.as_ptr(), value.bytes.len()) };
+    if value.interface {
+        // An interface handed out is a new reference, as on PC; taken
+        // while the entry (and so its reference) cannot go.
+        // SAFETY: the bytes were just written as a pointer's.
+        unknown_call(unsafe { data.cast::<usize>().read_unaligned() }, ADD_REF);
+    }
     S_OK
 }
 
@@ -207,22 +256,56 @@ extern "system" fn set_private_data(
     let Some(&id) = (unsafe { id.as_ref() }) else {
         return E_INVALIDARG;
     };
-    let mut map = private_data();
-    if data.is_null() {
-        map.remove(&(this as usize, id));
-    } else {
+    let entry = (!data.is_null()).then(|| Private {
         // SAFETY: the title passes `size` bytes.
-        let value = unsafe { std::slice::from_raw_parts(data, size as usize) };
-        map.insert((this as usize, id), value.to_vec());
-    }
+        bytes: unsafe { std::slice::from_raw_parts(data, size as usize) }.to_vec(),
+        interface: false,
+    });
+    replace_private(this, id, entry);
     S_OK
 }
 
-/// Fills a D3D12 table's object methods: private data and name (setting
-/// an interface as private data stays unwritten).
+/// `SetPrivateDataInterface(id, unknown)`: the entry holds a reference to
+/// the interface until it is replaced or removed (a null interface) or
+/// the object goes, and `GetPrivateData` hands out the interface's
+/// address with a new reference, as on PC.
+extern "system" fn set_private_data_interface(
+    this: This,
+    id: *const Iid,
+    unknown: *const c_void,
+) -> HRESULT {
+    // SAFETY: the title passes an id (null is tolerated).
+    let Some(&id) = (unsafe { id.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    let entry = (!unknown.is_null()).then(|| {
+        unknown_call(unknown as usize, ADD_REF);
+        Private::interface(unknown as usize)
+    });
+    replace_private(this, id, entry);
+    S_OK
+}
+
+/// Puts `entry` under `id` (none removes it), letting go of what was there
+/// once the private data is unlocked.
+fn replace_private(this: This, id: Iid, entry: Option<Private>) {
+    let key = (this as usize, id);
+    let old = {
+        let mut map = private_data();
+        match entry {
+            Some(entry) => map.insert(key, entry),
+            None => map.remove(&key),
+        }
+    };
+    old.into_iter().for_each(Private::let_go);
+}
+
+/// Fills a D3D12 table's object methods: private data (interfaces too)
+/// and name.
 pub(crate) const fn d3d12_object<const N: usize>(mut f: [*const (); N]) -> [*const (); N] {
     f[3] = get_private_data as *const (); // 0x18
     f[4] = set_private_data as *const (); // 0x20
+    f[5] = set_private_data_interface as *const (); // 0x28
     f[6] = set_name as *const (); // 0x30
     f
 }
@@ -594,5 +677,116 @@ mod tests {
         );
         assert!(found.is_null());
         slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
+    }
+
+    /// A title's COM object: its table and reference count.
+    #[repr(C)]
+    struct Unknown {
+        table: *const *const (),
+        refs: AtomicU32,
+    }
+    extern "system" fn unknown_add_ref(this: *const Unknown) -> u32 {
+        // SAFETY: one of the test's objects.
+        unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
+    }
+    extern "system" fn unknown_release(this: *const Unknown) -> u32 {
+        // SAFETY: as above.
+        unsafe { &*this }.refs.fetch_sub(1, Ordering::Relaxed) - 1
+    }
+    static UNKNOWN: Table<3> = Table([
+        std::ptr::null(),
+        unknown_add_ref as *const (),
+        unknown_release as *const (),
+    ]);
+
+    /// Interfaces as private data hold a reference while they are there,
+    /// hand out a new one, and let theirs go when replaced, removed or
+    /// when the object goes.
+    #[test]
+    fn private_interfaces_are_counted() {
+        type Get = extern "system" fn(This, *const Iid, *mut u32, *mut u8) -> HRESULT;
+        type Set = extern "system" fn(This, *const Iid, u32, *const u8) -> HRESULT;
+        type SetInterface = extern "system" fn(This, *const Iid, *const c_void) -> HRESULT;
+        let unknown = Unknown {
+            table: UNKNOWN.0.as_ptr(),
+            refs: AtomicU32::new(1),
+        };
+        let refs = || unknown.refs.load(Ordering::Relaxed);
+        let pointer = (&raw const unknown).cast::<c_void>();
+        let mut fence = std::ptr::null();
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let null = std::ptr::null();
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut fence),
+            S_OK
+        );
+        let get = slot::<Get>(fence, 0x18);
+        let set = slot::<Set>(fence, 0x20);
+        let set_interface = slot::<SetInterface>(fence, 0x28);
+        let id = guid(1, 2, 3, [4; 8]);
+
+        assert_eq!(set_interface(fence, &id, pointer), S_OK);
+        assert_eq!(refs(), 2);
+        let mut size = 0;
+        assert_eq!(get(fence, &id, &mut size, std::ptr::null_mut()), S_OK);
+        assert_eq!((size, refs()), (8, 2), "only asked the size");
+        let mut short = [0u8; 4];
+        size = 4;
+        assert_eq!(get(fence, &id, &mut size, short.as_mut_ptr()), MORE_DATA);
+        assert_eq!(refs(), 2);
+        let mut out = 0usize;
+        size = 8;
+        assert_eq!(get(fence, &id, &mut size, (&raw mut out).cast()), S_OK);
+        assert_eq!((out, refs()), (pointer as usize, 3));
+        unknown_release(&unknown);
+
+        // Replaced by bytes, then removed by a null interface.
+        assert_eq!(set(fence, &id, 4, [1u8; 4].as_ptr()), S_OK);
+        assert_eq!(refs(), 1);
+        assert_eq!(set_interface(fence, &id, pointer), S_OK);
+        assert_eq!(set_interface(fence, &id, pointer), S_OK);
+        assert_eq!(refs(), 2, "the old reference went with the old entry");
+        assert_eq!(set_interface(fence, &id, std::ptr::null()), S_OK);
+        assert_eq!(refs(), 1);
+        assert_eq!(get(fence, &id, &mut size, std::ptr::null_mut()), NOT_FOUND);
+        assert_eq!(
+            set_interface(fence, std::ptr::null(), pointer),
+            E_INVALIDARG
+        );
+        assert_eq!(refs(), 1);
+
+        // The object going lets go of what it held.
+        assert_eq!(set_interface(fence, &id, pointer), S_OK);
+        assert_eq!(refs(), 2);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence),
+            0
+        );
+        assert_eq!(refs(), 1);
+    }
+
+    /// An object held as another's private data, released with it, and
+    /// freed when that was its last reference (no deadlock in between).
+    #[test]
+    fn private_interfaces_can_be_our_objects() {
+        type SetInterface = extern "system" fn(This, *const Iid, *const c_void) -> HRESULT;
+        let null = std::ptr::null();
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let (mut holder, mut held) = (null, null);
+        assert_eq!(
+            crate::fence::create(null, 0, 0, fence_iid, &mut holder),
+            S_OK
+        );
+        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut held), S_OK);
+        let id = guid(5, 6, 7, [8; 8]);
+        let set_interface = slot::<SetInterface>(holder, 0x28);
+        assert_eq!(set_interface(holder, &id, held.cast()), S_OK);
+        // SAFETY: ours.
+        assert_eq!(unsafe { &*held }.refs.load(Ordering::Relaxed), 2);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(held, 0x10)(held), 1);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(holder, 0x10)(holder),
+            0
+        );
     }
 }

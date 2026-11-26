@@ -457,6 +457,8 @@ impl Written {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        // Titles signal fences this way too.
+        crate::fence::written(at as usize, bytes);
     }
 }
 

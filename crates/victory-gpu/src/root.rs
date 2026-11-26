@@ -407,11 +407,13 @@ mod tests {
     #[test]
     fn the_table_has_the_object_and_device_child_slots() {
         let root = created(&ROOT_SIGNATURE_IIDS[1]);
-        // SetPrivateDataInterface is the one object method left out.
-        assert_eq!(
-            slot::<extern "system" fn() -> HRESULT>(root, 0x28)(),
-            E_NOTIMPL
-        );
+        // SetPrivateDataInterface: an id is needed; a null interface
+        // removes the (absent) entry.
+        type SetInterface = extern "system" fn(This, *const Iid, *const c_void) -> HRESULT;
+        let set_interface = slot::<SetInterface>(root, 0x28);
+        let none = std::ptr::null();
+        assert_eq!(set_interface(root, std::ptr::null(), none), E_INVALIDARG);
+        assert_eq!(set_interface(root, &ROOT_SIGNATURE_IIDS[1], none), S_OK);
         assert_eq!(
             slot::<extern "system" fn(This, *const u16) -> HRESULT>(root, 0x30)(
                 root,
