@@ -1007,6 +1007,13 @@ impl<'a> Tracer<'a> {
             return false;
         };
         inst.name() == "v_add_co_ci_u32"
+            && f.abs == 0
+            && f.neg == 0
+            && f.opsel == 0
+            && !f.clamp
+            && f.omod == 0
+            && f.sdwa.is_none()
+            && f.dpp.is_none()
             && f.src[..2.min(f.src.len())]
                 .iter()
                 .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, high)))
@@ -3895,5 +3902,64 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn modified_v_add_co_ci_u32_is_not_treated_as_plain_address_carry() {
+        let layout = [param(Descriptor, 0, 2)];
+        let run = |words: &[u32]| track_words(words, &layout, HwStage::Cs);
+        // Plain VOP3B carry-add: v0 = s0 + v2 (with carry), v1 = s1 + 0 + vcc_lo.
+        let plain = run(&[
+            0xD70F_6A00,
+            0x0002_0400, // v_add_co_u32 v0, vcc_lo, s0, v2
+            0xD528_6A01,
+            0x01A9_0001, // v_add_co_ci_u32 v1, vcc_lo, s1, 0, vcc_lo
+            0xDC30_8000,
+            0x037D_0000, // global_load_dword v3, v[0:1], off
+            S_ENDPGM,
+        ]);
+        assert_eq!(plain.scalar.len(), 1);
+        assert_eq!(plain.scalar[0].1.param, 0);
+        assert!(plain.scalar[0].1.dynamic.is_some());
+
+        // VOP3B carry-add with CLAMP=1 saturates instead of wrapping as a 64-bit address high half.
+        let clamped = run(&[
+            0xD70F_6A00,
+            0x0002_0400, // v_add_co_u32 v0, vcc_lo, s0, v2
+            0xD528_EA01,
+            0x01A9_0001, // v_add_co_ci_u32 v1, vcc_lo, s1, 0, vcc_lo clamp
+            0xDC30_8000,
+            0x037D_0000, // global_load_dword v3, v[0:1], off
+            S_ENDPGM,
+        ]);
+        assert_eq!(clamped.scalar[0].1.param, MEMORY);
+
+        // VOP2 SDWA carry-add selects sub-dword lanes instead of performing a full 32-bit carry.
+        let sdwa = run(&[
+            0x7E06_0201, // v_mov_b32 v3, s1
+            0x7E08_0280, // v_mov_b32 v4, 0
+            0xD70F_6A00,
+            0x0002_0400, // v_add_co_u32 v0, vcc_lo, s0, v2
+            0x5002_08F9,
+            0x0606_0403, // v_add_co_ci_u32_sdwa v1, vcc_lo, v3, v4, vcc_lo dst_sel:WORD_0 ...
+            0xDC30_8000,
+            0x057D_0000, // global_load_dword v5, v[0:1], off
+            S_ENDPGM,
+        ]);
+        assert_eq!(sdwa.scalar[0].1.param, MEMORY);
+
+        // VOP2 DPP16 carry-add permutes src0 across lanes instead of adding this lane's high half.
+        let dpp = run(&[
+            0x7E06_0201, // v_mov_b32 v3, s1
+            0x7E08_0280, // v_mov_b32 v4, 0
+            0xD70F_6A00,
+            0x0002_0400, // v_add_co_u32 v0, vcc_lo, s0, v2
+            0x5002_08FA,
+            0xFF01_1103, // v_add_co_ci_u32_dpp v1, vcc_lo, v3, v4, vcc_lo row_shr:1 ...
+            0xDC30_8000,
+            0x057D_0000, // global_load_dword v5, v[0:1], off
+            S_ENDPGM,
+        ]);
+        assert_eq!(dpp.scalar[0].1.param, MEMORY);
     }
 }
