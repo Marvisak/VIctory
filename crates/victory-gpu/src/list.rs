@@ -1054,6 +1054,11 @@ extern "system" fn clear_dsv(
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
+        // Strip console-only clear flags; D3D12 rejects `ClearFlags == 0`.
+        let flags = flags as i32 & 3;
+        if flags == 0 {
+            return;
+        }
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
         else {
             return;
@@ -1074,7 +1079,7 @@ extern "system" fn clear_dsv(
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags), depth, stencil, rects)
         };
     }
     #[cfg(not(windows))]
@@ -2043,6 +2048,178 @@ mod tests {
         resolve_queries(list, null, 0, 0, 2, buffer, u64::MAX - 8);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [buffer, list, allocator] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// `ClearDepthStencilView` calls whose flags mask to zero after stripping
+    /// console-only bits must be ignored instead of passing `ClearFlags = 0`
+    /// to D3D12 or transitioning the depth target.
+    #[cfg(windows)]
+    #[test]
+    fn clear_dsv_skips_empty_masked_flags() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D32_FLOAT, DXGI_SAMPLE_DESC};
+        use windows::core::{GUID, Interface};
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+
+        let null = std::ptr::null();
+        let iid = |g: GUID| guid(g.data1, g.data2, g.data3, g.data4);
+        let mut allocator = null;
+        let mut list = null;
+        let mut heap = null;
+        let mut texture = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let heap_desc = [3u32, 1, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                heap_desc.as_ptr().cast(),
+                &iid(ID3D12DescriptorHeap::IID),
+                &mut heap,
+            ),
+            S_OK
+        );
+        // 4x1 Texture2D, DXGI_FORMAT_D32_FLOAT (40), ALLOW_DEPTH_STENCIL (2),
+        // initial state DEPTH_WRITE (0x10).
+        let tex_desc: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | (1 << 16), 40, 1, 0, 0, 2, 0];
+        let props = [1u32, 0, 0, 0, 0];
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                props.as_ptr().cast(),
+                0,
+                tex_desc.as_ptr().cast(),
+                0x10,
+                null.cast(),
+                &iid(ID3D12Resource::IID),
+                &mut texture,
+            ),
+            S_OK
+        );
+
+        let handle = crate::descriptor::heap(heap).start;
+        crate::descriptor::create_dsv(null, texture, null.cast(), handle);
+
+        let clear =
+            slot::<extern "system" fn(This, u64, u32, f32, u8, u32, *const Rect)>(list, 0x198);
+        clear(list, handle, 0, 0.75, 0, 0, null.cast());
+        clear(list, handle, 0x4, 0.9, 0, 0, null.cast());
+
+        let native = host_list(list).unwrap();
+        assert_eq!(host.log_messages(), None);
+        assert!(
+            native.is_empty(),
+            "empty masked flags should not record a clear or state transition"
+        );
+
+        // Depth flag combined with a console bit clears to 0.25; subsequent
+        // empty masked clears leave the depth value untouched.
+        clear(list, handle, 1 | 0x4, 0.25, 0, 0, null.cast());
+        clear(list, handle, 0, 0.75, 0, 0, null.cast());
+        clear(list, handle, 0x4, 0.9, 0, 0, null.cast());
+
+        let host_tex = crate::resource::host_resource(texture).unwrap();
+        ensure_state(native, texture, COPY_SOURCE);
+        let readback_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let readback_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: valid readback buffer creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &readback_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        // SAFETY: open command list and live host resources.
+        let closed = unsafe {
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&host_tex),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_D32_FLOAT,
+                            Width: 4,
+                            Height: 1,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            native.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            native.list.Close()
+        };
+        let debug_error = host.log_messages();
+        assert!(
+            closed.is_ok(),
+            "Close failed: {closed:?}; debug: {debug_error:?}"
+        );
+        assert_eq!(debug_error, None);
+
+        host.execute(&[native]);
+        assert_eq!(host.log_messages(), None);
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: submission finished; readback buffer holds at least 4 floats.
+        let values = unsafe {
+            readback
+                .Map(
+                    0,
+                    Some(&D3D12_RANGE { Begin: 0, End: 16 }),
+                    Some(&mut mapped),
+                )
+                .unwrap();
+            let v = mapped.cast::<[f32; 4]>().read();
+            readback.Unmap(0, Some(&D3D12_RANGE::default()));
+            v
+        };
+        assert_eq!(values, [0.25; 4]);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [list, allocator, heap, texture] {
             assert_eq!(release(object), 0);
         }
     }
