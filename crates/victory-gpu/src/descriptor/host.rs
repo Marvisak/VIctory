@@ -720,6 +720,8 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::MirrorCalls, 1);
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -732,6 +734,8 @@ impl HostHeap {
                     "title slot past the host heap"
                 );
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::MirrorPast, 1);
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
@@ -744,9 +748,14 @@ impl HostHeap {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::MirrorNull, 1);
                 made[index as usize] = 0;
                 self.make_null(index);
                 self.note_address(index, None);
+            } else {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::MirrorEmpty, 1);
             }
             return None;
         };
@@ -780,6 +789,8 @@ impl HostHeap {
                 })
         };
         if made[index as usize] == key && !needs_remake() {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::MirrorCurrent, 1);
             return Some(view);
         }
         // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -804,6 +815,8 @@ impl HostHeap {
                 return self.mirror(index, handle, for_draw);
             }
             if made[index as usize] == key && !needs_remake() {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::MirrorCurrent, 1);
                 return Some(view);
             }
         }
@@ -828,6 +841,23 @@ impl HostHeap {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
             self.keep(index, kept.flatten());
+            #[cfg(feature = "diagnostics")]
+            {
+                if later {
+                    crate::copystat::add(crate::copystat::C::MirrorDeferred, 1);
+                } else {
+                    crate::copystat::add(crate::copystat::C::MirrorMade, 1);
+                }
+                if !later && is_texture(&view) {
+                    crate::copystat::add(crate::copystat::C::MirrorTexture, 1);
+                } else if !later && buffer_read(&view) {
+                    crate::copystat::add(crate::copystat::C::MirrorBufferRead, 1);
+                } else if !later && buffer_write(&view) {
+                    crate::copystat::add(crate::copystat::C::MirrorBufferWrite, 1);
+                } else if !later {
+                    crate::copystat::add(crate::copystat::C::MirrorOther, 1);
+                }
+            }
         }
         Some(view)
     }
@@ -1634,6 +1664,18 @@ fn prepare(view: &View) {
 fn is_texture(view: &View) -> bool {
     is_placed_texture(view)
         || matches!(view, View::Shader(r, _) if crate::resource::texture_memory(*r as crate::object::This).is_some())
+}
+
+/// A buffer view a shader only reads (a shader resource view of no texture).
+#[cfg(feature = "diagnostics")]
+fn buffer_read(view: &View) -> bool {
+    matches!(view, View::Shader(..)) && !is_texture(view)
+}
+
+/// A buffer view a shader writes through (unordered access, no texture).
+#[cfg(feature = "diagnostics")]
+fn buffer_write(view: &View) -> bool {
+    matches!(view, View::Unordered(..)) && !is_texture(view)
 }
 
 /// A view of a texture the title placed in memory itself, as a view of the
