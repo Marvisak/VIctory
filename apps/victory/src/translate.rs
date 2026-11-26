@@ -166,12 +166,36 @@ pub fn run(
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
-        Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
+        let validator = Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
+        // The file version next to the path: the SDK's `dxil.dll` prints
+        // 1.8.2502 while it is the 1.7 validator, and a 1.7 verdict on a
+        // module whose PSV0 it rebuilds is worth less than the line it
+        // prints (#1945).
+        let version = validator
+            .version()
+            .map(|(major, minor)| format!(" {major}.{minor}"))
+            .unwrap_or_default();
+        // The file stamp is kept next to the engine version when it says
+        // something else: the SDK puts 1.8.2502 on a 1.7 engine (#1945).
+        let stamp = validator
+            .file_version()
+            .map(|(major, minor)| format!(" (file {major}.{minor})"))
+            .unwrap_or_default();
         println!(
-            "validator    {}",
+            "validator    {}{version}{stamp}",
             dll.as_ref()
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
+        if validator.version().is_some_and(|(major, _)| major < 1)
+            || validator
+                .version()
+                .is_some_and(|(major, minor)| major == 1 && minor < 8)
+        {
+            println!(
+                "warning      that validator is before 1.8: its PSV0 verdicts are wrong for any \
+                 shader with a repeated semantic name; set VICTORY_DXIL to a DXC 1.8 dxil.dll"
+            );
+        }
     }
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
@@ -872,3 +896,4 @@ mod tests {
         );
     }
 }
+

@@ -110,13 +110,141 @@ static BLOB_VTABLE: BlobVtable = BlobVtable {
 
 pub struct Validator {
     object: Object,
+    /// The DLL it came from, for its file version.
+    path: Option<PathBuf>,
 }
 
 // SAFETY: the validator object is free-threaded (DXC's validator has no
 // thread affinity); calls are serialised by `&mut self`.
 unsafe impl Send for Validator {}
 
+/// The version resource's fixed information, as `version.dll` defines it
+/// (`VS_FIXEDFILEINFO`): the one field this needs is the file version, and
+/// the binding crate this module otherwise uses does not carry it.
+#[repr(C)]
+struct FixedFileInfo {
+    signature: u32,
+    struct_version: u32,
+    file_version_ms: u32,
+    file_version_ls: u32,
+    product_version_ms: u32,
+    product_version_ls: u32,
+    file_flags_mask: u32,
+    file_flags: u32,
+    file_os: u32,
+    file_type: u32,
+    file_subtype: u32,
+    file_date_ms: u32,
+    file_date_ls: u32,
+}
+
+#[link(name = "version")]
+unsafe extern "system" {
+    fn GetFileVersionInfoSizeW(name: *const u16, handle: *mut u32) -> u32;
+    fn GetFileVersionInfoW(name: *const u16, handle: u32, len: u32, data: *mut c_void) -> i32;
+    fn VerQueryValueW(
+        block: *const c_void,
+        sub: *const u16,
+        out: *mut *mut c_void,
+        len: *mut u32,
+    ) -> i32;
+}
+
+/// The `(major, minor)` file version of the DLL at `path`, through the
+/// version resource Windows puts in it (`VS_FIXEDFILEINFO`). The SDK's
+/// `dxil.dll` prints `1.8.2502` there while it is the 1.7 validator, which
+/// is why a report should state this next to the path (#1945).
+fn file_version(path: &std::path::Path) -> Option<(u16, u16)> {
+    const ROOT: [u16; 2] = [b'\\' as u16, 0];
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    // SAFETY: plain version-resource calls with valid out pointers, on a
+    // NUL-terminated path and a block of the size just asked for.
+    unsafe {
+        let mut handle = 0u32;
+        let size = GetFileVersionInfoSizeW(wide.as_ptr(), &mut handle);
+        if size == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; size as usize];
+        if GetFileVersionInfoW(wide.as_ptr(), handle, size, data.as_mut_ptr().cast()) == 0 {
+            return None;
+        }
+        let mut info: *mut c_void = std::ptr::null_mut();
+        let mut len = 0u32;
+        if VerQueryValueW(data.as_ptr().cast(), ROOT.as_ptr(), &mut info, &mut len) == 0
+            || info.is_null()
+            || (len as usize) < size_of::<FixedFileInfo>()
+        {
+            return None;
+        }
+        let fixed = &*info.cast::<FixedFileInfo>();
+        if fixed.signature != 0xFEEF_04BD {
+            return None;
+        }
+        Some((
+            (fixed.file_version_ms >> 16) as u16,
+            (fixed.file_version_ms & 0xffff) as u16,
+        ))
+    }
+}
+/// The engine version a `VS_FIXEDFILEINFO` pair names. SDK builds prefix the
+/// series with 100 — `101.7` is the 1.7 engine — so a `major >= 1` or
+/// `>= 1.8` gate accepts a validator that rejects what 1.8 accepts (#1945).
+fn engine_version((major, minor): (u16, u16)) -> (u16, u16) {
+    if major >= 100 {
+        (major - 100, minor)
+    } else {
+        (major, minor)
+    }
+}
+
 impl Validator {
+    /// The file version of the DLL the validator was loaded from, as its
+    /// own resource states it: `(major, minor)`. DXC's `dxil.dll` from the
+    /// Windows SDK reports `1.8.2502` in `FileVersion` while it is the 1.7
+    /// validator, and that version prints the same in every SDK since, so
+    /// the pair is what tells a report which engine produced its numbers
+    /// (#1945). `None` when the version resource cannot be read.
+    ///
+    /// The 1.7 validator regenerates a program's `PSV0` and compares it with
+    /// what the module carries, so a writer that deduplicates the semantic
+    /// name table (as ours does, #1208) is rejected on any shader with a
+    /// repeated semantic name; 1.8 compares the content instead and never
+    /// rebuilds it. A verdict from a validator before 1.8 is therefore worth
+    /// less than the line it prints.
+    pub fn version(&self) -> Option<(u16, u16)> {
+        // The engine's own answer first: `IDxcValidator::GetVersion` is the
+        // pair `dxc -dumpbin` prints as "Validator version", and the only one
+        // that is the engine rather than the stamp the SDK put on the file.
+        let mut major = 0u32;
+        let mut minor = 0u32;
+        // SAFETY: slot 4 of `IDxcValidator` is GetVersion, which writes two
+        // u32s; the object outlives the call.
+        let get_version = unsafe {
+            method::<unsafe extern "system" fn(Object, *mut u32, *mut u32) -> Hresult>(self.object, 4)
+        };
+        // SAFETY: as above; `self.object` is a live `IDxcValidator`.
+        if unsafe { get_version(self.object, &mut major, &mut minor) } >= 0 {
+            return Some((major as u16, minor as u16));
+        }
+        // A validator whose table is short: the file stamp, with the SDK's
+        // 100-prefixed series levelled back to the engine's (#1945).
+        let path = self.path.as_ref()?;
+        file_version(path).map(engine_version)
+    }
+
+    /// The DLL's `VS_FIXEDFILEINFO` version, for a report that has to say
+    /// where the engine came from: the SDK stamps `1.8.2502` on a 1.7
+    /// engine, so this is not the engine version (#1945).
+    pub fn file_version(&self) -> Option<(u16, u16)> {
+        file_version(self.path.as_ref()?)
+    }
+
     /// Where `dxil.dll` is looked for.
     pub fn default_path() -> Option<PathBuf> {
         if let Some(p) = std::env::var_os("VICTORY_DXIL") {
@@ -157,6 +285,7 @@ impl Validator {
             }
             Ok(Validator {
                 object: object.cast(),
+                path: path.map(std::path::Path::to_path_buf),
             })
         }
     }
@@ -219,3 +348,72 @@ impl Drop for Validator {
         unsafe { release(self.object) };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `IDxcValidator::GetVersion` is the engine, not the stamp the SDK put
+    /// on the file: a DLL stamped `1.8.2502` that is the 1.7 engine answers
+    /// `(1, 7)` here, which is the pair a warning has to look at (#1945).
+    #[test]
+    fn the_engine_version_is_the_validators_own_answer() {
+        let Some(v) = Validator::load(Validator::default_path().as_deref()).ok() else {
+            return; // no dxil.dll on this machine: nothing to ask.
+        };
+        let (major, minor) = v.version().expect("IDxcValidator answers GetVersion");
+        assert!((1..=9).contains(&major), "engine {major}.{minor}");
+        if let Some((file_major, file_minor)) = v.file_version() {
+            // The two agree on this machine's SDK; what matters is that the
+            // engine is what a report uses, and that the stamp is not lost.
+            assert!(file_major >= 1, "file {file_major}.{file_minor}");
+        }
+    }
+
+    /// The Windows SDK stamps the engine series with 100: `101.7` is the 1.7
+    /// engine, and a plain `>= 1` (or `>= 1.8`) gate accepts it (#1945).
+    #[test]
+    fn a_prefixed_series_names_the_same_engine() {
+        assert_eq!(engine_version((101, 7)), (1, 7));
+        assert_eq!(engine_version((101, 6)), (1, 6));
+        assert_eq!(engine_version((1, 8)), (1, 8));
+        assert_eq!(engine_version((2, 0)), (2, 0));
+    }
+
+    /// The version printed next to the path is the DLL's own, through its
+    /// version resource: `VS_FIXEDFILEINFO` and not the string Windows shows
+    /// in Explorer, which is what made a 1.7 validator look like 1.8 (#1945).
+    #[test]
+    fn the_validator_reports_the_version_in_its_resource() {
+        let Some(path) = Validator::default_path() else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        let Ok(validator) = Validator::load(Some(&path)) else {
+            eprintln!("dxil.dll did not load; skipped");
+            return;
+        };
+        match validator.version() {
+            // Every DXC release validator is 1.x, and the SDK's prints 1.9.
+            Some((major, minor)) => assert!(
+                major >= 1,
+                "{} says version {major}.{minor}",
+                path.display()
+            ),
+            // A DLL without a version resource is possible; the line then has
+            // no version and the warning is not raised, which is the honest
+            // outcome and not a failure.
+            None => eprintln!("{} has no version resource", path.display()),
+        }
+    }
+
+    /// A path that is not there answers nothing rather than a wrong version.
+    #[test]
+    fn a_missing_dll_has_no_version() {
+        assert_eq!(
+            file_version(std::path::Path::new(r"Z:\no\such\dxil.dll")),
+            None
+        );
+    }
+}
+
