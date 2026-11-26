@@ -204,6 +204,23 @@ fn create() -> windows::core::Result<Host> {
             )
             .is_ok()
             && options.DepthBoundsTestSupported.as_bool();
+        let mut options1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                std::ptr::from_mut(&mut options1).cast(),
+                std::mem::size_of_val(&options1) as u32,
+            )
+            .is_ok()
+            && options1.WaveLaneCountMin > 0
+        {
+            victory_shader::emit::set_host_wave_min(options1.WaveLaneCountMin);
+            tracing::info!(
+                min_lanes = options1.WaveLaneCountMin,
+                max_lanes = options1.WaveLaneCountMax,
+                "host wave size range"
+            );
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

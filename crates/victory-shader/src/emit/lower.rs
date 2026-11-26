@@ -233,6 +233,11 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// Conservative check for cross-wave read-after-write or write-after-read
+    /// memory effects (any LDS usage, or both memory writes and memory reads
+    /// across buffers/images/flat global memory). When true, group sync is
+    /// never dropped so waves cannot race on shared data.
+    has_shared_rw: bool,
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
     heap: [bool; 2],
     /// src0 of the current instruction as DPP fetched it.
@@ -251,6 +256,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Blocks of loops lanes leave at different iterations.
+    lane_loops: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
@@ -557,6 +564,17 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        let writes_mem = writes_uavs
+            || insts().any(|i| {
+                matches!(i.fields, Fields::Flat { .. })
+                    && (i.name().contains("store") || i.name().contains("atomic"))
+            });
+        let reads_mem = insts().any(|i| {
+            matches!(
+                i.fields,
+                Fields::Image { .. } | Fields::Buffer { .. } | Fields::Flat { .. }
+            ) && (i.name().contains("load") || i.name().contains("atomic"))
+        });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
@@ -649,6 +667,7 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let has_shared_rw = s.lds_dwords > 0 || (writes_mem && reads_mem);
         Lower {
             s,
             x,
@@ -688,6 +707,7 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            has_shared_rw,
             heap: [false; 2],
             src0: None,
             console_lanes,
@@ -696,6 +716,7 @@ impl<'a> Lower<'a> {
             root_memory,
             flat: None,
             no_barrier,
+            lane_loops: super::barrier::lane_loop_blocks(x.st),
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -3010,6 +3031,31 @@ impl<'a> Lower<'a> {
         f
     }
 
+    /// Whether the `s_barrier` in block `b` is left without group sync (a
+    /// memory fence only). Keyed on the shader's effective minimum wave width
+    /// (`s.wave_size` if pinned, else `WaveLaneCountMin`), restricted to
+    /// single-console-wave groups with no shared read/write memory effects,
+    /// and only when block `b` has lane-dependent reach or sits in a loop with
+    /// a lane-dependent exit.
+    fn barrier_unsynced(&self, b: usize) -> bool {
+        let effective_wave = self.s.wave_size.unwrap_or_else(super::host_wave_min);
+        let group_threads = self.s.threads.map(|t| t.iter().product());
+        let st = self.x.st;
+        let non_uniform_reach = st
+            .bools
+            .support(st.reach[b])
+            .iter()
+            .any(|a| !matches!(a, crate::structure::Atom::Uniform(_)));
+        super::barrier::should_drop_barrier_sync(
+            effective_wave,
+            self.wave(),
+            group_threads,
+            self.has_shared_rw,
+            self.lane_loops.contains(&b),
+            non_uniform_reach,
+        )
+    }
+
     /// The console wave size.
     fn wave(&self) -> u32 {
         if self.x.native.wave64 { 64 } else { 32 }
@@ -3533,6 +3579,7 @@ impl<'a> Lower<'a> {
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
                 let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+                let mode = if self.barrier_unsynced(b) { mode & !1 } else { mode };
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s

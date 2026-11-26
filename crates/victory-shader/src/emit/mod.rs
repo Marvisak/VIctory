@@ -195,6 +195,7 @@
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
 
+mod barrier;
 mod bitcode;
 #[cfg(test)]
 mod census_tests;
@@ -262,6 +263,38 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+/// The host's narrowest wave (`D3D12_OPTIONS1::WaveLaneCountMin`; 0: not
+/// known, taken as 64).
+static HOST_WAVE_MIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_HOST_WAVE_MIN: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Translations from now on are for a host whose unpinned shaders may run with
+/// as few as `lanes` lanes (`WaveLaneCountMin`). Below 64, an unpinned
+/// single-console-wave group (at most 64 threads) can span several host waves;
+/// divergent group barriers in such groups with no shared read-after-write
+/// memory effects are left without group sync (keeping memory fences) so a
+/// host wave that skips the barrier does not hang the GPU (see `lower`).
+/// Set before the first translation: the shader cache keys on it.
+pub fn set_host_wave_min(lanes: u32) {
+    HOST_WAVE_MIN.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The host's narrowest wave, 64 when not set.
+pub fn host_wave_min() -> u32 {
+    #[cfg(test)]
+    if let Some(lanes) = TEST_HOST_WAVE_MIN.get() {
+        return lanes;
+    }
+    match HOST_WAVE_MIN.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => 64,
+        n => n,
+    }
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
