@@ -601,6 +601,22 @@ impl Module {
             .count()
     }
 
+    /// Integer-constant arguments of every written call to `name`.
+    #[cfg(test)]
+    pub fn written_call_int_args(&self, name: &str) -> Vec<Vec<Option<i64>>> {
+        let plan = self.plan();
+        let calls = plan.layout.iter().flat_map(|&b| &self.blocks[b].body);
+        calls
+            .filter(|&&i| plan.live[i as usize])
+            .filter_map(|&i| match &self.insts[i as usize].op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == name => {
+                    Some(args.iter().map(|&a| self.int_value(a)).collect())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The globals and functions [`Module::write`] declares, each kept
     /// one's new index and their number: functions declared and not called,
     /// and constant globals nothing reads, are left out (the validator

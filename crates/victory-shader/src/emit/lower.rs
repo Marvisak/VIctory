@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+#[cfg(test)]
+mod wave_prefix_tests;
 
 type Why = &'static str;
 
@@ -72,6 +74,11 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Constant integer arguments to written `dx.op.wavePrefixOp.{f32,i32}` calls.
+    #[cfg(test)]
+    pub wave_prefix_f32_args: Vec<Vec<Option<i64>>>,
+    #[cfg(test)]
+    pub wave_prefix_i32_args: Vec<Vec<Option<i64>>>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1244,7 +1251,8 @@ impl<'a> Lower<'a> {
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
             (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                // DXIL SignedOpKind: 0 = Signed (required for float ops), 1 = Unsigned.
+                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
                 let r = self.s.op(
                     c,
                     &format!("wavePrefixOp.{sfx}"),
@@ -1412,6 +1420,10 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            wave_prefix_f32_args: self.s.m.written_call_int_args("dx.op.wavePrefixOp.f32"),
+            #[cfg(test)]
+            wave_prefix_i32_args: self.s.m.written_call_int_args("dx.op.wavePrefixOp.i32"),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
