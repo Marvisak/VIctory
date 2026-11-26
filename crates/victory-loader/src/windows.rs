@@ -139,6 +139,37 @@ fn map_imports(
     Ok(())
 }
 
+/// True when `name` is a single plain file name: no separators, no `..`, no
+/// root, no drive or UNC prefix. A PE import name is always a plain file
+/// name, so anything else is a crafted name trying to escape the title
+/// directory.
+fn is_plain_import_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
+/// True when `path`, once resolved, is inside `title_dir`. This is the
+/// junction/symlink check the lexical test cannot see: both sides are
+/// canonicalised, so a reparse point that leaves `title_dir` is rejected.
+///
+/// A candidate that does not resolve (a host DLL that is not shipped in
+/// `title_dir`) is not an escape; the caller's `is_file` / `read` checks
+/// decide that case. The same applies if `title_dir` itself does not
+/// resolve - nothing can be shown to be inside it, and `is_file` will reject
+/// the join anyway.
+fn resolves_inside(path: &Path, title_dir: &Path) -> bool {
+    let Ok(base) = std::fs::canonicalize(title_dir) else {
+        return true;
+    };
+    match std::fs::canonicalize(path) {
+        Ok(candidate) => candidate.starts_with(&base),
+        Err(_) => true,
+    }
+}
+
 fn map_dll(
     name: &str,
     dirs: (&Path, &Path),
@@ -148,6 +179,17 @@ fn map_dll(
 ) -> Result<()> {
     let name = name.to_ascii_lowercase();
     let path = dirs.0.join(&name);
+    // A crafted import name must not leave the title directory. Reject it
+    // before it reaches `seen` or `wanted`, so a rejected name cannot poison
+    // the dedup set; `resolves_inside` also catches junctions and symlinks.
+    // Rejection is a no-op like a missing file, not a load error.
+    if !is_plain_import_name(&name) || !resolves_inside(&path, dirs.0) {
+        tracing::warn!(
+            name = %name,
+            "rejecting import DLL name outside the title directory"
+        );
+        return Ok(());
+    }
     if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
         return Ok(());
     }
@@ -423,5 +465,101 @@ impl LoadedImage {
         crate::threads::unmapped(self.base());
         // SAFETY: guaranteed by the caller.
         unsafe { FreeLibrary(self.module) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn accept_all(_: &str) -> bool {
+        true
+    }
+
+    #[test]
+    fn plain_import_names_are_accepted_lexically() {
+        assert!(is_plain_import_name("kernel32.dll"));
+        assert!(is_plain_import_name("KERNEL32.DLL"));
+        assert!(is_plain_import_name("vcruntime140.dll"));
+        // Anything with a separator, a parent, a root, a drive or a UNC
+        // prefix is a crafted name and is refused.
+        assert!(!is_plain_import_name(r"..\..\evil.dll"));
+        assert!(!is_plain_import_name(r"..\evil.dll"));
+        assert!(!is_plain_import_name(r"sub/evil.dll"));
+        assert!(!is_plain_import_name(r"C:\Windows\System32\version.dll"));
+        assert!(!is_plain_import_name(r"\foo.dll"));
+        assert!(!is_plain_import_name(r"C:foo.dll"));
+        assert!(!is_plain_import_name(r"\\server\share\evil.dll"));
+        assert!(!is_plain_import_name(r".\evil.dll"));
+    }
+
+    #[test]
+    fn escaping_names_are_refused_without_poisoning_the_dedup_set() {
+        let seen = &mut HashSet::new();
+        let loaded = &mut Vec::new();
+        let dirs = (Path::new("title"), Path::new("cache"));
+        for name in [
+            r"..\..\evil.dll",
+            r"..\evil.dll",
+            r"sub/evil.dll",
+            r"C:\Windows\System32\version.dll",
+        ] {
+            assert!(map_dll(name, dirs, &accept_all, seen, loaded).is_ok());
+        }
+        assert!(
+            seen.is_empty(),
+            "a rejected name must not enter the dedup set"
+        );
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn plain_names_share_a_key_across_case() {
+        let seen = &mut HashSet::new();
+        let loaded = &mut Vec::new();
+        let dirs = (Path::new("title"), Path::new("cache"));
+        // Both lower-case to the same key; the second is a dedup no-op. The
+        // files do not exist, so both are missing-file no-ops, and only the
+        // first registers in `seen`.
+        assert!(map_dll("kernel32.dll", dirs, &accept_all, seen, loaded).is_ok());
+        assert!(map_dll("KERNEL32.DLL", dirs, &accept_all, seen, loaded).is_ok());
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen.iter().next().map(String::as_str), Some("kernel32.dll"));
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn the_canonicalise_check_keeps_resolved_paths_inside_the_title_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let title = dir.path().join("title");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&title).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let inside_file = title.join("a.dll");
+        let outside_file = outside.join("a.dll");
+        std::fs::write(&inside_file, b"x").unwrap();
+        std::fs::write(&outside_file, b"x").unwrap();
+        assert!(resolves_inside(&inside_file, &title));
+        assert!(!resolves_inside(&outside_file, &title));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_symlink_outside_the_title_dir_is_refused() {
+        // Best-effort: creating a directory symlink needs Developer Mode or
+        // elevation. Without it, the case is covered by the maintainer's CI.
+        let Ok(dir) = tempfile::tempdir() else {
+            return;
+        };
+        let title = dir.path().join("title");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&title).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("a.dll"), b"x").unwrap();
+        let escaped = title.join("escaped.dll");
+        if std::os::windows::fs::symlink_dir(&outside, &escaped).is_err() {
+            return;
+        }
+        assert!(!resolves_inside(&escaped.join("a.dll"), &title));
     }
 }
