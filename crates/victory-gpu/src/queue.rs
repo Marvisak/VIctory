@@ -258,7 +258,9 @@ fn pump(held: &mut Holding, why: Why) {
     }
     // Once work stays held, a timer tests it every 2 ms: memory the title
     // writes from the CPU, or the valve, may let it go with no call of ours.
-    if held.blocked(&read).is_empty() {
+    // The pump already knows whether any queue remains blocked. Avoid
+    // re-reading the same wait words just to decide whether to start polling.
+    if !pumped.blocked {
         return;
     }
     static TIMER: std::sync::Once = std::sync::Once::new();
