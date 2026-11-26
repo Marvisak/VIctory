@@ -539,12 +539,15 @@ impl Shared {
         let out = unsafe { std::slice::from_raw_parts_mut(self.data as *mut u32, TABLE_DWORDS) };
         let (_, blocks, owner) = write_table(&ranges, &slots, self.null, out);
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
-        self.layout = Arc::new(Layout {
+        let layout = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
             blocks,
             owner,
         });
+        // The last submission has finished and the rewritten table names
+        // the copies for the next one. Release the old references off-thread.
+        crate::host::release_later(Box::new(std::mem::replace(&mut self.layout, layout)));
         self.generation = now;
         stats(|s| s.tables += 1);
     }

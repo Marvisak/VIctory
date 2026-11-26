@@ -923,10 +923,21 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
     marked.sort_unstable();
     marked.dedup();
-    let page_of = |m: &Marks, n: u32| {
-        let (&base, copy) = m.owners.range(..=n).next_back()?;
-        let copy = copy.upgrade()?;
-        let k = n - base;
+    // Keep even rejected owners alive until the lock is released: the
+    // last reference would take the same lock in Shadow::drop.
+    let owners_of = |bits: Vec<u32>| {
+        let m = marks();
+        bits.into_iter()
+            .filter_map(|n| {
+                let (&base, copy) = m.owners.range(..=n).next_back()?;
+                let copy = copy.upgrade()?;
+                #[cfg(test)]
+                tests::MARK_OWNER.with(|owner| drop(owner.take()));
+                Some((copy, n - base))
+            })
+            .collect::<Vec<_>>()
+    };
+    let page_of = |(copy, k): (Arc<Shadow>, u32)| {
         (k < pages(copy.start, copy.len)).then(|| {
             let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
             (copy, page)
@@ -934,19 +945,14 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     };
     // Held back: dropped from the copies (`crate::memory::drop_withheld`).
     if !held.is_empty() {
-        let m = marks();
-        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+        for (_, page) in owners_of(held).into_iter().filter_map(page_of) {
             crate::memory::drop_withheld(page, PAGE);
         }
     }
     if marked.is_empty() {
         return;
     }
-    let pages: Vec<(Arc<Shadow>, usize)> = {
-        let m = marks();
-        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
-    };
-    for (copy, page) in pages {
+    for (copy, page) in owners_of(marked).into_iter().filter_map(page_of) {
         if withheld
             .iter()
             .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
@@ -1305,6 +1311,63 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    thread_local! {
+        // Give up the other reference as soon as the marks lookup upgrades its weak reference.
+        pub(super) static MARK_OWNER: std::cell::Cell<Option<Arc<Shadow>>> = const { std::cell::Cell::new(None) };
+    }
+
+    #[test]
+    fn mark_lookup_releases_its_last_reference_outside_the_lock() {
+        const CHILD: &str = "VICTORY_TEST_MARK_LOOKUP_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // A deadlock leaves MARKS locked in the child alone.
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "shadow::tests::mark_lookup_releases_its_last_reference_outside_the_lock", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            return;
+        }
+
+        let Some(host) = host() else { return };
+        let (done, completed) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let p = crate::watch::tests::pool(1);
+            for memory in [true, false] {
+                let (buffer, data) = host.shared_buffer(PAGE as u64).unwrap();
+                let copy = Shadow::new(buffer, data, 0, p as u64, PAGE as u64);
+                let base = copy.marks.expect("tracked memory gets mark bits");
+                let bit = if memory {
+                    base
+                } else {
+                    // A free bit just past the copy tests rejection after the upgrade.
+                    let mut m = marks();
+                    let bit = m.take(1).unwrap();
+                    m.give_back(bit, 1);
+                    bit
+                };
+                let b = bitmap(memory).unwrap();
+                // SAFETY: a dword of the mapped bitmap, with no submission running.
+                unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+                let weak = Arc::downgrade(&copy);
+                MARK_OWNER.with(|owner| owner.set(Some(copy)));
+                copy_back_marks(&[], true);
+                assert!(weak.upgrade().is_none(), "the last owner was released for bit {bit}");
+                assert!(!marks().owners.contains_key(&base), "the mark run was returned");
+            }
+            done.send(()).unwrap();
+        });
+        completed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("copy_back_marks should release the last owner without deadlocking");
+    }
 
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.

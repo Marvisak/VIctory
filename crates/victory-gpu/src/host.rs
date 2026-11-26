@@ -3695,7 +3695,7 @@ pub(crate) fn release_retired() {
 /// Drops `what` on a thread of its own: releasing a D3D12 resource is a
 /// kernel call (~5 % of a world frame on the title's submitting thread,
 /// run perf1). Only for objects no GPU work in flight uses.
-fn release_later(what: Box<dyn std::any::Any + Send>) {
+pub(crate) fn release_later(what: Box<dyn std::any::Any + Send>) {
     type Release = std::sync::mpsc::Sender<Box<dyn std::any::Any + Send>>;
     static RELEASE: OnceLock<Release> = OnceLock::new();
     let release = RELEASE.get_or_init(|| {
