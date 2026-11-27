@@ -27,6 +27,7 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod draw;
+mod drvwatch;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;

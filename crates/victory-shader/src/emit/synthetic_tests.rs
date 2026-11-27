@@ -123,6 +123,8 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
     })
 }
 
@@ -913,6 +915,8 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             heap: l.heap,
             heap_writes: l.heap_writes,
             view_marks: false,
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
         }
     };
 

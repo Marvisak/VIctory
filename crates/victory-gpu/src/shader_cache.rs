@@ -230,6 +230,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        written_root_uavs,
+        writes_guest_memory,
         memory,
         memory_writes,
         view_addresses,
@@ -274,7 +276,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [root_cbvs, root_srvs, root_uavs] {
+    for slots in [root_cbvs, root_srvs, root_uavs, written_root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
@@ -285,7 +287,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*view_addresses) << 2
             | u32::from(*heap) << 3
             | u32::from(*heap_writes) << 4
-            | u32::from(*view_marks) << 5,
+            | u32::from(*view_marks) << 5
+            | u32::from(*writes_guest_memory) << 6,
     );
     out
 }
@@ -347,6 +350,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let written_root_uavs = r.list()?;
     let memory = r.word()?;
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
@@ -357,6 +361,8 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        written_root_uavs,
+        writes_guest_memory: memory & 64 != 0,
         memory: memory & 1 != 0,
         memory_writes: memory & 2 != 0,
         view_addresses: memory & 4 != 0,
@@ -390,6 +396,8 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![4],
+            written_root_uavs: vec![4],
+            writes_guest_memory: true,
             memory: true,
             memory_writes: true,
             view_addresses: true,
@@ -523,5 +531,27 @@ mod tests {
         let refusal = Err("GFX10 code at 0x10: x is not supported".to_owned());
         assert_eq!(decode(&encode(&refusal)), Some(refusal));
         assert_eq!(decode(&[b"VSHE".as_slice(), &[0xff]].concat()), None);
+    }
+    #[test]
+    fn cache_invalidation_on_write_classification_change() {
+        let mut s1 = shader();
+        s1.written_root_uavs = vec![4];
+        s1.writes_guest_memory = true;
+        let b1 = encode(&Ok(s1.clone()));
+        assert_eq!(decode(&b1), Some(Ok(s1.clone())));
+
+        // Changing written_root_uavs modifies encoding
+        let mut s2 = s1.clone();
+        s2.written_root_uavs = vec![];
+        let b2 = encode(&Ok(s2.clone()));
+        assert_ne!(b1, b2);
+        assert_eq!(decode(&b2), Some(Ok(s2)));
+
+        // Changing writes_guest_memory modifies encoding
+        let mut s3 = s1.clone();
+        s3.writes_guest_memory = false;
+        let b3 = encode(&Ok(s3.clone()));
+        assert_ne!(b1, b3);
+        assert_eq!(decode(&b3), Some(Ok(s3)));
     }
 }

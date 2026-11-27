@@ -302,6 +302,10 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the host binds as root descriptors:
     /// `u<index>` in [`ROOT_CBV_SPACE`] (likewise).
     pub root_uavs: Vec<u8>,
+    /// Root UAV slots through which an emitted operation may write.
+    pub written_root_uavs: Vec<u8>,
+    /// A translated store or atomic can write through the guest page directory.
+    pub writes_guest_memory: bool,
     /// Whether the shader reads title memory at addresses it computes: the
     /// host binds the page table `t0` in [`MEMORY_SPACE`] (module notes,
     /// "Title memory").
@@ -531,6 +535,8 @@ pub fn emit_with(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        written_root_uavs: l.written_root_uavs,
+        writes_guest_memory: l.writes_guest_memory,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
@@ -1064,6 +1070,8 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             memory: false,
             memory_writes: false,
             view_addresses: false,
@@ -1081,6 +1089,8 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                written_root_uavs: Vec::new(),
+                writes_guest_memory: false,
                 memory: false,
                 memory_writes: false,
                 view_addresses: false,
@@ -1791,5 +1801,27 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+    #[test]
+    fn root_uav_and_guest_memory_write_classification() {
+        let mut s = Shader::new(false);
+        let b = s.m.new_block();
+        let uav_h1 = s.root_uav_handle(1);
+        let uav_h2 = s.root_uav_handle(2);
+        let uav_h5 = s.root_uav_handle(5);
+
+        s.op(b, "dx.op.bufferLoad", Attr::ReadNone, s.t.i32, 68, &[uav_h1]);
+        assert!(!s.written_root_uavs.contains(&1));
+
+        s.op(b, "dx.op.bufferStore", Attr::NoUnwind, s.t.void, 69, &[uav_h2]);
+        assert!(s.written_root_uavs.contains(&2));
+        assert!(!s.written_root_uavs.contains(&1));
+
+        s.op(b, "dx.op.atomicOp", Attr::NoUnwind, s.t.i32, 100, &[uav_h5]);
+        assert!(s.written_root_uavs.contains(&5));
+
+        assert!(!s.writes_guest_memory);
+        s.writes_guest_memory = true;
+        assert!(s.writes_guest_memory);
     }
 }

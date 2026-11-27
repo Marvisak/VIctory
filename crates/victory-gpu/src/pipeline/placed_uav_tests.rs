@@ -81,7 +81,10 @@ fn store_shader() -> Arc<Shader> {
         container,
         translated: OnceLock::from(Some(Translated {
             host,
+            stores: false,
             used: native.used,
+            used_written: Vec::new(),
+            write_unknown: false,
         })),
     })
 }

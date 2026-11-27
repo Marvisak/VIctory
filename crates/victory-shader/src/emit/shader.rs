@@ -119,6 +119,10 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Root UAV slots through which an emitted operation may write.
+    pub written_root_uavs: Vec<u8>,
+    /// A translated store or atomic can write through the guest page directory.
+    pub writes_guest_memory: bool,
     /// The title-memory page table's handle, once read.
     pub memory: Option<V>,
     /// The written-pages bitmap's handle, once title memory is written.
@@ -195,6 +199,8 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             memory: None,
             memory_dirty: None,
             view_addresses: None,
@@ -236,6 +242,16 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // Track which root UAV slots an emitted operation can write through.
+        // Opcode 68: BufferLoad, 72: GetDimensions, 139: RawBufferLoad. Any
+        // other opcode (stores, atomics) is treated as a write.
+        if !matches!(opcode, 68 | 72 | 139)
+            && let Some(first) = args.first()
+            && let Some(&(slot, _)) = self.root_uavs.iter().find(|(_, h)| h == first)
+            && !self.written_root_uavs.contains(&slot)
+        {
+            self.written_root_uavs.push(slot);
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);

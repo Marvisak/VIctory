@@ -203,6 +203,34 @@ fn make() -> windows::core::Result<Clamp> {
 // promoted to a write state the input assembler may not use (the debug
 // layer cannot see view accesses; GPU-based validation might); upgrade to
 // per-list tracked buffer states if a driver or that validation minds.
+/// Validates that an indirect argument layout is 4-byte aligned and does not overflow.
+pub(crate) fn validate_layout(
+    (_kind, stride, records): (u32, u32, u32),
+    args_offset: u64,
+    count_offset: Option<u64>,
+) -> Option<u64> {
+    if !args_offset.is_multiple_of(4)
+        || !stride.is_multiple_of(4)
+        || stride == 0
+        || records == 0
+        || count_offset.is_some_and(|off| !off.is_multiple_of(4))
+    {
+        return None;
+    }
+    let bytes = u64::from(stride).checked_mul(u64::from(records))?;
+    (bytes <= u64::from(u32::MAX)).then_some(bytes)
+}
+
+/// Clamps records ahead for indirect argument windowing.
+pub(crate) fn bound_ahead(
+    list: &HostList,
+    gpu: u64,
+    spec: (u32, u32, u32),
+) -> Option<ID3D12Resource> {
+    validate_layout(spec, gpu, None)?;
+    bound(list, gpu, spec)
+}
+
 pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u32, u32)) -> Option<ID3D12Resource> {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return None;
@@ -416,5 +444,22 @@ mod tests {
             return; // no host GPU here
         };
         assert!(twice.iter().all(|&count| count == 0));
+    }
+    #[test]
+    fn validate_layout_and_window_spec() {
+        // Aligned and valid
+        assert_eq!(super::validate_layout((0, 16, 4), 0, None), Some(64));
+        assert_eq!(super::validate_layout((1, 20, 2), 64, Some(128)), Some(40));
+
+        // Unaligned argument offset
+        assert_eq!(super::validate_layout((0, 16, 4), 3, None), None);
+        // Unaligned stride
+        assert_eq!(super::validate_layout((0, 17, 4), 0, None), None);
+        // Zero stride
+        assert_eq!(super::validate_layout((0, 0, 4), 0, None), None);
+        // Zero records
+        assert_eq!(super::validate_layout((0, 16, 0), 0, None), None);
+        // Unaligned count offset
+        assert_eq!(super::validate_layout((0, 16, 4), 0, Some(5)), None);
     }
 }

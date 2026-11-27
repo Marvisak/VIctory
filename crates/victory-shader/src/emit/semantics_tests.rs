@@ -310,6 +310,8 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
     })
 }
 

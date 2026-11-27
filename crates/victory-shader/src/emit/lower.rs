@@ -38,6 +38,9 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    pub written_root_uavs: Vec<u8>,
+    /// A translated store or atomic can write through the guest page directory.
+    pub writes_guest_memory: bool,
     /// Reads title memory at computed addresses (the page table).
     pub memory: bool,
     /// Writes there (the written-pages bitmap).
@@ -1024,6 +1027,9 @@ impl<'a> Lower<'a> {
                 .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
             self.mark_view_write(h, off, 4 * u32::from(n), None);
             self.end_guarded(at, &[]);
+            if memory.is_some() {
+                self.s.writes_guest_memory = true;
+            }
             return Ok(());
         }
         let ops = ops.expect("an atomic");
@@ -1068,6 +1074,9 @@ impl<'a> Lower<'a> {
         self.mark_view_write(h, off, 4, None);
         let zero = self.s.m.i32(0);
         let r = self.end_guarded(at, &[(first.expect("an atomic"), zero)])[0];
+        if memory.is_some() {
+            self.s.writes_guest_memory = true;
+        }
         if let Some(reg) = returned {
             self.write(inst, Reg::V(reg), r, guard);
         }
@@ -1394,6 +1403,8 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            written_root_uavs: std::mem::take(&mut self.s.written_root_uavs),
+            writes_guest_memory: self.s.writes_guest_memory,
             memory,
             memory_writes,
             view_addresses,
