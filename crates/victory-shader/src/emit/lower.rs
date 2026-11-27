@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod sqrt;
 
 type Why = &'static str;
 
@@ -280,67 +281,102 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
-    /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
-    /// the one in force at the instruction being lowered (see [`round16`]).
-    round16: Vec<Option<u8>>,
-    mode16: Option<u8>,
+    /// The 16/64-bit floating-point modes at block entry and at the
+    /// instruction being lowered.
+    fp_modes16: Vec<FpMode16>,
+    mode16: FpMode16,
 }
 
-/// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
-/// after `inst`, from `mode` before it (`None`: not known).
-fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
-    match (inst.name(), &inst.fields) {
-        ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
-        (
-            "s_setreg_imm32_b32" | "s_setreg_b32",
-            Fields::Sop {
-                src, imm: Some(h), ..
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct FpMode16 {
+    round: Option<u8>,
+    denorm_input: Option<bool>,
+}
+
+impl FpMode16 {
+    // The shader entry convention: nearest-even rounding and preserved
+    // input and output subnormals for binary16 and binary64.
+    const INITIAL: Self = Self {
+        round: Some(0),
+        denorm_input: Some(true),
+    };
+
+    fn after(self, inst: &Inst) -> Self {
+        match (inst.name(), &inst.fields) {
+            ("s_round_mode", Fields::Sopp { imm }) => Self {
+                round: Some((imm >> 2 & 3) as u8),
+                ..self
             },
-        ) => {
-            let (id, off, size) = (h & 0x3F, h >> 6 & 0x1F, (h >> 11 & 0x1F) + 1);
-            if id != 1 || off >= 4 || off + size <= 2 {
-                return mode;
-            }
-            match src.first() {
-                Some(&Operand::Literal(x)) if off <= 2 && off + size >= 4 => {
-                    Some((x >> (2 - off) & 3) as u8)
+            ("s_denorm_mode", Fields::Sopp { imm }) => Self {
+                denorm_input: Some(imm & 4 != 0),
+                ..self
+            },
+            (
+                "s_setreg_imm32_b32" | "s_setreg_b32",
+                Fields::Sop {
+                    src, imm: Some(h), ..
+                },
+            ) if h & 0x3F == 1 => {
+                let offset = h >> 6 & 0x1F;
+                let end = offset + (h >> 11 & 0x1F) + 1;
+                let literal = match src.first() {
+                    Some(&Operand::Literal(bits)) => Some(bits),
+                    _ => None,
+                };
+                let round = if offset >= 4 || end <= 2 {
+                    self.round
+                } else if offset <= 2 && end >= 4 {
+                    literal.map(|bits| (bits >> (2 - offset) & 3) as u8)
+                } else {
+                    None
+                };
+                let denorm_input = if (offset..end).contains(&6) {
+                    literal.map(|bits| bits >> (6 - offset) & 1 != 0)
+                } else {
+                    self.denorm_input
+                };
+                Self {
+                    round,
+                    denorm_input,
                 }
-                _ => None,
             }
+            _ => self,
         }
-        _ => mode,
+    }
+
+    fn join(self, other: Self) -> Self {
+        Self {
+            round: self.round.filter(|_| self.round == other.round),
+            denorm_input: self
+                .denorm_input
+                .filter(|_| self.denorm_input == other.denorm_input),
+        }
     }
 }
 
-/// The 16/64-bit round mode each block starts with: nearest even at the
-/// program's start, then as the MODE writes on the way set it; `None` where
-/// paths that set it differently join (or a write is not a constant).
-fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
-    // None: not reached yet; Some(m): the mode (m None: not known).
-    let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
-    entry[0] = Some(Some(0));
+/// Track MODE bits 3:2 and the input-denormal bit 6 independently. A field
+/// is unknown after a dynamic write or a join between paths that disagree.
+fn fp_modes16(p: &crate::ir::Program) -> Vec<FpMode16> {
+    let mut entry = vec![None; p.blocks.len()];
+    entry[0] = Some(FpMode16::INITIAL);
     let order = crate::ir::reverse_postorder(&p.blocks);
     loop {
         let mut changed = false;
         for &b in &order {
-            let Some(mut m) = entry[b] else { continue };
+            let Some(mut mode) = entry[b] else { continue };
             for inst in &p.blocks[b].insts {
-                m = round16_after(inst, m);
+                mode = mode.after(inst);
             }
-            for s in p.blocks[b].exit.successors() {
-                let new = match entry[s] {
-                    None => Some(m),
-                    Some(old) if old == m => continue,
-                    Some(_) => Some(None),
-                };
-                if entry[s] != new {
-                    entry[s] = new;
+            for successor in p.blocks[b].exit.successors() {
+                let new = Some(entry[successor].map_or(mode, |old| old.join(mode)));
+                if entry[successor] != new {
+                    entry[successor] = new;
                     changed = true;
                 }
             }
         }
         if !changed {
-            return entry.into_iter().map(Option::flatten).collect();
+            return entry.into_iter().map(Option::unwrap_or_default).collect();
         }
     }
 }
@@ -723,8 +759,8 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
-            round16: round16(p),
-            mode16: Some(0),
+            fp_modes16: fp_modes16(p),
+            mode16: FpMode16::INITIAL,
         }
     }
 
@@ -1352,7 +1388,7 @@ impl<'a> Lower<'a> {
                 self.vals.insert(phi.value, val);
             }
             let mut i = 0;
-            self.mode16 = self.round16[b];
+            self.mode16 = self.fp_modes16[b];
             while i < p.blocks[b].insts.len() {
                 if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
                     // A pixel's discard: the lanes stay on as helpers.
@@ -1365,10 +1401,11 @@ impl<'a> Lower<'a> {
                         .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
                 }
                 self.inst(b, i)?;
-                self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
+                self.mode16 = self.mode16.after(&p.blocks[b].insts[i]);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
+                        self.mode16 = self.mode16.after(&p.blocks[b].insts[j]);
                     }
                     i = end;
                     continue;
@@ -2220,7 +2257,7 @@ impl<'a> Lower<'a> {
     // shortcut: rounding toward +-infinity, or a mode not known at this
     // point (paths that set it differently join), rounds to nearest even.
     fn narrow16(&mut self, f: V) -> V {
-        let rtz = self.mode16 == Some(3);
+        let rtz = self.mode16.round == Some(3);
         let c = self.cur;
         let x = self.as_int(f);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -6313,6 +6350,7 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::SDiv, one, a);
                 float(self, r)
             }
+            "v_sqrt_f64" => self.sqrt_f64(inst, guard),
             "v_rsq_f32" | "v_sqrt_f32" | "v_log_f32" | "v_exp_f32" | "v_fract_f32"
             | "v_trunc_f32" | "v_floor_f32" | "v_ceil_f32" | "v_rndne_f32" | "v_sin_f32"
             | "v_cos_f32" => {
@@ -7027,7 +7065,7 @@ impl<'a> Lower<'a> {
             } else {
                 self.half_fsrc(inst, 2)?
             };
-            if name == "v_fma_f16" && self.mode16 != Some(3) {
+            if name == "v_fma_f16" && self.mode16.round != Some(3) {
                 if v.omod != 0 {
                     return Err("an output modifier on a 16-bit operation");
                 }
