@@ -84,6 +84,20 @@ impl Pending {
         }
     }
 
+    /// Whether it has a host pipeline: `Some(true)` made, `Some(false)`
+    /// refused (its shaders do not translate, or the host driver would not
+    /// make it), `None` still being made.
+    pub(crate) fn made(&self) -> Option<bool> {
+        self.made.get().map(Option::is_some)
+    }
+
+    /// Makes it now, on this thread (tests): whether it got a host pipeline.
+    #[cfg(all(test, windows))]
+    pub(crate) fn now(&self) -> bool {
+        self.make();
+        self.made.get().is_some_and(Option::is_some)
+    }
+
     fn make(&self) {
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());

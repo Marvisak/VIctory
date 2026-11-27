@@ -3071,14 +3071,18 @@ impl Meter {
             self.logged = std::time::Instant::now();
             let report_frames = std::mem::take(&mut self.report_frames) as f64;
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
+            let [refused, waiting] = crate::pipeline::take_dropped_split();
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                 dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
+                 dropped {dropped:.0} without a host pipeline and {indirect:.0} indirect not run: \
+                 {refused:.0} refused, {waiting:.0} waiting for one, {making} being made \
+                 (both counts together); {root_views:.0} root-view slots/frame",
+                refused = refused as f64 / report_frames,
+                waiting = waiting as f64 / report_frames,
                 making = crate::pipeline::making()
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
