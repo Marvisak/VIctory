@@ -395,6 +395,14 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// A creation that faulted (`VICTORY_PIPELINE_SOFT_CRASH`) refuses the
+/// pipeline from now on, and in the journal.
+fn faulted(key: &str, detail: &str) {
+    if let Some(f) = super::soft_crash::take_fault() {
+        super::journal::faulted(key, detail, f.code, f.address);
+    }
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -458,6 +466,20 @@ impl HostPipeline {
         }
 
         let aniso_point_mip_supported = crate::sampler::aniso_point_mip(&host.device);
+
+        // A pipeline whose creation ended an earlier run is not tried again
+        // (`VICTORY_PIPELINE_JOURNAL`); the note lives until this returns.
+        let key = stages
+            .iter()
+            .map(|(s, _)| s.hash.as_str())
+            .collect::<Vec<_>>()
+            .join("+");
+        let detail = stages
+            .iter()
+            .map(|(s, _)| format!("{}-{}", s.stage.to_lowercase(), s.container.len()))
+            .collect::<Vec<_>>()
+            .join("+");
+        let _pending = super::journal::enter(&key, &detail)?;
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -621,6 +643,7 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
+                    faulted(&key, &detail);
                     return None;
                 }
             };
@@ -669,6 +692,7 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
+                    faulted(&key, &detail);
                     return None;
                 }
             };
@@ -762,6 +786,7 @@ impl HostPipeline {
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
+                faulted(&key, &detail);
                 return None;
             }
         };

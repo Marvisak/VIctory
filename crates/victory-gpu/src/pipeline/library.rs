@@ -269,20 +269,26 @@ pub(crate) fn pipeline(
     LAST.set(Some((name.to_owned(), true)));
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        return guarded(create);
     };
     let _held = NAMES.hold(name);
     // Outside the lock: loads take up to seconds, and a save holds the lock
     // for as long as it serialises. The library's blob lives as long as it
-    // does, which is never dropped.
-    if let Ok(pso) = load(&library.loads, PCWSTR(wide.as_ptr())) {
-        LOADED.fetch_add(1, Ordering::Relaxed);
-        return Ok(pso);
+    // does, which is never dropped. A load may compile too (when the host
+    // kept no compiled code); after a fault in it, nothing more is tried on
+    // this thread.
+    match super::soft_crash::guarded(|| load(&library.loads, PCWSTR(wide.as_ptr()))) {
+        Ok(Ok(pso)) => {
+            LOADED.fetch_add(1, Ordering::Relaxed);
+            return Ok(pso);
+        }
+        Ok(Err(_)) => {}
+        Err(fault) => return Err(fault.error()),
     }
     // Compiled outside the lock: compiles take up to seconds.
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), false)));
-    let pso = create()?;
+    let pso = guarded(create)?;
     MADE.fetch_add(1, Ordering::Relaxed);
     let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
@@ -291,6 +297,14 @@ pub(crate) fn pipeline(
         l.added += 1;
     }
     Ok(pso)
+}
+
+/// `f` on a thread that survives a fault in it (`VICTORY_PIPELINE_SOFT_CRASH`):
+/// a fault returns its code as the error, and stays for `soft_crash::take_fault`.
+fn guarded(
+    f: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
+    super::soft_crash::guarded(f).unwrap_or_else(|fault| Err(fault.error()))
 }
 
 #[cfg(feature = "diagnostics")]
