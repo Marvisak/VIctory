@@ -124,7 +124,7 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let top = parent.is_null();
+    let top = parent.is_null() && style & wm::WS_CHILD == 0;
     // SAFETY: the title's own arguments, forwarded (a top-level window
     // made message-only).
     let hwnd = unsafe {
@@ -165,7 +165,7 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let top = parent.is_null();
+    let top = parent.is_null() && style & wm::WS_CHILD == 0;
     // SAFETY: the title's own arguments, forwarded (a top-level window
     // made message-only).
     let hwnd = unsafe {
@@ -533,7 +533,21 @@ const RELAUNCHED_FROM: &str = "VICTORY_RELAUNCHED_FROM";
 /// Starts `victory` again with `args` (after the title has suspended); the
 /// new process waits until this one has ended.
 pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
-    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+    match std::env::current_exe().and_then(|exe| relaunch_exe(&exe, &args)) {
+        Ok(child) => tracing::info!(pid = child.id(), ?args, "relaunched"),
+        Err(e) => tracing::warn!(%e, "relaunch failed; the title just ends"),
+    }
+}
+
+/// Spawns `exe` with `args` and an inheritable duplicate of this process's
+/// handle in [`RELAUNCHED_FROM`], closing the parent's duplicate after spawn.
+fn relaunch_exe(
+    exe: &std::path::Path,
+    args: &[std::ffi::OsString],
+) -> std::io::Result<std::process::Child> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
+    };
     let mut me: HANDLE = std::ptr::null_mut();
     // SAFETY: an inheritable duplicate of our own process handle.
     let duplicated = unsafe {
@@ -547,18 +561,18 @@ pub(crate) fn relaunch(args: Vec<std::ffi::OsString>) {
             DUPLICATE_SAME_ACCESS,
         )
     } != 0;
-    let spawned = std::env::current_exe().and_then(|exe| {
-        let mut command = std::process::Command::new(exe);
-        command.args(&args);
-        if duplicated {
-            command.env(RELAUNCHED_FROM, (me as usize).to_string());
-        }
-        command.spawn()
-    });
-    match spawned {
-        Ok(child) => tracing::info!(pid = child.id(), ?args, "relaunched"),
-        Err(e) => tracing::warn!(%e, "relaunch failed; the title just ends"),
+    let mut command = std::process::Command::new(exe);
+    command.args(args);
+    if duplicated {
+        command.env(RELAUNCHED_FROM, (me as usize).to_string());
     }
+    let spawned = command.spawn();
+    if duplicated {
+        // SAFETY: `CreateProcessW` has already inherited `me` into the child
+        // (or failed), so the parent's duplicate handle is no longer needed.
+        unsafe { CloseHandle(me) };
+    }
+    spawned
 }
 
 /// In a relaunched `victory`: waits (30 s at most) for the process it
@@ -932,5 +946,190 @@ mod tests {
         }
         let seen = COMMANDS.with(|c| c.borrow().clone());
         assert_eq!(seen, [wm::SC_MINIMIZE as usize]);
+    }
+
+    #[test]
+    fn null_parent_ws_child_windows_fail_with_win32_error_while_valid_children_succeed() {
+        use windows_sys::Win32::Foundation::{ERROR_TLW_WITH_WSCHILD, GetLastError, SetLastError};
+        use windows_sys::core::s;
+
+        let null = std::ptr::null_mut();
+        // SAFETY: thread-local Win32 error state and window creation/destruction.
+        unsafe {
+            SetLastError(0);
+            let orphan_w = CreateWindowExW(
+                0,
+                w!("STATIC"),
+                w!("orphan"),
+                wm::WS_CHILD,
+                0,
+                0,
+                10,
+                10,
+                null,
+                null,
+                null,
+                std::ptr::null(),
+            );
+            assert!(orphan_w.is_null());
+            assert_eq!(GetLastError(), ERROR_TLW_WITH_WSCHILD);
+
+            SetLastError(0);
+            let orphan_a = CreateWindowExA(
+                0,
+                s!("STATIC"),
+                s!("orphan"),
+                wm::WS_CHILD,
+                0,
+                0,
+                10,
+                10,
+                null,
+                null,
+                null,
+                std::ptr::null(),
+            );
+            assert!(orphan_a.is_null());
+            assert_eq!(GetLastError(), ERROR_TLW_WITH_WSCHILD);
+
+            // A message-only parent made directly, not through our hook: no
+            // stand-in and nothing on the desktop that other tests share.
+            let parent = wm::CreateWindowExW(
+                0,
+                w!("STATIC"),
+                w!("parent"),
+                0,
+                0,
+                0,
+                20,
+                20,
+                wm::HWND_MESSAGE,
+                null,
+                null,
+                std::ptr::null(),
+            );
+            assert!(!parent.is_null());
+
+            let child_w = CreateWindowExW(
+                0,
+                w!("STATIC"),
+                w!("child_w"),
+                wm::WS_CHILD,
+                0,
+                0,
+                10,
+                10,
+                parent,
+                null,
+                null,
+                std::ptr::null(),
+            );
+            assert!(!child_w.is_null());
+            assert!(stand_in_of(child_w).is_null());
+            assert_eq!(wm::GetParent(child_w), parent);
+            assert!(!wm::GetPropW(child_w, TITLE_PROC).is_null());
+
+            let child_a = CreateWindowExA(
+                0,
+                s!("STATIC"),
+                s!("child_a"),
+                wm::WS_CHILD,
+                0,
+                0,
+                10,
+                10,
+                parent,
+                null,
+                null,
+                std::ptr::null(),
+            );
+            assert!(!child_a.is_null());
+            assert!(stand_in_of(child_a).is_null());
+            assert_eq!(wm::GetParent(child_a), parent);
+            assert!(!wm::GetPropW(child_a, TITLE_PROC).is_null());
+
+            wm::DestroyWindow(child_a);
+            wm::DestroyWindow(child_w);
+            wm::DestroyWindow(parent);
+        }
+    }
+
+    /// Set only in the child test process that
+    /// [`relaunch_closes_its_duplicated_process_handle`] starts.
+    const HANDLE_COUNT_CHILD: &str = "VICTORY_TEST_RELAUNCH_HANDLE_COUNT_CHILD";
+
+    /// Counts handles in a child copy of this test executable that runs only
+    /// [`relaunch_handle_count_in_isolated_process`] on one thread, so other
+    /// tests cannot open or close handles while it counts.
+    #[test]
+    fn relaunch_closes_its_duplicated_process_handle() {
+        let module = module_path!();
+        let helper = format!(
+            "{}::relaunch_handle_count_in_isolated_process",
+            module.split_once("::").map_or(module, |(_, path)| path)
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([helper.as_str(), "--exact", "--ignored", "--test-threads=1"])
+            .env(HANDLE_COUNT_CHILD, "1")
+            .output()
+            .expect("start the isolated handle-count test process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated handle-count test failed ({}):\n{stdout}\n{stderr}",
+            output.status
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "isolated handle-count test did not run:\n{stdout}\n{stderr}"
+        );
+    }
+
+    #[test]
+    #[ignore = "run by relaunch_closes_its_duplicated_process_handle in a child process"]
+    fn relaunch_handle_count_in_isolated_process() {
+        use windows_sys::Win32::System::Threading::GetProcessHandleCount;
+
+        if std::env::var_os(HANDLE_COUNT_CHILD).is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-relaunch-target.exe");
+        assert!(relaunch_exe(&missing, &[]).is_err());
+
+        let mut before = 0u32;
+        assert_ne!(
+            // SAFETY: queries handle count of the current process.
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut before) },
+            0
+        );
+
+        for _ in 0..256 {
+            assert!(relaunch_exe(&missing, &[]).is_err());
+        }
+
+        let comspec = std::env::var_os("ComSpec")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+        if comspec.exists() {
+            let args = [
+                std::ffi::OsString::from("/C"),
+                std::ffi::OsString::from("exit 0"),
+            ];
+            let mut child = relaunch_exe(&comspec, &args).expect("cmd /C exit 0");
+            assert!(child.wait().expect("wait").success());
+        }
+
+        let mut after = 0u32;
+        assert_ne!(
+            // SAFETY: queries handle count of the current process.
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut after) },
+            0
+        );
+        assert!(
+            after < before + 64,
+            "duplicated process handles leaked: before={before}, after={after}"
+        );
     }
 }
