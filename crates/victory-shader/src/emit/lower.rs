@@ -72,6 +72,15 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Wave size metadata emitted into DXIL (`None` = wave-size-agnostic).
+    #[cfg(test)]
+    pub wave_size: Option<u32>,
+    /// Whether `lds_wave32_sync` inserted DXIL barriers around LDS accesses.
+    #[cfg(test)]
+    pub lds_wave32_sync: bool,
+    /// Number of `dx.op.barrier` calls emitted in the DXIL module.
+    #[cfg(test)]
+    pub lds_barriers: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -112,6 +121,10 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
         }
     }
 }
+
+#[path = "wave64_lds.rs"]
+mod wave64_lds;
+use wave64_lds::can_sync_wave64_lds;
 
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
@@ -251,6 +264,10 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Single-wave Wave64 compute shader with uniform LDS accesses lowered
+    /// without `WaveSize(64)` by emitting group-memory barriers around LDS ops
+    /// so Wave32-only hosts (e.g. NVIDIA) can run it safely.
+    lds_wave32_sync: bool,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
@@ -408,11 +425,18 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
             return false;
         }
         Fields::Sop { src, .. } => src.iter().collect(),
+        Fields::Smem {
+            data,
+            base,
+            soffset,
+            ..
+        } => data.iter().chain([base, soffset]).collect(),
         Fields::Valu(v)
-            if !matches!(i.name(), "v_cndmask_b32") && !i.name().contains("_co_ci_") =>
+            if matches!(i.name(), "v_cndmask_b32") || i.name().contains("_co_ci_") =>
         {
-            v.src.iter().collect()
+            v.src.iter().take(2).collect()
         }
+        Fields::Valu(v) => v.src.iter().collect(),
         _ => return false,
     };
     ops.into_iter().any(|op| match *op {
@@ -599,11 +623,25 @@ impl<'a> Lower<'a> {
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            let threads = cs.threads.iter().product::<u32>();
+            let one_wave = threads <= wave;
+            if console_lanes {
                 s.wave_size = Some(wave);
+            } else if one_wave && s.lds_dwords > 0 {
+                if wave == 64 && can_sync_wave64_lds(p, x) {
+                    // Uniform single-wave Wave64 LDS accesses: sync with DXIL group
+                    // barriers instead of locking to WaveSize(64) so Wave32 (and
+                    // narrower WARP) hosts run it safely across 1..=64 threads.
+                } else {
+                    s.wave_size = Some(wave);
+                }
             }
         }
+        let lds_wave32_sync = matches!(&x.native.io, StageIo::Cs(cs) if x.native.wave64
+            && !console_lanes
+            && cs.threads.iter().product::<u32>() <= 64
+            && s.lds_dwords > 0
+            && can_sync_wave64_lds(p, x));
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
@@ -696,6 +734,7 @@ impl<'a> Lower<'a> {
             root_memory,
             flat: None,
             no_barrier,
+            lds_wave32_sync,
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -1412,6 +1451,12 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            wave_size: self.s.wave_size,
+            #[cfg(test)]
+            lds_wave32_sync: self.lds_wave32_sync,
+            #[cfg(test)]
+            lds_barriers: self.s.m.written_calls("dx.op.barrier") as u32,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3324,6 +3369,9 @@ impl<'a> Lower<'a> {
             ]
         };
         if let Some(rest) = name.strip_prefix("ds_read") {
+            if self.lds_wave32_sync {
+                self.emit_lds_barrier();
+            }
             let elements = if rest.starts_with('2') {
                 pair(name)
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
@@ -3371,6 +3419,9 @@ impl<'a> Lower<'a> {
                     x
                 };
                 self.write(inst, Reg::V(reg), x, guard);
+                if self.lds_wave32_sync {
+                    self.emit_lds_barrier();
+                }
                 return Ok(());
             };
             let reg = dst_reg.ok_or("an LDS read result")?;
@@ -3384,6 +3435,9 @@ impl<'a> Lower<'a> {
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
+            }
+            if self.lds_wave32_sync {
+                self.emit_lds_barrier();
             }
             return Ok(());
         }
@@ -3424,6 +3478,9 @@ impl<'a> Lower<'a> {
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, set);
                 self.end_guarded(at, &[]);
+                if self.lds_wave32_sync {
+                    self.emit_lds_barrier();
+                }
                 return Ok(());
             };
             let mut stores = Vec::new();
@@ -3439,6 +3496,9 @@ impl<'a> Lower<'a> {
                 let at = self.begin_guarded(Some(g));
                 self.s.m.store(self.cur, p, x);
                 self.end_guarded(at, &[]);
+            }
+            if self.lds_wave32_sync {
+                self.emit_lds_barrier();
             }
             return Ok(());
         }
@@ -3494,7 +3554,17 @@ impl<'a> Lower<'a> {
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
         }
+        if self.lds_wave32_sync {
+            self.emit_lds_barrier();
+        }
         Ok(())
+    }
+
+    fn emit_lds_barrier(&mut self) {
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
     // ---- instructions ----
@@ -12209,3 +12279,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "wave64_lds_tests.rs"]
+mod wave64_lds_tests;
