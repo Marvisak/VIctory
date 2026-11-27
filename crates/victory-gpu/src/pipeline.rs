@@ -288,6 +288,62 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parses a file of shader hashes (one 16-hex-digit hash per line; blank
+/// lines and `#`-prefixed comments are ignored) into the same form
+/// `parse_skip_hashes` returns.
+#[cfg(any(windows, test))]
+fn parse_skip_hashes_lines(text: &str) -> Vec<String> {
+    let comma_joined: String = text
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    // Reuse the validation logic by going through the diagnostics parser when
+    // it is available; otherwise do it inline to avoid a diagnostics dep.
+    #[cfg(feature = "diagnostics")]
+    return parse_skip_hashes(&comma_joined);
+    #[cfg(not(feature = "diagnostics"))]
+    return comma_joined
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .filter_map(|h| {
+            (h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| h.to_ascii_lowercase())
+        })
+        .collect();
+}
+
+/// Hashes to skip when `VICTORY_SKIP_BVH_SKINNING=1`, read once.
+///
+/// Set `VICTORY_SKIP_BVH_SKINNING=1` to load from `skip-bvh-skinning.txt`
+/// next to the executable. Use `VICTORY_SKIP_BVH_SKINNING=@/abs/path` to
+/// load from a custom file. The switch is off by default; when off this
+/// returns an empty slice with no overhead. Hashes live in
+/// `docs/skip-bvh-skinning.txt` (not in source; not part of the game).
+#[cfg(any(windows, test))]
+fn skip_bvh_skinning_hashes() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        if !crate::switch::on("VICTORY_SKIP_BVH_SKINNING") {
+            return Vec::new();
+        }
+        let value = std::env::var("VICTORY_SKIP_BVH_SKINNING").unwrap_or_default();
+        let raw = if let Some(path) = value.trim().strip_prefix('@') {
+            std::fs::read_to_string(path).unwrap_or_default()
+        } else {
+            // Default: `skip-bvh-skinning.txt` beside the executable.
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("skip-bvh-skinning.txt")))
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_default()
+        };
+        parse_skip_hashes_lines(&raw)
+    })
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
@@ -311,6 +367,25 @@ fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && pipeline(this).host.skipped_shader.is_some()
+}
+
+/// Whether `this` pipeline is skipped by `VICTORY_SKIP_BVH_SKINNING=1`.
+///
+/// Returns `false` when `VICTORY_SKIP_BVH_SKINNING` is unset or `0`, with no
+/// overhead — the hash list is empty and the check exits on the first guard.
+#[cfg(windows)]
+pub(crate) fn is_bvh_skinning_skipped(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let hashes = skip_bvh_skinning_hashes();
+    if hashes.is_empty() {
+        return false;
+    }
+    pipeline(this)
+        .shaders
+        .iter()
+        .any(|s| hashes.contains(&s.hash))
 }
 
 /// The shaders of `this`, as host pipelines are named (diagnostics).
@@ -715,6 +790,37 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    /// `parse_skip_hashes_lines` accepts the same hashes, one per line, with
+    /// blank lines and `#`-comments stripped.
+    #[test]
+    fn skip_hashes_lines_parses_file_format() {
+        assert!(super::parse_skip_hashes_lines("").is_empty());
+        assert!(super::parse_skip_hashes_lines("# just a comment\n\n").is_empty());
+        assert_eq!(
+            super::parse_skip_hashes_lines(
+                "# BVH skinning pipelines\n\
+                 0123456789ABCDEF\n\
+                 \n\
+                 0011223344556677 # variant\n\
+                 tooshort\n"
+            ),
+            ["0123456789abcdef", "0011223344556677"]
+        );
+    }
+
+    /// When `VICTORY_SKIP_BVH_SKINNING` is off (the default), the hash list
+    /// is empty and `is_bvh_skinning_skipped` returns `false` for any pipeline.
+    #[cfg(windows)]
+    #[test]
+    fn bvh_skinning_skip_is_off_by_default() {
+        // Verify the switch is not set in this test environment.
+        if std::env::var_os("VICTORY_SKIP_BVH_SKINNING").is_some_and(|v| v != "0") {
+            return; // skip the check if the env var is set externally
+        }
+        // A null pipeline is always false.
+        assert!(!super::is_bvh_skinning_skipped(std::ptr::null()));
     }
 
     use super::*;

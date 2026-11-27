@@ -1,0 +1,16 @@
+# Shader hashes skipped when VICTORY_SKIP_BVH_SKINNING=1
+#
+# One 16-hex-digit BLAKE3-prefix hash per line.  Blank lines and
+# lines starting with '#' are ignored.
+#
+# These are compute shader containers whose pipelines dispatch BVH
+# skinning work that serves no purpose when the BVH builder is
+# inactive.  Skipping them avoids unnecessary GPU work on hardware
+# where these shaders cause performance problems.
+#
+# To populate this file: run with VICTORY_PIPELINE_LOG set, collect
+# the hashes of pipelines first bound in the frames where BVH skinning
+# dispatches appear, and add them here (one per line).
+#
+# Example entry (replace with real hashes from your log):
+# 0000000000000000
