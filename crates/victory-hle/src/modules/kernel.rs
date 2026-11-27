@@ -164,14 +164,17 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
-    // Values below 0x10000 are ordinals; we export by name only.
+    // Values below 0x10000 are ordinals. Our export table names ordinal
+    // exports `#n`, the same form the import binder looks up.
     if (name as usize) < 0x1_0000 {
-        tracing::warn!(
-            module = m.name,
-            ordinal = name as usize,
-            "GetProcAddress by ordinal"
-        );
-        return std::ptr::null_mut();
+        let ordinal = format!("#{}", name as usize);
+        return match m.exports.iter().find(|e| e.name == ordinal) {
+            Some(e) => e.address as *mut c_void,
+            None => {
+                tracing::warn!(module = m.name, %ordinal, "GetProcAddress: not implemented");
+                std::ptr::null_mut()
+            }
+        };
     }
     // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
     let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
@@ -709,6 +712,21 @@ mod tests {
         assert_eq!(
             GetProcAddress(ws2, 4 as *const u8) as usize,
             crate::registry::lookup("ws2_32.dll", "connect").unwrap()
+        );
+    }
+
+    #[test]
+    fn pseudo_module_ordinals_resolve() {
+        let module = LoadLibraryA(c"gameinput.dll".as_ptr().cast());
+        assert!(!module.is_null(), "gameinput is one of our pseudo modules");
+        assert_eq!(
+            GetProcAddress(module, std::ptr::without_provenance::<u8>(1)) as usize,
+            crate::registry::lookup("gameinput.dll", "#1").unwrap(),
+            "GameInputCreate is imported by ordinal"
+        );
+        assert!(
+            GetProcAddress(module, std::ptr::without_provenance::<u8>(2)).is_null(),
+            "an ordinal we do not export stays null"
         );
     }
 
