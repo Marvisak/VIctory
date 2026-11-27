@@ -95,6 +95,29 @@ extern "system" fn launch_new_game(
     let _ = command;
 }
 
+fn same_path(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        fn norm(s: &std::ffi::OsStr) -> impl Iterator<Item = u16> + '_ {
+            s.encode_wide().map(|u| {
+                if u == u16::from(b'/') {
+                    u16::from(b'\\')
+                } else if (u16::from(b'A')..=u16::from(b'Z')).contains(&u) {
+                    u + 32
+                } else {
+                    u
+                }
+            })
+        }
+        norm(a).eq(norm(b))
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
 /// Our own arguments for the relaunch: the title's executable replaced by
 /// `exe`, earlier title arguments dropped, `args` after `--`.
 fn relaunch_args(
@@ -109,8 +132,8 @@ fn relaunch_args(
     // same way before matching, or a relaunch would run the old executable.
     if !exe.is_empty()
         && let Some(slot) = out.iter_mut().find(|a| {
-            a.as_os_str() == current
-                || std::path::absolute(a).is_ok_and(|p| p.as_os_str() == current)
+            same_path(a.as_os_str(), current)
+                || std::path::absolute(a).is_ok_and(|p| same_path(p.as_os_str(), current))
         })
     {
         *slot = exe.into();
@@ -281,6 +304,20 @@ mod tests {
         .map(Into::into)
         .into();
         assert_eq!(again, expected, "the requested exe and quoted args survive");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_relaunch_matches_windows_executable_paths_case_and_separator_insensitively() {
+        let current = std::ffi::OsStr::new(r"G:\Game\GTA6.exe");
+        let ours: Vec<std::ffi::OsString> = ["run", "g:/game/gta6.exe", "--execute"]
+            .map(Into::into)
+            .into();
+        let again = relaunch_args(ours, current, r"G:\Game\Other.exe", "");
+        let expected: Vec<std::ffi::OsString> = ["run", r"G:\Game\Other.exe", "--execute"]
+            .map(Into::into)
+            .into();
+        assert_eq!(again, expected);
     }
 
     #[test]
