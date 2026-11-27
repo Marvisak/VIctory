@@ -1581,6 +1581,12 @@ impl State {
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             #[cfg(feature = "diagnostics")]
             self.probe_small(list, false);
+            #[cfg(feature = "diagnostics")]
+            if count == 3 && instances == 1
+                && let [target] = self.targets.as_slice()
+            {
+                crate::framegen::hudless::record(list, self.pipeline as This, *target as This);
+            }
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list

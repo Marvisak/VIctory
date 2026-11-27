@@ -577,7 +577,13 @@ extern "system" fn present(
             blinks(frame, resources[0].0, resources[0].2, shown);
             #[cfg(not(feature = "diagnostics"))]
             let _ = shown;
+        } else {
+            #[cfg(feature = "diagnostics")]
+            let _ = crate::framegen::hudless::take(None);
         }
+    } else {
+        #[cfg(feature = "diagnostics")]
+        let _ = crate::framegen::hudless::take(None);
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);

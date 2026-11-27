@@ -14,7 +14,7 @@ otherwise. See [docs/architecture.md](docs/architecture.md).
 world.** Nothing else keeps the game from working: the title boots, runs its
 menus at its own 30 fps, loads the world, plays the intro cutscene and
 reaches the **prologue**, the mission after it, with the graphics fully
-displayed. 
+displayed.
 
 | Stage | State |
 |-------|-------|
@@ -210,6 +210,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | skip host pipeline creation and omit draws and dispatches, including indirect ones, when the pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
+| `VICTORY_FIDELITYFX_FRAMEGEN=1` | uses the built-in Frame Generation 3.x providers in `amd_fidelityfx_framegeneration_dx12.dll` from `VICTORY_FIDELITYFX_DIR`. Interpolates frames using the host upscale's depth and motion vectors. Requires an RGBA8 swap chain. |
+| `VICTORY_FRAMEGEN_HUDLESS=1` | lets Series X FG3 use a copy of the scene taken just before the matching HUD blend writes the displayed texture. |
 | `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |

@@ -3010,6 +3010,10 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     compositor: Option<Compositor>,
+    /// AMD frame generation, when on: `swap_chain` is then its proxy
+    /// (`crate::framegen`).
+    #[cfg(feature = "diagnostics")]
+    framegen: Option<crate::framegen::Presentation>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -3203,6 +3207,10 @@ impl Host {
             &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         ),
     ) -> Option<bool> {
+        #[cfg(feature = "diagnostics")]
+        let hudless = crate::framegen::hudless::take(
+            planes.first().filter(|_| planes.len() == 1).map(|(texture, _)| *texture),
+        );
         let &(primary, _) = planes.first()?;
         // SAFETY: live resources.
         let primary_desc = unsafe { primary.GetDesc() };
@@ -3257,6 +3265,10 @@ impl Host {
             p.compositor = Some(c);
         }
         if (p.width, p.height, p.format) != (width, height, format) {
+            #[cfg(feature = "diagnostics")]
+            if let Some(fg) = &mut p.framegen {
+                fg.disable(&p.swap_chain);
+            }
             let resized = retry.attempt(Instant::now(), || {
                 // SAFETY: no back buffer is held; every submission was waited for.
                 unsafe {
@@ -3467,6 +3479,15 @@ impl Host {
                 }
                 (capture, probe)
             };
+            // Frame generation reads the last submitted upscale's depth and
+            // motion in this list, before the present inserts its frames.
+            #[cfg(feature = "diagnostics")]
+            let generated = match &mut p.framegen {
+                Some(fg) => fg.prepare(&p.swap_chain, &self.device, &p.copy, [width, height], frame, hudless),
+                None => false,
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let generated = false;
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
@@ -3477,7 +3498,20 @@ impl Host {
                 inspect(&buffer, &footprint);
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // The proxy paces generated frames against the display.
+            let presented = p.swap_chain.Present(u32::from(generated), DXGI_PRESENT(0));
+            #[cfg(feature = "diagnostics")]
+            if generated && let Some(fg) = &mut p.framegen {
+                if presented.is_ok()
+                    && (presented == windows::Win32::Foundation::S_OK || !crate::framegen::hudless::enabled())
+                {
+                    fg.presented(&p.swap_chain, frame);
+                } else {
+                    tracing::warn!(?presented, frame, "FidelityFX frame generation: present failed; off");
+                    fg.disable(&p.swap_chain);
+                }
+            }
+            let _ = presented;
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -3516,6 +3550,21 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
+            #[cfg(feature = "diagnostics")]
+            let (swap_chain, framegen) = match crate::framegen::enabled()
+                .then(|| crate::framegen::Presentation::create(&factory, &self.queue, hwnd, &desc))
+                .flatten()
+            {
+                Some((swap_chain, fg)) => (swap_chain, Some(fg)),
+                None => (
+                    factory
+                        .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
+                        .and_then(|chain| chain.cast::<IDXGISwapChain3>())
+                        .map_err(|e| ("swap chain", e))?,
+                    None,
+                ),
+            };
+            #[cfg(not(feature = "diagnostics"))]
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
                 .and_then(|chain| chain.cast::<IDXGISwapChain3>())
@@ -3532,6 +3581,8 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 compositor: None,
+                #[cfg(feature = "diagnostics")]
+                framegen,
             })
         }
     }
