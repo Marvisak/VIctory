@@ -192,16 +192,18 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // Listed for an early start in later runs from its first use, made or
-    // not: one a run never got made is the one it should start early.
-    if !p.used.swap(true, Ordering::Relaxed) {
+    // not. Once listed, a lookup only needs to read the flag. The swap
+    // chooses one recorder when several threads reach the first use.
+    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
         #[cfg(feature = "diagnostics")]
         log("used", &p.key, String::new);
     }
-    if p.made.get().is_none() {
-        start(p, true);
-        wait(p, crate::frame::current());
+    if let Some(made) = p.made.get() {
+        return made.as_ref();
     }
+    start(p, true);
+    wait(p, crate::frame::current());
     p.made.get()?.as_ref()
 }
 
@@ -259,12 +261,11 @@ fn wait(p: &Pending, frame: u64) {
 static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
     (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Hands `p` to the workers (`workers()` of them), started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let n = workers();
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
@@ -288,6 +289,37 @@ fn queue(p: Arc<Pending>, now: bool) {
     let (lock, work) = &QUEUES;
     lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
     work.notify_one();
+}
+
+/// `VICTORY_PIPELINE_THREADS` when it holds a count, else `None`: how many
+/// threads may compile pipelines at once, a knob for hosts whose driver
+/// compiler misbehaves under parallel calls (AMD RDNA4 crashes in amdxc64
+/// while pipelines compile in parallel; serialising the calls delays the
+/// crash rather than removing it — #2124 tracks the real fix). Callers
+/// that make pipelines on threads of their own (`victory translate` sizes
+/// its `--jobs` default by it) read the same value so one setting covers
+/// both.
+pub fn env_workers() -> Option<usize> {
+    let v = std::env::var("VICTORY_PIPELINE_THREADS").ok()?;
+    match v.parse() {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!(value = %v, error = %e, "VICTORY_PIPELINE_THREADS not a number");
+            None
+        }
+    }
+}
+
+/// How many workers make pipelines: `VICTORY_PIPELINE_THREADS` when set
+/// (0 makes them on the calling thread, as when no worker starts), else
+/// half the logical processors, 2 to 8.
+fn workers() -> usize {
+    env_workers().unwrap_or_else(default_workers)
+}
+
+/// Half the logical processors, 2 to 8.
+fn default_workers() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
 }
 
 /// A worker: makes queued pipelines, those draws wait for first, and saves
@@ -404,6 +436,23 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn first_use_of_a_finished_pipeline_is_recorded_without_queueing() {
+        let p = Arc::new(Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ));
+        assert!(p.made.set(None).is_ok());
+        assert!(!p.used.load(Ordering::Relaxed));
+        for _ in 0..2 {
+            assert!(ready(&p).is_none());
+            assert!(p.used.load(Ordering::Relaxed));
+            assert!(!p.queued.load(Ordering::Relaxed));
+        }
     }
 
     #[cfg(feature = "diagnostics")]

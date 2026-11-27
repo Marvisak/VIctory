@@ -152,6 +152,15 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+/// How many translate workers: `--jobs` when given, else
+/// `VICTORY_PIPELINE_THREADS` — these threads call the same driver
+/// compiler the run's pipeline workers do (translate cannot run with no
+/// worker, so 0 means one), else every logical processor.
+fn thread_count(jobs: Option<usize>) -> usize {
+    jobs.or_else(|| victory_gpu::pipeline::env_workers().map(|n| n.max(1)))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -183,8 +192,7 @@ pub fn run(
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = thread_count(jobs);
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
     let started = std::time::Instant::now();
@@ -328,8 +336,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
         anyhow::bail!("no shader cache in {}", shaders.display());
     };
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = thread_count(jobs);
     // The pre-build's key listing (diagnostics) translates nothing.
     if pipelines && std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
         return crate::prebuild::run(&paths, threads);

@@ -35,13 +35,26 @@
 //! and allocated again while a tracker holds it is not seen.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
 /// made the checks of the world's big buffers cost more than the copies
 /// they saved.
 pub(crate) const PAGE: usize = 64 << 10;
+
+/// Per page (its number folded onto the table), a count bumped under the
+/// guard lock whenever the page stops being guarded: bytes read of a guarded
+/// page without the lock are still its bytes if, back under the lock, the
+/// page is guarded and its count did not move (pages sharing a count only
+/// make the check fail more often). Write faults read the bytes they save
+/// this way: the guard lock is not held across a 64 KiB read.
+static OPENED: [AtomicU32; OPENED_COUNTS] = [const { AtomicU32::new(0) }; OPENED_COUNTS];
+const OPENED_COUNTS: usize = 1 << 12;
+
+fn opened(page: usize) -> &'static AtomicU32 {
+    &OPENED[page % OPENED_COUNTS]
+}
 
 /// The pages a tracker has not taken since they changed, what it saves of
 /// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
@@ -156,19 +169,41 @@ impl Changed {
     }
 
     /// Page `page` is about to change for the first time since it was
-    /// taken: its bytes now, if armed for it.
-    fn save(&self, page: usize) {
+    /// taken: its bytes now, if armed for it; those of `read` if they are
+    /// this page's (read before, still its bytes), else read here.
+    fn save(&self, page: usize, read: &mut Read) {
         let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
         if !saved.armed(page) || saved.bytes.contains_key(&page) {
             return;
         }
-        let mut bytes = vec![0u8; PAGE].into_boxed_slice();
-        if crate::host::read_into((page * PAGE) as *const u8, &mut bytes) {
-            saved.bytes.insert(page, bytes);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::SavedPages, 1);
-        }
+        let bytes = match read.take_if(|(p, _)| *p == page) {
+            Some((_, bytes)) => bytes,
+            None => match page_bytes(page) {
+                Some(bytes) => bytes,
+                None => return,
+            },
+        };
+        saved.bytes.insert(page, bytes);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SavedPages, 1);
     }
+
+    /// Whether a first write to page `page` would have it saved now.
+    fn would_save(&self, page: usize) -> bool {
+        let changed = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = changed.contains(&page);
+        let saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        !changed && saved.armed(page) && !saved.bytes.contains_key(&page)
+    }
+}
+
+/// Bytes read ahead of a save: (page, its bytes) (see [`Changed::save`]).
+type Read = Option<(usize, Box<[u8]>)>;
+
+/// Page `page`'s bytes now (None if it cannot be read).
+fn page_bytes(page: usize) -> Option<Box<[u8]>> {
+    let mut bytes = vec![0u8; PAGE].into_boxed_slice();
+    crate::host::read_into((page * PAGE) as *const u8, &mut bytes).then_some(bytes)
 }
 
 /// Byte runs `[start, end)` in order.
@@ -366,22 +401,26 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
 }
 
 /// The pages of `[start, end)` that are the runtime's GPU memory: a
-/// write-watched pool, or (with `views`) anything but plain committed memory
-/// and images (views, placeholders, nothing mapped yet). Decided for every
-/// region the range covers, and a page touching any other memory is left
-/// out: a range can run past its allocation (a 4 MiB window of memory
-/// outside buffers, `crate::shadow`), and when the first page alone decided,
-/// a window starting in free memory had the process heap's pages after it
-/// guarded; the heap's own code then faulted while holding its lock, and the
-/// guard handler waited for the guard lock, whose holder waited for the heap
-/// lock (the crate's tests hung).
+/// write-watched pool, or (with `views`) anything but plain committed memory,
+/// images and free memory (views, placeholders, reserved memory with nothing
+/// mapped yet). Decided for every region the range covers, and a page
+/// touching any other memory is left out: a range can run past its
+/// allocation (a 4 MiB window of memory outside buffers, `crate::shadow`),
+/// and when the first page alone decided, a window starting in free memory
+/// had the process heap's pages after it guarded; the heap's own code then
+/// faulted while holding its lock, and the guard handler waited for the
+/// guard lock, whose holder waited for the heap lock (the crate's tests
+/// hung). Free memory is left out for the same reason: a null address's
+/// window is free, and guarding it would guard whatever is allocated there
+/// later (under Wine the process heap lies in the first 4 MiB).
 ///
-/// shortcut: memory free or reserved when the range is tracked counts as the
+/// shortcut: memory reserved when the range is tracked counts as the
 /// runtime's; another allocator committing it before the first take would
 /// have it guarded.
 fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{
-        GetWriteWatch, MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        GetWriteWatch, MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION,
+        VirtualQuery,
     };
     let watched = |at: usize, len: usize| {
         let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
@@ -405,7 +444,10 @@ fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
         }
         let next = (info.BaseAddress as usize + info.RegionSize).max(at + 1).min(end);
         let ours = watched(at, next - at)
-            || views && info.Type != MEM_IMAGE && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
+            || views
+                && info.State != MEM_FREE
+                && info.Type != MEM_IMAGE
+                && !(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
         (if ours { &mut runtime } else { &mut other }).extend(at / PAGE..next.div_ceil(PAGE));
         at = next;
     }
@@ -430,13 +472,26 @@ impl Drop for Tracked {
                 }
             }
         }
+        // A page also stays guarded for a tracker of a mapping showing the
+        // same memory (`guard_aliases`); its aliases need no guard any more
+        // once no tracker is left on any mapping.
         for page in free {
-            let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
-            if !watched_elsewhere {
-                open(&mut g, page);
+            let others = g.alias_of.get(&page).cloned().unwrap_or_default();
+            for p in std::iter::once(page).chain(others) {
+                if !watched(&g, p) {
+                    open(&mut g, p);
+                }
             }
         }
     }
+}
+
+/// Whether a tracker holds `page` or a page showing the same memory.
+fn watched(g: &Guards, page: usize) -> bool {
+    g.holders.contains_key(&page)
+        || g.alias_of
+            .get(&page)
+            .is_some_and(|others| others.iter().any(|o| g.holders.contains_key(o)))
 }
 
 /// Gives write access back to page `page` if we guarded it.
@@ -445,6 +500,7 @@ fn open(g: &mut Guards, page: usize) -> bool {
     if !g.protected.remove(&page) {
         return false;
     }
+    opened(page).fetch_add(1, Ordering::Relaxed);
     let mut old = 0;
     // SAFETY: a block we made read-only (failing harmlessly if it is gone).
     unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
@@ -711,7 +767,7 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
 /// elsewhere: gives write access back where we guarded them and marks them
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
-fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+fn changed(g: &mut Guards, first: usize, last: usize, save: bool, read: &mut Read) -> bool {
     let guarded = g.protected.range(first..last).next().is_some();
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
@@ -722,9 +778,9 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     // Every page's bytes are saved before any is opened: once a page is
     // open, a write by another thread lands without a fault, and a save
     // after it would keep that write as the page's old bytes.
-    mark_changed(g, first, last, save);
+    mark_changed(g, first, last, save, read);
     for &page in &others {
-        mark_changed(g, page, page + 1, save);
+        mark_changed(g, page, page + 1, save, read);
     }
     open_guarded(g, first, last);
     for page in others {
@@ -744,7 +800,7 @@ fn open_guarded(g: &mut Guards, first: usize, last: usize) {
 /// Marks `[first, last)` changed in the trackers holding its pages. With
 /// `save`, before the write lands: trackers armed for a page they had taken
 /// keep its bytes.
-fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
+fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool, read: &mut Read) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             let first_write = {
@@ -753,7 +809,7 @@ fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
                 set.insert(page)
             };
             if first_write && save {
-                c.save(page);
+                c.save(page, read);
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -789,7 +845,7 @@ impl Drop for Writing {
         if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
             g.busy.swap_remove(i);
         }
-        changed(&mut g, self.first, self.last, false);
+        changed(&mut g, self.first, self.last, false, &mut None);
     }
 }
 
@@ -804,7 +860,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     g.busy.push((first, last));
-    changed(&mut g, first, last, true);
+    changed(&mut g, first, last, true, &mut None);
     Writing { first, last }
 }
 
@@ -814,7 +870,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
-    changed(&mut g, first, last, false);
+    changed(&mut g, first, last, false, &mut None);
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -880,7 +936,7 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     if others.iter().any(|&o| g.protected.contains(&(o / PAGE)))
         && protect(&mut g, &[page]).is_empty()
     {
-        changed(&mut g, page, page + 1, false);
+        changed(&mut g, page, page + 1, false, &mut None);
     }
 }
 
@@ -908,8 +964,28 @@ fn install() {
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
+        let page = at / PAGE;
         let mut g = guards();
-        if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
+        // A tracker armed for the page keeps its bytes before the write: they
+        // are read without the lock, the page guarded meanwhile, and kept
+        // only if it stayed guarded throughout ([`OPENED`]); else they are
+        // read under it, as before.
+        let mut read = None;
+        let saves = |g: &Guards| {
+            g.holders
+                .get(&page)
+                .is_some_and(|h| h.iter().any(|c| c.would_save(page)))
+        };
+        if g.protected.contains(&page) && saves(&g) {
+            let before = opened(page).load(Ordering::Relaxed);
+            drop(g);
+            let bytes = page_bytes(page);
+            g = guards();
+            if g.protected.contains(&page) && opened(page).load(Ordering::Relaxed) == before {
+                read = bytes.map(|b| (page, b));
+            }
+        }
+        if changed(&mut g, page, page + 1, true, &mut read) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -973,6 +1049,17 @@ pub(crate) mod tests {
         } as usize;
         assert!(p != 0 && p.is_multiple_of(PAGE));
         p
+    }
+
+    /// Sets its flag when dropped, also while a failed assertion unwinds:
+    /// writer threads looping until the flag stop, and the test fails
+    /// instead of keeping `thread::scope` waiting for them.
+    struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn free(p: usize) {
@@ -1224,6 +1311,33 @@ pub(crate) mod tests {
         unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// Free memory is not tracked: tracked, it would be guarded once
+    /// something is allocated there (under Wine the process heap, in the
+    /// window of a null address: its writes then fault into the handler
+    /// while a thread holds the guard lock).
+    #[test]
+    fn free_memory_is_not_tracked() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        };
+        // SAFETY: a reservation of ours, released at once: free memory.
+        let r = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) }
+            as usize;
+        assert_ne!(r, 0);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
+        let tracked = track(r, 2 * PAGE, true).is_some();
+        // Other tests allocate meanwhile: only memory still free counts.
+        // SAFETY: plain data filled in by the query, of the right size.
+        let still_free = unsafe {
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            VirtualQuery(r as *const _, &mut info, size_of_val(&info)) != 0
+                && info.State == MEM_FREE
+                && info.BaseAddress as usize + info.RegionSize >= r + 2 * PAGE
+        };
+        assert!(!(tracked && still_free), "free memory");
+    }
+
     /// A kernel read into a guarded view block fails; opened first, it
     /// lands and the block counts as changed.
     #[test]
@@ -1437,6 +1551,22 @@ pub(crate) mod tests {
         drop(busy_c);
     }
 
+    /// With no tracker left on either mapping, neither stays guarded.
+    #[test]
+    fn dropping_the_last_tracker_opens_both_mappings() {
+        let (a, b) = twin_views(1);
+        let t = track(b, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(b, b + PAGE), [(b, b + PAGE)]);
+        {
+            let g = guards();
+            assert!(g.protected.contains(&(a / PAGE)) && g.protected.contains(&(b / PAGE)));
+        }
+        drop(t);
+        let g = guards();
+        assert!(!g.protected.contains(&(a / PAGE)), "the alias is open again");
+        assert!(!g.protected.contains(&(b / PAGE)));
+    }
+
     /// A write or mapping that runs past the end of the address space (a
     /// title's `fread` with a huge count) covers up to the end; the sum used
     /// to overflow. Up there no test has guarded blocks.
@@ -1445,5 +1575,307 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// Writers on several threads and a taker copying what it takes: at the
+    /// end, every page the taker's copy disagrees with title memory on is
+    /// still changed in its tracker (no write lost between a take's guard
+    /// and its copy), and no write faulted past the handler (the process
+    /// lives).
+    #[test]
+    fn concurrent_writes_and_takes_lose_no_write() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        const PAGES: usize = 32;
+        let p = pool(PAGES);
+        let trackers: Vec<Tracked> = (0..PAGES / 4)
+            .map(|i| track_copy(p + i * 4 * PAGE, 4 * PAGE, true).expect("tracked"))
+            .collect();
+        let mut copy = vec![0u32; PAGES * PAGE / 4];
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let _stop = StopOnDrop(&stop);
+            for w in 0..12u32 {
+                let stop = &stop;
+                s.spawn(move || {
+                    let mut x = 0x2545_f491_u32.wrapping_mul(w + 1);
+                    while !stop.load(Relaxed) {
+                        x ^= x << 13;
+                        x ^= x >> 17;
+                        x ^= x << 5;
+                        let at = p + (x as usize % PAGES) * PAGE + (x as usize >> 8 & 0xFFFC);
+                        // SAFETY: the pool's pages; a guarded one faults
+                        // into the handler, which opens it.
+                        unsafe { (at as *mut u32).write_volatile(x | 1) };
+                    }
+                });
+            }
+            // Enough rounds to catch a lost write or a stray fault in release
+            // (a guard race fell to it in 2 of 10 runs); fewer in debug.
+            for round in 0..if cfg!(debug_assertions) { 200 } else { 3000 } {
+                for (i, t) in trackers.iter().enumerate() {
+                    if (round + i) % 3 == 0 {
+                        t.arm(t.start, t.end);
+                    }
+                    for (a, b) in t.take(t.start, t.end) {
+                        for at in (a..b).step_by(4) {
+                            // SAFETY: the pool's pages, readable.
+                            copy[(at - p) / 4] = unsafe { (at as *const u32).read_volatile() };
+                        }
+                    }
+                    if round % 7 == 0 {
+                        t.taken(&[t.start / PAGE]);
+                        // The caller made its copy equal to memory first.
+                        for at in (t.start..t.start + PAGE).step_by(4) {
+                            // SAFETY: as above.
+                            copy[(at - p) / 4] = unsafe { (at as *const u32).read_volatile() };
+                        }
+                    }
+                    t.disarm();
+                }
+            }
+        });
+        for t in &trackers {
+            for page in t.start / PAGE..t.end / PAGE {
+                let base = page * PAGE;
+                // SAFETY: the pool's pages, no writer left.
+                let memory = unsafe { std::slice::from_raw_parts(base as *const u32, PAGE / 4) };
+                let held = &copy[(base - p) / 4..(base - p) / 4 + PAGE / 4];
+                assert!(
+                    memory == held || t.changed(page),
+                    "page {} differs from its copy and is not changed",
+                    page - p / PAGE
+                );
+            }
+        }
+        drop(trackers);
+        free(p);
+    }
+
+    /// Armed trackers and writers faulting on their pages on several
+    /// threads: whatever a tracker saved of a page is the page as it was
+    /// taken (the copy's bytes then), never bytes a write put there after.
+    #[test]
+    fn saved_bytes_are_the_page_as_taken_under_concurrent_faults() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        const PAGES: usize = 16;
+        let p = pool(PAGES);
+        let trackers: Vec<Tracked> = (0..PAGES / 4)
+            .map(|i| track_copy(p + i * 4 * PAGE, 4 * PAGE, true).expect("tracked"))
+            .collect();
+        // The copy: each page's bytes as last taken.
+        let mut copy = vec![0u8; PAGES * PAGE];
+        let stop = AtomicBool::new(false);
+        let (mut checked, mut saved) = (0usize, 0usize);
+        std::thread::scope(|s| {
+            let _stop = StopOnDrop(&stop);
+            for w in 0..12u32 {
+                let stop = &stop;
+                s.spawn(move || {
+                    let mut x = 0x2545_f491_u32.wrapping_mul(w + 1);
+                    while !stop.load(Relaxed) {
+                        x ^= x << 13;
+                        x ^= x >> 17;
+                        x ^= x << 5;
+                        let at = p + (x as usize % PAGES) * PAGE + (x as usize >> 8 & 0xFFFC);
+                        // SAFETY: the pool's pages; a guarded one faults
+                        // into the handler, which opens it.
+                        unsafe { (at as *mut u32).write_volatile(x | 1) };
+                    }
+                });
+            }
+            for _ in 0..if cfg!(debug_assertions) { 200 } else { 2000 } {
+                for t in &trackers {
+                    for (a, b) in t.take(t.start, t.end) {
+                        // SAFETY: the pool's pages, readable.
+                        let bytes = unsafe { std::slice::from_raw_parts(a as *const u8, b - a) };
+                        copy[a - p..b - p].copy_from_slice(bytes);
+                    }
+                    t.arm(t.start, t.end);
+                }
+                // A write of ours too: a page saved each round, however few
+                // of the writers' faults land between arming and checking.
+                for t in &trackers {
+                    // SAFETY: the pool's pages; a guarded one faults.
+                    unsafe { ((t.start + 64) as *mut u32).write_volatile(1) };
+                }
+                std::thread::yield_now();
+                for t in &trackers {
+                    for page in t.start / PAGE..t.end / PAGE {
+                        checked += 1;
+                        if let Some(bytes) = t.saved(page) {
+                            saved += 1;
+                            let at = page * PAGE - p;
+                            let page = page - p / PAGE;
+                            assert!(
+                                *bytes == copy[at..at + PAGE],
+                                "page {page} saved other bytes than taken"
+                            );
+                        }
+                    }
+                    t.disarm();
+                }
+            }
+        });
+        assert!(saved > 0, "no page saved of {checked}: nothing was checked");
+        drop(trackers);
+        free(p);
+    }
+
+    /// What the title's threads wait for when they write guarded pages
+    /// while a submission takes them again (issue #400: about 940 faults a
+    /// frame at about 450 µs each, mostly waiting for the guard lock).
+    ///
+    /// `writers` threads write one dword at a time into a hot set of
+    /// `HOT` pages of a write-watched pool; a submission thread, in rounds,
+    /// arms every other tracker (as a root view's declaration does) and
+    /// takes every tracker, which guards the written pages again. A write
+    /// slower than 2 µs counts as a fault. Per writer count: faults a
+    /// second, their median and 99th percentile, and a take round's median.
+    /// A kernel writer thread meanwhile opens 8-page ranges with [`writing`]
+    /// every 200 µs (a file read, DirectStorage): its median and 99th
+    /// percentile, the opening and the marking after.
+    ///
+    /// `cargo test --release -p victory-gpu --lib guard_lock_contention_bench
+    /// -- --ignored --nocapture --test-threads=1` (`GUARD_BENCH_MS` sets the
+    /// time per writer count, 1,500 by default; `GUARD_BENCH_SPIN_US` has
+    /// each writer work that long between writes, 0 by default;
+    /// `GUARD_BENCH_NO_ARM` arms nothing).
+    #[test]
+    #[ignore = "a benchmark: run alone, in release"]
+    fn guard_lock_contention_bench() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        use std::time::{Duration, Instant};
+        const HOT: usize = 256;
+        const PER_TRACKER: usize = 16;
+        let millis: u64 = std::env::var("GUARD_BENCH_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1500);
+        let spin = Duration::from_micros(
+            std::env::var("GUARD_BENCH_SPIN_US")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        );
+        let p = pool(HOT);
+        let trackers: Vec<Tracked> = (0..HOT / PER_TRACKER)
+            .map(|i| {
+                track_copy(p + i * PER_TRACKER * PAGE, PER_TRACKER * PAGE, true)
+                    .expect("pool memory is tracked")
+            })
+            .collect();
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v.get(v.len() / 2).copied().unwrap_or(0.0)
+        };
+        let p99 = |v: &[f64]| v.get(v.len() * 99 / 100).copied().unwrap_or(0.0);
+        println!(
+            "{HOT} hot pages, {} trackers of {PER_TRACKER} pages, every other armed; {millis} ms per row",
+            trackers.len()
+        );
+        println!(
+            "{:>7} {:>10} {:>12} {:>12} {:>14} {:>14} {:>12}",
+            "writers",
+            "faults/s",
+            "fault p50",
+            "fault p99",
+            "take round p50",
+            "8-page write p50",
+            "p99"
+        );
+        for writers in [1usize, 2, 4, 8, 15] {
+            for t in &trackers {
+                t.take(t.start, t.end);
+            }
+            let stop = AtomicBool::new(false);
+            let (faults, mut rounds, mut kernel) = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..writers)
+                    .map(|w| {
+                        let stop = &stop;
+                        s.spawn(move || {
+                            let mut slow = Vec::new();
+                            let mut x = 0x9e37_79b9_u32.wrapping_mul(w as u32 + 1);
+                            while !stop.load(Relaxed) {
+                                x ^= x << 13;
+                                x ^= x >> 17;
+                                x ^= x << 5;
+                                let at =
+                                    p + (x as usize % HOT) * PAGE + (x as usize >> 16 & 0x3FFC);
+                                let t0 = Instant::now();
+                                // SAFETY: the pool's committed pages; a guarded
+                                // one faults into the handler, which opens it.
+                                unsafe { (at as *mut u32).write_volatile(x) };
+                                let us = t0.elapsed().as_secs_f64() * 1e6;
+                                let until = Instant::now() + spin;
+                                while Instant::now() < until {
+                                    std::hint::spin_loop();
+                                }
+                                if us > 2.0 {
+                                    slow.push(us);
+                                }
+                            }
+                            slow
+                        })
+                    })
+                    .collect();
+                // A kernel write (a file read, DirectStorage) over 8 pages
+                // every 200 µs: what `writing` and its drop take, together.
+                let kernel = {
+                    let stop = &stop;
+                    s.spawn(move || {
+                        let mut took = Vec::new();
+                        let mut x = 0x85eb_ca6b_u32;
+                        while !stop.load(Relaxed) {
+                            x ^= x << 13;
+                            x ^= x >> 17;
+                            x ^= x << 5;
+                            let at = p + (x as usize % (HOT - 8)) * PAGE;
+                            let t0 = Instant::now();
+                            let open = writing(at, 8 * PAGE);
+                            // SAFETY: the pool's pages, kept open by `open`.
+                            unsafe { std::ptr::write_bytes(at as *mut u8, x as u8, 8 * PAGE) };
+                            drop(open);
+                            took.push(t0.elapsed().as_secs_f64() * 1e6);
+                            std::thread::sleep(Duration::from_micros(200));
+                        }
+                        took
+                    })
+                };
+                let mut rounds = Vec::new();
+                let end = Instant::now() + Duration::from_millis(millis);
+                while Instant::now() < end {
+                    let t0 = Instant::now();
+                    for (i, t) in trackers.iter().enumerate() {
+                        if i % 2 == 0 && std::env::var_os("GUARD_BENCH_NO_ARM").is_none() {
+                            t.arm(t.start, t.end);
+                        }
+                        t.take(t.start, t.end);
+                    }
+                    rounds.push(t0.elapsed().as_secs_f64() * 1e6);
+                    for t in trackers.iter().step_by(2) {
+                        t.disarm();
+                    }
+                    std::thread::sleep(Duration::from_micros(500));
+                }
+                stop.store(true, Relaxed);
+                let faults: Vec<f64> = handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                    .collect();
+                (faults, rounds, kernel.join().unwrap())
+            });
+            let mut faults = faults;
+            let rate = faults.len() as f64 / (millis as f64 / 1e3);
+            let p50 = median(&mut faults);
+            let kernel_p50 = median(&mut kernel);
+            println!(
+                "{writers:>7} {rate:>10.0} {p50:>10.1}us {:>10.1}us {:>12.1}us {kernel_p50:>12.1}us {:>10.1}us",
+                p99(&faults),
+                median(&mut rounds),
+                p99(&kernel)
+            );
+        }
+        drop(trackers);
+        free(p);
     }
 }

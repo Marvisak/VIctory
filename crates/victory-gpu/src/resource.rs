@@ -285,8 +285,8 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
-    let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
+    let own = pc_format(resource(this).desc.format);
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
     (format != own).then_some(own)
@@ -369,6 +369,15 @@ const NO_FOOTPRINT: PlacedFootprint = PlacedFootprint {
     row_pitch: 0,
 };
 
+/// The buffer footprint format of a depth or stencil plane in a two-plane texture.
+pub(crate) fn planar_depth_copy_format(format: u32, plane: u32) -> Option<u32> {
+    match (format, plane) {
+        (19..=22 | 44..=47, 0) => Some(39), // DXGI_FORMAT_R32_TYPELESS
+        (19..=22 | 44..=47, 1) => Some(60), // DXGI_FORMAT_R8_TYPELESS
+        _ => None,
+    }
+}
+
 /// One subresource's upload footprint (offset 0), row count and unpadded row size.
 fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32, u64)> {
     const PITCH: u64 = 256;
@@ -391,14 +400,13 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
     };
     let mip = index % mips;
     let plane = index / mips / slices;
-    let depth_stencil = matches!(desc.format, 19..=22 | 44..=47);
-    // Each plane contains all the mip levels and array slices. Depth and
-    // stencil copies use separate formats and 512-byte row alignment.
-    let (format, pitch_alignment) = match (depth_stencil, plane) {
-        (true, 0) => (39, 512), // DXGI_FORMAT_R32_TYPELESS
-        (true, 1) => (60, 512), // DXGI_FORMAT_R8_TYPELESS
-        (false, 0) => (desc.format, PITCH),
-        _ => return None,
+    // Depth and stencil use distinct footprint formats and 512-byte row alignment.
+    let (format, pitch_alignment) = if let Some(format) = planar_depth_copy_format(desc.format, plane) {
+        (format, 512)
+    } else if plane == 0 {
+        (desc.format, PITCH)
+    } else {
+        return None;
     };
     let (element, block) = element(format)?;
     let width = (desc.width >> mip).max(1).next_multiple_of(block);
@@ -1131,6 +1139,26 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // A texture made with the unordered flag needs a format the host can
+    // make a typed unordered view of. One without a family that could stand
+    // in (some console formats the title names, e.g. B5G5R5A1) removes the
+    // device at `GetResourceAllocationInfo`; make it without the flag
+    // instead, and its unordered views are refused later
+    // (`descriptor::host::fits`).
+    if d.flags & UNORDERED != 0
+        && family(d.format) == d.format
+        && family(d.format + 1) != d.format
+        && !crate::descriptor::host::typed_store(d.format)
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                format = d.format,
+                "no unordered access for this format: textures are made without it, their unordered views are refused"
+            );
+        });
+        d.flags &= !UNORDERED;
+    }
     Some(d)
 }
 
@@ -1274,6 +1302,20 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     d.flags & USES & !flags == 0
         && (family(d.format) == family(own)
             || t.castable.iter().any(|&c| family(c) == family(d.format)))
+        && serves_reads(flags, own, d)
+}
+
+/// Whether a host texture of flags `flags` and format `own` serves the
+/// shader reads of a title texture of host description `d`: one shaders
+/// read does not take a texture made without shader access (denied, or
+/// typed depth; the host takes no shader view of either). A new one
+/// replaces it, the old one's contents copied over (`alias_source`).
+#[cfg(windows)]
+fn serves_reads(flags: u32, own: u32, d: &ResourceDesc) -> bool {
+    const DENY_SHADER_RESOURCE: u32 = 8;
+    d.flags & DENY_SHADER_RESOURCE != 0
+        || (flags & DENY_SHADER_RESOURCE == 0
+            && !DEPTH_FORMATS.iter().any(|&(typed, _)| typed == own))
 }
 
 /// Whether `this`'s host texture is still its memory's (not replaced by one
@@ -1803,17 +1845,22 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         let rows = u64::from(d.height).div_ceil(block);
         Some((d.dimension, d.width.div_ceil(block) * size, rows, d.depth_or_array_size, d.sample_count, swizzle))
     };
-    let want = bytes(&b.desc)?;
-    map.get(&(b.data() as u64))?
+    // Asked for every placed view a draw reads: the cheap tests first, the
+    // layouts (a mip chain each) only for textures the GPU writes there.
+    let mut written = map
+        .get(&(b.data() as u64))?
         .iter()
         .map(|&r| r as This)
-        .filter(|&r| r != placed)
-        .find(|&r| {
+        .filter(|&r| {
             let a = resource(r);
-            a.desc.flags & WRITTEN != 0
-                && bytes(&a.desc) == Some(want)
+            r != placed
+                && a.desc.flags & WRITTEN != 0
                 && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
         })
+        .peekable();
+    written.peek()?;
+    let want = bytes(&b.desc)?;
+    written.find(|&r| bytes(&resource(r).desc) == Some(want))
 }
 
 #[cfg(windows)]
@@ -2679,6 +2726,12 @@ mod tests {
         assert_eq!(info.size, u64::MAX);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_resource_has_no_default_view_format() {
+        assert_eq!(view_format(std::ptr::null()), None);
+    }
+
     #[test]
     fn upload_footprints_follow_the_pc_rules() {
         let null = std::ptr::null();
@@ -2951,6 +3004,181 @@ mod tests {
         }
     }
 
+    /// The depth and stencil planes of an array mip have different row formats.
+    #[cfg(windows)]
+    #[test]
+    fn depth_and_stencil_planes_reach_the_guest_buffer() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let iid = &object::IUNKNOWN;
+        let (mut queue, mut allocator) = (null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, iid, &mut allocator),
+            S_OK
+        );
+        let release = |object: This| slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        let create = |desc: &ResourceDesc, state| {
+            let mut object = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    desc,
+                    state,
+                    null.cast(),
+                    iid,
+                    &mut object
+                ),
+                S_OK
+            );
+            object
+        };
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        type Copy =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        const DEPTH_WRITE: u32 = 0x10;
+        let mut failures = Vec::new();
+        for (storage, view) in [(45, 45), (44, 45), (20, 20), (19, 20)] {
+            let mut desc = texture(8, 4, storage, 2);
+            desc.depth_or_array_size = 2;
+            desc.flags = 2; // ALLOW_DEPTH_STENCIL
+            let image = create(&desc, DEPTH_WRITE);
+            let target = create(&buffer(4096), 0);
+            let (out, _) = buffer_bytes(target).unwrap();
+            // SAFETY: the guest target buffer holds 4096 bytes.
+            unsafe { out.write_bytes(0xee, 4096) };
+            let mut list = null;
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, iid, &mut list,),
+                S_OK
+            );
+            let texture = host_resource(image).unwrap();
+            let dsv = host.dsv(
+                &texture,
+                Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                    Format: DXGI_FORMAT(view),
+                    ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
+                    Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                        Texture2DArray: D3D12_TEX2D_ARRAY_DSV {
+                            MipSlice: 1,
+                            FirstArraySlice: 1,
+                            ArraySize: 1,
+                        },
+                    },
+                    ..Default::default()
+                }),
+            );
+            let host_list = crate::list::host_list(list).unwrap();
+            // Track the fixture's native clears before readback sets COPY_SOURCE.
+            crate::list::ensure_state(host_list, image, DEPTH_WRITE);
+            let native = &host_list.list;
+            let flags = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
+            let left = RECT {
+                left: 0,
+                top: 0,
+                right: 2,
+                bottom: 2,
+            };
+            // SAFETY: a live DSV into the selected mip and array slice.
+            unsafe {
+                native.ClearDepthStencilView(dsv, flags, 0.75, 0x91, None);
+                native.ClearDepthStencilView(dsv, flags, 0.25, 0x37, Some(&[left]));
+            }
+            let (left, right) = if view == 45 {
+                (0x0040_0000u32, 0x00bf_ffffu32)
+            } else {
+                (0.25_f32.to_bits(), 0.75_f32.to_bits())
+            };
+            let depth_row: Vec<_> = [left, left, right, right]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            let stencil_row = [0x37, 0x37, 0x91, 0x91];
+            let mut expected = vec![0xeeu8; 4096];
+            let copy = slot::<Copy>(list, 0x80);
+            for (index, start, format, row) in [
+                (3, 512, 39, depth_row.as_slice()),
+                (7, 1536, 60, stencil_row.as_slice()),
+            ] {
+                let mut footprint = NO_FOOTPRINT;
+                copyable_footprints(
+                    null,
+                    &desc,
+                    index,
+                    1,
+                    start,
+                    &mut footprint,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                assert_eq!(
+                    footprint,
+                    PlacedFootprint {
+                        offset: start,
+                        format,
+                        width: 4,
+                        height: 2,
+                        depth: 1,
+                        row_pitch: 512,
+                    }
+                );
+                let from = Location {
+                    resource: image,
+                    kind: 0,
+                    footprint: PlacedFootprint {
+                        offset: u64::from(index),
+                        ..footprint
+                    },
+                };
+                let to = Location {
+                    resource: target,
+                    kind: 1,
+                    footprint,
+                };
+                copy(list, &to, 0, 0, 0, &from, null.cast());
+                for at in [start as usize, start as usize + 512] {
+                    expected[at..at + row.len()].copy_from_slice(row);
+                }
+            }
+            assert_eq!(
+                slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+                S_OK
+            );
+            slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+            // SAFETY: the guest buffer still lives and the submission has run.
+            let actual = unsafe { std::slice::from_raw_parts(out, 4096) };
+            if actual != expected {
+                failures.push((storage, actual.iter().all(|&byte| byte == 0xee)));
+            }
+            for object in [list, image, target] {
+                release(object);
+            }
+        }
+        release(allocator);
+        release(queue);
+        assert!(
+            failures.is_empty(),
+            "(format, untouched buffer): {failures:?}"
+        );
+    }
+
     /// A texture region copied into a title buffer through our list and
     /// queue: once the list has run, its rows are in the buffer at the
     /// footprint's offset and pitch, and nothing else of the buffer moved.
@@ -3179,4 +3407,46 @@ mod tests {
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
+
+    /// A texture asked for with the unordered flag in a format the host has no
+    /// typed UAV for and no family to stand in (the console's B5G5R5A1) is made
+    /// without the flag instead of removing the device; a UAV-capable format
+    /// and an sRGB one with a typeless family keep it.
+    #[test]
+    fn a_format_without_unordered_access_loses_the_flag() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let texture = |format| ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 1 | UNORDERED,
+        };
+        // An sRGB texture, turned typeless for unordered access, keeps the
+        // flag: its typeless family (27) can stand in.
+        let host = host_desc(&texture(29)).unwrap();
+        assert_eq!(host.flags & UNORDERED, UNORDERED, "29 (sRGB) keeps the flag");
+        assert_eq!(host.format, 27, "as its typeless family");
+        if crate::descriptor::host::typed_store(86) {
+            eprintln!("this device stores to 86 as a typed UAV; skipped");
+            return;
+        }
+        let host = host_desc(&texture(86)).unwrap();
+        assert_eq!(host.flags & UNORDERED, 0, "86 has no typed UAV");
+        assert_eq!(host.format, 86, "and no family to stand in");
+        // A format whose type can be stored to keeps the flag.
+        if crate::descriptor::host::typed_store(28) {
+            let host = host_desc(&texture(28)).unwrap();
+            assert_eq!(host.flags & UNORDERED, UNORDERED, "28 keeps the flag");
+        }
+    }
 }
+

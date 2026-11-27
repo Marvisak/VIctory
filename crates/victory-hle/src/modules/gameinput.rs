@@ -105,6 +105,11 @@ struct KeyState {
 
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
+/// One `VICTORY_KEYS` entry: the key, when it starts, and how long it is
+/// held (all from the start of input, the key a Windows virtual-key code).
+#[cfg(feature = "diagnostics")]
+type Scripted = (Duration, Duration, u8);
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
@@ -1270,16 +1275,25 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
+    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>[:<hold ms>],...` holds
+    /// each key from that second for the hold (0.2 s by default) after input
+    /// starts, with or without focus: the keyboard device and the stand-in pad
+    /// both see it, so a run can be driven while the window is in the
+    /// background (`Enter` is the pad's A, `W` the left stick up). A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        type Schedule = Vec<Scripted>;
+        static SCRIPT: LazyLock<(Instant, Schedule)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
+                let mut parts = entry.split(':');
+                let (at, key) = (parts.next()?, parts.next()?);
+                let hold = parts
+                    .next()
+                    .and_then(|ms| ms.trim().parse::<u64>().ok())
+                    .map_or(Duration::from_millis(200), Duration::from_millis);
                 let vk = match key.trim() {
                     "Enter" => 0x0D,
                     "Esc" => 0x1B,
@@ -1296,6 +1310,7 @@ mod host {
                 };
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                    hold,
                     vk,
                 ))
             });
@@ -1304,8 +1319,8 @@ mod host {
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
+            .filter(|&&(at, hold, _)| (at..at + hold).contains(&now))
+            .map(|&(_, _, vk)| vk)
             .collect()
     }
 

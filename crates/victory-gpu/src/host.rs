@@ -432,13 +432,31 @@ pub(crate) mod tests {
 
     /// Shaders that use title memory mark their reads in their own bitmap:
     /// read marks of both bitmaps are taken, each slot once until it is
-    /// forgotten, and a forgotten slot's next read is taken again.
+    /// forgotten, and a forgotten slot's next read is taken again; also at
+    /// a dynamic slot past the title's. A mark past every slot in use names
+    /// none and is not taken.
     #[test]
     fn read_marks_of_both_bitmaps_are_taken() {
         let Some(host) = host() else { return };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 64, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
         // No submission takes the marks meanwhile.
         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let (plain, memory) = (victory_shader::emit::HEAP_VIEWS - 2, victory_shader::emit::HEAP_VIEWS - 1);
+        let past = victory_shader::emit::HEAP_VIEWS - 1;
+        assert!(crate::descriptor::view_slots() <= past, "no view heap reaches the last slot");
+        crate::shadow::tests::mark_read(false, past);
+        assert!(!crate::shadow::take_reads().contains(&past), "past every heap's slots");
+        let (plain, memory) = (62, 63);
+        // A dynamic slot (a table made afresh), past the title's 64.
+        let host_heap = crate::descriptor::heap(heap).host().expect("a host view heap");
+        let dynamic = host_heap.dynamic(1).expect("a dynamic slot");
+        assert!(dynamic >= 64);
+        crate::shadow::tests::mark_read(false, dynamic);
+        assert!(crate::shadow::take_reads().contains(&dynamic), "a dynamic slot's read");
+        host_heap.release(dynamic, 1);
         crate::shadow::tests::mark_read(false, plain);
         crate::shadow::tests::mark_read(true, memory);
         let taken = crate::shadow::take_reads();
@@ -780,6 +798,123 @@ pub(crate) mod tests {
         node.pCommandListDebugNameA = longer.as_ptr().cast();
         assert!(!list.is_node(&node), "a number that only starts with ours is no match");
     }
+
+    /// Submitting the same `HostList` twice in one `Host::execute` call must
+    /// split into separate `ExecuteCommandLists` batches separated by a fence
+    /// wait so neither the `prelude` allocator is clobbered nor the same direct
+    /// command list is submitted twice in a single `ExecuteCommandLists` call.
+    #[test]
+    fn duplicate_list_in_execute_uses_distinct_preludes() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let null = std::ptr::null();
+        let res_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        // 16x16 RGBA8 render target starting in COMMON (0).
+        let tex_desc: [u32; 14] = [
+            3, 0, // dimension=2D, pad
+            0, 0, // alignment=0
+            16, 0, // width=16
+            16,    // height=16
+            (1 << 16) | 1,
+            28, 1, 0, 0, 1, // RGBA8_UNORM, flags=ALLOW_RENDER_TARGET
+            0,
+        ];
+        let mut tex = null;
+        assert_eq!(
+            crate::resource::create_at_address(
+                null,
+                0x3_0000,
+                tex_desc.as_ptr().cast(),
+                0,
+                null.cast(),
+                &res_iid,
+                &mut tex,
+            ),
+            crate::object::S_OK
+        );
+        let list = host.new_list().unwrap();
+        // Record RENDER_TARGET (0x4) -> COPY_SOURCE (0x800) inside `list`.
+        assert!(list.transition(tex, 0x4).is_none());
+        let (host_tex, before) = list.transition(tex, 0x800).unwrap();
+        assert_eq!(before, 0x4);
+        // SAFETY: open list and live texture.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &host_tex,
+                D3D12_RESOURCE_STATES(0x4),
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        list.close();
+
+        // Execute the SAME `HostList` twice in one submission:
+        //   Chunk 1 prelude: COMMON (0) -> RENDER_TARGET (0x4), list ends at COPY_SOURCE (0x800), fence wait.
+        //   Chunk 2 prelude: COPY_SOURCE (0x800) -> RENDER_TARGET (0x4), list ends at COPY_SOURCE (0x800), fence wait.
+        host.execute(&[&list, &list]);
+        assert_eq!(
+            crate::resource::host_copy(tex)
+                .unwrap()
+                .state
+                .load(Ordering::Relaxed),
+            0x800
+        );
+
+        // Distinct-list batching control: two distinct lists stay in one chunk.
+        let list2 = host.new_list().unwrap();
+        list2.close();
+        assert_eq!(unique_run_chunks(&[&list, &list2]).len(), 1);
+        assert_eq!(unique_run_chunks(&[&list, &list]).len(), 2);
+        host.execute(&[&list, &list2]);
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        type Release = extern "system" fn(crate::object::This) -> u32;
+        crate::object::slot::<Release>(tex, 0x10)(tex);
+    }
+
+    #[test]
+    fn unique_run_chunks_preserves_distinct_batching_and_splits_repeats() {
+        let (a, b, c) = (1u8, 2u8, 3u8);
+        assert_eq!(unique_run_chunks::<u8>(&[]).len(), 0);
+        assert_eq!(unique_run_chunks(&[&a, &b, &c]).len(), 1);
+        let dup_in = [&a, &a];
+        let dup = unique_run_chunks(&dup_in);
+        assert_eq!(dup.len(), 2);
+        assert_eq!((dup[0].len(), dup[1].len()), (1, 1));
+        let mixed_in = [&a, &b, &a, &c, &b];
+        let mixed = unique_run_chunks(&mixed_in);
+        assert_eq!(mixed.len(), 2);
+        assert_eq!((mixed[0].len(), mixed[1].len()), (2, 3));
+    }
+}
+
+/// Partitions `runs` into maximal contiguous chunks in which no list pointer
+/// repeats. Distinct lists remain batched in one `ExecuteCommandLists` call,
+/// while a repeated list waits on the GPU fence before its prelude allocator is
+/// reset and its body is resubmitted.
+fn unique_run_chunks<'a, T>(runs: &'a [&'a T]) -> Vec<&'a [&'a T]> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut seen: Vec<usize> = Vec::with_capacity(runs.len());
+    for (i, item) in runs.iter().enumerate() {
+        let id = std::ptr::from_ref(*item) as usize;
+        if seen.contains(&id) {
+            chunks.push(&runs[start..i]);
+            start = i;
+            seen.clear();
+        }
+        seen.push(id);
+    }
+    if start < runs.len() {
+        chunks.push(&runs[start..]);
+    }
+    chunks
 }
 
 /// A host command list and its allocator, always used together.
@@ -825,6 +960,9 @@ pub(crate) struct HostList {
     /// Clamped indirect arguments (`crate::indirect`), reused by each
     /// execution in turn; replaced by a bigger one when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
+    /// Indirect argument clamps hoisted from this list's initial non-writing
+    /// prefix into its submission prelude (`crate::indirect::HoistedClamps`).
+    hoisted_indirect: Mutex<crate::indirect::HoistedClamps>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1142,6 +1280,7 @@ impl Host {
                 id,
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
+                hoisted_indirect: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1234,84 +1373,121 @@ impl Host {
                 }
             }
         }
+        // Split only when a `HostList` repeats so distinct lists stay batched in
+        // a single `ExecuteCommandLists` call, while a repeated direct list
+        // waits on the GPU fence before its prelude allocator is reset and its
+        // body is resubmitted (per D3D12 ExecuteCommandLists ordering rules).
+        let chunks = unique_run_chunks(runs);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
-        for list in runs {
-            list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            #[cfg(feature = "diagnostics")]
-            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
-            }
-            lists.push(list.list.cast().ok());
-        }
-        batch.flush();
-        let prepared = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let mut prep_us = started.elapsed().as_micros() as u64;
+        let mut gpu = std::time::Duration::ZERO;
         let mut removed_in = None;
-        for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
-            let started = std::time::Instant::now();
+        let mut chunk_base = 0usize;
+        let mut batches = Vec::new();
+        for chunk in chunks {
+            let chunk_start = std::time::Instant::now();
+            lists.clear();
+            firsts.clear();
+            let mut batch = Batch::default();
+            for list in chunk {
+                list.run_deferred(&mut batch);
+                firsts.push(lists.len());
+                #[cfg(feature = "diagnostics")]
+                let _timed =
+                    crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
+                if let Some(prelude) = list.prelude() {
+                    lists.push(Some(prelude));
+                }
+                lists.push(list.list.cast().ok());
+            }
+            batch.flush();
+            let prepared = std::time::Instant::now();
+            prep_us += (prepared - chunk_start).as_micros() as u64;
+            // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
             #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
-                self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+            let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+                firsts
+                    .iter()
+                    .zip(firsts.iter().skip(1).chain([&lists.len()]))
+                    .map(|(&a, &b)| &lists[a..b])
+                    .collect()
+            } else {
+                vec![&lists[..]]
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let groups = [&lists[..]];
+            for (i, group) in groups.iter().enumerate() {
+                *submitted += 1;
+                let group_started = std::time::Instant::now();
+                #[cfg(feature = "diagnostics")]
+                crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+                // SAFETY: closed lists; the fence and event are ours.
+                unsafe {
+                    self.queue.ExecuteCommandLists(group);
+                    let waited = self
+                        .queue
+                        .Signal(&self.fence, *submitted)
+                        .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    match waited {
+                        Ok(()) => {
+                            WaitForSingleObject(self.event, INFINITE);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
-            }
-            #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX));
-            }
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                #[cfg(feature = "diagnostics")]
+                crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
+                #[cfg(feature = "diagnostics")]
+                if groups.len() > 1 {
+                    // SAFETY: a plain query.
+                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    let run_idx = chunk_base + i;
+                    gpu_times(
+                        group_started.elapsed(),
+                        &runs[run_idx].slowest(frequency, usize::MAX),
+                    );
                 }
+                #[cfg(feature = "diagnostics")]
+                if groups.len() > 1 && group_started.elapsed() > std::time::Duration::from_millis(50)
+                {
+                    // SAFETY: a plain query.
+                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    let run_idx = chunk_base + i;
+                    let commands = runs[run_idx]
+                        .notes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .len();
+                    tracing::warn!(
+                        ms = group_started.elapsed().as_millis(),
+                        commands,
+                        "slow host list"
+                    );
+                    for (ms, op) in runs[run_idx].slowest(frequency, 6) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
+                }
+                if groups.len() > 1 && removed_in.is_none() {
+                    // SAFETY: a plain query.
+                    if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                        removed_in = Some(chunk_base + i);
+                    }
+                }
+                let _ = (i, group_started);
             }
-            // SAFETY: a plain query.
-            if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-                removed_in = Some(i);
-            }
-            let _ = (i, started);
+            gpu += prepared.elapsed();
+            batches.push(batch);
+            chunk_base += chunk.len();
         }
-        let _ = &firsts;
-        let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        let _ = (&firsts, chunk_base);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(
+            crate::copystat::C::FaultsPrep,
+            crate::copystat::page_faults().saturating_sub(faults),
+        );
+        SUBMISSION_US[0].fetch_add(prep_us, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
@@ -1426,7 +1602,7 @@ impl Host {
         // The submission has run and the next waits for our lock. Host
         // copies the title gave up meanwhile may have their last holder here.
         release_retired();
-        release_later(Box::new((batch, back, withheld, heaps)));
+        release_later(Box::new((batches, back, withheld, heaps)));
         self.log_messages();
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
@@ -1617,14 +1793,14 @@ impl Host {
         first_error
     }
 
-    /// A host render target view of `resource`, valid until it is recorded.
+    /// A host render target view, valid until it is recorded.
     pub(crate) fn rtv(
         &self,
-        resource: &ID3D12Resource,
+        resource: Option<&ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a slot of our heap and a live resource.
+        // SAFETY: a slot of our heap and a live resource or a typed null view.
         unsafe {
             let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.rtv_size) as usize;
@@ -1761,6 +1937,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.end_hoisted_indirect();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1785,6 +1962,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.hoisted_indirect.lock().unwrap_or_else(|e| e.into_inner()).reset();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -1944,7 +2122,11 @@ impl HostList {
                 copy.state.store(*last, Ordering::Relaxed);
             }
         };
-        if copies.is_empty() && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first) {
+        let has_hoisted = !self.hoisted().is_empty();
+        if copies.is_empty()
+            && !has_hoisted
+            && states.values().all(|(first, _, copy)| copy.state.load(Ordering::Relaxed) == *first)
+        {
             left();
             return None;
         }
@@ -1978,6 +2160,11 @@ impl HostList {
                 let barriers = moves();
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                if has_hoisted
+                    && let Some((budget_res, budget_gpu)) = self.budget_resource()
+                {
+                    self.hoisted().record_prelude(list, budget_res, budget_gpu);
                 }
                 list.Close()
             })
@@ -2112,9 +2299,15 @@ impl HostList {
     }
 
     /// Shaders of the list read title memory through the page table of
-    /// view heap `heap` (`crate::memory::prepare` at submission).
+    /// view heap `heap` (`crate::memory::prepare` at submission): once until
+    /// a step writes title memory, as a buffer range or a heap's views are
+    /// (a draw after such a step needs the copies brought up to date again).
     pub(crate) fn defer_memory(&self, heap: usize) {
-        self.deferred().copies.push(Step::Memory(heap));
+        let mut deferred = self.deferred();
+        // Not a buffer range (an address) or a heap's views (`usize::MAX`, 0).
+        if deferred.refreshed.insert((heap, usize::MAX, 1)) {
+            deferred.copies.push(Step::Memory(heap));
+        }
     }
 
     /// After the list has run, before its writes go back: `check` says
@@ -2241,6 +2434,24 @@ impl HostList {
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
+    /// The already-created indirect-work budget buffer and its GPU address.
+    pub(crate) fn budget_resource(&self) -> Option<(&ID3D12Resource, u64)> {
+        let (buffer, _) = self.budget.get()?.as_ref()?;
+        // SAFETY: a live buffer.
+        Some((buffer, unsafe { buffer.GetGPUVirtualAddress() }))
+    }
+
+    pub(crate) fn hoisted(&self) -> std::sync::MutexGuard<'_, crate::indirect::HoistedClamps> {
+        self.hoisted_indirect.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Ends the hoistable prefix of indirect clamps on this list, returning
+    /// its hoisted argument chunks from `INDIRECT_ARGUMENT` back to `COMMON`
+    /// once so later GPU writes and subsequent submissions see `COMMON`.
+    pub(crate) fn end_hoisted_indirect(&self) {
+        self.hoisted().end(&self.list);
+    }
+
     /// The list's argument buffer, at least `bytes` long, common between
     /// its uses (`crate::indirect`).
     pub(crate) fn arguments(&self, bytes: u64) -> Option<ID3D12Resource> {
@@ -2301,7 +2512,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
+            let mut started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
                 started,
@@ -2323,6 +2534,8 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    // The flush counted its own time; the copy starts here.
+                    started = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -2347,6 +2560,10 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            started = std::time::Instant::now();
+                        }
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -3962,8 +4179,35 @@ mod batch {   // `mod tests` is already taken at the top of this file
         drop(copy);
         crate::watch::tests::free(p);
     }
-}
 
+    /// A list reading title memory through a view heap's page table brings
+    /// the copies up to date once, and again after a step that writes title
+    /// memory (as a buffer range or a heap's views are), not only at its
+    /// first draw.
+    #[test]
+    fn title_memory_is_refreshed_again_after_a_title_write() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        let memory_steps = |list: &crate::host::HostList| {
+            list.deferred()
+                .copies
+                .iter()
+                .filter(|s| matches!(s, crate::host::Step::Memory(_)))
+                .count()
+        };
+        list.defer_memory(7);
+        list.defer_memory(7);
+        assert_eq!(memory_steps(&list), 1, "once until a title write");
+        list.defer_copy(std::ptr::null_mut(), std::ptr::null(), 0);
+        list.defer_memory(7);
+        list.defer_memory(7);
+        assert_eq!(memory_steps(&list), 2, "again after it, once");
+        list.defer_memory(8);
+        assert_eq!(memory_steps(&list), 3, "a heap of its own");
+    }
+}
 
 #[cfg(test)]
 mod withholding {
@@ -4023,6 +4267,79 @@ mod present_plane_tests {
     use super::*;
 
     #[test]
+    fn packed_10_bit_frames_are_sampled_for_black_detection() {
+        let Some(host) = host() else {
+            eprintln!("skipping black-frame probe: no D3D12 device");
+            return;
+        };
+        let formats = [
+            (DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM),
+            (DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM),
+            (DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM),
+            (DXGI_FORMAT_R10G10B10A2_UINT, DXGI_FORMAT_R10G10B10A2_UINT),
+        ];
+        let mut observed = Vec::new();
+        for (format, view_format) in formats {
+            let mut texture = None;
+            // SAFETY: a live device and a valid render target description.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 16,
+                            Height: 16,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: format,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+            }
+            let texture = texture.unwrap();
+            let desc = D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: view_format,
+                ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            let (dark, lit, max, alpha) = if view_format == DXGI_FORMAT_R10G10B10A2_UINT {
+                (28.0, 32.0, 1023.0, 3.0)
+            } else {
+                (7.0 / 255.0, 8.0 / 255.0, 1.0, 1.0)
+            };
+            for color in [
+                [0.0, 0.0, 0.0, alpha],
+                [dark, 0.0, 0.0, 0.0],
+                [0.0, lit, 0.0, 0.0],
+                [0.0, 0.0, max, alpha],
+            ] {
+                let list = host.new_list().unwrap();
+                // SAFETY: an open list and a live render target.
+                unsafe {
+                    list.list
+                        .ClearRenderTargetView(host.rtv(Some(&texture), Some(&desc)), &color, None);
+                }
+                list.close();
+                host.execute(&[&list]);
+                let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+                observed.push(host.present(&[(&texture, state)], 1));
+            }
+        }
+        assert_eq!(observed, [Some(true), Some(true), Some(false), Some(false)].repeat(4));
+    }
+
+    #[test]
     fn compositor_failure_presents_primary_in_the_same_frame() {
         let Some(host) = host() else {
             eprintln!("skipping PresentX recovery: no D3D12 device");
@@ -4061,7 +4378,7 @@ mod present_plane_tests {
                     .unwrap();
                 let texture = texture.unwrap();
                 list.list
-                    .ClearRenderTargetView(host.rtv(&texture, None), color, None);
+                    .ClearRenderTargetView(host.rtv(Some(&texture), None), color, None);
                 texture
             }
         };

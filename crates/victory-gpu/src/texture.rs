@@ -7,8 +7,9 @@
 //!
 //! "Changed" means a page of the memory changed since the last detiling
 //! ([`crate::watch`], which follows writes through every mapping of the
-//! same physical pages) in the runtime's memory; elsewhere, a content hash
-//! of the whole memory at every submission that samples it.
+//! same physical pages) in the runtime's memory. At each submission that
+//! samples it, hash subresources touching untracked pages, or the whole
+//! texture if it has no tracked pages.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Textures read through descriptor tables are brought up to date, and for
@@ -18,6 +19,7 @@
 //! 0 is uploaded (every mip and array slice), depth and stencil planes are
 //! not.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -212,6 +214,16 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
+/// Bytes retained by the texture upload pools and the idle per-thread read buffers.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn cached_staging_bytes() -> Option<(u64, usize)> {
+    let chunk_bytes = CHUNKS.try_lock().ok()?.all.len() as u64 * CHUNK;
+    let pool = BUFFERS.try_lock().ok()?;
+    let large_bytes = pool.free_bytes + pool.used.iter().map(|entry| entry.0).sum::<u64>();
+    let read_bytes = RETAINED_SCRATCH.load(std::sync::atomic::Ordering::Relaxed);
+    Some((chunk_bytes + large_bytes, read_bytes))
+}
+
 /// A host copy or resolve that `list` records writes `resource`: from the
 /// submission that runs `list` on, its host texture's contents are the
 /// host's, not title memory's, which stays as it was. Marked when that
@@ -242,6 +254,213 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// Copies [`alias_copy`] recorded since the last frame-rate line.
 pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Maximum number of `(desc_a, desc_b)` footprint plans cached in [`ALIAS_PLANS`].
+const ALIAS_PLAN_CAP: usize = 256;
+
+/// Hashable subset of [`D3D12_RESOURCE_DESC`] fields that determine copyable footprints.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct DescKey {
+    dimension: i32,
+    width: u64,
+    height: u32,
+    depth_or_array_size: u16,
+    mip_levels: u16,
+    format: i32,
+    sample_count: u32,
+    sample_quality: u32,
+    layout: i32,
+    flags: i32,
+}
+
+fn desc_key(d: &D3D12_RESOURCE_DESC) -> DescKey {
+    DescKey {
+        dimension: d.Dimension.0,
+        width: d.Width,
+        height: d.Height,
+        depth_or_array_size: d.DepthOrArraySize,
+        mip_levels: d.MipLevels,
+        format: d.Format.0,
+        sample_count: d.SampleDesc.Count,
+        sample_quality: d.SampleDesc.Quality,
+        layout: d.Layout.0,
+        flags: d.Flags.0,
+    }
+}
+
+/// Precomputed subresource footprints and scratch size for an alias copy between two descriptions.
+struct AliasPlan {
+    fa: Box<[D3D12_PLACED_SUBRESOURCE_FOOTPRINT]>,
+    fb: Box<[D3D12_PLACED_SUBRESOURCE_FOOTPRINT]>,
+    n: u32,
+    total: u64,
+}
+
+/// Cache map keyed by `(desc_a, desc_b)` (`None` caches incompatible pairs).
+type PlanMap = HashMap<(DescKey, DescKey), Option<Arc<AliasPlan>>>;
+
+/// Bounded mutex-guarded cache of alias-copy footprint plans (`None` caches incompatible pairs).
+struct AliasPlanCache {
+    entries: Mutex<Option<PlanMap>>,
+    #[cfg(test)]
+    computations: std::sync::atomic::AtomicU64,
+}
+
+impl AliasPlanCache {
+    const fn new() -> Self {
+        Self {
+            entries: Mutex::new(None),
+            #[cfg(test)]
+            computations: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Returns the cached alias-copy plan for `(da, db)`, computing and caching it on a miss.
+    fn get_or_compute(
+        &self,
+        device: &ID3D12Device,
+        da: &D3D12_RESOURCE_DESC,
+        db: &D3D12_RESOURCE_DESC,
+    ) -> Option<Arc<AliasPlan>> {
+        let key = (desc_key(da), desc_key(db));
+        {
+            let cache = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = cache.as_ref().and_then(|m| m.get(&key)) {
+                return cached.clone();
+            }
+        }
+        #[cfg(test)]
+        self.computations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let plan = compute_alias_plan(device, da, db).map(Arc::new);
+        let mut cache = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let map = cache.get_or_insert_with(HashMap::new);
+        if map.len() >= ALIAS_PLAN_CAP && !map.contains_key(&key) {
+            map.clear();
+        }
+        map.insert(key, plan.clone());
+        plan
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, HashMap::len)
+    }
+
+    #[cfg(test)]
+    fn clear(&self) {
+        if let Some(map) = self.entries.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            map.clear();
+        }
+        self.computations
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Global bounded cache of alias-copy footprint plans.
+static ALIAS_PLANS: AliasPlanCache = AliasPlanCache::new();
+
+fn subresource_count(d: &D3D12_RESOURCE_DESC) -> u32 {
+    if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        u32::from(d.MipLevels)
+    } else {
+        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize).max(1)
+    }
+}
+
+fn footprints_for(
+    device: &ID3D12Device,
+    d: &D3D12_RESOURCE_DESC,
+    count: u32,
+) -> (
+    Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    Vec<u32>,
+    Vec<u64>,
+    u64,
+) {
+    let mut f = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+    let mut rows = vec![0u32; count as usize];
+    let mut row_sizes = vec![0u64; count as usize];
+    let mut total = 0;
+    // SAFETY: output slices are sized for `count` subresources starting at subresource 0.
+    unsafe {
+        device.GetCopyableFootprints(
+            d,
+            0,
+            count,
+            0,
+            Some(f.as_mut_ptr()),
+            Some(rows.as_mut_ptr()),
+            Some(row_sizes.as_mut_ptr()),
+            Some(&mut total),
+        );
+    }
+    (f, rows, row_sizes, total)
+}
+
+fn footprint_span(f: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, rows: u32, row_size: u64) -> u64 {
+    let lines = u64::from(rows) * u64::from(f.Footprint.Depth);
+    if lines == 0 {
+        f.Offset
+    } else {
+        f.Offset
+            .saturating_add(u64::from(f.Footprint.RowPitch).saturating_mul(lines - 1))
+            .saturating_add(row_size)
+    }
+}
+
+fn compute_alias_plan(
+    device: &ID3D12Device,
+    da: &D3D12_RESOURCE_DESC,
+    db: &D3D12_RESOURCE_DESC,
+) -> Option<AliasPlan> {
+    let (na, nb) = (subresource_count(da), subresource_count(db));
+    if na == 0 || nb == 0 {
+        return None;
+    }
+    let (mut fa, ra, sa, total_a) = footprints_for(device, da, na);
+    let (mut fb, rb, sb, total_b) = footprints_for(device, db, nb);
+    if total_a == u64::MAX || total_b == u64::MAX {
+        return None;
+    }
+    // Subresources in order while both have the same bytes there (mips of
+    // a block-compressed texture past its last whole block do not).
+    let n = (0..fa.len().min(fb.len()))
+        .take_while(|&i| {
+            let (x, y) = (fa[i], fb[i]);
+            x.Offset != u64::MAX
+                && ra[i] != u32::MAX
+                && sa[i] != u64::MAX
+                && sb[i] != u64::MAX
+                && x.Offset == y.Offset
+                && x.Footprint.RowPitch == y.Footprint.RowPitch
+                && ra[i] == rb[i]
+                && x.Footprint.Depth == y.Footprint.Depth
+        })
+        .count() as u32;
+    if n == 0 {
+        return None;
+    }
+    let total = (0..n as usize)
+        .map(|i| footprint_span(&fa[i], ra[i], sa[i]).max(footprint_span(&fb[i], rb[i], sb[i])))
+        .max()
+        .unwrap_or(0);
+    if total == 0 {
+        return None;
+    }
+    fa.truncate(n as usize);
+    fb.truncate(n as usize);
+    Some(AliasPlan {
+        fa: fa.into_boxed_slice(),
+        fb: fb.into_boxed_slice(),
+        n,
+        total,
+    })
+}
+
 /// Records, once per list, the copy of `from`'s host texture into `to`'s:
 /// two title textures at one memory that cannot share a host texture
 /// (`resource::alias_source`: block-compressed against plain formats of
@@ -251,6 +470,12 @@ pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// row and rows in both; `to` no longer takes its contents from title
 /// memory.
 pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
+    if alias_copy_in(list, from, to, &ALIAS_PLANS) {
+        ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn alias_copy_in(list: &HostList, from: This, to: This, plans: &AliasPlanCache) -> bool {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
     let (Some(a), Some(b), Some(host)) = (
@@ -258,47 +483,21 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         crate::resource::host_resource(to),
         host(),
     ) else {
-        return;
+        return false;
     };
     // An odd key: textures' own first uses are keyed by the host texture.
     if !list.first_use(to as usize | 1) {
-        return;
+        return false;
     }
     // SAFETY: live resources.
     let (da, db) = unsafe { (a.GetDesc(), b.GetDesc()) };
-    let count = |d: &D3D12_RESOURCE_DESC| {
-        if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
-            u32::from(d.MipLevels)
-        } else {
-            u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize).max(1)
-        }
-    };
-    let footprints = |d: &D3D12_RESOURCE_DESC, n: u32| {
-        let mut f = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n as usize];
-        let mut rows = vec![0u32; n as usize];
-        let mut total = 0;
-        // SAFETY: outputs sized for `n` subresources.
-        unsafe {
-            host.device
-                .GetCopyableFootprints(d, 0, n, 0, Some(f.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total));
-        }
-        (f, rows, total)
-    };
-    let (fa, ra, total) = footprints(&da, count(&da));
-    let (fb, rb, _) = footprints(&db, count(&db));
-    // Subresources in order while both have the same bytes there (mips of
-    // a block-compressed texture past its last whole block do not).
-    let n = (0..fa.len().min(fb.len()))
-        .take_while(|&i| {
-            let (x, y) = (fa[i], fb[i]);
-            x.Offset == y.Offset && x.Footprint.RowPitch == y.Footprint.RowPitch && ra[i] == rb[i] && x.Footprint.Depth == y.Footprint.Depth
-        })
-        .count() as u32;
-    if n == 0 {
+    let Some(plan) = plans.get_or_compute(&host.device, &da, &db) else {
         once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
-        return;
-    }
-    let Some(buffer) = host.default_buffer(total) else { return };
+        return false;
+    };
+    let Some(buffer) = host.default_buffer(plan.total) else {
+        return false;
+    };
     list.keep(&buffer);
     crate::texture::host_writes(list, to);
     crate::list::ensure_state(list, from, COPY_SOURCE);
@@ -318,25 +517,34 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     let l = &list.list;
     // SAFETY: an open list; live resources in the states named.
     unsafe {
-        for i in 0..n {
-            l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(&a, i), None);
+        for i in 0..plan.n {
+            l.CopyTextureRegion(&place(&buffer, plan.fa[i as usize]), 0, 0, 0, &sub(&a, i), None);
         }
         l.ResourceBarrier(&[crate::host::transition(
             &buffer,
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         )]);
-        for i in 0..n {
-            l.CopyTextureRegion(&sub(&b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
+        for i in 0..plan.n {
+            l.CopyTextureRegion(&sub(&b, i), 0, 0, 0, &place(&buffer, plan.fb[i as usize]), None);
         }
     }
-    ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static LOGGED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
     let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
     if logged.len() < 64 && !logged.contains(&(from as usize, to as usize)) {
         logged.push((from as usize, to as usize));
-        tracing::info!(from = ?from, to = ?to, a = da.Format.0, b = db.Format.0, w = da.Width, h = da.Height, subresources = n, "aliased texture copied");
+        tracing::info!(
+            from = ?from,
+            to = ?to,
+            a = da.Format.0,
+            b = db.Format.0,
+            w = da.Width,
+            h = da.Height,
+            subresources = plan.n,
+            "aliased texture copied"
+        );
     }
+    true
 }
 
 /// Has `resource`'s host copy brought up to date at the submission that
@@ -439,7 +647,13 @@ fn copies(
             let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+            let len = subresource_len(
+                staging.footprints[i].Offset,
+                f.RowPitch as usize,
+                staging.rows[i],
+                f.Depth,
+                staging.size,
+            ) as u64;
             list.note_read(
                 || {
                     format!(
@@ -566,18 +780,20 @@ impl Staging {
                 return (0, None);
             }
             let ranges = t.take(start, start + size);
-            if ranges.is_empty() {
+            let untracked = t.untracked(start, start + size);
+            if ranges.is_empty() && untracked.is_empty() {
                 return (0, None);
             }
-            // Only the subresources in the pages that changed (streamed
-            // textures change page by page; a whole re-read and detile of
-            // each cost up to 430 MB a frame, run integ2).
+            // Untracked pages can change even when the tracker reports no
+            // writes. Re-read only subresources on those or on dirty pages.
             let n = self.footprints.len();
             let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
-            let touched: Vec<usize> = (0..n)
-                .filter(|&i| {
+            let touched: Vec<_> = (0..n)
+                .filter_map(|i| {
                     let (a, b) = span(i);
-                    ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
+                    let overlaps = |&(f, e): &(usize, usize)| f - start < b && a < e - start;
+                    let has_untracked = untracked.iter().any(overlaps);
+                    (has_untracked || ranges.iter().any(overlaps)).then_some((i, has_untracked))
                 })
                 .collect();
             // Read through the copy, which stands unmapped pages: memory of
@@ -588,7 +804,7 @@ impl Staging {
             let read = &mut scratch.0[..size];
             let mut bytes = 0;
             let mut done: Vec<(usize, usize)> = Vec::new();
-            for &i in &touched {
+            for &(i, _) in &touched {
                 let (a, b) = span(i);
                 if !done.contains(&(a, b)) {
                     // SAFETY: inside the buffer of the texture's size.
@@ -598,23 +814,26 @@ impl Staging {
             }
             // A changed page that holds only the subresource's bytes says it
             // changed. Pages it shares with other data the title writes
-            // (small textures): its own bytes decide. (Hashing a movie frame
-            // cost 8 ms a frame.)
+            // (small textures), and untracked pages: its own bytes decide.
+            // Keep the hash for untracked pages even after a tracked write,
+            // so the next refresh can skip an unchanged subresource.
             let page = crate::watch::PAGE;
             last.hashes.resize(n, None);
             let fresh: Vec<u32> = touched
                 .into_iter()
-                .filter(|&i| {
+                .filter(|&(i, has_untracked)| {
                     let (a, b) = span(i);
                     let (a0, b0) = (start + a, start + b);
-                    if ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0)) {
+                    if !has_untracked
+                        && ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0))
+                    {
                         last.hashes[i] = None;
                         return true;
                     }
                     let hash = blake3::hash(&read[a..b]);
                     last.hashes[i].replace(hash) != Some(hash)
                 })
-                .map(|i| i as u32)
+                .map(|(i, _)| i as u32)
                 .collect();
             if fresh.is_empty() {
                 return (bytes, None);
@@ -710,14 +929,28 @@ impl Staging {
 /// page fault per 4 KiB (129,000 faults in a frame, run placed1).
 struct Scratch(Vec<u8>);
 
+struct ScratchCache(std::cell::Cell<Vec<u8>>);
+
+#[cfg(feature = "diagnostics")]
+static RETAINED_SCRATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for ScratchCache {
+    fn drop(&mut self) {
+        RETAINED_SCRATCH.fetch_sub(self.0.get_mut().capacity(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 thread_local! {
-    static SCRATCH: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+    static SCRATCH: ScratchCache = const { ScratchCache(std::cell::Cell::new(Vec::new())) };
 }
 
 impl Scratch {
     /// The thread's buffer, at least `size` bytes.
     fn take(size: usize) -> Self {
-        let mut v = SCRATCH.take();
+        let mut v = SCRATCH.with(|cache| cache.0.take());
+        #[cfg(feature = "diagnostics")]
+        RETAINED_SCRATCH.fetch_sub(v.capacity(), std::sync::atomic::Ordering::Relaxed);
         if v.len() < size {
             v.resize(size, 0);
         }
@@ -730,7 +963,15 @@ impl Drop for Scratch {
         // The largest textures' buffers are not kept.
         const KEEP: usize = 32 << 20;
         if self.0.len() <= KEEP {
-            SCRATCH.set(std::mem::take(&mut self.0));
+            SCRATCH.with(|cache| {
+                let retained = std::mem::take(&mut self.0);
+                #[cfg(feature = "diagnostics")]
+                RETAINED_SCRATCH.fetch_add(retained.capacity(), std::sync::atomic::Ordering::Relaxed);
+                let previous = cache.0.replace(retained);
+                #[cfg(feature = "diagnostics")]
+                RETAINED_SCRATCH.fetch_sub(previous.capacity(), std::sync::atomic::Ordering::Relaxed);
+                drop(previous);
+            });
         }
     }
 }
@@ -821,6 +1062,11 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
             Some(&mut total),
         );
     }
+    // Both D3D12 copies and mapped CPU pointers use these offsets.
+    if footprints.iter().any(|f| f.Offset >= total) {
+        once!(?desc, total, "texture upload footprint outside its staging buffer");
+        return None;
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
     let spans = spans(&layout, count, u32::from(d.MipLevels));
@@ -843,7 +1089,12 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::c_void;
+
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+
     use super::*;
+    use crate::object::{Iid, S_OK, slot};
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
@@ -852,6 +1103,61 @@ mod tests {
         assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
         assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
         assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+        // A 10x6 RGBA8 texture with two mips (the last row contains 20 bytes).
+        let total = 1536 + 2 * 256 + 20;
+        assert_eq!(subresource_len(0, 256, 6, 1, total), 1536);
+        assert_eq!(subresource_len(1536, 256, 3, 1, total), 532);
+        assert_eq!(subresource_len(total, 256, 3, 1, total), 0);
+        assert_eq!(subresource_len(total + 1, 256, 3, 1, total), 0);
+    }
+
+    #[test]
+    fn last_bc4_mip_ends_after_the_active_block() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC4_UNORM, DXGI_SAMPLE_DESC};
+
+        let Some(host) = host() else {
+            return;
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 2,
+            Format: DXGI_FORMAT_BC4_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut footprints = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
+        let mut rows = [0; 2];
+        let mut row_bytes = [0; 2];
+        let mut total = 0;
+        // SAFETY: each output array has room for both subresources.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &desc,
+                0,
+                2,
+                0,
+                Some(footprints.as_mut_ptr()),
+                Some(rows.as_mut_ptr()),
+                Some(row_bytes.as_mut_ptr()),
+                Some(&mut total),
+            );
+        }
+        let last = footprints[1];
+        assert_eq!(row_bytes[1], 8);
+        assert!(u64::from(last.Footprint.RowPitch) > row_bytes[1]);
+        assert_eq!(
+            subresource_len(
+                last.Offset,
+                last.Footprint.RowPitch as usize,
+                rows[1],
+                last.Footprint.Depth,
+                total
+            ),
+            row_bytes[1] as usize
+        );
     }
 
     #[test]
@@ -877,5 +1183,463 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    struct ClearOnDrop(&'static AliasPlanCache);
+
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            self.0.clear();
+        }
+    }
+
+    const RESOURCE_IID: Iid = crate::object::guid(
+        0x696442be,
+        0xa72e,
+        0x4059,
+        [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+    );
+
+    struct OwnedTitleResource(This);
+
+    impl Drop for OwnedTitleResource {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                type Release = extern "system" fn(This) -> u32;
+                slot::<Release>(self.0, 0x10)(self.0);
+            }
+        }
+    }
+
+    fn tex2d_desc(
+        width: u64,
+        height: u32,
+        format: i32,
+        mip_levels: u16,
+        flags: i32,
+    ) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: width,
+            Height: height,
+            DepthOrArraySize: 1,
+            MipLevels: mip_levels,
+            Format: DXGI_FORMAT(format),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAGS(flags),
+        }
+    }
+
+    fn committed_texture(
+        width: u64,
+        height: u32,
+        format: i32,
+        mip_levels: u16,
+        flags: i32,
+    ) -> OwnedTitleResource {
+        assert_eq!(
+            size_of::<D3D12_RESOURCE_DESC>(),
+            size_of::<crate::resource::ResourceDesc>()
+        );
+        assert_eq!(
+            align_of::<D3D12_RESOURCE_DESC>(),
+            align_of::<crate::resource::ResourceDesc>()
+        );
+        assert_eq!(
+            size_of::<D3D12_HEAP_PROPERTIES>(),
+            size_of::<crate::resource::HeapProperties>()
+        );
+        assert_eq!(
+            align_of::<D3D12_HEAP_PROPERTIES>(),
+            align_of::<crate::resource::HeapProperties>()
+        );
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = tex2d_desc(width, height, format, mip_levels, flags);
+        let mut out = std::ptr::null();
+        let hr = crate::resource::create_committed(
+            std::ptr::null(),
+            std::ptr::from_ref(&heap).cast(),
+            0,
+            std::ptr::from_ref(&desc).cast(),
+            0,
+            std::ptr::null::<c_void>(),
+            &RESOURCE_IID,
+            &mut out,
+        );
+        assert_eq!(hr, S_OK);
+        assert!(!out.is_null());
+        OwnedTitleResource(out)
+    }
+
+    fn readback_buffer(device: &ID3D12Device, bytes: u64) -> ID3D12Resource {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut out: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer of `bytes` bytes.
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut out,
+                )
+                .expect("readback buffer");
+        }
+        out.expect("readback resource")
+    }
+
+    fn placed_loc(
+        resource: &ID3D12Resource,
+        footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    ) -> D3D12_TEXTURE_COPY_LOCATION {
+        D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer the copy does not release.
+            pResource: unsafe { std::mem::transmute_copy(resource) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: footprint,
+            },
+        }
+    }
+
+    fn subresource_loc(resource: &ID3D12Resource, index: u32) -> D3D12_TEXTURE_COPY_LOCATION {
+        D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer the copy does not release.
+            pResource: unsafe { std::mem::transmute_copy(resource) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: index,
+            },
+        }
+    }
+
+    #[test]
+    fn alias_plan_caches_compatible_and_incompatible_pairs() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let plans = AliasPlanCache::new();
+
+        // Compatible block-compressed <-> R32G32 pair across all 3 mips.
+        let bc1 = tex2d_desc(16, 16, 71, 3, 0);
+        let r32g32 = tex2d_desc(4, 4, 17, 3, 4);
+        let first = plans
+            .get_or_compute(&host.device, &r32g32, &bc1)
+            .expect("compatible alias plan");
+        assert_eq!(first.n, 3);
+        assert_eq!(first.fa.len(), 3);
+        assert_eq!(first.fb.len(), 3);
+        assert!(first.total > 0);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans.computations.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        let second = plans
+            .get_or_compute(&host.device, &r32g32, &bc1)
+            .expect("cached alias plan");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans.computations.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        // Incompatible dimensions/bytes-per-row: `None` is also cached cleanly.
+        let small = tex2d_desc(4, 4, 42, 1, 4);
+        let mismatch = tex2d_desc(8, 8, 28, 1, 0);
+        assert!(plans.get_or_compute(&host.device, &small, &mismatch).is_none());
+        assert_eq!(plans.len(), 2);
+        assert!(plans.get_or_compute(&host.device, &small, &mismatch).is_none());
+        assert_eq!(plans.len(), 2);
+        assert_eq!(
+            plans.computations.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+
+        // Exceeding `ALIAS_PLAN_CAP` clears cleanly and never grows past the cap.
+        for i in 1..=(ALIAS_PLAN_CAP as u64 + 4) {
+            let a = tex2d_desc(i * 4, 4, 42, 1, 4);
+            let b = tex2d_desc(i * 4, 4, 28, 1, 0);
+            let _ = plans.get_or_compute(&host.device, &a, &b);
+            assert!(plans.len() <= ALIAS_PLAN_CAP);
+        }
+        assert_eq!(plans.len(), 6);
+    }
+
+    #[test]
+    fn footprint_span_computes_exact_subresource_byte_extent() {
+        let base = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let footprint = |offset, row_pitch, depth| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: offset,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                RowPitch: row_pitch,
+                Depth: depth,
+                ..base.Footprint
+            },
+        };
+        assert_eq!(
+            footprint_span(&footprint(512, 256, 1), 4, 32),
+            512 + 256 * 3 + 32
+        );
+        assert_eq!(
+            footprint_span(&footprint(512, 256, 2), 4, 16),
+            512 + 256 * 7 + 16
+        );
+        assert_eq!(footprint_span(&footprint(512, 256, 1), 0, 32), 512);
+        assert_eq!(footprint_span(&footprint(512, 256, 0), 4, 32), 512);
+    }
+
+    #[test]
+    fn alias_copy_caches_plans_and_copies_bytes() {
+        static PLANS: AliasPlanCache = AliasPlanCache::new();
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let _ = host.log_messages();
+        PLANS.clear();
+        let _clear = ClearOnDrop(&PLANS);
+
+        // Title resources declared before `HostList`s so lists drop first.
+        let from = committed_texture(8, 8, 42, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0);
+        let to = committed_texture(8, 8, 28, 1, D3D12_RESOURCE_FLAG_NONE.0);
+        let from_bc = committed_texture(4, 4, 17, 1, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0);
+        let to_bc = committed_texture(16, 16, 71, 1, D3D12_RESOURCE_FLAG_NONE.0);
+
+        let a = crate::resource::host_resource(from.0).expect("from host texture");
+        let b = crate::resource::host_resource(to.0).expect("to host texture");
+        let a_bc = crate::resource::host_resource(from_bc.0).expect("from_bc host texture");
+        let b_bc = crate::resource::host_resource(to_bc.0).expect("to_bc host texture");
+        // SAFETY: live host textures.
+        let (da, db, da_bc, db_bc) =
+            unsafe { (a.GetDesc(), b.GetDesc(), a_bc.GetDesc(), b_bc.GetDesc()) };
+
+        let (fa, ra, sa, total_a) = footprints_for(&host.device, &da, 1);
+        let (fb, rb, sb, total_b) = footprints_for(&host.device, &db, 1);
+        let (fa_bc, ra_bc, sa_bc, total_a_bc) = footprints_for(&host.device, &da_bc, 1);
+        let (fb_bc, rb_bc, sb_bc, total_b_bc) = footprints_for(&host.device, &db_bc, 1);
+
+        let readback = readback_buffer(&host.device, total_b);
+        let readback_bc = readback_buffer(&host.device, total_b_bc);
+        let list = host.new_list().expect("host list 1");
+        let list2 = host.new_list().expect("host list 2");
+
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+
+        #[allow(clippy::too_many_arguments)]
+        let upload_and_alias = |target_list: &HostList,
+                                src_res: This,
+                                dst_res: This,
+                                src_tex: &ID3D12Resource,
+                                dst_tex: &ID3D12Resource,
+                                src_fp: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+                                dst_fp: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+                                rows: u32,
+                                row_bytes: usize,
+                                total_up: u64,
+                                rb: &ID3D12Resource,
+                                seed: u8| {
+            let (up, up_ptr) = target_list.upload(host, total_up).expect("upload buffer");
+            // SAFETY: `up_ptr` is mapped for `total_up` bytes.
+            let up_slice = unsafe { std::slice::from_raw_parts_mut(up_ptr, total_up as usize) };
+            up_slice.fill(0);
+            let mut expected = Vec::with_capacity(rows as usize * row_bytes);
+            for r in 0..rows as usize {
+                let row_off = src_fp.Offset as usize + r * src_fp.Footprint.RowPitch as usize;
+                for c in 0..row_bytes {
+                    let v = seed.wrapping_add((r * 37 + c * 13) as u8);
+                    up_slice[row_off + c] = v;
+                    expected.push(v);
+                }
+            }
+            crate::list::ensure_state(target_list, src_res, COPY_DEST);
+            // SAFETY: open list; valid upload buffer and destination texture in COPY_DEST.
+            unsafe {
+                target_list.list.CopyTextureRegion(
+                    &subresource_loc(src_tex, 0),
+                    0,
+                    0,
+                    0,
+                    &placed_loc(&up, src_fp),
+                    None,
+                );
+            }
+            assert!(alias_copy_in(target_list, src_res, dst_res, &PLANS));
+            // Calling a second time on the same open list is suppressed by `first_use`.
+            assert!(!alias_copy_in(target_list, src_res, dst_res, &PLANS));
+            crate::list::ensure_state(target_list, dst_res, COPY_SOURCE);
+            // SAFETY: open list; valid source texture in COPY_SOURCE and readback buffer in COPY_DEST.
+            unsafe {
+                target_list.list.CopyTextureRegion(
+                    &placed_loc(rb, dst_fp),
+                    0,
+                    0,
+                    0,
+                    &subresource_loc(dst_tex, 0),
+                    None,
+                );
+            }
+            expected
+        };
+
+        let verify_readback = |rb: &ID3D12Resource,
+                               fp: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+                               rows: u32,
+                               row_bytes: usize,
+                               total_rb: u64,
+                               expected: &[u8]| {
+            let mut mapped = std::ptr::null_mut();
+            let range = D3D12_RANGE {
+                Begin: 0,
+                End: total_rb as usize,
+            };
+            // SAFETY: `rb` is a `total_rb`-byte readback buffer and GPU work has completed.
+            unsafe {
+                rb.Map(0, Some(&range), Some(&mut mapped))
+                    .expect("map readback");
+                let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), total_rb as usize);
+                for r in 0..rows as usize {
+                    let off = fp.Offset as usize + r * fp.Footprint.RowPitch as usize;
+                    assert_eq!(
+                        &bytes[off..off + row_bytes],
+                        &expected[r * row_bytes..(r + 1) * row_bytes],
+                        "row {r} mismatch"
+                    );
+                }
+                rb.Unmap(0, None);
+            }
+        };
+
+        // 1. Both R32_UINT -> R8G8B8A8_UNORM and R32G32_UINT -> BC1_UNORM copy byte-exact
+        //    through per-copy scratch buffers and mark destinations as host-written.
+        let expected_1 = upload_and_alias(
+            &list,
+            from.0,
+            to.0,
+            &a,
+            &b,
+            fa[0],
+            fb[0],
+            ra[0],
+            sa[0] as usize,
+            total_a,
+            &readback,
+            0x11,
+        );
+        let expected_bc = upload_and_alias(
+            &list,
+            from_bc.0,
+            to_bc.0,
+            &a_bc,
+            &b_bc,
+            fa_bc[0],
+            fb_bc[0],
+            ra_bc[0],
+            sa_bc[0] as usize,
+            total_a_bc,
+            &readback_bc,
+            0xA5,
+        );
+        assert_eq!(PLANS.len(), 2);
+        assert_eq!(
+            PLANS.computations.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert!(!is_host_written(to.0));
+        assert!(!is_host_written(to_bc.0));
+        list.close();
+        host.execute(&[&list]);
+        assert!(is_host_written(to.0));
+        assert!(is_host_written(to_bc.0));
+        verify_readback(&readback, fb[0], rb[0], sb[0] as usize, total_b, &expected_1);
+        verify_readback(
+            &readback_bc,
+            fb_bc[0],
+            rb_bc[0],
+            sb_bc[0] as usize,
+            total_b_bc,
+            &expected_bc,
+        );
+        list.reset();
+
+        // 2. Subsequent alias copies across two open lists reuse the cached plans without recomputing.
+        let expected_2 = upload_and_alias(
+            &list,
+            from.0,
+            to.0,
+            &a,
+            &b,
+            fa[0],
+            fb[0],
+            ra[0],
+            sa[0] as usize,
+            total_a,
+            &readback,
+            0x79,
+        );
+        let expected_bc_2 = upload_and_alias(
+            &list2,
+            from_bc.0,
+            to_bc.0,
+            &a_bc,
+            &b_bc,
+            fa_bc[0],
+            fb_bc[0],
+            ra_bc[0],
+            sa_bc[0] as usize,
+            total_a_bc,
+            &readback_bc,
+            0x3C,
+        );
+        assert_eq!(
+            PLANS.computations.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        list.close();
+        list2.close();
+        host.execute(&[&list, &list2]);
+        verify_readback(&readback, fb[0], rb[0], sb[0] as usize, total_b, &expected_2);
+        verify_readback(
+            &readback_bc,
+            fb_bc[0],
+            rb_bc[0],
+            sb_bc[0] as usize,
+            total_b_bc,
+            &expected_bc_2,
+        );
+        list.reset();
+        list2.reset();
+        assert!(
+            host.log_messages().is_none(),
+            "D3D12 debug layer reported an error"
+        );
     }
 }

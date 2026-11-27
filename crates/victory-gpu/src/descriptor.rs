@@ -124,6 +124,29 @@ const SHADER_VISIBLE: u32 = 1;
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
+/// The end of the view slots in use (it only grows): the most slots any
+/// shader-visible view heap has had, or past them the dynamic slots a host
+/// heap has handed out (tables made afresh, whose texture views shaders
+/// read too). Shaders' read marks at or past it name no slot that
+/// [`make_read`] or the eviction stamps act on, so the scans of the marks
+/// after each submission stop there (`crate::shadow::take_reads`), instead
+/// of at `HEAP_VIEWS` (2^21 slots, two 256 KiB bitmaps). A host copy's
+/// pairs are buffer views, which take no read marks.
+#[cfg(windows)]
+static VIEW_SLOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// See [`VIEW_SLOTS`].
+#[cfg(windows)]
+pub(crate) fn view_slots() -> u32 {
+    VIEW_SLOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A host heap handed out view slots below `end` ([`VIEW_SLOTS`]).
+#[cfg(windows)]
+pub(crate) fn view_slots_reach(end: u32) {
+    VIEW_SLOTS.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
 /// so `Heap::drop` cannot free the heap concurrently.
@@ -347,8 +370,15 @@ impl RtvRecord {
     pub(crate) fn desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 4;
-        self.host_desc(TEXTURE_2D)
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        if self.described != 0 {
+            return self.explicit_desc();
+        }
+        let format = crate::resource::pc_format(crate::resource::view_format(self.resource)?);
+        let host = crate::resource::host_resource(self.resource)?;
+        // SAFETY: a live host texture.
+        let d = unsafe { host.GetDesc() };
+        Some(default_rtv_desc(&d, DXGI_FORMAT(format as i32)))
     }
 
     /// The depth view description in the host's type (the same layout).
@@ -356,31 +386,179 @@ impl RtvRecord {
     pub(crate) fn depth_desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 3;
-        self.host_desc(TEXTURE_2D)
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        if self.described != 0 {
+            return self.explicit_desc();
+        }
+        let format = crate::resource::pc_format(crate::resource::view_format(self.resource)?);
+        let host = crate::resource::host_resource(self.resource)?;
+        // SAFETY: a live host texture.
+        let d = unsafe { host.GetDesc() };
+        Some(default_dsv_desc(&d, DXGI_FORMAT(format as i32)))
     }
 
-    /// The description words as a host type, the format as the host has it.
-    /// Without one, a typeless host copy gets a 2D view (`dimension`) in
-    /// the title's format, which the host needs spelled out.
+    /// Explicit view description words in the host's layout, with the format
+    /// translated to PC.
     #[cfg(windows)]
-    fn host_desc<T>(&self, dimension: u32) -> Option<T> {
+    fn explicit_desc<T>(&self) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
-        let mut words = if self.described != 0 {
-            self.desc
-        } else {
-            [
-                crate::resource::view_format(self.resource)?,
-                dimension,
-                0,
-                0,
-                0,
-                0,
-            ]
-        };
+        let mut words = self.desc;
         words[0] = crate::resource::pc_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
+    }
+}
+
+/// Builds a default RTV description matching `d`'s dimension, array size, and
+/// MSAA sample count when a promoted-typeless host texture has a null RTV desc.
+#[cfg(windows)]
+fn default_rtv_desc(
+    d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) -> windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let array = u32::from(d.DepthOrArraySize);
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if array > 1 => D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE1DARRAY,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture1DArray: D3D12_TEX1D_ARRAY_RTV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: array,
+                },
+            },
+        },
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE1D,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture1D: D3D12_TEX1D_RTV { MipSlice: 0 },
+            },
+        },
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE3D,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_RTV {
+                    MipSlice: 0,
+                    FirstWSlice: 0,
+                    WSize: u32::MAX,
+                },
+            },
+        },
+        _ if d.SampleDesc.Count > 1 && array > 1 => D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2DMSArray: D3D12_TEX2DMS_ARRAY_RTV {
+                    FirstArraySlice: 0,
+                    ArraySize: array,
+                },
+            },
+        },
+        _ if d.SampleDesc.Count > 1 => D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2DMS,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2DMS: D3D12_TEX2DMS_RTV::default(),
+            },
+        },
+        _ if array > 1 => D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_RTV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: array,
+                    PlaneSlice: 0,
+                },
+            },
+        },
+        _ => D3D12_RENDER_TARGET_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_RTV {
+                    MipSlice: 0,
+                    PlaneSlice: 0,
+                },
+            },
+        },
+    }
+}
+
+/// Builds a default DSV description matching `d`'s dimension, array size, and
+/// MSAA sample count when a promoted-typeless host texture has a null DSV desc.
+#[cfg(windows)]
+fn default_dsv_desc(
+    d: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) -> windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let array = u32::from(d.DepthOrArraySize);
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if array > 1 => D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE1DARRAY,
+            Flags: D3D12_DSV_FLAG_NONE,
+            Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                Texture1DArray: D3D12_TEX1D_ARRAY_DSV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: array,
+                },
+            },
+        },
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE1D,
+            Flags: D3D12_DSV_FLAG_NONE,
+            Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                Texture1D: D3D12_TEX1D_DSV { MipSlice: 0 },
+            },
+        },
+        _ if d.SampleDesc.Count > 1 && array > 1 => D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY,
+            Flags: D3D12_DSV_FLAG_NONE,
+            Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                Texture2DMSArray: D3D12_TEX2DMS_ARRAY_DSV {
+                    FirstArraySlice: 0,
+                    ArraySize: array,
+                },
+            },
+        },
+        _ if d.SampleDesc.Count > 1 => D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DMS,
+            Flags: D3D12_DSV_FLAG_NONE,
+            Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                Texture2DMS: D3D12_TEX2DMS_DSV::default(),
+            },
+        },
+        _ if array > 1 => D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
+            Flags: D3D12_DSV_FLAG_NONE,
+            Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_DSV {
+                    MipSlice: 0,
+                    FirstArraySlice: 0,
+                    ArraySize: array,
+                },
+            },
+        },
+        _ => D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: format,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+            Flags: D3D12_DSV_FLAG_NONE,
+            Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_DSV { MipSlice: 0 },
+            },
+        },
     }
 }
 
@@ -449,9 +627,11 @@ pub(crate) enum View {
 /// generation, so descriptors (and host slots made from them) naming the
 /// old one go stale instead of naming whatever is made at the same address
 /// next.
-/// shortcut: views without a resource object (constant buffers, memory
-/// views, samplers) are kept for the run; they are bounded by the title's
-/// memory and sampler states.
+///
+/// Constant buffer views and views of placed memory have no resource to
+/// free them, so their records name them whole instead ([`constant_words`],
+/// [`placed_words`]); the table keeps only the shapes of placed views, and
+/// those that do not fit.
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
@@ -459,6 +639,9 @@ struct Views {
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
+    /// The shapes of views of placed memory, and where each is.
+    shapes: Vec<Shape>,
+    shape_index: std::collections::BTreeMap<Shape, u32>,
 }
 
 static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
@@ -466,8 +649,173 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
+    shapes: Vec::new(),
+    shape_index: std::collections::BTreeMap::new(),
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+
+/// A record is the tag and two words, `i` and `generation` (the host keeps
+/// them as one 64-bit key per slot). The top two bits of `generation` say
+/// what the other 62 bits are: 0, entry `i` of the table at that
+/// generation; [`CONSTANT`], a constant buffer view, whole; [`PLACED`], a
+/// view of placed memory: its address and the number of its shape.
+const KIND_SHIFT: u32 = 30;
+/// Table generations stay below the kind bits (and above 0).
+const GENERATIONS: u32 = (1 << KIND_SHIFT) - 1;
+const CONSTANT: u32 = 1;
+const PLACED: u32 = 2;
+/// Bits of a constant buffer view's address in its record: any address a
+/// program can have. The 15 bits above them are its size.
+const CONSTANT_ADDRESS_BITS: u32 = 47;
+/// Bits of a placed view's address in its record: placed memory is title
+/// memory, which lies below 1 TiB. The 22 bits above them number its shape.
+const PLACED_ADDRESS_BITS: u32 = 40;
+const SHAPES: usize = 1 << (62 - PLACED_ADDRESS_BITS);
+
+/// A view of placed memory without its address: whether it is unordered
+/// access, the resource description, and the view's words but the two that
+/// hold the address (10 and 11).
+type Shape = (bool, [u32; 14], [u32; 14]);
+
+/// The two record words of the 62 bits `payload` of kind `kind`.
+fn kind_words(kind: u32, payload: u64) -> [u32; 2] {
+    [payload as u32, kind << KIND_SHIFT | (payload >> 32) as u32]
+}
+
+/// The 62 bits two record words carry beside their kind.
+fn payload(i: u32, generation: u32) -> u64 {
+    u64::from(generation & GENERATIONS) << 32 | u64::from(i)
+}
+
+/// The record words that name the constant buffer view of `size` bytes at
+/// `address` whole; `None` if they cannot: an address past 47 bits, or a
+/// size of 16 KiB or more that is no multiple of 256 or reaches 4 MiB (the
+/// size has 15 bits: bytes below 16 KiB, else units of 256 bytes). Such a
+/// view is a table entry.
+fn constant_words(address: u64, size: u32) -> Option<[u32; 2]> {
+    if address >> CONSTANT_ADDRESS_BITS != 0 {
+        return None;
+    }
+    let code = if size < 1 << 14 {
+        u64::from(size)
+    } else if size.is_multiple_of(256) && size >> 8 < 1 << 14 {
+        1 << 14 | u64::from(size >> 8)
+    } else {
+        return None;
+    };
+    Some(kind_words(
+        CONSTANT,
+        code << CONSTANT_ADDRESS_BITS | address,
+    ))
+}
+
+/// The constant buffer view [`constant_words`] named.
+fn constant_of(i: u32, generation: u32) -> View {
+    let payload = payload(i, generation);
+    let code = (payload >> CONSTANT_ADDRESS_BITS) as u32;
+    let size = if code >> 14 == 0 {
+        code
+    } else {
+        (code & 0x3fff) << 8
+    };
+    View::Constant(payload & ((1 << CONSTANT_ADDRESS_BITS) - 1), size)
+}
+
+/// A placed view's shape and its address.
+fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, u64) {
+    let mut rest = [0u32; 14];
+    rest[..10].copy_from_slice(&desc[..10]);
+    rest[10..].copy_from_slice(&desc[12..]);
+    (
+        (unordered, *resource, rest),
+        u64::from(desc[10]) | u64::from(desc[11]) << 32,
+    )
+}
+
+/// The record words that name the view of placed memory at `address` with
+/// shape number `shape`.
+fn placed_words(shape: u32, address: u64) -> [u32; 2] {
+    kind_words(PLACED, u64::from(shape) << PLACED_ADDRESS_BITS | address)
+}
+
+impl Views {
+    /// The number of `shape`, a new one if it is not there yet; `None` when
+    /// the shapes are full (the view is then a table entry).
+    fn shape(&mut self, shape: Shape) -> Option<u32> {
+        if let Some(&at) = self.shape_index.get(&shape) {
+            return Some(at);
+        }
+        if self.shapes.len() >= SHAPES {
+            return None;
+        }
+        let at = self.shapes.len() as u32;
+        self.shapes.push(shape);
+        self.shape_index.insert(shape, at);
+        Some(at)
+    }
+
+    /// The view of placed memory [`placed_words`] named.
+    fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
+        let payload = payload(i, generation);
+        let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
+        let &(unordered, resource, rest) =
+            self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&rest[..10]);
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        desc[12..].copy_from_slice(&rest[10..]);
+        Some(View::Placed(unordered, resource, desc))
+    }
+
+    /// The record words of `view` as a table entry: its entry (a new or a
+    /// freed one if the view is not there yet) and that entry's generation.
+    fn entry(&mut self, view: View) -> [u32; 2] {
+        let i = match self.index.get(&view) {
+            Some(&i) => i,
+            None => {
+                let i = match self.free.pop() {
+                    Some(i) => {
+                        self.list[i as usize].0 = view.clone();
+                        i
+                    }
+                    None => {
+                        self.list.push((view.clone(), 1));
+                        self.list.len() as u32 - 1
+                    }
+                };
+                for r in view.resources().into_iter().filter(|&r| r != 0) {
+                    self.by_resource.entry(r).or_default().push(i);
+                }
+                self.index.insert(view, i);
+                i
+            }
+        };
+        [i, self.list[i as usize].1]
+    }
+}
+
+/// The two words that name `view` in a record: the view itself where its
+/// kind allows ([`Views`]), else its table entry.
+fn words_for(view: View) -> [u32; 2] {
+    match &view {
+        View::Constant(address, size) => {
+            if let Some(words) = constant_words(*address, *size) {
+                return words;
+            }
+        }
+        View::Placed(unordered, resource, desc) => {
+            let (shape, address) = shape_of(*unordered, resource, desc);
+            if address >> PLACED_ADDRESS_BITS == 0 {
+                let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(shape) = views.shape(shape) {
+                    return placed_words(shape, address);
+                }
+            }
+        }
+        _ => {}
+    }
+    VIEWS.lock().unwrap_or_else(|e| e.into_inner()).entry(view)
+}
 
 impl View {
     /// The resource objects the view names.
@@ -484,31 +832,9 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let i = match views.index.get(&view) {
-        Some(&i) => i,
-        None => {
-            let i = match views.free.pop() {
-                Some(i) => {
-                    views.list[i as usize].0 = view.clone();
-                    i
-                }
-                None => {
-                    views.list.push((view.clone(), 1));
-                    views.list.len() as u32 - 1
-                }
-            };
-            for r in view.resources().into_iter().filter(|&r| r != 0) {
-                views.by_resource.entry(r).or_default().push(i);
-            }
-            views.index.insert(view, i);
-            i
-        }
-    };
-    let generation = views.list[i as usize].1;
+    let [i, generation] = words_for(view);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
-    drop(views);
     #[cfg(windows)]
     mirror(handle);
 }
@@ -527,29 +853,51 @@ pub(crate) fn forget(resource: usize) {
             continue;
         }
         views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+        // (Below the bits that say a record is no table entry.)
+        views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
     }
 }
 
-/// The view of entry `i` if `generation` is still its own.
-#[cfg(windows)]
+/// The view the record words `i` and `generation` name: the one they hold
+/// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    match generation >> KIND_SHIFT {
+        0 => {
+            let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            let (view, current) = views.list.get(i as usize)?;
+            (*current == generation).then(|| view.clone())
+        }
+        CONSTANT => Some(constant_of(i, generation)),
+        PLACED => VIEWS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .placed_of(i, generation),
+        _ => None,
+    }
 }
 
 /// For each record (tag, index, generation): whether it names a view that
-/// is current, as [`view_at`] would find it (one lock for them all).
+/// is current, as [`view_at`] would find it (one lock for them all): a
+/// table entry at its own generation, a constant buffer view held whole, or
+/// a placed view held whole whose shape is known.
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     records
         .iter()
         .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+            tag == VIEW_TAG
+                && match generation >> KIND_SHIFT {
+                    0 => views.list.get(i as usize).is_some_and(|(_, at)| *at == generation),
+                    CONSTANT => true,
+                    PLACED => {
+                        ((payload(i, generation) >> PLACED_ADDRESS_BITS) as usize)
+                            < views.shapes.len()
+                    }
+                    _ => false,
+                }
         })
         .collect()
 }
@@ -561,9 +909,10 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    if tag != VIEW_TAG {
+        return None;
+    }
+    view_at(i, generation)
 }
 
 /// A description of `N` words, if the title passes one.
@@ -789,6 +1138,9 @@ pub(crate) extern "system" fn create_heap(
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        if desc.kind == VIEWS_KIND {
+            VIEW_SLOTS.fetch_max(desc.count, std::sync::atomic::Ordering::Relaxed);
+        }
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
@@ -964,6 +1316,187 @@ pub(crate) mod tests {
         assert_eq!(view(a), Some(View::Constant(0, 0)));
     }
 
+    /// Constant buffer views are named whole in their records: any address
+    /// a program can have, any size below 16 KiB, multiples of 256 bytes
+    /// up to 4 MiB; what does not fit says so.
+    #[test]
+    fn constant_views_fit_their_records() {
+        let top = (1u64 << CONSTANT_ADDRESS_BITS) - 1;
+        for address in [
+            0u64,
+            0x100,
+            0x2602_0000,
+            0xd_6b60_0000,
+            0x7ffd_a34f_0000,
+            top,
+        ] {
+            for size in [
+                0u32,
+                1,
+                255,
+                256,
+                4000,
+                (1 << 14) - 1,
+                1 << 14,
+                65536,
+                (1 << 22) - 256,
+            ] {
+                let [i, generation] = constant_words(address, size).expect("fits");
+                assert_eq!(generation >> KIND_SHIFT, CONSTANT);
+                assert_eq!(
+                    view_at(i, generation),
+                    Some(View::Constant(address, size)),
+                    "{address:#x} {size}"
+                );
+            }
+        }
+        assert_eq!(
+            constant_words(top + 1, 256),
+            None,
+            "an address past 47 bits"
+        );
+        assert_eq!(
+            constant_words(0x1000, (1 << 14) + 1),
+            None,
+            "16 KiB or more, no multiple of 256"
+        );
+        assert_eq!(constant_words(0x1000, 1 << 22), None, "4 MiB");
+        // Different views never share their words.
+        assert_ne!(constant_words(0x1000, 256), constant_words(0x1000, 512));
+        assert_ne!(constant_words(0x1000, 256), constant_words(0x1100, 256));
+        assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
+    }
+
+    /// A title that writes constant buffer views and views of placed memory
+    /// at ever new addresses adds nothing to the table; one shape stands
+    /// for all the placed views alike.
+    #[test]
+    fn views_at_new_addresses_add_no_entries() {
+        let null = std::ptr::null();
+        let slots = [0u64; 4];
+        let at = slots.as_ptr() as u64;
+        // A resource description and a view no other test uses.
+        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        let mine = |v: &View| match v {
+            View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
+            View::Placed(_, r, _) => *r == resource,
+            _ => false,
+        };
+        let entries = || {
+            VIEWS
+                .lock()
+                .unwrap()
+                .list
+                .iter()
+                .filter(|(v, _)| mine(v))
+                .count()
+        };
+        let shapes = || {
+            VIEWS
+                .lock()
+                .unwrap()
+                .shapes
+                .iter()
+                .filter(|s| s.1 == resource)
+                .count()
+        };
+        for n in 0..20_000u64 {
+            let address = 0x6_0000_0000 + n * 0x100;
+            create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
+            assert_eq!(view(at), Some(View::Constant(address, 512)));
+            let placed = 0xd_4940_0000 + n * 0x1_0000;
+            (desc[10], desc[11]) = (placed as u32, (placed >> 32) as u32);
+            create_placed_srv(null, &resource, &desc, at);
+            assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+        }
+        assert_eq!(entries(), 0, "no table entries");
+        assert_eq!(shapes(), 1, "one shape for 20,000 placed views");
+        // The same shape, unordered: another shape.
+        create_placed_uav(null, &resource, &desc, at);
+        assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
+        assert_eq!(shapes(), 2);
+        // Placed memory past 1 TiB (not title memory) is a table entry.
+        (desc[10], desc[11]) = (0, 0x100);
+        create_placed_srv(null, &resource, &desc, at);
+        assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+        assert_eq!(entries(), 1);
+        // A record's words are the same for the same view (the host knows
+        // a slot's view by them), and differ with the address.
+        // SAFETY: both handles are slots of 32 bytes above.
+        let words = |handle: u64| unsafe { *(handle as *const [u32; 3]) };
+        let other = [0u64; 4];
+        create_cbv(null, &[0x40, 6, 512, 0], at);
+        create_cbv(null, &[0x40, 6, 512, 0], other.as_ptr() as u64);
+        assert_eq!(words(at), words(other.as_ptr() as u64));
+        create_cbv(null, &[0x140, 6, 512, 0], other.as_ptr() as u64);
+        assert_ne!(words(at), words(other.as_ptr() as u64));
+    }
+
+    /// A table entry's generation, bumped each time its resource is
+    /// released, wraps below the kind bits: a released view's record never
+    /// reads as a constant or placed view, nor as the entry's next view.
+    #[test]
+    fn released_entries_keep_their_generations_below_the_kind_bits() {
+        let resource = 0x7_7e00_0000_usize;
+        let slot = [0u64; 4];
+        let at = slot.as_ptr() as u64;
+        record(at, View::Shader(resource, None));
+        // SAFETY: (both) the 32-byte slot above.
+        let words = || unsafe { *(at as *const [u32; 3]) };
+        let [_, i, _] = words();
+        {
+            // The entry at the last generation below the kind bits.
+            let mut views = VIEWS.lock().unwrap();
+            views.list[i as usize].1 = GENERATIONS;
+        }
+        record(at, View::Shader(resource, None));
+        assert_eq!(words()[2], GENERATIONS);
+        assert_eq!(view(at), Some(View::Shader(resource, None)));
+        forget(resource);
+        assert_eq!(view(at), None, "the released view's record is stale");
+        let generation = VIEWS.lock().unwrap().list[i as usize].1;
+        assert_eq!(generation, 1, "wrapped to 1, not into the kind bits");
+    }
+
+    /// Heap syncs ([`views_current`]) find current what [`view_at`] finds:
+    /// constant buffer and placed views held whole in their records as well
+    /// as live table entries; not released entries, unknown shapes or kinds,
+    /// nor records without the tag.
+    #[test]
+    fn views_held_whole_are_current_for_heap_syncs() {
+        let null = std::ptr::null();
+        let slots = [0u64; 4 * 4];
+        let at = |k: usize| slots.as_ptr() as u64 + k as u64 * 32;
+        // SAFETY: slot `k` of the 32-byte slots above.
+        let words = |k: usize| unsafe { *(at(k) as *const [u32; 3]) };
+        create_cbv(null, &[0x9_0000, 6, 512, 0], at(0));
+        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee1_0000 + k as u32);
+        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a71_0000 + k as u32);
+        (desc[10], desc[11]) = (0x4940_0000, 0xd);
+        create_placed_srv(null, &resource, &desc, at(1));
+        let released = 0x7_7f00_0000_usize;
+        record(at(2), View::Shader(released, None));
+        record(at(3), View::Shader(0x7_7f10_0000, None));
+        let mut records: Vec<[u32; 3]> = (0..4).map(words).collect();
+        assert_eq!(records[0][2] >> KIND_SHIFT, CONSTANT, "held whole");
+        assert_eq!(records[1][2] >> KIND_SHIFT, PLACED, "held whole");
+        forget(released);
+        // A placed view of a shape never numbered, a kind there is not, and
+        // a record without the tag.
+        let unknown = placed_words(SHAPES as u32 - 1, 0x4940_0000);
+        records.push([VIEW_TAG, unknown[0], unknown[1]]);
+        records.push([VIEW_TAG, 0, 3 << KIND_SHIFT | 1]);
+        records.push([0, records[0][1], records[0][2]]);
+        let current = views_current(&records);
+        let found: Vec<bool> = records
+            .iter()
+            .map(|&[tag, i, generation]| tag == VIEW_TAG && view_at(i, generation).is_some())
+            .collect();
+        assert_eq!(current, found);
+        assert_eq!(current, [true, true, false, true, false, false, false]);
+    }
+
     /// A released resource's views go stale; the same view of a new
     /// resource at the same address is a new record.
     #[test]
@@ -1054,5 +1587,61 @@ pub(crate) mod tests {
             release(h);
             assert!(queued, "the descriptor write reached the heap at the reused address");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn null_rtv_and_dsv_descs_match_resource_dimension_and_msaa() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+
+        let make_res = |dim, depth_or_array, samples| D3D12_RESOURCE_DESC {
+            Dimension: dim,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: depth_or_array,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: samples,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let fmt = DXGI_FORMAT(29);
+        let dfmt = DXGI_FORMAT(40);
+
+        let rtv_ms = default_rtv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1, 4), fmt);
+        assert_eq!(rtv_ms.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DMS);
+
+        let rtv_ms_arr = default_rtv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 4), fmt);
+        assert_eq!(rtv_ms_arr.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY);
+        // SAFETY: ViewDimension is TEXTURE2DMSARRAY.
+        assert_eq!(unsafe { rtv_ms_arr.Anonymous.Texture2DMSArray.ArraySize }, 4);
+
+        let rtv_arr = default_rtv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 6, 1), fmt);
+        assert_eq!(rtv_arr.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: ViewDimension is TEXTURE2DARRAY.
+        assert_eq!(unsafe { rtv_arr.Anonymous.Texture2DArray.ArraySize }, 6);
+
+        let rtv_3d = default_rtv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 8, 1), fmt);
+        assert_eq!(rtv_3d.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE3D);
+        // SAFETY: ViewDimension is TEXTURE3D.
+        assert_eq!(unsafe { rtv_3d.Anonymous.Texture3D.WSize }, u32::MAX);
+
+        let rtv_1d_arr = default_rtv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE1D, 3, 1), fmt);
+        assert_eq!(rtv_1d_arr.ViewDimension, D3D12_RTV_DIMENSION_TEXTURE1DARRAY);
+        // SAFETY: ViewDimension is TEXTURE1DARRAY.
+        assert_eq!(unsafe { rtv_1d_arr.Anonymous.Texture1DArray.ArraySize }, 3);
+
+        let dsv_ms = default_dsv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1, 4), dfmt);
+        assert_eq!(dsv_ms.ViewDimension, D3D12_DSV_DIMENSION_TEXTURE2DMS);
+
+        let dsv_arr = default_dsv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 4, 1), dfmt);
+        assert_eq!(dsv_arr.ViewDimension, D3D12_DSV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: ViewDimension is TEXTURE2DARRAY.
+        assert_eq!(unsafe { dsv_arr.Anonymous.Texture2DArray.ArraySize }, 4);
+
+        let dsv_1d = default_dsv_desc(&make_res(D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1, 1), dfmt);
+        assert_eq!(dsv_1d.ViewDimension, D3D12_DSV_DIMENSION_TEXTURE1D);
     }
 }

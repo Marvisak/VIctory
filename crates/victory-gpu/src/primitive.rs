@@ -11,35 +11,56 @@
 //! components past the end of the vertex (an element that reaches into the
 //! next one, which the layout allows).
 
-/// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
-/// vertices each in `dst`: `(v0, v1, v2)` and `(va, vb, v3)`, so both
-/// triangles turn the same way, with the right angle `vc` picked from the
-/// first float element of two or more components (taken as the position;
-/// none: at `v1`), `va` before it, `vb` after it and `v3 = va + vb - vc`.
-/// `elements` are (byte offset, format).
-pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+/// Picks a corner for each rectangle from the first usable float position
+/// in a vertex stream. Other streams of the draw share these corners.
+pub(crate) fn rectangle_corners(
+    src: &[u8],
+    stride: usize,
+    elements: &[(u32, u32)],
+) -> Option<Vec<u8>> {
+    let (offset, kind) = elements.iter().find_map(|&(offset, format)| {
+        let offset = offset as usize;
+        let (n, kind) = components(format)?;
+        let float = matches!(kind, Kind::F32 | Kind::F16);
+        (float && n >= 2 && stride.saturating_sub(offset) / kind.bytes() >= 2)
+            .then_some((offset, kind))
+    })?;
+    let corners = src
+        .chunks_exact(stride.checked_mul(3)?)
+        .map(|rect| {
+            let xy = [0, 1, 2].map(|i| {
+                let at = i * stride + offset;
+                [0, 1].map(|k| kind.read(&rect[at..], k))
+            });
+            victory_shader::emit::right_angle(xy) as u8
+        })
+        .collect();
+    Some(corners)
+}
+
+/// Expands each rectangle into two triangles using the draw's corner order.
+/// The first triangle is (v0, v1, v2), and the second is (va, vb, va + vb - vc)
+/// around right angle vc. Without a position to choose from, vc is v1.
+pub(crate) fn expand_rects_with_corners(
+    src: &[u8],
+    dst: &mut [u8],
+    stride: usize,
+    elements: &[(u32, u32)],
+    corners: &[u8],
+) {
     if stride == 0 {
         return;
     }
     let (Some(in_rect), Some(out_rect)) = (stride.checked_mul(3), stride.checked_mul(6)) else {
         return;
     };
-    for (rect, out) in src
+    for (i, (rect, out)) in src
         .chunks_exact(in_rect)
         .zip(dst.chunks_exact_mut(out_rect))
+        .enumerate()
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
-        let right = elements
-            .iter()
-            .find_map(|&(offset, format)| {
-                let at = offset as usize;
-                let (n, kind) = components(format)?;
-                let float = matches!(kind, Kind::F32 | Kind::F16);
-                (float && n >= 2 && stride.saturating_sub(at) / kind.bytes() >= 2).then(|| {
-                    victory_shader::emit::right_angle([0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k))))
-                })
-            })
-            .unwrap_or(1);
+        let right = usize::from(corners.get(i).copied().unwrap_or(1));
         let (a, b) = ((right + 2) % 3, (right + 1) % 3);
         for (slot, i) in [0, 1, 2, a, b].into_iter().enumerate() {
             out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i));
@@ -160,6 +181,9 @@ fn f32_to_half(v: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let man = bits & 0x7f_ffff;
+    if v.is_nan() {
+        return sign | 0x7e00 | (man >> 13) as u16;
+    }
     if exp >= 31 {
         return sign | 0x7c00; // too large: infinity
     }
@@ -181,12 +205,39 @@ fn f32_to_half(v: f32) -> u16 {
     // Rounded to nearest: a carry out of the mantissa is added into the
     // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    // At an exact midpoint, only increment an odd retained mantissa.
+    let rounding_bias = 0xfff + ((man >> 13) & 1);
+    sign | (half + ((man + rounding_bias) >> 13)) as u16
+}
+
+#[cfg(test)]
+fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+    let corners = rectangle_corners(src, stride, elements).unwrap_or_default();
+    expand_rects_with_corners(src, dst, stride, elements, &corners);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn half_midpoints_round_to_the_even_neighbour() {
+        for lower in 0u16..0x7bff {
+            let midpoint = (half_to_f32(lower) + half_to_f32(lower + 1)) * 0.5;
+            let even = lower + (lower & 1);
+            assert_eq!(f32_to_half(midpoint), even);
+            assert_eq!(f32_to_half(-midpoint), even | 0x8000);
+        }
+    }
+
+    #[test]
+    fn half_nan_attributes_remain_nan() {
+        for bits in [0x7f80_0001, 0x7fc0_0000, 0xffc0_0000] {
+            let half = f32_to_half(f32::from_bits(bits));
+            assert!(half_to_f32(half).is_nan());
+            assert_eq!(u32::from(half >> 15), bits >> 31);
+        }
+    }
 
     /// A rectangle of float2 positions and RGBA8 colors, given as top
     /// left, bottom left, bottom right: the fourth corner completes the
