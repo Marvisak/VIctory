@@ -628,7 +628,9 @@ impl State {
         // the title binds none (the BVH builder's dispatches may not).
         let memory_heap = self.heaps[0] == 0
             && p.stages.iter().any(|s| s.memory.is_some() || has_root_views(&s.translated().host));
-        self.bind_heaps(list, memory_heap);
+        if !self.bind_heaps(list, memory_heap) {
+            return false;
+        }
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
@@ -1000,7 +1002,7 @@ impl State {
     }
 
     /// Gives the host list the title's heaps if it has others.
-    fn bind_heaps(&mut self, list: &HostList, memory_heap: bool) {
+    fn bind_heaps(&mut self, list: &HostList, memory_heap: bool) -> bool {
         let want = Self::wanted(self.heaps, memory_heap);
         if self.host_heaps != want {
             let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
@@ -1014,22 +1016,26 @@ impl State {
                 heaps.insert(0, Some(h.heap.clone()));
             }
             if want[1] == SAMPLERS_OURS {
-                match crate::descriptor::fallback_samplers() {
+                match fallback_samplers_for_bind() {
                     Some(h) => {
                         tracing::debug!("the title binds no sampler heap: binding ours");
                         heaps.push(Some(h.heap.clone()));
                     }
                     None => {
                         once!("no sampler heap of ours to bind");
+                        return false;
                     }
                 }
             }
             heaps.iter().flatten().for_each(|h| list.keep(h));
+            #[cfg(test)]
+            HEAP_BIND_CALLS.set(HEAP_BIND_CALLS.get() + 1);
             // SAFETY: an open list and shader-visible heaps.
             unsafe { list.list.SetDescriptorHeaps(&heaps) };
             self.host_heaps = want;
             self.host_roots = [0; 2];
         }
+        true
     }
 
     /// `ClearUnorderedAccessViewUint` or `...Float` (`float`): the view the
@@ -1076,7 +1082,9 @@ impl State {
             slot: 0,
         };
         readable(list, &written, &view, false);
-        self.bind_heaps(list, false);
+        if !self.bind_heaps(list, false) {
+            return;
+        }
         list.keep(&resource);
         let gpu = visible.gpu(slot);
         // SAFETY: an open list; both slots view the live resource.
@@ -2008,6 +2016,20 @@ fn describe(view: Option<&View>) -> String {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_FALLBACK_SAMPLERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static HEAP_BIND_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn fallback_samplers_for_bind() -> Option<&'static crate::descriptor::host::HostHeap> {
+    #[cfg(test)]
+    if FAIL_FALLBACK_SAMPLERS.get() {
+        return None;
+    }
+    crate::descriptor::fallback_samplers()
+}
+
 /// A user-data entry that takes the heap index of a root view's view.
 fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
@@ -2028,6 +2050,20 @@ const QUAD_STRIP: u32 = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_fallback_sampler_does_not_record_heap_binding() {
+        let host = crate::host::host().expect("host device");
+        let list = host.new_list().expect("host list");
+        let mut state = State::default();
+        let before = state.host_heaps;
+        HEAP_BIND_CALLS.set(0);
+        FAIL_FALLBACK_SAMPLERS.set(true);
+        assert!(!state.bind_heaps(&list, false));
+        FAIL_FALLBACK_SAMPLERS.set(false);
+        assert_eq!(HEAP_BIND_CALLS.get(), 0, "must not bind an incomplete heap set");
+        assert_eq!(state.host_heaps, before, "failed fallback must not be recorded as bound");
+    }
 
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title
