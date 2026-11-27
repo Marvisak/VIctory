@@ -116,14 +116,19 @@ impl Port {
         port
     }
 
-    fn submit(&self, task: Task) {
-        match self.mode {
-            Mode::Immediate => task.run(false),
-            Mode::ThreadPool => POOL.submit(task),
-            Mode::Manual | Mode::Serialized => {
-                lock(&self.tasks).push_back(task);
-                self.ready.notify_one();
-            }
+    fn submit(self: &Arc<Self>, task: Task) {
+        if self.mode == Mode::Immediate {
+            task.run(false);
+            return;
+        }
+        // Queued on the port whatever its mode, so `XTaskQueueDispatch`
+        // can run it too; a thread-pool port also gives the pool a turn,
+        // which runs the port's first task unless a dispatch took it.
+        lock(&self.tasks).push_back(task);
+        self.ready.notify_one();
+        if self.mode == Mode::ThreadPool {
+            let port = Arc::into_raw(self.clone());
+            POOL.submit(Task::new(port.cast_mut().cast(), run_first));
         }
     }
 
@@ -144,6 +149,17 @@ impl Port {
                 .0
         };
         tasks.pop_front()
+    }
+}
+
+/// A pool thread's turn at a thread-pool port (one per task submitted to
+/// it): runs the port's first task, or nothing if dispatches took them all.
+extern "system" fn run_first(port: *mut c_void, _canceled: bool) {
+    // SAFETY: `Arc::into_raw` of the port in `Port::submit`, given up here.
+    let port = unsafe { Arc::from_raw(port.cast_const().cast::<Port>()) };
+    let task = lock(&port.tasks).pop_front();
+    if let Some(task) = task {
+        task.run(false);
     }
 }
 
@@ -353,9 +369,13 @@ pub fn XTaskQueueCloseHandle(handle: *const Queue) {
     }
 }
 
-/// Runs one queued callback of a manual port; false if none came in time,
-/// or none can come: the queue was terminated (which ends a wait under way,
-/// as a dispatcher thread's loop expects).
+/// Runs one queued callback of the port on the calling thread; false if
+/// none came in time, or none can come: the queue was terminated (which ends
+/// a wait under way, as a dispatcher thread's loop expects). Any dispatch
+/// mode, as documented ("XTaskQueueDispatch can be called for any dispatch
+/// mode"): a thread-pool or serialized port's callback that no thread of
+/// its own has started yet runs here, and the timeout is waited out on every
+/// port (an immediate port never queues one).
 pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> bool {
     let Some(queue) = queue(handle) else {
         return false;
@@ -363,9 +383,6 @@ pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> b
     let Some(port) = queue.ports.get(port as usize) else {
         return false;
     };
-    if port.mode != Mode::Manual {
-        return false;
-    }
     match port.take(timeout_ms, || queue.terminated.load(Ordering::Acquire)) {
         Some(task) => {
             task.run(false);
@@ -1701,5 +1718,96 @@ mod tests {
         assert_eq!(SEEN.load(Ordering::SeqCst), 1, "cleanup ran under the lock");
         assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
         *CLEANED.lock().unwrap() = None;
+    }
+
+    /// `XTaskQueueDispatch` "can be called for any dispatch mode" (its
+    /// documentation): a callback that the port's own thread has not
+    /// started runs on the dispatching thread.
+    #[test]
+    fn dispatch_runs_a_serialized_ports_callback_on_the_calling_thread() {
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        static RAN_ON: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+        /// Keeps the port's own thread busy until the test is done.
+        extern "system" fn hold(_: *mut c_void, _: bool) {
+            STARTED.store(true, Ordering::SeqCst);
+            let start = std::time::Instant::now();
+            while !RELEASE.load(Ordering::SeqCst) && start.elapsed().as_secs() < 10 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        extern "system" fn note_thread(_: *mut c_void, _: bool) {
+            *lock(&RAN_ON) = Some(std::thread::current().id());
+        }
+        let mut q = std::ptr::null();
+        // Work serialized on a thread of the port's own.
+        assert_eq!(XTaskQueueCreate(2, 0, &mut q), S_OK);
+        let none = std::ptr::null_mut();
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 0, none, Some(hold)),
+            S_OK
+        );
+        let start = std::time::Instant::now();
+        while !STARTED.load(Ordering::SeqCst) {
+            assert!(
+                start.elapsed().as_secs() < 10,
+                "the port's thread never ran"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // That thread is busy, so the next callback waits in the port.
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 0, none, Some(note_thread)),
+            S_OK
+        );
+        let dispatched = XTaskQueueDispatch(q, WORK, 0);
+        RELEASE.store(true, Ordering::SeqCst);
+        assert!(dispatched, "the serialized port's waiting callback");
+        assert_eq!(*lock(&RAN_ON), Some(std::thread::current().id()));
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// The timeout is how long a dispatch waits for work to arrive, on
+    /// every port, not only on manual ones.
+    #[test]
+    fn dispatch_waits_its_timeout_on_a_thread_pool_port() {
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        let start = std::time::Instant::now();
+        assert!(!XTaskQueueDispatch(q, COMPLETION, 200));
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(150),
+            "returned after {waited:?}"
+        );
+        XTaskQueueCloseHandle(q);
+    }
+
+    /// A thread-pool port's callbacks run once each, on the pool or on a
+    /// thread dispatching the port, whichever takes them first.
+    #[test]
+    fn thread_pool_callbacks_run_once_wherever_they_run() {
+        static RUNS: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn run(_: *mut c_void, _: bool) {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        let none = std::ptr::null_mut();
+        for _ in 0..64 {
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(q, WORK, 0, none, Some(run)),
+                S_OK
+            );
+            XTaskQueueDispatch(q, WORK, 0);
+        }
+        let start = std::time::Instant::now();
+        while RUNS.load(Ordering::SeqCst) < 64 && start.elapsed().as_secs() < 10 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // None runs twice.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(RUNS.load(Ordering::SeqCst), 64);
+        XTaskQueueCloseHandle(q);
     }
 }
