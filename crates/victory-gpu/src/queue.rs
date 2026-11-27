@@ -7,6 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
+#[cfg(windows)]
+mod behind;
+
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
         0x0ec870a6,
@@ -120,6 +123,10 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if crate::host::host().is_some() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        if behind::on() && !this.is_null() {
+            behind::submit(this, lists);
+            return;
+        }
         let mut held = held();
         for &l in lists {
             for segment in crate::list::segments(l) {
@@ -162,6 +169,54 @@ static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(crate::hold::Held
 #[cfg(windows)]
 fn held() -> std::sync::MutexGuard<'static, Holding> {
     HELD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether submissions go into the lane of our thread (`behind`).
+#[cfg(windows)]
+pub(crate) fn line_on() -> bool {
+    behind::on()
+}
+
+/// A recording was translated: the lane may have work it was standing at.
+#[cfg(windows)]
+pub(crate) fn line_moved() {
+    behind::wake();
+}
+
+/// This thread does work the lane waits for: it must not drain the lane.
+#[cfg(windows)]
+pub(crate) fn no_drain_here() {
+    behind::no_drain_here();
+}
+
+/// Before work by us that must see the title's submissions done.
+#[cfg(windows)]
+pub(crate) fn before_sync() {
+    if behind::on() {
+        behind::drain();
+    }
+}
+
+/// Submissions and presents the host has not begun.
+#[cfg(windows)]
+pub(crate) fn queued() -> u64 {
+    behind::queued()
+}
+
+/// For the frame-rate line.
+#[cfg(windows)]
+pub(crate) fn behind_line() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if behind::on() {
+        let now = FRAMES.load(Ordering::Relaxed);
+        let frames = now.saturating_sub(LAST.swap(now, Ordering::Relaxed)) as f64;
+        if frames > 0.0 {
+            let queued = queued();
+            crate::list::thin::line(frames);
+            behind::line(frames);
+            tracing::debug!(queued, "submissions and presents not begun by the host");
+        }
+    }
 }
 
 /// Runs held work that may run now (`why` for the frame line).
@@ -253,6 +308,12 @@ fn read_value(address: u64, bytes: u8) -> Option<u64> {
     crate::host::read_into(address as *const u8, &mut value[..usize::from(bytes.min(8))]).then(|| u64::from_le_bytes(value))
 }
 
+/// Whether a memory wait recorded by a list holds now.
+#[cfg(windows)]
+fn value_met(wait: &crate::hold::ValueWait) -> bool {
+    wait.holds(&read_value).unwrap_or(true)
+}
+
 /// A queue's type, for logs (0 graphics, 2 compute, 3 copy). Titles do not
 /// release queues that hold work.
 #[cfg(windows)]
@@ -286,6 +347,7 @@ fn account() -> std::sync::MutexGuard<'static, Account> {
 /// and what is still held at the present, with the waits that do not hold.
 #[cfg(windows)]
 fn account_frame(frame: u64) {
+    behind_line();
     let (cuts, early) = crate::list::take_cuts();
     let (fence_waits, fence_waited) = crate::fence::take_waited();
     let a = std::mem::take(&mut *account());
@@ -379,6 +441,11 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         return E_INVALIDARG;
     }
     #[cfg(windows)]
+    if behind::on() && !this.is_null() {
+        behind::signal(this, fence, value);
+        return S_OK;
+    }
+    #[cfg(windows)]
     {
         let mut held = held();
         if held.holds_work(this as usize) {
@@ -404,6 +471,11 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    if behind::on() && !this.is_null() {
+        behind::wait(this, fence, value);
+        return S_OK;
     }
     #[cfg(windows)]
     if crate::host::host().is_some() && crate::fence::value(fence) < value {
@@ -475,17 +547,48 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// What a presented frame still has to do when the lane shows it.
+#[cfg(windows)]
+pub(super) struct Shown {
+    pub(super) frame: u64,
+    pub(super) resource: This,
+    pub(super) state: u32,
+    pub(super) restore: Vec<(This, u32)>,
+}
+
+/// Shows the resources the lane kept for a frame, on our window.
+#[cfg(windows)]
+pub(super) fn show(
+    texture: &[(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)],
+    shown: Shown,
+) {
+    let Shown { frame, resource, state, restore } = shown;
+    if let Some(host) = crate::host::host() {
+        let sources: Vec<(&_, u32)> = texture.iter().map(|(tex, state)| (tex, *state)).collect();
+        let result = host.present(&sources, frame);
+        for (resource, state) in restore {
+            crate::resource::host_transition(resource, state);
+        }
+        #[cfg(feature = "diagnostics")]
+        blinks(frame, resource, state, result);
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = (resource, state, result);
+    }
+}
+
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
 /// Shows the first resource of each presented plane in our window.
 extern "system" fn present(
-    _: This,
+    this: This,
     planes: u32,
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(not(windows))]
+    let _ = this;
     // What may run before the frame is shown does.
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
@@ -563,20 +666,40 @@ extern "system" fn present(
             }
         }
         if !resources.is_empty() {
-            let sources: Vec<(&_, u32)> = resources
+            let texture: Vec<_> = resources
                 .iter()
-                .map(|(_, tex, state, _)| (tex, *state))
+                .map(|(_, tex, state, _)| (tex.clone(), *state))
                 .collect();
-            let shown = host.present(&sources, frame);
-            for &(resource, _, state, first) in &resources {
-                if first {
-                    crate::resource::host_transition(resource, state);
+            if behind::on() && !this.is_null() {
+                let restore = resources
+                    .iter()
+                    .filter(|(_, _, _, first)| *first)
+                    .map(|&(resource, _, state, _)| (resource, state))
+                    .collect();
+                let shown = Shown {
+                    frame,
+                    resource: resources[0].0,
+                    state: resources[0].2,
+                    restore,
+                };
+                let _ = &host;
+                behind::present(this, texture, shown);
+            } else {
+                let sources: Vec<(&_, u32)> = texture
+                    .iter()
+                    .map(|(tex, state)| (tex, *state))
+                    .collect();
+                let shown = host.present(&sources, frame);
+                for &(resource, _, state, first) in &resources {
+                    if first {
+                        crate::resource::host_transition(resource, state);
+                    }
                 }
+                #[cfg(feature = "diagnostics")]
+                blinks(frame, resources[0].0, resources[0].2, shown);
+                #[cfg(not(feature = "diagnostics"))]
+                let _ = shown;
             }
-            #[cfg(feature = "diagnostics")]
-            blinks(frame, resources[0].0, resources[0].2, shown);
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = shown;
         }
     }
     #[cfg(not(windows))]

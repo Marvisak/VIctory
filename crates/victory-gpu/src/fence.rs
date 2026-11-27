@@ -89,6 +89,8 @@ extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
+    #[cfg(windows)]
+    crate::queue::before_sync();
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
@@ -111,6 +113,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 /// may run now (`crate::hold`).
 extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let hr = set(this, value);
+    #[cfg(windows)]
+    crate::queue::line_moved();
     crate::queue::pump_held(crate::queue::Why::Fence);
     hr
 }

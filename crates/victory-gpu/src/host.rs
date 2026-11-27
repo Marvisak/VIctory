@@ -305,6 +305,28 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+/// Whether the adapter driving our device has at most 8 GiB of its own
+/// memory: one of the reasons list translation starts fewer threads.
+#[cfg(windows)]
+pub(crate) fn low_vram() -> bool {
+    let Some(host) = host() else { return false };
+    // SAFETY: plain queries on our device and the system's adapters.
+    unsafe {
+        let luid = host.device.GetAdapterLuid();
+        let Ok(factory): Result<IDXGIFactory4, _> = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return false;
+        };
+        for i in 0..64 {
+            let Ok(adapter) = factory.EnumAdapters1(i) else { break };
+            let Ok(desc) = adapter.GetDesc1() else { continue };
+            if desc.AdapterLuid.LowPart == luid.LowPart && desc.AdapterLuid.HighPart == luid.HighPart {
+                return desc.DedicatedVideoMemory <= 8 * (1 << 30);
+            }
+        }
+    }
+    false
+}
+
 /// Diagnostics, `VICTORY_GPU_TIMING`: GPU time per kind of command and
 /// pipeline (ms, commands) and lists' wall time against the sum of their
 /// commands' (ms), since the last frame-rate line.

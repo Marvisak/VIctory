@@ -18,6 +18,9 @@ use crate::object::{
 use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
+#[cfg(windows)]
+pub(crate) mod thin;
+
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
         0x6102dee4,
@@ -126,6 +129,10 @@ struct List {
     segment: std::sync::atomic::AtomicUsize,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+    /// With `VICTORY_THIN=1`, the calls the title wrote down instead of
+    /// recording them here at once.
+    #[cfg(windows)]
+    thin: thin::Front,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -169,6 +176,31 @@ pub(crate) fn segments(this: This) -> Vec<std::sync::Arc<crate::host::HostList>>
     let k = list.segment.load(std::sync::atomic::Ordering::Relaxed);
     let hosts = list.hosts.lock().unwrap_or_else(|e| e.into_inner());
     hosts.iter().take(k + 1).cloned().collect()
+}
+
+/// A submission split at its lists' waits: what the queue stands at, then
+/// the host lists that run once it holds.
+#[cfg(windows)]
+pub(crate) type Parts = Vec<(Vec<crate::hold::ValueWait>, Vec<std::sync::Arc<crate::host::HostList>>)>;
+
+/// Takes the host lists of `lists` in order, split at the waits recorded
+/// after commands. The title lists keep their own handles; a reset or
+/// release while a part is held gives it a fresh host list ([`restart`]).
+#[cfg(windows)]
+pub(crate) fn detach_parts(lists: &[This]) -> Parts {
+    let mut parts: Parts = Vec::new();
+    for &l in lists {
+        for segment in segments(l) {
+            let waits = segment.waits();
+            if waits.is_empty() && !parts.is_empty() {
+                parts.last_mut().unwrap().1.push(segment);
+            } else {
+                parts.push((waits, vec![segment]));
+            }
+        }
+    }
+    parts.retain(|(_, taken)| !taken.is_empty());
+    parts
 }
 
 /// Waits recorded after commands: the title list goes on in a new host
@@ -367,11 +399,33 @@ fn new_list(
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
-    let list = Box::new(List {
-        object: if crate::device::newer() {
-            Object::new(&NEWER_LIST_FUNCTIONS)
-        } else {
-            Object::new(&LIST_FUNCTIONS)
+    #[cfg(windows)]
+    if thin::on() {
+        let mut list = boxed(kind, pipeline, true);
+        list.thin.begin(kind, pipeline);
+        return object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    }
+    let hr = object::hand_out(LIST, boxed(kind, pipeline, false), iid, &LIST_IIDS, out);
+    if hr == S_OK {
+        crate::pipeline::bound(pipeline);
+    }
+    hr
+}
+
+/// A list, whose calls are written down when `thin` is set.
+fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
+    #[cfg(not(windows))]
+    let _ = thin;
+    Box::new(List {
+        object: match (crate::device::newer(), thin) {
+            (true, false) => Object::new(&NEWER_LIST_FUNCTIONS),
+            (false, false) => Object::new(&LIST_FUNCTIONS),
+            #[cfg(windows)]
+            (true, true) => Object::new(&NEWER_THIN_FUNCTIONS),
+            #[cfg(windows)]
+            (false, true) => Object::new(&THIN_FUNCTIONS),
+            #[cfg(not(windows))]
+            _ => Object::new(&LIST_FUNCTIONS),
         },
         kind,
         put: [0; 5],
@@ -384,6 +438,7 @@ fn new_list(
         #[cfg(windows)]
         hosts: std::sync::Mutex::new(
             crate::host::host()
+                .filter(|_| !thin)
                 .and_then(|h| match h.new_list() {
                     Ok(list) => Some(std::sync::Arc::new(list)),
                     Err(e) => {
@@ -402,12 +457,9 @@ fn new_list(
             state.set_pipeline(pipeline);
             std::sync::Mutex::new(state)
         },
-    });
-    let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
-    if hr == S_OK {
-        crate::pipeline::bound(pipeline);
-    }
-    hr
+        #[cfg(windows)]
+        thin: thin::Front::default(),
+    })
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -1854,6 +1906,11 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+/// Lists whose calls are written down for the translating threads.
+#[cfg(windows)]
+static THIN_FUNCTIONS: Table<160> = Table(thin::table(false));
+#[cfg(windows)]
+static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 
 #[cfg(all(test, windows))]
 pub(crate) fn has_newer_table(list: This) -> bool {
