@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{E_OUTOFMEMORY, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
@@ -429,6 +429,63 @@ pub(crate) mod tests {
     }
 
     use super::*;
+    use windows::Win32::Foundation::E_INVALIDARG;
+
+    /// A forced out-of-memory reset gets one more attempt with a fresh
+    /// prelude; other errors, and a failure to replace, do not.
+    #[test]
+    fn prelude_reset_retries_only_out_of_memory() {
+        use std::cell::Cell;
+
+        for (code, attempts_wanted, replaces_wanted, recovered) in [
+            (E_OUTOFMEMORY, 2, 1, true),
+            (E_INVALIDARG, 1, 0, false),
+        ] {
+            let attempts = Cell::new(0);
+            let replaces = Cell::new(0);
+            let mut unused = ();
+            let result: windows::core::Result<()> = record_with_retry(
+                &mut unused,
+                |_| {
+                    let n = attempts.get() + 1;
+                    attempts.set(n);
+                    if n == 1 {
+                        Err(windows::core::Error::new(code, "forced reset error"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| {
+                    replaces.set(replaces.get() + 1);
+                    true
+                },
+            );
+            assert_eq!(result.is_ok(), recovered);
+            assert_eq!(attempts.get(), attempts_wanted);
+            assert_eq!(replaces.get(), replaces_wanted);
+            if let Err(e) = result {
+                assert_eq!(e.code(), code);
+            }
+        }
+
+        let attempts = Cell::new(0);
+        let replaces = Cell::new(0);
+        let mut unused = ();
+        let result: windows::core::Result<()> = record_with_retry(
+            &mut unused,
+            |_| {
+                attempts.set(attempts.get() + 1);
+                Err(windows::core::Error::new(E_OUTOFMEMORY, "first"))
+            },
+            |_| {
+                replaces.set(replaces.get() + 1);
+                false
+            },
+        );
+        assert_eq!(result.unwrap_err().code(), E_OUTOFMEMORY);
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(replaces.get(), 1);
+    }
 
     /// Shaders that use title memory mark their reads in their own bitmap:
     /// read marks of both bitmaps are taken, each slot once until it is
@@ -782,6 +839,62 @@ pub(crate) mod tests {
     }
 }
 
+/// The command list that records a submission's state transitions, and its
+/// allocator. Kept separately so an allocator that runs out of memory can be
+/// replaced without rebuilding the list that carries the submission's work.
+struct Prelude {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+}
+
+impl Prelude {
+    /// Resets the list, records `commands` into it, and closes it.
+    fn record(
+        &self,
+        commands: &impl Fn(&ID3D12GraphicsCommandList) -> windows::core::Result<()>,
+    ) -> windows::core::Result<()> {
+        // SAFETY: the prelude is not executing, and the resources it names
+        // are live for this submission.
+        unsafe {
+            self.allocator.Reset()?;
+            self.list.Reset(&self.allocator, None)?;
+            commands(&self.list)?;
+            self.list.Close()
+        }
+    }
+}
+
+fn new_prelude(device: &ID3D12Device) -> windows::core::Result<Prelude> {
+    // SAFETY: plain object creation.
+    unsafe {
+        let allocator: ID3D12CommandAllocator =
+            device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+        let list: ID3D12GraphicsCommandList =
+            device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+        list.Close()?;
+        Ok(Prelude { allocator, list })
+    }
+}
+
+/// Only an out-of-memory reset is worth repeating with a fresh allocator.
+fn retryable_reset_error(error: &windows::core::Error) -> bool {
+    error.code() == E_OUTOFMEMORY
+}
+
+/// Runs `record` once more with a fresh prelude if the first attempt ran out
+/// of memory and a replacement could be made.
+fn record_with_retry<T, P>(
+    prelude: &mut P,
+    mut record: impl FnMut(&P) -> windows::core::Result<T>,
+    mut replace: impl FnMut(&mut P) -> bool,
+) -> windows::core::Result<T> {
+    let first = record(prelude);
+    match &first {
+        Err(e) if retryable_reset_error(e) && replace(prelude) => record(prelude),
+        _ => first,
+    }
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -812,8 +925,9 @@ pub(crate) struct HostList {
     /// The draw or dispatch being recorded runs a program using title
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
-    /// The list that runs those transitions just before this one.
-    prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    /// The list that runs those transitions just before this one. Replaced
+    /// if its allocator cannot be reset because memory runs out.
+    prelude: Mutex<Prelude>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// Which list this is, for the name that tells it apart in device-removed
@@ -1114,16 +1228,6 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude_allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let prelude: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &prelude_allocator,
-                None,
-            )?;
-            prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
             Ok(HostList {
@@ -1137,7 +1241,7 @@ impl Host {
                 rebind: false.into(),
                 ours: false.into(),
                 memory_writer: false.into(),
-                prelude: (prelude_allocator, prelude),
+                prelude: Mutex::new(new_prelude(&self.device)?),
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
@@ -1243,7 +1347,7 @@ impl Host {
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(&self.device) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -1919,7 +2023,7 @@ impl HostList {
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude(&self, device: &ID3D12Device) -> Option<ID3D12CommandList> {
         // Depth textures and their twins first, from their real states and
         // back: the side each first use needs, made newer.
         let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
@@ -1948,45 +2052,57 @@ impl HostList {
             left();
             return None;
         }
-        let (allocator, list) = &self.prelude;
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
-        let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
-                for (depth, to_depth) in &copies {
-                    let Some(Some(twin)) = depth.twin.get() else { continue };
-                    // From each texture's real state to the copy's and back.
-                    let mut back = Vec::new();
-                    twin.copy(list, depth, *to_depth, &mut |t, wanted| {
-                        let real = t.state.load(Ordering::Relaxed);
-                        let wanted = legal_state(&t.texture, wanted);
-                        (real != wanted).then(|| {
-                            let there = transition(&t.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(wanted as i32));
-                            back.push(transition(
-                                &t.texture,
-                                D3D12_RESOURCE_STATES(wanted as i32),
-                                D3D12_RESOURCE_STATES(real as i32),
-                            ));
-                            there
-                        })
-                    });
-                    if !back.is_empty() {
-                        list.ResourceBarrier(&back);
-                    }
+        let commands = |list: &ID3D12GraphicsCommandList| -> windows::core::Result<()> {
+            for (depth, to_depth) in &copies {
+                let Some(Some(twin)) = depth.twin.get() else { continue };
+                // From each texture's real state to the copy's and back.
+                let mut back = Vec::new();
+                twin.copy(list, depth, *to_depth, &mut |t, wanted| {
+                    let real = t.state.load(Ordering::Relaxed);
+                    let wanted = legal_state(&t.texture, wanted);
+                    (real != wanted).then(|| {
+                        let there = transition(&t.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(wanted as i32));
+                        back.push(transition(
+                            &t.texture,
+                            D3D12_RESOURCE_STATES(wanted as i32),
+                            D3D12_RESOURCE_STATES(real as i32),
+                        ));
+                        there
+                    })
+                });
+                if !back.is_empty() {
+                    // SAFETY: an open list and resources the list holds.
+                    unsafe { list.ResourceBarrier(&back) };
                 }
-                let barriers = moves();
-                if !barriers.is_empty() {
-                    list.ResourceBarrier(&barriers);
-                }
-                list.Close()
-            })
+            }
+            let barriers = moves();
+            if !barriers.is_empty() {
+                // SAFETY: an open list and resources the list holds.
+                unsafe { list.ResourceBarrier(&barriers) };
+            }
+            Ok(())
         };
+        let mut prelude = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
+        let recorded = record_with_retry(
+            &mut *prelude,
+            |p| p.record(&commands),
+            |p| match new_prelude(device) {
+                Ok(fresh) => {
+                    // The old list is not executing; drop its allocator
+                    // rather than let one out-of-memory reset end the run.
+                    // SAFETY: the old list is open and was never submitted.
+                    let _ = unsafe { p.list.Close() };
+                    *p = fresh;
+                    true
+                }
+                Err(_) => false,
+            },
+        );
         left();
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
-        list.cast().ok()
+        prelude.list.cast().ok()
     }
 
     /// Notes what the command about to be recorded does, as a marker
