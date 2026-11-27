@@ -112,9 +112,14 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     });
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
-    let tick = (c.first + (elapsed / interval) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
-    let at = u128::from(tick - c.first) * interval;
-    let wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
+    let mut tick = (c.first + (elapsed / interval) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
+    let mut at = u128::from(tick - c.first) * interval;
+    let mut wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
+    if wait.is_zero() && crate::telemetry::late_waits() {
+        tick += 1;
+        at = u128::from(tick - c.first) * interval;
+        wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
+    }
     if wait <= limit {
         last(kind).fetch_max(tick, Ordering::Relaxed);
     }
@@ -145,6 +150,10 @@ pub(crate) extern "system" fn wait(
         std::thread::sleep(wait);
         S_OK
     };
+    crate::telemetry::add(crate::telemetry::Counter::FrameWait, 1);
+    if hr == S_OK && wait.is_zero() {
+        crate::telemetry::add(crate::telemetry::Counter::LateFrameWait, 1);
+    }
     #[cfg(feature = "diagnostics")]
     {
         WAITS[0].fetch_add(1, Ordering::Relaxed);
@@ -194,8 +203,12 @@ pub(crate) fn presented() {
 /// Diagnostics: logs [`WAITS`] since the last call.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log() {
+    if !crate::telemetry::frame_log() {
+        return;
+    }
     let [waits, at_once, shared] = [0, 1, 2].map(|i| WAITS[i].swap(0, Ordering::Relaxed));
     tracing::info!("frame waits: {waits}, {at_once} of them ended at once; presents sharing a flip tick: {shared}");
+    crate::telemetry::log();
 }
 
 /// Device method: no statistics are kept, so none are returned.

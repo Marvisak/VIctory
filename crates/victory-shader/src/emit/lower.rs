@@ -21,6 +21,9 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod compat;
+
+pub use compat::{host_max_wave, set_host_max_wave};
 
 type Why = &'static str;
 
@@ -233,6 +236,14 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// A group barrier some lane of the group may not reach.
+    fence_only: HashSet<usize>,
+    /// The group-sync compatibility mode in force.
+    group_sync: u8,
+    /// The console's wave width for this program.
+    console_wave: u32,
+    /// Threads in a compute or mesh group, when the stage has them.
+    group_threads: Option<u32>,
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
     heap: [bool; 2],
     /// src0 of the current instruction as DPP fetched it.
@@ -570,6 +581,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -649,6 +661,10 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let fence_only = compat::fence_only(p, x.st);
+        let group_threads = s.threads.map(|t| t.iter().product());
+        let console_wave = if x.native.wave64 { 64 } else { 32 };
+        let group_sync = super::group_sync();
         Lower {
             s,
             x,
@@ -688,6 +704,10 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            fence_only,
+            group_sync,
+            console_wave,
+            group_threads,
             heap: [false; 2],
             src0: None,
             console_lanes,
@@ -3532,7 +3552,14 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+                let mode = compat::barrier_mode(
+                    self.group_sync,
+                    compat::host_max_wave(),
+                    self.console_wave,
+                    self.group_threads,
+                    self.fence_only.contains(&b),
+                    self.writes_uavs,
+                );
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
@@ -7527,6 +7554,32 @@ impl<'a> Lower<'a> {
                 let (a, off, w) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 let w = m31(self, w);
                 self.bfe(a, off, w, name == "v_bfe_i32")
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                self.cross_lane(false)?;
+                let x = s(self, 0)?;
+                let (s1, s2) = (s(self, 1)?, s(self, 2)?);
+                let i32t = self.s.t.i32;
+                let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+                let [k15, k8, k7, k2, k16, not31, not15] =
+                    [15, 8, 7, 2, 16, !31, !15].map(|x| self.s.m.i32(x));
+                let low = self.s.m.bin(c, Bin::And, lane, k15);
+                let hi_word = self.s.m.cmp(c, pred::IUGE, low, k8);
+                let word = self.s.m.select(c, hi_word, s2, s1);
+                let n = self.s.m.bin(c, Bin::And, low, k7);
+                let sh = self.s.m.bin(c, Bin::Shl, n, k2);
+                let pick = self.s.m.bin(c, Bin::LShr, word, sh);
+                let pick = self.s.m.bin(c, Bin::And, pick, k15);
+                let row = if name == "v_permlanex16_b32" {
+                    let half = self.s.m.bin(c, Bin::And, lane, not31);
+                    let other = self.s.m.bin(c, Bin::And, lane, k16);
+                    let other = self.s.m.bin(c, Bin::Xor, other, k16);
+                    self.s.m.bin(c, Bin::Or, half, other)
+                } else {
+                    self.s.m.bin(c, Bin::And, lane, not15)
+                };
+                let from = self.s.m.bin(c, Bin::Or, row, pick);
+                self.read_lane(x, from)
             }
             "v_bfi_b32" => {
                 let (m, a, b) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
