@@ -21,8 +21,23 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod interp;
 
 type Why = &'static str;
+
+/// How an interpolation evaluates an input channel.
+#[derive(Debug, Clone, Copy)]
+enum Eval {
+    /// Loaded with this DXIL interpolation mode (1: constant, P0).
+    Mode(u8),
+    /// From the vertex values of a constant element: P0 when `p0`, plus
+    /// i (P1 - P0), plus j (P2 - P0), weights as floats.
+    Weights {
+        p0: bool,
+        i: Option<V>,
+        j: Option<V>,
+    },
+}
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -213,7 +228,9 @@ struct Lower<'a> {
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
-    interps: HashMap<Site, &'a Interp>,
+    interps: HashMap<Site, Interp>,
+    /// Native data needed after conditional interpolation pairs are resolved.
+    interp_live: Option<HashSet<Value>>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
     /// Handles made in the entry block for descriptors at addresses the
     /// root parameters alone give (table and heap loads with no other
@@ -679,7 +696,8 @@ impl<'a> Lower<'a> {
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
-            interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
+            interps: x.io.interps.iter().cloned().collect(),
+            interp_live: None,
             handles: HashMap::new(),
             entry_handles: HashMap::new(),
             join_handles: HashMap::new(),
@@ -1293,6 +1311,25 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
+        // Ordinary interpolation can replace the native pair only in lanes
+        // which avoided other definitions of its i/j registers. Resolve this
+        // before retaining first halves or deciding which rows need vertices.
+        let mut interps = self.x.io.interps.clone();
+        for (site, interp) in &mut interps {
+            if let Interp::Interpolated {
+                attribute, unless, ..
+            } = interp
+                && !self.avoids(*site, unless)
+            {
+                *interp = Interp::Weighted {
+                    attribute: *attribute,
+                };
+            }
+        }
+        self.interp_live =
+            crate::io::retain_live_first_halves(self.x.p, self.x.native, &mut interps)
+                .map_err(Stop::Fail)?;
+        self.interps = interps.into_iter().collect();
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1433,6 +1470,11 @@ impl<'a> Lower<'a> {
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
+                // Most programs only interpolate with them: loaded on first
+                // use as a value (`get`).
+                Reg::V(_) if matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) => {
+                    continue;
+                }
                 Reg::S(n) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
                     // Above the SGPRs the hardware initializes, a register
@@ -1487,7 +1529,7 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            Input::Barycentric { kind, index } => return self.barycentric(kind, index),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -1648,6 +1690,10 @@ impl<'a> Lower<'a> {
             let val = self.user(param, dword);
             self.vals.insert(v, val);
             return Ok(val);
+        }
+        if let Some(loaded) = self.lazy_barycentric(v) {
+            loaded?;
+            return Ok(self.vals[&v]);
         }
         Err("a value defined after its use")
     }
@@ -8063,114 +8109,6 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        let Some(&interp) = self.interps.get(&site) else {
-            return Err("the first half of an interpolation");
-        };
-        let (attribute, mode) = match interp {
-            Interp::Interpolated { unless, .. } if !self.avoids(site, unless) => {
-                return Err("an interpolation with computed barycentrics");
-            }
-            Interp::Interpolated {
-                attribute,
-                barycentric,
-                ..
-            } => (
-                attribute,
-                match barycentric {
-                    Barycentric::PerspectiveCenter => 2,
-                    Barycentric::PerspectiveCentroid => 3,
-                    Barycentric::PerspectiveSample => 6,
-                    Barycentric::LinearCenter => 4,
-                    Barycentric::LinearCentroid => 5,
-                    Barycentric::LinearSample => 7,
-                    Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
-                },
-            ),
-            // P0, the provoking vertex: a flat (nointerpolation) input.
-            Interp::Vertex {
-                attribute,
-                vertex: 2,
-            } => (attribute, 1),
-            Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
-        };
-        let dst = match &inst.fields {
-            Fields::Vintrp { dst, .. } => *dst,
-            Fields::Valu(v) => v.dst.ok_or("an interpolation")?,
-            _ => unreachable!(),
-        };
-        let Operand::Vector { reg, .. } = dst else {
-            return Err("an interpolation");
-        };
-        // A channel of an input element, interpolated as `mode` says.
-        let channel = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
-            let (id, col) = l
-                .find_input(row, ch)
-                .ok_or("an input the signature lacks")?;
-            let e = &mut l.s.inputs[id];
-            if e.interp != mode && e.usage != 0 {
-                return Err("one input interpolated two ways");
-            }
-            e.interp = mode;
-            match l.load_any_input(id, col) {
-                Val::I32(x) => Ok(x),
-                _ => Err("an input"),
-            }
-        };
-        let packing = match &self.x.native.io {
-            StageIo::Ps { inputs, .. } => inputs
-                .iter()
-                .find(|i| i.row == attribute.row && i.fp16)
-                .map(|i| i.pack2),
-            _ => None,
-        };
-        let f16 = inst.name().ends_with("_f16");
-        let x = match packing {
-            None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
-            None => channel(self, attribute.row, attribute.channel)?,
-            Some(pack2) => {
-                // 16-bit values: one in the low half of each dword, or two
-                // per dword (`packed_half`); the host's are 32-bit floats.
-                let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
-                    let src = if pack2 {
-                        packed_half(&l.s.inputs, attribute.row, h)
-                    } else {
-                        h.is_multiple_of(2).then_some((attribute.row, h / 2))
-                    };
-                    let Some((row, ch)) = src else {
-                        return Ok(None);
-                    };
-                    let x = channel(l, row, ch)?;
-                    let f = l.as_float(x);
-                    Ok(Some(l.narrow16(f)))
-                };
-                let h = 2 * attribute.channel;
-                let c = self.cur;
-                if f16 {
-                    let lo = half(self, h + u8::from(attribute.high))?
-                        .ok_or("a packed input half no element holds")?;
-                    // omod and clamp are part of the f16 instruction; op_sel[3]
-                    // picks the destination half.
-                    let lo = self.half_modifiers(inst, lo);
-                    return self.write_half(inst, lo, None);
-                } else if mode == 1 {
-                    // The whole dword of a flat input: both halves.
-                    let z = self.s.m.i32(0);
-                    let lo = half(self, h)?.unwrap_or(z);
-                    let hi = half(self, h + 1)?.unwrap_or(z);
-                    let k16 = self.s.m.i32(16);
-                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                    self.s.m.bin(c, Bin::Or, lo, hi)
-                } else {
-                    return Err("32-bit interpolation of a 16-bit input");
-                }
-            }
-        };
-        // A pixel interpolates in every lane; guards only hide inactive ones.
-        self.write(inst, Reg::V(reg), x, None);
-        Ok(())
-    }
-
     /// Whether no lane that runs the instruction at `site` has been where
     /// `unless` says: a lane that came along such an edge or ran (skipped)
     /// such an instruction meets its condition, which the instruction's must
@@ -10839,7 +10777,24 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 let read = live.contains(&(phi.value, n));
+                // Keep the counted indexed-write proof ahead of lazy input
+                // loading: the original value is never observed on this edge.
+                let overwritten_input = read
+                    && !bit
+                    && self.x.io.inputs.iter().any(|&(v, input)| {
+                        v == arg && matches!(input, Input::Barycentric { .. })
+                    })
+                    && self.overwritten_movreld_edge(b, phi, n).is_some();
+                if read
+                    && !overwritten_input
+                    && !self.vals.contains_key(&arg)
+                    && !self.never_taken(q, b)
+                    && !self.dead_on_edge(b, n, phi.reg)
+                {
+                    let _ = self.lazy_barycentric(arg);
+                }
                 let x = match (self.vals.get(&arg).copied(), bit) {
+                    _ if overwritten_input => self.s.m.undef(self.s.t.i32),
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     // No lane from this edge reads it, or no lane comes
                     // along it at all: any value will do.
@@ -10851,13 +10806,6 @@ impl<'a> Lower<'a> {
                         } else {
                             self.s.m.i32(0)
                         }
-                    }
-                    // An input an unguarded counted `v_movreld` loop overwrites
-                    // before anything reads it (PR #457).
-                    (Some(Val::Missing("barycentrics read directly")), false)
-                        if read && self.overwritten_movreld_edge(b, phi, n).is_some() =>
-                    {
-                        self.s.m.undef(self.s.t.i32)
                     }
                     (Some(Val::Bit(_)), false) if read => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
