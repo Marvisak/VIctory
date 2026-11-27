@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)]
 //! IR to DXIL, one machine instruction at a time (decision 0003).
 //!
 //! Every register dword is an `i32` (SCC an `i1`); float operations bitcast
@@ -284,6 +285,8 @@ struct Lower<'a> {
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
     mode16: Option<u8>,
+    #[allow(dead_code)]
+    own_bits: crate::emit::own_bits::OwnBits,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -392,11 +395,49 @@ enum MaskData {
 }
 
 /// What a value holding a lane mask read as a number stops with.
-const LANE_MASK: Why = "a lane mask read as data";
+pub(super) const LANE_MASK: Why = "a lane mask read as data";
+#[allow(dead_code)]
+pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+
+thread_local! {
+    static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[allow(dead_code)]
+pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
+    let was = LOCAL_WAVES.replace(true);
+    let r = f();
+    LOCAL_WAVES.set(was);
+    r
+}
+#[allow(dead_code)]
+pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
+    let was = LOCAL_ANY.replace(true);
+    let r = with_local_waves(f);
+    LOCAL_ANY.set(was);
+    r
+}
+fn own_bits_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
+}
+#[allow(dead_code)]
+pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'static str)> {
+    if st.exits.iter().any(|e| matches!(e, LaneExit::Indirect)) { return Err((0, "indirect exit")); }
+    let mut i = 0usize;
+    for b in &p.blocks {
+        for inst in &b.insts {
+            if reads_mask_as_data(st, inst) { return Err((i, LANE_MASK)); }
+            i += 1;
+        }
+    }
+    Ok(())
+}
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
         // A mask operation (its result a mask) is no data use.
@@ -725,6 +766,7 @@ impl<'a> Lower<'a> {
             abort: None,
             round16: round16(p),
             mode16: Some(0),
+            own_bits: if own_bits_on() { crate::emit::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some()) } else { Default::default() },
         }
     }
 

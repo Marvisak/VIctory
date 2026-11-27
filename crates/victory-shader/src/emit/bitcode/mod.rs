@@ -7,6 +7,13 @@
 
 use std::collections::HashMap;
 
+pub mod census;
+pub mod opt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum Tag { Guard, Clamp, Counter }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
 
@@ -15,6 +22,7 @@ enum TypeDef {
     Void,
     Int(u32),
     Float,
+    Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
     Struct(Option<String>, Vec<Ty>),
@@ -129,7 +137,7 @@ pub(crate) mod pred {
 }
 
 #[derive(Debug, Clone)]
-enum Op {
+pub enum Op {
     Bin(Bin, V, V),
     Cast(Cast, V),
     Cmp(u8, V, V),
@@ -211,9 +219,16 @@ pub(crate) struct Module {
     /// Structures chosen between by a condition: `(cond, other)` by the
     /// one taken where `cond` holds. [`Module::extract`] chooses the field.
     pub chosen: HashMap<V, (V, V)>,
+    tags: HashMap<u32, Tag>,
 }
 
 impl Module {
+
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self { types: Vec::new(), type_ids: HashMap::new(), consts: Vec::new(), const_ids: HashMap::new(), globals: Vec::new(), funcs: Vec::new(), func_ids: HashMap::new(), insts: Vec::new(), blocks: Vec::new(), mds: Vec::new(), named: Vec::new(), chosen: HashMap::new(), tags: HashMap::new() }
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);
@@ -233,6 +248,10 @@ impl Module {
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
     }
+    #[allow(dead_code)]
+    pub fn double(&mut self) -> Ty { self.ty(TypeDef::Double) }
+    #[allow(dead_code)]
+    pub fn tag(&mut self, v: V, tag: Tag) { if let V::Inst(i)=v { self.tags.insert(i, tag); } }
     pub fn ptr(&mut self, to: Ty) -> Ty {
         self.ty(TypeDef::Ptr(to, 0))
     }
@@ -550,7 +569,7 @@ impl Module {
     /// descriptor words no path reads, 556 of ActivateRays' 587). A worklist
     /// visits each instruction once, so a long chain of merges costs one
     /// pass, not one pass per merge.
-    fn live(&self) -> Vec<bool> {
+    pub(super) fn live(&self) -> Vec<bool> {
         let mut live = vec![false; self.insts.len()];
         let mut work: Vec<u32> = Vec::new();
         let mark = |live: &mut [bool], work: &mut Vec<u32>, v: V| {
@@ -718,6 +737,12 @@ impl Module {
     }
 
     pub fn write(&self) -> Vec<u8> {
+        let bytes = self.write_clean();
+        census::note(self, &bytes);
+        bytes
+    }
+
+    pub fn write_clean(&self) -> Vec<u8> {
         let plan = self.plan();
         let (live, layout) = (&plan.live, &plan.layout);
         let term_of = |b: usize| self.term(b);
@@ -758,6 +783,7 @@ impl Module {
             match t {
                 TypeDef::Void => w.record(2, &[]),
                 TypeDef::Float => w.record(3, &[]),
+                TypeDef::Double => w.record(4, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
                 TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),
@@ -1075,7 +1101,7 @@ impl Plan {
 }
 
 /// Calls `f` with every value `op` reads, in operand order.
-fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
+pub fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
     match op {
         Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) | Op::AtomicRmw(_, a, b) => {
             f(*a);
@@ -1097,7 +1123,7 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
 }
 
 /// A block's successors (at most two), without allocating.
-struct Succs {
+pub struct Succs {
     to: [usize; 2],
     len: usize,
 }
@@ -1109,7 +1135,7 @@ impl std::ops::Deref for Succs {
     }
 }
 
-fn successors(term: Option<Term>) -> Succs {
+pub fn successors(term: Option<Term>) -> Succs {
     match term {
         Some(Term::Br(t)) => Succs { to: [t, 0], len: 1 },
         Some(Term::CondBr(_, t, f)) => Succs { to: [t, f], len: 2 },

@@ -76,6 +76,7 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&victory_shader::emit::translation_fingerprint());
     *h.finalize().as_bytes()
 }
 
@@ -523,5 +524,24 @@ mod tests {
         let refusal = Err("GFX10 code at 0x10: x is not supported".to_owned());
         assert_eq!(decode(&encode(&refusal)), Some(refusal));
         assert_eq!(decode(&[b"VSHE".as_slice(), &[0xff]].concat()), None);
+    }
+}
+
+#[cfg(test)]
+mod tests2 {
+    use super::*;
+
+    #[test]
+    fn fingerprint_invalidation_on_wave_or_opt_flags() {
+        let k1 = key("t", b"e", 1);
+        let mut h = blake3::Hasher::new();
+        h.update(b"t");
+        h.update(blake3::hash(b"e").as_bytes());
+        h.update(&1u32.to_le_bytes());
+        let mut fp = victory_shader::emit::translation_fingerprint();
+        fp.push(1);
+        h.update(&fp);
+        let k2: [u8; 32] = *h.finalize().as_bytes();
+        assert_ne!(k1, k2);
     }
 }

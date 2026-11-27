@@ -196,6 +196,57 @@
 //!   console never exports them).
 
 mod bitcode;
+mod own_bits;
+
+
+/// The bitcode passes `VICTORY_SHADER_OPT` enables.
+pub fn shader_opt() -> u32 {
+    static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+/// A version byte for the translation, the layout the host binds, and the
+/// opt/wave env that changes it.
+pub fn translation_fingerprint() -> Vec<u8> {
+    let mut fp = Vec::with_capacity(1 + 5 * 4);
+    fp.push(1);
+    for n in [
+        shader_opt(),
+        std::env::var("VICTORY_WAVE_LOCAL").ok().as_deref().map(|v| if v=="0"{0}else{1}).unwrap_or(1),
+        std::env::var("VICTORY_WAVE_OWN_BITS").ok().as_deref().map(|v| if v=="0"{0}else{1}).unwrap_or(1),
+        0u32, 0u32,
+    ] { fp.extend_from_slice(&n.to_le_bytes()); }
+    fp
+}
+
+/// `VICTORY_SHADER_OPT`'s value; every pass when unset or unrecognized, none for "0".
+pub fn parse_shader_opt(value: Option<&str>) -> u32 {
+    let Some(v) = value else { return bitcode::opt::DEFAULT };
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("all") || v.eq_ignore_ascii_case("on") || v == "1" {
+        return bitcode::opt::ALL;
+    }
+    if v == "0" || v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("off") {
+        return 0;
+    }
+    let mut out = 0u32;
+    for tok in v.split(|c: char| c == ',' || c == '+' || c == '|' || c.is_whitespace()) {
+        let t = tok.trim();
+        if t.is_empty() { continue; }
+        out |= match t.to_ascii_lowercase().as_str() {
+            "dead" => bitcode::opt::DEAD,
+            "fold" => bitcode::opt::FOLD,
+            "reuse" => bitcode::opt::REUSE,
+            "facts" => bitcode::opt::FACTS,
+            "loads" => bitcode::opt::LOADS,
+            "first" => bitcode::opt::FIRST,
+            "wide" => bitcode::opt::WIDE,
+            "module" => bitcode::opt::MODULE,
+            _ => return bitcode::opt::DEFAULT,
+        };
+    }
+    if out == 0 { bitcode::opt::DEFAULT } else { out }
+}
 #[cfg(test)]
 mod census_tests;
 #[cfg(all(test, windows))]

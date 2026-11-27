@@ -210,7 +210,7 @@ pub fn build_bounded(
             };
         }
         let m0 = m0_max.get(&machine.offset).copied();
-        if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, m0)? {
+        if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, m0, true)? {
             blocks[b].insts.push(Inst {
                 machine,
                 fields,
@@ -378,6 +378,7 @@ fn link(blocks: &mut [Block]) {
     for block in blocks.iter_mut() {
         block.preds.clear();
     }
+    #[allow(clippy::needless_range_loop)]
     for b in 0..blocks.len() {
         for s in blocks[b].exit.successors() {
             blocks[s].preds.push(b);
@@ -715,6 +716,14 @@ type Effects = (Vec<(Reg, Value)>, Vec<(Reg, Value)>);
 
 /// Registers an instruction reads and writes, one per dword, or `None` if
 /// the IR drops it.
+pub(crate) fn operand_reads(p: &Program, inst: &Inst) -> Vec<Reg> {
+    let lanes = 1 + u8::from(p.wave64);
+    effects(&inst.machine, &inst.fields, inst.name(), lanes, p.vgprs, None, false)
+        .ok()
+        .flatten()
+        .map_or_else(Vec::new, |e| e.0.into_iter().map(|(r,_)| r).collect())
+}
+
 fn effects(
     inst: &Instruction,
     fields: &Fields,
@@ -722,6 +731,7 @@ fn effects(
     lanes: u8,
     vgprs: u16,
     m0_max: Option<u8>,
+    old_vgpr: bool,
 ) -> Result<Option<Effects>, ShaderError> {
     if DROPPED.contains(&name) {
         return Ok(None);
@@ -985,7 +995,9 @@ fn effects(
     if vector {
         r.extend(mask(EXEC));
         // Lanes disabled in EXEC keep the old value.
-        r.extend(w.iter().filter(|(w, _)| matches!(w, Reg::V(_))).cloned());
+        if old_vgpr {
+            r.extend(w.iter().filter(|(w, _)| matches!(w, Reg::V(_))).cloned());
+        }
     }
     let mut seen = Vec::with_capacity(r.len());
     r.retain(|reg| {
@@ -1080,6 +1092,29 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<(Reg, Value)>) -> Result<(), 
         Operand::Const(_) | Operand::Literal(_) | Operand::Attr { .. } => {}
     }
     Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
+    let ends = |b: usize| {
+        p.blocks[b].exit == Exit::End
+            && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
+    };
+    let mut blocks = p.blocks.clone();
+    let mut any = false;
+    #[allow(clippy::needless_range_loop)]
+    #[allow(clippy::needless_range_loop)]
+    for b in 0..blocks.len() {
+        match blocks[b].exit {
+            Exit::Branch { taken, .. } if ends(taken) => {
+                blocks[b].exit = Exit::Jump(taken);
+                any = true;
+            }
+            _ => {}
+        }
+    }
+    if !any { return None; }
+    Some(Program { blocks, wave64: p.wave64, vgprs: p.vgprs, inputs: p.inputs.clone() })
 }
 
 #[cfg(test)]
