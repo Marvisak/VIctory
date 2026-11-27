@@ -14,8 +14,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -28,6 +28,13 @@ use crate::shader::{MAX_FILE, Source, sources};
 
 /// Where a native program's container is: file, source, and its stage.
 type Found = (usize, usize, HwStage);
+
+/// The pack identifies the compute or vertex/mesh container by its database hash.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Primary {
+    Compute(u64),
+    Graphics(u64),
+}
 
 /// One pipeline to make: a graphics or compute record of the pack.
 #[derive(Clone, Copy, Debug)]
@@ -66,9 +73,20 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     // Every container by the hash instructions its native program starts
     // with, which the pack's programs start with too.
     let sources: Vec<Vec<Source>> = files.iter().map(|(_, d)| sources(d)).collect();
-    let programs: Mutex<HashMap<[u8; 24], Found>> = Mutex::new(HashMap::new());
+    let mut programs: HashMap<[u8; 24], Found> = HashMap::new();
+    let mut by_engine = HashMap::new();
+    let mut databases = Vec::new();
     for (f, list) in sources.iter().enumerate() {
+        let dbs = sgd5::databases(&files[f].1);
+        let hashes: HashMap<_, _> = dbs
+            .iter()
+            .flat_map(|db| db.shaders.iter().flatten())
+            .map(|shader| (shader.record.offset, shader.hash))
+            .collect();
+        databases.extend(dbs);
+
         let next = AtomicUsize::new(0);
+        let indexed: Vec<_> = (0..list.len()).map(|_| OnceLock::new()).collect();
         std::thread::scope(|s| {
             for _ in 0..threads.min(list.len()) {
                 s.spawn(|| {
@@ -78,17 +96,32 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
                         let Some(bytes) = source.bytes() else {
                             continue;
                         };
-                        for (id, stage) in program_ids(&bytes) {
-                            lock(&programs).entry(id).or_insert((f, i, stage));
-                        }
+                        indexed[i].get_or_init(|| program_ids(&bytes));
                     }
                 });
             }
         });
+        // Keep the input order for programs with no matching database hash,
+        // independently of which worker finished unpacking a container first.
+        for (i, entry) in indexed.into_iter().enumerate() {
+            let hash = match &list[i] {
+                Source::Packed(r) => hashes.get(&r.offset),
+                Source::Raw { .. } => None,
+            };
+            for (id, stage) in entry.into_inner().unwrap_or_default() {
+                let found = (f, i, stage);
+                programs.entry(id).or_insert(found);
+                if let Some(&hash) = hash {
+                    let primary = match stage {
+                        HwStage::Cs => Primary::Compute(hash),
+                        HwStage::Vs | HwStage::Ms => Primary::Graphics(hash),
+                        _ => continue,
+                    };
+                    by_engine.entry((primary, id)).or_insert(found);
+                }
+            }
+        }
     }
-    let programs = programs.into_inner().unwrap_or_else(|e| e.into_inner());
-    let databases: Vec<sgd5::Database> =
-        files.iter().flat_map(|(_, d)| sgd5::databases(d)).collect();
     let named = Named::find(&pack, &databases);
     eprintln!(
         "{}: shader pack, {} graphics and {} compute pipelines; states named: {} depth-stencil, {} rasteriser, {} blend",
@@ -100,8 +133,13 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         named.blend.len(),
     );
 
-    let container = |code: &[u8]| -> Option<(Vec<u8>, HwStage)> {
-        let &(f, i, stage) = programs.get(&shaderpack::program_id(code)?)?;
+    // Distinct containers can carry the same native program. The pack names
+    // the compute or vertex/mesh container by its database hash as well.
+    let container = |code: &[u8], primary: Option<Primary>| -> Option<(Vec<u8>, HwStage)> {
+        let id = shaderpack::program_id(code)?;
+        let &(f, i, stage) = primary
+            .and_then(|p| by_engine.get(&(p, id)))
+            .or_else(|| programs.get(&id))?;
         let bytes = sources[f][i].bytes()?;
         // As the title passes it: the container's own size.
         let size = u32::from_le_bytes(bytes.get(0x18..0x1c)?.try_into().ok()?) as usize;
@@ -112,7 +150,9 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         let g = match job {
             Job::Graphics(i) => &graphics[i],
             Job::Compute(i) => {
-                let (cs, _) = container(compute[i].stage.program).ok_or("shader not found")?;
+                let c = &compute[i];
+                let (cs, _) = container(c.stage.program, Some(Primary::Compute(c.shader_hash)))
+                    .ok_or("shader not found")?;
                 return Ok(Prebuild::compute(&cs));
             }
         };
@@ -122,10 +162,10 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         }
         let (first, stage) = vs
             .or(gs)
-            .and_then(|s| container(s.program))
+            .and_then(|s| container(s.program, Some(Primary::Graphics(g.shader_hash))))
             .ok_or("shader not found")?;
         let pixel = match ps {
-            Some(ps) => Some(container(ps.program).ok_or("shader not found")?.0),
+            Some(ps) => Some(container(ps.program, None).ok_or("shader not found")?.0),
             None => None,
         };
         let mesh = match stage {
@@ -149,21 +189,26 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
 
     // A job's shaders as a run names them (diagnostics).
     let shaders_of = |job: Job| {
-        let stages: Vec<(&str, &[u8])> = match job {
-            Job::Compute(i) => vec![("compute", compute[i].stage.program)],
+        let stages: Vec<_> = match job {
+            Job::Compute(i) => vec![(
+                "compute",
+                compute[i].stage.program,
+                Some(Primary::Compute(compute[i].shader_hash)),
+            )],
             Job::Graphics(i) => {
                 let [ps, vs, gs, ..] = graphics[i].stages;
+                let hash = Some(Primary::Graphics(graphics[i].shader_hash));
                 let first = vs
-                    .map(|s| ("vertex", s.program))
-                    .or(gs.map(|s| ("mesh", s.program)));
+                    .map(|s| ("vertex", s.program, hash))
+                    .or(gs.map(|s| ("mesh", s.program, hash)));
                 first
                     .into_iter()
-                    .chain(ps.map(|s| ("pixel", s.program)))
+                    .chain(ps.map(|s| ("pixel", s.program, None)))
                     .collect()
             }
         };
         let names: Vec<String> = (stages.iter())
-            .map(|(stage, code)| match container(code) {
+            .map(|(stage, code, hash)| match container(code, *hash) {
                 Some((c, _)) => format!("{stage} {}", &blake3::hash(&c).to_hex()[..16]),
                 None => format!("{stage} ?"),
             })
