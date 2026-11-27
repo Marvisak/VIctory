@@ -88,8 +88,12 @@ pub fn data_directory_offset(data: &[u8], index: usize) -> Option<usize> {
     if index >= count {
         return None;
     }
-    opt.checked_add(OPT_DATA_DIRECTORY)?
-        .checked_add(index.checked_mul(DATA_DIRECTORY_SIZE)?)
+    let at = opt
+        .checked_add(OPT_DATA_DIRECTORY)?
+        .checked_add(index.checked_mul(DATA_DIRECTORY_SIZE)?)?;
+    at.checked_add(DATA_DIRECTORY_SIZE)
+        .filter(|&end| end <= data.len())
+        .map(|_| at)
 }
 
 pub fn read_u32(data: &[u8], at: usize) -> Option<u32> {
@@ -238,6 +242,15 @@ mod tests {
         );
         assert_eq!(data_directory_offset(b"", dir::IMPORT), None);
         assert_eq!(data_directory_offset(b"MZ", dir::IMPORT), None);
+    }
+
+    #[test]
+    fn data_directory_offset_rejects_a_truncated_entry() {
+        let mut data = image();
+        let at = data_directory_offset(&data, dir::IMPORT).unwrap();
+        data.truncate(at + DATA_DIRECTORY_SIZE - 1);
+
+        assert_eq!(data_directory_offset(&data, dir::IMPORT), None);
     }
 
     #[test]
