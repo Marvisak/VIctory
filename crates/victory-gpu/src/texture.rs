@@ -120,8 +120,12 @@ const KEPT_BYTES: u64 = 64 << 20;
 pub(crate) fn recycle() {
     {
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+        let c = &mut *c;
+        let used_chunks = c.current + usize::from(c.used > 0);
         (c.current, c.used) = (0, 0);
-        c.all.truncate(CHUNKS_KEPT);
+        let len = c.all.len();
+        let keep = trim_target(len, used_chunks, &mut c.peak_used, &mut c.window);
+        c.all.truncate(keep);
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
@@ -171,16 +175,44 @@ struct Chunks {
     /// The chunk being carved and the bytes taken from it.
     current: usize,
     used: u64,
+    /// Peak chunks used in the current submission window, and submissions so far.
+    peak_used: usize,
+    window: u32,
 }
 
 // SAFETY: the mappings are persistent mappings of the upload buffers.
 unsafe impl Send for Chunks {}
 
-static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks { all: Vec::new(), current: 0, used: 0 });
+static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks {
+    all: Vec::new(),
+    current: 0,
+    used: 0,
+    peak_used: 0,
+    window: 0,
+});
 
 const CHUNK: u64 = 32 << 20;
 /// Chunks kept between submissions (more are made while one needs them).
 const CHUNKS_KEPT: usize = 16;
+/// Warm floor of chunks kept when idle.
+const SPARE_CHUNKS: usize = 2;
+/// Submissions per window before trimming idle staging chunks.
+const IDLE_SUBMISSIONS: u32 = 64;
+
+/// Number of staging chunks to keep after a submission.
+fn trim_target(len: usize, used_chunks: usize, peak_used: &mut usize, window: &mut u32) -> usize {
+    let len = len.min(CHUNKS_KEPT);
+    *peak_used = (*peak_used).max(used_chunks);
+    *window += 1;
+    if *window >= IDLE_SUBMISSIONS {
+        let keep = (*peak_used).clamp(SPARE_CHUNKS, CHUNKS_KEPT);
+        *peak_used = 0;
+        *window = 0;
+        len.min(keep)
+    } else {
+        len
+    }
+}
 
 /// `size` bytes of staging space: a buffer, the offset of the space in it
 /// (a multiple of 512, as texture copies need) and its mapping there.
@@ -877,5 +909,26 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn staging_chunks_trim_after_idle_window() {
+        let (mut peak, mut window) = (0, 0);
+        // Excess above CHUNKS_KEPT is trimmed immediately.
+        assert_eq!(trim_target(20, 1, &mut peak, &mut window), CHUNKS_KEPT);
+        // Stay warm during the window.
+        for _ in 1..IDLE_SUBMISSIONS - 1 {
+            assert_eq!(trim_target(16, 1, &mut peak, &mut window), 16);
+        }
+        // End of window: shrinks to SPARE_CHUNKS since peak was 1.
+        assert_eq!(trim_target(16, 1, &mut peak, &mut window), SPARE_CHUNKS);
+        assert_eq!((peak, window), (0, 0));
+
+        // Window with peak of 5 keeps 5 chunks.
+        for i in 0..IDLE_SUBMISSIONS - 1 {
+            let used = if i == 10 { 5 } else { 1 };
+            assert_eq!(trim_target(16, used, &mut peak, &mut window), 16);
+        }
+        assert_eq!(trim_target(16, 1, &mut peak, &mut window), 5);
     }
 }

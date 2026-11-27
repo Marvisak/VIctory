@@ -1121,9 +1121,7 @@ pub(crate) fn log_views(frames: f64) {
         .count();
     let (chunks, held) = {
         let a = arena();
-        // SAFETY: live buffers.
-        let size = |c: &(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)| unsafe { c.0.GetDesc() }.Width;
-        let held: u64 = a.chunks.iter().map(|c| size(c) - c.3.values().sum::<u64>()).sum();
+        let held: u64 = a.chunks.iter().map(|c| c.size - c.free.values().sum::<u64>()).sum();
         (a.chunks.len(), held)
     };
     if asks > 0 {
@@ -1171,13 +1169,22 @@ fn exact(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
-/// A run of an [`Arena`] buffer: the buffer, where the run starts, its
+/// A run of an [`Arena`] buffer: the chunk id, where the run starts, its
 /// bytes.
 #[derive(Clone, Copy)]
 struct Slice {
-    chunk: usize,
+    chunk: u64,
     offset: u64,
     len: u64,
+}
+
+struct ArenaChunk {
+    id: u64,
+    buffer: ID3D12Resource,
+    data: usize,
+    gpu: u64,
+    size: u64,
+    free: BTreeMap<u64, u64>,
 }
 
 /// Shared buffers for the copies of single views ([`exact`]): they are
@@ -1189,13 +1196,16 @@ struct Slice {
 struct Arena {
     /// Each buffer, its mapping and host address, and its free runs
     /// (offset → bytes).
-    chunks: Vec<(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)>,
+    chunks: Vec<ArenaChunk>,
+    next_id: u64,
 }
 
 /// Bytes of each arena buffer (a larger copy gets one of its size).
 const CHUNK: u64 = 16 << 20;
+/// Empty standard chunks kept warm for future view allocations.
+const SPARE_CHUNKS: usize = 1;
 
-static ARENA: Mutex<Arena> = Mutex::new(Arena { chunks: Vec::new() });
+static ARENA: Mutex<Arena> = Mutex::new(Arena { chunks: Vec::new(), next_id: 0 });
 
 fn arena() -> std::sync::MutexGuard<'static, Arena> {
     ARENA.lock().unwrap_or_else(|e| e.into_inner())
@@ -1219,8 +1229,8 @@ impl Arena {
                 (start + len <= at + n).then_some((at, n, start))
             })
         };
-        let found = self.chunks.iter().enumerate().find_map(|(c, chunk)| fits(&chunk.3).map(|f| (c, f)));
-        let (chunk, (at, n, start)) = match found {
+        let found = self.chunks.iter().enumerate().find_map(|(c, chunk)| fits(&chunk.free).map(|f| (c, f)));
+        let (chunk_idx, (at, n, start)) = match found {
             Some(found) => found,
             None => {
                 let size = CHUNK.max((len + align).next_multiple_of(1 << 16));
@@ -1229,37 +1239,61 @@ impl Arena {
                 // SAFETY: a live buffer.
                 let gpu = unsafe { buffer.GetGPUVirtualAddress() };
                 let free = BTreeMap::from([(0, size)]);
-                self.chunks.push((buffer, data as usize, gpu, free));
+                let id = self.next_id;
+                self.next_id += 1;
+                self.chunks.push(ArenaChunk {
+                    id,
+                    buffer,
+                    data: data as usize,
+                    gpu,
+                    size,
+                    free,
+                });
                 let c = self.chunks.len() - 1;
-                (c, fits(&self.chunks[c].3)?)
+                (c, fits(&self.chunks[c].free)?)
             }
         };
-        let (buffer, data, gpu, free) = &mut self.chunks[chunk];
-        free.remove(&at);
+        let chunk = &mut self.chunks[chunk_idx];
+        chunk.free.remove(&at);
         if start > at {
-            free.insert(at, start - at);
+            chunk.free.insert(at, start - at);
         }
         if at + n > start + len {
-            free.insert(start + len, at + n - start - len);
+            chunk.free.insert(start + len, at + n - start - len);
         }
-        let slice = Slice { chunk, offset: start, len };
-        Some((buffer.clone(), (*data + start as usize) as *mut u8, *gpu + start, slice))
+        let slice = Slice { chunk: chunk.id, offset: start, len };
+        Some((chunk.buffer.clone(), (chunk.data + start as usize) as *mut u8, chunk.gpu + start, slice))
     }
 
-    /// A run goes back, joined to its free neighbours.
+    /// A run goes back, joined to its free neighbours; if the returned chunk
+    /// became empty, release it immediately when oversized or when more than
+    /// [`SPARE_CHUNKS`] standard chunks are already empty.
     fn give_back(&mut self, slice: Slice) {
-        let Some((_, _, _, free)) = self.chunks.get_mut(slice.chunk) else { return };
+        let Some(idx) = self.chunks.iter().position(|c| c.id == slice.chunk) else { return };
+        let chunk = &mut self.chunks[idx];
         let (mut at, mut n) = (slice.offset, slice.len);
-        if let Some((&before, &m)) = free.range(..at).next_back()
+        if let Some((&before, &m)) = chunk.free.range(..at).next_back()
             && before + m == at
         {
-            free.remove(&before);
+            chunk.free.remove(&before);
             (at, n) = (before, n + m);
         }
-        if let Some(m) = free.remove(&(at + n)) {
+        if let Some(m) = chunk.free.remove(&(at + n)) {
             n += m;
         }
-        free.insert(at, n);
+        chunk.free.insert(at, n);
+        if chunk.free.get(&0) != Some(&chunk.size) {
+            return;
+        }
+        let oversized = chunk.size != CHUNK;
+        let empty_standard = self
+            .chunks
+            .iter()
+            .filter(|c| c.size == CHUNK && c.free.get(&0) == Some(&c.size))
+            .count();
+        if oversized || empty_standard > SPARE_CHUNKS {
+            self.chunks.swap_remove(idx);
+        }
     }
 }
 
@@ -1434,10 +1468,12 @@ pub(crate) mod tests {
             arena.give_back(s);
         }
         assert_eq!(arena.chunks.len(), 1);
-        assert_eq!(arena.chunks[0].3.len(), 1, "one free run again");
+        assert_eq!(arena.chunks[0].free.len(), 1, "one free run again");
         // Larger than a buffer: one of its own.
         let (_, _, _, d) = arena.take(CHUNK + 1, 4).unwrap();
         assert_eq!((arena.chunks.len(), d.chunk), (2, 1));
+        arena.give_back(d);
+        assert_eq!(arena.chunks.len(), 1, "oversized empty chunk released, 1 spare kept");
     }
 
     /// Ranges shaders write far apart are kept apart (not the copy between
