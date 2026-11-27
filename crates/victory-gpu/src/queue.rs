@@ -234,7 +234,9 @@ fn pump(held: &mut Holding, why: Why) {
     }
     // Once work stays held, a timer tests it every 2 ms: memory the title
     // writes from the CPU, or the valve, may let it go with no call of ours.
-    if held.blocked(&read).is_empty() {
+    // The pump already tested every wait once and said whether any is still
+    // blocked, so the same waits are not read again here.
+    if !pumped.blocked {
         return;
     }
     static TIMER: std::sync::Once = std::sync::Once::new();
