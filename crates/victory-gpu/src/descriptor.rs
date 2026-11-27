@@ -9,6 +9,8 @@
 
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
 use crate::resource::{Memory, PAGEABLE_IIDS};
+use std::sync::atomic::Ordering::{Acquire, Release};
+use std::sync::atomic::{AtomicPtr, AtomicU32};
 
 #[cfg(windows)]
 pub(crate) mod host;
@@ -469,6 +471,81 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
+/// Entries of [`LIVE`]: chunks of this many, made as the view list grows.
+const LIVE_CHUNK: usize = 4096;
+
+/// The generation of each entry of [`VIEWS`] that a view holds (0: free, or
+/// not made yet), read without its lock; written under its exclusive lock.
+/// While an entry is live its view does not change (an entry is given a new
+/// view only after `forget` freed it, under a new generation), so a view
+/// found for an entry and generation still live is the one there.
+/// shortcut: entries past `LIVE_CHUNK * 1024` are not cached (always looked
+/// up under the lock).
+static LIVE: [AtomicPtr<[AtomicU32; LIVE_CHUNK]>; 1024] =
+    [const { AtomicPtr::new(std::ptr::null_mut()) }; 1024];
+
+/// Entry `i`'s live generation, if its chunk is made.
+fn live(i: u32) -> Option<u32> {
+    let chunk = LIVE.get(i as usize / LIVE_CHUNK)?.load(Acquire);
+    // SAFETY: chunks are never freed once made.
+    (!chunk.is_null()).then(|| unsafe { &(*chunk)[i as usize % LIVE_CHUNK] }.load(Acquire))
+}
+
+/// Entry `i` holds a view under `generation` (0: none). Called under
+/// [`VIEWS`]' exclusive lock.
+fn set_live(i: u32, generation: u32) {
+    let Some(at) = LIVE.get(i as usize / LIVE_CHUNK) else {
+        return;
+    };
+    let mut chunk = at.load(Acquire);
+    if chunk.is_null() {
+        chunk = Box::into_raw(Box::new([const { AtomicU32::new(0) }; LIVE_CHUNK]));
+        at.store(chunk, Release);
+    }
+    // SAFETY: as in `live`.
+    unsafe { &(*chunk)[i as usize % LIVE_CHUNK] }.store(generation, Release);
+}
+
+/// Views each thread looked up lately (entry, generation, view), by entry:
+/// title threads recording draws find the views their tables hold here,
+/// not under [`VIEWS`]' lock, whose shared count every thread wrote.
+const SEEN_SLOTS: usize = 1024;
+type Seen = Vec<Option<(u32, u32, View)>>;
+std::thread_local! {
+    static SEEN: std::cell::RefCell<Seen> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The view of entry `i` if `generation` is still its own.
+fn view_of(i: u32, generation: u32) -> Option<View> {
+    let slot = i as usize % SEEN_SLOTS;
+    if live(i) == Some(generation)
+        && let Ok(Some(view)) = SEEN.try_with(|s| match s.borrow().get(slot) {
+            Some(Some((at, g, view))) if *at == i && *g == generation => Some(view.clone()),
+            _ => None,
+        })
+    {
+        return Some(view);
+    }
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let (view, current) = views.list.get(i as usize)?;
+    if *current != generation {
+        return None;
+    }
+    let view = view.clone();
+    // Kept only while the entry holds it (a freed entry keeps its last view
+    // under the generation its next view will have).
+    if live(i) == Some(generation) {
+        let _ = SEEN.try_with(|s| {
+            let mut s = s.borrow_mut();
+            if s.is_empty() {
+                s.resize(SEEN_SLOTS, None);
+            }
+            s[slot] = Some((i, generation, view.clone()));
+        });
+    }
+    Some(view)
+}
+
 impl View {
     /// The resource objects the view names.
     fn resources(&self) -> [usize; 2] {
@@ -502,6 +579,7 @@ fn record(handle: u64, view: View) {
                 views.by_resource.entry(r).or_default().push(i);
             }
             views.index.insert(view, i);
+            set_live(i, views.list[i as usize].1);
             i
         }
     };
@@ -528,6 +606,7 @@ pub(crate) fn forget(resource: usize) {
         }
         views.index.remove(&view);
         views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+        set_live(i, 0);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
@@ -537,9 +616,7 @@ pub(crate) fn forget(resource: usize) {
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    view_of(i, generation)
 }
 
 /// For each record (tag, index, generation): whether it names a view that
@@ -561,9 +638,10 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    if tag != VIEW_TAG {
+        return None;
+    }
+    view_of(i, generation)
 }
 
 /// A description of `N` words, if the title passes one.
@@ -981,6 +1059,93 @@ pub(crate) mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    /// A thread that looked views up (as title threads recording draws do)
+    /// finds the slot's new view once the title rewrites it, and none for a
+    /// released resource's view, also when its entry holds another view
+    /// since.
+    #[test]
+    fn threads_that_looked_views_up_see_them_rewritten_and_released() {
+        let null = std::ptr::null();
+        let slots = [0u64; 4 * 4];
+        let a = slots.as_ptr() as u64;
+        let (b, c) = (a + 32, a + 64);
+        let (first, second, third) = (0x7778_0000usize, 0x7779_0000usize, 0x777a_0000usize);
+        let (ask, asked) = std::sync::mpsc::channel::<u64>();
+        let (answer, answers) = std::sync::mpsc::channel::<Option<View>>();
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                for at in asked {
+                    answer.send(view(at)).unwrap();
+                }
+            });
+            let look = |at: u64| {
+                ask.send(at).unwrap();
+                answers.recv().unwrap()
+            };
+            create_srv(null, first as This, std::ptr::null(), a);
+            assert_eq!(look(a), Some(View::Shader(first, None)));
+            assert_eq!(look(a), Some(View::Shader(first, None)), "looked up again");
+            create_srv(null, second as This, std::ptr::null(), a);
+            assert_eq!(look(a), Some(View::Shader(second, None)), "rewritten");
+            create_srv(null, first as This, std::ptr::null(), b);
+            assert_eq!(look(b), Some(View::Shader(first, None)));
+            // SAFETY: in `slots`.
+            let [_, entry, _] = unsafe { *(b as *const [u32; 3]) };
+            forget(first);
+            assert_eq!(look(b), None, "released");
+            // The freed entry most likely holds this view next (other tests
+            // may take it first).
+            create_srv(null, third as This, std::ptr::null(), c);
+            // SAFETY: in `slots`.
+            let [_, reused, _] = unsafe { *(c as *const [u32; 3]) };
+            assert_eq!(look(c), Some(View::Shader(third, None)));
+            let again = if entry == reused { "reused" } else { "free" };
+            assert_eq!(look(b), None, "released, its entry {again}");
+            assert_eq!(view(b), None);
+            drop(ask);
+        });
+        forget(second);
+        forget(third);
+    }
+
+    /// A thread that looked a view up finds it again while another thread
+    /// holds the view registry's lock (as a title thread writing a view
+    /// does): it does not wait for that lock.
+    #[test]
+    fn a_view_looked_up_before_does_not_wait_for_the_view_registry() {
+        let null = std::ptr::null();
+        let slots = [0u64; 4];
+        let a = slots.as_ptr() as u64;
+        let resource = 0x777b_0000usize;
+        create_srv(null, resource as This, std::ptr::null(), a);
+        let (ask, asked) = std::sync::mpsc::channel::<u64>();
+        let (answer, answers) = std::sync::mpsc::channel::<Option<View>>();
+        let in_time = std::thread::scope(|s| {
+            s.spawn(move || {
+                for at in asked {
+                    answer.send(view(at)).unwrap();
+                }
+            });
+            ask.send(a).unwrap();
+            assert_eq!(answers.recv().unwrap(), Some(View::Shader(resource, None)));
+            // The entry stays live (only `forget` of its resource frees it),
+            // so nothing changes what the thread found while the lock is held.
+            let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            ask.send(a).unwrap();
+            let in_time = answers.recv_timeout(std::time::Duration::from_secs(1));
+            drop(views);
+            let late = in_time.is_err().then(|| answers.recv().unwrap());
+            drop(ask);
+            (in_time, late)
+        });
+        assert_eq!(
+            in_time,
+            (Ok(Some(View::Shader(resource, None))), None),
+            "the lookup waited for the view registry's lock"
+        );
+        forget(resource);
     }
 
     /// A record the title copies into its shader-visible heap as bytes (no
