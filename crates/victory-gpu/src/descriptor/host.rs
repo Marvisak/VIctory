@@ -1185,8 +1185,52 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    let align = copy_alignment(u64::from(view_stride(view)), view_raw(view));
+    let (shadow, _) = crate::shadow::for_view(address, len, align)?;
     Some((shadow, address, len))
+}
+
+/// Where in its host copy a buffer view may start: on its element, and a
+/// raw view on 16 bytes. The host refuses a raw view whose first byte is
+/// not 16-byte aligned in its buffer (the call is invalid and the device is
+/// removed), where the console takes any dword; such a view gets a copy of
+/// its own bytes that starts on 16 ([`crate::shadow::for_view`]).
+fn copy_alignment(element: u64, raw: bool) -> u64 {
+    if raw {
+        element.max(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT))
+    } else {
+        element
+    }
+}
+
+/// Whether `view` is made as a raw buffer view on the host: constant
+/// buffers (`make`) and buffer views with the raw flag. The same views
+/// [`buffer_srv`] and [`buffer_uav`] align with [`copy_alignment`], so the
+/// copy refreshed for a view is the one its slot reads.
+fn view_raw(view: &View) -> bool {
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Constant(..) => return true,
+        View::Shader(_, Some(desc)) => (false, desc),
+        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
+            Ok(words) => (*unordered, words),
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    // The view dimension: buffer (1) for shader and unordered views alike.
+    if words[1] != 1 {
+        return false;
+    }
+    if unordered {
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { uav_desc(words).Anonymous.Buffer };
+        buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
+    } else {
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { srv_desc(words).Anonymous.Buffer };
+        buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0
+    }
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -1231,8 +1275,9 @@ fn buffer_srv(
     }
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
+    let align = copy_alignment(element, buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0);
     let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
+        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)
     else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
@@ -1296,7 +1341,9 @@ fn buffer_uav(
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let align = copy_alignment(element, buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0);
+    let (shadow, own) =
+        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -1844,6 +1891,33 @@ mod tests {
         let srv = View::Shader(0, Some([62, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
         assert_eq!(view_kind(&srv), VIEW_INTEGER, "R8_UINT");
         assert_eq!(view_stride(&uav(12, 0, 0)) | view_kind(&uav(12, 0, 0)), 8 | VIEW_INTEGER);
+    }
+
+    /// Raw views (constant buffers are made raw too) start on 16 bytes of
+    /// their host copy, other views on their element: the host refuses a
+    /// raw view 4, 8 or 12 bytes past a 16-byte boundary and removes the
+    /// device (a title run: `FirstElement (2) must be a multiple of 4`).
+    #[test]
+    fn raw_views_start_on_16_bytes_of_their_copy() {
+        // Format, dimension (buffer), first element, count, stride, counter, flags.
+        let uav = |format, stride, flags| View::Unordered(0, 0, Some([format, 1, 0, 0, 64, stride, 0, 0, flags, 0]));
+        // Format, dimension, mapping, first element, count, stride, flags.
+        let srv = |flags| View::Shader(0, Some([0, 1, 5768, 0, 0, 0, 64, 0, flags, 0]));
+        for (view, raw) in [
+            (uav(0, 0, 1), true),
+            (srv(1), true),
+            (View::Constant(0x1008, 256), true),
+            (uav(12, 0, 0), false),
+            (uav(0, 16, 0), false),
+            (srv(0), false),
+        ] {
+            assert_eq!(view_raw(&view), raw, "{view:?}");
+        }
+        assert_eq!(copy_alignment(4, true), 16);
+        assert_eq!(copy_alignment(4, false), 4);
+        assert_eq!(copy_alignment(12, false), 12);
+        // Whatever the element of a raw view, never below its 16.
+        assert_eq!(copy_alignment(32, true), 32);
     }
 
     /// A placed texture's view the title writes into a heap is left null
