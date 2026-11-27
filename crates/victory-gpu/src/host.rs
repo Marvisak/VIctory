@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    E_FAIL, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
@@ -358,6 +360,13 @@ fn log_gpu_times(frames: f64) {
 /// system's memory manager sees them: use over budget makes it page
 /// allocations at submissions.
 pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
+    let mb = |(usage, budget): (u64, u64)| (usage as f64 / 1e6, budget as f64 / 1e6);
+    Some([mb(memory_info(true)?), mb(memory_info(false)?)])
+}
+
+/// The host device's use and budget in bytes, of video memory on the card
+/// (`local`) or of the system memory it reads.
+pub(crate) fn memory_info(local: bool) -> Option<(u64, u64)> {
     static ADAPTER: OnceLock<Option<IDXGIAdapter3>> = OnceLock::new();
     let adapter = ADAPTER
         .get_or_init(|| {
@@ -370,13 +379,15 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
             }
         })
         .as_ref()?;
-    let info = |group| {
-        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        // SAFETY: a valid out pointer.
-        unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }.ok()?;
-        Some((info.CurrentUsage as f64 / 1e6, info.Budget as f64 / 1e6))
+    let group = if local {
+        DXGI_MEMORY_SEGMENT_GROUP_LOCAL
+    } else {
+        DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL
     };
-    Some([info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?])
+    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    // SAFETY: a valid out pointer.
+    unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }.ok()?;
+    Some((info.CurrentUsage, info.Budget))
 }
 
 #[cfg(test)]
@@ -1340,6 +1351,8 @@ impl Host {
         let faults = crate::copystat::page_faults();
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
+        // Whether every list that declared `back[i]` marks its writes there.
+        let mut marked: Vec<bool> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
         // Shaders that read memory with no copy computed something else than
         // the console's: it stays out of title memory, where it broke the
@@ -1360,15 +1373,19 @@ impl Host {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();
             for step in &deferred.copies {
-                if let Step::GpuWrite(shadow, address, len, _, memory) = step {
+                if let Step::GpuWrite(shadow, address, len, marks, memory) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
                     // A range both kinds declare is withheld whole.
                     let goes_back = !(missed && *memory);
                     match index.get(&key) {
-                        Some(&i) => back[i].3 &= goes_back,
+                        Some(&i) => {
+                            back[i].3 &= goes_back;
+                            marked[i] &= *marks;
+                        }
                         None => {
                             index.insert(key, back.len());
                             back.push((shadow.clone(), *address, *len, goes_back));
+                            marked.push(*marks);
                         }
                     }
                 }
@@ -1393,6 +1410,15 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        // What shaders wrote into host copies in video memory first comes
+        // into their system memory side, which the copy-backs read: ranges
+        // declared unmarked whole, marked ones by their marked pages.
+        crate::shadow::pull_written(
+            back.iter()
+                .zip(&marked)
+                .filter(|(_, marked)| !**marked)
+                .map(|((s, a, n, _), _)| (s, *a, *n)),
+        );
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
@@ -3124,6 +3150,7 @@ impl Meter {
                 crate::copystat::log(report_frames);
                 crate::bindless::log(report_frames);
                 crate::shadow::log_views(report_frames);
+                crate::vram::log(report_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
                 if n > 0 {
                     tracing::info!(
@@ -3591,7 +3618,7 @@ impl Host {
     /// the GPU's time is shaders reading the copies over the bus. CPU reads
     /// of them (snapshots, copy-backs) become slow: for that measurement only.
     #[cfg(feature = "diagnostics")]
-    fn copies_in_video_memory(&self) -> bool {
+    pub(crate) fn copies_in_video_memory(&self) -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| {
             if !crate::switch::on("VICTORY_COPIES_IN_VIDEO_MEMORY") {
@@ -3618,18 +3645,37 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        #[cfg(feature = "diagnostics")]
+        if self.copies_in_video_memory() {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+                ..Default::default()
+            };
+            return self.buffer_in(size, &heap);
+        }
+        self.system_buffer(size)
+    }
+
+    /// [`Host::shared_buffer`] in system memory always, whatever
+    /// `VICTORY_COPIES_IN_VIDEO_MEMORY` asks: for host copies while
+    /// `crate::vram` places them, within its budget.
+    pub(crate) fn system_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
             CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
             MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
             ..Default::default()
         };
-        #[cfg(feature = "diagnostics")]
-        let heap = if self.copies_in_video_memory() {
-            D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() }
-        } else {
-            heap
-        };
+        self.buffer_in(size, &heap)
+    }
+
+    /// A buffer of `size` bytes in `heap`, mapped, that shaders read and
+    /// write. Starts in the common state.
+    pub(crate) fn buffer_in(
+        &self,
+        size: u64,
+        heap: &D3D12_HEAP_PROPERTIES,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),
@@ -3650,7 +3696,7 @@ impl Host {
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
-                    &heap,
+                    heap,
                     D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
@@ -3665,12 +3711,184 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
+                tracing::warn!(error = %e, size, heap = heap.Type.0, "no shared buffer");
                 None
             }
         }
     }
+
+    /// Copies `regions` (destination, its offset, source, its offset,
+    /// bytes) between buffers on the GPU, now, and waits: what shaders
+    /// wrote into host copies in video memory reaches their system memory
+    /// side before the CPU reads it (`crate::shadow::pull`). A list of its
+    /// own on the queue, after whatever the queue holds, so it can run
+    /// inside a submission's copy-back. Buffers start and end in the common
+    /// state (they enter and leave the copy states implicitly).
+    ///
+    /// Returns whether the copy is known to have run to its end: false when
+    /// there is no copier, when a call failed, or when the end could not be
+    /// seen. A list that was executed but whose end was not seen may still
+    /// be running: the copier is then never used again (its allocator is
+    /// reset only after its last list was seen to end), and every later
+    /// call returns false. A removed device ends the run here, as after a
+    /// submission ([`fail`]).
+    // From #2130 (0xkn0wh3r3).
+    pub(crate) fn copy_now(
+        &self,
+        regions: &[(&ID3D12Resource, u64, &ID3D12Resource, u64, u64)],
+    ) -> bool {
+        if regions.is_empty() {
+            return true;
+        }
+        let Some(copier) = self.copier() else {
+            return false;
+        };
+        let mut c = copier.lock().unwrap_or_else(|e| e.into_inner());
+        if c.broken {
+            return false;
+        }
+        c.value += 1;
+        let value = c.value;
+        // SAFETY: the allocator's last list was seen to end (else the copier
+        // is broken, above); the buffers are live and the ranges inside them
+        // (the caller's).
+        let recorded = unsafe {
+            c.allocator.Reset().and_then(|()| {
+                c.list.Reset(&c.allocator, None)?;
+                for &(dst, dst_at, src, src_at, bytes) in regions {
+                    c.list.CopyBufferRegion(dst, dst_at, src, src_at, bytes);
+                }
+                c.list.Close()?;
+                c.list.cast::<ID3D12CommandList>()
+            })
+        };
+        let list = match recorded {
+            Ok(list) => list,
+            // Nothing was executed: the copier stays usable.
+            Err(e) => {
+                tracing::warn!(error = %e, "a host GPU copy was not recorded");
+                return false;
+            }
+        };
+        // SAFETY: a closed list of ours.
+        unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+        // From here the list may be running until its end is seen.
+        #[cfg(test)]
+        let fails = COPY_FAILS.swap(0, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let fails = 0;
+        let signalled = if fails == FAIL_SIGNAL {
+            Err(windows::core::Error::from(E_FAIL))
+        } else {
+            // SAFETY: our fence.
+            unsafe { self.queue.Signal(&c.fence, value) }
+        };
+        let ended = match signalled {
+            Ok(()) => c.wait(value, fails == FAIL_WAIT),
+            Err(e) => {
+                tracing::error!(error = %e, "a host GPU copy's signal failed: its end cannot be seen");
+                false
+            }
+        };
+        // SAFETY: a plain query.
+        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            fail(format_args!(
+                "host GPU device removed during a GPU copy of shaders' writes"
+            ));
+        }
+        if !ended {
+            c.broken = true;
+            tracing::error!(
+                "a host GPU copy's end was not seen: the copier is not used again (shaders' writes into host copies in video memory come back through the mapping from now on)"
+            );
+        }
+        ended
+    }
+
+    /// The copier of [`Host::copy_now`], made on first use (none if it could
+    /// not be made).
+    pub(crate) fn copier(&self) -> Option<&'static Mutex<Copier>> {
+        static COPIER: OnceLock<Option<Mutex<Copier>>> = OnceLock::new();
+        COPIER
+            .get_or_init(|| {
+                // SAFETY: plain creation; the list stays closed until used.
+                let made = unsafe {
+                    (|| -> windows::core::Result<Copier> {
+                        let allocator: ID3D12CommandAllocator =
+                            self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                        let list: ID3D12GraphicsCommandList =
+                            self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                        list.Close()?;
+                        let fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                        let event = CreateEventW(None, false, false, None)?;
+                        Ok(Copier { allocator, list, fence, event, value: 0, broken: false })
+                    })()
+                };
+                made.map_err(|e| tracing::warn!(error = %e, "no host copier: host copies stay in system memory"))
+                    .ok()
+                    .map(Mutex::new)
+            })
+            .as_ref()
+    }
 }
+
+/// The list [`Host::copy_now`] records its copies in, and its fence.
+pub(crate) struct Copier {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    fence: ID3D12Fence,
+    event: HANDLE,
+    value: u64,
+    /// A list was executed and its end not seen: never used again.
+    broken: bool,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the event is waited on under the
+// mutex only.
+unsafe impl Send for Copier {}
+
+impl Copier {
+    /// Waits until the fence reaches `value`: through the event, else (the
+    /// event could not be set or waited on, or `event_fails` in tests) by
+    /// reading the fence. Returns whether it was seen to reach it; a removed
+    /// device's fence reads `u64::MAX`, which is not taken for an end.
+    fn wait(&self, value: u64, event_fails: bool) -> bool {
+        let waited = !event_fails
+            // SAFETY: our fence and event.
+            && unsafe { self.fence.SetEventOnCompletion(value, self.event) }.is_ok()
+            // SAFETY: our event.
+            && unsafe { WaitForSingleObject(self.event, INFINITE) } == WAIT_OBJECT_0;
+        if !waited {
+            tracing::warn!("a host GPU copy's event failed: its fence is read instead");
+        }
+        let started = std::time::Instant::now();
+        loop {
+            // SAFETY: a plain query.
+            let done = unsafe { self.fence.GetCompletedValue() };
+            if done == u64::MAX {
+                return false;
+            }
+            if done >= value {
+                return true;
+            }
+            if waited || started.elapsed() > std::time::Duration::from_secs(10) {
+                // Woken without the fence there, or no end in 10 s (the host
+                // resets a device whose work runs for about 2 s).
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    }
+}
+
+/// Failures [`Host::copy_now`] stands in for in tests ([`COPY_FAILS`]):
+/// its signal, or its event.
+pub(crate) const FAIL_SIGNAL: u8 = 1;
+pub(crate) const FAIL_WAIT: u8 = 2;
+
+/// The next [`Host::copy_now`] fails as asked (tests).
+#[cfg(test)]
+pub(crate) static COPY_FAILS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Host resources that view heap slots stopped viewing while a submission
 /// may have been running ([`retire`]).
@@ -3996,7 +4214,7 @@ mod withholding {
             copy.refresh(&list, address, len);
             copy.gpu_writes(&list, address, len, false);
             // The shader's write, after the step that keeps the range's bytes.
-            list.defer_host(move || copy.write_host(address, &[value]));
+            list.defer_host(move || copy.write_gpu(address, &[value]));
         }
         list.defer_missed(|| true);
         list.close();
