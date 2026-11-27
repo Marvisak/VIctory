@@ -42,6 +42,7 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     pub(crate) key: String,
     used: AtomicBool,
+    first_wait: OnceLock<Instant>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -81,6 +82,7 @@ impl Pending {
             #[cfg(feature = "diagnostics")]
             skipped_shader,
             used: AtomicBool::new(false),
+            first_wait: OnceLock::new(),
         }
     }
 
@@ -235,12 +237,17 @@ pub(crate) fn early(p: &Arc<Pending>) {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
+    let first_wait = p.first_wait.get_or_init(Instant::now);
+    let pipeline_left = BUDGET.saturating_sub(first_wait.elapsed());
+    if pipeline_left.is_zero() {
+        return;
+    }
     static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
     static WAITED_US: AtomicU64 = AtomicU64::new(0);
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
         WAITED_US.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed))).min(pipeline_left);
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -351,6 +358,20 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_pipeline_does_not_wait_a_fresh_budget_each_frame() {
+        let p = Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
+        wait(&p, 900_000);
+        let started = Instant::now();
+        wait(&p, 900_001);
+        assert!(started.elapsed() < Duration::from_millis(200));
+    }
 
     /// An early start is queued once; a draw waiting for it puts it ahead,
     /// once, unless a worker has taken it.
