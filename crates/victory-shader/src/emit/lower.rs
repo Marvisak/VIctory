@@ -42,8 +42,8 @@ pub(crate) struct Lowered {
     pub memory: bool,
     /// Writes there (the written-pages bitmap).
     pub memory_writes: bool,
-    /// Reads buffer views' addresses or texture views' sizes from
-    /// descriptors (the view addresses).
+    /// Reads a buffer pointer, native base word or texture size from the
+    /// host's view-address table.
     pub view_addresses: bool,
     /// Takes descriptors from the resource heap itself (root type 5, not
     /// a table), and whether as unordered access views.
@@ -64,7 +64,7 @@ pub(crate) struct Lowered {
     #[cfg(test)]
     pub wave_ops: bool,
     /// Whether it declares rasterizer-ordered views.
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub rovs: bool,
     /// Whether the module declares `dx.op.waveGetLaneIndex`.
     #[cfg(test)]
@@ -1406,7 +1406,7 @@ impl<'a> Lower<'a> {
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
-            #[cfg(test)]
+            #[cfg(all(test, windows))]
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
@@ -4799,14 +4799,22 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Byte offset at t1 for the descriptor loaded from this heap slot.
+    fn view_record_offset(&mut self, site: Site, first: u8) -> Result<V, Why> {
+        let index = self.heap_index(site, first, false)?;
+        let stride = self.s.m.i32(super::VIEW_ADDRESS_BYTES);
+        Ok(self.s.m.bin(self.cur, Bin::Mul, index, stride))
+    }
+
     /// A descriptor load from a table or heap whose dwords the program only
     /// reads as numbers: the base address of a buffer view (dwords 0 and 1,
     /// as a pointer to title memory: the BVH's address in its SRV) or, for
-    /// a whole image descriptor (eight dwords), also the size fields of
-    /// dwords 1-3 (width, height, first and last level, type: size queries
-    /// of a texture the program never samples). They come from the host's
-    /// view addresses, `t1` in [`super::shader::MEMORY_SPACE`]: four dwords
-    /// per heap index.
+    /// a whole image descriptor (eight dwords), the native base in dword 0
+    /// and the size fields in dwords 1-3 (width, height, first and last level,
+    /// type). These support queries of a texture the program never samples.
+    /// The host supplies four dwords per heap index at `t1` in
+    /// [`super::shader::MEMORY_SPACE`]. Bit 16 of word 1 is host-only: a buffer-shaped load
+    /// of a tagged image or CBV reads zero for both address halves.
     // shortcut: dword 1 holds the address bits only (stride and swizzle read
     // 0) or a texture's width bits, dword 3 a texture's size fields (format,
     // tiling and swizzle choice read 0 or the identity); dword 4 on and a
@@ -4824,18 +4832,40 @@ impl<'a> Lower<'a> {
         }
         // The compiler loads image descriptors whole, buffer ones as four
         // dwords.
-        let known = if count == 8 && a.offset.is_multiple_of(32) { 4 } else { 2 };
+        let image = count == 8 && a.offset.is_multiple_of(32);
+        let known = if image { 4 } else { 2 };
         let views = self.s.view_addresses_handle();
         for k in 0..count {
             let word = (a.offset / 4 + k) % 8;
             let val = if word < known {
-                let index = self.heap_index(site, k as u8, false)?;
+                let record = self.view_record_offset(site, k as u8)?;
                 let c = self.cur;
-                let four = self.s.m.i32(4);
-                let at = self.s.m.bin(c, Bin::Shl, index, four);
-                let w = self.s.m.i32(4 * word);
-                let at = self.s.m.bin(c, Bin::Add, at, w);
-                Val::I32(self.raw_dword(views, at))
+                let offset = self.s.m.i32(4 * word);
+                let at = self.s.m.bin(c, Bin::Add, record, offset);
+                let value = self.raw_dword(views, at);
+                let value = if image {
+                    if word == 1 {
+                        let fields = self.s.m.i32(!super::VIEW_NO_BUFFER_POINTER);
+                        self.s.m.bin(c, Bin::And, value, fields)
+                    } else {
+                        value
+                    }
+                } else {
+                    // A buffer-shaped load of either half of a non-buffer base reads zero.
+                    let hi = if word == 1 {
+                        value
+                    } else {
+                        let four = self.s.m.i32(4);
+                        let at = self.s.m.bin(c, Bin::Add, record, four);
+                        self.raw_dword(views, at)
+                    };
+                    let tag = self.s.m.i32(super::VIEW_NO_BUFFER_POINTER);
+                    let tagged = self.s.m.bin(c, Bin::And, hi, tag);
+                    let zero = self.s.m.i32(0);
+                    let buffer = self.s.m.cmp(c, pred::EQ, tagged, zero);
+                    self.s.m.select(c, buffer, value, zero)
+                };
+                Val::I32(value)
             } else {
                 Val::Missing(OTHER)
             };
@@ -11578,6 +11608,7 @@ mod tests {
         let layout = vec![root(RootType::Table, 0, 0)];
         let l = lower_with(&words, layout, used).unwrap();
         assert_eq!(l.nonuniform_handles, 0);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -11631,6 +11662,7 @@ mod tests {
         let l = lower_with(&words, layout, used).unwrap();
         // One image handle from the joins' heap index, the same in all lanes.
         assert_eq!(l.nonuniform_handles, 0);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -11681,6 +11713,7 @@ mod tests {
         // One image handle made in the entry block for both loads, and the
         // UAV's.
         assert_eq!(l.heap_handles, 2);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -12165,7 +12198,7 @@ mod tests {
             let st = structure::structure(&p).unwrap();
             let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = io::raise(&p, &native).unwrap();
-            let mut lowered = lower(&Parts {
+            let lowered = lower(&Parts {
                 native: &native,
                 p: &p,
                 st: &st,
@@ -12185,7 +12218,8 @@ mod tests {
             if let Ok(mut v) = crate::emit::validator::Validator::load(
                 crate::emit::validator::Validator::default_path().as_deref(),
             ) {
-                v.validate(&mut lowered.dxil).unwrap();
+                let mut dxil = lowered.dxil;
+                v.validate(&mut dxil).unwrap();
             }
         }
     }

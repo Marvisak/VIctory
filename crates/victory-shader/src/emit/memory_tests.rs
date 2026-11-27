@@ -105,14 +105,28 @@ fn program() -> HostShader {
     w.extend(global(12, 9, 1, 0, 6, 0x24)); // global_load_dword v9, v1, s[6:7]
     w.push(S_WAITCNT_ALL);
     w.extend(buffer_store_dword(9, 8, 20));
-    // The image descriptor at heap index 2 loaded whole and read only for
-    // its size fields (dwords 1-3).
+    // Read the whole image descriptor at heap index 2 for its native base
+    // and size fields (dwords 0-3).
     w.extend(s_load(3, 28, 4, 0x40)); // s[28:35]
     w.push(S_WAITCNT_ALL);
-    for (k, at) in [(29, 24), (30, 28), (31, 32)] {
+    for (k, at) in [(29, 24), (30, 28), (31, 32), (28, 36)] {
         w.push(v_mov_b32(5, k));
         w.extend(buffer_store_dword(5, 8, at));
     }
+    // Read both the image and the neighbouring CBV as buffer pointers.
+    for (offset, output) in [(0x40, 40), (0x60, 48)] {
+        w.extend(s_load(1, 28, 4, offset));
+        w.push(S_WAITCNT_ALL);
+        w.push(v_mov_b32(5, 28));
+        w.push(v_mov_b32(7, 29));
+        w.extend(buffer_store_dword(5, 8, output));
+        w.extend(buffer_store_dword(7, 8, output + 4));
+    }
+    // A full numeric descriptor read keeps the CBV's base word.
+    w.extend(s_load(3, 28, 4, 0x60));
+    w.push(S_WAITCNT_ALL);
+    w.push(v_mov_b32(5, 28));
+    w.extend(buffer_store_dword(5, 8, 56));
     w.push(S_ENDPGM);
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -255,7 +269,14 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     let mut view_addresses = vec![0u32; 4 * 5];
     view_addresses[4..6].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
     let image = [0xC000_0000, 0x0957_C0F9, 0x9004_2FAC];
-    view_addresses[9..12].copy_from_slice(&image);
+    let base = 0xFEDC_BA98;
+    view_addresses[8..12].copy_from_slice(&[
+        base,
+        image[0] | super::VIEW_NO_BUFFER_POINTER,
+        image[1],
+        image[2],
+    ]);
+    view_addresses[12..14].copy_from_slice(&[0xDEAD_BEEF, super::VIEW_NO_BUFFER_POINTER]);
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -287,7 +308,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                             (3, Root::View { srv: true, data: view_addresses.clone() }),
                         ],
                         views: &[
-                            View::RawUav(9),
+                            View::RawUav(15),
                             View::Memory(&memory),
                             View::Pair,
                             View::NullPair,
@@ -300,7 +321,23 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(
                 out[0],
-                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333, image[0], image[1], image[2]],
+                [
+                    0x1111_1111,
+                    0x2222_2222,
+                    0x2222_2222,
+                    0,
+                    0,
+                    0x3333_3333,
+                    image[0],
+                    image[1],
+                    image[2],
+                    base,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0xDEAD_BEEF,
+                ],
                 "{label}: reads"
             );
             assert_eq!(out[1][0x40 / 4], value, "{label}: the store");
@@ -316,6 +353,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                 .collect();
             assert_eq!(marked, [(far >> 28) as usize, entry, entry + 1], "{label}: pages");
         }
+        eprintln!("{label}: view-address numeric words and pointer reads matched");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
