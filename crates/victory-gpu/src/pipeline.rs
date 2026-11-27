@@ -267,6 +267,14 @@ pub(crate) fn making() -> u64 {
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
+/// Whether `what` has been reported before (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn first_time(what: &str) -> bool {
+    static REPORTED: Mutex<Option<HashMap<String, ()>>> = Mutex::new(None);
+    let mut reported = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+    reported.get_or_insert_with(HashMap::new).insert(what.to_owned(), ()).is_none()
+}
+
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(all(feature = "diagnostics", any(windows, test)))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
@@ -291,10 +299,14 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    HASHES.get_or_init(|| {
+    let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
-    })
+    });
+    if !hashes.is_empty() && first_time("VICTORY_SKIP_PIPELINES") {
+        tracing::info!(?hashes, "VICTORY_SKIP_PIPELINES: skipping their draws and dispatches");
+    }
+    hashes
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -333,7 +345,13 @@ pub(crate) fn note_drop(this: This) {
         p.host
             .skipped_shader
             .as_deref()
-            .map(|hash| format!("skipped shader {hash}"))
+            .map(|hash| {
+                let why = format!("skipped shader {hash}");
+                if first_time(&why) {
+                    tracing::info!(hash, "VICTORY_SKIP_PIPELINES: skipped a draw or dispatch");
+                }
+                why
+            })
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
@@ -707,6 +725,17 @@ pub fn wanted_early(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_skip_is_reported_once_per_hash() {
+        let a = "a_skip_is_reported_once:1";
+        let b = "a_skip_is_reported_once:2";
+        assert!(super::first_time(a));
+        assert!(!super::first_time(a));
+        assert!(super::first_time(b));
+        assert!(!super::first_time(b));
+    }
+
     #[cfg(feature = "diagnostics")]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
