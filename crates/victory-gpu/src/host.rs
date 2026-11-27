@@ -617,6 +617,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn spare_scratch_slots_reuse_by_size_and_evict_past_budget() {
+        let mut spare: Spare<usize> = Spare::new();
+        assert_eq!(spare.take(64), None);
+        assert_eq!(spare.give(1, 64, 128), None);
+        assert_eq!(spare.give(2, 37, 128), None);
+        assert_eq!(spare.take(37), Some(2));
+        assert_eq!(spare.take(64), Some(1));
+        assert_eq!(spare.bytes, 0);
+        assert_eq!(spare.give(3, 64, 100), None);
+        assert_eq!(spare.give(4, 37, 100), Some(4));
+        assert_eq!(spare.bytes, 64);
+        assert_eq!(spare.take(64), Some(3));
+    }
+
+    #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
         let Some(host) = host() else { return };
         let list = host.new_list().unwrap();
@@ -633,7 +648,7 @@ pub(crate) mod tests {
         host.execute(&[&list]);
         list.reset();
         assert_eq!(list.scratch(96 << 10).unwrap(), large);
-        assert_eq!(list.scratch.lock().unwrap().chunks.len(), 2);
+        assert_eq!(list.scratch.lock().unwrap().chunks.len(), 1);
         list.close();
         host.execute(&[&list]);
         list.reset();
@@ -964,6 +979,39 @@ struct ScratchChunk {
     gpu: u64,
     capacity: u64,
 }
+
+// SAFETY: the chunk owns its buffer and persistent mapping.
+unsafe impl Send for ScratchChunk {}
+
+const SPARE_MOST: u64 = 128 << 20;
+
+struct Spare<T> {
+    kept: Vec<(T, u64)>,
+    bytes: u64,
+}
+
+impl<T> Spare<T> {
+    const fn new() -> Self {
+        Spare { kept: Vec::new(), bytes: 0 }
+    }
+
+    fn take(&mut self, size: u64) -> Option<T> {
+        let at = self.kept.iter().rposition(|(_, bytes)| *bytes == size)?;
+        self.bytes -= size;
+        Some(self.kept.remove(at).0)
+    }
+
+    fn give(&mut self, thing: T, size: u64, most: u64) -> Option<T> {
+        if self.bytes + size > most {
+            return Some(thing);
+        }
+        self.bytes += size;
+        self.kept.push((thing, size));
+        None
+    }
+}
+
+static SPARE: Mutex<Spare<ScratchChunk>> = Mutex::new(Spare::new());
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -1791,6 +1839,12 @@ impl HostList {
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            for chunk in std::mem::take(&mut scratch.chunks) {
+                let capacity = chunk.capacity;
+                drop(spare.give(chunk, capacity, SPARE_MOST));
+            }
+            drop(spare);
             (scratch.current, scratch.used) = (0, 0);
         }
         // SAFETY: the list is not executing.
@@ -2201,14 +2255,20 @@ impl HostList {
         if s.current == s.chunks.len() {
             let next = s.chunks.last().map_or(FIRST_SCRATCH_CHUNK, |c| 2 * c.capacity);
             let capacity = len.next_multiple_of(FIRST_SCRATCH_CHUNK).max(next).min(SCRATCH_CHUNK);
-            let (buffer, data) = host.upload_buffer(capacity)?;
-            name(&buffer, || format!("list scratch {capacity:#x}"));
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            #[cfg(feature = "diagnostics")]
-            tracing::debug!(target: "victory_gpu::scratch", list = ?std::ptr::from_ref(self),
-                chunk = s.current, requested = len, capacity, "allocated list scratch");
-            s.chunks.push(ScratchChunk { _buffer: buffer, mapped: data as usize, gpu, capacity });
+            let taken = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(capacity);
+            let chunk = if let Some(chunk) = taken {
+                chunk
+            } else {
+                let (buffer, data) = host.upload_buffer(capacity)?;
+                name(&buffer, || format!("list scratch {capacity:#x}"));
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                #[cfg(feature = "diagnostics")]
+                tracing::debug!(target: "victory_gpu::scratch", list = ?std::ptr::from_ref(self),
+                    chunk = s.current, requested = len, capacity, "allocated list scratch");
+                ScratchChunk { _buffer: buffer, mapped: data as usize, gpu, capacity }
+            };
+            s.chunks.push(chunk);
             s.used = 0;
         }
         let chunk = &s.chunks[s.current];

@@ -122,30 +122,34 @@ const SHADER_VISIBLE: u32 = 1;
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
+
+#[cfg(windows)]
+static SYNCING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(windows)]
+fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let &(_, _, at) = heaps
+        .iter()
+        .find(|&&(start, end, _)| (start..end).contains(&handle))?;
+    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+    // the `SHADER_HEAPS` write lock.
+    let heap = unsafe { &*(at as *const Heap) };
+    Some((heap, heap.index(handle)?))
+}
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
-/// so `Heap::drop` cannot free the heap concurrently.
+/// is in a shader-visible heap.
 #[cfg(windows)]
 fn mirror(handle: u64) {
     #[cfg(feature = "diagnostics")]
     let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((heap, index)) = shader_slot(handle) else {
+        return;
+    };
     #[cfg(feature = "diagnostics")]
     drop(waited);
-    let Some(&(_, _, at)) = heaps
-        .iter()
-        .find(|&&(start, end, _)| (start..end).contains(&handle))
-    else {
-        return;
-    };
-    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
-    // the `SHADER_HEAPS` lock we hold here.
-    let heap = unsafe { &*(at as *const Heap) };
-    let Some(index) = heap.index(handle) else {
-        return;
-    };
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -167,8 +171,9 @@ fn mirror(handle: u64) {
 /// heap at indices in their data, where a slot never mirrored reads nothing.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
+    let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     // Held throughout: a heap is not dropped while its slots are made.
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -211,7 +216,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     // runs evict2, noevict1). They are never released, so they outlive it;
     // the lock is held only to look the slots up and to make the views.
     let placed: Vec<View> = {
-        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
         heaps
             .iter()
             // SAFETY: registered heaps are live (removed when dropped).
@@ -228,7 +233,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     crate::texture::in_parallel(placed.len(), |i| {
         let _ = host::placed_texture(&placed[i]);
     });
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -249,7 +254,7 @@ pub(crate) fn make_read(slots: &[u32]) {
 /// shader-visible view heaps view.
 #[cfg(windows)]
 pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let mut textures = std::collections::HashSet::new();
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -266,7 +271,7 @@ pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
 /// (`crate::resource::evict` gives those textures up).
 #[cfg(windows)]
 pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -280,7 +285,7 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -293,7 +298,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 /// heap cannot be released; None if it is gone or has no host heap.
 #[cfg(windows)]
 pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) -> Option<R> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if !heaps.iter().any(|&(_, _, h)| h == heap) {
         return None;
     }
@@ -307,7 +312,7 @@ pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) ->
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
         // Nothing can find the heap by now. The table's lock is taken
         // inside the heaps' lock (`memory::bind`), never the other way
@@ -461,13 +466,21 @@ struct Views {
     free: Vec<u32>,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+
+fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
+    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
+    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+}
 
 impl View {
     /// The resource objects the view names.
@@ -484,7 +497,7 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = views_write();
     let i = match views.index.get(&view) {
         Some(&i) => i,
         None => {
@@ -515,7 +528,7 @@ fn record(handle: u64, view: View) {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = views_write();
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -537,7 +550,7 @@ pub(crate) fn forget(resource: usize) {
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = views_read();
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
 }
@@ -545,7 +558,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 /// For each record (tag, index, generation): whether it names a view that
 /// is current, as [`view_at`] would find it (one lock for them all).
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = views_read();
     records
         .iter()
         .map(|&[tag, i, generation]| {
@@ -561,7 +574,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = views_read();
     let (view, current) = views.list.get(i as usize)?;
     (tag == VIEW_TAG && *current == generation).then(|| view.clone())
 }
@@ -788,7 +801,7 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
@@ -1054,5 +1067,68 @@ pub(crate) mod tests {
             release(h);
             assert!(queued, "the descriptor write reached the heap at the reused address");
         }
+    }
+
+    #[test]
+    fn views_support_concurrent_readers_and_writers() {
+        let sentinel = |i: usize| View::Shader(usize::MAX - 0x1_0000 - i, None);
+        let barrier = std::sync::Barrier::new(5);
+        std::thread::scope(|scope| {
+            for reader in 0..4usize {
+                let barrier = &barrier;
+                let sentinel = &sentinel;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..256 {
+                        let views = views_read();
+                        let _ = views.index.get(&sentinel(reader));
+                    }
+                });
+            }
+            let barrier = &barrier;
+            let sentinel = &sentinel;
+            scope.spawn(move || {
+                barrier.wait();
+                for i in 0..64usize {
+                    views_write().index.insert(sentinel(i), u32::MAX - i as u32);
+                }
+            });
+        });
+        for i in 0..64usize {
+            assert!(views_read().index.contains_key(&sentinel(i)));
+        }
+        let mut views = views_write();
+        for i in 0..64usize {
+            views.index.remove(&sentinel(i));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shader_heaps_are_concurrently_readable() {
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..256 {
+                        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+                        let _ = heaps.len();
+                    }
+                });
+            }
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                for i in 0..64usize {
+                    SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner()).push((i as u64, i as u64 + 1, usize::MAX - 0x1000 - i));
+                }
+                for i in 0..64usize {
+                    SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner()).retain(|entry| entry.2 != usize::MAX - 0x1000 - i);
+                }
+            });
+        });
+        assert!(SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).iter().all(|entry| entry.2 < usize::MAX - 0x2000));
     }
 }

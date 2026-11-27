@@ -34,6 +34,8 @@ use crate::{HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
 
+mod remap_pool;
+
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
 pub(crate) fn on_wine() -> bool {
     static WINE: LazyLock<bool> = LazyLock::new(|| {
@@ -134,6 +136,11 @@ pub extern "system" fn XMemVirtualAlloc(
         // watched (their physical-page views are copied whole).
         if kind & MEM_RESERVE_PLACEHOLDER == 0 {
             kind |= MEM_WRITE_WATCH;
+        }
+    }
+    if !base.is_null() && size != 0 {
+        for entry in remap_pool::release(base as usize, size) {
+            release_view(entry);
         }
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
@@ -401,6 +408,25 @@ impl Slice {
     /// The key of page `k` of the slices from this one on in `shown`.
     fn key(&self, k: usize) -> (usize, usize) {
         (Arc::as_ptr(&self.section) as usize, self.index + k)
+    }
+}
+
+fn remap_key(slice: &Slice) -> remap_pool::Key {
+    let (section, index) = slice.key(0);
+    remap_pool::Key(section, index)
+}
+
+fn release_view(entry: remap_pool::Cached) {
+    victory_gpu::title_memory_remapped(entry.address, entry.len);
+    // SAFETY: a cached view we mapped; it becomes a placeholder again.
+    unsafe {
+        UnmapViewOfFile2(
+            GetCurrentProcess(),
+            MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: entry.address as *mut c_void,
+            },
+            MEM_PRESERVE_PLACEHOLDER,
+        );
     }
 }
 
@@ -801,40 +827,46 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
-    let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
-        MapViewOfFile3(
-            slice.section.0,
-            GetCurrentProcess(),
-            base as *const c_void,
-            (slice.index * PAGE) as u64,
-            len,
-            MEM_REPLACE_PLACEHOLDER,
-            PAGE_READWRITE,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if view.Value as usize != base {
-        tracing::warn!(
-            address = format_args!("{base:#x}"),
-            len,
-            error = %std::io::Error::last_os_error(),
-            "mapping physical pages failed (not a placeholder?)"
-        );
-        return false;
-    }
-    if !commit(base, len) {
-        // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
-        return false;
+    let key = remap_key(&slice);
+    if !remap_pool::take(base, len, key) {
+        for stale in remap_pool::release(base, len) {
+            release_view(stale);
+        }
+        // SAFETY: splits the placeholder around the range (failing harmlessly
+        // when the range is the whole placeholder), then maps the section
+        // there; both act only on placeholders.
+        let view = unsafe {
+            VirtualFree(
+                base as *mut c_void,
+                len,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            );
+            MapViewOfFile3(
+                slice.section.0,
+                GetCurrentProcess(),
+                base as *const c_void,
+                (slice.index * PAGE) as u64,
+                len,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if view.Value as usize != base {
+            tracing::warn!(
+                address = format_args!("{base:#x}"),
+                len,
+                error = %std::io::Error::last_os_error(),
+                "mapping physical pages failed (not a placeholder?)"
+            );
+            return false;
+        }
+        if !commit(base, len) {
+            // SAFETY: the view just mapped, back to a placeholder.
+            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+            return false;
+        }
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
@@ -975,17 +1007,19 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
-        victory_gpu::title_memory_remapped(at, size);
-        // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
-            UnmapViewOfFile2(
-                GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: at as *mut c_void,
-                },
-                MEM_PRESERVE_PLACEHOLDER,
-            )
+        let entry = remap_pool::Cached {
+            address: at,
+            len: size,
+            key: remap_key(&slice),
         };
+        if at >= base && at + size <= end {
+            victory_gpu::title_memory_remapped(at, size);
+            for evicted in remap_pool::insert(entry) {
+                release_view(evicted);
+            }
+        } else {
+            release_view(entry);
+        }
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
@@ -1296,7 +1330,7 @@ mod tests {
             XMemMapPhysicalPagesScatter(addresses.as_ptr(), 1, [0usize].as_ptr()),
             1
         );
-        assert_eq!(query(at(a, 1)).host.State, MEM_RESERVE);
+        assert_eq!(query(at(a, 1)).host.State, MEM_COMMIT);
         // The GPU's page-mapping copy: what `a + 2 pages` shows, at `b`.
         assert!(map_alias(b as u64, at(a, 2) as u64, PAGE as u64));
         // SAFETY: mapped read-write.
@@ -1306,7 +1340,7 @@ mod tests {
         assert_eq!(both, [b as usize, at(b, 1) as usize]);
         assert!(map_alias(b as u64, 0, PAGE as u64));
         assert_eq!(others(at(a, 2)), [at(b, 1) as usize], "unmapped views are forgotten");
-        assert_eq!(query(b).host.State, MEM_RESERVE);
+        assert_eq!(query(b).host.State, MEM_COMMIT);
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
