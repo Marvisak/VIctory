@@ -9,7 +9,7 @@
 //! such shaders first brings all of them up to date (what changed since,
 //! `crate::watch`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, btree_map, hash_map};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
@@ -50,8 +50,10 @@ type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 
 #[derive(Default)]
 struct Inner {
-    slots: HashMap<u32, Seen>,
-    ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
+    slots: Slots,
+    /// How many slots view each range (no order needed: a hash map is one
+    /// lookup where the tree was a descent through the world's ~130,000).
+    ranges: HashMap<Range, u32>,
     textures: BTreeMap<usize, u32>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
@@ -66,48 +68,141 @@ struct Inner {
     ends: HashMap<(usize, bool), Ends>,
 }
 
+/// What each slot sees, by slot index, in pages of [`Slots::PAGE`] made
+/// as slots in them are first set: one access a slot where a hash map of
+/// the world's ~600,000 slots (a table of 2^20 buckets) cost ~290 ns per
+/// insert, its probes missing the caches (sync_slots_bench). Smaller than
+/// that map once a heap's slots are mostly set; pages no slot is set in
+/// take nothing.
+#[derive(Default)]
+struct Slots {
+    pages: Vec<Option<Box<[Option<Seen>]>>>,
+}
+
+impl Slots {
+    const PAGE: usize = 1024;
+
+    /// Slot `index` sees `seen` now: what it saw before.
+    fn insert(&mut self, index: u32, seen: Seen) -> Option<Seen> {
+        let (page, at) = (index as usize / Self::PAGE, index as usize % Self::PAGE);
+        if self.pages.len() <= page {
+            self.pages.resize_with(page + 1, || None);
+        }
+        let page = self.pages[page]
+            .get_or_insert_with(|| std::iter::repeat_with(|| None).take(Self::PAGE).collect());
+        page[at].replace(seen)
+    }
+
+    /// Slot `index` sees nothing now: what it saw before.
+    fn remove(&mut self, index: u32) -> Option<Seen> {
+        let (page, at) = (index as usize / Self::PAGE, index as usize % Self::PAGE);
+        self.pages.get_mut(page)?.as_mut()?[at].take()
+    }
+
+    /// Keeps what slots see where `keep` says so.
+    fn retain(&mut self, mut keep: impl FnMut(&Seen) -> bool) {
+        for slot in self.pages.iter_mut().flatten().flat_map(|p| p.iter_mut()) {
+            if slot.as_ref().is_some_and(|s| !keep(s)) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// What the slots see.
+    #[cfg(feature = "diagnostics")]
+    fn values(&self) -> impl Iterator<Item = &Seen> {
+        self.pages.iter().flatten().flat_map(|p| p.iter().flatten())
+    }
+}
+
 /// A copy, and the counts of its ranges' starts and ends.
 type Ends = (Arc<Shadow>, BTreeMap<u64, u32>, BTreeMap<u64, u32>);
 
-/// One more (`add`) or one fewer of `at` in `counts`.
+/// One more (`add`) or one fewer of `at` in `counts` (one lookup).
 fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
-    let n = counts.entry(at).or_insert(0);
-    *n = if add { *n + 1 } else { n.saturating_sub(1) };
-    if *n == 0 {
-        counts.remove(&at);
+    match counts.entry(at) {
+        btree_map::Entry::Occupied(mut e) => {
+            let n = e.get_mut();
+            *n = if add { *n + 1 } else { *n - 1 };
+            if *n == 0 {
+                e.remove();
+            }
+        }
+        btree_map::Entry::Vacant(e) => {
+            if add {
+                e.insert(1);
+            }
+        }
     }
 }
 
 impl Inner {
+    /// Slot `index` now sees `seen` (or nothing). The new view is counted
+    /// before the old one goes: a slot rewritten with a view of the same
+    /// range keeps its count above 0 (no hull work), and the counts end the
+    /// same either way.
+    fn put(&mut self, index: u32, seen: Option<Seen>) {
+        let old = match seen {
+            Some(seen) => {
+                self.count(&seen, true);
+                self.slots.insert(index, seen)
+            }
+            None => self.slots.remove(index),
+        };
+        if let Some(old) = old {
+            self.count(&old, false);
+        }
+    }
+
     fn count(&mut self, seen: &Seen, add: bool) {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
         match seen {
             Seen::Buffer(shadow, address, len, uav) => {
                 let key = (Arc::as_ptr(shadow) as usize, *address, address + len, *uav);
-                let e = self.ranges.entry(key).or_insert_with(|| (0, shadow.clone()));
-                let was = e.0;
-                step(&mut e.0);
-                let now = e.0;
-                if now == 0 {
-                    self.ranges.remove(&key);
-                }
+                // Whether the range came or went (its count left or reached
+                // 0), in one lookup of the counts.
+                let came_or_went = match self.ranges.entry(key) {
+                    hash_map::Entry::Occupied(mut e) => {
+                        step(e.get_mut());
+                        if *e.get() == 0 {
+                            e.remove();
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    hash_map::Entry::Vacant(e) => {
+                        if add {
+                            e.insert(1);
+                        }
+                        add
+                    }
+                };
                 // A range came or went: its copy's hull may change.
-                if (was == 0) != (now == 0) {
+                if came_or_went {
                     let ends = self
                         .ends
                         .entry((key.0, key.3))
                         .or_insert_with(|| (shadow.clone(), BTreeMap::new(), BTreeMap::new()));
-                    tally(&mut ends.1, key.1, now > 0);
-                    tally(&mut ends.2, key.2, now > 0);
-                    let hull = match (ends.1.keys().next(), ends.2.keys().next_back()) {
-                        (Some(&from), Some(&to)) => Some((shadow.clone(), from, to - from, key.3, shadow.dirty_bit())),
-                        _ => None,
-                    };
-                    match hull {
-                        Some(hull) => {
-                            self.hulls.insert((key.0, key.3), hull);
+                    tally(&mut ends.1, key.1, add);
+                    tally(&mut ends.2, key.2, add);
+                    match (ends.1.keys().next(), ends.2.keys().next_back()) {
+                        (Some(&from), Some(&to)) => {
+                            let bit = shadow.dirty_bit();
+                            match self.hulls.entry((key.0, key.3)) {
+                                // Most ranges lie inside their copy's hull:
+                                // it stays as it is (the copy is the same
+                                // one, which `ends` holds while the key does).
+                                hash_map::Entry::Occupied(mut e) => {
+                                    let h = e.get_mut();
+                                    (h.1, h.2, h.4) = (from, to - from, bit);
+                                }
+                                hash_map::Entry::Vacant(e) => {
+                                    e.insert((shadow.clone(), from, to - from, key.3, bit));
+                                }
+                            }
                         }
-                        None => {
+                        _ => {
                             self.ends.remove(&(key.0, key.3));
                             self.hulls.remove(&(key.0, key.3));
                         }
@@ -130,15 +225,17 @@ impl Viewed {
     /// Title slot `index` now holds `view` (none: no view), made on the
     /// host (`made`) or left without a host view.
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
-        let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = inner.slots.remove(&index) {
-            inner.count(&old, false);
-        }
-        if let Some(seen) = seen {
-            inner.count(&seen, true);
-            inner.slots.insert(index, seen);
-        }
+        let seen = view.and_then(|v| {
+            if made {
+                seen(v)
+            } else {
+                Some(Seen::Left(left_kind(v)))
+            }
+        });
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(index, seen);
     }
 
     /// The buffer ranges views reach, merged per host copy and kind
@@ -358,7 +455,9 @@ pub(crate) fn forget(resource: usize) {
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.textures.remove(&resource).is_some() {
-            inner.slots.retain(|_, seen| !matches!(seen, Seen::Texture(r) if *r == resource));
+            inner
+                .slots
+                .retain(|seen| !matches!(seen, Seen::Texture(r) if *r == resource));
         }
     }
 }
@@ -398,6 +497,7 @@ pub(crate) fn log(frames: f64) {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         let copies = {
             let mut c: Vec<usize> = inner.ranges.keys().map(|k| k.0).collect();
+            c.sort_unstable();
             c.dedup();
             c.len()
         };
@@ -548,6 +648,58 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     const LINEAR: u32 = 0x100;
 
+    /// Slots are set, replaced, cleared and filtered by index across pages,
+    /// a far one without the pages before it holding anything.
+    #[test]
+    fn slots_keep_what_each_index_sees() {
+        let mut slots = Slots::default();
+        let texture = |r: usize| Seen::Texture(r);
+        let sees = |slots: &mut Slots, i: u32| {
+            let seen = slots.remove(i);
+            let r = seen.as_ref().map(|s| match s {
+                Seen::Texture(r) => *r,
+                _ => usize::MAX,
+            });
+            if let Some(seen) = seen {
+                slots.insert(i, seen);
+            }
+            r
+        };
+        assert!(slots.remove(5).is_none(), "nothing set yet");
+        assert!(slots.insert(1023, texture(1)).is_none());
+        assert!(slots.insert(1024, texture(2)).is_none());
+        assert!(slots.insert(1 << 20, texture(3)).is_none());
+        assert!(
+            matches!(slots.insert(1023, texture(4)), Some(Seen::Texture(1))),
+            "replaced: the old one back"
+        );
+        assert_eq!(
+            slots.pages.iter().filter(|p| p.is_some()).count(),
+            3,
+            "pages only where slots were set"
+        );
+        assert_eq!(
+            (
+                sees(&mut slots, 1023),
+                sees(&mut slots, 1024),
+                sees(&mut slots, 1 << 20)
+            ),
+            (Some(4), Some(2), Some(3))
+        );
+        assert_eq!(sees(&mut slots, 1022), None);
+        slots.retain(|s| !matches!(s, Seen::Texture(2)));
+        assert_eq!(
+            (
+                sees(&mut slots, 1023),
+                sees(&mut slots, 1024),
+                sees(&mut slots, 1 << 20)
+            ),
+            (Some(4), None, Some(3))
+        );
+        assert!(matches!(slots.remove(1 << 20), Some(Seen::Texture(3))));
+        assert!(slots.remove(1 << 20).is_none() && slots.remove(1 << 21).is_none());
+    }
+
     /// A copy's hull is its live ranges' first start to last end, kept as
     /// slots come and go; a copy no slot views any more has none.
     #[test]
@@ -561,17 +713,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         };
         let viewed = Viewed::default();
         let set = |slot: u32, range: Option<(u64, u64)>| {
-            let mut inner = viewed.inner.lock().unwrap();
-            if let Some(old) = inner.slots.remove(&slot) {
-                inner.count(&old, false);
-            }
-            if let Some((from, len)) = range {
-                let seen = Seen::Buffer(copy.clone(), at + from, len, false);
-                inner.count(&seen, true);
-                inner.slots.insert(slot, seen);
-            }
+            let seen = range.map(|(from, len)| Seen::Buffer(copy.clone(), at + from, len, false));
+            viewed.inner.lock().unwrap().put(slot, seen);
         };
         let hull = || viewed.ranges().iter().map(|h| (h.1 - at, h.2)).collect::<Vec<_>>();
+        let ranges = || viewed.inner.lock().unwrap().ranges.len();
         set(0, Some((0x100, 0x100)));
         set(1, Some((0x800, 0x200)));
         set(2, Some((0x100, 0x100)));
@@ -582,6 +728,45 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(hull(), [(0x100, 0x100)], "one slot still views it");
         set(2, None);
         assert!(hull().is_empty());
+        // A slot rewritten with its own range, then ranges inside the hull,
+        // at its ends and sharing a start, coming and going.
+        set(3, Some((0x200, 0x100)));
+        set(3, Some((0x200, 0x100)));
+        assert_eq!(
+            (hull(), ranges()),
+            (vec![(0x200, 0x100)], 1),
+            "rewritten with the same range"
+        );
+        set(4, Some((0x240, 0x40)));
+        assert_eq!(hull(), [(0x200, 0x100)], "a range inside");
+        set(5, Some((0x200, 0x400)));
+        assert_eq!(
+            hull(),
+            [(0x200, 0x400)],
+            "a range sharing the start, further"
+        );
+        set(3, Some((0x100, 0x10)));
+        assert_eq!(hull(), [(0x100, 0x500)], "a slot moved before the start");
+        set(5, None);
+        assert_eq!(
+            hull(),
+            [(0x100, 0x180)],
+            "the far end gone, the inner range's end left"
+        );
+        set(3, None);
+        assert_eq!(
+            (hull(), ranges()),
+            (vec![(0x240, 0x40)], 1),
+            "the first start gone"
+        );
+        set(4, Some((0x800, 0x100)));
+        assert_eq!(
+            (hull(), ranges()),
+            (vec![(0x800, 0x100)], 1),
+            "the last slot moved"
+        );
+        set(4, None);
+        assert!(hull().is_empty() && ranges() == 0 && viewed.inner.lock().unwrap().ends.is_empty());
         crate::shadow::unregister(at as usize, at);
     }
 
