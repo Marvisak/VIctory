@@ -203,6 +203,11 @@ pub(crate) fn sync_heaps() {
 /// placed itself, textures given up) in every shader-visible view heap, now
 /// that shaders read them (`crate::shadow::take_reads`), and stamps what
 /// they view as used (`crate::resource::evict`).
+///
+/// Buffer views are the other invariant: one the host cannot make for lack
+/// of a host copy is not left null forever, [`note_refused`] keeps its
+/// record and [`make_refused`] tries it again at the end of each submission
+/// (buffer reads carry no shader mark to wait for).
 #[cfg(windows)]
 pub(crate) fn make_read(slots: &[u32]) {
     // The placed textures those slots view are made first, without the
@@ -243,6 +248,88 @@ pub(crate) fn make_read(slots: &[u32]) {
             host.stamp_read(i);
         }
     }
+}
+
+/// Buffer views left null for lack of a host copy, by the title heap record
+/// they were made from (`descriptor::host`, "refused buffer view"). Buffer
+/// reads carry no shader read mark (textures' do, `make_read`), so the
+/// refusal itself is noted here and [`make_refused`] retries it.
+#[cfg(windows)]
+static REFUSED: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// The buffer view at title heap record `handle` was refused: no host copy
+/// holds its bytes. Noted for [`make_refused`], once per record.
+#[cfg(windows)]
+pub(crate) fn note_refused(handle: u64) {
+    REFUSED.lock().unwrap_or_else(|e| e.into_inner()).insert(handle);
+}
+
+/// At the end of a submission: makes the buffer views refused so far again,
+/// from the record the title has at their slot (`HostHeap::remake`), so that
+/// `crate::shadow::find` makes the host copy the view reads in that attempt,
+/// from the title buffer registered at the view's address (`BUFFERS`,
+/// `crate::shadow::register`). Records whose heap is gone, or which are no
+/// longer views of ours, are forgotten; slots whose copy still cannot be
+/// made stay noted, and the next submission tries them again.
+#[cfg(windows)]
+pub(crate) fn make_refused() {
+    #[cfg(test)]
+    if tests::refused_paused() {
+        return; // a test owns the noted records (`retry_refused`)
+    }
+    make_refused_now();
+}
+
+#[cfg(windows)]
+fn make_refused_now() {
+    let refused = {
+        let mut noted = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        if noted.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *noted)
+    };
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut still = Vec::new();
+    for handle in refused {
+        let Some(&(_, _, at)) = heaps
+            .iter()
+            .find(|&&(start, end, _)| (start..end).contains(&handle))
+        else {
+            continue;
+        };
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.desc.kind != VIEWS_KIND {
+            continue;
+        }
+        let Some(index) = heap.index(handle) else {
+            continue;
+        };
+        let Some(Some(host)) = heap.host.get() else {
+            continue;
+        };
+        if !host.remake(index, handle) {
+            still.push(handle);
+        }
+    }
+    drop(heaps);
+    let mut noted = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    noted.extend(still);
+}
+
+/// [`make_refused`], whatever the test pause says: a refused buffer view
+/// noted by a test is retried by that test alone.
+#[cfg(all(test, windows))]
+pub(crate) fn retry_refused() {
+    make_refused_now();
+}
+
+/// The records noted for [`make_refused`] (tests).
+#[cfg(all(test, windows))]
+pub(crate) fn refused() -> Vec<u64> {
+    REFUSED.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect()
 }
 
 /// The host textures (raw pointers) that slots `slots` of the
@@ -834,6 +921,19 @@ pub(crate) mod tests {
 
     /// The work [`WHILE_MAKING`] runs.
     pub(crate) type Work = Box<dyn FnOnce() + Send>;
+
+    /// Whether a test owns the buffer views noted for [`make_refused`]
+    /// (other tests' submissions then leave them alone; the test calls
+    /// [`retry_refused`]).
+    static PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub(crate) fn refused_paused() -> bool {
+        PAUSED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn pause_refused(pause: bool) {
+        PAUSED.store(pause, std::sync::atomic::Ordering::Relaxed);
+    }
 
     pub(crate) fn while_making(slots: &[u32]) {
         let mut hook = WHILE_MAKING.lock().unwrap_or_else(|e| e.into_inner());

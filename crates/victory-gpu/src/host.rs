@@ -1399,6 +1399,10 @@ impl Host {
         if !read.is_empty() {
             crate::descriptor::make_read(&read);
         }
+        // Buffer views refused for lack of a host copy: made now that the
+        // submission has run, when find can make the copy
+        // (`crate::descriptor::make_refused`).
+        crate::descriptor::make_refused();
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {

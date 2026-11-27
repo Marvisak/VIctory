@@ -404,7 +404,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let (kept, mark) = make_marked(view, self.cpu(index));
+        let (kept, mark, _) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
@@ -815,8 +815,8 @@ impl HostHeap {
                 crate::shadow::forget_read(index);
             }
             made[index as usize] = key;
-            let (kept, mark) = if later {
-                (None, None)
+            let (kept, mark, no_copy) = if later {
+                (None, None, false)
             } else {
                 make_marked(&view, self.cpu(index))
             };
@@ -828,8 +828,39 @@ impl HostHeap {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
             self.keep(index, kept.flatten());
+            if no_copy {
+                // The copy the view reads is not there (yet). A texture's
+                // left null waits for a shader's read mark (`later` above);
+                // a buffer read carries none, so the refusal is the mark:
+                // the slot is noted and made again at the end of each
+                // submission (`crate::descriptor::make_refused`), when
+                // `crate::shadow::find` can make the copy from the title
+                // buffer the view's address is in (`crate::shadow::register`,
+                // `BUFFERS`). Until then it reads zeros, as before.
+                crate::descriptor::note_refused(handle);
+            }
         }
         Some(view)
+    }
+
+    /// Slot `index`, whose record the title has at `handle`, made again
+    /// although the record did not change: a buffer view left null for lack
+    /// of a host copy (`crate::descriptor::make_refused`, which retries it at
+    /// the end of each submission). True when the slot needs no further try:
+    /// its view was made, or the record is no longer a view of ours.
+    pub(crate) fn remake(&self, index: u32, handle: u64) -> bool {
+        if index >= self.count {
+            return true;
+        }
+        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] = 0;
+        if self.mirror(index, handle, true).is_none() {
+            return true;
+        }
+        self.kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .is_some_and(Option::is_some)
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -1234,6 +1265,7 @@ fn buffer_srv(
     let Some((shadow, own)) =
         crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
     else {
+        NO_COPY.with(|c| c.set(true));
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), len, element, count = buffer.NumElements, "refused buffer view: no host copy");
@@ -1296,7 +1328,12 @@ fn buffer_uav(
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let Some((shadow, own)) =
+        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
+    else {
+        NO_COPY.with(|c| c.set(true));
+        return None;
+    };
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -1324,15 +1361,25 @@ thread_local! {
     /// The view-mark entry of the unordered buffer view [`make`] last made
     /// on this thread ([`make_marked`]).
     static MARK: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+    /// Whether the buffer view [`make`] last tried was refused for lack of
+    /// a host copy (`buffer_srv`, `buffer_uav`): [`make_marked`] hands it to
+    /// the heap slot, which notes it for a retry
+    /// (`crate::descriptor::make_refused`).
+    static NO_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// [`make`], and the view-mark entry of the view if it is an unordered
 /// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
-/// marks").
-fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+/// marks"), and whether a buffer view was refused for lack of a host copy
+/// (`buffer_srv`, `buffer_uav`).
+fn make_marked(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> (Option<Kept>, Option<(u32, u32)>, bool) {
     MARK.with(|m| m.set(None));
+    NO_COPY.with(|c| c.set(false));
     let kept = make(view, at);
-    (kept, MARK.with(std::cell::Cell::take))
+    (kept, MARK.with(std::cell::Cell::take), NO_COPY.with(std::cell::Cell::take))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -1876,6 +1923,60 @@ mod tests {
         }
         assert!(host.mirror(0, title_heap.start, true).is_some());
         assert!(host.kept(0), "made for the draw");
+    }
+
+    /// A buffer view the host cannot make for lack of a host copy is left
+    /// null but noted, not made-and-forgotten: at the end of a submission it
+    /// is made again (`crate::descriptor::make_refused`), when the copy is
+    /// made from the title buffer registered at its address
+    /// (`crate::shadow::find`), so later draws read its bytes instead of
+    /// zeros.
+    #[test]
+    fn a_refused_buffer_view_is_noted_and_made_at_the_next_retry() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        // A title buffer of 256 bytes (registered while its resource lives),
+        // and a raw view of its 64 dwords at slot 0.
+        let memory = vec![0u8; 256];
+        let (resource, address) = (memory.as_ptr() as usize, memory.as_ptr() as u64);
+        crate::shadow::register(resource, address, 256);
+        let buffer: [u32; 14] = [1, 0, 0, 0, 256, 0, 1, 1 | 1 << 16, 0, 1, 0, 0, 0, 0];
+        let mut view = [0u32; 16];
+        view[..10].copy_from_slice(&[39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        // No host copy can be made yet: the view is refused, its slot null.
+        crate::descriptor::tests::pause_refused(true);
+        crate::shadow::tests::refuse_copies(true);
+        crate::descriptor::create_placed_srv(null, &buffer, &view, title_heap.start);
+        let host = title_heap.host().expect("a host view heap");
+        assert!(!host.kept(0), "left null: no host copy");
+        assert!(
+            crate::descriptor::refused().contains(&title_heap.start),
+            "noted for the retry"
+        );
+        // The copy can be made now: the retry at the submission's end makes
+        // it (from the title buffer registered at the view's address) and
+        // the view.
+        crate::shadow::tests::refuse_copies(false);
+        crate::descriptor::retry_refused();
+        assert!(host.kept(0), "made at the retry");
+        assert!(
+            !crate::descriptor::refused().contains(&title_heap.start),
+            "made, no longer noted"
+        );
+        assert!(
+            crate::shadow::find(address, 256).is_some(),
+            "the copy was made"
+        );
+        crate::descriptor::tests::pause_refused(false);
+        crate::shadow::unregister(resource, address);
     }
 
     /// A slot viewing a texture given up (`crate::resource::evict`) holds it

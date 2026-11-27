@@ -264,6 +264,12 @@ struct Stats {
     /// The same for ranges written through views (bytes).
     withheld_bytes: u64,
     missed_pages: u64,
+    /// The distinct pages among [`missed_pages`]: that sum adds every list's
+    /// misses, this counts each page once a frame (whether the working set
+    /// is dense or has a hot subset).
+    missed_pages_unique: u64,
+    /// The pages counted in [`missed_pages_unique`] this frame.
+    missed_pages_seen: HashSet<u64>,
     missed_regions: u64,
     first_missed: Vec<u64>,
 }
@@ -369,7 +375,7 @@ pub(crate) fn log_frame() {
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
          copied back, {} withheld and {:.1} MB of views kept (their list read memory with no copy), missed {} pages \
-         and {} 256 MiB regions with no copy (first: {})",
+         (missed_pages_unique={}) and {} 256 MiB regions with no copy (first: {})",
         s.uses.values().sum::<u64>(),
         uses.join(", "),
         s.tables,
@@ -377,6 +383,7 @@ pub(crate) fn log_frame() {
         s.withheld,
         s.withheld_bytes as f64 / 1e6,
         s.missed_pages,
+        s.missed_pages_unique,
         s.missed_regions,
         missed.join(" ")
     );
@@ -648,6 +655,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let marks =
             unsafe { std::slice::from_raw_parts_mut(pooled.data() as *mut u32, BITMAP_WORDS) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
+        let mut distinct: HashSet<u64> = HashSet::new();
         let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             if *mark == 0 {
@@ -670,6 +678,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                     Some(&k) if k != NO_OWNER => writes.push((k as usize, at)),
                     _ => {
                         pages += 1;
+                        distinct.insert(at);
                         missed.push(at);
                     }
                 }
@@ -700,6 +709,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             s.written += written;
             s.withheld += withheld;
             s.missed_pages += pages;
+            s.missed_pages_unique += distinct
+                .iter()
+                .filter(|&&at| s.missed_pages_seen.insert(at))
+                .count() as u64;
             s.missed_regions += regions;
             let room = 4usize.saturating_sub(s.first_missed.len());
             s.first_missed.extend(missed.into_iter().take(room));
