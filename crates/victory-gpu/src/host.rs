@@ -3117,6 +3117,16 @@ impl Meter {
                      from title memory {:.0} {:.0} {:.0}",
                     gpu[0], gpu[1], gpu[2], title[0], title[1], title[2]
                 );
+                // The title's slots the host heap could not hold (the NVIDIA
+                // cap): a shader that indexes one reads past the heap.
+                let (skips, highest, count) = crate::descriptor::host::PAST_HEAP.get();
+                if highest >= count && count > 0 {
+                    tracing::info!(
+                        "title slots past the host heap: {} (the title's slots reach {highest}, \
+                         the heap holds {count}; {skips} skips)",
+                        crate::descriptor::host::slots_past(count, highest)
+                    );
+                }
                 // Window caption updates leave the report counters intact.
                 let drops = crate::pipeline::take_drops();
                 crate::frame::log();
