@@ -21,8 +21,13 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod partial;
+#[cfg(test)]
+mod view_tests;
 
 type Why = &'static str;
+
+const SLOT_VIEW_MAPPING: u32 = 0x1688;
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -95,10 +100,19 @@ enum Stop {
     Fail(ShaderError),
 }
 
+#[cfg(test)]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_thread_limit(parts, false)
+}
+
+/// [`lower`], with a partial dispatch's thread-count guard when `partial`.
+pub(super) fn lower_with_thread_limit(
+    parts: &Parts,
+    partial: bool,
+) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad).run(partial) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -1292,7 +1306,8 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
-    fn run(mut self) -> Result<Lowered, Stop> {
+    fn run(mut self, partial: bool) -> Result<Lowered, Stop> {
+        self.partial_dispatch_prologue(partial);
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -4821,6 +4836,28 @@ impl<'a> Lower<'a> {
             Some(RootType::Table | RootType::ResourceHeap)
         ) {
             return Err("a descriptor read only as data");
+        }
+        if count == 4
+            && let Some((lo, hi, len, stride)) =
+                self.view_address_indexed(site, 0).ok().flatten()
+        {
+            let c = self.cur;
+            let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+            let nonzero = self.s.m.cmp(c, pred::NE, stride, zero);
+            let divisor = self.s.m.select(c, nonzero, stride, one);
+            let records = self.s.m.bin(c, Bin::UDiv, len, divisor);
+            let mask = self.s.m.i32(0x3FFF);
+            let bits = self.s.m.bin(c, Bin::And, stride, mask);
+            let sixteen = self.s.m.i32(16);
+            let shifted = self.s.m.bin(c, Bin::Shl, bits, sixteen);
+            let mapping = self.s.m.i32(SLOT_VIEW_MAPPING);
+            let mapped = self.s.m.bin(c, Bin::Or, shifted, mapping);
+            for (k, v) in [lo, hi, records, mapped].into_iter().enumerate() {
+                if let Some(reg) = inst.write(Reg::S(code + k as u8)) {
+                    self.vals.insert(reg, Val::I32(v));
+                }
+            }
+            return Ok(());
         }
         // The compiler loads image descriptors whole, buffer ones as four
         // dwords.
@@ -10920,7 +10957,12 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half};
+    use std::collections::HashMap;
+
+    use super::{
+        Lower, Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower,
+        packed_half,
+    };
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -11035,6 +11077,53 @@ mod tests {
             mesh_stride: 0,
             view_marks: false,
         })
+    }
+
+    #[test]
+    fn partial_dispatch_guards_threads_past_the_tail() {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads: [64, 1, 1],
+            }),
+            code: S_ENDPGM.to_le_bytes().to_vec(),
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let bad = HashMap::new();
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+        };
+        let mut l = Lower::new(&parts, &bad);
+        let original = l.s.entry;
+        l.partial_dispatch_prologue(true);
+        let u = l
+            .user_reads
+            .values()
+            .find(|u| u.root == RootType::Other(super::super::shader::USER_DISPATCH_THREADS_X))
+            .expect("the real X thread count");
+        assert_eq!((u.slot, u.dword, u.index), (0, 64, 0));
+        let Some(super::Term::CondBr(_, body, done)) = l.s.m.block_term(original) else {
+            panic!("the entry block must branch around the tail");
+        };
+        assert_eq!(l.s.entry, body);
+        assert!(matches!(l.s.m.block_term(done), Some(super::Term::Ret)));
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.

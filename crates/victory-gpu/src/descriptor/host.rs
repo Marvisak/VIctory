@@ -44,6 +44,11 @@ pub(crate) struct HostHeap {
     /// byte stride of the buffer view there, 0 for none. Mapped at the
     /// address kept beside it.
     strides: Option<(ID3D12Resource, usize)>,
+    /// View heaps: the title address of the buffer view at each title slot,
+    /// for shaders that read a descriptor's address at a computed index
+    /// (`victory_shader::emit::SLOT_VIEWS`). Four dwords per slot: address
+    /// low and high, byte length and element stride.
+    views: Option<(ID3D12Resource, usize)>,
     /// View heaps: the view-mark table translated shaders read
     /// (`victory_shader::emit`, "Write marks"), two dwords per slot as the
     /// stride table has one: the mark bit and phase of the unordered buffer
@@ -137,6 +142,17 @@ impl HostHeap {
                 Some((buffer, data as usize))
             })
             .flatten();
+        let view_table = (!sampler)
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_VIEWS_COUNT)
+                    * u64::from(victory_shader::emit::SLOT_VIEW_BYTES);
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                crate::host::name(&buffer, || "view addresses by view heap slot".into());
+                // SAFETY: the whole mapping of a live upload buffer.
+                unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+                Some((buffer, data as usize))
+            })
+            .flatten();
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
         // Translated shaders clamp their indices below `HEAP_VIEWS` or
@@ -203,6 +219,7 @@ impl HostHeap {
                 _ => total,
             },
             strides,
+            views: view_table,
             marks,
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
@@ -473,6 +490,7 @@ impl HostHeap {
         self.set_mark(index, None);
         // Not a title view: no entry an earlier table left there stays.
         self.note_address(index, None);
+        self.write_view(index, None, 0);
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -496,6 +514,27 @@ impl HostHeap {
     /// bits of a typed buffer view ([`view_kind`]).
     fn set_stride(&self, index: u32, view: Option<&View>) {
         self.write_stride(index, view.map_or(0, |v| view_stride(v) | view_kind(v)));
+        self.write_view(index, view, view.map_or(0, view_stride));
+    }
+
+    /// Enters slot `index`'s view address, byte length and element stride in
+    /// the table shaders read at computed heap indices.
+    fn write_view(&self, index: u32, view: Option<&View>, stride: u32) {
+        let Some((_, data)) = &self.views else { return };
+        if index >= victory_shader::emit::SLOT_VIEWS_COUNT {
+            return;
+        }
+        let (address, len) = view.and_then(buffer_range).unwrap_or((0, 0));
+        // SAFETY: one whole entry of the mapped table, which has one per
+        // slot below `SLOT_VIEWS_COUNT`.
+        unsafe {
+            let at = (*data as *mut u32)
+                .add(index as usize * victory_shader::emit::SLOT_VIEW_BYTES as usize / 4);
+            at.write_volatile(address as u32);
+            at.add(1).write_volatile((address >> 32) as u32);
+            at.add(2).write_volatile(len as u32);
+            at.add(3).write_volatile(stride);
+        }
     }
 
     fn write_stride(&self, index: u32, stride: u32) {
@@ -511,6 +550,20 @@ impl HostHeap {
     /// The view-stride table, for root SRV `VIEW_STRIDES`.
     pub(crate) fn strides(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|(buffer, _)| buffer)
+    }
+
+    /// The GPU address of the table of view addresses by title slot, for
+    /// root SRV `SLOT_VIEWS`.
+    pub(crate) fn views_gpu(&self) -> Option<u64> {
+        // SAFETY: a live upload buffer.
+        self.views
+            .as_ref()
+            .map(|(buffer, _)| unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The view-address table's buffer, for a list to hold.
+    pub(crate) fn views_buffer(&self) -> Option<&ID3D12Resource> {
+        self.views.as_ref().map(|(buffer, _)| buffer)
     }
 
     /// Enters slot `index`'s view-mark entry: the mark bit and phase of the
@@ -670,6 +723,8 @@ impl HostHeap {
         // Not a title view: no entry an earlier table left there stays.
         self.note_address(index, None);
         self.note_address(index + 1, None);
+        self.write_view(index, None, 0);
+        self.write_view(index + 1, None, 0);
     }
 
     /// The shader-visible handle of slot `index`.
@@ -2211,6 +2266,61 @@ mod tests {
         assert_eq!(unsafe { past.read_unaligned() }, mark);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn view_slots_record_the_address_length_and_stride() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let slot = 7;
+        let address = 0xd_6013_e000u64;
+        let mut resource = [0u32; 14];
+        (resource[0], resource[4]) = (1, 64);
+        let mut desc = [0u32; 16];
+        (desc[1], desc[2], desc[6], desc[7]) = (1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 16, 4);
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        let view = View::Placed(false, resource, desc);
+        heap.make_at(slot, &view);
+        let (_, data) = heap.views.as_ref().expect("the host view table");
+        // SAFETY: one whole entry of a mapped buffer, within the table.
+        let words = unsafe {
+            let at = (*data as *const u32)
+                .add(slot as usize * victory_shader::emit::SLOT_VIEW_BYTES as usize / 4);
+            [at.read(), at.add(1).read(), at.add(2).read(), at.add(3).read()]
+        };
+        assert_eq!(words[0], address as u32);
+        assert_eq!(words[1], (address >> 32) as u32);
+        assert_eq!(words[2], 64);
+        assert_eq!(words[3], view_stride(&view));
+        heap.make_null(slot);
+        // SAFETY: as above.
+        assert_eq!(unsafe { *(*data as *const u32).add(slot as usize * 4) }, 0);
+    }
+
+    #[test]
+    fn raw_view_at_clears_a_previous_buffer_view_slot() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let slot = 7;
+        let address = 0xd_6013_e000u64;
+        let mut resource = [0u32; 14];
+        (resource[0], resource[4]) = (1, 64);
+        let mut desc = [0u32; 16];
+        (desc[1], desc[2], desc[6], desc[7]) = (1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 16, 4);
+        (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+        heap.make_at(slot, &View::Placed(false, resource, desc));
+        let (_, data) = heap.views.as_ref().expect("the host view table");
+        // SAFETY: one whole entry of the mapped table, which has one per slot.
+        let words = || unsafe {
+            let at = (*data as *const u32)
+                .add(slot as usize * victory_shader::emit::SLOT_VIEW_BYTES as usize / 4);
+            [at.read(), at.add(1).read(), at.add(2).read(), at.add(3).read()]
+        };
+        assert_ne!(words(), [0; 4], "the placed view is recorded");
+        heap.raw_view_at(slot, None, 0, 0, false);
+        assert_eq!(words(), [0; 4], "the raw view clears every entry");
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.

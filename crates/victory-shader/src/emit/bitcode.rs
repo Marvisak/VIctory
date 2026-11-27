@@ -518,6 +518,35 @@ impl Module {
         }
     }
 
+    /// A block's terminator (tests).
+    #[cfg(test)]
+    pub(crate) fn block_term(&self, block: usize) -> Option<Term> {
+        self.blocks[block].term
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bin_of(&self, v: V) -> Option<(Bin, V, V)> {
+        let V::Inst(i) = v else { return None };
+        match self.insts.get(i as usize)? {
+            Inst { op: Op::Bin(op, a, b), .. } => Some((*op, *a, *b)),
+            _ => None,
+        }
+    }
+
+    /// The DXIL operations in the module, by name and opcode (tests).
+    #[cfg(test)]
+    pub(crate) fn dx_opcodes(&self) -> Vec<(String, u32)> {
+        self.insts
+            .iter()
+            .filter_map(|i| {
+                let Op::Call(f, args) = &i.op else { return None };
+                let name = self.funcs[*f as usize].name.clone();
+                let opcode = self.int_value(*args.first()?)? as u32;
+                name.starts_with("dx.op.").then_some((name, opcode))
+            })
+            .collect()
+    }
+
     /// What the instructions [`Module::write`] writes use, of what the
     /// shader flags declare (which must match it, or the validator refuses
     /// the module: "Flags must match usage").

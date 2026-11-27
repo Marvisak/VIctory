@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V, pred};
+use super::bitcode::{Attr, Bin, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -24,6 +24,15 @@ pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
+/// The root SRV slot (`t252` in [`ROOT_CBV_SPACE`]) of the host's table of
+/// buffer-view title addresses by heap slot, for console code that reads a
+/// descriptor's address at an index it computes. Four dwords per slot: the
+/// address (low, high), the byte length and the element stride.
+pub const SLOT_VIEWS: u8 = 252;
+/// Slots of the [`SLOT_VIEWS`] table (heap indices are clamped to it).
+pub const SLOT_VIEWS_COUNT: u32 = HEAP_VIEWS;
+/// Byte stride of a [`SLOT_VIEWS`] entry.
+pub const SLOT_VIEW_BYTES: u32 = 4 * size_of::<u32>() as u32;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
@@ -52,6 +61,12 @@ pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// marks"), after the written pages in the same bitmap: one bit per
 /// resource-heap index, [`HEAP_VIEWS`] of them.
 pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
+/// `RootType::Other` code of the user-data dword the host computes: the
+/// actual X thread count of a one-dimensional partial dispatch. Zero keeps
+/// every thread of every dispatched group active; otherwise threads whose
+/// global X index is at or past it do nothing. The metadata `dword` holds
+/// the group's X width.
+pub const USER_DISPATCH_THREADS_X: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -338,6 +353,29 @@ impl Shader {
         self.flags |= flags::RAW_BUFFERS;
         self.root_srvs.push((slot, h));
         h
+    }
+
+    /// Loads the four dwords of one entry of the host view-address table:
+    /// the title address (low, high), byte length and element stride of the
+    /// buffer view at a heap slot the program computes. The slot is clamped
+    /// below the table so a computed index cannot read past it.
+    pub fn read_view_slot(&mut self, block: usize, slot: V) -> V {
+        let last = self.m.i32(SLOT_VIEWS_COUNT - 1);
+        let slot = self.op(block, "binary.i32", Attr::ReadNone, self.t.i32, 40, &[slot, last]);
+        let stride = self.m.i32(SLOT_VIEW_BYTES);
+        let byte = self.m.bin(block, Bin::Mul, slot, stride);
+        let handle = self.root_srv_handle(SLOT_VIEWS);
+        let unused = self.m.undef(self.t.i32);
+        let mask = self.m.i8(0xf);
+        let alignment = self.m.i32(4);
+        self.op(
+            block,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.t.res_ret,
+            139,
+            &[handle, byte, unused, mask, alignment],
+        )
     }
 
     /// The handle of the root UAV (a raw buffer) of root parameter `slot`.
@@ -1087,5 +1125,28 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+
+    #[test]
+    fn computed_view_slots_are_clamped_and_read_from_the_host_table() {
+        let mut s = Shader::new(false);
+        let slot = s.m.i32(SLOT_VIEWS_COUNT + 7);
+        let _ = s.read_view_slot(s.entry, slot);
+        assert_eq!(
+            s.root_srvs.iter().map(|&(slot, _)| slot).collect::<Vec<_>>(),
+            vec![SLOT_VIEWS]
+        );
+        let ops = s.m.dx_opcodes();
+        assert!(ops.iter().any(|(name, op)| name == "dx.op.binary.i32" && *op == 40), "{ops:?}");
+        assert!(
+            ops.iter().any(|(name, op)| name == "dx.op.rawBufferLoad.f32" && *op == 139),
+            "{ops:?}"
+        );
+        assert_eq!(SLOT_VIEW_BYTES, 16);
     }
 }

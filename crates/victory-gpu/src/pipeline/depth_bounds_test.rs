@@ -56,6 +56,8 @@ fn fullscreen_vertex_shader() -> Arc<Shader> {
 fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[u8]) -> Arc<Shader> {
     let shader = shader(stage, bytes);
     shader.translated.get_or_init(|| Some(Translated {
+        compute_threads: None,
+        partial_dispatch: false,
         host: victory_shader::emit::HostShader {
             stage: hw_stage,
             dxil: bytes.to_vec(),
