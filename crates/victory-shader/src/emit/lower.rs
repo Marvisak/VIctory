@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1407,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -7756,13 +7761,18 @@ impl<'a> Lower<'a> {
                 r
             }
             "v_bfm_b32" => {
-                // ((1 << src0[4:0]) - 1) << src1[4:0]
+                // Bfi masks width/offset to five bits and truncates fields
+                // crossing bit 31, just as the ISA's shifted mask does.
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let one = k(self, 1);
-                let (a, b) = (m31(self, a), m31(self, b));
-                let m = self.s.m.bin(c, Bin::Shl, one, a);
-                let m = self.s.m.bin(c, Bin::Sub, m, one);
-                self.s.m.bin(c, Bin::Shl, m, b)
+                let (ones, zero) = (k(self, u32::MAX), k(self, 0));
+                self.s.op(
+                    c,
+                    "quaternary.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    53,
+                    &[a, b, ones, zero],
+                )
             }
             "v_cvt_pk_u8_f32" => {
                 // src0 rounded to nearest even and saturated to a byte, into
@@ -11089,6 +11099,15 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn vector_bitfield_mask_instruction_count() {
+        // v_bfm_b32 v0, v1, v2: two runtime inputs, result stored to a UAV.
+        let words = [0xD763_0000, 0x101 | 0x102 << 9];
+        let count = lower_valu(&words).unwrap().instructions;
+        eprintln!("v_bfm_b32 DXIL instruction count: {count}");
+        assert_eq!(count, 17, "v_bfm_b32 DXIL instruction count");
     }
 
     #[test]

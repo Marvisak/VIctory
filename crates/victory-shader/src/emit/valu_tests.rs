@@ -236,6 +236,32 @@ fn run_cases(
 }
 
 #[test]
+fn vector_bitfield_mask_matches_rdna2() {
+    let shader = build_valu_cs(&vop3(0x363, 0, vgpr(1), vgpr(2), 0));
+    let mut cases = Vec::new();
+    // Every effective width/offset pair, both plain and with ignored high bits.
+    for width in 0..32 {
+        for offset in 0..32 {
+            cases.push([width, offset, 0, 0]);
+            cases.push([width | 0xFFFF_FFE0, offset | 0x8000_0020, 0, 0]);
+        }
+    }
+    // Zero width, wrapped counts, and signed/unsigned extremes.
+    for width in [0, 32, u32::MAX, i32::MIN as u32, i32::MAX as u32] {
+        for offset in [0, 31, 32, u32::MAX, i32::MIN as u32, i32::MAX as u32] {
+            cases.push([width, offset, 0, 0]);
+        }
+    }
+    run_cases(&shader, &cases, |backend, _, inputs, got| {
+        let [width, offset, ..] = inputs;
+        // A 64-bit reference keeps fields crossing bit 31 defined, then
+        // truncates to the low dword as the ISA does.
+        let want = (((1u64 << (width & 31)) - 1) << (offset & 31)) as u32;
+        assert_eq!(got, want, "{backend}: v_bfm_b32({width:#x}, {offset:#x})");
+    });
+}
+
+#[test]
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
         [
