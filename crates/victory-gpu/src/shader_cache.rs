@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, Target, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -53,7 +53,8 @@ pub fn counts() -> (u64, u64) {
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
 /// the compiler), the entry's encoding (this file's text) and the
 /// translation settings (the loop limit, which a diagnostics build can
-/// change at run time).
+/// change at run time, and the view-heap size shaders clamp their indices
+/// below, which a host that caps its heaps lowers).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -64,32 +65,56 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        crate::descriptor::host::probe_view_limit();
+        key(victory_shader::SOURCE_HASH, ENCODING, limit, victory_shader::emit::view_heap_limit())
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, views: u32) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&views.to_le_bytes());
     *h.finalize().as_bytes()
 }
 
-/// The translation of a console shader container, from the cache when
-/// there is one, and whether it came from there.
-pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+/// The wave sizes a run translates for: the host device's, any without one.
+/// The warm-up asks here too, so its entries are the ones a run looks up.
+pub fn host_target() -> Target {
+    crate::host::host().map_or(Target::ANY, |h| h.target())
+}
+
+/// The translation of a console shader container for a host that runs
+/// `target`'s wave sizes, from the cache when there is one, and whether it
+/// came from there.
+pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, String>, bool) {
+    // The translation depends on it (a view index clamped below a capped
+    // heap's end), and so does the cache key.
+    crate::descriptor::host::probe_view_limit();
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true };
+    let options = victory_shader::emit::Options {
+        view_marks: true,
+        target,
+    };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &host_key(build(), target), container, translate),
         None => (translate(container), false),
     }
+}
+
+/// The part of an entry's key before the container: the build, and the
+/// host's wave sizes (a translation for one host's waves is not another's).
+fn host_key(build: &[u8; 32], target: Target) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(&target.key());
+    *h.finalize().as_bytes()
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -480,17 +505,19 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, 1 << 21);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, 1 << 21));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, 1 << 21));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, 1 << 21));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, 1 << 21));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 1_000_000));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                victory_shader::emit::view_heap_limit()
             )
         );
         // The encoding part is this file as built.
@@ -499,6 +526,22 @@ mod tests {
                 .unwrap()
                 .contains("fn encode(translation: &Result<HostShader, String>)")
         );
+    }
+
+    #[test]
+    fn keys_tell_hosts_wave_sizes_apart() {
+        let build = [7u8; 32];
+        let nvidia = Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        };
+        let rdna = Target {
+            lanes_min: 32,
+            lanes_max: 64,
+        };
+        assert_eq!(host_key(&build, nvidia), host_key(&build, nvidia));
+        assert_ne!(host_key(&build, nvidia), host_key(&build, rdna));
+        assert_ne!(host_key(&build, nvidia), host_key(&[8; 32], nvidia));
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

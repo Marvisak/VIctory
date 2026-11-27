@@ -22,12 +22,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::s;
 
+use crate::compute::{compute, constants, root_view};
 use crate::host::{HostList, host, transition};
 use crate::object::This;
 use crate::resource::HostTexture;
@@ -485,29 +484,29 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 /// plane and back, in the scratch buffer: `u` becomes `u` times
 /// `0x37800080` (the title's 1/65535; its tiled-lighting draws rasterise
 /// that very float and test it EQUAL), and a float back the nearest `u`.
+/// In words: footprint offsets and row pitches are multiples of 4, and
+/// each thread takes an even pixel and the next.
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), UAV(u0)"
 cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uint pitch32; uint at32; uint toDepth; uint unused; };
-RWByteAddressBuffer buf : register(u0);
+RWStructuredBuffer<uint> buf : register(u0);
 uint depth(uint u) { return asuint((float)u * asfloat(0x37800080)); }
 uint u16(uint d) { return (uint)(saturate(asfloat(d)) * 65535.0 + 0.5); }
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint x = id.x * 2;
     uint y = id.y;
     if (x >= width || y >= height) return;
-    uint a = at16 + y * pitch16 + x * 2;
-    uint b = at32 + y * pitch32 + x * 4;
+    uint a = (at16 + y * pitch16) / 4 + id.x;
+    uint b = (at32 + y * pitch32) / 4 + x;
     bool two = x + 1 < width;
     if (toDepth != 0) {
-        uint pair = buf.Load(a);
-        buf.Store(b, depth(pair & 0xffff));
-        if (two) buf.Store(b + 4, depth(pair >> 16));
+        uint pair = buf[a];
+        buf[b] = depth(pair & 0xffff);
+        if (two) buf[b + 1] = depth(pair >> 16);
     } else {
-        uint lo = u16(buf.Load(b));
-        uint hi = two ? u16(buf.Load(b + 4)) : 0;
-        buf.Store(a, lo | hi << 16);
+        uint lo = u16(buf[b]);
+        uint hi = two ? u16(buf[b + 1]) : 0;
+        buf[a] = lo | hi << 16;
     }
 }
 "#;
@@ -534,34 +533,13 @@ fn converter() -> Option<&'static Converter> {
     .as_ref()
 }
 
+/// The conversion, its root signature the constants (b0) and the scratch
+/// buffer (u0), as [`Twin::copy`] binds them.
 fn compile() -> windows::core::Result<Converter> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("depth"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, Some(&mut errors))
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe { std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize()) };
-            tracing::warn!("depth conversion: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
-    unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
-            ..Default::default()
-        })?;
-        Ok(Converter { root, pso })
-    }
+    let params = [constants(0, 8), root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0)];
+    let (root, pso) = compute(device, s!("depth conversion"), SOURCE, 0, &params)?;
+    Ok(Converter { root, pso })
 }
 
 #[cfg(test)]

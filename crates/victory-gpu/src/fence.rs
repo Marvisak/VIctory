@@ -6,7 +6,11 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
+#[cfg(not(windows))]
+use crate::object::E_NOTIMPL;
+#[cfg(windows)]
+use crate::object::E_OUTOFMEMORY;
+use crate::object::{self, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 pub(crate) const FENCE_IIDS: [Iid; 5] = [
@@ -99,10 +103,34 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
-        // shortcut: a null event means "block until reached"; nothing can
-        // reach it while no GPU work runs, so fail instead of hanging.
-        tracing::warn!(value, "blocking fence wait not implemented");
-        return E_NOTIMPL;
+        // A null event: block until the value is reached (by a queue's
+        // Signal once the work before it has completed, or the title's).
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::{
+                CreateEventW, INFINITE, WaitForSingleObject,
+            };
+            // SAFETY: a plain auto-reset event, ours until closed below.
+            let ours = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+            if ours.is_null() {
+                return E_OUTOFMEMORY;
+            }
+            waiters.push((value, ours as usize, std::time::Instant::now()));
+            drop(waiters);
+            // SAFETY: our event; `set` drops the waiter as it sets the
+            // event, so nothing names it once the wait ends.
+            unsafe {
+                WaitForSingleObject(ours, INFINITE);
+                CloseHandle(ours);
+            }
+            return S_OK;
+        }
+        #[cfg(not(windows))]
+        {
+            tracing::warn!(value, "blocking fence wait not implemented");
+            return E_NOTIMPL;
+        }
     }
     waiters.push((value, event as usize, std::time::Instant::now()));
     S_OK
@@ -209,11 +237,19 @@ mod tests {
         assert_eq!(wait(f, 5, event), S_OK, "already reached");
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        // A null event blocks until the value is reached.
+        let fence = f as usize;
+        let signaller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            slot::<extern "system" fn(This, u64) -> HRESULT>(fence as This, 0x50)(fence as This, 9)
+        });
+        assert_eq!(wait(f, 9, std::ptr::null_mut()), S_OK);
+        assert_eq!(slot::<extern "system" fn(This) -> u64>(f, 0x40)(f), 9);
+        assert_eq!(signaller.join().unwrap(), S_OK);
         // Grand Theft Auto VI reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
-        assert_eq!(unsafe { *(at as *const u64) }, 5);
+        assert_eq!(unsafe { *(at as *const u64) }, 9);
         // A new wait after a rewind uses the current fence value.
         assert_eq!(signal(f, 2), S_OK);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(f, 0x40)(f), 2);

@@ -294,6 +294,15 @@ fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Whether each page number in `pages` has any aliased mapping in `Guards`.
+pub(crate) fn has_aliases(pages: &[usize]) -> Vec<bool> {
+    let g = guards();
+    if g.alias_of.is_empty() {
+        return vec![false; pages.len()];
+    }
+    pages.iter().map(|p| g.alias_of.contains_key(p)).collect()
+}
+
 /// Guards the other mappings of taken pages, returning those that still
 /// have an unguarded mapping (cannot be taken yet).
 fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {

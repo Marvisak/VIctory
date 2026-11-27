@@ -14,7 +14,7 @@ otherwise. See [docs/architecture.md](docs/architecture.md).
 world.** Nothing else keeps the game from working: the title boots, runs its
 menus at its own 30 fps, loads the world, plays the intro cutscene and
 reaches the **prologue**, the mission after it, with the graphics fully
-displayed. 
+displayed.
 
 | Stage | State |
 |-------|-------|
@@ -142,6 +142,13 @@ title's window has focus:
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
+
+Tests on a Linux host, under Wine: `cargo xtask wine-test` cross-builds the
+Windows test binaries (clang-cl, lld-link and llvm-lib on `PATH`, the MSVC CRT
+and Windows SDK from `xwin splat --output ~/.xwin`) and runs them in a Wine
+prefix of their own under `target/`. `--vkd3d-proton <dir>` puts that
+folder's `d3d12.dll` and `d3d12core.dll` into the prefix (Wine's own D3D12
+has no shader model 6.6); arguments after `--` go to `cargo test`.
 
 ## Commands
 

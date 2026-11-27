@@ -65,6 +65,9 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// The console resources its code reads, from the container alone.
+    #[cfg(windows)]
+    used: OnceLock<Vec<victory_shader::UsedResource>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -95,6 +98,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            used: OnceLock::new(),
         }
     }
 
@@ -151,6 +156,15 @@ impl Shader {
             })
             .as_ref()
     }
+
+    /// The console resources its code reads, without translating it (the
+    /// container's own records, read once).
+    pub(crate) fn used(&self) -> &[victory_shader::UsedResource] {
+        self.used.get_or_init(|| match self.translated.get() {
+            Some(Some(t)) => t.used.clone(),
+            _ => container_used(&self.container).unwrap_or_default(),
+        })
+    }
 }
 
 /// This thread's processor time so far, user and kernel, in 100 ns units.
@@ -178,7 +192,8 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
-    let (host, cached) = crate::shader_cache::host_shader(container);
+    let target = crate::shader_cache::host_target();
+    let (host, cached) = crate::shader_cache::host_shader(container, target);
     (host.and_then(|host| with_resources(container, host)), cached)
 }
 
@@ -187,9 +202,18 @@ fn with_resources(
     container: &[u8],
     host: victory_shader::emit::HostShader,
 ) -> Result<Translated, String> {
+    Ok(Translated {
+        host,
+        used: container_used(container)?,
+    })
+}
+
+/// The console resources the program in `container` reads.
+#[cfg(windows)]
+fn container_used(container: &[u8]) -> Result<Vec<victory_shader::UsedResource>, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
+    Ok(match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => victory_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -202,8 +226,7 @@ fn with_resources(
             .map(|p| p.used)
             .unwrap_or_default(),
         None => Vec::new(),
-    };
-    Ok(Translated { host, used })
+    })
 }
 
 #[repr(C)]
@@ -218,6 +241,10 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    /// Whether it is one of the title's acceleration-structure builder's
+    /// ([`builder`]).
+    #[cfg(windows)]
+    builder: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -254,6 +281,78 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// Whether a dispatch with the title pipeline is held back: it is the
+/// acceleration-structure builder's, which does not run this frame
+/// ([`builder::runs`]).
+#[cfg(windows)]
+pub(crate) fn held_back(this: This) -> bool {
+    !this.is_null() && pipeline(this).builder && !builder::runs()
+}
+
+/// A title DLL was mapped at `base`, `size` bytes (the acceleration-
+/// structure builder's pipelines are known by its image).
+#[cfg(windows)]
+pub fn note_title_dll(file: &str, base: usize, size: usize) {
+    builder::note_title_dll(file, base, size);
+}
+
+/// A title pipeline's pending host pipeline, as [`crate::feeds`] keeps it.
+#[cfg(windows)]
+pub(crate) type Waited = Arc<make::Pending>;
+
+/// Whether the host pipeline of `this` is being made (not made, not
+/// refused).
+#[cfg(windows)]
+pub(crate) fn being_made(this: This) -> bool {
+    !this.is_null() && make::being_made(&pipeline(this).host)
+}
+
+/// The console resources the shaders of `this` read, without translating
+/// them.
+#[cfg(windows)]
+pub(crate) fn used(this: This) -> impl Iterator<Item = &'static victory_shader::UsedResource> {
+    let p: &'static Pipeline = pipeline(this);
+    p.shaders.iter().flat_map(|s| s.used())
+}
+
+/// A draw or dispatch with `this`, which would have written `writes`
+/// (title resources: targets, unordered views), was dropped for want of a
+/// host pipeline. If that pipeline is being made, the frame notes the pass
+/// ([`crate::feeds`]); if it wrote an image the title presents, the image
+/// is not shown until written again and the pipeline goes to the head of
+/// the workers' queue ([`crate::shown`]).
+#[cfg(windows)]
+pub(crate) fn dropped_into(this: This, writes: &[usize]) {
+    if !being_made(this) {
+        return;
+    }
+    let p = pipeline(this);
+    crate::feeds::dropped(this as usize, &p.host, writes);
+    if crate::shown::dropped(writes, || format!("{:?}", p.shaders)) && make::hurry(&p.host) {
+        tracing::info!(shaders = ?p.shaders, "made first: a presented image waits for it");
+    }
+}
+
+/// Whether the pending pipeline `w` could still go to the head of the
+/// workers' queue (queued, not made, not taken, not put there before).
+#[cfg(windows)]
+pub(crate) fn may_hurry(w: &Waited) -> bool {
+    make::may_hurry(w)
+}
+
+/// Puts the pending pipelines in `feeders`, nearest first, at the head of
+/// the workers' queue: the frame's dropped passes whose writes the
+/// presented image reads ([`crate::feeds`]).
+#[cfg(windows)]
+pub(crate) fn hurry_feeders(feeders: &[Waited]) {
+    // The nearest last, to be at the head.
+    let hurried: Vec<_> = feeders.iter().rev().filter(|w| make::hurry(w)).collect();
+    if !hurried.is_empty() {
+        let shaders: Vec<_> = hurried.iter().rev().map(|w| w.shaders()).collect();
+        tracing::info!(?shaders, "made first: passes the presented image reads wait for them");
+    }
 }
 
 /// Host pipelines queued and not made yet.
@@ -371,13 +470,20 @@ fn code_of(code: &Bytecode) -> Option<*const [u8]> {
         .then(|| std::ptr::slice_from_raw_parts(code.code, code.size))
 }
 
+/// `code`: the title's bytecode pointers (by which a pipeline of the
+/// acceleration-structure builder is known, [`builder`]).
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    code: &[*const u8],
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
+    #[cfg(windows)]
+    let builder = !code.is_empty() && builder::created_by_builder(code);
+    #[cfg(not(windows))]
+    let _ = code;
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(
         shaders.clone(),
@@ -387,11 +493,17 @@ fn hand_out(
     ));
     #[cfg(windows)]
     make::early(&host);
+    #[cfg(windows)]
+    if builder {
+        builder::note(&host);
+    }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        builder,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -415,6 +527,7 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        &[],
         iid,
         out,
     )
@@ -435,6 +548,7 @@ pub(crate) extern "system" fn create_compute(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
         None,
+        &[desc.stage.code],
         iid,
         out,
     )
@@ -514,6 +628,7 @@ pub(crate) extern "system" fn create_stream(
         shaders,
         #[cfg(windows)]
         Some(Box::new(graphics)),
+        &[],
         iid,
         out,
     )
@@ -581,6 +696,8 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(windows)]
+mod builder;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
@@ -745,6 +862,58 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    /// A compute pipeline the acceleration-structure builder creates (its
+    /// bytecode in the builder's image) is known as the builder's, and its
+    /// dispatches are held back while its host pipeline is not made: here
+    /// never, as its bytes are no shader container. Pipelines of other
+    /// code are never held back.
+    #[cfg(windows)]
+    #[test]
+    fn builder_dispatches_wait_for_every_builder_pipeline() {
+        let _one = builder::test_lock();
+        let code = [0xB0u8; 64];
+        let create = |code: &[u8]| {
+            let desc = ComputeHead {
+                root: std::ptr::null(),
+                stage: Bytecode {
+                    code: code.as_ptr(),
+                    size: code.len(),
+                },
+            };
+            let mut p: This = std::ptr::null();
+            assert_eq!(
+                create_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+                S_OK
+            );
+            p
+        };
+        builder::note_title_dll("xboxbvhbuilder.DLL", code.as_ptr() as usize, code.len());
+        let p = create(&code);
+        let other_code = [0xC0u8; 64];
+        let other = create(&other_code);
+        builder::note_title_dll("XboxBvhBuilder.dll", 0, 0);
+        assert!(
+            pipeline(p).builder,
+            "its bytecode is in the builder's image"
+        );
+        assert!(!pipeline(other).builder);
+        // Its host pipeline is started at once and refused.
+        let refused = (0..500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            make::state(&pipeline(p).host).is_some()
+        });
+        assert!(refused, "the builder's pipeline was started");
+        assert_eq!(make::state(&pipeline(p).host), Some(false));
+        assert!(
+            held_back(p),
+            "one builder pipeline missing: the builder waits"
+        );
+        assert!(!held_back(other));
+        for q in [p, other] {
+            slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
+        }
     }
 
     #[test]

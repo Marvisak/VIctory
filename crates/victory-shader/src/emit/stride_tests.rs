@@ -198,6 +198,9 @@ fn build(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
         view_marks: false,
     })
     .expect("lower");
@@ -268,7 +271,8 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
         for u in &shader.user_data {
             ud[u.index as usize] = match u.root {
                 // The buffer is at heap index 1, the UAV's table at 0.
-                RootType::Constants => 1,
+                RootType::Constants if u.slot != super::DISPATCH_SLOT => 1,
+                RootType::Constants => 0,
                 RootType::Table => 0,
                 other => panic!("unexpected user data {other:?}"),
             };
@@ -309,16 +313,6 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
 /// indices"): a texture descriptor read as a buffer one is a wild address.
 #[test]
 fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
-    let shader = build(
-        HEAP_ELEMENT_WAVE32,
-        vec![
-            param(RootType::Constants, 0),
-            param(RootType::ResourceHeap, 1),
-            param(RootType::Table, 2),
-        ],
-        vec![entry(ResourceType::Uav, 4, 2)],
-        32,
-    );
     let texel = [[1.0f32, 2.0, 3.0, 4.0]];
     let views = [View::RawUav(32), View::Texture(1, 1, &texel), View::NullBuffers];
     let _one = super::valu_tests::ONE_AT_A_TIME
@@ -330,13 +324,32 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        // Host::new probes the heap limit. Lowering embeds the null slot
+        // for that limit, so translate only after the probe.
+        let translated_null_slot = super::null_buffer_view();
+        let shader = build(
+            HEAP_ELEMENT_WAVE32,
+            vec![
+                param(RootType::Constants, 0),
+                param(RootType::ResourceHeap, 1),
+                param(RootType::Table, 2),
+            ],
+            vec![entry(ResourceType::Uav, 4, 2)],
+            32,
+        );
+        assert_eq!(
+            translated_null_slot,
+            super::null_buffer_view(),
+            "{label}: shader fallback descriptor must match the null SRV in the dispatch heap"
+        );
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
             // The texture at heap index 1, the UAV's table at 0.
-            ud[u.index as usize] = u32::from(u.root == RootType::Constants);
+            ud[u.index as usize] =
+                u32::from(u.root == RootType::Constants && u.slot != super::DISPATCH_SLOT);
         }
         let dispatch = Dispatch {
             // Heap index 1 holds no buffer view: stride 0.
@@ -394,7 +407,8 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
         for u in &shader.user_data {
             ud[u.index as usize] = match u.root {
                 // The constants are at heap index 1, the UAV's table at 0.
-                RootType::Constants => 1,
+                RootType::Constants if u.slot != super::DISPATCH_SLOT => 1,
+                RootType::Constants => 0,
                 RootType::Table => 0,
                 other => panic!("unexpected user data {other:?}"),
             };
@@ -454,7 +468,11 @@ fn a_half_buffer_load_reads_the_half_at_its_address() {
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
             // The SRV's table at heap index 0, the UAV's at 1.
-            ud[u.index as usize] = if u.slot == 0 { 0 } else { 32 };
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, super::DISPATCH_SLOT) => 0,
+                (_, 0) => 0,
+                _ => 32,
+            };
         }
         let words = host
             .dispatch(
@@ -556,6 +574,7 @@ fn a_sampler_chosen_by_a_uniform_branch_samples_as_chosen() {
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Table, 0) => 0,
                     (RootType::Constants, 1) => clamp,
+                    (RootType::Constants, super::DISPATCH_SLOT) => 0,
                     // The UAV at heap index 1: 32 bytes in.
                     (RootType::Table, 2) => 32,
                     other => panic!("unexpected user data {other:?}"),

@@ -11,7 +11,8 @@
 //!    not) are listed by a key known when the title creates them (their
 //!    shader containers and graphics state); the next run hands those to
 //!    the workers at creation, during loading. A full list keeps the
-//!    latest run's first.
+//!    latest run's first. Those a presented image waited for
+//!    (`make::hurry`) are also listed apart, and go ahead of the others.
 //!
 //! 3. The pre-build (`victory translate --cache --pipelines`) lists the
 //!    title pipelines it has put in the library, by the same key, so a
@@ -132,6 +133,12 @@ const EARLY_FILE: &str = "early-pipelines.txt";
 const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
+/// Title pipelines a presented image waited for in earlier runs, started
+/// first when the title creates them (`make::early`).
+const FIRST_FILE: &str = "first-pipelines.txt";
+/// Title pipelines listed to start first, at most; a run lists the first
+/// it hurries (those the first frames wait for), no more.
+const FIRST_MAX: usize = 64;
 
 fn library() -> Option<&'static Shared> {
     static LIBRARY: OnceLock<Option<Shared>> = OnceLock::new();
@@ -160,9 +167,27 @@ fn library() -> Option<&'static Shared> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
+        // An empty library from a null blob: vkd3d-proton (Wine) refuses a
+        // pointer with no bytes (E_INVALIDARG), and an empty slice's
+        // pointer is not null.
+        let blob = if bytes.is_empty() {
+            std::ptr::null()
+        } else {
+            bytes.as_ptr().cast()
+        };
+        let mut library = std::ptr::null_mut();
+        // SAFETY: the bytes outlive the library (kept beside it); the out
+        // pointer is ours, holding a reference on success.
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            (Interface::vtable(device).CreatePipelineLibrary)(
+                Interface::as_raw(device),
+                blob,
+                bytes.len(),
+                &ID3D12PipelineLibrary1::IID,
+                &mut library,
+            )
+            .ok()?;
+            Ok(ID3D12PipelineLibrary1::from_raw(library))
         }
     };
     if !blob.is_empty() {
@@ -344,9 +369,11 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used = used().as_ref().map(Used::list).unwrap_or_default();
+    let first = first().as_ref().map(|f| f.list_at_most(FIRST_MAX)).unwrap_or_default();
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
+        .and_then(|()| write_atomically(&dir.join(FIRST_FILE), first.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
             None => Ok(()),
@@ -440,28 +467,70 @@ impl Used {
     /// The list to keep: this run's keys, then earlier runs' others, most
     /// recent first, at most `EARLY_MAX` (the oldest go once it is full).
     fn list(&self) -> Vec<String> {
+        self.list_at_most(EARLY_MAX)
+    }
+
+    /// As [`Used::list`], at most `max` keys.
+    fn list_at_most(&self, max: usize) -> Vec<String> {
         let mut earlier: Vec<_> = self.before.iter().filter(|(k, _)| !self.now.contains(*k)).collect();
         earlier.sort_unstable_by_key(|&(_, &place)| place);
         let earlier = earlier.into_iter().map(|(k, _)| k);
-        self.now.iter().chain(earlier).take(EARLY_MAX).cloned().collect()
+        self.now.iter().chain(earlier).take(max).cloned().collect()
+    }
+
+    /// Notes `key` for this run if it has fewer than `max`; whether it is
+    /// new.
+    fn note_at_most(&mut self, key: &str, max: usize) -> bool {
+        self.now.len() < max && self.now.insert(key.to_owned())
     }
 }
 
 static USED: Mutex<Option<Used>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
-    let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
-    if used.is_none() {
-        let listed = DIR
+/// The list in `file` under `slot`, read on first use.
+fn read_list(
+    slot: &'static Mutex<Option<Used>>,
+    file: &str,
+    what: &str,
+) -> std::sync::MutexGuard<'static, Option<Used>> {
+    let mut list = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if list.is_none() {
+        let saved = DIR
             .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
+            .and_then(|d| std::fs::read_to_string(d.join(file)).ok())
             .unwrap_or_default();
-        let read = Used::read(&listed);
-        tracing::info!(pipelines = read.before.len(), "title pipelines to start early");
-        *used = Some(read);
+        let read = Used::read(&saved);
+        tracing::info!(pipelines = read.before.len(), "{what}");
+        *list = Some(read);
     }
-    used
+    list
+}
+
+fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
+    read_list(&USED, EARLY_FILE, "title pipelines to start early")
+}
+
+/// Title pipelines whose draws a presented image waited for
+/// (`make::hurry`): in earlier runs and this one.
+static FIRST: Mutex<Option<Used>> = Mutex::new(None);
+
+fn first() -> std::sync::MutexGuard<'static, Option<Used>> {
+    read_list(&FIRST, FIRST_FILE, "title pipelines to start first")
+}
+
+/// Whether a presented image waited for the title pipeline with `key` in
+/// an earlier run: started early, it goes ahead of the other early starts.
+pub(crate) fn wanted_first(key: &str) -> bool {
+    first().as_ref().is_some_and(|f| f.before.contains_key(key))
+}
+
+/// A presented image waits for the title pipeline with `key`: listed if
+/// this run has listed fewer than [`FIRST_MAX`].
+pub(crate) fn note_hurried(key: &str) {
+    if first().get_or_insert_with(Used::default).note_at_most(key, FIRST_MAX) {
+        USED_CHANGED.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Reads the early list now if not yet (a pre-build asks for no title
@@ -515,6 +584,31 @@ mod tests {
         assert_eq!(list.len(), EARLY_MAX);
         assert!(used.now.iter().all(|k| list.contains(k)));
         assert_eq!(list.iter().collect::<HashSet<_>>().len(), EARLY_MAX, "no key twice");
+    }
+
+    /// The list of pipelines to start first is kept the same way, under
+    /// its own cap.
+    #[test]
+    fn the_first_list_keeps_this_run_first_under_its_cap() {
+        let key = |i: usize| format!("{i:032x}");
+        let saved: Vec<String> = (0..FIRST_MAX).map(key).collect();
+        let mut first = Used::read(&saved.join("\n"));
+        first.now.insert(key(FIRST_MAX));
+        let list = first.list_at_most(FIRST_MAX);
+        assert_eq!(list.len(), FIRST_MAX);
+        assert_eq!(list[0], key(FIRST_MAX));
+        assert!(!list.contains(&key(FIRST_MAX - 1)), "the oldest goes");
+    }
+
+    /// A run lists the first pipelines it hurries, up to the cap.
+    #[test]
+    fn a_run_lists_its_first_hurries_only() {
+        let mut first = Used::default();
+        assert!(first.note_at_most("a", 2));
+        assert!(!first.note_at_most("a", 2), "once");
+        assert!(first.note_at_most("b", 2));
+        assert!(!first.note_at_most("c", 2), "full");
+        assert_eq!(first.now.len(), 2);
     }
 
     /// A full list makes room by the oldest runs' keys, and keeps that
@@ -598,51 +692,27 @@ mod tests {
     /// stored and the library is serialised.
     #[test]
     fn pipelines_load_on_many_threads_at_once() {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::core::s;
         const N: usize = 48;
-        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
-        else {
+        let Some(host) = crate::host::host() else {
             return; // no host GPU here
+        };
+        let Ok(device) = host.device.cast::<ID3D12Device1>() else {
+            return; // no pipeline libraries here
         };
         let shader = |i: usize| {
             let source = format!(
-                "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n\
-                 [RootSignature(RS)] [numthreads(1, 1, 1)] void main() {{ b.Store(0, b.Load(4) * {i} + {i}); }}"
+                "RWStructuredBuffer<uint> b : register(u0);\n\
+                 [numthreads(1, 1, 1)] void main() {{ b[0] = b[1] * {i} + {i}; }}"
             );
-            let mut blob = None;
-            // SAFETY: the source outlives the call; the blob is read within it.
-            unsafe {
-                D3DCompile(
-                    source.as_ptr().cast(),
-                    source.len(),
-                    None,
-                    None,
-                    None,
-                    s!("main"),
-                    s!("cs_5_1"),
-                    0,
-                    0,
-                    &mut blob,
-                    None,
-                )
-                .ok()?;
-                let blob = blob?;
-                Some(
-                    std::slice::from_raw_parts(
-                        blob.GetBufferPointer().cast::<u8>(),
-                        blob.GetBufferSize(),
-                    )
-                    .to_vec(),
-                )
-            }
+            let code = crate::compute::compile(&source, s!("library"), s!("main"), s!("cs_5_1"), 0).ok()?;
+            Some(crate::compute::bytes(&code).to_vec())
         };
         let Some(codes) = (0..2 * N).map(shader).collect::<Option<Vec<_>>>() else {
             return; // no shader compiler here
         };
-        // SAFETY: the code holds its root signature.
-        let root: ID3D12RootSignature =
-            unsafe { device.CreateRootSignature(0, &codes[0]) }.unwrap();
+        let params = [crate::compute::root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0, 0)];
+        let root = crate::compute::root_signature(&host.device, &params, D3D12_ROOT_SIGNATURE_FLAG_NONE).unwrap();
         struct Shared(ID3D12Device1, ID3D12RootSignature, ID3D12PipelineLibrary1);
         // SAFETY: D3D12 objects are free-threaded.
         unsafe impl Sync for Shared {}

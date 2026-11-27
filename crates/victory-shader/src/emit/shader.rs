@@ -29,14 +29,36 @@ pub const VIEW_SIGNED: u32 = 1 << 30;
 pub const MEMORY_SPACE: u32 = 2;
 /// Heap indices are clamped below these (views, samplers): the host's heaps
 /// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
+/// indices"). A host that caps its view heaps lower (NVIDIA: 1,000,000)
+/// lowers the view limit to its cap ([`set_view_heap_limit`]).
 pub const HEAP_VIEWS: u32 = 1 << 21;
 pub const HEAP_SAMPLERS: u32 = 2048;
+
+/// The view-heap size shaders clamp their indices below: [`HEAP_VIEWS`], or
+/// a host's lower cap.
+static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(HEAP_VIEWS);
+
+/// Sets the view-heap size translated shaders clamp their indices below,
+/// for a host whose view heaps are capped under [`HEAP_VIEWS`]. Set before
+/// any translation: a translated shader keeps the limit it was made with
+/// (a shader cache keys its entries by [`view_heap_limit`]).
+pub fn set_view_heap_limit(views: u32) {
+    VIEW_LIMIT.store(views.clamp(16, HEAP_VIEWS), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The view-heap size translated shaders clamp their indices below.
+pub fn view_heap_limit() -> u32 {
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
-/// (`emit`, "Buffer views at computed heap indices").
-pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+/// (`emit`, "Buffer views at computed heap indices"): two below the view
+/// limit, whose last slot stays null.
+pub fn null_buffer_view() -> u32 {
+    view_heap_limit() - 2
+}
 /// The view-mark table's register: `t2` (a raw root SRV) in
 /// [`MEMORY_SPACE`] (`emit`, "Write marks").
 pub const VIEW_MARKS: u32 = 2;
@@ -92,6 +114,9 @@ pub(crate) struct Mesh {
 
 pub(crate) struct Shader {
     pub m: Module,
+    /// Test builds: the property words of each handle annotation, in order.
+    #[cfg(test)]
+    pub annotations: Vec<(u32, u32)>,
     pub t: Types,
     pub pixel: bool,
     pub inputs: Vec<SigElement>,
@@ -149,6 +174,22 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// The `dx.op` operations called (names without overload).
+    ops: std::collections::BTreeSet<String>,
+}
+
+thread_local! {
+    /// See [`last_summary`].
+    static LAST: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// What the module this thread finished last declares and calls: its
+/// thread-group size and wave size, and its `dx.op` operations. A
+/// diagnostic for tools that report a module the validator refuses, since
+/// the validator's message for an operation the stage or the entry's
+/// properties do not allow names neither.
+pub(crate) fn last_summary() -> String {
+    LAST.with(|l| l.borrow().clone())
 }
 
 impl Shader {
@@ -171,6 +212,8 @@ impl Shader {
         let entry = m.new_block();
         Shader {
             m,
+            #[cfg(test)]
+            annotations: Vec::new(),
             t: Types {
                 void,
                 i1,
@@ -211,6 +254,7 @@ impl Shader {
             lds: None,
             main,
             entry,
+            ops: std::collections::BTreeSet::new(),
         }
     }
 
@@ -240,6 +284,8 @@ impl Shader {
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
         self.m.ptr(fty);
+        self.ops
+            .insert(name.split('.').next().unwrap_or(name).to_owned());
         let f = self
             .m
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
@@ -512,6 +558,8 @@ impl Shader {
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        #[cfg(test)]
+        self.annotations.push((props0, props1));
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(
@@ -542,7 +590,7 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { view_heap_limit() } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
@@ -570,6 +618,13 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        let threads = self
+            .threads
+            .map_or(String::new(), |[x, y, z]| format!("threads {x}x{y}x{z}, "));
+        let wave = self.wave_size.map_or("any".to_owned(), |n| n.to_string());
+        let ops: Vec<&str> = self.ops.iter().map(String::as_str).collect();
+        let summary = format!("{threads}wave size {wave}; ops: {}", ops.join(", "));
+        LAST.with(|l| *l.borrow_mut() = summary);
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The flags of what lowering made, as the module writes it: what only
@@ -916,6 +971,7 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        self.m.single_latches();
         let bitcode = self.m.write();
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());

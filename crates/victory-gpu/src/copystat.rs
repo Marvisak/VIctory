@@ -104,8 +104,20 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
+    /// Argument clamps (`crate::indirect`): passes of one execution;
+    /// windows opened (`VICTORY_CLAMP_WINDOW`), indirect draws they took;
+    /// indirect draws clamped alone because their shaders may write
+    /// arguments; indirect draws clamped in a prelude (hoisted); of the
+    /// hoisted and windowed, those with read marks (the read-mark rule,
+    /// `crate::draw`'s `may_write_arguments`, let them in).
+    ClampSingle,
+    ClampWindows,
+    ClampWindowDraws,
+    ClampStoring,
+    ClampHoisted,
+    ClampReadMarked,
 }
-const COUNTERS: usize = 61;
+const COUNTERS: usize = 67;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -304,6 +316,19 @@ pub(crate) fn log(frames: f64) {
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
+    );
+    let (single, windows, draws, hoisted) = (
+        c[C::ClampSingle as usize],
+        c[C::ClampWindows as usize],
+        c[C::ClampWindowDraws as usize],
+        c[C::ClampHoisted as usize],
+    );
+    tracing::info!(
+        "clamps per frame: {:.0} passes ({single:.0} single, {windows:.0} windows of {draws:.0} indirect draws, {:.1} a window), {hoisted:.0} indirect draws hoisted to preludes, {:.0} hoisted or windowed by the read-mark rule, {:.0} indirect draws alone as they may write arguments",
+        single + windows,
+        if windows > 0.0 { draws / windows } else { 0.0 },
+        c[C::ClampReadMarked as usize],
+        c[C::ClampStoring as usize],
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()

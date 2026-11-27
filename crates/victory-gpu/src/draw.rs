@@ -11,6 +11,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
+use victory_shader::emit::spread_groups;
 
 use crate::descriptor::View;
 use windows::Win32::Foundation::RECT;
@@ -94,6 +95,8 @@ pub(crate) struct State {
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
+    /// Host-computed compute dispatch spread constants `[row, asked_x]`.
+    dispatch_spread: [u32; 2],
 }
 
 /// Fixed-function state the title set, as it set it.
@@ -536,6 +539,7 @@ impl State {
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            self.not_made(false);
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -603,7 +607,55 @@ impl State {
             unsafe { l.SetPipelineState(&p.pso) };
             (self.host_pipeline, self.host_roots[1]) = (p.pso.as_raw() as usize, 0);
         }
+        crate::feeds::ran(&self.targets, self.depth);
         true
+    }
+
+    /// A draw (`compute` false) or dispatch dropped for want of its host
+    /// pipeline: what it would have written, its targets and the unordered
+    /// views its code names through tables, goes to
+    /// [`crate::pipeline::dropped_into`] if the pipeline is being made.
+    fn not_made(&self, compute: bool) {
+        let this = self.pipeline as This;
+        if !crate::pipeline::being_made(this) {
+            return;
+        }
+        let writes = self.would_write(compute, crate::pipeline::used(this));
+        crate::pipeline::dropped_into(this, &writes);
+    }
+
+    /// What a draw (`compute` false) or dispatch would write: its targets,
+    /// its depth, and the resources its unordered views name through tables.
+    ///
+    /// Only a handle a bound heap holds is read: a title with a null root
+    /// table, no bound view heap, a stale handle from an unmapped heap, or
+    /// a table reach past the end of one names nothing, and
+    /// [`crate::descriptor::view`] would dereference an address the title
+    /// never gave us (a null table and an eight-dword offset crashed with
+    /// `0xC0000005`). A null descriptor (`resource == 0`) names nothing
+    /// either (`crate::feeds`).
+    fn would_write<'a>(
+        &self,
+        compute: bool,
+        uavs: impl Iterator<Item = &'a UsedResource>,
+    ) -> Vec<usize> {
+        let mut writes = Vec::new();
+        if !compute {
+            writes.extend(self.targets.iter().copied().filter(|&t| t != 0));
+            writes.extend((self.depth != 0).then_some(self.depth));
+        }
+        let uavs = uavs.filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table);
+        for u in uavs {
+            if let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot))
+                && let Some(handle) = table.checked_add(u64::from(u.table_offset_dwords) * 4)
+                && self.heap_of(handle).is_some()
+                && let Some(View::Unordered(resource, _, _)) = crate::descriptor::view(handle)
+                && resource != 0
+            {
+                writes.push(resource);
+            }
+        }
+        writes
     }
 
     /// A descriptor a shader reads through a table: its host slot made if
@@ -614,9 +666,13 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        if compute || may_write_arguments(p) {
+            list.end_hoisted_indirect();
+        }
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
+        crate::feeds::begin();
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -674,6 +730,7 @@ impl State {
                 return false;
             };
             list.keep(table);
+            list.marking();
             // SAFETY: an open list; the table lives while the list holds it,
             // the bitmap for good.
             unsafe {
@@ -768,7 +825,10 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
+                        None if u.slot == victory_shader::emit::DISPATCH_SLOT => {
+                            self.dispatch_spread[usize::from(u.dword != 0)]
+                        }
+                        None if is_root_view_offset(u) => {
                             // Where the root address lies in the copy its view shows.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
                                 Some(&Root::View(address)) => crate::shadow::find(address, 1)
@@ -1044,6 +1104,8 @@ impl State {
         float: bool,
         rects: &[RECT],
     ) {
+        // Writes buffers: no indirect draw after it joins a window before.
+        crate::indirect::end_window(list);
         let Some(view) = crate::descriptor::view(cpu) else {
             once!("an unordered access clear of a slot without a view");
             return;
@@ -1075,6 +1137,7 @@ impl State {
             user_data: 0,
             slot: 0,
         };
+        list.end_hoisted_indirect();
         readable(list, &written, &view, false);
         self.bind_heaps(list, false);
         list.keep(&resource);
@@ -1094,9 +1157,19 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            dropped(list, self.pipeline, "dispatch");
+            return;
+        }
+        // The acceleration-structure builder runs whole or not at all
+        // (`pipeline::builder`).
+        if crate::pipeline::held_back(self.pipeline as This) {
+            once!("a dispatch of the BVH builder held back: not all its pipelines are made");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
         }
@@ -1105,6 +1178,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            self.not_made(true);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
@@ -1114,18 +1188,35 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        let can_spread = p.stages.first().is_some_and(|s| {
+            s.translated()
+                .host
+                .user_data
+                .iter()
+                .any(|u| u.slot == victory_shader::emit::DISPATCH_SLOT)
+        });
+        let (row, asked, gx, gy, gz) = spread_groups(x, y, z, can_spread);
+        if gx > 65_535 || gy > 65_535 || gz > 65_535 {
+            once!(
+                "dispatch groups ({gx}, {gy}, {gz}) exceed D3D12 limit 65,535 (spread: {can_spread})"
+            );
+        }
+        self.dispatch_spread = [row, asked];
+        let bound = self.bind(list, p, true);
+        self.dispatch_spread = [0, 0];
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        crate::feeds::ran(&[], 0);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        unsafe { list.list.Dispatch(gx, gy, gz) };
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1199,6 +1290,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
@@ -1560,6 +1652,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
@@ -1664,6 +1757,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -1724,6 +1818,9 @@ impl State {
         };
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        if max == 0 {
+            return true;
+        }
         // A call with no host pipeline cannot run, and that is the common
         // case while the world builds its pipelines: #400 measures 1 400-1 750
         // indirect calls a frame dropped this way. Drop it here, before the
@@ -1731,12 +1828,17 @@ impl State {
         // the arguments and dispatch a compute shader for records nothing
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
-        if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+        if crate::pipeline::held_back(self.pipeline as This) {
+            why("the BVH builder held back");
+            return false;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            self.not_made(kind == DISPATCH);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             why("no host pipeline");
             return false;
-        }
+        };
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
@@ -1752,10 +1854,27 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
+        let spread = if kind == DISPATCH && p.compute {
+            p.stages.first().and_then(|s| {
+                let (param, _) = s.user_data?;
+                let row_index = s
+                    .translated()
+                    .host
+                    .user_data
+                    .iter()
+                    .find(|u| u.slot == victory_shader::emit::DISPATCH_SLOT && u.dword == 0)?
+                    .index;
+                host_spread_signature(&p.root, param, row_index)
+            })
+        } else {
+            None
+        };
+        let is_spread = spread.is_some();
+        let Some(signature) = spread.or_else(|| {
+            matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+                .then(|| host_signature(kind, stride))
+                .flatten()
+        }) else {
             why("no host signature");
             return false;
         };
@@ -1763,44 +1882,129 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own.
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
-        };
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
-        let ran = match kind {
-            DRAW | INDEXED => {
-                (self.topology != RECTANGLES || self.completes_rectangles() || {
-                    not_run("rectangles");
-                    false
-                }) && self.prepare(list, kind == INDEXED)
-            }
-            MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
-                _ => false,
-            },
-            _ => false,
-        };
-        if !ran {
-            crate::indirect::done(list, &clamped);
-            #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => {
-                    crate::pipeline::note_drop(self.pipeline as This);
-                    list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
+        let spec = (kind, stride, max);
+        let args_gpu = args.gpu(arguments);
+        // Where the rule sends this clamp ([`clamp_route`]): hoisted into
+        // the list's prelude with the list's other hoisted clamps (#2472),
+        // whose pipeline is bound before the clamp is known and whose pass
+        // is recorded once per submission instead of dispatched here;
+        // joined to the list's open window (#3197); or on its own, which
+        // ends any window first.
+        // `kept`: the clamped records stay readable as arguments after the
+        // execution (hoisted, or in a window), so no transition back.
+        let writes = may_write_arguments(p);
+        let windows = crate::indirect::windows_on();
+        let route = clamp_route(kind == DISPATCH, writes, windows, || {
+            crate::indirect::can_hoist(list, args_gpu, spec)
+        });
+        let (clamped, clamped_at, kept) = if route == ClampRoute::Hoisted {
+            let ran = match kind {
+                DRAW | INDEXED => {
+                    (self.topology != RECTANGLES || self.completes_rectangles() || {
+                        not_run("rectangles");
+                        false
+                    }) && self.prepare(list, kind == INDEXED)
                 }
-                Some(p) => why(&format!(
+                MESH => self.prepare_for(list, false, true),
+                _ => false,
+            };
+            if !ran {
+                #[cfg(feature = "diagnostics")]
+                why(&format!(
                     "prepare failed (compute {}, mesh {}): {}",
                     p.compute,
                     p.mesh,
                     NOT_RUN.with(|w| w.replace(""))
-                )),
+                ));
+                return false;
             }
-            return false;
-        }
+            if let Some((buf, at)) = crate::indirect::hoist(list, &args.buffer, args_gpu, spec) {
+                #[cfg(feature = "diagnostics")]
+                joined(p, true);
+                (buf, at, true)
+            } else {
+                list.end_hoisted_indirect();
+                let Some(clamped) = crate::indirect::bound(list, args_gpu, spec, is_spread) else {
+                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                    return false;
+                };
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+                let rebound = match kind {
+                    DRAW | INDEXED => self.prepare(list, kind == INDEXED),
+                    MESH => self.prepare_for(list, false, true),
+                    _ => false,
+                };
+                if !rebound {
+                    crate::indirect::done(list, &clamped);
+                    return false;
+                }
+                (clamped, 0, false)
+            }
+        } else {
+            list.end_hoisted_indirect();
+            // A draw the rule lets join is clamped in a window with the
+            // indirect draws next to it (#3197, `crate::indirect::windowed`);
+            // one that may write arguments is clamped on its own below,
+            // which ends the window first.
+            #[cfg(feature = "diagnostics")]
+            if windows && writes && kind != DISPATCH {
+                crate::copystat::add(crate::copystat::C::ClampStoring, 1);
+            }
+            let window = (route == ClampRoute::Windowed)
+                .then(|| {
+                    let (start, _) = args.range();
+                    crate::indirect::windowed(list, args.gpu(start), arguments - start, spec)
+                })
+                .flatten();
+            let (clamped, at, windowed) = match window {
+                Some((out, at, opened)) => {
+                    // Its pass bound a compute pipeline of its own.
+                    if opened {
+                        self.host_pipeline = 0;
+                        self.host_roots[1] = 0;
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    joined(p, false);
+                    (out, at, true)
+                }
+                None => {
+                    // Bounded first: the clamp binds a compute pipeline of its own.
+                    let Some(clamped) = crate::indirect::bound(list, args_gpu, spec, is_spread) else {
+                        why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                        return false;
+                    };
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                    (clamped, 0, false)
+                }
+            };
+            let ran = match kind {
+                DRAW | INDEXED => {
+                    (self.topology != RECTANGLES || self.completes_rectangles() || {
+                        not_run("rectangles");
+                        false
+                    }) && self.prepare(list, kind == INDEXED)
+                }
+                MESH => self.prepare_for(list, false, true),
+                DISPATCH => p.compute && self.bind(list, p, true),
+                _ => false,
+            };
+            if !ran {
+                if !windowed {
+                    crate::indirect::done(list, &clamped);
+                }
+                #[cfg(feature = "diagnostics")]
+                why(&format!(
+                    "prepare failed (compute {}, mesh {}): {}",
+                    p.compute,
+                    p.mesh,
+                    NOT_RUN.with(|w| w.replace(""))
+                ));
+                return false;
+            }
+            (clamped, at, windowed)
+        };
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
@@ -1812,7 +2016,7 @@ impl State {
                 &signature,
                 max,
                 &clamped,
-                0,
+                clamped_at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
@@ -1826,10 +2030,12 @@ impl State {
             if always || crate::capture::dump_on() {
                 let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let name = crate::pipeline::shaders_of(pipeline);
-                crate::capture::read_indirect(list, (&clamped, 0), count, (kind, stride, max), name, always);
+                crate::capture::read_indirect(list, (&clamped, clamped_at), count, (kind, stride, max), name, always);
             }
         }
-        crate::indirect::done(list, &clamped);
+        if !kept {
+            crate::indirect::done(list, &clamped);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1877,6 +2083,65 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     Some(signature)
 }
 
+/// A command signature for compute dispatches whose group count was spread across z:
+/// 4 bytes groups per row (root constant at `row_index`),
+/// 4 bytes asked x groups (root constant at `row_index + 1`),
+/// 12 bytes dispatch arguments (x, y, z).
+/// Command signature for spread indirect dispatches: 2 root constants
+/// (`row`, `asked_x`) followed by `DISPATCH` (`gx, gy, gz`), stride 20 bytes.
+fn host_spread_signature(
+    root: &ID3D12RootSignature,
+    param: u32,
+    row_index: u32,
+) -> Option<ID3D12CommandSignature> {
+    type SpreadKey = (usize, u32, u32);
+    static MADE: std::sync::Mutex<Vec<(SpreadKey, ID3D12CommandSignature)>> =
+        std::sync::Mutex::new(Vec::new());
+    let key = (root.as_raw() as usize, param, row_index);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
+        return Some(s.clone());
+    }
+    let args = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: param,
+                    DestOffsetIn32BitValues: row_index,
+                    Num32BitValuesToSet: 2,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: 20,
+        NumArgumentDescs: args.len() as u32,
+        pArgumentDescs: args.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: valid argument descriptors and root signature.
+    let result = unsafe {
+        crate::host::host()?.device.CreateCommandSignature(
+            &desc,
+            Some(root),
+            &mut signature,
+        )
+    };
+    if let Err(e) = result {
+        once!(error = %e, param, row_index, "spread command signature refused");
+        return None;
+    }
+    let signature = signature?;
+    made.push((key, signature.clone()));
+    Some(signature)
+}
+
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need. `marked`: a shader's
 /// writes through the view mark their pages (every translated shader's do);
@@ -1884,6 +2149,17 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
+    // What the frame's pass reads and writes (`crate::feeds`), by the title
+    // resource its descriptor names.
+    match (view, u.kind) {
+        (View::Shader(resource, _), ResourceType::Srv) if marked => {
+            crate::feeds::view(*resource, false)
+        }
+        (View::Unordered(resource, _, _), ResourceType::Uav) if marked => {
+            crate::feeds::view(*resource, true)
+        }
+        _ => {}
+    }
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
@@ -1943,6 +2219,94 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}
+    }
+}
+
+/// Whether anything `p`'s shaders write may be read as indirect arguments
+/// or counts by a later execution: whether its draw or dispatch ends a
+/// list's prefix of hoisted clamps (#2472) and a window of clamped indirect
+/// draws (#3197), and is clamped on its own if indirect.
+fn may_write_arguments(p: &HostPipeline) -> bool {
+    p.stages.iter().any(stage_may_write_arguments)
+}
+
+/// [`may_write_arguments`] for one stage, from its write flags: unordered
+/// views in its tables (`used`), taken from the heap itself
+/// (`heap_writes`), or root UAVs, bound as root descriptors (`root_uavs`)
+/// or as their heap views (`ROOT_UAV_VIEW` user data), all views of title
+/// buffers' host copies, which arguments and counts are read from; and
+/// title memory at computed addresses (`memory`, its page bitmap
+/// `memory_writes`), any title buffer.
+///
+/// View marks (`view_marks`, the pipeline's `marks`) are not among them.
+/// Every write mark is set beside a store or atomic through an unordered
+/// buffer view from the heap (`victory_shader::emit`, "Write marks": only
+/// handles the heap makes are marked, and those are a table's, the heap's
+/// own or a root UAV's view), so a stage writing marks has one of the flags
+/// above anyway. A stage with marks and none of them only sets read marks
+/// ("Read marks"): bits in our own bitmap, `u1` (`VIEW_WRITES`) in
+/// `MEMORY_SPACE`, a host buffer that is never title memory, so never an
+/// argument or count buffer. Its draws may join a hoist or a window: the
+/// G-buffer's pixel shaders read-mark the textures they take from the heap.
+fn stage_may_write_arguments(s: &crate::pipeline::host::Stage) -> bool {
+    let t = s.translated();
+    !s.root_uavs.is_empty()
+        || !t.host.root_uavs.is_empty()
+        || t.host.user_data.iter().any(|u| {
+            u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_UAV_VIEW
+        })
+        || t.used.iter().any(|u| u.kind == ResourceType::Uav)
+        || t.host.heap_writes
+        || s.memory.is_some()
+        || s.memory_dirty.is_some()
+        || t.host.memory
+        || t.host.memory_writes
+}
+
+/// Where [`clamp_route`] sends an indirect execution's clamp: the list's
+/// prelude of hoisted clamps (#2472), its open window of clamped draws
+/// (#3197), or its own pass, which first ends any window
+/// (`crate::indirect::bound`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClampRoute {
+    Hoisted,
+    Windowed,
+    Alone,
+}
+
+/// The rule's decision for one indirect execution, shared by the hoist and
+/// the window: a dispatch, or a pipeline that may write arguments
+/// ([`may_write_arguments`]), is clamped on its own whatever `hoistable` and
+/// the window switch say, so neither a window nor the prelude can clamp a
+/// record before writes that may change it happen. Anything else is hoisted
+/// when the prelude takes it, and otherwise joins a window when `windows`
+/// (`VICTORY_CLAMP_WINDOW`) is on.
+fn clamp_route(
+    dispatch: bool,
+    writes_arguments: bool,
+    windows: bool,
+    hoistable: impl FnOnce() -> bool,
+) -> ClampRoute {
+    if dispatch || writes_arguments {
+        ClampRoute::Alone
+    } else if hoistable() {
+        ClampRoute::Hoisted
+    } else if windows {
+        ClampRoute::Windowed
+    } else {
+        ClampRoute::Alone
+    }
+}
+
+/// Counts an indirect draw whose clamp was hoisted or joined a window, and
+/// of those the ones only the read-mark rule let in ([`may_write_arguments`]).
+#[cfg(feature = "diagnostics")]
+fn joined(p: &HostPipeline, hoisted: bool) {
+    if hoisted {
+        crate::copystat::add(crate::copystat::C::ClampHoisted, 1);
+    }
+    if p.marks.is_some() {
+        crate::copystat::add(crate::copystat::C::ClampReadMarked, 1);
     }
 }
 
@@ -2013,6 +2377,12 @@ fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
 }
 
+/// Whether `u` is a root view's offset in the copy its view shows: a root
+/// descriptor's dword 4. A root constant's dword 4 is a value.
+fn is_root_view_offset(u: &victory_shader::emit::UserData) -> bool {
+    u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET
+}
+
 /// Whether a shader reads root views through views the host makes.
 fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
     t.user_data.iter().any(is_root_view)
@@ -2046,42 +2416,259 @@ mod tests {
         // A title sampler heap stays whatever the views are.
         assert_eq!(State::wanted([0, 0x20], true), [MEMORY_HEAP, 0x20]);
     }
+
+    /// A pixel stage as the G-buffer's are: it reads a table's textures
+    /// and textures it takes from the heap itself, read-marking those
+    /// (`view_marks`), and writes nothing else. `edit` changes its facts.
+    fn read_marking(
+        edit: impl FnOnce(&mut victory_shader::emit::HostShader, &mut Vec<UsedResource>),
+    ) -> crate::pipeline::host::Stage {
+        let mut host = victory_shader::emit::HostShader {
+            stage: victory_shader::HwStage::Ps,
+            dxil: Vec::new(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            memory: false,
+            memory_writes: false,
+            view_addresses: false,
+            heap: true,
+            heap_writes: false,
+            view_marks: true,
+        };
+        let table = |kind| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 8,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        };
+        let mut used = vec![table(ResourceType::Srv), table(ResourceType::Sampler)];
+        edit(&mut host, &mut used);
+        let translated = crate::pipeline::Translated { host, used };
+        crate::pipeline::host::Stage {
+            shader: crate::pipeline::Shader::for_test("pixel", translated),
+            user_data: Some((0, 4)),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            memory: None,
+            memory_dirty: None,
+            view_addresses: None,
+        }
+    }
+
+    /// The read-mark rule: a stage whose only unordered-access writes are
+    /// read marks, into our own bitmap, writes nothing a later indirect
+    /// execution reads as arguments or counts, so its draws may join a
+    /// hoist or a clamp window.
+    #[test]
+    fn a_stage_that_only_read_marks_may_join_a_clamp_batch() {
+        assert!(!stage_may_write_arguments(&read_marking(|_, _| {})));
+    }
+
+    /// A store through a table's unordered view may write arguments.
+    #[test]
+    fn a_table_uav_store_ends_a_clamp_batch() {
+        let s = read_marking(|_, used| {
+            used.push(UsedResource { kind: ResourceType::Uav, ..used[0] });
+        });
+        assert!(stage_may_write_arguments(&s));
+    }
+
+    /// A store through an unordered view taken from the heap itself may
+    /// write any view's buffer.
+    #[test]
+    fn a_heap_store_ends_a_clamp_batch() {
+        assert!(stage_may_write_arguments(&read_marking(|h, _| h.heap_writes = true)));
+    }
+
+    /// A root UAV, bound as a root descriptor or as its heap view.
+    #[test]
+    fn a_root_uav_ends_a_clamp_batch() {
+        let mut descriptor = read_marking(|h, _| h.root_uavs = vec![2]);
+        assert!(stage_may_write_arguments(&descriptor));
+        descriptor = read_marking(|_, _| {});
+        descriptor.root_uavs = vec![(2, 5)];
+        assert!(stage_may_write_arguments(&descriptor));
+        let view = read_marking(|h, _| {
+            h.user_data.push(victory_shader::emit::UserData {
+                index: 4,
+                slot: 2,
+                root: RootType::Descriptor,
+                dword: victory_shader::emit::ROOT_UAV_VIEW,
+            });
+        });
+        assert!(stage_may_write_arguments(&view));
+        // A root SRV's view is only read.
+        let read = read_marking(|h, _| {
+            h.user_data.push(victory_shader::emit::UserData {
+                index: 4,
+                slot: 2,
+                root: RootType::Descriptor,
+                dword: victory_shader::emit::ROOT_SRV_VIEW,
+            });
+        });
+        assert!(!stage_may_write_arguments(&read));
+    }
+
+    /// Title memory at computed addresses: any title buffer, arguments
+    /// among them.
+    #[test]
+    fn title_memory_ends_a_clamp_batch() {
+        let shader = read_marking(|h, _| (h.memory, h.memory_writes) = (true, true));
+        assert!(stage_may_write_arguments(&shader));
+        let mut bound = read_marking(|_, _| {});
+        (bound.memory, bound.memory_dirty) = (Some(6), Some(7));
+        assert!(stage_may_write_arguments(&bound));
+    }
+
+    /// The rule's sequence in a window: a read-marking draw joins one, and
+    /// the draw after it that may write arguments is clamped on its own,
+    /// which ends the window (`crate::indirect::bound`); the next
+    /// read-marking draw opens a new one rather than joining the old.
+    #[test]
+    fn a_read_marking_draw_may_join_a_window_and_the_writer_ends_it() {
+        let read = read_marking(|_, _| {});
+        let writer = read_marking(|_, used| {
+            used.push(UsedResource { kind: ResourceType::Uav, ..used[0] });
+        });
+        // The window switch on, and the prelude not free (it ended before).
+        let route = |s: &crate::pipeline::host::Stage| {
+            clamp_route(false, stage_may_write_arguments(s), true, || false)
+        };
+        assert_eq!(route(&read), ClampRoute::Windowed);
+        assert_eq!(route(&writer), ClampRoute::Alone);
+        let mut opened = 0;
+        let mut open = false;
+        for stage in [&read, &writer, &read] {
+            match route(stage) {
+                ClampRoute::Windowed if !open => {
+                    opened += 1;
+                    open = true;
+                }
+                ClampRoute::Windowed => {}
+                // Its own clamp ends the window (`crate::indirect::bound`).
+                ClampRoute::Alone => open = false,
+                ClampRoute::Hoisted => panic!("the prelude was not free"),
+            }
+        }
+        assert_eq!(opened, 2);
+        // A free prelude does not take the writer either: neither batch may
+        // clamp a record before the writes happen.
+        assert_eq!(
+            clamp_route(false, stage_may_write_arguments(&writer), true, || true),
+            ClampRoute::Alone
+        );
+        assert_eq!(
+            clamp_route(false, stage_may_write_arguments(&read), true, || true),
+            ClampRoute::Hoisted
+        );
+        // A dispatch always clamps on its own: an indirect dispatch cannot be
+        // hoisted, and its own clamp ends any window.
+        assert_eq!(clamp_route(true, false, true, || false), ClampRoute::Alone);
+    }
+
+    /// A dropped pass reads no descriptor it cannot name: a null root table
+    /// with an eight-dword offset (the reviewer's `0xC0000005`), a stale
+    /// handle whose offset overflows, a table entry no bound heap holds, or
+    /// a UAV that is not a table's are all skipped without touching memory.
+    /// `State::default()` binds no heap, so a read would fault here.
+    #[test]
+    fn a_dropped_pass_reads_no_descriptor_it_cannot_name() {
+        let uav = |slot: u8, table_offset_dwords: u32| UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 32,
+            dwords: 4,
+            user_data: 0,
+            slot,
+        };
+        let mut state = State::default();
+        state.set_table(true, 0, 0);
+        state.set_table(true, 1, u64::MAX - 16);
+        assert!(
+            state
+                .would_write(true, [uav(0, 8), uav(1, 8)].iter())
+                .is_empty()
+        );
+        // A root descriptor is not read through the heap at all.
+        let mut descriptor = uav(0, 8);
+        descriptor.root = RootType::Descriptor;
+        assert!(state.would_write(true, [descriptor].iter()).is_empty());
+    }
+
     use crate::object::{HRESULT, S_OK};
-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use crate::compute::{compute, range, root_view, table};
     use windows::core::s;
+
+    /// A root constant's dword 4 is a value: only a root descriptor's dword
+    /// 4 names its view's offset.
+    #[test]
+    fn only_a_root_descriptors_dword_four_is_a_view_offset() {
+        let u = |root, dword| victory_shader::emit::UserData {
+            index: 0,
+            slot: 0,
+            root,
+            dword,
+        };
+        let offset = victory_shader::emit::ROOT_VIEW_OFFSET;
+        assert!(is_root_view_offset(&u(RootType::Descriptor, offset)));
+        assert!(!is_root_view_offset(&u(RootType::Constants, offset)));
+        assert!(!is_root_view_offset(&u(RootType::Table, offset)));
+    }
 
     /// Reads 16 dwords 64 bytes apart from `offset` past the root view
     /// (heap index in the table) as the translated shaders do: the root
     /// address's offset in the view plus their own.
     const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), RootConstants(num32BitConstants=2, b0)"
 ByteAddressBuffer src : register(t0);
 RWByteAddressBuffer dst : register(u0);
 cbuffer c : register(b0) { uint root; uint offset; }
-[RootSignature(RS)]
 [numthreads(16, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     dst.Store(id.x * 4, src.Load(root + offset + id.x * 64));
 }
 "#;
 
+    /// Writes `value` at `byte_offset` of the view in the table and marks
+    /// its 64 KiB page in `writes` (a bitmap, in words) from the view's
+    /// marks, as translated shaders do.
     const MARKED_WRITE_SOURCE: &str = r#"
-#define RS "DescriptorTable(UAV(u0)), SRV(t0), UAV(u1), RootConstants(num32BitConstants=3, b0)"
 RWByteAddressBuffer dst : register(u0);
 ByteAddressBuffer marks : register(t0);
-RWByteAddressBuffer writes : register(u1);
+RWStructuredBuffer<uint> writes : register(u1);
 cbuffer c : register(b0) { uint slot; uint byte_offset; uint value; }
-[RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
     dst.Store(byte_offset, value);
     uint2 m = marks.Load2(slot * 8);
     uint bit = m.x + ((m.y + byte_offset) >> 16);
     uint old;
-    writes.InterlockedOr((bit >> 5) * 4, 1u << (bit & 31), old);
+    InterlockedOr(writes[bit >> 5], 1u << (bit & 31), old);
 }
 "#;
+
+    /// The marked write, its root signature a table (u0), the marks (t0),
+    /// the bitmap (u1) and 3 constants, as [`dispatch_marked_uav`] binds.
+    fn marked_writer() -> (ID3D12RootSignature, ID3D12PipelineState) {
+        let ranges = [range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 0, 1)];
+        let params = [
+            table(&ranges),
+            root_view(D3D12_ROOT_PARAMETER_TYPE_SRV, 0, 0),
+            root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1, 0),
+            crate::compute::constants(0, 3),
+        ];
+        compile_cs(MARKED_WRITE_SOURCE, &params)
+    }
 
     fn buffer_at_address(address: u64, bytes: u64) -> This {
         let desc: [u32; 14] = [
@@ -2201,7 +2788,7 @@ void main() {
         let view = crate::descriptor::view(slot0).expect("subpage uav view");
         let _ = heap_host.mirror(0, slot0, true);
 
-        let shader = compile_cs(MARKED_WRITE_SOURCE);
+        let shader = marked_writer();
         let list = host.new_list().unwrap();
         readable(&list, &used(ResourceType::Uav), &view, true);
         dispatch_marked_uav(&list, heap_host, &shader, 0, 0, 0, 0xDEAD_BEEF);
@@ -2242,7 +2829,7 @@ void main() {
         let _ = heap_host.mirror(0, slot0, true);
 
         let cpu_val = 0xCAFE_BABEu32.to_le_bytes();
-        let shader = compile_cs(MARKED_WRITE_SOURCE);
+        let shader = marked_writer();
         let list = host.new_list().unwrap();
         readable(&list, &used(ResourceType::Uav), &view, true);
         list.defer_copy((p + 0x2000) as *mut u8, cpu_val.as_ptr(), cpu_val.len());
@@ -2313,7 +2900,7 @@ void main() {
         let view = crate::descriptor::view(slot0).expect("cross-page subrange uav");
         let _ = heap_host.mirror(0, slot0, true);
 
-        let shader = compile_cs(MARKED_WRITE_SOURCE);
+        let shader = marked_writer();
         let list = host.new_list().unwrap();
         readable(&list, &used(ResourceType::Uav), &view, true);
         dispatch_marked_uav(&list, heap_host, &shader, 0, 0, 0, 0x1234_5678);
@@ -2356,7 +2943,7 @@ void main() {
         let _ = heap_host.mirror(1, slot1, true);
 
         let copy_src = 0x1111_1111u32.to_le_bytes();
-        let shader = compile_cs(MARKED_WRITE_SOURCE);
+        let shader = marked_writer();
         let list = host.new_list().unwrap();
         list.defer_copy((p + 0x200) as *mut u8, copy_src.as_ptr(), copy_src.len());
         readable(&list, &used(ResourceType::Uav), &view1, true);
@@ -2394,7 +2981,7 @@ void main() {
         let (heap, title_heap, heap_host) = view_heap(8);
         let _ = host.log_messages();
 
-        let shader = compile_cs(MARKED_WRITE_SOURCE);
+        let shader = marked_writer();
         let list = host.new_list().unwrap();
         let mut state = State::default();
         state.set_heaps(&[heap]);
@@ -2440,49 +3027,27 @@ void main() {
     }
 
     fn compile() -> (ID3D12RootSignature, ID3D12PipelineState) {
-        compile_cs(SOURCE)
+        let ranges = [range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 0, 1), range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 0, 1)];
+        compile_cs(SOURCE, &[table(&ranges[..1]), table(&ranges[1..]), crate::compute::constants(0, 2)])
     }
 
-    /// A compute shader with its root signature inside (`RS`).
-    fn compile_cs(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
+    /// A compute shader and its root signature of `params`.
+    fn compile_cs(source: &str, params: &[D3D12_ROOT_PARAMETER]) -> (ID3D12RootSignature, ID3D12PipelineState) {
         let host = crate::host::host().unwrap();
-        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
-        // SAFETY: the source and names outlive the call.
-        unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("root"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                Some(&mut errors),
-            )
-            .unwrap();
-        }
-        let code = code.unwrap();
-        // SAFETY: the blob's own bytes.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
-        };
-        // SAFETY: a compiled shader with its root signature inside.
-        unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
-            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: bytes.as_ptr().cast(),
-                    BytecodeLength: bytes.len(),
-                },
-                ..Default::default()
-            };
-            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
-            (root, pso)
-        }
+        compute(&host.device, s!("root"), source, 0, params).unwrap()
+    }
+
+    /// A compute shader writing `views` unordered views from u0, through
+    /// the table [`run`] binds.
+    fn writer(source: &str, views: u32) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        compile_cs(source, &[table(&[range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 0, views)])])
+    }
+
+    /// A compute shader reading `views` shader resource views from t0,
+    /// through the table [`run`] binds, into its root view u1.
+    fn reader(source: &str, views: u32) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        let ranges = [range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 0, views)];
+        compile_cs(source, &[table(&ranges), root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 1, 0)])
     }
 
     /// Which pixels of a 64x64 host D32S8 `texture` (title texture `depth`)
@@ -2493,9 +3058,7 @@ void main() {
     fn equal_test_passes(depth: This, texture: &ID3D12Resource) -> Vec<bool> {
         use windows::Win32::Graphics::Dxgi::Common::*;
         const SOURCE: &str = r#"
-#define RS "RootFlags(0)"
 static const float2 CORNERS[6] = { float2(0, 0), float2(1, 0), float2(0, 1), float2(1, 0), float2(1, 1), float2(0, 1) };
-[RootSignature(RS)]
 float4 vs(uint v : SV_VertexID) : SV_Position {
     uint i = v / 6;
     float2 p = float2(i % 64, i / 64) + CORNERS[v % 6];
@@ -2504,20 +3067,13 @@ float4 vs(uint v : SV_VertexID) : SV_Position {
 uint ps() : SV_Target { return 1; }
 "#;
         let host = crate::host::host().unwrap();
-        let blob = |entry: windows::core::PCSTR, target: windows::core::PCSTR| {
-            let mut code: Option<ID3DBlob> = None;
-            // SAFETY: the source and names outlive the call.
-            unsafe { D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("equal"), None, None, entry, target, 0, 0, &mut code, None) }.unwrap();
-            code.unwrap()
-        };
+        let blob = |entry, target| crate::compute::compile(SOURCE, s!("equal"), entry, target, 0).unwrap();
         let (vs, ps) = (blob(s!("vs"), s!("vs_5_1")), blob(s!("ps"), s!("ps_5_1")));
-        // SAFETY: the blobs' own bytes.
-        let bytes = |b: &ID3DBlob| unsafe { D3D12_SHADER_BYTECODE { pShaderBytecode: b.GetBufferPointer(), BytecodeLength: b.GetBufferSize() } };
-        // SAFETY: a compiled shader with its root signature inside.
-        let root: ID3D12RootSignature = unsafe {
-            host.device.CreateRootSignature(0, std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize()))
-        }
-        .unwrap();
+        let bytes = |b| {
+            let b = crate::compute::bytes(b);
+            D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr().cast(), BytecodeLength: b.len() }
+        };
+        let root = crate::compute::root_signature(&host.device, &[], D3D12_ROOT_SIGNATURE_FLAG_NONE).unwrap();
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: borrowed for the call.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -2800,10 +3356,8 @@ uint ps() : SV_Target { return 1; }
     }
 
     const READ: &str = r#"
-#define RS "DescriptorTable(SRV(t0)), UAV(u1)"
 Texture2D<float4> t : register(t0);
 RWByteAddressBuffer o : register(u1);
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     o.Store4((id.y * 64 + id.x) * 16, asuint(t.Load(int3(id.xy, 0))));
@@ -2821,7 +3375,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             return; // no host GPU here
         };
         let slots = Slots::new(4);
-        let read = compile_cs(READ);
+        let read = reader(READ, 1);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
         // Format written and size, what the shader writes, format read and
         // size, the texel expected, whether one host texture.
@@ -2861,9 +3415,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             let unordered = View::Unordered(object as usize, 0, Some([written, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
             slots.make(0, &unordered);
             slots.make(1, &view);
-            let write = compile_cs(&format!(
-                "#define RS \"DescriptorTable(UAV(u0))\"\n{put}\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ put(id.xy); }}"
-            ));
+            let write = writer(
+                &format!("{put}\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ put(id.xy); }}"),
+                1,
+            );
             let list = host.new_list().unwrap();
             let copies = crate::texture::ALIAS_COPIES.load(Ordering::Relaxed);
             readable(&list, &used(ResourceType::Uav), &unordered, false);
@@ -2894,7 +3449,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             return; // no host GPU here
         };
         let slots = Slots::new(2);
-        let read = compile_cs(READ);
+        let read = reader(READ, 1);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
         // Runtime memory the change journal follows; RGBA8 64x64, linear.
         let address = crate::watch::tests::pool(1) as u64;
@@ -2941,7 +3496,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             return; // no host GPU here
         };
         let slots = Slots::new(2);
-        let read = compile_cs(READ);
+        let read = reader(READ, 1);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
         // Runtime memory the change journal follows; RGBA8 64x64, linear.
         let address = crate::watch::tests::pool(1) as u64;
@@ -2991,7 +3546,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             return; // no host GPU here
         };
         let slots = Slots::new(2);
-        let read = compile_cs(READ);
+        let read = reader(READ, 1);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
         let address = crate::watch::tests::pool(1) as u64;
         let object = texture_at_address(address, &texture_words(64, 64, 28, 0x100, 0));
@@ -3031,7 +3586,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             return; // no host GPU here
         };
         let slots = Slots::new(2);
-        let read = compile_cs(READ);
+        let read = reader(READ, 1);
         let outs: Vec<_> = (0..2).map(|_| host.shared_buffer(64 * 64 * 16).unwrap()).collect();
         let pool = crate::watch::tests::pool(2);
         let views: Vec<View> = (0..2usize)
@@ -3072,7 +3627,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             return; // no host GPU here
         };
         let slots = Slots::new(2);
-        let read = compile_cs(READ);
+        let read = reader(READ, 1);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
         // RGBA8 128x128, linear: one whole 64 KiB page.
         let address = crate::watch::tests::pool(1) as u64;
@@ -3110,7 +3665,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             return; // no host GPU here
         };
         let slots = Slots::new(2);
-        let read = compile_cs(READ);
+        let read = reader(READ, 1);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
         // RGBA8 512x512 with two mips, linear, in memory the journal follows.
         let address = crate::watch::tests::pool(32) as u64;
@@ -3172,31 +3727,29 @@ void main(uint3 id : SV_DispatchThreadID) {
         ];
         slots.make(2, &reads[0]);
         slots.make(3, &reads[1]);
-        let write = compile_cs(
+        let write = writer(
             r#"
-#define RS "DescriptorTable(UAV(u0, numDescriptors=2))"
 RWTexture2D<float> d : register(u0);
 RWTexture2D<uint> s : register(u1);
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     d[id.xy] = (1 + id.x + 64 * id.y) * (1.0 / 65535.0);
     s[id.xy] = (id.x ^ id.y) & 0xff;
 }
 "#,
+            2,
         );
-        let read = compile_cs(
+        let read = reader(
             r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2)), UAV(u1)"
 Texture2D<float> d : register(t0);
 Texture2D<uint2> s : register(t1);
 RWByteAddressBuffer o : register(u1);
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     o.Store2((id.y * 64 + id.x) * 8, uint2(asuint(d.Load(int3(id.xy, 0))), s.Load(int3(id.xy, 0)).g));
 }
 "#,
+            2,
         );
         let (out, data) = host.shared_buffer(64 * 64 * 8).unwrap();
         // The depth texture's planes as bytes, read back after.
@@ -3399,7 +3952,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             &st,
             &io,
             &res,
-            Options { view_marks: true },
+            Options {
+                view_marks: true,
+                target: victory_shader::emit::Target::ANY,
+            },
         )
         .unwrap();
         assert!(host_shader.view_marks);
@@ -3451,16 +4007,15 @@ void main(uint3 id : SV_DispatchThreadID) {
         let twin_slots = Slots::new(1);
         let twin_uav = View::Unordered(depth as usize, 0, Some([56, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
         twin_slots.make(0, &twin_uav);
-        let write_twin = compile_cs(
+        let write_twin = writer(
             r#"
-#define RS "DescriptorTable(UAV(u0))"
 RWTexture2D<float> d : register(u0);
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     d[id.xy] = 49152.0 / 65535.0;
 }
 "#,
+            1,
         );
 
         let list = host.new_list().unwrap();
@@ -3550,12 +4105,14 @@ void main(uint3 id : SV_DispatchThreadID) {
             let shader = View::Shader(texture as usize, Some(srv));
             slots.make(0, &unordered);
             slots.make(1, &shader);
-            let write = compile_cs(&format!(
-                "#define RS \"DescriptorTable(UAV(u0))\"\n{put}\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ for (uint z = 0; z < 64; z++) put(uint3(id.xy, z)); }}"
-            ));
-            let read = compile_cs(&format!(
-                "#define RS \"DescriptorTable(SRV(t0)), UAV(u1)\"\n{get}\nRWByteAddressBuffer o : register(u1);\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ o.Store4((id.y * 64 + id.x) * 16, asuint(get(id))); }}"
-            ));
+            let write = writer(
+                &format!("{put}\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ for (uint z = 0; z < 64; z++) put(uint3(id.xy, z)); }}"),
+                1,
+            );
+            let read = reader(
+                &format!("{get}\nRWByteAddressBuffer o : register(u1);\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ o.Store4((id.y * 64 + id.x) * 16, asuint(get(id))); }}"),
+                1,
+            );
             let list = host.new_list().unwrap();
             readable(&list, &used(ResourceType::Uav), &unordered, false);
             run(&list, &slots, &write, 0, None, groups);
@@ -3661,30 +4218,29 @@ void main(uint3 id : SV_DispatchThreadID) {
         slots.make(2, &uav2);
         slots.make(3, &srv2);
 
-        let write = compile_cs(
+        let write = writer(
             r#"
-#define RS "DescriptorTable(UAV(u0))"
 RWTexture2D<float4> outTex : register(u0);
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     outTex[id.xy] = float4((id.x + 1.0) / 8.0, (id.y + 1.0) / 8.0, 0.5, 1.0);
 }
 "#,
+            1,
         );
+        let ranges = [range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 0, 1), range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 0, 1)];
         let copy_srv_to_uav = compile_cs(
             r#"
-#define RS "DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0))"
 Texture2D<float4> inTex : register(t0);
 RWTexture2D<float4> outTex : register(u0);
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     outTex[id.xy] = inTex.Load(int3(id.xy, 0));
 }
 "#,
+            &[table(&ranges[..1]), table(&ranges[1..])],
         );
-        let read = compile_cs(READ);
+        let read = reader(READ, 1);
         let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
 
         let list = host.new_list().unwrap();
@@ -3768,29 +4324,27 @@ void main(uint3 id : SV_DispatchThreadID) {
         let heap_host = title_heap.host().expect("a host view heap");
         let _ = host.log_messages();
 
-        let write = compile_cs(
+        let write = writer(
             r#"
-#define RS "DescriptorTable(UAV(u0))"
 RWTexture2D<unorm float4> outTex : register(u0);
-[RootSignature(RS)]
 [numthreads(2, 2, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     outTex[id.xy] = float4(64.0 / 255.0, 0.0, 1.0, 1.0);
 }
 "#,
+            1,
         );
-        let read_bytes = compile_cs(
+        let read_bytes = reader(
             r#"
-#define RS "DescriptorTable(SRV(t0)), UAV(u1)"
 Texture2D<unorm float4> inTex : register(t0);
 RWByteAddressBuffer outBuf : register(u1);
-[RootSignature(RS)]
 [numthreads(2, 2, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint4 px = uint4(round(inTex.Load(int3(id.xy, 0)) * 255.0));
     outBuf.Store4((id.y * 2 + id.x) * 16, px);
 }
 "#,
+            1,
         );
         let (out, data) = host.shared_buffer(4 * 16).unwrap();
 
@@ -3906,5 +4460,53 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!(host.log_messages(), None, "case {case} D3D12 debug errors");
             let _ = kept_obj;
         }
+    }
+
+    #[test]
+    fn spread_indirect_signature_matches_root_and_layout() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let param = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 4,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: 1,
+            pParameters: &param,
+            NumStaticSamplers: 0,
+            pStaticSamplers: std::ptr::null(),
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+        };
+        let mut blob = None;
+        let mut error = None;
+        // SAFETY: valid root signature desc.
+        let hr = unsafe {
+            D3D12SerializeRootSignature(
+                &desc,
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &mut blob,
+                Some(&mut error),
+            )
+        };
+        if hr.is_err() {
+            return;
+        }
+        let blob = blob.unwrap();
+        // SAFETY: the serialized root signature blob is valid and within its size.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        };
+        // SAFETY: the device is live and root signature bytes are valid.
+        let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, bytes) }.unwrap();
+        let sig = super::host_spread_signature(&root, 0, 0);
+        assert!(sig.is_some());
     }
 }

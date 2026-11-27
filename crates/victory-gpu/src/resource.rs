@@ -1291,9 +1291,45 @@ fn current(this: This) -> bool {
         .is_none_or(|live| std::sync::Arc::ptr_eq(&live, &h))
 }
 
-/// A host texture of host description `d` in GPU memory, castable to
-/// [`castable`]'s formats (colour textures, through the enhanced-barrier
-/// creation; it starts in the common state) where the host takes that.
+/// Whether the host has `format` at all. A castable list naming one it does
+/// not have is refused whole (vkd3d-proton has no
+/// `R10G10B10_XR_BIAS_A2_UNORM`), and with it every castable texture.
+#[cfg(windows)]
+fn host_has(host: &crate::host::Host, format: u32) -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    // Per format: 0 not asked yet, 1 had, 2 not.
+    static HAS: [AtomicU8; 128] = [const { AtomicU8::new(0) }; 128];
+    let Some(known) = HAS.get(format as usize) else {
+        return false;
+    };
+    match known.load(Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: the query writes its own structure of the given size.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut data).cast(),
+            size_of_val(&data) as u32,
+        )
+    };
+    let has = asked.is_ok() && data.Support1 != D3D12_FORMAT_SUPPORT1_NONE;
+    known.store(if has { 1 } else { 2 }, Relaxed);
+    has
+}
+
+/// A host texture of host description `d` in GPU memory, castable to the
+/// formats of [`castable`] the host has (colour textures, through the
+/// enhanced-barrier creation; it starts in the common state) where the host
+/// takes that.
 #[cfg(windows)]
 fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<HostTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
@@ -1315,6 +1351,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     };
     let mut texture: Option<ID3D12Resource> = None;
     let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
+    castable_formats.retain(|&f| host_has(host, f));
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     // In a heap of textures if it fits there (`crate::placement`).
     // SAFETY: the description has the host layout (checked size).
@@ -1581,16 +1618,26 @@ fn evictable(t: &HostTexture) -> bool {
     t.key.is_some() && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Once per presented frame, before a submission (`Host::execute`, one at a
-/// time, the last one has run): gives up host textures fed from title memory
-/// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
-/// the card's budget the least recently used ones until [`BUDGET_LOW`].
+/// The frame [`evict_unused`] last ran in.
+#[cfg(windows)]
+static EVICTED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether [`evict_unused`] has yet to run in this frame.
+#[cfg(windows)]
+pub(crate) fn eviction_due() -> bool {
+    EVICTED_AT.load(std::sync::atomic::Ordering::Relaxed) != crate::queue::presented()
+}
+
+/// Once per presented frame, before a submission is prepared (`Host::run`;
+/// those in flight keep what it gives up until they have run): gives up
+/// host textures fed from title memory that the title has not used for
+/// [`IDLE_MS`], and past [`BUDGET_HIGH`] of the card's budget the least
+/// recently used ones until [`BUDGET_LOW`].
 #[cfg(windows)]
 pub(crate) fn evict_unused() {
     use std::sync::atomic::Ordering::Relaxed;
-    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     let frame = crate::queue::presented();
-    if LAST.swap(frame, Relaxed) == frame {
+    if EVICTED_AT.swap(frame, Relaxed) == frame {
         return;
     }
     let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
@@ -1612,6 +1659,13 @@ pub(crate) type Owned = (std::sync::Arc<HostTexture>, Vec<usize>);
 /// ([`give_up`]). Returns how many and their bytes.
 #[cfg(windows)]
 fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
+    // Submissions that completed with others marking in flight may have
+    // left reads untaken: their null views are made now, as the completion
+    // would (the pass below clears every mark; none marks in flight now).
+    let first = crate::shadow::take_reads(true);
+    if !first.is_empty() {
+        crate::descriptor::make_read(&first);
+    }
     // Read through the heap since the last pass: used (a slot's read mark is
     // reported as new only once, so its first read alone stamped it; run
     // evict1 gave up and made again hundreds of textures a frame).
@@ -1711,6 +1765,10 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
             given.insert(k, frame);
         }
     }
+    // Submissions in flight may still read them through views made before.
+    crate::host::retire_any(Box::new(
+        gone.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+    ));
     EVICTIONS[0].fetch_add(gone.len() as u64, Relaxed);
     EVICTIONS[1].fetch_add(bytes, Relaxed);
     (gone.len() as u64, bytes)
@@ -2311,6 +2369,37 @@ mod tests {
     }
     use crate::object::slot;
 
+    /// A render target with unordered views (the title's full-screen
+    /// targets) is made castable to the formats of its element the host
+    /// has, on every host: one format it lacks does not cost it the list.
+    #[cfg(windows)]
+    #[test]
+    fn a_colour_target_is_castable_to_the_formats_the_host_has() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let d = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 256,
+            height: 256,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 5,
+        };
+        let t = make_texture(&d, 0, std::ptr::null()).unwrap();
+        let had: Vec<u32> = castable(28)
+            .into_iter()
+            .filter(|&f| host_has(host, f))
+            .collect();
+        assert!(!had.is_empty());
+        assert_eq!(t.castable, had);
+    }
+
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
         // DXGI_FORMAT values: 60 R8_TYPELESS, 61 R8_UNORM, 62 R8_UINT,
@@ -2762,6 +2851,9 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
+        let _queues = crate::queue::tests::TITLE_QUEUES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
@@ -2960,6 +3052,9 @@ mod tests {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
+        let _queues = crate::queue::tests::TITLE_QUEUES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
@@ -3011,6 +3106,7 @@ mod tests {
         copy(list, &into_target, 2, 1, 0, &image_at, region.as_ptr().cast());
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        crate::queue::tests::finish(queue);
         // SAFETY: the buffer holds 4096 bytes; the submission has run.
         let read = unsafe { std::slice::from_raw_parts(out, 4096) };
         let mut want = vec![0xEEu8; 4096];
@@ -3019,6 +3115,158 @@ mod tests {
             want[to..to + 8].copy_from_slice(&bytes[from..from + 8]);
         }
         assert!(read == want.as_slice(), "the region's rows, and nothing else");
+    }
+
+    /// The title's ExecuteCommandLists returns before the host GPU has run
+    /// its lists: the fence its queue signals behind them, and what they
+    /// copy into a title buffer, move only once they have completed; a
+    /// blocking wait for the fence ends then.
+    #[cfg(windows)]
+    #[test]
+    fn a_submission_completes_after_it_returns() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _queues = crate::queue::tests::TITLE_QUEUES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !crate::host::overlap() {
+            return; // VICTORY_GPU_OVERLAP=0: each submission is waited for
+        }
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        const COPY_DEST: u32 = 0x400;
+        let (mut image, mut source, mut target) = (null, null, null);
+        let created = |desc: &ResourceDesc, state, out: &mut This| {
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), iid, out),
+                S_OK
+            );
+        };
+        created(&texture(4, 4, 28, 1), COPY_DEST, &mut image);
+        created(&buffer(1024), 0, &mut source);
+        created(&buffer(1024), 0, &mut target);
+        let (data, _) = buffer_bytes(source).unwrap();
+        // SAFETY: the buffer holds 1024 bytes.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(data, 1024) };
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let (out, _) = buffer_bytes(target).unwrap();
+        // SAFETY: the buffer holds 1024 bytes.
+        unsafe { std::ptr::write_bytes(out, 0xEE, 1024) };
+        let (mut queue, mut allocator, mut list, mut fence) = (null, null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(
+                null,
+                queue_desc.as_ptr().cast(),
+                &guid(
+                    0x0ec870a6,
+                    0x5d7e,
+                    0x4c22,
+                    [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]
+                ),
+                &mut queue
+            ),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(
+                null,
+                0,
+                &guid(
+                    0x6102dee4,
+                    0xaf59,
+                    0x4b09,
+                    [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]
+                ),
+                &mut allocator
+            ),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(
+                null,
+                0,
+                0,
+                allocator,
+                null,
+                &guid(
+                    0x5b160d0f,
+                    0xac1b,
+                    0x4185,
+                    [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]
+                ),
+                &mut list
+            ),
+            S_OK
+        );
+        assert_eq!(
+            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+            S_OK
+        );
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let rows = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 4,
+            height: 4,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let image_at = Location {
+            resource: image,
+            kind: 0,
+            footprint: rows,
+        };
+        let from_source = Location {
+            resource: source,
+            kind: 1,
+            footprint: rows,
+        };
+        let into_target = Location {
+            resource: target,
+            kind: 1,
+            footprint: rows,
+        };
+        type Copy =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        let copy = slot::<Copy>(list, 0x80);
+        copy(list, &image_at, 0, 0, 0, &from_source, null.cast());
+        copy(list, &into_target, 0, 0, 0, &image_at, null.cast());
+        slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
+        let value = slot::<extern "system" fn(This) -> u64>(fence, 0x40);
+        let wait =
+            slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> HRESULT>(fence, 0x48);
+        // SAFETY: the buffer holds 1024 bytes.
+        let read = || unsafe { std::slice::from_raw_parts(out, 1024) }.to_vec();
+
+        let gate = host.hold_gpu();
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        let signal = crate::queue::tests::signal_slot(queue);
+        slot::<extern "system" fn(This, This, u64) -> HRESULT>(queue, signal)(queue, fence, 1);
+        // Back with the host GPU held: nothing has run.
+        assert_eq!(value(fence), 0, "the fence waits for the lists");
+        assert!(read().iter().all(|&b| b == 0xEE), "nothing went back yet");
+        drop(gate);
+        assert_eq!(wait(fence, 1, std::ptr::null_mut()), S_OK);
+        assert_eq!(value(fence), 1);
+        let read = read();
+        for row in 0..4 {
+            let at = row * 256;
+            assert_eq!(
+                read[at..at + 16],
+                bytes[at..at + 16],
+                "row {row}, back once the fence is reached"
+            );
+        }
+        slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
     }
 
     /// Two queues, as Grand Theft Auto VI's: a compute list copies a buffer,
@@ -3032,6 +3280,9 @@ mod tests {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
+        let _queues = crate::queue::tests::TITLE_QUEUES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
@@ -3098,6 +3349,9 @@ mod tests {
         slot::<Close>(drawing, 0x48)(drawing);
 
         slot::<Execute>(compute, 0x50)(compute, 1, &computing);
+        // The part before the wait has run once its submission completes (a
+        // fence the queue signalled would wait behind the held part).
+        crate::host::host().unwrap().complete_all();
         let (copied, _) = buffer_bytes(early).unwrap();
         // SAFETY: the buffers hold 1024 bytes; nothing runs meanwhile.
         let read = |at: *mut u8| unsafe { std::slice::from_raw_parts(at, 1024) }.to_vec();
@@ -3112,6 +3366,8 @@ mod tests {
         slot::<Close>(computing, 0x48)(computing);
 
         slot::<Execute>(graphics, 0x50)(graphics, 1, &drawing);
+        crate::queue::tests::finish(graphics);
+        crate::queue::tests::finish(compute);
         // SAFETY: as above.
         assert_eq!(unsafe { flag.read_volatile() }, 1);
         let read = read(out);
