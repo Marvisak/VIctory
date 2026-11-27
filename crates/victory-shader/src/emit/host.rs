@@ -352,6 +352,12 @@ impl Host {
         &self,
         cs: &HostShader,
     ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        #[cfg(test)]
+        eprintln!(
+            "{:?}: creating compute root signature ({} DXIL bytes)",
+            std::thread::current().name(),
+            cs.dxil.len()
+        );
         let root = self.root_signature_for(&[(cs, D3D12_SHADER_VISIBILITY_ALL)])?;
         let pso = self.compute_pipeline_with(&root, &cs.dxil)?;
         Ok((root, pso))
@@ -372,8 +378,23 @@ impl Host {
             ..Default::default()
         };
         let _guard = self.lock_warp();
+        // In tests, record the native call boundary before entering the driver.
+        // An access violation can terminate the process before an HRESULT returns.
+        #[cfg(test)]
+        eprintln!(
+            "{:?}: entering CreateComputePipelineState ({} DXIL bytes)",
+            std::thread::current().name(),
+            cs.len()
+        );
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err)
+        let result = unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err);
+        #[cfg(test)]
+        eprintln!(
+            "{:?}: CreateComputePipelineState returned (success={})",
+            std::thread::current().name(),
+            result.is_ok()
+        );
+        result
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or
