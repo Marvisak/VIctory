@@ -33,12 +33,15 @@
 //! world), and loads that waited on it stalled every worker for as long.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
+
+mod mapped;
+use mapped::MappedFile;
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -56,7 +59,14 @@ pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 struct Library {
     library: ID3D12PipelineLibrary1,
     /// The blob the library was made from: it must outlive the library.
-    _blob: Vec<u8>,
+    blob: BlobBacking,
+    /// The file the blob was read from, for its digest's sidecar.
+    source: Option<PathBuf>,
+    /// Digest of the blob (empty for none), once `digest` was asked.
+    digest: String,
+    /// The generation the blob was read from (0 for the legacy file or none);
+    /// a save writes the generation after the highest one seen.
+    generation: u64,
     /// Pipelines stored since the last save.
     added: u64,
     /// Title pipelines the pre-build put in the library or found there, by
@@ -127,7 +137,10 @@ impl Drop for Held<'_> {
 /// Pipelines being loaded, or made and stored.
 static NAMES: Names = Names::new();
 
+/// The library file earlier builds saved (generation 0).
 const LIBRARY_FILE: &str = "host-pipelines.bin";
+/// Each save is a new generation, `host-pipelines.gen-N.bin`.
+const GENERATION_PREFIX: &str = "host-pipelines.gen-";
 const EARLY_FILE: &str = "early-pipelines.txt";
 const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
@@ -138,15 +151,19 @@ fn library() -> Option<&'static Shared> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let blob = read(LIBRARY_FILE).unwrap_or_default();
-            let tag = tag(&blob);
-            let mut library = open(&device, blob);
-            // The pre-build's list, if it was saved with these bytes.
-            if let (Some(l), Some(list)) = (library.as_mut(), read(PREBUILT_FILE))
-                && !l._blob.is_empty()
+            let dir = DIR.get();
+            let mut library = match dir {
+                Some(dir) => open_dir(&device, dir, mmap_enabled()),
+                None => open(&device, BlobBacking::Owned(Vec::new())),
+            };
+            // The pre-build's list, if it was saved with these bytes. Only
+            // here is the blob's digest needed: with a sidecar it costs no
+            // page of a mapped library.
+            if let (Some(l), Some(dir)) = (library.as_mut(), dir)
+                && !l.blob.is_empty()
+                && let Ok(list) = std::fs::read(dir.join(PREBUILT_FILE))
             {
-                l.prebuilt = listed(&list, &tag);
+                l.prebuilt = listed(&list, &tag(&l.digest(dir)));
             }
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -158,51 +175,94 @@ fn library() -> Option<&'static Shared> {
 
 /// The library in `blob`, or an empty one if the host rejects the blob (an
 /// adapter or driver change, damage).
-fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
-    let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
-        unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
-        }
-    };
+fn open(device: &ID3D12Device1, blob: BlobBacking) -> Option<Library> {
     if !blob.is_empty() {
-        let started = std::time::Instant::now();
-        match make(&blob) {
-            Ok(library) => {
-                let ms = started.elapsed().as_millis() as u64;
-                tracing::info!(bytes = blob.len(), ms, "host pipeline library loaded");
-                return Some(Library {
-                    library,
-                    _blob: blob,
-                    added: 0,
-                    prebuilt: HashSet::new(),
-                    prebuilt_changed: false,
-                });
-            }
+        match adopt(device, blob) {
+            Ok(library) => return Some(library),
             Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
-    let library = make(&[]).ok()?;
+    empty(device)
+}
+
+/// A library with no pipelines.
+fn empty(device: &ID3D12Device1) -> Option<Library> {
     Some(Library {
-        library,
-        _blob: Vec::new(),
+        library: create(device, &[]).ok()?,
+        blob: BlobBacking::Owned(Vec::new()),
+        source: None,
+        digest: String::new(),
+        generation: 0,
         added: 0,
         prebuilt: HashSet::new(),
         prebuilt_changed: false,
     })
 }
 
-/// What the pre-build's list holds for: the library's bytes, and what
+fn create(device: &ID3D12Device1, bytes: &[u8]) -> windows::core::Result<ID3D12PipelineLibrary1> {
+    // SAFETY: the callers keep the bytes beside the library, which they
+    // outlive.
+    unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast() }
+}
+
+/// The library made of `blob`, which it keeps for as long as it lives.
+fn adopt(device: &ID3D12Device1, blob: BlobBacking) -> windows::core::Result<Library> {
+    let started = std::time::Instant::now();
+    let library = create(device, blob.as_slice())?;
+    let ms = started.elapsed().as_millis() as u64;
+    tracing::info!(bytes = blob.len(), mapped = blob.is_mapped(), ms, "host pipeline library loaded");
+    Ok(Library {
+        library,
+        blob,
+        source: None,
+        digest: String::new(),
+        generation: 0,
+        added: 0,
+        prebuilt: HashSet::new(),
+        prebuilt_changed: false,
+    })
+}
+
+/// The library saved in `dir`: the newest generation the host accepts (the
+/// legacy file counts as generation 0), else an empty one. Generations the
+/// host rejected, and older ones, are deleted (best effort).
+fn open_dir(device: &ID3D12Device1, dir: &Path, mmap: bool) -> Option<Library> {
+    let found = generations(dir);
+    let highest = found.first().map_or(0, |&(n, _)| n);
+    for (n, path) in &found {
+        let Some(blob) = BlobBacking::read(path, mmap) else { continue };
+        match adopt(device, blob) {
+            Ok(mut library) => {
+                // A save never reuses the number of a generation seen here.
+                library.generation = highest;
+                library.source = Some(path.clone());
+                remove_other_generations(dir, *n);
+                return Some(library);
+            }
+            Err(e) => tracing::info!(error = %e, file = %path.display(), "host pipeline library rejected"),
+        }
+    }
+    if found.is_empty() {
+        tracing::info!("no host pipeline library yet; starting an empty one");
+    }
+    let mut library = empty(device)?;
+    library.generation = highest;
+    remove_other_generations(dir, u64::MAX);
+    Some(library)
+}
+
+/// What the pre-build's list holds for: the library's bytes (by their
+/// digest, so that a mapped library need not be read to know), and what
 /// names its pipelines (the translation, as the shader cache keys it; the
 /// host descriptions).
-fn tag(blob: &[u8]) -> String {
+fn tag(digest: &str) -> String {
     let limit = victory_shader::emit::loop_limit().to_le_bytes();
     let translator = victory_shader::SOURCE_HASH.as_bytes();
     let mut h = blake3::Hasher::new();
     for part in [
-        blob,
+        digest.as_bytes(),
         translator,
         include_bytes!("../shader_cache.rs"),
         &limit,
@@ -213,6 +273,226 @@ fn tag(blob: &[u8]) -> String {
         h.update(part);
     }
     h.finalize().to_hex().to_string()
+}
+
+impl Library {
+    /// The blob's digest: from the sidecar a save left beside a mapped
+    /// blob (no page of it is read), else hashed (and kept in a sidecar for
+    /// the next run). An owned blob, read whole already, is hashed.
+    fn digest(&mut self, dir: &Path) -> String {
+        if self.digest.is_empty() && !self.blob.is_empty() {
+            let sidecar = self.source.as_deref().map(sidecar).filter(|_| self.blob.is_mapped());
+            let saved = sidecar.as_deref().and_then(|s| read_sidecar(s, self.blob.len()));
+            self.digest = saved.unwrap_or_else(|| {
+                let digest = digest_of(self.blob.as_slice());
+                if let Some(sidecar) = &sidecar {
+                    let _ = std::fs::create_dir_all(dir)
+                        .and_then(|()| write_sidecar(sidecar, self.blob.len(), &digest));
+                }
+                digest
+            });
+        }
+        self.digest.clone()
+    }
+}
+
+/// The bytes a library was made from, which must outlive it: its file
+/// mapped (the pages come from the file as the host reads them, and are
+/// not committed memory), or read whole when that is not possible or
+/// `VICTORY_PIPELINE_LIB_MMAP=0` says not to.
+enum BlobBacking {
+    Mapped(MappedFile),
+    Owned(Vec<u8>),
+}
+
+impl BlobBacking {
+    /// The file's bytes, or `None` if it cannot be read or holds none.
+    fn read(path: &Path, mmap: bool) -> Option<BlobBacking> {
+        if mmap {
+            match MappedFile::open(path) {
+                Ok(mapped) => return Some(BlobBacking::Mapped(mapped)),
+                // An empty file is skipped below; others are read whole.
+                Err(e) => tracing::debug!(error = %e, file = %path.display(), "not mapped; reading it"),
+            }
+        }
+        std::fs::read(path).ok().filter(|b| !b.is_empty()).map(BlobBacking::Owned)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            BlobBacking::Mapped(m) => m.as_slice(),
+            BlobBacking::Owned(v) => v,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn is_mapped(&self) -> bool {
+        matches!(self, BlobBacking::Mapped(_))
+    }
+}
+
+/// Whether the library is mapped from its file (the default) and saved
+/// through a mapping; `VICTORY_PIPELINE_LIB_MMAP=0` reads and writes whole
+/// buffers instead.
+fn mmap_enabled() -> bool {
+    mmap_set(std::env::var_os("VICTORY_PIPELINE_LIB_MMAP").as_deref())
+}
+
+fn mmap_set(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+fn digest_of(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+/// The file beside `path` that keeps the digest of its bytes.
+fn sidecar(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".b3");
+    path.with_file_name(name)
+}
+
+/// The digest in `sidecar`, if it was made for a file of `len` bytes.
+fn read_sidecar(sidecar: &Path, len: usize) -> Option<String> {
+    let text = std::fs::read_to_string(sidecar).ok()?;
+    let (saved_len, digest) = text.trim().split_once(' ')?;
+    (saved_len.parse() == Ok(len) && digest.len() == 64).then(|| digest.to_owned())
+}
+
+fn write_sidecar(sidecar: &Path, len: usize, digest: &str) -> std::io::Result<()> {
+    write_atomically(sidecar, format!("{len} {digest}").as_bytes())
+}
+
+/// The library's generations in `dir`, newest first: `host-pipelines.gen-N.bin`
+/// is generation N, and the file earlier builds saved is generation 0.
+fn generations(dir: &Path) -> Vec<(u64, PathBuf)> {
+    let mut found: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let n = match name == LIBRARY_FILE {
+                true => 0,
+                false => name.strip_prefix(GENERATION_PREFIX)?.strip_suffix(".bin")?.parse().ok()?,
+            };
+            Some((n, entry.path()))
+        })
+        .collect();
+    found.sort_unstable_by_key(|&(n, _)| std::cmp::Reverse(n));
+    found
+}
+
+fn generation_file(n: u64) -> String {
+    format!("{GENERATION_PREFIX}{n}.bin")
+}
+
+/// Deletes the generations matching `remove` (best effort: where Windows
+/// refuses to delete the one a process has mapped, a sharing violation, it
+/// stays for the next start).
+fn remove_generations_where(dir: &Path, mut remove: impl FnMut(u64) -> bool) {
+    for (n, path) in generations(dir).into_iter().filter(|&(n, _)| remove(n)) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(sidecar(&path));
+            }
+            Err(e) => tracing::debug!(generation = n, error = %e, "old host pipeline library kept"),
+        }
+    }
+}
+
+/// Deletes every generation other than `keep` (used on open after falling
+/// back past damaged newer generations).
+fn remove_other_generations(dir: &Path, keep: u64) {
+    remove_generations_where(dir, |n| n != keep);
+}
+
+/// Deletes generations strictly older than `keep` (used on save so a save
+/// never deletes a newer generation).
+fn remove_older_generations(dir: &Path, keep: u64) {
+    remove_generations_where(dir, |n| n < keep);
+}
+
+/// Serialises `library` into the file of generation `generation` in `dir`
+/// and returns its size and (if `digest`) its digest, also saved in a
+/// sidecar. Windows does not let a file a process has mapped be written, so
+/// a save makes a new generation, through a staging file renamed once
+/// whole. With `mmap` the staging file is mapped and serialised into, so
+/// no buffer of the library's size is made; without it (or if mapping
+/// fails) a buffer is.
+fn write_generation(
+    dir: &Path,
+    library: &ID3D12PipelineLibrary1,
+    generation: u64,
+    mmap: bool,
+    digest: bool,
+) -> std::io::Result<(usize, Option<String>)> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(generation_file(generation));
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{}", std::process::id()));
+    let staging = path.with_file_name(name);
+    // SAFETY: a plain size query on a live library.
+    let size = unsafe { library.GetSerializedSize() };
+    let staged = match mmap && size > 0 {
+        true => serialize_mapped(library, &staging, size, digest).or_else(|e| {
+            tracing::info!(error = %e, "host pipeline library not saved through a mapping");
+            serialize_owned(library, &staging, size, digest)
+        }),
+        false => serialize_owned(library, &staging, size, digest),
+    };
+    let digest = staged
+        .and_then(|digest| {
+            // A sidecar left by an earlier file of this name no longer holds.
+            let _ = std::fs::remove_file(sidecar(&path));
+            std::fs::rename(&staging, &path).map(|()| digest)
+        })
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&staging);
+        })?;
+    if let Some(digest) = &digest {
+        write_sidecar(&sidecar(&path), size, digest)?;
+    }
+    Ok((size, digest))
+}
+
+fn serialize_mapped(
+    library: &ID3D12PipelineLibrary1,
+    file: &Path,
+    size: usize,
+    digest: bool,
+) -> std::io::Result<Option<String>> {
+    let mut mapped = MappedFile::create(file, size)?;
+    // SAFETY: a mapping of the size the library asks for.
+    unsafe { library.Serialize(mapped.as_mut_slice()) }.map_err(std::io::Error::other)?;
+    mapped.flush()?;
+    Ok(digest.then(|| digest_of(mapped.as_slice())))
+}
+
+fn serialize_owned(
+    library: &ID3D12PipelineLibrary1,
+    file: &Path,
+    size: usize,
+    digest: bool,
+) -> std::io::Result<Option<String>> {
+    let Some(mut bytes) = zeroed(size) else {
+        // Left for a later save: the pipelines stay counted as added.
+        tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
+        return Err(std::io::ErrorKind::OutOfMemory.into());
+    };
+    // SAFETY: a buffer of the size the library asks for.
+    unsafe { library.Serialize(&mut bytes) }.map_err(std::io::Error::other)?;
+    std::fs::write(file, &bytes)?;
+    Ok(digest.then(|| digest_of(&bytes)))
 }
 
 /// The pre-build's list as saved: the tag it holds for, then its keys.
@@ -305,6 +585,10 @@ thread_local! {
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    // Serialises the full save sequence (generation write, metadata files,
+    // old-generation cleanup) without holding `library.state` during post-
+    // serialisation file updates.
+    static SAVING: Mutex<()> = Mutex::new(());
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
@@ -314,28 +598,25 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
-    let (blob, prebuilt) = {
+    let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    let mmap = mmap_enabled();
+    let (generation, bytes, prebuilt) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
             return;
         }
-        // SAFETY: a plain size query on a live library.
-        let size = unsafe { l.library.GetSerializedSize() };
-        let Some(mut bytes) = zeroed(size) else {
-            // Left for a later save: the pipelines stay counted as added.
-            tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
-            return;
-        };
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe { l.library.Serialize(&mut bytes) }.map(|()| bytes);
-        match bytes {
-            Ok(bytes) => {
+        let generation = l.generation + 1;
+        // The digest is the pre-build's list's tag (needed only with one).
+        let digest = !l.prebuilt.is_empty();
+        match write_generation(dir, &l.library, generation, mmap, digest) {
+            Ok((bytes, digest)) => {
+                l.generation = generation;
                 l.added = 0;
                 l.prebuilt_changed = false;
                 // Kept beside the bytes it holds for (also when a run adds
                 // pipelines).
-                let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
+                let prebuilt = digest.map(|d| list(&tag(&d), &l.prebuilt));
+                (generation, bytes, prebuilt)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
@@ -344,18 +625,22 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used = used().as_ref().map(Used::list).unwrap_or_default();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
-        .and_then(|()| match &prebuilt {
+    let written = write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()).and_then(|()| {
+        match &prebuilt {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
             None => Ok(()),
-        });
+        }
+    });
+    // The generation this process maps may stay (if Windows refuses to
+    // delete it); the next start removes it. Only strictly older generations
+    // are removed so a save can never delete a newer generation.
+    remove_older_generations(dir, generation);
     let (created, distinct) = created();
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
         Ok(()) => tracing::info!(
-            bytes = blob.len(),
+            bytes,
+            generation,
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
@@ -544,10 +829,10 @@ mod tests {
     #[test]
     fn the_prebuilt_list_holds_for_its_library_only() {
         let keys: HashSet<String> = ["a".repeat(32), "b".repeat(32)].into();
-        let saved = list(&tag(b"library"), &keys);
-        assert_eq!(listed(saved.as_bytes(), &tag(b"library")), keys);
-        assert!(listed(saved.as_bytes(), &tag(b"library2")).is_empty());
-        assert!(listed(b"", &tag(b"library")).is_empty());
+        let saved = list(&tag(&digest_of(b"library")), &keys);
+        assert_eq!(listed(saved.as_bytes(), &tag(&digest_of(b"library"))), keys);
+        assert!(listed(saved.as_bytes(), &tag(&digest_of(b"library2"))).is_empty());
+        assert!(listed(b"", &tag(&digest_of(b"library"))).is_empty());
     }
 
     #[test]
@@ -682,10 +967,10 @@ mod tests {
                 }
             }
         }
-        let first = open(&device, Vec::new()).expect("an empty library");
+        let first = open(&device, BlobBacking::Owned(Vec::new())).expect("an empty library");
         let made = Shared(device.clone(), root.clone(), first.library.clone());
         (0..N).for_each(|i| made.store(i, &codes[i]));
-        let again = open(&device, made.serialized()).expect("the library again");
+        let again = open(&device, BlobBacking::Owned(made.serialized())).expect("the library again");
         let shared = Shared(device, root, again.library.clone());
         let stores = Mutex::new(());
         std::thread::scope(|s| {
@@ -811,10 +1096,208 @@ mod tests {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
-        let library = open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
+        let library = open(&device, BlobBacking::Owned(b"not a pipeline library".repeat(16)))
+            .expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
-        assert!(library._blob.is_empty());
+        assert!(library.blob.is_empty());
+    }
+
+    fn host_device() -> Option<ID3D12Device1> {
+        crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
+    }
+
+    /// An empty library's bytes: a blob the host accepts.
+    fn valid_blob(device: &ID3D12Device1) -> Vec<u8> {
+        let library = empty(device).expect("an empty library").library;
+        // SAFETY: a buffer of the size asked for.
+        unsafe {
+            let mut bytes = vec![0; library.GetSerializedSize()];
+            library.Serialize(&mut bytes).unwrap();
+            bytes
+        }
+    }
+
+    fn files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_env_var_opts_out_of_mapping() {
+        use std::ffi::OsStr;
+        assert!(mmap_set(None));
+        assert!(mmap_set(Some(OsStr::new("1"))));
+        assert!(mmap_set(Some(OsStr::new(""))));
+        assert!(!mmap_set(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn a_mapped_file_reads_and_writes_what_the_file_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mapped.bin");
+        let mut out = MappedFile::create(&path, 100_000).unwrap();
+        out.as_mut_slice().iter_mut().enumerate().for_each(|(i, b)| *b = i as u8);
+        out.flush().unwrap();
+        drop(out);
+        let expected: Vec<u8> = (0..100_000).map(|i| i as u8).collect();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        let read = MappedFile::open(&path).unwrap();
+        assert_eq!(read.as_slice(), &expected[..]);
+        // Deleting the file (Rust unlinks it, as Windows 10 allows) leaves
+        // the mapping readable.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read.as_slice(), &expected[..]);
+        drop(read);
+        std::fs::write(&path, &expected).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // Nothing to map in a file with no bytes.
+        std::fs::write(&path, b"").unwrap();
+        assert!(MappedFile::open(&path).is_err());
+        assert!(BlobBacking::read(&path, true).is_none());
+    }
+
+    #[test]
+    fn generations_are_listed_newest_first_with_the_legacy_file_last() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "host-pipelines.bin",
+            "host-pipelines.gen-2.bin",
+            "host-pipelines.gen-10.bin",
+            "host-pipelines.gen-10.bin.b3",
+            "host-pipelines.gen-3.bin.tmp-1",
+            "host-pipelines.gen-x.bin",
+            "early-pipelines.txt",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let found: Vec<_> = generations(dir.path()).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(found, [10, 2, 0]);
+        remove_other_generations(dir.path(), 2);
+        assert_eq!(
+            files(dir.path()),
+            [
+                "early-pipelines.txt",
+                "host-pipelines.gen-2.bin",
+                "host-pipelines.gen-3.bin.tmp-1",
+                "host-pipelines.gen-x.bin"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sidecar_holds_for_its_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let side = dir.path().join("a.bin.b3");
+        let digest = digest_of(b"bytes");
+        write_sidecar(&side, 5, &digest).unwrap();
+        assert_eq!(read_sidecar(&side, 5), Some(digest));
+        assert_eq!(read_sidecar(&side, 6), None);
+        assert_eq!(read_sidecar(&dir.path().join("none.b3"), 5), None);
+        std::fs::write(&side, b"5 short").unwrap();
+        assert_eq!(read_sidecar(&side, 5), None);
+    }
+
+    /// A library saved to a generation opens again from it, mapped, with
+    /// the digest of its bytes taken from the sidecar.
+    #[test]
+    fn a_saved_library_opens_again_mapped() {
+        let Some(device) = host_device() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let library = empty(&device).unwrap();
+        // SAFETY: a plain query on a live library.
+        let size = unsafe { library.library.GetSerializedSize() };
+        let (bytes, digest) = write_generation(dir.path(), &library.library, 1, true, true).unwrap();
+        assert_eq!(bytes, size);
+        assert_eq!(files(dir.path()), ["host-pipelines.gen-1.bin", "host-pipelines.gen-1.bin.b3"]);
+        let mut again = open_dir(&device, dir.path(), true).expect("the library again");
+        assert!(again.blob.is_mapped());
+        assert_eq!(again.blob.len(), size);
+        assert_eq!(again.generation, 1);
+        let digest = digest.unwrap();
+        assert_eq!(again.digest(dir.path()), digest);
+        assert_eq!(digest_of(again.blob.as_slice()), digest);
+        // The mapping serves the bytes even if the file is deleted meanwhile
+        // (a cleanup does that to the generation a run still maps).
+        std::fs::remove_file(dir.path().join("host-pipelines.gen-1.bin")).unwrap();
+        assert_eq!(digest_of(again.blob.as_slice()), digest);
+    }
+
+    /// Each save is a generation after the last, and the older ones go (the
+    /// one a library has mapped too, where Windows lets a mapped file go;
+    /// else at the next start).
+    #[test]
+    fn saves_rotate_generations_and_clean_up_the_old_ones() {
+        let Some(device) = host_device() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let first = empty(&device).unwrap();
+        write_generation(dir.path(), &first.library, 1, true, false).unwrap();
+        // A run maps generation 1 and saves generation 2 beside it.
+        let running = open_dir(&device, dir.path(), true).unwrap();
+        assert!(running.blob.is_mapped());
+        write_generation(dir.path(), &running.library, running.generation + 1, true, false).unwrap();
+        remove_other_generations(dir.path(), 2);
+        // Windows may keep the one still mapped (a sharing violation is
+        // ignored); the newest stays either way.
+        assert!(files(dir.path()).contains(&"host-pipelines.gen-2.bin".to_owned()));
+        // The next start opens the newest and removes the old one.
+        drop(running);
+        let next = open_dir(&device, dir.path(), true).unwrap();
+        assert_eq!(next.generation, 2);
+        assert_eq!(files(dir.path()), ["host-pipelines.gen-2.bin"]);
+    }
+
+    #[test]
+    fn the_owned_fallback_reads_and_saves_whole_buffers() {
+        let Some(device) = host_device() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let library = empty(&device).unwrap();
+        write_generation(dir.path(), &library.library, 1, false, true).unwrap();
+        let mut again = open_dir(&device, dir.path(), false).expect("the library again");
+        assert!(!again.blob.is_mapped());
+        assert!(!again.blob.is_empty());
+        // The digest of an owned blob is hashed, not taken on trust.
+        std::fs::write(sidecar(&dir.path().join("host-pipelines.gen-1.bin")), b"1 wrong").unwrap();
+        assert_eq!(again.digest(dir.path()), digest_of(again.blob.as_slice()));
+        // The same file maps when asked to.
+        drop(again);
+        assert!(open_dir(&device, dir.path(), true).unwrap().blob.is_mapped());
+    }
+
+    /// The file earlier builds saved opens (as generation 0, with a sidecar
+    /// made on the way); a newer generation the host rejects falls back to
+    /// it, and a rejected blob alone gives an empty library.
+    #[test]
+    fn a_legacy_file_opens_and_a_corrupt_generation_is_rejected() {
+        let Some(device) = host_device() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let blob = valid_blob(&device);
+        std::fs::write(dir.path().join(LIBRARY_FILE), &blob).unwrap();
+        let mut legacy = open_dir(&device, dir.path(), true).expect("the legacy library");
+        assert!(legacy.blob.is_mapped());
+        assert_eq!(legacy.generation, 0);
+        assert_eq!(legacy.digest(dir.path()), digest_of(&blob));
+        assert!(dir.path().join("host-pipelines.bin.b3").exists());
+        drop(legacy);
+        // A newer generation that is damaged: the legacy one serves, the
+        // damaged one goes, and the next save does not reuse its number.
+        std::fs::write(dir.path().join("host-pipelines.gen-4.bin"), b"damaged".repeat(100)).unwrap();
+        let library = open_dir(&device, dir.path(), true).expect("the legacy library again");
+        assert_eq!(library.blob.len(), blob.len());
+        assert_eq!(library.generation, 4);
+        assert!(!dir.path().join("host-pipelines.gen-4.bin").exists());
+        drop(library);
+        // Only damage: an empty library, and nothing left of it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("host-pipelines.gen-1.bin"), b"damaged".repeat(100)).unwrap();
+        let library = open_dir(&device, dir.path(), true).expect("an empty library");
+        assert!(library.blob.is_empty());
+        assert_eq!(library.generation, 1);
+        assert!(files(dir.path()).is_empty());
     }
 
     #[test]
@@ -838,5 +1321,21 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+
+    #[test]
+    fn remove_older_generations_never_deletes_newer_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in [1u64, 2, 3] {
+            let bin = dir.path().join(generation_file(n));
+            std::fs::write(&bin, b"blob").unwrap();
+            std::fs::write(sidecar(&bin), b"4 deadbeef").unwrap();
+        }
+        remove_older_generations(dir.path(), 2);
+        assert!(!dir.path().join(generation_file(1)).exists());
+        assert!(!sidecar(&dir.path().join(generation_file(1))).exists());
+        assert!(dir.path().join(generation_file(2)).exists());
+        assert!(dir.path().join(generation_file(3)).exists());
+        assert!(sidecar(&dir.path().join(generation_file(3))).exists());
     }
 }
