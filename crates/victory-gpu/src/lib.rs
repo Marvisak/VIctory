@@ -73,6 +73,6 @@ pub use copystat::CountingAlloc;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{
-    Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
-    writing as kernel_will_write,
+    PageWriter, Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
+    use_page_writer, writing as kernel_will_write,
 };

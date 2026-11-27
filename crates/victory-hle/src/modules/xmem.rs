@@ -11,7 +11,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
@@ -363,15 +363,37 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section: its handle, its size, and a view of ours of all of it, mapped
+/// when first asked for (`write_beside`; 0 if mapping failed).
+struct Section(HANDLE, usize, OnceLock<usize>);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
 // SAFETY: as above.
 unsafe impl Sync for Section {}
 
+impl Section {
+    /// The address of our view of the whole section, which no guard covers.
+    /// Its pages are those the title's views show; only committed ones (a
+    /// title view's) may be touched.
+    fn whole(&self) -> Option<usize> {
+        let at = *self.2.get_or_init(|| {
+            use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+            // SAFETY: our section, mapped whole; unmapped when it is dropped.
+            unsafe { MapViewOfFile(self.0, FILE_MAP_WRITE, 0, 0, self.1) }.Value as usize
+        });
+        (at != 0).then_some(at)
+    }
+}
+
 impl Drop for Section {
     fn drop(&mut self) {
+        if let Some(&at) = self.2.get().filter(|&&at| at != 0) {
+            use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+            // SAFETY: our view of the whole section; nobody holds the
+            // section any more, so nobody writes through it.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }) };
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -515,7 +537,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section(handle, size, OnceLock::new()));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -625,6 +647,28 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
         }
     }
     Some(runs)
+}
+
+/// Writes title memory `[at, at + len)` where one title view of physical
+/// pages shows all of it: `write` gets the address of those bytes in our
+/// view of the whole section (`Section::whole`), which no guard covers, and
+/// runs under the mapping lock, so no view there is mapped, unmapped or
+/// freed meanwhile. False, with `write` not called, where no such view
+/// shows the range (other memory: the caller writes it as before).
+/// The GPU side's copy-back of what shaders wrote (`victory_gpu::use_page_writer`).
+pub fn write_beside(at: usize, len: usize, write: &mut dyn FnMut(*mut u8)) -> bool {
+    let physical = physical();
+    let Some((&base, (size, slice))) = physical.views.range(..=at).next_back() else {
+        return false;
+    };
+    if at.checked_add(len).is_none_or(|end| end > base + size) {
+        return false;
+    }
+    let Some(whole) = slice.section.whole() else {
+        return false;
+    };
+    write((whole + slice.index * PAGE + (at - base)) as *mut u8);
+    true
 }
 
 /// Copies `data` into physical pages, from `offset` bytes into the first,
@@ -1310,6 +1354,53 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// A write beside the guards lands in the page a view shows, through a
+    /// read-only (guarded) view, and shows at its other mapping too; memory
+    /// no view of pages shows, or a range past the view, is not written.
+    #[test]
+    fn writes_beside_land_through_guarded_views() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        let pages = allocate(2);
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                2 * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve() as usize, reserve() as usize);
+        assert!(a != 0 && b != 0);
+        assert_eq!(XMemMapPhysicalPages(a as _, 2, pages.as_ptr()), a as _);
+        assert_eq!(XMemMapPhysicalPages(b as _, 1, pages[1..].as_ptr()), b as _);
+        let mut old = 0;
+        // SAFETY: our view, made read-only as a guard makes it.
+        assert_ne!(unsafe { VirtualProtect(a as _, 2 * PAGE, PAGE_READONLY, &mut old) }, 0);
+        let put = |at: usize, len: usize| {
+            write_beside(at, len, &mut |to| {
+                // SAFETY: `len` writable bytes the writer gives.
+                unsafe { std::ptr::write_bytes(to, 9, len) }
+            })
+        };
+        assert!(put(a + PAGE + 8, 4));
+        // SAFETY: both mappings, readable.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts((a + PAGE + 8) as *const u8, 4), [9; 4]);
+            assert_eq!(std::slice::from_raw_parts((b + 8) as *const u8, 4), [9; 4]);
+            assert_eq!(((a + PAGE + 12) as *const u8).read(), 0);
+        }
+        assert!(!put(b + PAGE - 2, 4), "past the end of the view at b");
+        let private = [0u8; 4];
+        assert!(!put(private.as_ptr() as usize, 4), "not a view of pages");
+        assert_eq!(private, [0; 4]);
+        // SAFETY: as above.
+        assert_eq!(unsafe { ((b + PAGE - 2) as *const u8).read() }, 0);
+        assert_eq!(XMemMapPhysicalPages(b as _, 1, std::ptr::null()), b as _);
+        assert_eq!(XMemMapPhysicalPages(a as _, 2, std::ptr::null()), a as _);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
     #[test]

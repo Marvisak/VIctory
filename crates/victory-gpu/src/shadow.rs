@@ -522,8 +522,12 @@ impl Shadow {
             }
         };
         if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
+            // SAFETY: `n` bytes of the copy or of `title`, alive here.
+            let bytes = unsafe { std::slice::from_raw_parts(bytes, n) };
+            if !crate::watch::write_beside(from, bytes) {
+                let _writing = crate::watch::writing(from, n);
+                crate::host::write_mapped(from as *mut u8, bytes.as_ptr(), n);
+            }
         }
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
