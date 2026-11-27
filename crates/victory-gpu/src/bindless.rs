@@ -267,8 +267,23 @@ pub(crate) fn uploads(
     let mut recorded = false;
     // The textures copied into stay alive in `work` until recorded.
     let mut readable = Vec::new();
-    for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
-        if let Some(upload) = upload {
+    let (bytes_limit, span) = crate::texture::staging_budget(work.len());
+    let started = std::time::Instant::now();
+    let mut spent = 0u64;
+    for (staging, copy) in &work {
+        if spent >= bytes_limit || started.elapsed() >= span {
+            break;
+        }
+        if !staging.maybe_changed() {
+            continue;
+        }
+        let size = staging.size();
+        if spent != 0 && spent.saturating_add(size) > bytes_limit {
+            break;
+        }
+        if let Some(upload) = staging.refresh() {
+            spent = spent.saturating_add(size);
+            crate::texture::mark_uploaded(Arc::as_ptr(staging) as usize);
             readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
             recorded = true;
             #[cfg(feature = "diagnostics")]

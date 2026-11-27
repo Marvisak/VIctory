@@ -13,6 +13,41 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at, views_current};
 use crate::host::host;
 
+/// Delay a slot's first appearance until its texture has been uploaded.
+/// Off by default: titles that write a view and read it in one pass still
+/// see it at once (`VICTORY_SHOW_AFTER=1`).
+pub(crate) fn show_after() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_AFTER").is_some_and(|v| v == "1"))
+}
+
+/// A new texture slot made by a heap write appears on the next draw rather
+/// than mid-pass (`VICTORY_SHOW_NEW_LATER=1`).
+pub(crate) fn show_new_later() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_NEW_LATER").is_some_and(|v| v == "1"))
+}
+
+pub(crate) fn slot_visible(show_after: bool, show_new_later: bool, for_draw: bool, uploaded: bool) -> bool {
+    (for_draw && show_new_later) || uploaded || !(show_after || show_new_later)
+}
+
+/// Whether the staging copy behind a texture view has been uploaded once.
+fn texture_uploaded(view: &View) -> bool {
+    let r = match placed_texture(view).as_ref().unwrap_or(view) {
+        View::Shader(r, _) | View::Unordered(r, _, _) => *r,
+        _ => return true,
+    };
+    let Some(copy) = crate::resource::made_copy(r as crate::object::This) else {
+        return false;
+    };
+    let staging = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(staging) = staging.as_ref() else {
+        return false;
+    };
+    crate::texture::was_uploaded(std::sync::Arc::as_ptr(staging) as usize)
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -750,6 +785,22 @@ impl HostHeap {
             }
             return None;
         };
+        let after = show_after();
+        let later = show_new_later();
+        let visible = if !after && !later {
+            true
+        } else {
+            let uploaded = || !is_texture(&view) || texture_uploaded(&view);
+            slot_visible(after, later, for_draw, uploaded())
+        };
+        if !visible {
+            if made[index as usize] != 0 {
+                made[index as usize] = 0;
+                self.make_null(index);
+                self.note_address(index, None);
+            }
+            return None;
+        }
         // A placed texture's view left null below is made when a draw reads
         // the slot through a table; until then the slot is not made again
         // (heap syncs revisit it at every submission). Also re-mirror if a
@@ -1824,6 +1875,16 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_slots_wait_for_upload_unless_a_draw_brings_them_on() {
+        assert!(slot_visible(false, false, false, false));
+        assert!(!slot_visible(true, false, false, false));
+        assert!(slot_visible(true, false, true, true));
+        assert!(!slot_visible(false, true, false, false));
+        assert!(slot_visible(false, true, true, false));
+        assert!(slot_visible(true, true, true, false));
+    }
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.

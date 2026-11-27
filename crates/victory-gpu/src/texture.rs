@@ -33,6 +33,84 @@ macro_rules! once {
     }};
 }
 
+/// Bytes and milliseconds one texture pass may spend staging textures,
+/// and whether the backlog was large enough to offer catch-up.
+pub(crate) fn staging_limits(
+    asked_mb: Option<u64>,
+    vram_mb: Option<f64>,
+    ram_gb: Option<f64>,
+    due: usize,
+) -> (u64, u64, bool) {
+    let small = vram_mb.is_some_and(|mb| mb <= 8192.0) || ram_gb.is_some_and(|gb| gb <= 16.0);
+    let bytes = asked_mb.unwrap_or(if small { 64 } else { 192 }) << 20;
+    let ms = if small { 100 } else { 250 };
+    let catchup = due >= 1024;
+    let scale = if catchup { 3 } else { 1 };
+    (bytes * scale, ms * scale, catchup)
+}
+
+/// The pass budget from the environment (`VICTORY_TEXTURE_STAGE_MB`,
+/// `VICTORY_TEXTURE_STAGE_MS`, `VICTORY_TEXTURE_CATCHUP`), scaled down on
+/// small machines.
+pub(crate) fn staging_budget(due: usize) -> (u64, std::time::Duration) {
+    static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let mb = *MB.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_STAGE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+    });
+    let ms = *MS.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_STAGE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(250)
+    });
+    let catchup = *CATCHUP.get_or_init(|| {
+        std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0")
+    });
+    if std::env::var_os("VICTORY_TEXTURE_STAGE_MB").is_none()
+        && std::env::var_os("VICTORY_TEXTURE_STAGE_MS").is_none()
+    {
+        return (u64::MAX, std::time::Duration::MAX);
+    }
+    let vram = crate::host::video_memory().map(|[local, _]| local.1);
+    let (bytes, scaled_ms, _) = staging_limits(mb, vram, crate::host::total_ram_gb(), due);
+    let scaled = if catchup { scaled_ms } else { ms };
+    (bytes, std::time::Duration::from_millis(scaled))
+}
+
+/// Whether a refresh may read title memory through the kernel instead of
+/// waiting for the runtime to stop remapping it (`VICTORY_TEXTURE_NO_WAIT`).
+pub(crate) fn no_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// Whether a first fill takes the pages that are there while the runtime is
+/// remapping (`VICTORY_TEXTURE_FILL`, on unless `0`).
+pub(crate) fn fill_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FILL").is_none_or(|v| v != "0"))
+}
+
+static UPLOADED: std::sync::OnceLock<Mutex<std::collections::HashSet<usize>>> = std::sync::OnceLock::new();
+
+fn uploaded() -> &'static Mutex<std::collections::HashSet<usize>> {
+    UPLOADED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// A staging area has been copied into its host texture; a slot viewing that
+/// texture may become visible to shaders (`VICTORY_SHOW_AFTER`).
+pub(crate) fn mark_uploaded(staging: usize) -> bool {
+    uploaded().lock().unwrap_or_else(|e| e.into_inner()).insert(staging)
+}
+
+pub(crate) fn was_uploaded(staging: usize) -> bool {
+    uploaded().lock().unwrap_or_else(|e| e.into_inner()).contains(&staging)
+}
+
 /// A texture's upload state: how a staging buffer lays out the host
 /// texture's subresources, and what was last detiled. The buffer itself is
 /// taken for each upload from a small pool shared by all textures
@@ -113,15 +191,19 @@ static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
 });
 
 /// Free staging buffers kept at most.
-const KEPT_BYTES: u64 = 64 << 20;
+fn kept_bytes() -> u64 {
+    if crate::host::small_memory() { 16 << 20 } else { 64 << 20 }
+}
 
 /// Called before a submission's uploads: the buffers of the last one are
 /// free again (the oldest dropped past `KEPT_BYTES`).
 pub(crate) fn recycle() {
     {
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
-        (c.current, c.used) = (0, 0);
-        c.all.truncate(CHUNKS_KEPT);
+        for chunk in &mut c.all {
+            chunk.3 = 0;
+        }
+        c.all.truncate(chunks_kept());
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
@@ -129,7 +211,7 @@ pub(crate) fn recycle() {
         b.free_bytes += e.0;
         b.free.push_back(e);
     }
-    while b.free_bytes > KEPT_BYTES
+    while b.free_bytes > kept_bytes()
         && let Some((n, ..)) = b.free.pop_front()
     {
         b.free_bytes -= n;
@@ -166,21 +248,19 @@ fn staging_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
 /// upload buffers was 10 % of the submitting thread in a new shot, run
 /// evict5). Rewound at each submission ([`recycle`]): the last one has run.
 struct Chunks {
-    /// (buffer, mapping), [`CHUNK`] bytes each.
-    all: Vec<(ID3D12Resource, usize)>,
-    /// The chunk being carved and the bytes taken from it.
-    current: usize,
-    used: u64,
+    /// (buffer, mapping, submission begun when made, bytes used), [`CHUNK`] bytes each.
+    all: Vec<(ID3D12Resource, usize, u64, u64)>,
 }
 
 // SAFETY: the mappings are persistent mappings of the upload buffers.
 unsafe impl Send for Chunks {}
 
-static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks { all: Vec::new(), current: 0, used: 0 });
+static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks { all: Vec::new() });
 
 const CHUNK: u64 = 32 << 20;
-/// Chunks kept between submissions (more are made while one needs them).
-const CHUNKS_KEPT: usize = 16;
+fn chunks_kept() -> usize {
+    if crate::host::small_memory() { 4 } else { 16 }
+}
 
 /// `size` bytes of staging space: a buffer, the offset of the space in it
 /// (a multiple of 512, as texture copies need) and its mapping there.
@@ -190,20 +270,35 @@ fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
         return staging_buffer(size).map(|(b, data)| (b, 0, data));
     }
     let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+    let ripe = crate::pool::Ripe::now();
     loop {
-        if let Some((buffer, data)) = c.all.get(c.current) {
-            let at = c.used.next_multiple_of(512);
-            if at + size <= CHUNK {
-                let made = (buffer.clone(), at, (*data + at as usize) as *mut u8);
-                c.used = at + size;
-                return Some(made);
+        let mut found = None;
+        for i in 0..c.all.len() {
+            let at = c.all[i].3.next_multiple_of(512);
+            if at + size <= CHUNK && ripe.is(c.all[i].2) {
+                found = Some((i, at));
+                break;
             }
-            (c.current, c.used) = (c.current + 1, 0);
-            continue;
+        }
+        if found.is_none() {
+            for i in 0..c.all.len() {
+                let at = c.all[i].3.next_multiple_of(512);
+                if at + size <= CHUNK {
+                    ripe.unripe(c.all[i].2);
+                    found = Some((i, at));
+                    break;
+                }
+            }
+        }
+        if let Some((i, at)) = found {
+            let (buffer, data, _, used) = &mut c.all[i];
+            let made = (buffer.clone(), at, (*data + at as usize) as *mut u8);
+            *used = at + size;
+            return Some(made);
         }
         let (buffer, data) = host()?.upload_buffer(CHUNK)?;
         crate::host::name(&buffer, || "texture staging chunk".into());
-        c.all.push((buffer, data as usize));
+        c.all.push((buffer, data as usize, crate::pool::Ripe::now().made, 0));
     }
 }
 
@@ -513,25 +608,11 @@ pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
     });
 }
 
-/// [`Staging::refresh`] of each of `work`, those whose memory may have
-/// changed on several threads at once (reading title memory and detiling
-/// cost ~6 ms of frame a MB on one thread in a new shot, run evict5).
-pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)]) -> Vec<Option<Upload>> {
-    // Most find nothing changed (their trackers' clean bits say so): those
-    // are not handed to threads.
-    let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.maybe_changed()).collect();
-    let results: Vec<Mutex<Option<Upload>>> = changed.iter().map(|_| Mutex::new(None)).collect();
-    in_parallel(changed.len(), |k| {
-        *results[k].lock().unwrap_or_else(|e| e.into_inner()) = work[changed[k]].0.refresh();
-    });
-    let mut out: Vec<Option<Upload>> = vec![None; work.len()];
-    for (k, r) in results.into_iter().enumerate() {
-        out[changed[k]] = r.into_inner().unwrap_or_else(|e| e.into_inner());
-    }
-    out
-}
-
 impl Staging {
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {
@@ -629,7 +710,14 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
             return (bytes, buffer.map(|(b, at)| (b, at, fresh)));
         }
-        if !committed(self.memory, size) {
+        let tiled = if no_wait() {
+            let mut read = vec![0u8; size];
+            let got = crate::host::read_there(self.memory, &mut read);
+            if got != size && !fill_unlocked() {
+                return (0, None);
+            }
+            std::borrow::Cow::Owned(read)
+        } else if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -642,14 +730,12 @@ impl Staging {
             if last.hash.is_some() {
                 return (0, None);
             }
-            let zeros = vec![0u8; size];
-            let every = all();
-            let buffer = self.detile(&zeros, &every);
-            last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
-            return (0, buffer.map(|(b, at)| (b, at, every)));
-        }
-        // SAFETY: committed memory of the texture's layout size.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+            std::borrow::Cow::Owned(vec![0u8; size])
+        } else {
+            // SAFETY: committed memory of the texture's layout size.
+            std::borrow::Cow::Borrowed(unsafe { std::slice::from_raw_parts(self.memory, size) })
+        };
+        let tiled = tiled.as_ref();
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -844,6 +930,42 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_limits_scale_for_small_memory_and_backlog() {
+        assert_eq!(staging_limits(None, None, None, 0), (192 << 20, 250, false));
+        assert_eq!(staging_limits(None, Some(4096.0), None, 0), (64 << 20, 100, false));
+        assert_eq!(staging_limits(None, None, Some(8.0), 1024), (192 << 20, 300, true));
+        assert_eq!(staging_limits(Some(8), None, None, 1024), (24 << 20, 750, true));
+    }
+
+    #[test]
+    fn uploads_are_remembered_for_slot_visibility() {
+        let key = usize::MAX - 7;
+        assert!(!was_uploaded(key));
+        assert!(mark_uploaded(key));
+        assert!(was_uploaded(key));
+    }
+
+    #[test]
+    fn staging_space_reuses_chunks_across_large_allocations() {
+        let Some(_) = crate::host::host() else { return };
+        {
+            let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+            c.all.clear();
+        }
+        let twenty = 20u64 << 20;
+        let twelve = 12u64 << 20;
+        let a = staging_space(twenty).expect("first 20 MiB");
+        let b = staging_space(twenty).expect("second 20 MiB");
+        let d = staging_space(twelve).expect("12 MiB fits in second chunk");
+        let c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(c.all.len(), 2, "allocations should pack into two chunks, got {}", c.all.len());
+        assert_eq!(c.all[0].3, twenty + twelve);
+        assert_eq!(c.all[1].3, twenty);
+        drop(c);
+        drop((a, b, d));
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {

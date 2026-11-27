@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -377,6 +377,58 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
         Some((info.CurrentUsage as f64 / 1e6, info.Budget as f64 / 1e6))
     };
     Some([info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?])
+}
+
+/// Total physical RAM in GiB, when the query works.
+#[allow(clippy::undocumented_unsafe_blocks)]
+pub(crate) fn total_ram_gb() -> Option<f64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX::default();
+    status.dwLength = size_of_val(&status) as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0)
+        .then(|| status.ullTotalPhys as f64 / (1 << 30) as f64)
+}
+
+/// A card of at most 8 GiB or a machine of at most 16 GiB: texture staging
+/// and block retention are scaled down there.
+pub(crate) fn small_memory() -> bool {
+    static SMALL: OnceLock<bool> = OnceLock::new();
+    *SMALL.get_or_init(|| {
+        let vram = video_memory().is_some_and(|[local, _]| local.1 <= 8192.0);
+        vram || total_ram_gb().is_some_and(|gb| gb <= 16.0)
+    })
+}
+
+static BEGUN: AtomicU64 = AtomicU64::new(0);
+static FINISHED: AtomicU64 = AtomicU64::new(0);
+
+/// Submissions begun (one per list) and finished (each submission is waited
+/// for before the next one is prepared).
+pub(crate) fn submissions() -> (u64, u64) {
+    (BEGUN.load(Ordering::Relaxed), FINISHED.load(Ordering::Relaxed))
+}
+
+pub(crate) fn submission_started() {
+    BEGUN.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn submission_finished() {
+    FINISHED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Reads the pages of `[src, src + dst.len())` that are there, skipping the
+/// ones the runtime is remapping (`VICTORY_TEXTURE_NO_WAIT`).
+pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
+    let mut got = 0;
+    let mut at = 0;
+    while at < dst.len() {
+        let n = crate::watch::PAGE.min(dst.len() - at);
+        if read_into(src.wrapping_add(at), &mut dst[at..at + n]) {
+            got += n;
+        }
+        at += n;
+    }
+    got
 }
 
 #[cfg(test)]
@@ -1267,6 +1319,7 @@ impl Host {
         let groups = [&lists[..]];
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
+            submission_started();
             *submitted += 1;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
@@ -1285,6 +1338,7 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
+            submission_finished();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
