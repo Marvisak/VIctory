@@ -27,13 +27,13 @@ const fn vop2(op: u32, d: u32, s0: u32, v1: u32) -> u32 {
     op << 25 | d << 17 | v1 << 9 | s0
 }
 
-/// The texture's size; its texel (i, j) holds `i + SIZE * j` in red.
+/// The default texture size; its texel (i, j) holds `i + SIZE * j` in red.
 const SIZE: u32 = 16;
 
-/// Loads the descriptors as `lod_tests` does, puts `(x + 0.5 + d) / SIZE`
+/// Loads the descriptors as `lod_tests` does, puts `(x + 0.5 + d) / size`
 /// of the pixel position in v2 and v3 and exports what the MIMG `op` reads
 /// with `dmask` into v4-v7.
-fn pixel_program(d: f32, op: u32, dmask: u32) -> Vec<u32> {
+fn pixel_program(d: f32, op: u32, dmask: u32, size: u32) -> Vec<u32> {
     vec![
         sop1(0x03, 5, 0x80),                    // s_mov_b32 s5, 0 (table address, high)
         sop1(0x03, 7, 0x80),                    // s_mov_b32 s7, 0
@@ -46,9 +46,9 @@ fn pixel_program(d: f32, op: u32, dmask: u32) -> Vec<u32> {
         vop2(0x03, 3, 0xFF, 1), // v_add_f32 v3, d, v1
         d.to_bits(),
         vop2(0x08, 2, 0xFF, 2), // v_mul_f32 v2, 1/SIZE, v2
-        (1.0 / SIZE as f32).to_bits(),
+        (1.0 / size as f32).to_bits(),
         vop2(0x08, 3, 0xFF, 3), // v_mul_f32 v3, 1/SIZE, v3
-        (1.0 / SIZE as f32).to_bits(),
+        (1.0 / size as f32).to_bits(),
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
         // image_<op> v[4:7], v[2:3], s[8:15], s[16:19] dmask dim:2D
         0xF000_0008 | op << 18 | dmask << 8,
@@ -62,10 +62,9 @@ fn pixel_program(d: f32, op: u32, dmask: u32) -> Vec<u32> {
 
 /// The four red values a gather whose footprint starts at texel (i, j)
 /// returns, in D3D's order: (i, j+1), (i+1, j+1), (i+1, j), (i, j); wrap.
-fn gathered(i: i32, j: i32) -> [f32; 4] {
-    let t = |i: i32, j: i32| {
-        (i.rem_euclid(SIZE as i32) + SIZE as i32 * j.rem_euclid(SIZE as i32)) as f32
-    };
+fn gathered(i: i32, j: i32, size: u32) -> [f32; 4] {
+    let size = size as i32;
+    let t = |i: i32, j: i32| (i.rem_euclid(size) + size * j.rem_euclid(size)) as f32;
     [t(i, j + 1), t(i + 1, j + 1), t(i + 1, j), t(i, j)]
 }
 
@@ -126,9 +125,11 @@ fn lookups(
     op: u32,
     dmask: u32,
     shift: f32,
-    value: fn(i32, i32) -> [f32; 4],
+    value: fn(i32, i32, u32) -> [f32; 4],
     cases: &[(f32, Option<i32>)],
+    (size, address): (u32, D3D12_TEXTURE_ADDRESS_MODE),
 ) -> Vec<String> {
+    let count = (size * size) as usize;
     let vs_code = [0xF800_08CF, 0x0706_0504, S_ENDPGM]; // exp pos0 v4..v7 done
     let vs = translate(
         &NativeProgram {
@@ -151,20 +152,21 @@ fn lookups(
         &[sig("POSITION", 0, 0)],
         &[sig("SV_Position", 3, 4)],
     );
-    // A triangle covering the whole 16x16 target.
+    // A triangle covering the whole target.
     let vertices = [
         -1.0, -1.0, 0.5, 1.0, //
         -1.0, 3.0, 0.5, 1.0, //
         3.0, -1.0, 0.5, 1.0,
     ];
-    let texels: Vec<[f32; 4]> = (0..SIZE * SIZE)
+    let texels: Vec<[f32; 4]> = (0..size * size)
         .map(|n| [n as f32, 0.0, 0.0, 1.0])
         .collect();
     let point = D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
-        AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        AddressU: address,
+        AddressV: address,
+        AddressW: address,
+        BorderColor: [0.625, 0.0, 0.0, 1.0],
         MaxAnisotropy: 1,
         MaxLOD: f32::MAX,
         ..Default::default()
@@ -207,7 +209,7 @@ fn lookups(
                     db_shader_control: 0,
                     patches: Vec::new(),
                 },
-                code: pixel_program(d + shift, op, dmask)
+                code: pixel_program(d + shift, op, dmask, size)
                     .iter()
                     .flat_map(|w| w.to_le_bytes())
                     .collect(),
@@ -227,19 +229,20 @@ fn lookups(
                     &pso,
                     &Draw {
                         roots: vec![(1, Root::Constants(user_data.clone()))],
-                        textures: &[(SIZE, SIZE, &texels)],
+                        textures: &[(size, size, &texels)],
                         samplers: &[point],
                         vertices: &vertices,
                         stride: 16,
-                        size: (16, 16),
+                        size: (size, size),
                         mesh_groups: 0,
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+            assert_eq!(pixels.len(), count);
             let (mut floor, mut rounded, mut other, mut first) = (0, 0, 0, None);
             for (n, px) in pixels.iter().enumerate() {
-                let (x, y) = ((n as u32 % 16) as i32, (n as u32 / 16) as i32);
-                let at = |k: i32| value(x + k, y + k);
+                let (x, y) = ((n as u32 % size) as i32, (n as u32 / size) as i32);
+                let at = |k: i32| value(x + k, y + k, size);
                 // Kept below the edge (x - 1, floor(t) just below x) or
                 // rounded up to it (x); inside a texel both are x.
                 if d < 0.0 && *px == at(-1) {
@@ -254,7 +257,7 @@ fn lookups(
                 }
             }
             eprintln!(
-                "{label}: 256 pixels, kept below {floor}, at x {rounded}, neither {other}{}",
+                "{label}: {count} pixels, kept below {floor}, at x {rounded}, neither {other}{}",
                 first
                     .as_deref()
                     .map(|f| format!(", first {f}"))
@@ -263,9 +266,9 @@ fn lookups(
             let wanted = match expect {
                 Some(0) => rounded,
                 Some(_) => floor,
-                None => 256 - other,
+                None => count - other,
             };
-            if wanted != 256 {
+            if wanted != count {
                 failures.push(format!(
                     "{label}: kept below {floor}, at x {rounded}, neither {other}"
                 ));
@@ -296,6 +299,7 @@ fn gathers_take_the_footprint_at_the_coordinate() {
             (-(1.0 / 512.0 + 1.0 / 65536.0), Some(-1)),
             (-3.0 / 1024.0, Some(-1)),
         ],
+        (SIZE, D3D12_TEXTURE_ADDRESS_MODE_WRAP),
     );
     assert!(failures.is_empty(), "{}", failures.join("; "));
 }
@@ -304,8 +308,9 @@ fn gathers_take_the_footprint_at_the_coordinate() {
 /// (`t = u * SIZE`), and reports which way each host takes `d = -1/1024`.
 #[test]
 fn point_samples_take_the_texel_at_the_coordinate() {
-    let texel = |i: i32, j: i32| {
-        let n = i.rem_euclid(SIZE as i32) + SIZE as i32 * j.rem_euclid(SIZE as i32);
+    let texel = |i: i32, j: i32, size: u32| {
+        let size = size as i32;
+        let n = i.rem_euclid(size) + size * j.rem_euclid(size);
         [n as f32, 0.0, 0.0, 1.0]
     };
     let failures = lookups(
@@ -315,6 +320,60 @@ fn point_samples_take_the_texel_at_the_coordinate() {
         -0.5,
         texel,
         &[(0.25, Some(0)), (0.75, Some(0)), (-1.0 / 1024.0, None)],
+        (SIZE, D3D12_TEXTURE_ADDRESS_MODE_WRAP),
+    );
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+#[test]
+fn gathers_round_npot_wrapped_tile_edges() {
+    const EDGE_SIZE: u32 = 13;
+    let period = EDGE_SIZE as f32;
+    let failures = lookups(
+        "gather wrapped tiles",
+        0x47,
+        0x1,
+        0.0,
+        gathered,
+        &[
+            (-period - 1.0 / 1024.0, Some(0)),
+            (period - 1.0 / 1024.0, Some(0)),
+        ],
+        (EDGE_SIZE, D3D12_TEXTURE_ADDRESS_MODE_WRAP),
+    );
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+#[test]
+fn gathers_round_npot_border_edges() {
+    let border = |i: i32, j: i32, size: u32| {
+        let size = size as i32;
+        let texel = |x, y| {
+            if (0..size).contains(&x) && (0..size).contains(&y) {
+                (x + size * y) as f32
+            } else {
+                0.625
+            }
+        };
+        [
+            texel(i, j + 1),
+            texel(i + 1, j + 1),
+            texel(i + 1, j),
+            texel(i, j),
+        ]
+    };
+    let failures = lookups(
+        "gather texture border",
+        0x47,
+        0x1,
+        0.0,
+        border,
+        &[
+            (-1.0 / 1024.0, Some(0)),
+            (-3.0 / 1024.0, Some(-1)),
+            (0.25, Some(0)),
+        ],
+        (13, D3D12_TEXTURE_ADDRESS_MODE_BORDER),
     );
     assert!(failures.is_empty(), "{}", failures.join("; "));
 }
