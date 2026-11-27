@@ -321,9 +321,11 @@ extern "system" fn check_feature_support(
         MULTISAMPLE => {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<[u32; 4]>() };
-            // Format, sample count, flags in; one quality level out for the
-            // counts the hardware has.
-            q[3] = u32::from(matches!(q[1], 1 | 2 | 4 | 8));
+            // Block-compressed textures have a single-sample layout only.
+            let samples = q[1];
+            let msaa = matches!(samples, 2 | 4 | 8)
+                && !resource::element(q[0]).is_some_and(|(_, texels)| texels == 4);
+            q[3] = u32::from(samples == 1 || msaa);
             S_OK
         }
         SHADER_MODEL => {
@@ -592,6 +594,29 @@ mod tests {
             check(device, 8, waves.as_mut_ptr().cast(), 16),
             E_INVALIDARG
         );
+    }
+
+    #[test]
+    fn block_compressed_formats_only_report_single_sample_quality() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let query = |format, samples, flags, quality| {
+            let mut params = [format, samples, flags, u32::MAX];
+            assert_eq!(check(device, 4, params.as_mut_ptr().cast(), 16), S_OK);
+            assert_eq!(params, [format, samples, flags, quality]);
+        };
+        for flags in [0, 1] {
+            for format in (70..=84).chain(94..=99) {
+                for samples in [0, 1, 2, 3, 4, 8, 16] {
+                    query(format, samples, flags, u32::from(samples == 1));
+                }
+            }
+            // DXGI_FORMAT_R8G8B8A8_UNORM still follows the console's sample-count profile.
+            for samples in [0, 1, 2, 3, 4, 8, 16] {
+                query(28, samples, flags, u32::from(matches!(samples, 1 | 2 | 4 | 8)));
+            }
+        }
     }
 
     #[test]
