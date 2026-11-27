@@ -20,9 +20,15 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+mod barriers;
 mod bvh;
 
 type Why = &'static str;
+
+/// A loop's parked lanes ([`Lower::parked`]): the header's phi, its
+/// incoming (value, DXIL block) pairs, and per IR block whether it is in
+/// the loop (its natural body, which the header dominates).
+type Parked = (V, Vec<(V, usize)>, Vec<bool>);
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -60,6 +66,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Barriers added on branch edges (IR blocks from, to), by count.
+    #[cfg(test)]
+    pub extra_barriers: Vec<((usize, usize), u32)>,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -225,6 +234,25 @@ struct Lower<'a> {
     join_handles: HashMap<(String, bool, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
+    /// Group barriers to emit on a branch edge, by (from, to) IR block
+    /// ([`Lower::barrier_balance`]).
+    extra_barriers: HashMap<(usize, usize), u32>,
+    /// Branches decided for the whole wave as the console does, by IR
+    /// block: whether all active lanes must take it (else any)
+    /// ([`Lower::wave_loop_exits`]).
+    wave_branches: HashMap<usize, bool>,
+    /// The program runs as the console runs it ([`Lower::console_branches`]):
+    /// every branch on a lane mask decided for the whole wave, every vector
+    /// instruction guarded by its EXEC.
+    console_mode: bool,
+    /// Console mode's parked lanes, by loop header: lanes the wave keeps
+    /// in a loop past their own exit (its exit decided for the wave), which
+    /// run nothing more in it, as the console's EXEC leaves them out. The
+    /// header's phi, its incoming (value, DXIL block) pairs, and the loop's
+    /// last block in RPO ([`Lower::park_lanes`]).
+    parked: HashMap<usize, Parked>,
+    /// Latches going round through a jump ([`barriers::Rounds`]).
+    rounds: barriers::Rounds,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -684,6 +712,11 @@ impl<'a> Lower<'a> {
             entry_handles: HashMap::new(),
             join_handles: HashMap::new(),
             edges: HashMap::new(),
+            extra_barriers: HashMap::new(),
+            wave_branches: HashMap::new(),
+            console_mode: false,
+            parked: HashMap::new(),
+            rounds: Default::default(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -1324,6 +1357,18 @@ impl<'a> Lower<'a> {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
         }
+        // Barriers lanes could part at: loop exits decided for the wave,
+        // other branches balanced where the barriers can be counted, else
+        // the program runs as the console runs it (`barrier_tests`).
+        self.wave_branches = self.wave_loop_exits(&order);
+        match self.barrier_balance(&order) {
+            Ok(extra) => self.extra_barriers = extra,
+            Err(_) => {
+                self.console_mode = true;
+                self.wave_branches = self.console_branches(&order);
+                self.park_lanes(&order);
+            }
+        }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
@@ -1404,6 +1449,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            extra_barriers: self.extra_barriers.iter().map(|(&e, &n)| (e, n)).collect(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -2704,10 +2751,18 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
-        match self.x.st.guards[b][i] {
-            None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
-        }
+        // In console mode a lane runs an instruction where its EXEC bit is
+        // set, whatever path brought it ([`Lower::console_branches`]).
+        let guard = if self.console_mode {
+            self.x.st.execs[b][i]
+        } else {
+            self.x.st.guards[b][i]
+        };
+        let guard = match guard {
+            None => None,
+            Some(g) => Some(self.boolean(g, self.cur)?),
+        };
+        Ok(self.unparked(b, guard))
     }
 
     /// Whether every lane outside the guard of the export at (b, i) runs
@@ -3529,14 +3584,7 @@ impl<'a> Lower<'a> {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
-                // Thread-group sync with a shared-memory fence, and a UAV
-                // fence when the program writes UAVs (the waits before an
-                // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                let mode = self.s.m.i32(mode);
-                let void = self.s.t.void;
-                self.s
-                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.group_barrier(self.cur);
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -10159,8 +10207,15 @@ impl<'a> Lower<'a> {
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
-                self.enter_loop(b, t, self.cur);
+                self.enter_loop(b, t, self.cur, None);
                 Term::Br(self.block[t].expect("reachable"))
+            }
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } if self.wave_branches.contains_key(&b) => {
+                self.wave_branch(b, when, taken, not_taken, offset)?
             }
             LaneExit::Branch {
                 when,
@@ -10207,7 +10262,7 @@ impl<'a> Lower<'a> {
                         } else {
                             via
                         };
-                        self.enter_loop(b, to, from);
+                        self.enter_loop(b, to, from, None);
                     }
                 }
                 Term::CondBr(cond, t, f)
@@ -10230,11 +10285,12 @@ impl<'a> Lower<'a> {
 
     /// A forward edge into loop header `to` (from DXIL block `via`) starts
     /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
+    fn enter_loop(&mut self, from: usize, to: usize, via: usize, takes: Option<V>) {
         if let Some((_, incoming)) = self.counters.get_mut(&to) {
             let z = self.s.m.i32(0);
             incoming.push((z, via));
         }
+        self.park_entry(from, to, via, takes);
     }
 
     /// A back edge to header `to` (a back edge keeps its block, no
@@ -10251,6 +10307,7 @@ impl<'a> Lower<'a> {
             .expect("header")
             .1
             .push((next, c));
+        self.park_round(to, c);
         self.s.m.cmp(c, p, next, limit)
     }
 
@@ -10278,11 +10335,17 @@ impl<'a> Lower<'a> {
             .iter()
             .filter(|&&q| self.block[q].is_some())
             .count();
+        let extra = self.extra_barriers.get(&(from, to)).copied().unwrap_or(0);
         // Back edges stay as they are: the exiting block is the latch.
-        if preds < 2 || self.rpo[to] <= self.rpo[from] {
+        if (preds < 2 && extra == 0) || self.rpo[to] <= self.rpo[from] {
             return target;
         }
         let e = self.s.m.new_block();
+        // The group barriers lanes taking this edge would miss
+        // ([`Lower::barrier_balance`]).
+        for _ in 0..extra {
+            self.group_barrier(e);
+        }
         self.s.m.terminate(e, Term::Br(target));
         self.edges.insert((from, to), e);
         e
@@ -10887,6 +10950,9 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+            self.s.m.set_phi(phi, incoming);
+        }
+        for (phi, incoming, _) in std::mem::take(&mut self.parked).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
         while let Some((v, b, i)) = self.pending_masks.pop() {

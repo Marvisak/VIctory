@@ -221,6 +221,8 @@ mod shader;
 #[cfg(all(test, windows))]
 mod stride_tests;
 #[cfg(all(test, windows))]
+mod barrier_tests;
+#[cfg(all(test, windows))]
 mod synthetic_tests;
 #[cfg(windows)]
 pub mod validator;
