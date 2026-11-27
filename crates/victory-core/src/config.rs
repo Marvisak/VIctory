@@ -51,22 +51,7 @@ impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
         let explicit = explicit_config_path(|k| std::env::var_os(k));
-        let path = explicit
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("victory.toml"));
-        let file = if path.is_file() {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            Some((path, text))
-        } else if let Some(p) = explicit {
-            anyhow::bail!(
-                "VICTORY_CONFIG points at {}, which does not exist",
-                p.display()
-            );
-        } else {
-            None
-        };
-        let (source, parsed) = match file {
+        let (source, parsed) = match read_config_file(explicit.as_deref())? {
             Some((path, text)) => {
                 let parsed: FileConfig =
                     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
@@ -130,6 +115,32 @@ fn explicit_config_path(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Opt
     env("VICTORY_CONFIG")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+}
+
+/// The config file's text, `explicit` or `./victory.toml`, none without
+/// one. An explicit path that names no file is an error: missing, or not
+/// a file (a folder, say).
+fn read_config_file(explicit: Option<&Path>) -> Result<Option<(PathBuf, String)>> {
+    let path = explicit
+        .map_or_else(|| PathBuf::from("victory.toml"), Path::to_path_buf);
+    if path.is_file() {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        Ok(Some((path, text)))
+    } else if let Some(p) = explicit {
+        if p.exists() {
+            anyhow::bail!(
+                "VICTORY_CONFIG points at {}, which is not a file",
+                p.display()
+            );
+        }
+        anyhow::bail!(
+            "VICTORY_CONFIG points at {}, which does not exist",
+            p.display()
+        );
+    } else {
+        Ok(None)
+    }
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -210,6 +221,22 @@ mod tests {
             explicit_config_path(set),
             Some(PathBuf::from("custom.toml"))
         );
+    }
+
+    /// An explicit `VICTORY_CONFIG` that names no file is an error naming
+    /// why: missing, or there but not a file (a folder, say).
+    #[test]
+    fn an_explicit_config_error_names_why_the_path_is_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("settings");
+        std::fs::create_dir(&folder).unwrap();
+        let err = read_config_file(Some(&folder)).unwrap_err().to_string();
+        assert!(err.contains("is not a file"), "unexpected error: {err}");
+        assert!(err.contains(&folder.display().to_string()));
+
+        let missing = dir.path().join("absent.toml");
+        let err = read_config_file(Some(&missing)).unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "unexpected error: {err}");
     }
 
     #[test]
