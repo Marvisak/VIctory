@@ -829,6 +829,15 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
+/// The runtime demand-committed previously uncommitted title memory
+/// `[at, at + len)`: mark it changed in every tracker holding it without
+/// disturbing physical-page alias links.
+pub fn title_memory_committed(at: usize, len: usize) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut g = guards();
+    changed(&mut g, first, last, false);
+}
+
 /// What shaders wrote into host copies of `[at, at + len)` is dropped:
 /// every host buffer copy holding the memory takes it from title memory
 /// again at its next refresh (the pages count as changed in each, aliases
@@ -1445,5 +1454,46 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    #[test]
+    fn demand_committed_page_marks_tracked_dirty() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const LEN: usize = 4 * PAGE;
+        // SAFETY: reserving a write-watched 4-page region with only page 0 committed.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_RESERVE | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        // SAFETY: committing page 0 inside our reservation.
+        assert!(!unsafe { VirtualAlloc(base as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+
+        let tracked = track(base, LEN, false).expect("tracked");
+        // Frame 1 takes the range while pages 1..4 are still uncommitted.
+        let _ = tracked.take_split(base, base + LEN);
+        assert!(tracked.clean(), "clean after frame 1 take");
+
+        // Demand-commit page 1 and notify watch via `title_memory_committed`.
+        let page1 = base + PAGE;
+        // SAFETY: committing page 1 inside our reservation.
+        assert!(!unsafe { VirtualAlloc(page1 as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        title_memory_committed(page1, PAGE);
+        // SAFETY: page 1 is now committed.
+        unsafe { (page1 as *mut u32).write_volatile(0xDEAD_BEEF) };
+
+        assert!(!tracked.clean(), "demand-committed page must dirty the tracker");
+        assert!(tracked.changed(page1 / PAGE));
+        assert_eq!(tracked.take(base, base + LEN), [(page1, page1 + PAGE)]);
+
+        drop(tracked);
+        // SAFETY: freeing our test reservation.
+        assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
     }
 }

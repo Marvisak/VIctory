@@ -1012,7 +1012,8 @@ fn into_destination(
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
+        // GPU side's guard on title buffers; commit lazy pages and open them first.
+        crate::modules::xmem::ensure_committed(request.destination as usize, len);
         let _writing = victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
