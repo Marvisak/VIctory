@@ -28,6 +28,7 @@ pub(crate) struct GraphicsState {
     /// Input elements, their names pointing into `names`.
     inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
     names: Vec<CString>,
+    pub(crate) invalid_input_layout: bool,
     strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
@@ -79,6 +80,7 @@ impl Default for GraphicsState {
             depth_bounds: false,
             inputs: Vec::new(),
             names: Vec::new(),
+            invalid_input_layout: false,
             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
             topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED,
             targets: D3D12_RT_FORMAT_ARRAY::default(),
@@ -185,13 +187,27 @@ impl GraphicsState {
                 }
                 12 => {
                     let layout = at.add(8).cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned();
-                    if layout.pInputElementDescs.is_null() {
+                    if layout.NumElements > 32 {
+                        self.invalid_input_layout = true;
+                        return;
+                    }
+                    if layout.NumElements == 0 {
+                        self.inputs.clear();
+                        self.names.clear();
+                        return;
+                    }
+                    if layout.pInputElementDescs.is_null() || !layout.pInputElementDescs.is_aligned() {
+                        self.invalid_input_layout = true;
                         return;
                     }
                     let elements = std::slice::from_raw_parts(
                         layout.pInputElementDescs,
                         layout.NumElements as usize,
                     );
+                    if elements.iter().any(|e| e.InputSlot >= 32 || e.SemanticName.is_null()) {
+                        self.invalid_input_layout = true;
+                        return;
+                    }
                     self.names = elements
                         .iter()
                         .map(|e| CStr::from_ptr(e.SemanticName.0.cast()).to_owned())

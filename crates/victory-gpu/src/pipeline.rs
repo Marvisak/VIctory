@@ -510,6 +510,10 @@ pub(crate) extern "system" fn create_stream(
     let stream = unsafe { std::slice::from_raw_parts(desc.stream, desc.size) };
     #[allow(unused_variables)]
     let (shaders, graphics) = read_stream(stream, copy);
+    #[cfg(windows)]
+    if graphics.invalid_input_layout {
+        return E_INVALIDARG;
+    }
     hand_out(
         shaders,
         #[cfg(windows)]
@@ -787,6 +791,64 @@ mod tests {
             &pipeline(q).shaders[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+    }
+
+    #[cfg(windows)]
+    fn create_layout(
+        elements: &[windows::Win32::Graphics::Direct3D12::D3D12_INPUT_ELEMENT_DESC],
+    ) -> HRESULT {
+        let mut stream = [0u8; 24];
+        stream[..4].copy_from_slice(&12u32.to_le_bytes());
+        stream[8..16].copy_from_slice(&(elements.as_ptr() as usize).to_le_bytes());
+        stream[16..20].copy_from_slice(&(elements.len() as u32).to_le_bytes());
+        let desc = StreamDesc {
+            size: stream.len(),
+            stream: stream.as_ptr(),
+        };
+        let mut out = std::ptr::null();
+        let result = create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut out);
+        if !out.is_null() {
+            slot::<extern "system" fn(This) -> u32>(out, 0x10)(out);
+        }
+        result
+    }
+
+    #[cfg(windows)]
+    fn layout_element() -> windows::Win32::Graphics::Direct3D12::D3D12_INPUT_ELEMENT_DESC {
+        windows::Win32::Graphics::Direct3D12::D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: windows::core::PCSTR(c"POSITION".as_ptr().cast()),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn input_layout_rejects_more_than_32_elements() {
+        assert_eq!(create_layout(&[layout_element(); 33]), E_INVALIDARG);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn input_layout_rejects_slot_32() {
+        let mut e = layout_element();
+        e.InputSlot = 32;
+        assert_eq!(create_layout(&[e]), E_INVALIDARG);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn input_layout_rejects_null_semantic() {
+        let mut e = layout_element();
+        e.SemanticName = windows::core::PCSTR::null();
+        assert_eq!(create_layout(&[e]), E_INVALIDARG);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn input_layout_accepts_32_elements_and_slot_31() {
+        let mut elements = [layout_element(); 32];
+        elements[31].InputSlot = 31;
+        assert_eq!(create_layout(&elements), S_OK);
     }
 
     /// The stream layout Grand Theft Auto VI builds (title+0x86f090): root
