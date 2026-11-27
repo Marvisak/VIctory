@@ -470,11 +470,18 @@ pub(crate) fn read_indirect(
         }
         let Some(buffer) = buffer else { return };
         l.ResourceBarrier(&[transition(args.0, arg_state, copy)]);
-        l.CopyBufferRegion(&buffer, 0, args.0, args.1, len);
+        let mut pieces: Vec<((usize, &ID3D12Resource), usize, usize, u64)> =
+            vec![((0, args.0), args.1 as usize, (args.1 + len) as usize, 0)];
         if let Some((c, at)) = count {
             // A title buffer's copy: never transitioned, the read promotes it.
-            l.CopyBufferRegion(&buffer, len, c, at, 4);
+            pieces.push(((1, c), at as usize, at as usize + 4, 0));
         }
+        let (runs, _) = crate::host::pack_relay_fetch(&mut pieces, |(order, _)| *order);
+        crate::host::copy_fetch_runs(
+            l,
+            &buffer,
+            runs.iter().map(|&(i, lo, hi, at)| (pieces[i].0.1, lo, hi, at)),
+        );
         l.ResourceBarrier(&[transition(args.0, copy, arg_state)]);
         list.keep(&buffer);
         let buffer = Readback(buffer);

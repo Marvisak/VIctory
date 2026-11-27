@@ -379,6 +379,83 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
     Some([info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?])
 }
 
+/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
+pub(crate) fn available_physical_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    ok.then_some(m.ullAvailPhys)
+}
+
+/// Whether pieces hashed again after ranges were sent up to a copy in the
+/// card's memory are hashed once per contiguous run. Set
+/// `VICTORY_CARD_REHASH_RUNS=0` to compare against one pass per upload range.
+pub(crate) fn rehash_runs() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_none_or(|v| v == "1"))
+}
+
+/// The byte ranges in the packed readback buffer follow the merge order.
+/// Record one copy command for neighboring ranges of the same GPU buffer.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn copy_fetch_runs<'a>(
+    list: &ID3D12GraphicsCommandList,
+    destination: &ID3D12Resource,
+    pieces: impl Iterator<Item = (&'a ID3D12Resource, usize, usize, u64)>,
+) {
+    let mut pieces = pieces.peekable();
+    while let Some((source, lo, mut hi, at)) = pieces.next() {
+        while let Some(&(next, from, to, out)) = pieces.peek()
+            && next == source
+            && from == hi
+            && out == at + (hi - lo) as u64
+        {
+            hi = to;
+            pieces.next();
+        }
+        // SAFETY: the original adjacent ranges lie inside the same live
+        // source and destination, retained by the caller through its fence.
+        unsafe { list.CopyBufferRegion(destination, at, source, lo as u64, (hi - lo) as u64) };
+    }
+}
+
+/// Assign each dirty range an offset in the readback buffer. A single copy
+/// can cover adjacent or overlapping ranges from any flight in this landing.
+/// Keep `pieces` in landing order for applying the resulting bytes.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn pack_relay_fetch<T>(
+    pieces: &mut [(T, usize, usize, u64)],
+    buffer_id: impl Fn(&T) -> usize,
+) -> (Vec<(usize, usize, usize, u64)>, u64) {
+    let mut order: Vec<_> = (0..pieces.len()).collect();
+    order.sort_unstable_by_key(|&i| {
+        let (source, lo, _, _) = &pieces[i];
+        (buffer_id(source), *lo)
+    });
+    let mut runs: Vec<(usize, usize, usize, u64)> = Vec::new();
+    let mut total = 0;
+    for i in order {
+        let (source, lo, hi, _) = &pieces[i];
+        let (lo, hi) = (*lo, *hi);
+        if let Some((previous, start, end, out)) = runs.last_mut()
+            && buffer_id(&pieces[*previous].0) == buffer_id(source)
+            && lo <= *end
+        {
+            pieces[i].3 = *out + (lo - *start) as u64;
+            total += hi.saturating_sub(*end) as u64;
+            *end = (*end).max(hi);
+        } else {
+            pieces[i].3 = total;
+            runs.push((i, lo, hi, total));
+            total += (hi - lo) as u64;
+        }
+    }
+    (runs, total)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     thread_local! {
@@ -4129,5 +4206,27 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::pack_relay_fetch;
+
+    #[test]
+    fn readback_packs_dirty_ranges_without_reordering_their_landings() {
+        let mut pieces = [
+            (1, 32, 48, 0), (2, 0, 16, 0), (1, 16, 36, 0),
+            (1, 64, 65, 0), (1, 24, 26, 0), (2, 16, 17, 0),
+        ];
+        let (runs, size) = pack_relay_fetch(&mut pieces, |source| *source);
+        assert_eq!(runs, [(2, 16, 48, 0), (3, 64, 65, 32), (1, 0, 17, 33)]);
+        assert_eq!(size, 50);
+        assert_eq!(pieces.map(|(_, _, _, offset)| offset), [16, 33, 0, 32, 8, 49]);
+        assert_eq!(pieces.map(|(source, lo, hi, _)| (source, lo, hi)), [
+            (1, 32, 48), (2, 0, 16), (1, 16, 36),
+            (1, 64, 65), (1, 24, 26), (2, 16, 17),
+        ]);
+        assert_eq!(pack_relay_fetch::<usize>(&mut [], |source| *source), (vec![], 0));
     }
 }

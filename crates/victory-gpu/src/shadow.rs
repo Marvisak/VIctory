@@ -24,6 +24,55 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+/// Whether snapshots and compares of shadow copies run together in merged
+/// runs. `VICTORY_WIDE_BACK=1` forces them on and `=0` off; otherwise they
+/// need a host with at least 8 GiB of VRAM budget and 16 GiB of free RAM, so
+/// a small machine does not retain full shadow twins and stall frame pacing.
+pub(crate) fn wide_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        match std::env::var_os("VICTORY_WIDE_BACK") {
+            Some(v) if v == "0" => return false,
+            Some(v) if v == "1" => return true,
+            _ => {}
+        }
+        const VRAM_MB: f64 = 8.0 * 1024.0;
+        const RAM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+        let vram = crate::host::video_memory()
+            .and_then(|m| m.first().map(|&(_, budget)| budget >= VRAM_MB))
+            .unwrap_or(false);
+        let ram = crate::host::available_physical_ram().is_some_and(|bytes| bytes >= RAM_BYTES);
+        vram && ram
+    })
+}
+
+/// The runs of bytes where `now` differs from `was` (of one length), as
+/// (offset, bytes) in order: every differing byte is in a run and no equal
+/// byte is.
+fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    let n = now.len().min(was.len());
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < n {
+        // Equal bytes, eight at a time while they last.
+        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
+            i += 8;
+        }
+        while i < n && now[i] == was[i] {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let first = i;
+        while i < n && now[i] != was[i] {
+            i += 1;
+        }
+        runs.push((first, i - first));
+    }
+    runs
+}
+
 fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
     let mut changed = 0;
     for ((title_byte, host_byte), old_byte) in title.iter_mut().zip(host).zip(old) {
@@ -34,6 +83,25 @@ fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
         changed |= delta;
     }
     changed != 0
+}
+
+/// Merges only the runs where the copy changed, when merged runs are safe,
+/// then syncs the rest of the copy with title memory as the bytewise merge
+/// does. The same bytes go back either way.
+fn merge_writeback_runs(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    let runs = if wide_back() && crate::host::rehash_runs() {
+        changed_runs(host, old)
+    } else {
+        vec![(0, host.len())]
+    };
+    let mut changed = false;
+    for (at, n) in runs {
+        changed |= merge_writeback(&mut title[at..at + n], &mut host[at..at + n], &old[at..at + n]);
+    }
+    for (title_byte, host_byte) in title.iter().zip(host.iter_mut()) {
+        *host_byte = *title_byte;
+    }
+    changed
 }
 
 #[test]
@@ -61,6 +129,30 @@ fn writeback_merge_matches_bytewise_oracle() {
             assert_eq!(host, expected);
         }
     }
+}
+
+#[test]
+fn changed_runs_are_exactly_the_bytes_that_differ() {
+    let was: Vec<u8> = (0..300u32).map(|i| (i * 13 + 5) as u8).collect();
+    for changes in [vec![], vec![0], vec![299], vec![7, 8, 9], vec![7, 9], vec![15, 16, 17, 23, 24, 64, 65, 66, 67, 68, 69, 70, 71, 72, 298, 299]] {
+        let mut now = was.clone();
+        for &at in &changes {
+            now[at] ^= 0x41;
+        }
+        let runs = changed_runs(&now, &was);
+        let mut put = was.clone();
+        let mut held = Vec::new();
+        for &(at, n) in &runs {
+            assert!(n > 0);
+            put[at..at + n].copy_from_slice(&now[at..at + n]);
+            held.extend(at..at + n);
+        }
+        assert_eq!(put, now, "{changes:?}");
+        assert_eq!(held, changes, "{changes:?}");
+        // Runs do not touch: two that did would be one.
+        assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
+    }
+    assert!(changed_runs(&[], &[]).is_empty());
 }
 
 /// A title buffer's host copy.
@@ -443,7 +535,7 @@ impl Shadow {
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
-                    if merge_writeback(title, host, old) {
+                    if merge_writeback_runs(title, host, old) {
                         let _writing = crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
