@@ -18,8 +18,8 @@ use windows::core::Interface;
 
 /// Bytes of one heap.
 const HEAP: u64 = 64 << 20;
-/// Empty heaps kept for the next textures.
-const SPARE: usize = 2;
+/// Empty heaps kept for the next textures (1 × 64 MiB).
+const SPARE: usize = 1;
 /// Placement alignment of textures that are not render targets.
 const ALIGN: u64 = 64 << 10;
 

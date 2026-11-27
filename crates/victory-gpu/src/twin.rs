@@ -57,8 +57,9 @@ pub(crate) struct Twin {
     /// Per plane and subresource: how its bytes go through `scratch`.
     routes: Vec<Route>,
     /// A shader-writable buffer the copies go through, in the common state
-    /// between them.
-    scratch: ID3D12Resource,
+    /// between them. Held via `Arc` so the shared class buffer is released
+    /// automatically once the last twin referencing it is dropped.
+    scratch: Arc<SharedScratch>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the rest is atomics and data.
@@ -185,6 +186,16 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
     Some(Twin { planes, newer: AtomicU8::new(DEPTH), routes, scratch })
 }
 
+/// Wrapper around a shared depth-twin scratch buffer so `Weak` references in
+/// [`SCRATCH`] release the `ID3D12Resource` automatically once no live `Twin`
+/// uses that size class.
+struct SharedScratch(ID3D12Resource);
+
+// SAFETY: D3D12 resources are free-threaded.
+unsafe impl Send for SharedScratch {}
+// SAFETY: as above.
+unsafe impl Sync for SharedScratch {}
+
 /// Scratch buffers shared by the twins, one per power-of-two size: a
 /// buffer each held as much video memory as its twin's planes for good
 /// (about 325 MB for Grand Theft Auto VI's 315 twins in the menu).
@@ -192,26 +203,42 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
 /// common state and returns the buffer to it, so copies in one list are
 /// ordered by those transitions, and lists run one after another on the
 /// host's single queue.
-struct Scratch(Vec<(u64, ID3D12Resource)>);
+struct Scratch(Vec<(u64, std::sync::Weak<SharedScratch>)>);
 
-// SAFETY: D3D12 resources are free-threaded.
+// SAFETY: `SharedScratch` is Send + Sync.
 unsafe impl Send for Scratch {}
 
 static SCRATCH: std::sync::Mutex<Scratch> = std::sync::Mutex::new(Scratch(Vec::new()));
 
 /// The shared scratch buffer of at least `size` bytes: the one of `size`'s
-/// power-of-two class, made on first use. All of them together hold at
-/// most twice the largest.
-fn shared_scratch(size: u64) -> Option<ID3D12Resource> {
+/// power-of-two class, made on first use and released automatically once no
+/// live [`Twin`] references it.
+fn shared_scratch(size: u64) -> Option<Arc<SharedScratch>> {
     let class = size.max(1 << 16).next_power_of_two();
-    let mut all = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, buffer)) = all.0.iter().find(|(c, _)| *c == class) {
-        return Some(buffer.clone());
+    {
+        let mut all = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        all.0.retain(|(_, w)| w.strong_count() > 0);
+        if let Some(buffer) = all.0.iter().find_map(|(c, w)| (*c == class).then(|| w.upgrade()).flatten()) {
+            return Some(buffer);
+        }
     }
     let buffer = scratch_buffer(class)?;
     crate::host::name(&buffer, || format!("depth twin copies {class:#x}"));
-    all.0.push((class, buffer.clone()));
-    Some(buffer)
+    let created = Arc::new(SharedScratch(buffer));
+    let mut duplicate = None;
+    let chosen = {
+        let mut all = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        all.0.retain(|(_, w)| w.strong_count() > 0);
+        if let Some(existing) = all.0.iter().find_map(|(c, w)| (*c == class).then(|| w.upgrade()).flatten()) {
+            duplicate = Some(created);
+            existing
+        } else {
+            all.0.push((class, Arc::downgrade(&created)));
+            created
+        }
+    };
+    drop(duplicate);
+    Some(chosen)
 }
 
 /// A default-heap buffer of `size` bytes shaders may write, in the common
@@ -418,12 +445,12 @@ impl Twin {
         };
         let placed = |f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&self.scratch) },
+            pResource: unsafe { std::mem::transmute_copy(&self.scratch.0) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
         };
         let converts = self.routes.iter().any(|r| r.depth.is_some());
-        let state = |from, to| transition(&self.scratch, D3D12_RESOURCE_STATES(from), D3D12_RESOURCE_STATES(to));
+        let state = |from, to| transition(&self.scratch.0, D3D12_RESOURCE_STATES(from), D3D12_RESOURCE_STATES(to));
         let mut converted = false;
         // SAFETY: an open list; live resources in the states named (the
         // scratch buffer starts common: its first copy promotes it).
@@ -443,7 +470,7 @@ impl Twin {
                 l.ResourceBarrier(&[state(COPY_DEST as i32, UNORDERED_ACCESS as i32)]);
                 l.SetComputeRootSignature(&c.root);
                 l.SetPipelineState(&c.pso);
-                l.SetComputeRootUnorderedAccessView(1, self.scratch.GetGPUVirtualAddress());
+                l.SetComputeRootUnorderedAccessView(1, self.scratch.0.GetGPUVirtualAddress());
                 for r in &self.routes {
                     let Some(d) = r.depth else { continue };
                     let (t, d) = (r.twin.Footprint, d);
@@ -644,5 +671,20 @@ mod tests {
         // What the list left is what the next prelude starts from.
         assert_eq!(states[&key(&depth)], depth.state.load(Relaxed));
         assert_eq!(states[&key(&twin.planes[0])], twin.planes[0].state.load(Relaxed));
+    }
+
+    #[test]
+    fn shared_scratch_reuses_live_buffer_and_releases_when_last_owner_drops() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let a = shared_scratch(512 << 10).expect("first scratch");
+        let b = shared_scratch(300 << 10).expect("same 512 KiB class");
+        assert!(Arc::ptr_eq(&a, &b), "live twins share one scratch buffer per class");
+        let weak = Arc::downgrade(&a);
+        drop(a);
+        assert!(weak.upgrade().is_some(), "still held by second owner");
+        drop(b);
+        assert!(weak.upgrade().is_none(), "released automatically once last owner drops");
     }
 }
