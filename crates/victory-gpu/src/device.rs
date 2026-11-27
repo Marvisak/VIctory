@@ -275,6 +275,7 @@ extern "system" fn check_feature_support(
     const MULTISAMPLE: u32 = 4;
     const SHADER_MODEL: u32 = 7;
     const OPTIONS1: u32 = 8;
+    const ARCHITECTURE1: u32 = 16;
     const OPTIONS4: u32 = 23;
     let expected = match feature {
         OPTIONS_QUERY => size_of_val(&OPTIONS),
@@ -284,6 +285,7 @@ extern "system" fn check_feature_support(
         MULTISAMPLE => 16,
         SHADER_MODEL => 4,
         OPTIONS1 => 24,
+        ARCHITECTURE1 => 20,
         OPTIONS4 => 12,
         _ => {
             tracing::warn!(feature, size, "device feature query not implemented");
@@ -307,6 +309,16 @@ extern "system" fn check_feature_support(
             }
             // Not tile-based; unified, cache-coherent memory.
             a[1..].copy_from_slice(&[0, 1, 1]);
+            S_OK
+        }
+        ARCHITECTURE1 => {
+            // SAFETY: checked size and non-null.
+            let a = unsafe { &mut *data.cast::<[u32; 5]>() };
+            if a[0] != 0 {
+                return E_INVALIDARG; // one node only
+            }
+            // Not tile-based; unified, cache-coherent memory, isolated MMU.
+            a[1..].copy_from_slice(&[0, 1, 1, 1]);
             S_OK
         }
         FORMAT_SUPPORT => {
@@ -354,7 +366,7 @@ extern "system" fn check_feature_support(
 fn feature_levels(data: *mut c_void) -> HRESULT {
     // SAFETY: the caller checked size and non-null.
     let query = unsafe { &mut *data.cast::<FeatureLevels>() };
-    if query.requested.is_null() {
+    if query.count == 0 || query.requested.is_null() {
         return E_INVALIDARG;
     }
     // SAFETY: the title passes `count` levels.
@@ -567,7 +579,27 @@ mod tests {
         let levels = [0xb000, 0xb100, 0xc000, 0xc100, 0xd000];
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
+        assert_eq!(query(&[], 0x18).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    #[test]
+    fn architecture1_reports_console_uma_and_rejects_other_nodes() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let mut arch1 = [0u32; 5];
+        assert_eq!(check(device, 16, arch1.as_mut_ptr().cast(), 20), S_OK);
+        assert_eq!(arch1, [0, 0, 1, 1, 1]);
+        assert_eq!(
+            check(device, 16, arch1.as_mut_ptr().cast(), 16),
+            E_INVALIDARG
+        );
+        arch1[0] = 1;
+        assert_eq!(
+            check(device, 16, arch1.as_mut_ptr().cast(), 20),
+            E_INVALIDARG
+        );
     }
 
     /// The queries the AMD upscaler's capability check makes.
