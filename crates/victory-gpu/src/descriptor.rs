@@ -239,8 +239,12 @@ pub(crate) fn make_read(slots: &[u32]) {
             continue;
         }
         for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
-            host.mirror(i, start + u64::from(i) * u64::from(step), true);
-            host.stamp_read(i);
+            // One resolution a slot: `mirror` has the view in hand, so the
+            // read stamp takes it rather than looking the slot up again
+            // (both locks and a view clone, per read slot).
+            if let Some(view) = host.mirror(i, start + u64::from(i) * u64::from(step), true) {
+                host.stamp_read_view(&view);
+            }
         }
     }
 }
