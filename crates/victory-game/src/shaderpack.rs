@@ -157,14 +157,23 @@ impl<'a> Graphics<'a> {
     /// The input layout; `None` if the metadata does not read as one.
     pub fn input_layout(&self) -> Option<Vec<InputElement<'a>>> {
         let m = self.metadata;
-        let end = 0x4c + u32_at(m, 0x38)? as usize;
+        let end = 0x4c_usize.checked_add(u32_at(m, 0x38)? as usize)?;
+        if end > m.len() {
+            return None;
+        }
         let count = u32_at(m, 0x4c)?;
-        let mut at = 0x50;
+        let mut at = 0x50_usize;
         let mut out = Vec::new();
         for _ in 0..count {
             let len = u32_at(m, at)? as usize;
-            let name = m.get(at + 4..at + 4 + len)?;
-            at += 4 + len;
+            let name_start = at.checked_add(4)?;
+            let name_end = name_start.checked_add(len)?;
+            let name = m.get(name_start..name_end)?;
+            at = name_end;
+            let next = at.checked_add(24)?;
+            if next > end {
+                return None;
+            }
             let f = |i: usize| u32_at(m, at + 4 * i);
             out.push(InputElement {
                 semantic: text(name),
@@ -175,9 +184,9 @@ impl<'a> Graphics<'a> {
                 class: f(4)?,
                 step_rate: f(5)?,
             });
-            at += 24;
+            at = next;
         }
-        (at == end && end <= m.len()).then_some(out)
+        (at == end).then_some(out)
     }
 }
 
@@ -190,17 +199,18 @@ impl<'a> Pack<'a> {
         let (ng, nc, nb, np, blob_bytes, prog_bytes) =
             (n(0x50)?, n(0x54)?, n(0x58)?, n(0x5c)?, n(0x60)?, n(0x64)?);
         let mut at = HEADER;
-        let mut take = |len: usize| {
+        let mut take = |len: Option<usize>| {
+            let len = len?;
             let part = file.get(at..at.checked_add(len)?)?;
             at += len;
             Some(part)
         };
-        let graphics = take(ng * GRAPHICS).ok_or("truncated graphics records")?;
-        let compute = take(nc * COMPUTE).ok_or("truncated compute records")?;
-        let blob_entries = take(nb * 8).ok_or("truncated blob table")?;
-        let prog_entries = take(np * 8).ok_or("truncated program table")?;
-        let blob_data = take(blob_bytes).ok_or("truncated blob data")?;
-        let prog_data = take(prog_bytes).ok_or("truncated program data")?;
+        let graphics = take(ng.checked_mul(GRAPHICS)).ok_or("truncated graphics records")?;
+        let compute = take(nc.checked_mul(COMPUTE)).ok_or("truncated compute records")?;
+        let blob_entries = take(nb.checked_mul(8)).ok_or("truncated blob table")?;
+        let prog_entries = take(np.checked_mul(8)).ok_or("truncated program table")?;
+        let blob_data = take(Some(blob_bytes)).ok_or("truncated blob data")?;
+        let prog_data = take(Some(prog_bytes)).ok_or("truncated program data")?;
         let pack = Pack {
             file,
             graphics,
@@ -502,5 +512,40 @@ mod tests {
         let table = HEADER + GRAPHICS + COMPUTE;
         bad[table + 4..table + 8].copy_from_slice(&0xFFFF_u32.to_le_bytes());
         assert_eq!(Pack::parse(&bad).err(), Some("blob outside its data"));
+    }
+
+    #[test]
+    fn rejects_overflowing_header_counts_and_input_layout_lengths() {
+        let mut bad = vec![0u8; HEADER];
+        bad[..4].copy_from_slice(MAGIC);
+        bad[0x50..0x54].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            Pack::parse(&bad).err(),
+            Some("truncated graphics records")
+        );
+
+        fn graphics_with(metadata: &[u8]) -> Graphics<'_> {
+            Graphics {
+                key: 0,
+                shader_hash: 0,
+                pipeline_hash: 0,
+                depth_stencil_hash: 0,
+                rasterizer_hash: 0,
+                blend_hash: 0,
+                packet: &[],
+                metadata,
+                stages: [None; 7],
+            }
+        }
+
+        let mut meta = vec![0u8; 0x80];
+        meta[0x38..0x3c].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(graphics_with(&meta).input_layout(), None);
+
+        // Valid end, but overflowing element name length.
+        meta[0x38..0x3c].copy_from_slice(&0x20_u32.to_le_bytes());
+        meta[0x4c..0x50].copy_from_slice(&1_u32.to_le_bytes());
+        meta[0x50..0x54].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(graphics_with(&meta).input_layout(), None);
     }
 }
