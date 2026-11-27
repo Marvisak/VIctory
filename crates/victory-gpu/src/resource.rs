@@ -1187,11 +1187,19 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
 /// (no view takes them).
 pub(crate) fn castable(format: u32) -> Vec<u32> {
     const DEPTH_FAMILIES: [u32; 10] = [19, 20, 21, 22, 40, 44, 45, 46, 47, 55];
+    // 68/69 are 4:2:2 macro-pixel formats (`R8G8_B8G8` / `G8R8_G8B8`) and 89 is
+    // `R10G10B10_XR_BIAS_A2_UNORM`; D3D12 rejects relaxed casting lists containing them.
+    const UNCASTABLE: [u32; 3] = [68, 69, 89];
     let Some(e) = element(format) else {
         return Vec::new();
     };
     (1..=115)
-        .filter(|&f| f != format && element(f) == Some(e) && !DEPTH_FAMILIES.contains(&f))
+        .filter(|&f| {
+            f != format
+                && element(f) == Some(e)
+                && !DEPTH_FAMILIES.contains(&f)
+                && !UNCASTABLE.contains(&f)
+        })
         .filter(|&f| !(family(f) == f && family(f + 1) == f))
         .collect()
 }
@@ -1291,6 +1299,59 @@ fn current(this: This) -> bool {
         .is_none_or(|live| std::sync::Arc::ptr_eq(&live, &h))
 }
 
+/// Queries `D3D12_FEATURE_FORMAT_SUPPORT` `Support1` bits on `device` for `format`.
+#[cfg(windows)]
+fn format_support1(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    format: u32,
+) -> windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1 {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: valid feature query struct for `D3D12_FEATURE_FORMAT_SUPPORT`.
+    if unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            std::ptr::from_mut(&mut data).cast(),
+            std::mem::size_of_val(&data) as u32,
+        )
+    }
+    .is_ok()
+    {
+        data.Support1
+    } else {
+        D3D12_FORMAT_SUPPORT1_NONE
+    }
+}
+
+/// Whether `device` supports creating a texture of `dimension` in `format` with `flags`.
+#[cfg(windows)]
+fn host_supports_texture(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    dimension: u32,
+    format: u32,
+    flags: u32,
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let dim_bit = match dimension {
+        2 => D3D12_FORMAT_SUPPORT1_TEXTURE1D,
+        TEXTURE_3D => D3D12_FORMAT_SUPPORT1_TEXTURE3D,
+        _ => D3D12_FORMAT_SUPPORT1_TEXTURE2D,
+    };
+    let mut need = dim_bit;
+    if flags & 1 != 0 {
+        need |= D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+    }
+    if flags & UNORDERED != 0 {
+        need |= D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+    }
+    let sup = format_support1(device, format);
+    (sup & need) == need
+}
+
 /// A host texture of host description `d` in GPU memory, castable to
 /// [`castable`]'s formats (colour textures, through the enhanced-barrier
 /// creation; it starts in the common state) where the host takes that.
@@ -1300,9 +1361,41 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     use windows::core::Interface;
     let host = crate::host::host()?;
+    let mut d = *d;
+    let is_typeless = family(d.format) == d.format && family(d.format + 1) == d.format;
+    let mut promoted_format = false;
+    if d.flags & DEPTH == 0
+        && !is_typeless
+        && !host_supports_texture(&host.device, d.dimension, d.format, d.flags)
+    {
+        // Console textures (or pooled memory shared across aliased formats, e.g.
+        // `R9G9B9E5_SHAREDEXP` + `R32_UINT` UAV + `R8G8B8A8_UNORM` RTV, or
+        // `B4G4R4A4_UNORM` + 16-bit RTV) can carry RT/UAV flags on a typed format
+        // the PC adapter only supports for SRVs. Promote the carrier to a
+        // compatible format of the same element size while keeping the original
+        // format in `castable_formats`.
+        const PREFERRED: [u32; 8] = [28, 24, 41, 42, 34, 49, 54, 56];
+        let candidates = castable(d.format);
+        let pick = PREFERRED
+            .into_iter()
+            .filter(|f| candidates.contains(f))
+            .chain(candidates.iter().copied())
+            .find(|&f| host_supports_texture(&host.device, d.dimension, f, d.flags));
+        if let Some(carrier) = pick {
+            tracing::debug!(
+                from = d.format,
+                to = carrier,
+                flags = d.flags,
+                "promoted texture carrier format for host RT/UAV support"
+            );
+            d.format = carrier;
+            promoted_format = true;
+        }
+    }
+    let d = &d;
     // The clear value names the format too: format, then color or depth
-    // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    // and stencil (5 words). Drop the hint if the carrier format changed.
+    let clear_value = (!clear.is_null() && !promoted_format).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -1314,7 +1407,14 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
+    let mut castable_formats = if d.flags & DEPTH == 0 {
+        castable(d.format)
+            .into_iter()
+            .filter(|&f| host_supports_texture(&host.device, d.dimension, f, 0))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     // In a heap of textures if it fits there (`crate::placement`).
     // SAFETY: the description has the host layout (checked size).
@@ -3178,5 +3278,61 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sharedexp_and_b4g4r4a4_rt_uav_textures_promote_to_supported_carrier() {
+        assert!(!castable(115).contains(&68));
+        assert!(!castable(115).contains(&69));
+        assert!(!castable(67).contains(&89));
+        if crate::host::host().is_none() {
+            return;
+        }
+        let rgb9e5_rt_uav = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 1920,
+            height: 1080,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 67, // DXGI_FORMAT_R9G9B9E5_SHAREDEXP
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 5, // ALLOW_RENDER_TARGET | ALLOW_UNORDERED_ACCESS
+        };
+        let hd67 = host_desc(&rgb9e5_rt_uav).unwrap();
+        let tex67 = make_texture(&hd67, 0, std::ptr::null()).expect("RGB9E5 RT+UAV carrier texture");
+        // SAFETY: `tex67.texture` is a live D3D12 resource just created.
+        let desc67 = unsafe { tex67.texture.GetDesc() };
+        assert!(
+            desc67.Format.0 == 67 || tex67.castable.contains(&67),
+            "original RGB9E5 format must remain viewable"
+        );
+        assert!(takes(&tex67, &hd67));
+
+        let b4g4r4a4_rt = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 1280,
+            height: 720,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 115, // DXGI_FORMAT_B4G4R4A4_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 1, // ALLOW_RENDER_TARGET
+        };
+        let hd115 = host_desc(&b4g4r4a4_rt).unwrap();
+        let tex115 = make_texture(&hd115, 0, std::ptr::null()).expect("B4G4R4A4 RT carrier texture");
+        // SAFETY: `tex115.texture` is a live D3D12 resource just created.
+        let desc115 = unsafe { tex115.texture.GetDesc() };
+        assert!(
+            desc115.Format.0 == 115 || tex115.castable.contains(&115),
+            "original B4G4R4A4 format must remain viewable"
+        );
+        assert!(takes(&tex115, &hd115));
     }
 }
