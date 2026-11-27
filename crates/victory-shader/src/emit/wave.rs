@@ -131,51 +131,161 @@ pub(crate) struct Section {
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
+    let all = if p.wave64 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
     let mut out = HashMap::new();
     let mut i = 0;
     while i < insts.len() {
         let inst = &insts[i];
-        // EXEC becomes every lane: `s_or_saveexec -1` or `s_nand_saveexec 0`.
-        let all = match inst.name() {
-            "s_or_saveexec_b64" | "s_or_saveexec_b32" => Some(Operand::Const(193)),
-            "s_nand_saveexec_b64" | "s_nand_saveexec_b32" => Some(Operand::Const(128)),
+        // EXEC becomes every lane: `s_or_saveexec -1` or `s_nand_saveexec 0`,
+        // matching the shader's wave width.
+        let save_const = match (p.wave64, inst.name()) {
+            (true, "s_or_saveexec_b64") | (false, "s_or_saveexec_b32") => Some(Operand::Const(193)),
+            (true, "s_nand_saveexec_b64") | (false, "s_nand_saveexec_b32") => {
+                Some(Operand::Const(128))
+            }
             _ => None,
         };
-        let start = all.is_some_and(
+        let start = save_const.is_some_and(
             |k| matches!(&inst.fields, Fields::Sop { src, .. } if src.first() == Some(&k)),
         );
         let saved = match &inst.fields {
             Fields::Sop {
                 dst: Some(Operand::Scalar { code, .. }),
                 ..
-            } if start => inst.write(Reg::S(*code)),
+            } if start => inst.write(Reg::S(*code)).and_then(|lo| {
+                let hi = if p.wave64 {
+                    Some(inst.write(Reg::S(*code + 1))?)
+                } else {
+                    None
+                };
+                Some((*code, lo, hi))
+            }),
             _ => None,
         };
-        let Some(saved) = saved else {
+        let Some((code, saved_lo, saved_hi)) = saved else {
             i += 1;
             continue;
         };
-        let end = (i + 1..insts.len()).find(|&j| {
-            insts[j].write(Reg::S(EXEC)).is_some()
-                && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
+        let end = (i + 1..insts.len()).find_map(|j| {
+            is_restore(&insts[j], p.wave64, code, saved_lo, saved_hi).map(|n| (j, n))
         });
-        let Some(end) = end else {
-            break;
+        let Some((end, needs_all)) = end else {
+            i += 1;
+            continue;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
+        let Some((shapes, end_exec)) = simulate(&insts[i + 1..end], wave, saved_lo) else {
+            i += 1;
+            continue;
+        };
+        if needs_all && end_exec != all {
+            i += 1;
+            continue;
+        }
         out.insert(i, Section { end, shapes });
         i = end + 1;
     }
     out
 }
 
-fn saved_code(inst: &Inst) -> u8 {
+/// Whether `inst` is a matching-width `EXEC` restore from `(code, saved_lo,
+/// saved_hi)`: returns `Some(false)` for a direct `s_mov_b32`/`s_mov_b64`
+/// restore and `Some(true)` for `s_and_b32`/`s_and_b64` (which only restores
+/// `saved` when `EXEC` is all lanes immediately beforehand).
+fn is_restore(
+    inst: &Inst,
+    wave64: bool,
+    code: u8,
+    saved_lo: Value,
+    saved_hi: Option<Value>,
+) -> Option<bool> {
+    let dwords = if wave64 { 2 } else { 1 };
+    let Fields::Sop {
+        dst: Some(Operand::Scalar {
+            code: EXEC,
+            dwords: dst_dw,
+        }),
+        src,
+        ..
+    } = &inst.fields
+    else {
+        return None;
+    };
+    if *dst_dw != dwords
+        || inst.write(Reg::S(EXEC)).is_none()
+        || (wave64 && inst.write(Reg::S(EXEC + 1)).is_none())
+        || inst.read(Reg::S(code)) != Some(saved_lo)
+        || saved_hi.is_some_and(|hi| inst.read(Reg::S(code + 1)) != Some(hi))
+    {
+        return None;
+    }
+    let is_saved = |op: &Operand| matches!(*op, Operand::Scalar { code: c, dwords: dw } if c == code && dw == dwords);
+    let is_exec =
+        |op: &Operand| matches!(*op, Operand::Scalar { code: EXEC, dwords: dw } if dw == dwords);
+    match (wave64, inst.name()) {
+        (false, "s_mov_b32") | (true, "s_mov_b64") if matches!(&src[..], [s] if is_saved(s)) => {
+            Some(false)
+        }
+        (false, "s_and_b32") | (true, "s_and_b64") if matches!(&src[..], [a, b] if (is_exec(a) && is_saved(b)) || (is_saved(a) && is_exec(b))) => {
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `inst` has observable side effects (memory/LDS stores, atomics,
+/// exports, barriers, mode-register writes, control transfers) that would be
+/// silently dropped if a whole-wave section replaced the instruction range.
+fn has_side_effect(inst: &Inst) -> bool {
+    let name = inst.name();
     match &inst.fields {
-        Fields::Sop {
-            dst: Some(Operand::Scalar { code, .. }),
-            ..
-        } => *code,
-        _ => NULL,
+        Fields::Valu(_) | Fields::Vintrp { .. } => false,
+        Fields::Sop { .. } => {
+            name.starts_with("s_setreg")
+                || matches!(
+                    name,
+                    "s_call_b64" | "s_setpc_b64" | "s_swappc_b64" | "s_rfe_b64"
+                )
+        }
+        Fields::Sopp { .. } => !matches!(
+            name,
+            "s_nop"
+                | "s_waitcnt"
+                | "s_waitcnt_vscnt"
+                | "s_waitcnt_vmcnt"
+                | "s_waitcnt_expcnt"
+                | "s_waitcnt_lgkmcnt"
+                | "s_waitcnt_depctr"
+                | "s_clause"
+                | "s_code_end"
+        ),
+        Fields::Smem { .. } => {
+            name.contains("_store_")
+                || name.contains("_atomic_")
+                || name.contains("_inv")
+                || name.contains("_wb")
+                || name.contains("_discard")
+                || name.starts_with("s_atc_probe")
+        }
+        Fields::Ds { .. } => {
+            !(name.starts_with("ds_read")
+                || matches!(
+                    name,
+                    "ds_swizzle_b32" | "ds_permute_b32" | "ds_bpermute_b32" | "ds_nop"
+                ))
+        }
+        Fields::Buffer { lds, .. } => {
+            *lds || name.contains("_store_")
+                || name.contains("_atomic_")
+                || name.ends_with("_inv")
+                || name.ends_with("_wb")
+        }
+        Fields::Image { .. } => name.contains("_store") || name.contains("_atomic"),
+        Fields::Flat { lds, .. } => *lds || !name.contains("_load_"),
+        Fields::Exp { .. } => true,
     }
 }
 
@@ -312,7 +422,7 @@ fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Option<(HashMap<Value, Shape>, u64)> {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -326,15 +436,13 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     for inst in insts {
         let name = inst.name();
         if inst.write(Reg::S(EXEC)).is_some() {
-            // Constant lane sets (prefix sums); anything else ends what
-            // the simulation can follow.
+            // Constant lane sets (prefix sums); any unmodeled EXEC write
+            // (such as a nested `saveexec` or `v_cmpx`) disqualifies the section.
             let lo = name
                 .starts_with("s_mov_b")
                 .then(|| constant(inst))
                 .flatten();
-            let Some(k) = lo else {
-                return shapes(vec, uni, wave);
-            };
+            let k = lo?;
             exec = (if name == "s_mov_b64" {
                 k
             } else {
@@ -343,15 +451,15 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             continue;
         }
         if inst.write(Reg::S(EXEC + 1)).is_some() {
-            let Some(k) = name
+            let k = name
                 .starts_with("s_mov_b")
                 .then(|| constant(inst))
-                .flatten()
-            else {
-                return shapes(vec, uni, wave);
-            };
+                .flatten()?;
             exec = ((exec & 0xFFFF_FFFF) | ((k & 0xFFFF_FFFF) << 32)) & all;
             continue;
+        }
+        if has_side_effect(inst) {
+            return None;
         }
         if let Fields::Sop { src, .. } = &inst.fields {
             if name.starts_with("s_and_b")
@@ -582,7 +690,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             .collect();
         vec.insert(dst, merged);
     }
-    shapes(vec, uni, wave)
+    Some((shapes(vec, uni, wave), exec))
 }
 
 fn constant(inst: &Inst) -> Option<u64> {
@@ -1089,5 +1197,184 @@ mod tests {
             let (shape, _, _) = run(c);
             assert_eq!(shape, None, "inline float const {c} was treated as identity");
         }
+    }
+
+    #[test]
+    fn unmatched_saveexec_does_not_skip_later_wave_sections_in_block() {
+        // An unmatched `s_or_saveexec_b32 s2, -1` earlier in the basic block
+        // (for instance, whose EXEC restore lives in a later block) must not
+        // abort scanning for subsequent whole-wave sections in the same block.
+        let mut w = vec![
+            sop1(2, 0x3D, 193), // unmatched: s_or_saveexec_b32 s2, -1
+            sop1(0, 0x3D, 193), // matched:   s_or_saveexec_b32 s0, -1
+        ];
+        w.extend(vop3(1, 0x101, 128, 256, 0)); // v_cndmask_b32 v1, 0, v0, s0
+        for ctrl in [0x00B1u16, 0x004E, 0x0164, 0x0168] {
+            w.push(vop2(1, 0x32, 0xFA, 1));
+            w.push(dpp16(1, ctrl, 0xF, 0xF, false));
+        }
+        w.extend(vop3(2, 0x378, 257, 128, 128)); // v_permlanex16_b32 v2, v1, 0, 0
+        w.push(vop2(1, 0x32, 258, 1)); // v_add_f16 v1, v2, v1
+        w.extend(vop3(1, 0x360, 257, 128 + 31, 0)); // v_readlane_b32 s1, v1, 31
+        w.push(sop1(EXEC, 0x03, 0)); // s_mov_b32 exec_lo, s0
+
+        let p = build(&w, false);
+        let insts = &p.blocks[0].insts;
+        let saved = insts[1].write(Reg::S(0)).unwrap();
+        let v0_in = insts[2].read(Reg::V(0)).unwrap();
+        let s1 = insts[insts.len() - 3].write(Reg::S(1)).unwrap();
+
+        let secs = sections(&p, 0);
+        assert!(
+            !secs.contains_key(&0),
+            "unmatched saveexec should not form a section"
+        );
+        let sec = secs
+            .get(&1)
+            .expect("later matched section in the same block must still be discovered");
+        assert_eq!(
+            sec.shapes.get(&s1).copied(),
+            Some(Shape::Half(Op::AddH, v0_in, saved, 0, 31))
+        );
+    }
+
+    #[test]
+    fn section_with_store_or_side_effect_is_rejected() {
+        // A saveexec..restore range containing a memory store (or LDS write /
+        // barrier) must not be turned into a whole-wave section, because
+        // `Lower::run` replaces all instructions in the range.
+        let cases: &[(&str, &[u32])] = &[
+            (
+                "global_store_dword",
+                &[
+                    sop1(0, 0x3D, 193), // s_or_saveexec_b32 s0, -1
+                    0xDC70_8000,
+                    0x007D_0200,         // global_store_dword v[0:1], v2, off
+                    sop1(EXEC, 0x03, 0), // s_mov_b32 exec_lo, s0
+                ],
+            ),
+            (
+                "ds_write_b32",
+                &[
+                    sop1(0, 0x3D, 193), // s_or_saveexec_b32 s0, -1
+                    0xD834_0000,
+                    0x0000_0200,         // ds_write_b32 v0, v2
+                    sop1(EXEC, 0x03, 0), // s_mov_b32 exec_lo, s0
+                ],
+            ),
+            (
+                "s_barrier",
+                &[
+                    sop1(0, 0x3D, 193),  // s_or_saveexec_b32 s0, -1
+                    0xBF8A_0000,         // s_barrier
+                    sop1(EXEC, 0x03, 0), // s_mov_b32 exec_lo, s0
+                ],
+            ),
+        ];
+        for &(label, words) in cases {
+            let p = build(words, false);
+            assert!(
+                sections(&p, 0).is_empty(),
+                "{label} inside saveexec..restore must reject the section"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_saveexec_does_not_close_outer_or_drop_inner() {
+        // Case 1: nested `s_and_saveexec_b32 s2, s0` after `s_mov_b32 exec_lo, 0`
+        // must not prematurely match as the outer restore, and must disqualify
+        // the outer section as an unmodeled EXEC write.
+        let p = build(
+            &[
+                sop1(0, 0x3D, 193),    // s_or_saveexec_b32 s0, -1
+                sop1(EXEC, 0x03, 128), // s_mov_b32 exec_lo, 0
+                sop1(2, 0x3C, 0),      // s_and_saveexec_b32 s2, s0
+                vop1(1, 0x01, 135),    // v_mov_b32 v1, 7
+                sop1(EXEC, 0x03, 0),   // s_mov_b32 exec_lo, s0
+            ],
+            false,
+        );
+        assert!(
+            sections(&p, 0).is_empty(),
+            "nested s_and_saveexec reading saved mask must not form a section"
+        );
+
+        // Case 2: an outer `s_or_saveexec_b32 s0, -1` wrapping a clean inner
+        // reduction rejects the outer range while still discovering the inner
+        // clean section.
+        let mut w = vec![
+            sop1(0, 0x3D, 193), // outer: s_or_saveexec_b32 s0, -1
+            sop1(2, 0x3D, 193), // inner: s_or_saveexec_b32 s2, -1
+        ];
+        w.extend(vop3(1, 0x101, 128, 256, 2)); // v_cndmask_b32 v1, 0, v0, s2
+        for ctrl in [0x00B1u16, 0x004E, 0x0164, 0x0168] {
+            w.push(vop2(1, 0x32, 0xFA, 1));
+            w.push(dpp16(1, ctrl, 0xF, 0xF, false));
+        }
+        w.extend(vop3(3, 0x378, 257, 128, 128)); // v_permlanex16_b32 v3, v1, 0, 0
+        w.push(vop2(1, 0x32, 259, 1)); // v_add_f16 v1, v3, v1
+        w.extend(vop3(4, 0x360, 257, 128 + 31, 0)); // v_readlane_b32 s4, v1, 31
+        w.push(sop1(EXEC, 0x03, 2)); // s_mov_b32 exec_lo, s2 (inner restore)
+        w.push(sop1(EXEC, 0x03, 0)); // s_mov_b32 exec_lo, s0 (outer restore)
+
+        let p = build(&w, false);
+        let secs = sections(&p, 0);
+        assert!(
+            !secs.contains_key(&0),
+            "outer section with nested saveexec must be rejected"
+        );
+        assert!(
+            secs.contains_key(&1),
+            "inner clean reduction section must still be found"
+        );
+    }
+
+    #[test]
+    fn wave64_requires_matching_width_save_and_full_pair_restore() {
+        // Wave32 saver in a Wave64 program must not start a section.
+        let wrong_width_save = build(
+            &[
+                sop1(0, 0x3D, 193),  // s_or_saveexec_b32 s0, -1 (wrong width in wave64)
+                vop1(1, 0x01, 135),  // v_mov_b32 v1, 7
+                sop1(EXEC, 0x03, 0), // s_mov_b32 exec_lo, s0
+            ],
+            true,
+        );
+        assert!(sections(&wrong_width_save, 0).is_empty());
+
+        // Partial 32-bit restore in Wave64 must not close a 64-bit saveexec.
+        let partial_restore = build(
+            &[
+                sop1(0, 0x25, 193),  // s_or_saveexec_b64 s[0:1], -1
+                vop1(1, 0x01, 135),  // v_mov_b32 v1, 7
+                sop1(EXEC, 0x03, 0), // s_mov_b32 exec_lo, s0 (partial restore)
+            ],
+            true,
+        );
+        assert!(sections(&partial_restore, 0).is_empty());
+
+        // Clobbering the high saved dword `s1` before `s_mov_b64 exec, s[0:1]`
+        // invalidates the restore match.
+        let clobbered_hi = build(
+            &[
+                sop1(0, 0x25, 193),  // s_or_saveexec_b64 s[0:1], -1
+                sop1(1, 0x03, 128),  // s_mov_b32 s1, 0 (clobbers saved high dword)
+                sop1(EXEC, 0x04, 0), // s_mov_b64 exec, s[0:1]
+            ],
+            true,
+        );
+        assert!(sections(&clobbered_hi, 0).is_empty());
+
+        // Full matching-width Wave64 save + restore is accepted.
+        let valid = build(
+            &[
+                sop1(0, 0x25, 193),  // s_or_saveexec_b64 s[0:1], -1
+                vop1(1, 0x01, 135),  // v_mov_b32 v1, 7
+                sop1(EXEC, 0x04, 0), // s_mov_b64 exec, s[0:1]
+            ],
+            true,
+        );
+        assert_eq!(sections(&valid, 0).get(&0).map(|s| s.end), Some(2));
     }
 }
