@@ -32,6 +32,7 @@ pub const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
 pub const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
 pub const E_NOT_SUFFICIENT_BUFFER: HRESULT = 0x8007_007A_u32 as i32;
 pub const E_ILLEGAL_METHOD_CALL: HRESULT = 0x8000_000E_u32 as i32;
+pub const E_NO_TASK_QUEUE: HRESULT = 0x8007_01AB_u32 as i32;
 
 const WORK: u32 = 0;
 const COMPLETION: u32 = 1;
@@ -495,6 +496,9 @@ struct Call {
     provider: Provider,
     context: usize,
     identity: usize,
+    /// Resolved at Begin: a later change of the process queue must not
+    /// take this call's work or completion to a different port.
+    queue: Arc<Queue>,
     /// Set by the first completion, which then runs without a lock: the
     /// provider's cleanup may wait for a thread completing the same call.
     claimed: AtomicBool,
@@ -567,8 +571,25 @@ pub fn XAsyncBegin(
     block: *mut AsyncBlock,
     context: *mut c_void,
     identity: *const c_void,
+    identity_name: *const u8,
+    provider: Option<Provider>,
+) -> HRESULT {
+    begin_on_queue(block, context, identity, identity_name, provider, || {
+        // SAFETY: called only after checking the block is not null; the
+        // title passes its own block with a valid queue handle or null.
+        queue(unsafe { (*block).queue })
+    })
+}
+
+/// Starts a call after resolving its queue. Split out so tests can
+/// exercise the no-queue path without changing the process default.
+fn begin_on_queue(
+    block: *mut AsyncBlock,
+    context: *mut c_void,
+    identity: *const c_void,
     _identity_name: *const u8,
     provider: Option<Provider>,
+    resolve_queue: impl FnOnce() -> Option<Arc<Queue>>,
 ) -> HRESULT {
     let Some(provider) = provider else {
         return E_INVALIDARG;
@@ -576,7 +597,8 @@ pub fn XAsyncBegin(
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if let Some(left) = call(block) {
+    let left = call(block);
+    if let Some(left) = &left {
         // Calls are filed by block address, and one that succeeded stays
         // filed until its result is taken. A title that never takes it and
         // frees the block may get the same address for its next one, which
@@ -588,6 +610,12 @@ pub fn XAsyncBegin(
         if !(over && zeroed(block)) {
             return E_INVALIDARG;
         }
+    }
+    // GDK refuses to start a provider with nowhere to run its work.
+    let Some(queue) = resolve_queue() else {
+        return E_NO_TASK_QUEUE;
+    };
+    if left.is_some() {
         release(block);
     }
     let (status, size) = words(block);
@@ -597,6 +625,7 @@ pub fn XAsyncBegin(
         provider,
         context: context as usize,
         identity: identity as usize,
+        queue,
         claimed: AtomicBool::new(false),
         done: Mutex::new(false),
         finished: Condvar::new(),
@@ -610,7 +639,7 @@ pub fn XAsyncBegin(
     S_OK
 }
 
-/// Queues the provider's `DoWork` on the block's work port. The work
+/// Queues the provider's `DoWork` on the call's work port. The work
 /// belongs to the call that scheduled it: when it runs, that call may be
 /// over and the block may hold another.
 pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
@@ -637,11 +666,7 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
     let Some(call) = call(block) else {
         return E_INVALIDARG;
     };
-    // SAFETY: a block in flight is valid.
-    let handle = unsafe { (*block).queue };
-    let Some(queue) = queue(handle) else {
-        return E_INVALIDARG;
-    };
+    let queue = call.queue.clone();
     let context = Box::into_raw(Box::new(Work { call, block }));
     let hr = queue.submit(WORK, delay_ms, Task::new(context.cast(), work));
     if hr < 0 {
@@ -653,7 +678,7 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
 }
 
 /// Records the result (the first one wins), wakes waiters and queues the
-/// completion routine on the block's completion port.
+/// completion routine on the call's completion port.
 pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: usize) {
     if let Some(call) = call(block) {
         complete_call(&call, block, result, required_size);
@@ -681,7 +706,7 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     // Read before publishing: once the status is set, the title may free
     // the block.
     // SAFETY: a block in flight is valid.
-    let (handle, routine) = unsafe { ((*block).queue, (*block).callback) };
+    let routine = unsafe { (*block).callback };
     let (status, size) = words(block);
     if result < 0 || required_size == 0 {
         release(block);
@@ -692,9 +717,8 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     call.finished.notify_all();
     if routine.is_some() {
         let task = Task::new(block.cast(), complete);
-        match queue(handle) {
-            Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {}
-            _ => task.run(true),
+        if call.queue.submit(COMPLETION, 0, task) != S_OK {
+            task.run(true);
         }
     }
 }
@@ -1225,6 +1249,84 @@ mod tests {
         assert_eq!(begin(&mut block, left), E_INVALIDARG);
         XAsyncComplete(&mut block, E_ABORT, 0);
         assert!(call(&mut block).is_none());
+    }
+
+    /// A separate counter so these tests do not disturb `COMPLETED`.
+    static PINNED_COMPLETED: AtomicU32 = AtomicU32::new(0);
+    extern "system" fn pinned_completed(_: *mut AsyncBlock) {
+        PINNED_COMPLETED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn begin_without_a_task_queue_is_refused() {
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(
+            begin_on_queue(
+                &mut block,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(provider),
+                || None,
+            ),
+            E_NO_TASK_QUEUE
+        );
+        assert_eq!(block.internal, [0; 4]);
+        assert!(call(&mut block).is_none(), "no call was started");
+    }
+
+    #[test]
+    fn a_call_keeps_the_queue_it_began_on() {
+        extern "system" fn finish(_: u32, _: *const ProviderData) -> HRESULT {
+            S_OK
+        }
+
+        let mut first = std::ptr::null();
+        let mut second = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut first), S_OK);
+        assert_eq!(XTaskQueueCreate(0, 0, &mut second), S_OK);
+        let before = PINNED_COMPLETED.load(Ordering::SeqCst);
+        let mut block = AsyncBlock {
+            queue: first,
+            context: std::ptr::null_mut(),
+            callback: Some(pinned_completed),
+            internal: [0; 4],
+        };
+        assert_eq!(
+            XAsyncBegin(
+                &mut block,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(finish),
+            ),
+            S_OK
+        );
+        // The title changes the block's queue before it schedules work.
+        block.queue = second;
+        assert_eq!(XAsyncSchedule(&mut block, 0), S_OK);
+        assert!(!XTaskQueueDispatch(second, WORK, 0), "not the new queue");
+        assert!(
+            XTaskQueueDispatch(first, WORK, 0),
+            "work is on the first queue"
+        );
+        assert_eq!(PINNED_COMPLETED.load(Ordering::SeqCst), before);
+        assert!(
+            !XTaskQueueDispatch(second, COMPLETION, 0),
+            "not the new queue"
+        );
+        assert!(
+            XTaskQueueDispatch(first, COMPLETION, 0),
+            "completion is on the first queue"
+        );
+        assert_eq!(PINNED_COMPLETED.load(Ordering::SeqCst), before + 1);
+        XTaskQueueCloseHandle(first);
+        XTaskQueueCloseHandle(second);
     }
 
     #[test]
