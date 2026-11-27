@@ -663,6 +663,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-agility"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "victory-pe",
+ "windows",
+ "windows-sys",
+]
+
+[[package]]
 name = "victory-core"
 version = "0.1.0"
 dependencies = [
@@ -695,6 +705,7 @@ dependencies = [
  "miniz_oxide",
  "tempfile",
  "tracing",
+ "victory-agility",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",
@@ -758,6 +769,7 @@ version = "0.1.0"
 dependencies = [
  "miniz_oxide",
  "thiserror",
+ "victory-agility",
  "windows",
  "windows-sys",
 ]

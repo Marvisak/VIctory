@@ -13,7 +13,7 @@ miniz_oxide.workspace = true
 
 [features]
 # Host D3D12 pipeline checks (`emit::host`).
-host = ["dep:windows"]
+host = ["dep:windows", "dep:victory-agility"]
 # Debugging switches (emitted-module dumps and the like).
 diagnostics = []
 
@@ -22,6 +22,7 @@ name = "guard_runs"
 harness = false
 
 [target.'cfg(windows)'.dependencies]
+victory-agility = { workspace = true, optional = true }
 windows-sys = { workspace = true, features = ["Win32_System_LibraryLoader"] }
 windows = { workspace = true, optional = true, features = [
     "Win32_Foundation",
@@ -39,6 +40,7 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
 ] }
+victory-agility.workspace = true
 
 [lints]
 workspace = true

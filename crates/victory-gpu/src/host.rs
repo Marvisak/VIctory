@@ -147,11 +147,16 @@ fn create() -> windows::core::Result<Host> {
         // The debug layer only in builds with diagnostics.
         let debug = cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DEBUG");
         if debug {
-            let mut layer: Option<ID3D12Debug> = None;
-            match D3D12GetDebugInterface(&mut layer) {
-                Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
-                Err(e) => tracing::warn!(error = %e, "no D3D12 debug layer"),
-            }
+            let layer = match victory_agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
+                Ok(layer) => {
+                    layer.EnableDebugLayer();
+                    Some(layer)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no D3D12 debug layer");
+                    None
+                }
+            };
             // GPU-based validation (`VICTORY_D3D12_GBV`): out-of-range
             // descriptor heap indices and the like become messages naming
             // the command instead of page faults. Without state tracking
@@ -172,29 +177,31 @@ fn create() -> windows::core::Result<Host> {
         }
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
-        if dred_on() {
-            let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-            if D3D12GetDebugInterface(&mut dred).is_ok()
-                && let Some(dred) = dred
-            {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-            }
+        if dred_on()
+            && let Ok(dred) = victory_agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
+                &CLSID_D3D12DeviceRemovedExtendedData,
+            )
+        {
+            dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         }
-        let mut device: Option<ID3D12Device> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
+        let device = if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
             let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let device = victory_agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0)?;
             tracing::info!("host device on the software adapter (WARP)");
+            device
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let device = victory_agility::create_device(None, D3D_FEATURE_LEVEL_12_0)?;
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
+            device
+        };
+        if let Some((version, dir)) = victory_agility::loaded() {
+            tracing::info!(version, dir = %dir.display(), "host device uses D3D12 Agility SDK");
         }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -714,11 +721,9 @@ pub(crate) mod tests {
         // SAFETY: plain device and list creation on the software adapter.
         unsafe {
             let Ok(adapter) = warp_adapter() else { return };
-            let mut device: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+            let Ok(device) = victory_agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) else {
                 return;
-            }
-            let device = device.unwrap();
+            };
             // An open list holds its allocator: one each.
             let make = || -> ID3D12GraphicsCommandList {
                 let allocator: ID3D12CommandAllocator = device

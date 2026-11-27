@@ -59,6 +59,14 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+Windows 10's inbox D3D12 runtime stops at SM 6.5 even on SM 6.6 hardware. On
+Windows 10 22H2 (19045.3393+, KB5029331) and Windows 11, point
+`VICTORY_D3D12_DIR` at a folder containing a DirectX 12 Agility SDK
+`D3D12Core.dll` (for example the `build/native/bin/x64` folder from NuGet
+`Microsoft.Direct3D.D3D12`). VIctory also checks `<exe>\D3D12`, `<exe>` and
+`%LOCALAPPDATA%\Victory\D3D12`; without a valid SDK it falls back to the inbox
+runtime.
+
 To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
 the installer from https://rustup.rs). The first `cargo` command in this
 repository then fetches the pinned toolchain. Building needs the MSVC C++
@@ -211,6 +219,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | skip host pipeline creation and omit draws and dispatches, including indirect ones, when the pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
 | `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
+| `VICTORY_D3D12_DIR=<dir>` | folder with an app-local D3D12 Agility SDK `D3D12Core.dll`; enables SM 6.6 on Windows 10 |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
 | `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |

@@ -77,7 +77,6 @@ unsafe impl Sync for SharedDevice {}
 fn create_device(warp: bool) -> Result<ID3D12Device, String> {
     // SAFETY: plain D3D12/DXGI calls with valid out pointers.
     unsafe {
-        let mut device: Option<ID3D12Device> = None;
         let factory: IDXGIFactory4 =
             CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
         let adapter: IDXGIAdapter1 = if warp {
@@ -85,8 +84,8 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
         } else {
             hardware_adapter(&factory).map_err(err)?
         };
-        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-        let device = device.ok_or("no device")?;
+        let device = victory_agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0)
+            .map_err(err)?;
         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_6,
         };
