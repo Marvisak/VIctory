@@ -38,6 +38,7 @@ jobs:
           cargo test -p victory-gpu --features diagnostics --lib --locked resource::tests::a_slot_left_null_for_want_of_memory_is_read_again -- --nocapture
         env:
           VICTORY_D3D12_WARP: "1"
+          VICTORY_D3D12_DEBUG: "1"
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
