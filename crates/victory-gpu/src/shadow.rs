@@ -1053,18 +1053,51 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
-/// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
-const WINDOW: u64 = 4 << 20;
+/// Default 1 MiB (configurable via `VICTORY_LOOSE_WINDOW_KB`, power of two in
+/// `64..=16384` KiB) to avoid 4 MiB rounding slack on scattered small regions.
+const DEFAULT_LOOSE_WINDOW: u64 = 1 << 20;
+const MIN_LOOSE_WINDOW: u64 = 64 << 10;
+const MAX_LOOSE_WINDOW: u64 = 16 << 20;
+
+fn parse_loose_window(val: Option<&str>) -> u64 {
+    let Some(kb) = val.and_then(|v| v.trim().parse::<u64>().ok()) else {
+        return DEFAULT_LOOSE_WINDOW;
+    };
+    let bytes = kb.saturating_mul(1024).clamp(MIN_LOOSE_WINDOW, MAX_LOOSE_WINDOW);
+    bytes.next_power_of_two().min(MAX_LOOSE_WINDOW)
+}
+
+fn loose_window() -> u64 {
+    static W: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| parse_loose_window(std::env::var("VICTORY_LOOSE_WINDOW_KB").ok().as_deref()))
+}
+
+fn loose_span(address: u64, end: u64, window: u64) -> (u64, u64) {
+    let start = address & !(window - 1);
+    let len = end.next_multiple_of(window).saturating_sub(start).max(window);
+    (start, len)
+}
+
+/// Finds an existing loose shadow whose `[s_start, s_start + s_len)` already
+/// covers `[address, end)`, avoiding duplicate overlapping host buffers.
+fn find_containing_loose<T>(map: &BTreeMap<(u64, u64), T>, address: u64, end: u64) -> Option<&T> {
+    map.range(..=(address, u64::MAX))
+        .rev()
+        .find(|&(&(s_start, s_len), _)| s_start <= address && s_start.saturating_add(s_len) >= end)
+        .map(|(_, v)| v)
+}
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let window = loose_window();
+    let (start, len) = loose_span(address, end, window);
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
+    if let Some(shadow) = map
+        .get(&(start, len))
+        .or_else(|| find_containing_loose(&map, address, end))
+    {
         return Some(shadow.clone());
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -1656,5 +1689,28 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    #[test]
+    fn loose_window_defaults_to_1_mib_and_reuses_containing_spans() {
+        assert_eq!(parse_loose_window(None), 1 << 20);
+        assert_eq!(parse_loose_window(Some("64")), 64 << 10);
+        assert_eq!(parse_loose_window(Some("16")), 64 << 10, "clamps to 64 KiB min");
+        assert_eq!(parse_loose_window(Some("4096")), 4 << 20);
+        assert_eq!(parse_loose_window(Some("65536")), 16 << 20, "clamps to 16 MiB max");
+
+        let w = 1 << 20;
+        assert_eq!(loose_span(0x10_0040, 0x10_1000, w), (0x10_0000, w));
+        assert_eq!(loose_span(0x1f_ff00, 0x20_0100, w), (0x10_0000, 2 * w));
+
+        let mut map = BTreeMap::new();
+        map.insert((0x10_0000u64, 2 * w), "two-mib");
+        // Sub-ranges inside an already-allocated 2 MiB loose shadow reuse it instead of
+        // allocating a duplicate overlapping 1 MiB shadow buffer.
+        assert_eq!(find_containing_loose(&map, 0x10_0000, 0x18_0000), Some(&"two-mib"));
+        assert_eq!(find_containing_loose(&map, 0x20_0000, 0x2f_ffff), Some(&"two-mib"));
+        // Out-of-bounds range does not match.
+        assert_eq!(find_containing_loose(&map, 0x20_0000, 0x31_0000), None);
+        assert_eq!(find_containing_loose(&map, 0x0f_0000, 0x12_0000), None);
     }
 }
