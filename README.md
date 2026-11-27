@@ -90,8 +90,10 @@ Run the title:
 
 ```powershell
 cargo build --release -p victory
-target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+$targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { '.\target' }
+$victory = Join-Path $targetDir 'release\victory.exe'
+& $victory translate --cache --pipelines "<game dir>\shaders.rpf" "<game dir>\<the title's exe>" "<game dir>\XboxBvhBuilder.dll" "<game dir>\amd_fidelityfx_upscaler_xbox.dll"
+& $victory run "<game dir>\<the title's exe>" --execute
 ```
 
 The `translate --cache` step (minutes; again after a change of the shader
@@ -186,8 +188,12 @@ the translated shaders do not require it at runtime.
 A release build has no debugging aids. Build them in with
 
 ```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
+cargo build --profile diag -p victory --features diagnostics
 ```
+
+The executable is `target\diag\victory.exe` by default. If you set
+`CARGO_TARGET_DIR`, look in its `diag` subdirectory (for example,
+`C:\vt\diag\victory.exe`).
 
 The on/off switches below (`...=1`) are off when unset or set to `0`.
 
