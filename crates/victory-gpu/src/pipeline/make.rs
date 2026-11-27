@@ -12,7 +12,9 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //! Pipelines a draw waits for go ahead of those started early (at the
-//! title's creation, because an earlier run drew them).
+//! title's creation, because an earlier run drew them), and one whose
+//! dropped draw left a presented image unwritten goes ahead of them all
+//! (`hurry`, `crate::shown`).
 //!
 //! shortcut: the budget (half a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
@@ -31,9 +33,11 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
-    /// Whether it went into the queue of pipelines a draw waits for, and
-    /// whether a worker took it (it may be in both queues).
+    /// Whether it went into the queue of pipelines a draw waits for, to its
+    /// head (`hurry`), and whether a worker took it (it may be in both
+    /// queues, and twice in the first).
     now: AtomicBool,
+    first: AtomicBool,
     taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     #[cfg(feature = "diagnostics")]
@@ -76,12 +80,18 @@ impl Pending {
             graphics,
             queued: AtomicBool::new(false),
             now: AtomicBool::new(false),
+            first: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             made,
             #[cfg(feature = "diagnostics")]
             skipped_shader,
             used: AtomicBool::new(false),
         }
+    }
+
+    /// The shader containers it is made from.
+    pub(crate) fn shaders(&self) -> &[Arc<Shader>] {
+        &self.shaders
     }
 
     fn make(&self) {
@@ -205,12 +215,45 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
+/// Whether `p` has no answer yet (neither a host pipeline nor a refusal).
+pub(crate) fn being_made(p: &Pending) -> bool {
+    p.made.get().is_none()
+}
+
 /// Queues `p` for the workers: once, and once more ahead of the early
 /// starts if a draw waits for it (`now`) while it is still queued.
 fn start(p: &Arc<Pending>, now: bool) {
     if let Some(now) = enqueue(p, now) {
-        queue(p.clone(), now);
+        queue(p.clone(), if now { Place::Now } else { Place::Early });
     }
+}
+
+/// Puts `p`, queued for a draw, at the head of the workers' queue if no
+/// worker has it yet; whether it did. A draw into an image the title
+/// presents, or into what such a draw reads, was dropped for it
+/// (`crate::shown`, `crate::feeds`), and the frame's other new pipelines
+/// (~1,900 in Grand Theft Auto VI's first world frame) can wait behind it.
+pub(crate) fn hurry(p: &Arc<Pending>) -> bool {
+    let first = hurried(p);
+    if first {
+        super::library::note_hurried(&p.key);
+        queue(p.clone(), Place::First);
+    }
+    first
+}
+
+/// Whether `p` would go to the head of the queue now: queued, not made,
+/// not taken by a worker, and not put there before.
+pub(crate) fn may_hurry(p: &Pending) -> bool {
+    p.made.get().is_none()
+        && p.queued.load(Ordering::Relaxed)
+        && !p.taken.load(Ordering::Relaxed)
+        && !p.first.load(Ordering::Relaxed)
+}
+
+/// As [`may_hurry`], and marks it put there.
+fn hurried(p: &Pending) -> bool {
+    may_hurry(p) && !p.first.swap(true, Ordering::Relaxed)
 }
 
 /// Which queue `p` goes into now (true: the one draws wait for), if any.
@@ -224,12 +267,14 @@ fn enqueue(p: &Pending, now: bool) -> Option<bool> {
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// run drew with it (during loading, so the world's first frames find it),
+/// ahead of the other early starts if a presented image waited for it then
+/// (`hurry`).
 pub(crate) fn early(p: &Arc<Pending>) {
     super::library::note_created(&p.key);
     if p.made.get().is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, false);
+        start(p, super::library::wanted_first(&p.key));
     }
 }
 
@@ -259,12 +304,33 @@ fn wait(p: &Pending, frame: u64) {
 static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
     (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
 
+/// Where a pipeline goes in the workers' queues.
+#[derive(Clone, Copy)]
+enum Place {
+    /// Before everything (`hurry`).
+    First,
+    /// After the pipelines draws wait for, before the early starts.
+    Now,
+    /// Last.
+    Early,
+}
+
+fn place(queues: &mut [VecDeque<Arc<Pending>>; 2], p: Arc<Pending>, place: Place) {
+    match place {
+        Place::First => queues[0].push_front(p),
+        Place::Now => queues[0].push_back(p),
+        Place::Early => queues[1].push_back(p),
+    }
+}
+
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
-fn queue(p: Arc<Pending>, now: bool) {
+fn queue(p: Arc<Pending>, at: Place) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
         let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        #[cfg(test)]
+        let n = if two_frame_probe::WORKER.get().is_some() { 1 } else { n };
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
@@ -286,7 +352,7 @@ fn queue(p: Arc<Pending>, now: bool) {
         return;
     }
     let (lock, work) = &QUEUES;
-    lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
+    place(&mut lock.lock().unwrap_or_else(|e| e.into_inner()), p, at);
     work.notify_one();
 }
 
@@ -321,6 +387,8 @@ fn work() {
         if p.taken.swap(true, Ordering::Relaxed) {
             continue; // its other queue entry
         }
+        #[cfg(test)]
+        two_frame_probe::pause(&p);
         p.make();
         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
             drained();
@@ -329,6 +397,9 @@ fn work() {
         }
     }
 }
+
+#[cfg(test)]
+mod two_frame_probe;
 
 /// The most pipelines waiting at once since the workers last ran out.
 static PEAK: AtomicU64 = AtomicU64::new(0);
@@ -387,6 +458,38 @@ mod tests {
         WAITING.fetch_sub(3, Ordering::Relaxed);
     }
 
+    /// The pipeline of a draw into a presented image goes before the
+    /// frame's other new pipelines, once, and only while no worker has it.
+    #[test]
+    fn a_pipeline_a_presented_image_waits_for_goes_first() {
+        let new = || {
+            Arc::new(Pending::new(
+                Vec::new(),
+                None,
+                #[cfg(feature = "diagnostics")]
+                &[],
+            ))
+        };
+        let (early, a, b, last) = (new(), new(), new(), new());
+        let mut queues = [VecDeque::new(), VecDeque::new()];
+        place(&mut queues, early.clone(), Place::Early);
+        place(&mut queues, a.clone(), Place::Now);
+        place(&mut queues, b.clone(), Place::Now);
+        for p in [&a, &b, &last] {
+            p.queued.store(true, Ordering::Relaxed);
+        }
+        assert!(hurried(&last));
+        place(&mut queues, last.clone(), Place::First);
+        assert!(!hurried(&last), "once");
+        let order: Vec<_> = queues.iter().flatten().map(Arc::as_ptr).collect();
+        assert_eq!(order, [&last, &a, &b, &early].map(Arc::as_ptr));
+        b.taken.store(true, Ordering::Relaxed);
+        assert!(!hurried(&b), "a worker has it");
+        let _ = a.made.set(None);
+        assert!(!hurried(&a), "made");
+        assert!(!hurried(&early), "not queued for a draw");
+    }
+
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
@@ -415,6 +518,7 @@ mod tests {
             hash: "0123456789abcdef".into(),
             container: Vec::new(),
             translated: OnceLock::new(),
+            used: OnceLock::new(),
         });
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
         let warm = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));

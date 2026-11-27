@@ -536,6 +536,7 @@ impl State {
             return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            self.not_made(false);
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -603,7 +604,55 @@ impl State {
             unsafe { l.SetPipelineState(&p.pso) };
             (self.host_pipeline, self.host_roots[1]) = (p.pso.as_raw() as usize, 0);
         }
+        crate::feeds::ran(&self.targets, self.depth);
         true
+    }
+
+    /// A draw (`compute` false) or dispatch dropped for want of its host
+    /// pipeline: what it would have written, its targets and the unordered
+    /// views its code names through tables, goes to
+    /// [`crate::pipeline::dropped_into`] if the pipeline is being made.
+    fn not_made(&self, compute: bool) {
+        let this = self.pipeline as This;
+        if !crate::pipeline::being_made(this) {
+            return;
+        }
+        let writes = self.would_write(compute, crate::pipeline::used(this));
+        crate::pipeline::dropped_into(this, &writes);
+    }
+
+    /// What a draw (`compute` false) or dispatch would write: its targets,
+    /// its depth, and the resources its unordered views name through tables.
+    ///
+    /// Only a handle a bound heap holds is read: a title with a null root
+    /// table, no bound view heap, a stale handle from an unmapped heap, or
+    /// a table reach past the end of one names nothing, and
+    /// [`crate::descriptor::view`] would dereference an address the title
+    /// never gave us (a null table and an eight-dword offset crashed with
+    /// `0xC0000005`). A null descriptor (`resource == 0`) names nothing
+    /// either (`crate::feeds`).
+    fn would_write<'a>(
+        &self,
+        compute: bool,
+        uavs: impl Iterator<Item = &'a UsedResource>,
+    ) -> Vec<usize> {
+        let mut writes = Vec::new();
+        if !compute {
+            writes.extend(self.targets.iter().copied().filter(|&t| t != 0));
+            writes.extend((self.depth != 0).then_some(self.depth));
+        }
+        let uavs = uavs.filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table);
+        for u in uavs {
+            if let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot))
+                && let Some(handle) = table.checked_add(u64::from(u.table_offset_dwords) * 4)
+                && self.heap_of(handle).is_some()
+                && let Some(View::Unordered(resource, _, _)) = crate::descriptor::view(handle)
+                && resource != 0
+            {
+                writes.push(resource);
+            }
+        }
+        writes
     }
 
     /// A descriptor a shader reads through a table: its host slot made if
@@ -617,6 +666,7 @@ impl State {
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
+        crate::feeds::begin();
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -1105,6 +1155,7 @@ impl State {
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            self.not_made(true);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
@@ -1120,6 +1171,7 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        crate::feeds::ran(&[], 0);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
@@ -1732,6 +1784,7 @@ impl State {
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+            self.not_made(kind == DISPATCH);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             why("no host pipeline");
@@ -1779,7 +1832,13 @@ impl State {
             }
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
+                Some(p) if p.compute => {
+                    let bound = self.bind(list, p, true);
+                    if bound {
+                        crate::feeds::ran(&[], 0);
+                    }
+                    bound
+                }
                 _ => false,
             },
             _ => false,
@@ -1884,6 +1943,17 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
+    // What the frame's pass reads and writes (`crate::feeds`), by the title
+    // resource its descriptor names.
+    match (view, u.kind) {
+        (View::Shader(resource, _), ResourceType::Srv) if marked => {
+            crate::feeds::view(*resource, false)
+        }
+        (View::Unordered(resource, _, _), ResourceType::Uav) if marked => {
+            crate::feeds::view(*resource, true)
+        }
+        _ => {}
+    }
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
@@ -2046,6 +2116,38 @@ mod tests {
         // A title sampler heap stays whatever the views are.
         assert_eq!(State::wanted([0, 0x20], true), [MEMORY_HEAP, 0x20]);
     }
+
+    /// A dropped pass reads no descriptor it cannot name: a null root table
+    /// with an eight-dword offset (the reviewer's `0xC0000005`), a stale
+    /// handle whose offset overflows, a table entry no bound heap holds, or
+    /// a UAV that is not a table's are all skipped without touching memory.
+    /// `State::default()` binds no heap, so a read would fault here.
+    #[test]
+    fn a_dropped_pass_reads_no_descriptor_it_cannot_name() {
+        let uav = |slot: u8, table_offset_dwords: u32| UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 32,
+            dwords: 4,
+            user_data: 0,
+            slot,
+        };
+        let mut state = State::default();
+        state.set_table(true, 0, 0);
+        state.set_table(true, 1, u64::MAX - 16);
+        assert!(
+            state
+                .would_write(true, [uav(0, 8), uav(1, 8)].iter())
+                .is_empty()
+        );
+        // A root descriptor is not read through the heap at all.
+        let mut descriptor = uav(0, 8);
+        descriptor.root = RootType::Descriptor;
+        assert!(state.would_write(true, [descriptor].iter()).is_empty());
+    }
+
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;

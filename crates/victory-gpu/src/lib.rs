@@ -30,6 +30,8 @@ mod draw;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
+#[cfg(windows)]
+mod feeds;
 pub mod fence;
 pub mod frame;
 mod hold;
@@ -56,6 +58,8 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod shown;
 pub mod signature;
 mod switch;
 #[cfg(windows)]

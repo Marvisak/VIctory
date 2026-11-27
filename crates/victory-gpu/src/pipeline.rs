@@ -65,6 +65,9 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// The console resources its code reads, from the container alone.
+    #[cfg(windows)]
+    used: OnceLock<Vec<victory_shader::UsedResource>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -95,6 +98,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            used: OnceLock::new(),
         }
     }
 
@@ -151,6 +156,15 @@ impl Shader {
             })
             .as_ref()
     }
+
+    /// The console resources its code reads, without translating it (the
+    /// container's own records, read once).
+    pub(crate) fn used(&self) -> &[victory_shader::UsedResource] {
+        self.used.get_or_init(|| match self.translated.get() {
+            Some(Some(t)) => t.used.clone(),
+            _ => container_used(&self.container).unwrap_or_default(),
+        })
+    }
 }
 
 /// This thread's processor time so far, user and kernel, in 100 ns units.
@@ -187,9 +201,18 @@ fn with_resources(
     container: &[u8],
     host: victory_shader::emit::HostShader,
 ) -> Result<Translated, String> {
+    Ok(Translated {
+        host,
+        used: container_used(container)?,
+    })
+}
+
+/// The console resources the program in `container` reads.
+#[cfg(windows)]
+fn container_used(container: &[u8]) -> Result<Vec<victory_shader::UsedResource>, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
+    Ok(match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => victory_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -202,8 +225,7 @@ fn with_resources(
             .map(|p| p.used)
             .unwrap_or_default(),
         None => Vec::new(),
-    };
-    Ok(Translated { host, used })
+    })
 }
 
 #[repr(C)]
@@ -254,6 +276,71 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// A title pipeline's pending host pipeline, as [`crate::feeds`] keeps it.
+#[cfg(windows)]
+pub(crate) type Waited = Arc<make::Pending>;
+
+/// Whether the host pipeline of `this` is being made (not made, not
+/// refused).
+#[cfg(windows)]
+pub(crate) fn being_made(this: This) -> bool {
+    !this.is_null() && make::being_made(&pipeline(this).host)
+}
+
+/// The console resources the shaders of `this` read, without translating
+/// them.
+#[cfg(windows)]
+pub(crate) fn used(this: This) -> impl Iterator<Item = &'static victory_shader::UsedResource> {
+    let p: &'static Pipeline = pipeline(this);
+    p.shaders.iter().flat_map(|s| s.used())
+}
+
+/// A draw or dispatch with `this`, which would have written `writes`
+/// (title resources: targets, unordered views), was dropped for want of a
+/// host pipeline. If that pipeline is being made, the frame notes the pass
+/// ([`crate::feeds`]); if it wrote an image the title presents, the image
+/// is not shown until written again and the pipeline goes to the head of
+/// the workers' queue ([`crate::shown`]).
+#[cfg(windows)]
+pub(crate) fn dropped_into(this: This, writes: &[usize]) {
+    if !being_made(this) {
+        return;
+    }
+    let p = pipeline(this);
+    crate::feeds::dropped(this as usize, &p.host, writes);
+    if crate::shown::dropped(writes, || format!("{:?}", p.shaders)) && make::hurry(&p.host) {
+        tracing::info!(shaders = ?p.shaders, "made first: a presented image waits for it");
+    }
+}
+
+/// Whether the pending pipeline `w` could still go to the head of the
+/// workers' queue (queued, not made, not taken, not put there before).
+#[cfg(windows)]
+pub(crate) fn may_hurry(w: &Waited) -> bool {
+    make::may_hurry(w)
+}
+
+/// Whether the pending pipeline `w` has no answer yet (neither made nor
+/// refused): only such a writer still leaves what it wrote stale, so only
+/// it counts against [`crate::feeds`]'s cap on one resource's writers.
+#[cfg(windows)]
+pub(crate) fn pending(w: &Waited) -> bool {
+    make::being_made(w)
+}
+
+/// Puts the pending pipelines in `feeders`, nearest first, at the head of
+/// the workers' queue: the frame's dropped passes whose writes the
+/// presented image reads ([`crate::feeds`]).
+#[cfg(windows)]
+pub(crate) fn hurry_feeders(feeders: &[Waited]) {
+    // The nearest last, to be at the head.
+    let hurried: Vec<_> = feeders.iter().rev().filter(|w| make::hurry(w)).collect();
+    if !hurried.is_empty() {
+        let shaders: Vec<_> = hurried.iter().rev().map(|w| w.shaders()).collect();
+        tracing::info!(?shaders, "made first: passes the presented image reads wait for them");
+    }
 }
 
 /// Host pipelines queued and not made yet.
