@@ -37,6 +37,13 @@ impl Source<'_> {
     }
 }
 
+/// The runtime's short BLAKE3 of an already parsed container. A raw source
+/// can include more of the enclosing file after its declared DXBC size.
+pub(crate) fn container_hash(bytes: &[u8]) -> String {
+    let size = u32::from_le_bytes(bytes[0x18..0x1c].try_into().expect("size checked by parse"));
+    blake3::hash(&bytes[..size as usize]).to_hex()[..16].to_owned()
+}
+
 /// The packed records of SGD5 data, and every container stored as is (the
 /// executable keeps some records uncompressed), found by its magic.
 pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
@@ -132,8 +139,6 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
                     Some(Ok(programs)) if !programs.is_empty() => {
                         t.with_native += 1;
                         let mut list = Vec::new();
-                        // `parse` checked the size field against the data.
-                        let size = u32::from_le_bytes(bytes[0x18..0x1c].try_into()?) as usize;
                         let name = match &source {
                             Source::Raw { offset, .. } => {
                                 let file = path.file_name().unwrap_or_default();
@@ -141,7 +146,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool, effects: bool) -> R
                             }
                             Source::Packed(r) => r.name.unwrap_or("?").to_owned(),
                         };
-                        let id = format!("{}:{name}", &blake3::hash(&bytes[..size]).to_hex()[..16]);
+                        let id = format!("{}:{name}", container_hash(&bytes));
                         if let Source::Packed(r) = &source
                             && let Some(&hash) = engine.get(&r.offset)
                         {

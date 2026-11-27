@@ -115,6 +115,18 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// The refused program's declared geometry, including for a cached refusal.
+    fn refused_compute_threads(&self) -> Option<[u32; 3]> {
+        if self.stage != "compute" {
+            return None;
+        }
+        let program = native_program(&self.container).ok().flatten()?;
+        match program.io {
+            victory_shader::native::StageIo::Cs(cs) => Some(cs.threads),
+            _ => None,
+        }
+    }
+
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -140,6 +152,7 @@ impl Shader {
                         stage = self.stage,
                         hash = %self.hash,
                         error = %e,
+                        numthreads = self.refused_compute_threads().map(tracing::field::debug),
                         cached,
                         ms,
                         user_ms,
@@ -187,23 +200,31 @@ fn with_resources(
     container: &[u8],
     host: victory_shader::emit::HostShader,
 ) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
-    let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
-        Some(part) => victory_shader::native_programs(part.data)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|p| {
-                matches!(
-                    p.stage,
-                    HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-                )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
+    let used = native_program(container)
+        .map_err(|e| e.to_string())?
+        .map(|p| p.used)
+        .unwrap_or_default();
     Ok(Translated { host, used })
+}
+
+/// The same first supported program as `victory_shader::emit::translate_with`.
+#[cfg(windows)]
+fn native_program(
+    container: &[u8],
+) -> Result<Option<victory_shader::NativeProgram>, victory_shader::ShaderError> {
+    use victory_shader::{Container, FourCC, HwStage};
+    let c = Container::parse(container)?;
+    let Some(part) = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) else {
+        return Ok(None);
+    };
+    Ok(victory_shader::native_programs(part.data)?
+        .into_iter()
+        .find(|p| {
+            matches!(
+                p.stage,
+                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+            )
+        }))
 }
 
 #[repr(C)]

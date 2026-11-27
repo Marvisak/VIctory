@@ -506,7 +506,9 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    let mut hash = None;
     for p in programs {
+        let first_line = t.lines.len();
         t.programs += 1;
         match victory_shader::range::build(&p.patched_code(), p.wave64, p.vgprs) {
             Ok((program, structured)) => {
@@ -588,6 +590,17 @@ fn translate(
                     e => e.to_string(),
                 };
                 t.fail(reason, || format!("{} {:?}", example(), p.stage));
+            }
+        }
+        // A program may produce several list rows. Keep its failure summary
+        // and the labels used for shader dumps and pipeline pairs unchanged.
+        if t.list
+            && let victory_shader::native::StageIo::Cs(cs) = &p.io
+        {
+            let hash = hash.get_or_insert_with(|| crate::shader::container_hash(&bytes));
+            let suffix = format!("  hash={hash} numthreads={:?}", cs.threads);
+            for line in &mut t.lines[first_line..] {
+                line.push_str(&suffix);
             }
         }
     }
