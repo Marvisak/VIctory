@@ -72,6 +72,9 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// The declared `WaveSize` attribute, if any.
+    #[cfg(test)]
+    pub wave_size: Option<u32>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -575,11 +578,26 @@ impl<'a> Lower<'a> {
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || {
-                // Masks held as numbers or constant lane sets: the lane
-                // tests its own bit by its console lane.
+                // Masks held as numbers: the lane tests its own bit by its
+                // console lane. Constant lane sets in compute/mesh shaders use
+                // `flattenedThreadIdInGroup & (wave - 1)` without forcing
+                // `WaveSize(64)`.
                 let whens = x.st.exits.iter().filter_map(|e| match *e {
                     LaneExit::Branch { when, .. } => Some(when),
                     _ => None,
+                });
+                let cndmasks = insts().filter_map(|i| {
+                    let Fields::Valu(v) = &i.fields else {
+                        return None;
+                    };
+                    if i.name() != "v_cndmask_b32" {
+                        return None;
+                    }
+                    let Some(&Operand::Scalar { code, .. }) = v.src.get(2) else {
+                        return None;
+                    };
+                    let m = i.read(Reg::S(code))?;
+                    x.st.masks.get(&m).or_else(|| x.st.other.get(&m)).copied()
                 });
                 let mut all: Vec<Bool> =
                     x.st.guards
@@ -588,6 +606,7 @@ impl<'a> Lower<'a> {
                         .flatten()
                         .copied()
                         .chain(whens)
+                        .chain(cndmasks)
                         .collect();
                 all.sort_unstable();
                 all.dedup();
@@ -595,7 +614,7 @@ impl<'a> Lower<'a> {
                     x.st.bools
                         .support(g)
                         .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                        .any(|a| matches!(a, Atom::Opaque(_)))
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
@@ -1412,6 +1431,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            wave_size: self.s.wave_size,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2611,6 +2632,12 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
+            Atom::Constant(k) if self.s.threads.is_some() => {
+                let lo = self.s.m.i32(k as u32);
+                let hi = self.s.m.i32((k >> 32) as u32);
+                let lane = self.flat_console_lane(at);
+                Ok(self.lane_bit_of(at, lane, lo, hi))
+            }
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
@@ -3008,6 +3035,14 @@ impl<'a> Lower<'a> {
         );
         self.flat = Some(f);
         f
+    }
+
+    /// Console lane index (`0..wave`) from the thread's flat group index, for
+    /// compute and mesh shaders that do not relabel threads (`!console_lanes`).
+    fn flat_console_lane(&mut self, at: usize) -> V {
+        let f = self.mesh_thread();
+        let mask = self.s.m.i32(self.wave() - 1);
+        self.s.m.bin(at, Bin::And, f, mask)
     }
 
     /// The console wave size.
@@ -6554,6 +6589,11 @@ impl<'a> Lower<'a> {
                             let lo = self.s.m.i32(x);
                             let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
                             self.lane_bit(c, lo, Some(hi))
+                        } else if self.s.threads.is_some() {
+                            let lo = self.s.m.i32(x);
+                            let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
+                            let lane = self.flat_console_lane(c);
+                            self.lane_bit_of(c, lane, lo, hi)
                         } else {
                             return Err("a constant lane mask");
                         }
@@ -12209,3 +12249,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "const_mask_tests.rs"]
+mod const_mask_tests;
