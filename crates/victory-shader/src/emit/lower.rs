@@ -6335,6 +6335,18 @@ impl<'a> Lower<'a> {
                     22 => self.fract(a, 1.0, f32::from_bits(0x3F7F_FFFF)),
                     _ => self.unary(op, a),
                 };
+                let r = if matches!(op, 23..=25) {
+                    // An invalid negative input of v_log/v_sqrt/v_rsq_f32 gives
+                    // the negative quiet NaN 0xffc00000 on RDNA2 (measured on
+                    // gfx1030 by the Leonida project), while D3D12 hosts return
+                    // 0x7fffffff (NVIDIA) or 0xffffffff (WARP for log2).
+                    let zero = self.s.m.f32(0);
+                    let neg = self.s.m.cmp(c, pred::OLT, a, zero);
+                    let qnan = self.s.m.f32(0xFFC0_0000);
+                    self.s.m.select(c, neg, qnan, r)
+                } else {
+                    r
+                };
                 float(self, r)
             }
             "v_cvt_i32_f32" | "v_cvt_u32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
