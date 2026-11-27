@@ -1,8 +1,8 @@
 //! A pixel program's lane-mask loop at a triangle edge: on the console the
 //! helper lanes of whole-quad mode are in EXEC and are served like the
 //! others, so quad reads of their results give the neighbour's value. On
-//! the host, wave operations leave helper lanes out (before shader model
-//! 6.7's `WaveOpsIncludeHelperLanes`).
+//! the host, wave operations leave helper lanes out unless the program asks
+//! for them (shader model 6.7's `WaveOpsIncludeHelperLanes`).
 
 use super::container::{SigElement, signature};
 use super::host::{Draw, Host};
@@ -112,14 +112,13 @@ fn translate(native: &NativeProgram, inputs: &[SigElement], outputs: &[SigElemen
     h
 }
 
-/// Open: the keys a lane-mask loop serves should reach the helper lanes at
-/// a triangle edge, so that a quad read of a helper's result gives its key,
-/// as on the console. The host's ballots leave helpers out, so a helper is
-/// never served and its neighbour reads 0: on main, 8 of 136 pixels on a
-/// Radeon 780M (RDNA3) and 18 on WARP; 0 on both with the wave operations
-/// over helper lanes of #2373 (shader model 6.7).
+/// The keys a lane-mask loop serves reach the helper lanes at a triangle
+/// edge, so a quad read of a helper's result gives its key, as on the
+/// console. Needs a host with shader model 6.7 (wave operations over helper
+/// lanes). Was a defect: the host's ballots left helpers out, so a helper
+/// was never served and its neighbour read 0 (8 of 136 pixels on a Radeon
+/// 780M, RDNA3, and 18 on WARP).
 #[test]
-#[ignore = "defect: lane-mask loops in pixel programs leave helper lanes unserved"]
 fn lane_mask_loops_serve_helper_lanes_at_a_triangle_edge() {
     // A host first: translation may depend on what the device supports.
     let _ = Host::new(false);

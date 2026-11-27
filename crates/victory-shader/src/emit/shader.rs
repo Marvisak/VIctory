@@ -911,7 +911,10 @@ impl Shader {
         let minor_c = i32c(&mut self, minor);
         let version = self.m.md_node(vec![Some(one), Some(minor_c)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        // The container's parts are written as validator 1.6 does (see
+        // `container::signature`), whatever the shader model.
+        let valver = self.m.md_node(vec![Some(one), Some(six)]);
+        self.m.named_md("dx.valver", vec![valver]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
