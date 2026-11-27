@@ -19,6 +19,7 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
@@ -872,10 +873,13 @@ extern "system" fn submit(
     data: *const c_void,
     notification: u32,
 ) -> HRESULT {
-    static SEEN: Mutex<u64> = Mutex::new(0);
-    if command < 64 && *lock(&SEEN) & 1 << command == 0 {
-        *lock(&SEEN) |= 1 << command;
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let bit = 1u64.checked_shl(command).unwrap_or(0);
+    if bit != 0 && SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
         tracing::info!(command, "first coprocessor command of this kind");
+        if command == LOAD_FLOWGRAPH {
+            tracing::warn!(command, "audio flowgraph acknowledged without host processing");
+        }
     }
     let mut state = state(this);
     let word = |at: usize| -> Option<u32> {
