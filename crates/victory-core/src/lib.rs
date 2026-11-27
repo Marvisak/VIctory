@@ -4,9 +4,11 @@
 //! * [`policy`]: the runtime half of rule #1, refusing to write
 //!   game-derived data into the source tree.
 //! * [`logging`]: one tracing setup for all binaries.
+//! * [`pad`]: the keys of the keyboard's stand-in gamepad.
 
 pub mod config;
 pub mod logging;
+pub mod pad;
 pub mod policy;
 
 pub use config::Config;

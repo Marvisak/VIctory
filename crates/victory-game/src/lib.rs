@@ -5,6 +5,7 @@
 
 pub mod cityhash;
 pub mod pipelines;
+pub mod prompts;
 pub mod sgd5;
 pub mod shaderpack;
 
@@ -17,6 +18,8 @@ pub struct KnownBuild {
     pub blake3: &'static str,
     /// RPF9 archive the title needs during startup, relative to its executable.
     pub startup_archive: &'static str,
+    /// Where the build keeps what the keyboard prompts hook needs.
+    pub key_prompts: Option<prompts::HookOffsets>,
 }
 
 /// Executables identified from a local package.
@@ -24,6 +27,10 @@ pub const KNOWN_BUILDS: &[KnownBuild] = &[KnownBuild {
     label: "Series 1.0.2.1",
     blake3: "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93",
     startup_archive: "appdata0.rpf",
+    key_prompts: Some(prompts::HookOffsets {
+        movie_address_builder: prompts::PointerOffset(0x62f_3388),
+        string_assign: prompts::CodeOffset(0xeb_ba60),
+    }),
 }];
 
 /// Looks up a build by the BLAKE3 hash of its executable.

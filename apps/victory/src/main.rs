@@ -116,6 +116,10 @@ enum Command {
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
+        /// What the title's button prompts show: its gamepad pictures, or
+        /// the keys of the keyboard's stand-in gamepad.
+        #[arg(long, value_enum, default_value_t = Prompts::Gamepad)]
+        prompts: Prompts,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -135,6 +139,12 @@ enum Unimplemented {
 enum Console {
     SeriesX,
     SeriesS,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Prompts {
+    Gamepad,
+    Keys,
 }
 
 /// Diagnostics: the heap bytes Rust code holds, for the statistics.
@@ -195,9 +205,17 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
+            prompts,
             title_args: _,
         } => {
-            let code = run::run(&exe, unimplemented, strict, execute, console)?;
+            let launch = run::Launch {
+                unimplemented,
+                strict,
+                execute,
+                console,
+                prompts,
+            };
+            let code = run::run(&exe, &launch)?;
             if code != 0 {
                 // Preserve all 32 bits of the Windows process status.
                 std::process::exit(code as i32);

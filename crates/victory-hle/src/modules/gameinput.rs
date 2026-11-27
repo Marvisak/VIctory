@@ -1,6 +1,6 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
 //! (host slots 0-3); while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
+//! stand-in gamepad (`victory_core::pad`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
+
+use victory_core::pad::{PadControl, fallback_key};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
@@ -61,24 +63,37 @@ const DEVICES: usize = PADS + 2;
 const HISTORY: usize = 32;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
-    (0x1B, MENU), // Esc
-    (0x09, VIEW), // Tab
-    (0x0D, A),    // Enter
-    (0x08, B),    // Backspace
-    (b'X', X),
-    (b'Y', Y),
-    (0x26, UP), // arrows
-    (0x28, DOWN),
-    (0x25, LEFT),
-    (0x27, RIGHT),
-    (b'Q', LEFT_SHOULDER),
-    (b'E', RIGHT_SHOULDER),
-    (b'F', LEFT_STICK),
-    (b'H', RIGHT_STICK),
-];
+/// A control's bit in a reading's buttons; `None` for a trigger or a stick
+/// direction, which are axes.
+const fn button(control: PadControl) -> Option<u32> {
+    use PadControl as C;
+    Some(match control {
+        C::Menu => MENU,
+        C::View => VIEW,
+        C::A => A,
+        C::B => B,
+        C::X => X,
+        C::Y => Y,
+        C::Up => UP,
+        C::Down => DOWN,
+        C::Left => LEFT,
+        C::Right => RIGHT,
+        C::LeftShoulder => LEFT_SHOULDER,
+        C::RightShoulder => RIGHT_SHOULDER,
+        C::LeftStick => LEFT_STICK,
+        C::RightStick => RIGHT_STICK,
+        C::LeftTrigger
+        | C::RightTrigger
+        | C::LeftStickUp
+        | C::LeftStickDown
+        | C::LeftStickLeft
+        | C::LeftStickRight
+        | C::RightStickUp
+        | C::RightStickDown
+        | C::RightStickLeft
+        | C::RightStickRight => return None,
+    })
+}
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
@@ -121,24 +136,25 @@ trait Source: Send {
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
+    let on = |control: PadControl| {
+        if keys.iter().any(|k| k.virtual_key == fallback_key(control)) {
             1.0
         } else {
             0.0
         }
     };
     PadState {
-        buttons: FALLBACK_BUTTONS
+        buttons: PadControl::ALL
             .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
+            .filter_map(|&control| Some((control, button(control)?)))
+            .filter(|&(control, _)| on(control) != 0.0)
             .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
-        left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
+        left_trigger: on(PadControl::LeftTrigger),
+        right_trigger: on(PadControl::RightTrigger),
+        left_x: on(PadControl::LeftStickRight) - on(PadControl::LeftStickLeft),
+        left_y: on(PadControl::LeftStickUp) - on(PadControl::LeftStickDown),
+        right_x: on(PadControl::RightStickRight) - on(PadControl::RightStickLeft),
+        right_y: on(PadControl::RightStickUp) - on(PadControl::RightStickDown),
     }
 }
 
@@ -1276,19 +1292,22 @@ mod host {
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
+        use victory_core::pad::{
+            VK_BACK, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP,
+        };
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
                 let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
+                    "Enter" => VK_RETURN,
+                    "Esc" => VK_ESCAPE,
+                    "Tab" => VK_TAB,
+                    "Back" => VK_BACK,
+                    "Up" => VK_UP,
+                    "Down" => VK_DOWN,
+                    "Left" => VK_LEFT,
+                    "Right" => VK_RIGHT,
                     k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
                         k.as_bytes()[0].to_ascii_uppercase()
                     }
@@ -1611,6 +1630,49 @@ mod tests {
         assert_eq!(walk(hub, 0x30, pad_a), Err(READING_NOT_FOUND));
         for r in order {
             release(r);
+        }
+    }
+
+    #[test]
+    fn each_control_of_the_stand_in_pad_has_the_key_the_readme_lists() {
+        use PadControl as C;
+        let rest = PadState::default();
+        let button = |buttons| PadState { buttons, ..rest };
+        let pad = |set: fn(&mut PadState)| {
+            let mut state = rest;
+            set(&mut state);
+            state
+        };
+        let expected = [
+            (C::Menu, 0x1B, button(MENU)),
+            (C::View, 0x09, button(VIEW)),
+            (C::A, 0x0D, button(A)),
+            (C::B, 0x08, button(B)),
+            (C::X, b'X', button(X)),
+            (C::Y, b'Y', button(Y)),
+            (C::Up, 0x26, button(UP)),
+            (C::Down, 0x28, button(DOWN)),
+            (C::Left, 0x25, button(LEFT)),
+            (C::Right, 0x27, button(RIGHT)),
+            (C::LeftShoulder, b'Q', button(LEFT_SHOULDER)),
+            (C::RightShoulder, b'E', button(RIGHT_SHOULDER)),
+            (C::LeftStick, b'F', button(LEFT_STICK)),
+            (C::RightStick, b'H', button(RIGHT_STICK)),
+            (C::LeftTrigger, b'Z', pad(|pad| pad.left_trigger = 1.0)),
+            (C::RightTrigger, b'C', pad(|pad| pad.right_trigger = 1.0)),
+            (C::LeftStickUp, b'W', pad(|pad| pad.left_y = 1.0)),
+            (C::LeftStickDown, b'S', pad(|pad| pad.left_y = -1.0)),
+            (C::LeftStickLeft, b'A', pad(|pad| pad.left_x = -1.0)),
+            (C::LeftStickRight, b'D', pad(|pad| pad.left_x = 1.0)),
+            (C::RightStickUp, b'I', pad(|pad| pad.right_y = 1.0)),
+            (C::RightStickDown, b'K', pad(|pad| pad.right_y = -1.0)),
+            (C::RightStickLeft, b'J', pad(|pad| pad.right_x = -1.0)),
+            (C::RightStickRight, b'L', pad(|pad| pad.right_x = 1.0)),
+        ];
+        assert_eq!(expected.map(|(control, ..)| control), PadControl::ALL);
+        for (control, virtual_key, state) in expected {
+            assert_eq!(fallback_key(control), virtual_key, "{control:?}");
+            assert_eq!(fallback(&[key(virtual_key)]), state, "{control:?}");
         }
     }
 

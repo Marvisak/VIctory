@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use victory_loader::{
-    ImportResolver, Provenance, Resolution, UnimplementedPolicy, WithTitleDlls, prepare,
+    ImportResolver, Provenance, Resolution, SlotError, UnimplementedPolicy, WithTitleDlls, prepare,
     unimplemented_call_count,
 };
 use victory_pe::ImportSymbol;
@@ -161,6 +161,56 @@ fn loads_binds_and_calls_probe() {
     assert!(report.host > 0);
     assert_eq!(report.missing.len(), 1);
     assert_eq!(report.missing[0].symbol, "VIctoryProbeNotImplemented");
+
+    // A hook's pointer swap, on a bound import slot, and put back. No
+    // title thread runs: the probe's code is only called below.
+    let slot = image.info().imports[0].entries[0].iat_slot_rva;
+    let size = image.info().size_of_image;
+    // SAFETY: nothing runs the probe's code until the slot is put back.
+    unsafe {
+        let bound = image.read_pointer(slot).unwrap();
+        assert_ne!(bound, 0);
+        image.write_pointer(slot, 0x1234_5678).unwrap();
+        assert_eq!(image.read_pointer(slot).unwrap(), 0x1234_5678);
+        image.write_pointer(slot, bound).unwrap();
+        assert_eq!(image.read_pointer(slot).unwrap(), bound);
+        // Aligned, but at the end of the image or where offsets wrap.
+        for outside in [size, u32::MAX - 7] {
+            assert!(
+                matches!(
+                    image.read_pointer(outside),
+                    Err(SlotError::OutsideImage { .. })
+                ),
+                "{outside:#x}"
+            );
+        }
+        assert!(matches!(
+            image.write_pointer(size, 0),
+            Err(SlotError::OutsideImage { .. })
+        ));
+        assert!(matches!(
+            image.write_pointer(slot + 4, 0),
+            Err(SlotError::Misaligned { .. })
+        ));
+        // Code is no pointer slot, and a pointer slot is no code.
+        let entry = image.info().entry_rva;
+        assert!(matches!(
+            image.read_pointer(entry & !7),
+            Err(SlotError::NotData { .. })
+        ));
+        assert_eq!(
+            image.code_address(entry).unwrap(),
+            image.base() + entry as usize
+        );
+        assert!(matches!(
+            image.code_address(slot),
+            Err(SlotError::NotCode { .. })
+        ));
+        assert!(matches!(
+            image.code_address(size),
+            Err(SlotError::OutsideImage { .. })
+        ));
+    }
 
     let call = |name: &str| -> usize { image.export(name).unwrap_or_else(|| panic!("{name}")) };
     // SAFETY: the exports have the signatures declared in the fixture and

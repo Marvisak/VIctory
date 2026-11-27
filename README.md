@@ -45,7 +45,7 @@ What each part does today and what it still needs:
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
+| Input | XInput pads, keyboard, keyboard stand-in pad; button prompts as keyboard keys with `--prompts keys` (seen on the first screen) | Trigger rumble; key prompts on other screens are unverified, and the animated prompts keep their gamepad pictures |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address, depth written from compute, lists that wait for values other queues write, textures made when a shader first reads them, pipelines pre-built or made by worker threads and kept on disk, depth bounds on supporting adapters (synthetic tests) | The title's ray-tracing structures are never built (no ray-traced shadows or indirect light in the intro cutscene); about 1 s a frame; draws of untranslated shaders are dropped; real queries, HDR and scaling are missing |
@@ -143,6 +143,12 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+The title's button prompts show gamepad buttons. `victory run ... --prompts
+keys` draws the keys of the table above in their place (the Y key for Y, an
+Enter sign for A), with fonts of the host. It needs a known build; the
+`prompts` line of the output says whether the hook is placed, and the log
+says when the title's prompt pictures were redrawn.
+
 ## Commands
 
 ```
@@ -153,7 +159,8 @@ victory shader-info [paths...] [--verbose] [--disasm] [--effects]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 victory translate [paths...] --cache [--pipelines] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
+            [--console series-x|series-s] [--prompts gamepad|keys]
+            [-- <title arguments>]
 victory config
 ```
 

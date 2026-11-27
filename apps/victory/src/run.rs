@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::{Console, Unimplemented};
+use crate::{Console, Prompts, Unimplemented};
 
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
@@ -35,17 +35,28 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+/// How `victory run` loads and starts the title: the command's options.
+pub struct Launch {
+    pub unimplemented: Unimplemented,
+    pub strict: bool,
+    pub execute: bool,
+    pub console: Console,
+    pub prompts: Prompts,
+}
+
 #[cfg(windows)]
-pub fn run(
-    exe: &Path,
-    unimplemented: Unimplemented,
-    strict: bool,
-    execute: bool,
-    console: Console,
-) -> Result<u32> {
+pub fn run(exe: &Path, launch: &Launch) -> Result<u32> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
+
+    let &Launch {
+        unimplemented,
+        strict,
+        execute,
+        console,
+        prompts,
+    } = launch;
 
     if execute {
         check_cpu_features()?;
@@ -66,7 +77,8 @@ pub fn run(
     )?;
     let hash = prepared.original_hash.to_hex();
     let title_dir = exe.parent().unwrap_or(Path::new("."));
-    match victory_game::identify(&hash) {
+    let build = victory_game::identify(&hash);
+    match build {
         Some(build) => {
             println!("build          {} ({hash})", build.label);
             if execute {
@@ -172,6 +184,13 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    match prompts {
+        Prompts::Gamepad => {}
+        Prompts::Keys if execute => show_keys_in_prompts(&image, build),
+        Prompts::Keys => {
+            println!("prompts        keyboard keys: the hook is placed only with --execute");
+        }
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(0);
@@ -199,6 +218,32 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(code)
+}
+
+/// `--prompts keys`: places the hook that hands the title key caps for its
+/// button pictures, and says whether it is placed. Before the title starts.
+#[cfg(windows)]
+fn show_keys_in_prompts(
+    image: &victory_loader::LoadedImage,
+    build: Option<&victory_game::KnownBuild>,
+) {
+    let Some(build) = build else {
+        println!("prompts        gamepad pictures: the keys need a known build");
+        return;
+    };
+    let Some(offsets) = build.key_prompts else {
+        println!(
+            "prompts        gamepad pictures: no keys for {}",
+            build.label
+        );
+        return;
+    };
+    // SAFETY: the image of the build the offsets belong to is mapped and
+    // bound, and no title thread runs yet.
+    match unsafe { victory_game::prompts::hook::install(image, offsets) } {
+        Ok(()) => println!("prompts        keyboard keys: hook placed"),
+        Err(refused) => println!("prompts        gamepad pictures: {refused}"),
+    }
 }
 
 #[cfg(windows)]
@@ -553,6 +598,6 @@ mod cpu_check_tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<u32> {
+pub fn run(_: &Path, _: &Launch) -> Result<u32> {
     anyhow::bail!("running titles requires Windows")
 }

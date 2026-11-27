@@ -684,6 +684,12 @@ version = "0.1.0"
 dependencies = [
  "memchr",
  "miniz_oxide",
+ "thiserror",
+ "tracing",
+ "victory-core",
+ "victory-formats",
+ "victory-loader",
+ "windows-sys",
 ]
 
 [[package]]
@@ -710,6 +716,7 @@ dependencies = [
  "opus-pure",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
  "victory-gpu",
  "victory-loader",
