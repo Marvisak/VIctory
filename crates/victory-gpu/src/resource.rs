@@ -1546,6 +1546,82 @@ const NEVER: u64 = u64::MAX;
 const BUDGET_HIGH: f64 = 0.90;
 #[cfg(windows)]
 const BUDGET_LOW: f64 = 0.85;
+/// Past this share of Windows system commit limit, evict LRU title-backed
+/// textures until commit is back under [`COMMIT_LOW`]: on 16 GB RAM hosts
+/// with large VRAM GPUs, WDDM commit backing can exhaust system commit
+/// before VRAM hits [`BUDGET_HIGH`].
+#[cfg(windows)]
+const COMMIT_HIGH: f64 = 0.85;
+#[cfg(windows)]
+const COMMIT_LOW: f64 = 0.80;
+
+#[cfg(windows)]
+fn commit_evict_enabled_for(val: Option<&str>) -> bool {
+    val.is_some_and(|v| {
+        let v = v.trim();
+        !v.is_empty() && v != "0"
+    })
+}
+
+#[cfg(windows)]
+fn commit_evict_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !cfg!(test) && commit_evict_enabled_for(std::env::var("VICTORY_COMMIT_EVICT").ok().as_deref())
+    })
+}
+
+#[cfg(windows)]
+fn commit_over_bytes_for(
+    commit_total: usize,
+    commit_limit: usize,
+    page_size: usize,
+    placement_free_bytes: u64,
+) -> u64 {
+    if commit_limit == 0 || page_size == 0 {
+        return 0;
+    }
+    let total = commit_total as f64;
+    let limit = commit_limit as f64;
+    if total > COMMIT_HIGH * limit {
+        let raw = ((total - COMMIT_LOW * limit) * page_size as f64).max(0.0) as u64;
+        raw.saturating_sub(placement_free_bytes)
+    } else {
+        0
+    }
+}
+
+#[cfg(windows)]
+fn system_commit_over(placement_free_bytes: u64) -> u64 {
+    if !commit_evict_enabled() {
+        return 0;
+    }
+    use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
+    let mut info = PERFORMANCE_INFORMATION {
+        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `info` is a valid writable PERFORMANCE_INFORMATION of size `info.cb`.
+    if unsafe { K32GetPerformanceInfo(&mut info, info.cb) } == 0 {
+        return 0;
+    }
+    commit_over_bytes_for(info.CommitTotal, info.CommitLimit, info.PageSize, placement_free_bytes)
+}
+
+#[cfg(windows)]
+fn texture_budget_bytes_for(val: Option<&str>) -> Option<u64> {
+    val.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0)
+        .map(|mb| mb.saturating_mul(1 << 20))
+}
+
+#[cfg(windows)]
+fn texture_budget_bytes() -> Option<u64> {
+    static CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        texture_budget_bytes_for(std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok().as_deref())
+    })
+}
 /// A texture made again within this many frames of being given up counts
 /// as remade soon ([`EVICTIONS`]): too eager an [`IDLE_MS`].
 #[cfg(windows)]
@@ -1593,41 +1669,49 @@ pub(crate) fn evict_unused() {
     if LAST.swap(frame, Relaxed) == frame {
         return;
     }
-    let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
+    let free = crate::placement::free_bytes();
+    let vram_over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
         // Free space in the heaps of textures takes the card's memory but
         // is not in use: new textures go there first.
-        let used = used - crate::placement::free_bytes() as f64 / 1e6;
+        let used = used - free as f64 / 1e6;
         if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
     });
-    evict(frame, now_ms(), over);
+    let commit_over = system_commit_over(free);
+    let cands = candidates();
+    let cap_over = texture_budget_bytes().map_or(0, |cap| {
+        let live: u64 = cands.iter().map(|(t, _)| t.bytes).sum();
+        live.saturating_sub(cap)
+    });
+    let pressure_over = commit_over.max(cap_over);
+    let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
+    evict_among_with_pressure(&cands, &read, frame, now_ms(), vram_over, pressure_over);
 }
 
 /// A host texture and the title textures (resource objects) holding it.
 #[cfg(windows)]
 pub(crate) type Owned = (std::sync::Arc<HostTexture>, Vec<usize>);
 
-/// Gives up the host textures fed from title memory that the title has
-/// not used for [`IDLE_MS`] and [`IDLE_FRAMES`] at (`frame`, `now` ms),
-/// then least recently used ones until `over` bytes are gone
-/// ([`give_up`]). Returns how many and their bytes.
-#[cfg(windows)]
-fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
-    // Read through the heap since the last pass: used (a slot's read mark is
-    // reported as new only once, so its first read alone stamped it; run
-    // evict1 gave up and made again hundreds of textures a frame).
-    let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
-    evict_among(&candidates(), &read, frame, now, over)
-}
-
-/// [`evict`] among `candidates`, with `read` (raw pointers) the host
+/// [`evict_unused`] among `candidates`, with `read` (raw pointers) the host
 /// textures shaders read through the heap since the last pass.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 pub(crate) fn evict_among(
     candidates: &[Owned],
     read: &std::collections::HashSet<usize>,
     frame: u64,
     now: u64,
     over: u64,
+) -> (u64, u64) {
+    evict_among_with_pressure(candidates, read, frame, now, over, 0)
+}
+
+#[cfg(windows)]
+fn evict_among_with_pressure(
+    candidates: &[Owned],
+    read: &std::collections::HashSet<usize>,
+    frame: u64,
+    now: u64,
+    vram_over: u64,
+    pressure_over: u64,
 ) -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     for (t, _) in candidates {
@@ -1637,7 +1721,7 @@ pub(crate) fn evict_among(
     }
     let uses: Vec<(u64, u64, u64)> =
         candidates.iter().map(|(t, _)| (t.last[0].load(Relaxed), t.last[1].load(Relaxed), t.bytes)).collect();
-    let chosen = choose(&uses, frame, now, over);
+    let chosen = choose_with_pressure(&uses, frame, now, vram_over, pressure_over);
     let gone: Vec<Owned> = chosen.into_iter().map(|i| candidates[i].clone()).collect();
     give_up(&gone, frame)
 }
@@ -1660,17 +1744,41 @@ fn candidates() -> Vec<Owned> {
 /// up at (`frame`, `now`): every one idle for [`IDLE_FRAMES`] and
 /// [`IDLE_MS`], then the least recently used others until `over` bytes are
 /// gone (indices).
+#[cfg(test)]
 fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
+    choose_with_pressure(uses, frame, now, over, 0)
+}
+
+/// Like [`choose`], plus optional `pressure_over` (system commit pressure or
+/// explicit texture budget) that never evicts textures used in the current or
+/// immediately preceding frame (`frame - last_frame <= 1`) to avoid thrashing
+/// active-frame textures under persistent external commit pressure.
+fn choose_with_pressure(
+    uses: &[(u64, u64, u64)],
+    frame: u64,
+    now: u64,
+    vram_over: u64,
+    pressure_over: u64,
+) -> Vec<usize> {
     let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
     let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
-    let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
+    let idle_bytes: u64 = gone.iter().map(|&i| uses[i].2).sum();
+    let mut vram_rem = vram_over.saturating_sub(idle_bytes);
+    let mut press_rem = pressure_over.saturating_sub(idle_bytes);
     rest.sort_by_key(|&i| uses[i].1);
     for i in rest {
-        if over == 0 {
+        if vram_rem == 0 && press_rem == 0 {
             break;
         }
-        over = over.saturating_sub(uses[i].2);
-        gone.push(i);
+        let active_frame = uses[i].0 != NEVER && frame.saturating_sub(uses[i].0) <= 1;
+        if vram_rem > 0 {
+            vram_rem = vram_rem.saturating_sub(uses[i].2);
+            press_rem = press_rem.saturating_sub(uses[i].2);
+            gone.push(i);
+        } else if press_rem > 0 && !active_frame {
+            press_rem = press_rem.saturating_sub(uses[i].2);
+            gone.push(i);
+        }
     }
     gone
 }
@@ -3178,5 +3286,30 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn commit_pressure_and_texture_budget_compute_eviction_targets() {
+        assert!(!commit_evict_enabled_for(None));
+        assert!(!commit_evict_enabled_for(Some("0")));
+        assert!(commit_evict_enabled_for(Some("1")));
+        assert_eq!(commit_over_bytes_for(0, 0, 4096, 0), 0);
+        assert_eq!(commit_over_bytes_for(800, 1000, 4096, 0), 0);
+        assert_eq!(commit_over_bytes_for(850, 1000, 4096, 0), 0);
+        assert_eq!(commit_over_bytes_for(900, 1000, 4096, 0), 100 * 4096);
+        assert_eq!(commit_over_bytes_for(900, 1000, 4096, 40 * 4096), 60 * 4096);
+        assert_eq!(commit_over_bytes_for(900, 1000, 4096, 200 * 4096), 0);
+        assert_eq!(texture_budget_bytes_for(None), None);
+        assert_eq!(texture_budget_bytes_for(Some("0")), None);
+        assert_eq!(texture_budget_bytes_for(Some("2048")), Some(2048 << 20));
+
+        // Commit/cap pressure must never evict active-frame textures (frame - last <= 1).
+        let uses = [
+            (100, 10_000, 100), // active frame (delta 0) -> protected
+            (99, 9_900, 100),   // previous frame (delta 1) -> protected
+            (90, 9_000, 100),   // older (delta 10) -> evictable
+        ];
+        assert_eq!(choose_with_pressure(&uses, 100, 10_000, 0, 500), vec![2]);
     }
 }
