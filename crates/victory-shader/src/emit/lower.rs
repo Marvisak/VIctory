@@ -2198,7 +2198,16 @@ impl<'a> Lower<'a> {
         let op = if max { Bin::And } else { Bin::Or };
         let sign = self.s.m.bin(c, op, ia, ib);
         let signed = self.as_float(sign);
-        self.s.m.select(c, zeros, signed, r)
+        let r = self.s.m.select(c, zeros, signed, r);
+        // Keep the first NaN if both inputs are NaN. Classify on the bits
+        // so a host floating-point comparison cannot discard the NaN case.
+        let infinity = self.s.m.i32(0x7F80_0000);
+        let a_magnitude = self.s.m.bin(c, Bin::And, ia, magnitude);
+        let b_magnitude = self.s.m.bin(c, Bin::And, ib, magnitude);
+        let a_nan = self.s.m.cmp(c, pred::IUGT, a_magnitude, infinity);
+        let b_nan = self.s.m.cmp(c, pred::IUGT, b_magnitude, infinity);
+        let r = self.s.m.select(c, a_nan, b, r);
+        self.s.m.select(c, b_nan, a, r)
     }
 
     fn fmad(&mut self, a: V, b: V, c: V) -> V {

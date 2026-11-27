@@ -769,6 +769,110 @@ fn f16_max_and_min_order_negative_zero_below_positive_zero() {
     }
 }
 
+/// RDNA2 min/max with a NaN operand return the other operand; if both are
+/// NaN, keep the first operand's NaN. For 3-operand forms the NaN is
+/// ignored and the result is min/max of the remaining operands; if all are
+/// NaN, keep the first NaN (measured on RDNA2/WARP; DXIL FMax/FMin has the
+/// same semantics, but keep it explicit so driver quirks cannot turn NaNs
+/// into black pixels).
+#[test]
+fn max_and_min_treat_a_nan_as_the_other_operand() {
+    let nan = 0x7FC0_0001u32;
+    let nan2 = 0x7FC0_0002u32;
+    let nan3 = 0x7FC0_0003u32;
+    let negative_nan = 0xFFC0_0004u32;
+    let positive_inf = f32::INFINITY.to_bits();
+    let negative_inf = f32::NEG_INFINITY.to_bits();
+    let a = 1.0f32.to_bits();
+    let b = 2.0f32.to_bits();
+    // (inputs, 2-op want, max3 want, min3 want)
+    let cases = [
+        ([nan, a, b, 0], a, b, a),
+        ([a, nan, b, 0], a, b, a),
+        ([nan, nan2, b, 0], nan, b, b),
+        ([nan, nan2, nan3, 0], nan, nan, nan),
+        (
+            [negative_nan, nan2, nan3, 0],
+            negative_nan,
+            negative_nan,
+            negative_nan,
+        ),
+        (
+            [negative_nan, positive_inf, negative_inf, 0],
+            positive_inf,
+            positive_inf,
+            negative_inf,
+        ),
+    ];
+    let ops = [
+        ("v_max_f32", 0x110u16),
+        ("v_min_f32", 0x10F),
+        ("v_max3_f32", 0x154),
+        ("v_min3_f32", 0x151),
+    ];
+    for (name, op) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(
+            &shader,
+            &cases.iter().map(|c| c.0).collect::<Vec<_>>(),
+            |backend, i, inp, got| {
+                let want = match name {
+                    "v_max_f32" | "v_min_f32" => cases[i].1,
+                    "v_max3_f32" => cases[i].2,
+                    _ => cases[i].3,
+                };
+                assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+            },
+        );
+    }
+}
+
+#[test]
+fn f16_max_and_min_treat_a_nan_as_the_other_operand() {
+    let nan = 0x7E01u32;
+    let nan2 = 0x7E02u32;
+    let nan3 = 0x7E03u32;
+    let a = 0x3C00u32; // 1.0
+    let b = 0x4000u32; // 2.0
+    // (inputs, 2-op want, max3 want, min3 want)
+    let cases = [
+        ([nan, a, b, 0], a, b, a),
+        ([a, nan, b, 0], a, b, a),
+        ([nan, nan2, b, 0], nan, b, b),
+        ([nan, nan2, nan3, 0], nan, nan, nan),
+    ];
+    let ops = [
+        ("v_max_f16", 0x139u16),
+        ("v_min_f16", 0x13A),
+        ("v_max3_f16", 0x354),
+        ("v_min3_f16", 0x351),
+    ];
+    for (name, op) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(
+            &shader,
+            &cases.iter().map(|c| c.0).collect::<Vec<_>>(),
+            |backend, i, inp, got| {
+                let want = match name {
+                    "v_max_f16" | "v_min_f16" => cases[i].1,
+                    "v_max3_f16" => cases[i].2,
+                    _ => cases[i].3,
+                };
+                let got = got & 0xFFFF;
+                let want = want & 0xFFFF;
+                if is_f16_nan(want as u16) {
+                    assert!(
+                        is_f16_nan(got as u16),
+                        "{backend}: {name} {inp:x?} = {got:#06x}"
+                    );
+                } else {
+                    assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+                }
+            },
+        );
+    }
+}
+
 #[test]
 fn v_min3_max3_med3_integer_forms_match_rdna2() {
     // v_{min3,max3,med3}_{i32,u32} v0, v1, v2, v3 (VOP3 0x152..0x159).
