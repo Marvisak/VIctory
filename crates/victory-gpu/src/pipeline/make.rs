@@ -150,6 +150,42 @@ pub(crate) fn log_built(key: &str) {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+struct PipelineLog {
+    file: std::fs::File,
+    seen: std::collections::HashSet<String>,
+}
+
+#[cfg(feature = "diagnostics")]
+impl PipelineLog {
+    fn open(path: &std::ffi::OsStr) -> Option<Self> {
+        if path.is_empty() {
+            return None;
+        }
+        match std::fs::File::create(path) {
+            Ok(file) => Some(Self {
+                file,
+                seen: std::collections::HashSet::new(),
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    path = %std::path::Path::new(path).display(),
+                    error = %e,
+                    "VICTORY_PIPELINE_LOG could not be opened"
+                );
+                None
+            }
+        }
+    }
+
+    fn record(&mut self, what: &str, key: &str, rest: impl FnOnce() -> String) {
+        use std::io::Write;
+        if self.seen.insert(format!("{what} {key}")) {
+            let _ = writeln!(self.file, "{what}\t{key}\t{}", rest());
+        }
+    }
+}
+
 /// `VICTORY_PIPELINE_LOG=<file>` (diagnostics): a line per title pipeline
 /// key created (`created`, its shaders, its state as described) and first
 /// drawn or dispatched with (`used`), and its host pipeline's library name
@@ -157,21 +193,20 @@ pub(crate) fn log_built(key: &str) {
 /// a run creates with what the pre-build makes.
 #[cfg(feature = "diagnostics")]
 fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
-    use std::collections::HashSet;
-    use std::io::Write;
-    static LOG: Mutex<Option<(std::fs::File, HashSet<String>)>> = Mutex::new(None);
-    static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
-    let Some(path) = PATH.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_LOG")) else {
+    static LOG: OnceLock<Option<Mutex<PipelineLog>>> = OnceLock::new();
+    let Some(log) = LOG
+        .get_or_init(|| {
+            std::env::var_os("VICTORY_PIPELINE_LOG")
+                .and_then(|path| PipelineLog::open(&path))
+                .map(Mutex::new)
+        })
+        .as_ref()
+    else {
         return;
     };
-    let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
-    if log.is_none() {
-        *log = std::fs::File::create(path).ok().map(|f| (f, HashSet::new()));
-    }
-    let Some((file, seen)) = log.as_mut() else { return };
-    if seen.insert(format!("{what} {key}")) {
-        let _ = writeln!(file, "{what}\t{key}\t{}", rest());
-    }
+    log.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .record(what, key, rest);
 }
 
 /// Signalled whenever a worker has made a pipeline.
@@ -431,5 +466,34 @@ mod tests {
         assert!(matches!(cold.made.get(), Some(None)));
         assert!(matches!(warm.made.get(), Some(None)));
         assert!(shader.translated.get().is_none());
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn pipeline_log_ignores_empty_and_unwritable_paths() {
+        assert!(PipelineLog::open(std::ffi::OsStr::new("")).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-dir").join("pipelines.log");
+        assert!(PipelineLog::open(missing.as_os_str()).is_none());
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn pipeline_log_deduplicates_events_per_kind_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipelines.log");
+        let mut log = PipelineLog::open(path.as_os_str()).unwrap();
+        log.record("created", "abc", || "shaders\tstate".to_owned());
+        log.record("created", "abc", || {
+            panic!("duplicate event should not evaluate rest")
+        });
+        log.record("used", "abc", String::new);
+        log.record("built", "abc", || "libname\tmade".to_owned());
+        drop(log);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            "created\tabc\tshaders\tstate\nused\tabc\t\nbuilt\tabc\tlibname\tmade\n"
+        );
     }
 }
