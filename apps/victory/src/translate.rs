@@ -339,6 +339,7 @@ pub fn run(
 /// same code, so a run finds it translated or refused. With `pipelines`,
 /// then the shader pack's pipelines go into the pipeline library
 /// (`prebuild`).
+#[cfg(windows)]
 pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
@@ -693,6 +694,10 @@ fn check(
             }
             t.fail(format!("validator: {first}"), label);
         }
+    }
+    #[cfg(not(windows))]
+    if t.list {
+        t.lines.push(format!("{}  emitted", label()));
     }
 }
 

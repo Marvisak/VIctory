@@ -1528,17 +1528,14 @@ fn now_ms() -> u64 {
 /// this long (and this many presented frames) is given up ([`evict`]).
 /// Two minutes: of the textures given up after 20 s, nine in ten were
 /// read again within a minute (run evict4).
-#[cfg(windows)]
 pub(crate) const IDLE_MS: u64 = 120_000;
 /// Frames as well as time: in slow runs (seconds a frame) 20 s alone cycled
 /// the textures of a cutscene's alternating shots (run evict2), and 30
 /// frames gave up what the menus and loading made (at 30 fps) before the
 /// world read it (run evict3). At 30 fps the idle time decides; slower, the
 /// card's budget does.
-#[cfg(windows)]
 pub(crate) const IDLE_FRAMES: u64 = 300;
 /// A use stamp's frame for "never" (tests).
-#[cfg(windows)]
 const NEVER: u64 = u64::MAX;
 /// Past this share of the card's memory budget, host textures fed from
 /// title memory are given up least recently used first, until the card's

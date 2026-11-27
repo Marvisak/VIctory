@@ -439,6 +439,7 @@ mod tests {
             .map(|(_, p)| *p)
     }
 
+    #[cfg(windows)]
     #[test]
     fn password_scope_masks_the_edit_control() {
         use windows_sys::Win32::UI::WindowsAndMessaging as wm;

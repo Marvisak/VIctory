@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
 mod prebuild;
 mod run;
 mod shader;
@@ -168,6 +169,7 @@ fn main() -> Result<()> {
             disasm,
             effects,
         } => shader::run(paths, verbose || disasm, disasm, effects),
+        #[cfg(windows)]
         Command::Translate {
             paths,
             jobs,
@@ -175,6 +177,10 @@ fn main() -> Result<()> {
             cache: true,
             ..
         } => translate::warm(paths, jobs.map(NonZeroUsize::get), pipelines),
+        #[cfg(not(windows))]
+        Command::Translate { cache: true, .. } => {
+            anyhow::bail!("the shader cache warm-up requires Windows")
+        }
         Command::Translate {
             paths,
             validate,
