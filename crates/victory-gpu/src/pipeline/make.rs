@@ -264,7 +264,7 @@ static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let n = crate::memory_budget::worker_count(crate::residency::tier());
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()

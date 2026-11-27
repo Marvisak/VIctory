@@ -122,10 +122,11 @@ fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let kept = crate::pool::shadow_bytes_kept(crate::residency::tier()).min(POOL_BYTES);
     let mut total = 0;
     pool.retain(|v| {
         total += v.capacity();
-        total <= POOL_BYTES
+        total <= kept
     });
 }
 

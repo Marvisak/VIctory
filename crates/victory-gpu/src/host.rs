@@ -357,6 +357,7 @@ fn log_gpu_times(frames: f64) {
 /// (on the card) and non-local (system memory the GPU reads), as the
 /// system's memory manager sees them: use over budget makes it page
 /// allocations at submissions.
+#[allow(dead_code)]
 pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
     static ADAPTER: OnceLock<Option<IDXGIAdapter3>> = OnceLock::new();
     let adapter = ADAPTER
@@ -1162,6 +1163,7 @@ impl Host {
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        crate::residency::refresh();
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
         crate::resource::evict_unused();
@@ -2718,6 +2720,10 @@ impl Host {
     /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
     /// readback memory in the copy-destination state.
     fn mapped_buffer(&self, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
+        if !readback && size > crate::residency::inplace_cap() {
+            tracing::warn!(size, cap = crate::residency::inplace_cap(), "host lock cap exceeded");
+            return None;
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: if readback { D3D12_HEAP_TYPE_READBACK } else { D3D12_HEAP_TYPE_UPLOAD },
             ..Default::default()

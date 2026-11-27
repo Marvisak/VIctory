@@ -18,8 +18,6 @@ use windows::core::Interface;
 
 /// Bytes of one heap.
 const HEAP: u64 = 64 << 20;
-/// Empty heaps kept for the next textures.
-const SPARE: usize = 2;
 /// Placement alignment of textures that are not render targets.
 const ALIGN: u64 = 64 << 10;
 
@@ -113,13 +111,14 @@ impl Heaps {
             }
         }
         let empty = |h: &Heap| h.free.get(&0) == Some(&HEAP);
+        let kept = crate::pool::spare_kept(crate::residency::tier());
         let mut spare = 0;
         self.heaps.retain(|h| {
             if !empty(h) {
                 return true;
             }
             spare += 1;
-            spare <= SPARE
+            spare <= kept
         });
     }
 

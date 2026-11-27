@@ -39,15 +39,21 @@ mod host;
 mod indirect;
 pub mod list;
 #[cfg(windows)]
+pub(crate) mod memory_budget;
+#[cfg(windows)]
 mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod placement;
 #[cfg(windows)]
+pub(crate) mod pool;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+pub(crate) mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

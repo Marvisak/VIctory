@@ -1543,8 +1543,6 @@ const NEVER: u64 = u64::MAX;
 /// title memory are given up least recently used first, until the card's
 /// use is back under [`BUDGET_LOW`].
 #[cfg(windows)]
-const BUDGET_HIGH: f64 = 0.90;
-#[cfg(windows)]
 const BUDGET_LOW: f64 = 0.85;
 /// A texture made again within this many frames of being given up counts
 /// as remade soon ([`EVICTIONS`]): too eager an [`IDLE_MS`].
@@ -1593,11 +1591,17 @@ pub(crate) fn evict_unused() {
     if LAST.swap(frame, Relaxed) == frame {
         return;
     }
-    let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
-        // Free space in the heaps of textures takes the card's memory but
-        // is not in use: new textures go there first.
-        let used = used - crate::placement::free_bytes() as f64 / 1e6;
-        if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
+    let snapshot = crate::residency::snapshot();
+    let over = snapshot.vram_budget.map_or(0, |budget| {
+        let used = snapshot.vram_used.unwrap_or(0).saturating_sub(crate::placement::free_bytes());
+        let reserve = snapshot.render_target_reserve();
+        let ceiling = snapshot.texture_admission_ceiling(crate::residency::tier());
+        let low = if budget >= 16 * crate::memory_budget::GIB {
+            (budget as f64 * BUDGET_LOW) as u64
+        } else {
+            ceiling.saturating_sub(reserve / 2)
+        };
+        if used > ceiling { used.saturating_sub(low) } else { 0 }
     });
     evict(frame, now_ms(), over);
 }
@@ -1637,7 +1641,7 @@ pub(crate) fn evict_among(
     }
     let uses: Vec<(u64, u64, u64)> =
         candidates.iter().map(|(t, _)| (t.last[0].load(Relaxed), t.last[1].load(Relaxed), t.bytes)).collect();
-    let chosen = choose(&uses, frame, now, over);
+    let chosen = choose_with(&uses, frame, now, over, crate::residency::texture_keep_ms().min(IDLE_MS));
     let gone: Vec<Owned> = chosen.into_iter().map(|i| candidates[i].clone()).collect();
     give_up(&gone, frame)
 }
@@ -1660,8 +1664,13 @@ fn candidates() -> Vec<Owned> {
 /// up at (`frame`, `now`): every one idle for [`IDLE_FRAMES`] and
 /// [`IDLE_MS`], then the least recently used others until `over` bytes are
 /// gone (indices).
+#[cfg(test)]
 fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usize> {
-    let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
+    choose_with(uses, frame, now, over, IDLE_MS)
+}
+
+fn choose_with(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64, idle_ms: u64) -> Vec<usize> {
+    let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= idle_ms;
     let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
     let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
     rest.sort_by_key(|&i| uses[i].1);

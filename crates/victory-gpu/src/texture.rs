@@ -18,6 +18,9 @@
 //! 0 is uploaded (every mip and array slice), depth and stencil planes are
 //! not.
 
+mod ahead;
+
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -115,21 +118,26 @@ static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
 /// Free staging buffers kept at most.
 const KEPT_BYTES: u64 = 64 << 20;
 
+static AHEAD_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// Called before a submission's uploads: the buffers of the last one are
 /// free again (the oldest dropped past `KEPT_BYTES`).
 pub(crate) fn recycle() {
+    let tier = crate::residency::tier();
+    AHEAD_BYTES.store(0, Ordering::Relaxed);
     {
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
         (c.current, c.used) = (0, 0);
-        c.all.truncate(CHUNKS_KEPT);
+        c.all.truncate(crate::pool::staging_kept(tier).min(CHUNKS_KEPT));
     }
+    let kept = crate::pool::staging_bytes_kept(tier).min(KEPT_BYTES);
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
     for e in b.used.drain(..) {
         b.free_bytes += e.0;
         b.free.push_back(e);
     }
-    while b.free_bytes > KEPT_BYTES
+    while b.free_bytes > kept
         && let Some((n, ..)) = b.free.pop_front()
     {
         b.free_bytes -= n;
@@ -186,7 +194,10 @@ const CHUNKS_KEPT: usize = 16;
 /// (a multiple of 512, as texture copies need) and its mapping there.
 /// Space larger than a chunk is a buffer of its own ([`staging_buffer`]).
 fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
-    if size > CHUNK {
+    if !crate::residency::admit_texture_pass() {
+        return None;
+    }
+    if size > CHUNK || !ahead::admit(AHEAD_BYTES.load(Ordering::Relaxed), size) {
         return staging_buffer(size).map(|(b, data)| (b, 0, data));
     }
     let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
@@ -196,6 +207,7 @@ fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
             if at + size <= CHUNK {
                 let made = (buffer.clone(), at, (*data + at as usize) as *mut u8);
                 c.used = at + size;
+                AHEAD_BYTES.fetch_add(size, Ordering::Relaxed);
                 return Some(made);
             }
             (c.current, c.used) = (c.current + 1, 0);
