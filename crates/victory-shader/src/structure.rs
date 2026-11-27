@@ -49,6 +49,8 @@ pub enum Atom {
     Lane(Value),
     /// An SCC value, the same in every lane.
     Uniform(Value),
+    /// The whole compute group's nonempty-mask decision at this block.
+    GroupVote(usize),
     /// A lane mask joined at a block entry, by its low dword's phi.
     Phi(Value),
     /// `s_wqm` result: some lane of the quad is in the source mask.
@@ -450,6 +452,8 @@ pub struct Structured {
     /// enough (lanes outside EXEC then never get there, so a VGPR write
     /// needs no old value). Always `None` for scalar instructions.
     pub guards: Vec<Vec<Option<Bool>>>,
+    /// The lane predicate reduced before a group-uniform branch.
+    pub(crate) group_votes: HashMap<usize, Bool>,
     /// Per block: what holds in every lane that enters it (over forward
     /// edges; a loop header forgets what its loop redefines).
     pub reach: Vec<Bool>,
@@ -472,6 +476,11 @@ pub struct Structured {
     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
     /// the instruction takes out of the live mask, which here stay in it.
     pub discards: HashMap<(usize, usize), Bool>,
+    /// SCC values of mask operations nothing but a branch reads (the mask
+    /// itself is dead): "some lane is set", the same in every lane of the
+    /// console's wave, not each lane's own bit. The lanes outside the mask
+    /// run the branch's arm too, so the arm is the wave's, not the lane's.
+    pub any_sccs: HashSet<Value>,
 }
 
 impl Structured {
@@ -486,7 +495,7 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true)
+    structure_as(program, true, false)
 }
 
 /// The per-lane form with a pixel's discarded lanes taken out of the live
@@ -494,11 +503,25 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// what a program needs whose discarded lanes would read values no
 /// surviving lane does (see [`Structured::discards`]).
 pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, false)
+    structure_as(program, false, false)
 }
 
-fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
-    let mut l = Lanes::new(program)?;
+pub(crate) fn for_compute(program: &Program, threads: [u32; 3]) -> Result<Structured, ShaderError> {
+    let lanes = if program.wave64 { 64 } else { 32 };
+    let count = threads.into_iter().try_fold(1u32, u32::checked_mul);
+    if count.is_some_and(|count| (1..=lanes).contains(&count)) {
+        structure_as(program, true, true).or_else(|_| structure(program))
+    } else {
+        structure(program)
+    }
+}
+
+fn structure_as(
+    program: &Program,
+    helpers: bool,
+    try_group_control: bool,
+) -> Result<Structured, ShaderError> {
+    let mut l = Lanes::new(program, try_group_control)?;
     if !helpers {
         l.kills.clear();
     }
@@ -539,6 +562,12 @@ struct Lanes<'a> {
     /// For branches: SCC of a mask operation ("some lane is set") as the
     /// lane's own bit.
     scc_lane: Map<Value, Bool>,
+    /// SCC values only branches read, of mask operations whose result
+    /// nothing reads ([`Structured::any_sccs`]), and those found so far.
+    branch_only: HashSet<Value>,
+    any_sccs: HashSet<Value>,
+    group_control: bool,
+    group_votes: HashMap<usize, Bool>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
     /// Per block: what a lane knows on entry, over forward edges only.
@@ -573,10 +602,83 @@ struct SopMasks {
     scc: Option<Bool>,
 }
 
+/// Only insert group barriers when all reachable branches can take the
+/// same edge for every thread. Accept acyclic paths controlled by EXEC or
+/// SCC from a direct VCC-and-EXEC operation.
+fn group_control_is_safe(
+    p: &Program,
+    order: &[usize],
+    index: &[usize],
+    branch_only: &HashSet<Value>,
+) -> bool {
+    let mut has_scc_branch = false;
+    let mask_and = if p.wave64 { "s_and_b64" } else { "s_and_b32" };
+    for &b in order {
+        let block = &p.blocks[b];
+        if block
+            .exit
+            .successors()
+            .into_iter()
+            .any(|next| index[next] <= index[b])
+            || matches!(block.exit, Exit::Indirect)
+        {
+            return false;
+        }
+        // Scalar memory writes would execute once per host thread in the
+        // full-group path. Keep this lowering to scalar reads.
+        if block.insts.iter().any(|i| {
+            matches!(i.fields, Fields::Smem { .. })
+                && !i.name().starts_with("s_load_")
+                && !i.name().starts_with("s_buffer_load_")
+        }) {
+            return false;
+        }
+        if !matches!(block.exit, Exit::Branch { .. }) {
+            continue;
+        }
+        let Some(branch) = block.insts.last() else {
+            return false;
+        };
+        if matches!(branch.name(), "s_cbranch_execz" | "s_cbranch_execnz") {
+            continue;
+        }
+        let [.., mask, _] = block.insts.as_slice() else {
+            return false;
+        };
+        let Some(scc) = branch.read(Reg::Scc) else {
+            return false;
+        };
+        if !matches!(branch.name(), "s_cbranch_scc0" | "s_cbranch_scc1")
+            || mask.name() != mask_and
+            || mask.write(Reg::Scc) != Some(scc)
+            || !branch_only.contains(&scc)
+        {
+            return false;
+        }
+        let Fields::Sop { src, .. } = &mask.fields else {
+            return false;
+        };
+        if !matches!(
+            src.as_slice(),
+            [
+                Operand::Scalar { code: VCC, .. },
+                Operand::Scalar { code: EXEC, .. }
+            ] | [
+                Operand::Scalar { code: EXEC, .. },
+                Operand::Scalar { code: VCC, .. }
+            ]
+        ) {
+            return false;
+        }
+        has_scc_branch = true;
+    }
+    has_scc_branch
+}
+
 const MAX_ROUNDS: usize = 256;
 
 impl<'a> Lanes<'a> {
-    fn new(p: &'a Program) -> Result<Self, ShaderError> {
+    fn new(p: &'a Program, try_group_control: bool) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
         let order = crate::ir::reverse_postorder(blocks);
         let mut index = vec![usize::MAX; blocks.len()];
@@ -611,6 +713,10 @@ impl<'a> Lanes<'a> {
             masks: Map::default(),
             other: Map::default(),
             scc_lane: Map::default(),
+            branch_only: HashSet::new(),
+            any_sccs: HashSet::new(),
+            group_control: false,
+            group_votes: HashMap::new(),
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
@@ -628,6 +734,9 @@ impl<'a> Lanes<'a> {
                 l.kills.insert(*def);
             }
         }
+        l.branch_only = l.branch_only_sccs();
+        l.group_control =
+            try_group_control && group_control_is_safe(p, &l.order, &l.index, &l.branch_only);
         for inst in blocks.iter().flat_map(|b| &b.insts) {
             if let Fields::Valu(v) = &inst.fields
                 && inst.name() == "v_readlane_b32"
@@ -641,6 +750,64 @@ impl<'a> Lanes<'a> {
             }
         }
         Ok(l)
+    }
+
+    /// The SCC values of bitwise mask operations (not writing EXEC) that
+    /// only `s_cbranch_scc0/1` read, whose result nothing reads: such a
+    /// branch tests whether any bit of the result is set, for the whole
+    /// wave. A mask that is used (as EXEC in the arm, say) keeps the lane's
+    /// own bit, which the lanes outside it agree with there.
+    fn branch_only_sccs(&self) -> HashSet<Value> {
+        let mut reads: Map<Value, (u32, u32)> = Map::default();
+        for block in &self.p.blocks {
+            for phi in &block.phis {
+                for &a in &phi.args {
+                    reads.entry(a).or_default().0 += 1;
+                }
+            }
+            for inst in &block.insts {
+                let branch = inst.name().starts_with("s_cbranch_scc");
+                for &(r, v) in &inst.reads {
+                    let n = reads.entry(v).or_default();
+                    n.0 += 1;
+                    n.1 += u32::from(branch && r == Reg::Scc);
+                }
+            }
+        }
+        const BITWISE: [&str; 9] = [
+            "and", "or", "xor", "andn2", "orn2", "nand", "nor", "xnor", "not",
+        ];
+        let width = if self.p.wave64 { "_b64" } else { "_b32" };
+        let mut found = HashSet::new();
+        for (b, block) in self.p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                let Fields::Sop { .. } = inst.fields else {
+                    continue;
+                };
+                let bitwise = inst
+                    .name()
+                    .strip_prefix("s_")
+                    .and_then(|n| n.strip_suffix(width))
+                    .is_some_and(|op| BITWISE.contains(&op));
+                let Some(scc) = inst.write(Reg::Scc) else {
+                    continue;
+                };
+                let (all, branches) = reads.get(&scc).copied().unwrap_or_default();
+                if bitwise
+                    && inst.write(Reg::S(EXEC)).is_none()
+                    && branches > 0
+                    && all == branches
+                    && !self.kills.contains(&(b, i))
+                    && inst
+                        .writes
+                        .iter()
+                        .all(|&(r, v)| r == Reg::Scc || !reads.contains_key(&v))
+                {
+                    found.insert(scc);
+                }
+            }
+        }
+        found
     }
 
     /// What lane `lane` of VGPR value `v` holds when `v_writelane_b32` put
@@ -689,6 +856,8 @@ impl<'a> Lanes<'a> {
         self.masks.clear();
         self.other.clear();
         self.scc_lane.clear();
+        self.any_sccs.clear();
+        self.group_votes.clear();
         self.joins.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
@@ -760,7 +929,7 @@ impl<'a> Lanes<'a> {
             if let Exit::Branch { taken, not_taken } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
-                let mut w = self.branch(last);
+                let mut w = self.branch(b, last);
                 // A discard's "no lane is left" exit: no lane takes it (the
                 // live mask keeps every lane, see `kills`).
                 if let Some(live) = self.discards(last)
@@ -871,7 +1040,18 @@ impl<'a> Lanes<'a> {
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
+        if self.group_control
+            && self.order.iter().any(|&b| {
+                matches!(blocks[b].exit, Exit::Branch { .. }) && !self.group_votes.contains_key(&b)
+            })
+        {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a group branch whose mask is unknown",
+            });
+        }
         Ok(Structured {
+            group_votes: self.group_votes,
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             other: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
@@ -882,6 +1062,7 @@ impl<'a> Lanes<'a> {
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
+            any_sccs: self.any_sccs,
             restored: self.restored.into_iter().collect(),
             discards: self
                 .kills
@@ -1201,7 +1382,11 @@ impl<'a> Lanes<'a> {
                         }
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
-                        self.scc_lane.insert(scc, m);
+                        if self.branch_only.contains(&scc) && !self.group_control {
+                            self.any_sccs.insert(scc);
+                        } else {
+                            self.scc_lane.insert(scc, m);
+                        }
                     }
                 }
                 // `s_cmp_eq/lg` of a mask: "no lane differs" per lane.
@@ -1344,9 +1529,27 @@ impl<'a> Lanes<'a> {
     }
 
     /// The per-lane condition under which a block's closing branch is taken.
-    fn branch(&mut self, inst: &Inst) -> Bool {
+    fn branch(&mut self, b: usize, inst: &Inst) -> Bool {
         let exec = self.exec(inst);
-        match inst.name() {
+        let name = inst.name();
+        if self.group_control {
+            let mask = match name {
+                "s_cbranch_execz" | "s_cbranch_execnz" => Some(exec),
+                _ => inst
+                    .read(Reg::Scc)
+                    .and_then(|scc| self.scc_lane.get(&scc).copied()),
+            };
+            if let Some(mask) = mask {
+                self.group_votes.insert(b, mask);
+                let any = self.b.atom(Atom::GroupVote(b), self.index[b]);
+                return if matches!(name, "s_cbranch_execz" | "s_cbranch_scc0") {
+                    self.b.not(any)
+                } else {
+                    any
+                };
+            }
+        }
+        match name {
             "s_cbranch_execz" => self.b.not(exec),
             "s_cbranch_execnz" => exec,
             n @ ("s_cbranch_vccz" | "s_cbranch_vccnz") => {

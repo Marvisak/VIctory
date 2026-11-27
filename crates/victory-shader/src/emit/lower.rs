@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod group_vote;
 
 type Why = &'static str;
 
@@ -249,6 +250,8 @@ struct Lower<'a> {
     root_memory: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    group_vote_slot: Option<V>,
+    group_vote_values: HashMap<usize, V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
@@ -598,6 +601,10 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
+            // A branch on the SCC of a mask nothing else reads is the console
+            // wave's "some lane is set" ([`Structured::any_sccs`]): the
+            // host's wave is the console's.
+            console_lanes |= !x.st.any_sccs.is_empty();
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
@@ -695,6 +702,8 @@ impl<'a> Lower<'a> {
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
             flat: None,
+            group_vote_slot: None,
+            group_vote_values: HashMap::new(),
             no_barrier,
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
@@ -1809,6 +1818,38 @@ impl<'a> Lower<'a> {
         Ok(self.memory(lo, hi, bytes, write, active))
     }
 
+    /// Whether lane mask `lo` (its low dword's value), as the console's
+    /// number, is not zero: some lane of the wave (both dwords of a wave64
+    /// mask) is set. Compute programs only, where the host's lanes are the
+    /// console's. A mask set only in lanes that reach its block is voted on
+    /// there; any other (a complement) is the console's number tested.
+    fn mask_any(&mut self, lo: Value) -> Result<V, Why> {
+        if self.mask_data != MaskData::Console {
+            return Err("a branch on a lane mask's SCC outside compute");
+        }
+        if self.x.st.active.contains(&lo)
+            && !self.ballots.contains_key(&lo)
+            && self.def_block.get(&lo) == Some(&self.cur_ir)
+            && let Some(&m) = self.x.st.masks.get(&lo)
+        {
+            let bit = self.boolean(m, self.cur)?;
+            let i1 = self.s.t.i1;
+            let any = self
+                .s
+                .op(self.cur, "waveAnyTrue", Attr::NoUnwind, i1, 113, &[bit]);
+            self.s.flags |= flags::WAVE_OPS;
+            return Ok(any);
+        }
+        let mut n = self.mask_dword(lo)?;
+        if self.x.native.wave64 {
+            // `mask_dword` keeps both dwords of the mask it made.
+            let (_, high) = *self.ballots.get(&lo).ok_or(LANE_MASK)?;
+            n = self.s.m.bin(self.cur, Bin::Or, n, high);
+        }
+        let zero = self.s.m.i32(0);
+        Ok(self.s.m.cmp(self.cur, pred::NE, n, zero))
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
@@ -2572,6 +2613,11 @@ impl<'a> Lower<'a> {
                 }
                 Val::Missing(w) => Err(w),
             },
+            Atom::GroupVote(block) => self
+                .group_vote_values
+                .get(&block)
+                .copied()
+                .ok_or("a group vote used before its block"),
             Atom::Phi(id) => {
                 if let Some(&v) = self.mask_phis.get(&id) {
                     return Ok(v);
@@ -3578,6 +3624,18 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
+        // A mask operation only a branch reads the SCC of: whether the
+        // wave's mask is not zero, the same for every lane.
+        if let (Some(lo), Some(scc)) = (lo, scc.filter(|s| self.x.st.any_sccs.contains(s))) {
+            let any = self.mask_any(lo)?;
+            for &(r, v) in &inst.writes {
+                if r != Reg::Scc {
+                    self.vals.insert(v, Val::Missing(LANE_MASK));
+                }
+            }
+            self.set(Some(scc), Val::Bit(any));
+            return Ok(());
+        }
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
             return Err(LANE_MASK);
         }
@@ -10152,6 +10210,14 @@ impl<'a> Lower<'a> {
             .insts
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
+        if let Some(&mask) = self.x.st.group_votes.get(&b) {
+            let bit = self
+                .boolean(mask, self.cur)
+                .map_err(|w| unsupported(offset, w))?;
+            let vote = self.group_vote(bit);
+            self.group_vote_values.insert(b, vote);
+            self.tail[b] = Some(self.cur);
+        }
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
@@ -10429,7 +10495,7 @@ impl<'a> Lower<'a> {
                 | Atom::Phi(v)
                 | Atom::Quad(v)
                 | Atom::Opaque(v) => Some(v),
-                Atom::Constant(_) => None,
+                Atom::Constant(_) | Atom::GroupVote(_) => None,
             };
             if v.is_some_and(|v| tainted.contains(&v)) {
                 return true;
