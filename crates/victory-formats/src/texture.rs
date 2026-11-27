@@ -679,6 +679,23 @@ impl Layout {
         if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
+        // Dense linear rows have no padding to preserve. Copy a whole plane,
+        // or the whole volume when both layouts also have adjacent planes.
+        // A mip chain separates depth slices by slice_size, not slice_bytes.
+        if row_pitch == bytes
+            && m.pitch as usize * n == bytes
+            && self.desc.swizzle == Swizzle::LINEAR
+        {
+            let base = (u64::from(first) * self.slice_size + m.offset) as usize;
+            if depth > 1 && self.slice_size == slice_bytes as u64 && depth_pitch == slice_bytes {
+                copy(base, 0, need);
+            } else {
+                for z in 0..depth as usize {
+                    copy(base + z * self.slice_size as usize, z * depth_pitch, slice_bytes);
+                }
+            }
+            return Ok(());
+        }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
@@ -1216,6 +1233,180 @@ mod tests {
         }
     }
 
+    fn linear_copy_pattern(i: usize, salt: usize) -> u8 {
+        (i.wrapping_mul(97) ^ i.rotate_right(7) ^ salt.wrapping_mul(37)) as u8
+    }
+
+    fn check_linear_copy(layout: &Layout, mip: u32, slice: u32, row_pad: usize, depth_pad: usize) {
+        let m = layout.mips[mip as usize];
+        let n = layout.desc.element_bytes as usize;
+        let active = m.width as usize * n;
+        let row = active + row_pad;
+        let span = (m.height as usize - 1) * row + active;
+        let plane = span + depth_pad;
+        let len = (m.depth as usize - 1) * plane + span;
+        let input: Vec<_> = (0..len + 7).map(|i| linear_copy_pattern(i, 3)).collect();
+        let tiled_input: Vec<_> = (0..layout.size as usize + 7)
+            .map(|i| linear_copy_pattern(i, 11))
+            .collect();
+        let mut expected_tile = vec![0xc7; tiled_input.len()];
+        let mut expected_detile = vec![0x39; input.len()];
+        for z in 0..m.depth {
+            for y in 0..m.height {
+                for x in 0..m.width {
+                    let t = layout.offset(mip, x, y, slice + z).unwrap() as usize;
+                    let l = z as usize * plane + y as usize * row + x as usize * n;
+                    expected_tile[t..t + n].copy_from_slice(&input[l..l + n]);
+                    expected_detile[l..l + n].copy_from_slice(&tiled_input[t..t + n]);
+                }
+            }
+        }
+        let mut actual_tile = vec![0xc7; tiled_input.len()];
+        layout
+            .tile(&mut actual_tile, mip, slice, &input, row, plane)
+            .unwrap();
+        assert_eq!(actual_tile, expected_tile);
+        let mut actual_detile = vec![0x39; input.len()];
+        layout
+            .detile(&tiled_input, mip, slice, &mut actual_detile, row, plane)
+            .unwrap();
+        assert_eq!(actual_detile, expected_detile);
+        // The final active byte is enough: no trailing row/depth padding is required.
+        let mut exact_tile = vec![0xc7; layout.size as usize];
+        layout
+            .tile(&mut exact_tile, mip, slice, &input[..len], row, plane)
+            .unwrap();
+        assert_eq!(exact_tile, expected_tile[..layout.size as usize]);
+        let mut exact_detile = vec![0x39; len];
+        layout
+            .detile(
+                &tiled_input[..layout.size as usize],
+                mip,
+                slice,
+                &mut exact_detile,
+                row,
+                plane,
+            )
+            .unwrap();
+        assert_eq!(exact_detile, expected_detile[..len]);
+
+        // Invalid arguments must be rejected before modifying a destination.
+        for (bad_mip, bad_slice) in [(layout.mips.len() as u32, slice), (mip, layout.slices)] {
+            let mut out = vec![0x39; input.len()];
+            assert_eq!(
+                layout.detile(&tiled_input, bad_mip, bad_slice, &mut out, row, plane),
+                Err(Error::Invalid)
+            );
+            assert!(out.iter().all(|&b| b == 0x39));
+        }
+        for short_linear in [false, true] {
+            let mut tiled = vec![
+                0xc7;
+                if short_linear {
+                    layout.size as usize
+                } else {
+                    layout.size as usize - 1
+                }
+            ];
+            let lin = &input[..if short_linear { len - 1 } else { len }];
+            assert_eq!(
+                layout.tile(&mut tiled, mip, slice, lin, row, plane),
+                Err(Error::TooSmall)
+            );
+            assert!(tiled.iter().all(|&b| b == 0xc7));
+            let mut out = vec![0x39; lin.len()];
+            assert_eq!(
+                layout.detile(
+                    &tiled_input[..tiled.len()],
+                    mip,
+                    slice,
+                    &mut out,
+                    row,
+                    plane
+                ),
+                Err(Error::TooSmall)
+            );
+            assert!(out.iter().all(|&b| b == 0x39));
+        }
+
+        if m.depth == 1 {
+            for irrelevant_depth in [0, usize::MAX] {
+                let mut out = vec![0x39; input.len()];
+                layout
+                    .detile(&tiled_input, mip, slice, &mut out, row, irrelevant_depth)
+                    .unwrap();
+                assert_eq!(out, expected_detile);
+            }
+        } else {
+            let mut out = vec![0x39; input.len()];
+            assert_eq!(
+                layout.detile(&tiled_input, mip, slice, &mut out, row, span - 1),
+                Err(Error::TooSmall)
+            );
+            assert!(out.iter().all(|&b| b == 0x39));
+            assert_eq!(
+                layout.detile(&tiled_input, mip, slice, &mut out, row, usize::MAX),
+                Err(Error::TooSmall)
+            );
+            assert!(out.iter().all(|&b| b == 0x39));
+        }
+    }
+    /// Independent sources and an element-wise oracle expose symmetric copy errors.
+    #[test]
+    fn linear_copies_match_element_addresses() {
+        let mut cases = 0;
+        for dimension in [Dimension::Tex1d, Dimension::Tex2d, Dimension::Tex3d] {
+            for element_bytes in [1, 2, 4, 8, 16] {
+                for block in [1, 4] {
+                    for width in [
+                        256 / element_bytes * block - 1,
+                        256 / element_bytes * block,
+                        256 / element_bytes * block + 1,
+                    ] {
+                        for height in [1, 7] {
+                            if dimension == Dimension::Tex1d && height != 1 {
+                                continue;
+                            }
+                            for depth in [1, 3] {
+                                for mips in [1, 3] {
+                                    let layout = Layout::new(&Desc {
+                                        dimension,
+                                        width,
+                                        height,
+                                        depth,
+                                        mips,
+                                        element_bytes,
+                                        block,
+                                        samples: 1,
+                                        swizzle: Swizzle::LINEAR,
+                                    })
+                                    .unwrap();
+                                    for mip in 0..mips {
+                                        let slices = if dimension == Dimension::Tex3d {
+                                            1
+                                        } else {
+                                            depth
+                                        };
+                                        for slice in 0..slices {
+                                            for row_pad in [0, 13] {
+                                                for depth_pad in [0, 17] {
+                                                    check_linear_copy(
+                                                        &layout, mip, slice, row_pad, depth_pad,
+                                                    );
+                                                    cases += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 7680);
+    }
     #[test]
     fn depth_stencil_is_two_planes() {
         let t = Texture::new(&TextureDesc {
