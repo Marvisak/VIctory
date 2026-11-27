@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod joins;
 
 type Why = &'static str;
 
@@ -202,6 +203,10 @@ struct Lower<'a> {
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
+    /// At joins a console wave reaches along several edges at once: each
+    /// lane's edge, as the rank of its predecessor in code order
+    /// ([`Lower::wave_scalars`]), filled with the phis.
+    edge_ranks: Vec<(V, usize)>,
     read_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
@@ -665,6 +670,7 @@ impl<'a> Lower<'a> {
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
+            edge_ranks: Vec::new(),
             read_phis: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
@@ -1351,6 +1357,7 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            self.wave_scalars(b);
             let mut i = 0;
             self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
@@ -10883,6 +10890,16 @@ impl<'a> Lower<'a> {
                     _ => self.s.m.i32(0),
                 };
                 incoming.push((x, qb));
+            }
+            self.s.m.set_phi(v, incoming);
+        }
+        for (v, b) in std::mem::take(&mut self.edge_ranks) {
+            let ranks = self.pred_ranks(b);
+            let mut incoming = Vec::new();
+            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                let Some(qb) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                incoming.push((self.s.m.i32(ranks[n]), qb));
             }
             self.s.m.set_phi(v, incoming);
         }

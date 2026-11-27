@@ -428,6 +428,30 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
     }
 }
 
+/// A scalar a per-lane branch writes is the wave's after the join
+/// (issue #3562): `s38` is 0x5555, the lanes above `from` run
+/// `v_readlane_b32 s38, v0, 45`, and after `s_or_b64 exec` every lane
+/// stores `s38`. On the console the wave ran the branch if any lane took
+/// it, so every lane reads 45; the lanes that skipped it are no exception.
+/// With no lane in the branch (`from` 63), every lane keeps 0x5555.
+#[test]
+fn a_scalar_a_lane_branch_writes_is_the_waves_after_the_join() {
+    for (from, want) in [(39, 45), (63, 0x5555)] {
+        let body = [
+            0xBEA6_03FF,
+            0x0000_5555,                             // s_mov_b32 s38, 0x5555
+            0x7C00_0000 | 0xC1 << 17 | (128 + from), // v_cmp_lt_u32 vcc, from, v0
+            0xBEA2_246A,                             // s_and_saveexec_b64 s[34:35], vcc
+            0xBF88_0002,                             // s_cbranch_execz over the read
+            0xD760_0026,
+            256 | (128 + 45) << 9, // v_readlane_b32 s38, v0, 45
+            0x88FE_227E,           // s_or_b64 exec, exec, s[34:35]
+            0x7E06_0226,           // v_mov_b32 v3, s38
+        ];
+        run_permute_cs(true, &body, &[want; 64]);
+    }
+}
+
 #[test]
 fn permutes_mask_high_address_bits_and_divergent_branches() {
     // High byte-address bits (0x100) and sub-dword bits (+3) are ignored, so
