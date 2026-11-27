@@ -78,11 +78,15 @@ Before merging any implementation PR into `dev`:
 4. Reviewers must inspect the actual diff and relevant call sites. Do not rely solely on the PR description, author's summary, another reviewer's conclusion, or green CI.
 5. Each reviewer must publish a review in the PR containing:
    - exact head SHA reviewed;
+   - unique review `TASK-ID` from #50, with a direct link to the claim and handoff;
+   - a non-secret agent-instance identifier, model family/name, and reasoning configuration/effort used for this review;
    - files/functions and invariants inspected;
    - concrete checks and counterexamples attempted;
    - findings with severity and evidence, or explicit statement that no blocking finding was found;
    - test gaps and residual risks;
    - verdict: `APPROVE`, `REQUEST_CHANGES`, or `BLOCKED`.
+
+The #50 claim is the auditable record of a separate review context. Multiple reviews posted under one GitHub account may count as independent only when their TASK-IDs and agent-instance identifiers show distinct instances that inspected the diff separately. A GitHub username, different wording, or separate comment alone is not proof of independence.
 6. A review is not independent if its author merely paraphrases an earlier review. Reviewers should initially inspect independently, then challenge each other's findings.
 7. The implementer must respond to every finding. Fixes require a fresh review of the changed lines and affected invariants. A reviewer must not silently withdraw a finding because the author disagrees.
 8. Any unresolved P0/P1 finding blocks merge. P2/P3 findings may remain only when their impact, rationale, and follow-up issue are recorded and they do not undermine correctness or safety.
@@ -98,6 +102,7 @@ A PR is merge-ready only when all of the following are true:
 - The diff is focused, based on the current target branch, and free of unexplained generated files, binaries, proprietary assets, or unrelated changes.
 - The exact current PR head has completed every applicable required CI check successfully. Earlier green runs do not validate a newer commit.
 - The final combined tree has been checked for conflicts and interactions with already merged or queued changes.
+- Formatting is a required exact-head check: run `cargo fmt --all -- --check` after the final commit. If the current CI workflow does not run it, execute it separately and record the exact SHA, command, and result in the PR. Clippy is not a substitute for rustfmt.
 - Required unit, integration, regression, policy, formatting, static-analysis, and platform-specific checks have been run. A skipped check is not evidence that the underlying behavior works.
 - Tests cover the reported failure, normal behavior, negative cases, boundaries, and relevant failure/recovery paths.
 - The two independent reviews in section 4.1 are complete, all blocking findings are resolved, and the final head has been re-reviewed after fixes.
