@@ -1789,10 +1789,26 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
+        let excess_scratch: Vec<_> = {
+            const SCRATCH_KEPT_BYTES: u64 = 1 << 20;
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
-        }
+            let mut kept = 0u64;
+            let mut keep = 0usize;
+            for chunk in &scratch.chunks {
+                if keep > 0 && kept.saturating_add(chunk.capacity) > SCRATCH_KEPT_BYTES {
+                    break;
+                }
+                kept = kept.saturating_add(chunk.capacity);
+                keep += 1;
+            }
+            if scratch.chunks.len() > keep {
+                scratch.chunks.drain(keep..).collect()
+            } else {
+                Vec::new()
+            }
+        };
+        drop(excess_scratch);
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator

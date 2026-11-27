@@ -112,17 +112,23 @@ static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
     used: Vec::new(),
 });
 
-/// Free staging buffers kept at most.
-const KEPT_BYTES: u64 = 64 << 20;
+/// Free staging buffers kept at most (still covers the 12.7 MiB menu movie).
+const KEPT_BYTES: u64 = 16 << 20;
 
 /// Called before a submission's uploads: the buffers of the last one are
 /// free again (the oldest dropped past `KEPT_BYTES`).
 pub(crate) fn recycle() {
-    {
+    let excess_chunks: Vec<_> = {
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
         (c.current, c.used) = (0, 0);
-        c.all.truncate(CHUNKS_KEPT);
-    }
+        let keep = staging_chunks_kept();
+        if c.all.len() > keep {
+            c.all.drain(keep..).collect()
+        } else {
+            Vec::new()
+        }
+    };
+    drop(excess_chunks);
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
     for e in b.used.drain(..) {
@@ -179,8 +185,21 @@ unsafe impl Send for Chunks {}
 static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks { all: Vec::new(), current: 0, used: 0 });
 
 const CHUNK: u64 = 32 << 20;
-/// Chunks kept between submissions (more are made while one needs them).
-const CHUNKS_KEPT: usize = 16;
+/// Default chunks kept between submissions (4 × 32 MiB = 128 MiB; more are
+/// made while one needs them). Overridable via `VICTORY_TEXTURE_STAGING_CHUNKS`.
+const DEFAULT_CHUNKS_KEPT: usize = 4;
+
+fn staging_chunks_kept_for(val: Option<&str>) -> usize {
+    val.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_CHUNKS_KEPT)
+}
+
+fn staging_chunks_kept() -> usize {
+    static KEPT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KEPT.get_or_init(|| {
+        staging_chunks_kept_for(std::env::var("VICTORY_TEXTURE_STAGING_CHUNKS").ok().as_deref())
+    })
+}
 
 /// `size` bytes of staging space: a buffer, the offset of the space in it
 /// (a multiple of 512, as texture copies need) and its mapping there.
@@ -877,5 +896,13 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn staging_chunks_kept_defaults_to_four_and_respects_env() {
+        assert_eq!(staging_chunks_kept_for(None), DEFAULT_CHUNKS_KEPT);
+        assert_eq!(staging_chunks_kept_for(Some("2")), 2);
+        assert_eq!(staging_chunks_kept_for(Some("0")), 0);
+        assert_eq!(staging_chunks_kept_for(Some("invalid")), DEFAULT_CHUNKS_KEPT);
     }
 }

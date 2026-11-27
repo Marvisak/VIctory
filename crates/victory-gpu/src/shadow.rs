@@ -116,21 +116,36 @@ fn pooled(n: usize) -> Vec<u8> {
 }
 
 /// Returns a snapshot buffer to the pool, which keeps the largest up to
-/// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
+/// [`pool_bytes`] in all: a world submission snapshots several copies, and
 /// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
 fn give_back(v: Vec<u8>) {
+    let limit = pool_bytes();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let mut total = 0;
     pool.retain(|v| {
         total += v.capacity();
-        total <= POOL_BYTES
+        total <= limit
     });
 }
 
-/// Snapshot memory kept for reuse.
-const POOL_BYTES: usize = 512 << 20;
+/// Default snapshot memory kept for reuse (128 MiB; overridable via
+/// `VICTORY_SHADOW_POOL_MB`).
+const DEFAULT_POOL_BYTES: usize = 128 << 20;
+
+fn pool_bytes_for(val: Option<&str>) -> usize {
+    val.and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|mb| mb.saturating_mul(1 << 20))
+        .unwrap_or(DEFAULT_POOL_BYTES)
+}
+
+fn pool_bytes() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        pool_bytes_for(std::env::var("VICTORY_SHADOW_POOL_MB").ok().as_deref())
+    })
+}
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
@@ -694,7 +709,8 @@ impl Shadow {
 impl Drop for Shadow {
     fn drop(&mut self) {
         if let Some(slice) = self.slice {
-            arena().give_back(slice);
+            let released = arena().give_back(slice);
+            drop(released);
         }
         if let Some(base) = self.marks {
             let mut m = marks();
@@ -1121,10 +1137,10 @@ pub(crate) fn log_views(frames: f64) {
         .count();
     let (chunks, held) = {
         let a = arena();
-        // SAFETY: live buffers.
-        let size = |c: &(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)| unsafe { c.0.GetDesc() }.Width;
-        let held: u64 = a.chunks.iter().map(|c| size(c) - c.3.values().sum::<u64>()).sum();
-        (a.chunks.len(), held)
+        let live_chunks = a.chunks.iter().flatten();
+        let chunks = live_chunks.clone().count();
+        let held: u64 = live_chunks.map(|c| c.size - c.free.values().sum::<u64>()).sum();
+        (chunks, held)
     };
     if asks > 0 {
         tracing::info!(
@@ -1180,6 +1196,14 @@ struct Slice {
     len: u64,
 }
 
+struct ArenaChunk {
+    buffer: ID3D12Resource,
+    data: usize,
+    gpu: u64,
+    size: u64,
+    free: BTreeMap<u64, u64>,
+}
+
 /// Shared buffers for the copies of single views ([`exact`]): they are
 /// small (~2 KB on average) and come and go by the hundred a frame, and a
 /// buffer of their own each cost a kernel call to make and one to free on
@@ -1187,13 +1211,15 @@ struct Slice {
 /// of memory each (~5,000 live).
 #[derive(Default)]
 struct Arena {
-    /// Each buffer, its mapping and host address, and its free runs
-    /// (offset → bytes).
-    chunks: Vec<(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)>,
+    /// Each slot holds a live chunk or `None` once an empty chunk past
+    /// [`ARENA_SPARE`] is released (preserving indices of remaining slices).
+    chunks: Vec<Option<ArenaChunk>>,
 }
 
 /// Bytes of each arena buffer (a larger copy gets one of its size).
 const CHUNK: u64 = 16 << 20;
+/// Completely free arena chunks kept for reuse before releasing.
+const ARENA_SPARE: usize = 1;
 
 static ARENA: Mutex<Arena> = Mutex::new(Arena { chunks: Vec::new() });
 
@@ -1219,7 +1245,11 @@ impl Arena {
                 (start + len <= at + n).then_some((at, n, start))
             })
         };
-        let found = self.chunks.iter().enumerate().find_map(|(c, chunk)| fits(&chunk.3).map(|f| (c, f)));
+        let found = self
+            .chunks
+            .iter()
+            .enumerate()
+            .find_map(|(c, slot)| slot.as_ref().and_then(|chunk| fits(&chunk.free).map(|f| (c, f))));
         let (chunk, (at, n, start)) = match found {
             Some(found) => found,
             None => {
@@ -1229,37 +1259,69 @@ impl Arena {
                 // SAFETY: a live buffer.
                 let gpu = unsafe { buffer.GetGPUVirtualAddress() };
                 let free = BTreeMap::from([(0, size)]);
-                self.chunks.push((buffer, data as usize, gpu, free));
-                let c = self.chunks.len() - 1;
-                (c, fits(&self.chunks[c].3)?)
+                let entry = ArenaChunk {
+                    buffer,
+                    data: data as usize,
+                    gpu,
+                    size,
+                    free,
+                };
+                let c = match self.chunks.iter().position(Option::is_none) {
+                    Some(slot) => {
+                        self.chunks[slot] = Some(entry);
+                        slot
+                    }
+                    None => {
+                        self.chunks.push(Some(entry));
+                        self.chunks.len() - 1
+                    }
+                };
+                let f = fits(&self.chunks[c].as_ref()?.free)?;
+                (c, f)
             }
         };
-        let (buffer, data, gpu, free) = &mut self.chunks[chunk];
-        free.remove(&at);
+        let slot = self.chunks[chunk].as_mut()?;
+        slot.free.remove(&at);
         if start > at {
-            free.insert(at, start - at);
+            slot.free.insert(at, start - at);
         }
         if at + n > start + len {
-            free.insert(start + len, at + n - start - len);
+            slot.free.insert(start + len, at + n - start - len);
         }
         let slice = Slice { chunk, offset: start, len };
-        Some((buffer.clone(), (*data + start as usize) as *mut u8, *gpu + start, slice))
+        Some((slot.buffer.clone(), (slot.data + start as usize) as *mut u8, slot.gpu + start, slice))
     }
 
-    /// A run goes back, joined to its free neighbours.
-    fn give_back(&mut self, slice: Slice) {
-        let Some((_, _, _, free)) = self.chunks.get_mut(slice.chunk) else { return };
+    /// A run goes back, joined to its free neighbours. Completely empty chunks
+    /// past [`ARENA_SPARE`] are returned to be dropped outside the arena lock.
+    fn give_back(&mut self, slice: Slice) -> Option<ArenaChunk> {
+        let Some(Some(chunk)) = self.chunks.get_mut(slice.chunk) else { return None };
         let (mut at, mut n) = (slice.offset, slice.len);
-        if let Some((&before, &m)) = free.range(..at).next_back()
+        if let Some((&before, &m)) = chunk.free.range(..at).next_back()
             && before + m == at
         {
-            free.remove(&before);
+            chunk.free.remove(&before);
             (at, n) = (before, n + m);
         }
-        if let Some(m) = free.remove(&(at + n)) {
+        if let Some(m) = chunk.free.remove(&(at + n)) {
             n += m;
         }
-        free.insert(at, n);
+        chunk.free.insert(at, n);
+        let is_empty = chunk.free.len() == 1 && chunk.free.get(&0) == Some(&chunk.size);
+        if is_empty {
+            let empty_count = self
+                .chunks
+                .iter()
+                .filter(|slot| {
+                    slot.as_ref()
+                        .is_some_and(|c| c.free.len() == 1 && c.free.get(&0) == Some(&c.size))
+                })
+                .count();
+            if empty_count > ARENA_SPARE {
+                return self.chunks[slice.chunk].take();
+            }
+        }
+        None
     }
 }
 
@@ -1431,13 +1493,18 @@ pub(crate) mod tests {
         runs.sort_unstable();
         assert!(runs.windows(2).all(|w| w[0].1 <= w[1].0), "{runs:?}");
         for s in [b, a, c] {
-            arena.give_back(s);
+            assert!(arena.give_back(s).is_none());
         }
         assert_eq!(arena.chunks.len(), 1);
-        assert_eq!(arena.chunks[0].3.len(), 1, "one free run again");
-        // Larger than a buffer: one of its own.
+        assert_eq!(arena.chunks[0].as_ref().unwrap().free.len(), 1, "one free run again");
+        // Larger than a buffer: one of its own, released once empty past ARENA_SPARE.
         let (_, _, _, d) = arena.take(CHUNK + 1, 4).unwrap();
         assert_eq!((arena.chunks.len(), d.chunk), (2, 1));
+        assert!(arena.give_back(d).is_some(), "excess empty chunk released");
+        assert!(arena.chunks[1].is_none());
+        assert_eq!(pool_bytes_for(None), DEFAULT_POOL_BYTES);
+        assert_eq!(pool_bytes_for(Some("64")), 64 << 20);
+        assert_eq!(pool_bytes_for(Some("0")), 0);
     }
 
     /// Ranges shaders write far apart are kept apart (not the copy between
