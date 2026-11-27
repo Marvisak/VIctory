@@ -116,21 +116,47 @@ pub struct Validator {
 // thread affinity); calls are serialised by `&mut self`.
 unsafe impl Send for Validator {}
 
+fn parse_sdk_version(name: &std::ffi::OsStr) -> Option<Vec<u64>> {
+    let text = name.to_str()?;
+    if text.is_empty() {
+        return None;
+    }
+    text.split('.').map(|part| part.parse::<u64>().ok()).collect()
+}
+
+fn newest_sdk_dxil(kits_dir: &std::path::Path) -> Option<PathBuf> {
+    let mut versions: Vec<(Option<Vec<u64>>, std::ffi::OsString, PathBuf)> =
+        std::fs::read_dir(kits_dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let dll = e.path().join(r"x64\dxil.dll");
+                dll.exists().then(|| {
+                    let name = e.file_name();
+                    let parsed = parse_sdk_version(&name);
+                    (parsed, name, dll)
+                })
+            })
+            .collect();
+    versions.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    versions.pop().map(|(_, _, path)| path)
+}
+
+fn resolve_default_path(
+    env_val: Option<std::ffi::OsString>,
+    kits_dir: &std::path::Path,
+) -> Option<PathBuf> {
+    if let Some(p) = env_val.filter(|v| !v.is_empty()) {
+        return Some(p.into());
+    }
+    newest_sdk_dxil(kits_dir)
+}
+
 impl Validator {
     /// Where `dxil.dll` is looked for.
     pub fn default_path() -> Option<PathBuf> {
-        if let Some(p) = std::env::var_os("VICTORY_DXIL") {
-            return Some(p.into());
-        }
-        let kits = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin");
-        let mut versions: Vec<PathBuf> = std::fs::read_dir(&kits)
-            .ok()?
-            .filter_map(Result::ok)
-            .map(|e| e.path().join(r"x64\dxil.dll"))
-            .filter(|p| p.exists())
-            .collect();
-        versions.sort();
-        versions.pop()
+        let kits = std::path::Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
+        resolve_default_path(std::env::var_os("VICTORY_DXIL"), kits)
     }
 
     /// Loads `path`'s validator (or `dxil.dll` from the DLL search path).
@@ -145,7 +171,8 @@ impl Validator {
         unsafe {
             let module = LoadLibraryW(name.as_ptr());
             if module.is_null() {
-                return Err(format!("cannot load {}", String::from_utf16_lossy(&name)));
+                let shown = String::from_utf16_lossy(&name[..name.len() - 1]);
+                return Err(format!("cannot load {shown}"));
             }
             let create = GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast())
                 .ok_or("dxil.dll lacks DxcCreateInstance")?;
@@ -217,5 +244,80 @@ impl Drop for Validator {
     fn drop(&mut self) {
         // SAFETY: we own one reference.
         unsafe { release(self.object) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "victory-validator-test-{label}-{}-{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn newest_sdk_dxil_orders_versions_numerically() {
+        let dir = TempDir::new("versions");
+        for ver in ["10.0.9999.0", "10.0.26100.0", "10.0.19041.0", "misc"] {
+            let x64 = dir.path().join(ver).join("x64");
+            std::fs::create_dir_all(&x64).unwrap();
+            std::fs::write(x64.join("dxil.dll"), b"").unwrap();
+        }
+        assert_eq!(
+            newest_sdk_dxil(dir.path()),
+            Some(dir.path().join("10.0.26100.0").join(r"x64\dxil.dll"))
+        );
+    }
+
+    #[test]
+    fn resolve_default_path_prefers_non_empty_env_and_ignores_empty() {
+        let dir = TempDir::new("env");
+        let x64 = dir.path().join("10.0.22621.0").join("x64");
+        std::fs::create_dir_all(&x64).unwrap();
+        let expected = x64.join("dxil.dll");
+        std::fs::write(&expected, b"").unwrap();
+
+        assert_eq!(
+            resolve_default_path(Some(OsString::from(r"C:\custom\dxil.dll")), dir.path()),
+            Some(PathBuf::from(r"C:\custom\dxil.dll"))
+        );
+        assert_eq!(
+            resolve_default_path(Some(OsString::new()), dir.path()),
+            Some(expected.clone())
+        );
+        assert_eq!(resolve_default_path(None, dir.path()), Some(expected));
+    }
+
+    #[test]
+    fn load_missing_dll_error_omits_trailing_nul() {
+        let dir = TempDir::new("missing");
+        let missing = dir.path().join("definitely-missing-dxil.dll");
+        let err = Validator::load(Some(&missing)).err().unwrap();
+        assert!(!err.contains('\0'), "error must not contain NUL: {err:?}");
+        assert!(err.contains("definitely-missing-dxil.dll"), "{err}");
     }
 }
