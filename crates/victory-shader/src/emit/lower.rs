@@ -7069,6 +7069,17 @@ impl<'a> Lower<'a> {
                     let one = self.s.m.f32(1.0f32.to_bits());
                     self.s.m.bin(c, Bin::SDiv, one, a)
                 }
+                "v_exp_f16" => {
+                    let a = self.half_fsrc(inst, 0)?;
+                    let r = self.unary(21, a);
+                    // Exact 2^(0x11c5) exceeds the 0x3c00/0x3c01 tie where f32
+                    // lands; return 0x3c01 directly (RDNA2 rounds f16 exp to
+                    // nearest in both RNE and RTZ modes).
+                    let x = self.s.m.f32(0x3A38_A000);
+                    let boundary = self.s.m.cmp(c, pred::OEQ, a, x);
+                    let up = self.s.m.f32(0x3F80_2000);
+                    self.s.m.select(c, boundary, up, r)
+                }
                 _ => {
                     let a = self.half_fsrc(inst, 0)?;
                     let op = match name {
