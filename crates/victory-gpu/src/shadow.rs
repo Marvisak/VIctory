@@ -533,7 +533,7 @@ impl Shadow {
     }
 
     /// Whether the title wrote none of the copy's memory since the copy took
-    /// it (tracked memory only): [`Shadow::update`] would copy nothing.
+    /// it (tracked memory only): a refresh ([`plan`]) would copy nothing.
     pub(crate) fn clean(&self) -> bool {
         self.tracked.as_ref().is_some_and(crate::watch::Tracked::clean)
     }
@@ -544,29 +544,23 @@ impl Shadow {
         self.tracked.as_ref().and_then(crate::watch::Tracked::bit)
     }
 
-    /// At submission: copies what changed of `[address, address + len)`
-    /// since it was last copied (all of it if the memory is not
-    /// write-watched). Returns the bytes copied.
+    /// Copies what changed of `[address, address + len)` since it was last
+    /// copied (all of it if the memory is not write-watched), as a refresh
+    /// batch of this copy alone ([`plan`], [`refresh_planned`]: the host's
+    /// batches do all their copies at once). Returns the bytes copied
+    /// (tests).
+    #[cfg(test)]
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
-        if self.clean() {
-            return 0;
+        match plan(self, address, len) {
+            Plan::Done(copied) => copied,
+            Plan::Take(planned) => refresh_planned(&[planned]).pop().map_or(0, |(copied, _)| copied),
         }
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (address.max(start), (address + len).min(end));
-        if from >= to {
-            return 0;
-        }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
-        if self.tracked.is_some() {
-            return self.update_tracked(from, to, !busy.is_empty());
-        }
+    }
+
+    /// A refresh of `[from, to)` (inside the buffer) where the
+    /// memory is not tracked: all of it, around the ranges `busy` shaders
+    /// are writing.
+    fn update_whole(&self, from: usize, to: usize, mut busy: Vec<(usize, usize)>) -> usize {
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -589,12 +583,12 @@ impl Shadow {
         self.update_untracked(from, to)
     }
 
-    /// [`Shadow::update`] of `[from, to)` (inside the buffer) where the
-    /// memory is tracked: the pages the title wrote since they were taken,
-    /// in one [`crate::watch::Tracked::take`], so that a page wholly in the
-    /// range is guarded even where shaders write part of it (split at those
-    /// ranges it stayed changed, and [`Shadow::copy_back_marked`] dropped
-    /// what they wrote).
+    /// The rest of a refresh ([`refresh_planned`]) where the memory is tracked, once the
+    /// pages the title wrote since they were taken are taken (`runs` to
+    /// copy, `unmapped` to zero): a page wholly in the range is guarded even
+    /// where shaders write part of it (split at those ranges it stayed
+    /// changed, and [`Shadow::copy_back_marked`] dropped what they wrote).
+    /// The parts off the runtime's memory (`untracked`) are copied whole.
     ///
     /// `busy`: a list submitted earlier declared that shaders write in the
     /// range. A submission waits for the one before it, so none of this
@@ -604,15 +598,7 @@ impl Shadow {
     /// and looped until the device was removed). The same bytes go into the
     /// snapshot `writing` took, so copy-back neither takes them for the
     /// GPU's nor puts them back over a later title write.
-    fn update_tracked(&self, from: usize, to: usize, busy: bool) -> usize {
-        let Some(t) = &self.tracked else {
-            return 0;
-        };
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        let (runs, unmapped) = t.take_split(from, to);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
+    fn copy_taken(&self, busy: bool, runs: crate::watch::Runs, unmapped: crate::watch::Runs, untracked: &[(usize, usize)]) -> usize {
         let start = self.start as usize;
         let mut before = busy.then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
         let mut sync_before = |a: usize, b: usize| {
@@ -633,14 +619,14 @@ impl Shadow {
             sync_before(a, b);
         }
         for (a, b) in unmapped {
-            // SAFETY: inside the mapping (`take_split` cuts to the buffer).
+            // SAFETY: inside the mapping (`take_written` cuts to the buffer).
             unsafe { self.data.add(a - start).write_bytes(0, b - a) };
             sync_before(a, b);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
         }
         // Parts on memory that is not the runtime's: whole, as below.
-        for (a, b) in t.untracked(from, to) {
+        for &(a, b) in untracked {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
             copied += self.copy(a, b);
@@ -652,17 +638,10 @@ impl Shadow {
                 add(C::WholeUs, started.elapsed().as_micros() as u64);
             }
         }
-        #[cfg(feature = "diagnostics")]
-        {
-            use crate::copystat::{C, add};
-            add(C::Watches, 1);
-            add(C::Checked, (to - from) as u64);
-            add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
-        }
         copied
     }
 
-    /// [`Shadow::update`] of untracked `[from, to)` (inside the buffer).
+    /// A refresh of untracked `[from, to)` (inside the buffer).
     fn update_untracked(&self, from: usize, to: usize) -> usize {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -689,6 +668,110 @@ impl Shadow {
         }
         to - from
     }
+}
+
+/// A refresh of a tracked copy whose written pages were read but not taken
+/// yet ([`plan`]).
+pub(crate) struct Planned<'a> {
+    shadow: &'a Shadow,
+    tracked: &'a crate::watch::Tracked,
+    from: usize,
+    to: usize,
+    busy: bool,
+    pages: Vec<usize>,
+    untracked: Vec<(usize, usize)>,
+}
+
+/// What [`plan`] made of a refresh.
+pub(crate) enum Plan<'a> {
+    /// Done already: the bytes copied (nothing written in the range, or
+    /// memory that is not tracked, copied whole).
+    Done(usize),
+    /// Pages to take with the batch's others ([`refresh_planned`]).
+    Take(Planned<'a>),
+}
+
+/// A refresh of `[address, address + len)` up to the take: the
+/// pages the title wrote since the copy took them, read under its
+/// tracker's own lock ([`crate::watch::Tracked::written`]). Memory that is
+/// not tracked is copied whole here.
+pub(crate) fn plan(shadow: &Shadow, address: usize, len: usize) -> Plan<'_> {
+    if shadow.clean() {
+        return Plan::Done(0);
+    }
+    let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+    let (from, to) = (address.max(start), (address + len).min(end));
+    if from >= to {
+        return Plan::Done(0);
+    }
+    let busy: Vec<(usize, usize)> = shadow
+        .pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .filter(|&(a, e)| a < to && e > from)
+        .collect();
+    let Some(tracked) = &shadow.tracked else {
+        return Plan::Done(shadow.update_whole(from, to, busy));
+    };
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let pages = tracked.written(from, to);
+    let untracked = tracked.untracked(from, to);
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::WatchUs, started.elapsed().as_micros() as u64);
+        add(C::Watches, 1);
+        add(C::Checked, (to - from) as u64);
+    }
+    if pages.is_empty() && untracked.is_empty() {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Unchanged, (to - from) as u64);
+        return Plan::Done(0);
+    }
+    Plan::Take(Planned {
+        shadow,
+        tracked,
+        from,
+        to,
+        busy: !busy.is_empty(),
+        pages,
+        untracked,
+    })
+}
+
+/// The rest of a batch's refreshes [`plan`] left to take: the
+/// pages of all of them are taken in one hold of the guard lock
+/// ([`crate::watch::take_written`]), then each copy copies its runs. Per
+/// plan (in order): the bytes copied and the microseconds its copies took.
+pub(crate) fn refresh_planned(plans: &[Planned<'_>]) -> Vec<(usize, u64)> {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let asks: Vec<crate::watch::Ask<'_>> = plans
+        .iter()
+        .map(|p| crate::watch::Ask {
+            tracked: p.tracked,
+            from: p.from,
+            to: p.to,
+            pages: &p.pages,
+        })
+        .collect();
+    let taken = crate::watch::take_written(&asks);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
+    plans
+        .iter()
+        .zip(taken)
+        .map(|(p, (runs, unmapped))| {
+            let started = std::time::Instant::now();
+            let copied = p.shadow.copy_taken(p.busy, runs, unmapped, &p.untracked);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unchanged, (p.to - p.from).saturating_sub(copied) as u64);
+            (copied, started.elapsed().as_micros() as u64)
+        })
+        .collect()
 }
 
 impl Drop for Shadow {

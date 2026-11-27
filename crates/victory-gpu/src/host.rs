@@ -2436,16 +2436,48 @@ impl Batch {
         self.current.clear();
     }
 
-    /// Does the refreshes; returns the bytes copied.
+    /// Does the refreshes; returns the bytes copied. Each copy first reads
+    /// which of its pages in its range the title wrote
+    /// ([`crate::shadow::plan`]); the pages of all of them are then taken
+    /// in one hold of the guard lock and copied
+    /// ([`crate::shadow::refresh_planned`]). A take per copy cost a round
+    /// of the guard lock each, the lock the title's write faults and
+    /// copy-back take too: a world frame's thousands of rounds mostly
+    /// waited for it.
     fn flush(&mut self) -> usize {
+        use crate::shadow::{Plan, plan, refresh_planned};
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
-        let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
+        let refreshes = std::mem::take(&mut self.refreshes);
+        // Per refresh: bytes copied, microseconds (the shared take split
+        // evenly among those that took pages).
+        let mut done = vec![(0, 0); refreshes.len()];
+        let (mut planned, mut at) = (Vec::new(), Vec::new());
+        for (i, (shadow, from, to)) in refreshes.iter().enumerate() {
             let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
+            let made = plan(shadow, *from, to - from);
+            done[i].1 = started.elapsed().as_micros() as u64;
+            match made {
+                Plan::Done(copied) => done[i].0 = copied,
+                Plan::Take(p) => {
+                    planned.push(p);
+                    at.push(i);
+                }
+            }
+        }
+        if !planned.is_empty() {
+            let started = std::time::Instant::now();
+            let copies = refresh_planned(&planned);
             let us = started.elapsed().as_micros() as u64;
+            let share = us.saturating_sub(copies.iter().map(|c| c.1).sum()) / copies.len() as u64;
+            for (i, (copied, us)) in at.into_iter().zip(copies) {
+                done[i] = (copied, done[i].1 + us + share);
+            }
+        }
+        drop(planned);
+        let mut total = 0;
+        for ((shadow, from, to), (copied, us)) in refreshes.into_iter().zip(done) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
@@ -3960,6 +3992,51 @@ mod batch {   // `mod tests` is already taken at the top of this file
         assert_eq!(batch.flush(), PAGE, "after a title write, what changed");
         crate::shadow::unregister(p, p as u64);
         drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// Copies of overlapping title buffers in one batch: each gets the pages
+    /// the title wrote in its range, in the batch's one take, and a write
+    /// after the batch (the page they share guarded again) is seen by both.
+    #[test]
+    fn overlapping_copies_in_one_batch_each_take_the_written_pages() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(6);
+        let (a, b) = ((p, 4 * PAGE), (p + 2 * PAGE, 4 * PAGE));
+        crate::shadow::register(a.0, a.0 as u64, a.1 as u64);
+        crate::shadow::register(b.0, b.0 as u64, b.1 as u64);
+        let copies = (crate::shadow::find(a.0 as u64, a.1 as u64), crate::shadow::find(b.0 as u64, b.1 as u64));
+        let (Some(ca), Some(cb)) = copies else {
+            crate::shadow::unregister(a.0, a.0 as u64);
+            crate::shadow::unregister(b.0, b.0 as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&ca, a.0, a.1);
+        batch.add(&cb, b.0, b.1);
+        assert_eq!(batch.flush(), a.1 + b.1, "all of both at first");
+        // SAFETY: our pool, guarded since the copies took it: page 3 is both
+        // copies', page 1 the first's, page 5 the second's.
+        unsafe {
+            ((p + 3 * PAGE + 4) as *mut u32).write_volatile(0x33);
+            ((p + PAGE + 4) as *mut u32).write_volatile(0x11);
+            ((p + 5 * PAGE + 4) as *mut u32).write_volatile(0x55);
+        }
+        let mut batch = Batch::default();
+        batch.add(&ca, a.0, a.1);
+        batch.add(&cb, b.0, b.1);
+        assert_eq!(batch.flush(), 4 * PAGE, "two pages each");
+        for (copy, at, v) in [(&ca, 3, 0x33), (&ca, 1, 0x11), (&cb, 3, 0x33), (&cb, 5, 0x55)] {
+            assert_eq!(copy.read_host((p + at * PAGE + 4) as u64, 1)[0], v, "page {at}");
+        }
+        assert!(ca.clean() && cb.clean());
+        // SAFETY: as above, guarded again by the batch.
+        unsafe { ((p + 3 * PAGE + 8) as *mut u32).write_volatile(0x34) };
+        assert!(!ca.clean() && !cb.clean(), "a write after the batch is seen by both");
+        for (start, _) in [a, b] {
+            crate::shadow::unregister(start, start as u64);
+        }
+        drop((ca, cb));
         crate::watch::tests::free(p);
     }
 }
