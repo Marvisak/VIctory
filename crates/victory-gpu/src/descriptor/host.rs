@@ -1222,6 +1222,7 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    desc.Format = bit_exact_format(desc.Format);
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -1242,7 +1243,11 @@ fn buffer_srv(
     };
     buffer.FirstElement = shadow.offset(start) / element;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
+    let stride = buffer.StructureByteStride;
+    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+    // SAFETY: a live buffer.
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), first, count, element, "refused buffer view: empty or past its copy");
@@ -1259,16 +1264,52 @@ fn buffer_srv(
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
 
-/// Whether `count` elements of `element` bytes from element `first` lie in
-/// `buffer`. The console takes a view that is empty or runs past its
-/// memory; the host removes the device for one.
-fn in_buffer(buffer: &ID3D12Resource, first: u64, count: u32, element: u64) -> bool {
-    // SAFETY: a live buffer.
-    within(unsafe { buffer.GetDesc() }.Width, first, count, element)
+/// Maps 32-bit UINT/SINT typed buffer formats to bit-exact FLOAT formats.
+pub(crate) fn bit_exact_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    match format {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT => {
+            DXGI_FORMAT_R32G32B32A32_FLOAT
+        }
+        DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT => DXGI_FORMAT_R32G32B32_FLOAT,
+        DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT => DXGI_FORMAT_R32_FLOAT,
+        other => other,
+    }
+}
+
+pub(crate) fn constant_view_size(size: u32) -> u32 {
+    super::constant_view_size(size)
 }
 
 fn within(width: u64, first: u64, count: u32, element: u64) -> bool {
     count > 0 && first.saturating_add(u64::from(count)).saturating_mul(element) <= width
+}
+
+pub(crate) fn buffer_view_ok(
+    format: DXGI_FORMAT,
+    first: u64,
+    count: u32,
+    stride: u32,
+    raw: bool,
+    width: u64,
+) -> bool {
+    let element = if raw {
+        if format != DXGI_FORMAT_R32_TYPELESS || stride != 0 || !first.is_multiple_of(4) {
+            return false;
+        }
+        4
+    } else if stride > 0 {
+        if format != DXGI_FORMAT_UNKNOWN || stride > 2048 || !stride.is_multiple_of(4) {
+            return false;
+        }
+        u64::from(stride)
+    } else {
+        match crate::resource::element(format.0 as u32) {
+            Some((bytes, 1)) if format.0 != 0 && bytes > 0 => bytes,
+            _ => return false,
+        }
+    };
+    within(width, first, count, element)
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -1282,6 +1323,7 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    desc.Format = bit_exact_format(desc.Format);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -1306,7 +1348,11 @@ fn buffer_uav(
     buffer.FirstElement = shadow.offset(start) / element;
     buffer.CounterOffsetInBytes = 0;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
+    let stride = buffer.StructureByteStride;
+    let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    // SAFETY: a live buffer.
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         once!(first, count, element, "unordered buffer view empty or past its host copy");
         return None;
     }
@@ -1469,6 +1515,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            if address == 0 || size == 0 {
+                null_for(view, at);
+                return None;
+            }
+            let size = constant_view_size(size);
             // Constant buffers in the title's slots, through the heap itself
             // or a table, are read as raw buffers by translated shaders
             // (`victory_shader::emit`, "Constant buffers in the heap"): the
@@ -2461,5 +2512,35 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    fn host_constant_views_clamp_and_zero() {
+        assert_eq!(constant_view_size(0), 256);
+        assert_eq!(constant_view_size(255), 256);
+        assert_eq!(constant_view_size(256), 256);
+        assert_eq!(constant_view_size(257), 512);
+        assert_eq!(constant_view_size(65_536), 65_536);
+        assert_eq!(constant_view_size(100_000), 65_536);
+    }
+
+    #[test]
+    fn typed_buffer_views_of_32_bit_integers_move_bits() {
+        assert_eq!(bit_exact_format(DXGI_FORMAT_R32_UINT), DXGI_FORMAT_R32_FLOAT);
+        assert_eq!(bit_exact_format(DXGI_FORMAT_R32_SINT), DXGI_FORMAT_R32_FLOAT);
+        assert_eq!(bit_exact_format(DXGI_FORMAT_R32G32_UINT), DXGI_FORMAT_R32G32_FLOAT);
+        assert_eq!(bit_exact_format(DXGI_FORMAT_R32G32_SINT), DXGI_FORMAT_R32G32_FLOAT);
+        assert_eq!(bit_exact_format(DXGI_FORMAT_R32G32B32_UINT), DXGI_FORMAT_R32G32B32_FLOAT);
+        assert_eq!(bit_exact_format(DXGI_FORMAT_R32G32B32A32_UINT), DXGI_FORMAT_R32G32B32A32_FLOAT);
+        assert_eq!(bit_exact_format(DXGI_FORMAT_R16_UINT), DXGI_FORMAT_R16_UINT);
+    }
+
+    #[test]
+    fn buffer_views_validation_rejects_unsafe() {
+        assert!(buffer_view_ok(DXGI_FORMAT_R32_FLOAT, 0, 4, 0, false, 64));
+        assert!(buffer_view_ok(DXGI_FORMAT_R32_FLOAT, 3, 1, 0, false, 16));
+        assert!(!buffer_view_ok(DXGI_FORMAT_R32_FLOAT, 0, 0, 0, false, 64));
+        assert!(!buffer_view_ok(DXGI_FORMAT_R32_FLOAT, 3, 2, 0, false, 16));
+        assert!(!buffer_view_ok(DXGI_FORMAT_R32_FLOAT, u64::MAX, 1, 0, false, 64));
     }
 }

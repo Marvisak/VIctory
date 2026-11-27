@@ -138,6 +138,8 @@ pub(crate) struct Shader {
     pub texture_index: std::collections::HashMap<V, V>,
     pub texture_reads: Vec<V>,
     pub flags: u64,
+    /// Every UAV the shader opens is rasterizer ordered ([`Self::annotate`]).
+    pub rov: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -204,6 +206,7 @@ impl Shader {
             texture_index: std::collections::HashMap::new(),
             texture_reads: Vec::new(),
             flags: 0,
+            rov: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
@@ -512,6 +515,12 @@ impl Shader {
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        let props0 = if self.rov && props0 & 0x1000 != 0 {
+            self.flags |= flags::ROVS;
+            props0 | 0x2000
+        } else {
+            props0
+        };
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(

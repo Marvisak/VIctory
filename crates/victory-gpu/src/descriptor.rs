@@ -577,11 +577,20 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 /// A null `desc` writes a null CBV (`Constant(0, 0)`), matching D3D12's
 /// `CreateConstantBufferView` with a null description. Leaving the slot
 /// untouched would keep a stale view active.
+/// Caps oversized CBVs to 64 KiB and ensures 256-byte granularity.
+pub(crate) fn constant_view_size(size: u32) -> u32 {
+    const MOST: u32 = 4096 * 16;
+    if size > MOST {
+        return MOST;
+    }
+    size.max(256).next_multiple_of(256)
+}
+
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
     let view = match words(desc) {
         Some([lo, hi, size, _]) => {
             let address = u64::from(lo) | u64::from(hi) << 32;
-            View::Constant(address, size)
+            View::Constant(address, constant_view_size(size))
         }
         None => View::Constant(0, 0),
     };
@@ -962,6 +971,25 @@ pub(crate) mod tests {
         assert_eq!(view(a), Some(View::Shader(0, None)));
         create_cbv(null, std::ptr::null(), a);
         assert_eq!(view(a), Some(View::Constant(0, 0)));
+    }
+
+    #[test]
+    fn cbv_size_clamping_and_zero_views() {
+        assert_eq!(constant_view_size(0), 256);
+        assert_eq!(constant_view_size(1), 256);
+        assert_eq!(constant_view_size(256), 256);
+        assert_eq!(constant_view_size(65_536), 65_536);
+        assert_eq!(constant_view_size(65_537), 65_536);
+        assert_eq!(constant_view_size(1_306_368), 65_536);
+        assert_eq!(constant_view_size(u32::MAX), 65_536);
+
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let a = slots.as_ptr() as u64;
+        create_cbv(null, &[0x1000, 1, 1_306_368, 0], a);
+        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 65_536)));
+        create_cbv(null, &[0x1000, 1, 0, 0], a);
+        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 256)));
     }
 
     /// A released resource's views go stale; the same view of a new
