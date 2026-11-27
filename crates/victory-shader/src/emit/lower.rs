@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1407,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -7683,6 +7688,25 @@ impl<'a> Lower<'a> {
                     _ => {
                         // A computed selector: each byte picked at run time.
                         let (a, b, sv) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                        // Pack the four sign-fill bytes once. Selector codes
+                        // 8..11 index these with the same low two bits as
+                        // ordinary byte selectors, and hence the same shift.
+                        let signs = |l: &mut Self, src, shift: u32| {
+                            let (k16, k31, ff, ff00) = (
+                                k(l, 16),
+                                k(l, 31),
+                                k(l, 0xFFu32 << shift),
+                                k(l, 0xFF00u32 << shift),
+                            );
+                            let lo = l.s.m.bin(c, Bin::Shl, src, k16);
+                            let lo = l.s.m.bin(c, Bin::AShr, lo, k31);
+                            let lo = l.s.m.bin(c, Bin::And, lo, ff);
+                            let hi = l.s.m.bin(c, Bin::AShr, src, k31);
+                            let hi = l.s.m.bin(c, Bin::And, hi, ff00);
+                            l.s.m.bin(c, Bin::Or, lo, hi)
+                        };
+                        let (sa, sb) = (signs(self, a, 16), signs(self, b, 0));
+                        let signs = self.s.m.bin(c, Bin::Or, sa, sb);
                         let mut r = k(self, 0);
                         for i in 0..4u32 {
                             let (sh, ff) = (k(self, 8 * i), k(self, 0xFF));
@@ -7699,19 +7723,13 @@ impl<'a> Lower<'a> {
                             let index = self.s.m.bin(c, Bin::And, sel, three);
                             let bits = self.s.m.bin(c, Bin::Shl, index, three);
                             let x = self.s.m.bin(c, Bin::LShr, word, bits);
-                            let mut byte = self.s.m.bin(c, Bin::And, x, ff);
+                            let byte = self.s.m.bin(c, Bin::And, x, ff);
                             // 8-11: the sign of bytes 1, 3 of src1, then of src0.
-                            for (n, src, bit) in [(8, b, 15), (9, b, 31), (10, a, 15), (11, a, 31)]
-                            {
-                                let left = k(self, 31 - bit);
-                                let t = self.s.m.bin(c, Bin::Shl, src, left);
-                                let k31 = k(self, 31);
-                                let t = self.s.m.bin(c, Bin::AShr, t, k31);
-                                let t = self.s.m.bin(c, Bin::And, t, ff);
-                                let kn = k(self, n);
-                                let is = self.s.m.cmp(c, pred::EQ, sel, kn);
-                                byte = self.s.m.select(c, is, t, byte);
-                            }
+                            let fill = self.s.m.bin(c, Bin::LShr, signs, bits);
+                            let fill = self.s.m.bin(c, Bin::And, fill, ff);
+                            let eight = k(self, 8);
+                            let ordinary = self.s.m.cmp(c, pred::IULT, sel, eight);
+                            let mut byte = self.s.m.select(c, ordinary, byte, fill);
                             let (k12, z) = (k(self, 12), k(self, 0));
                             let is12 = self.s.m.cmp(c, pred::EQ, sel, k12);
                             byte = self.s.m.select(c, is12, z, byte);
@@ -11089,6 +11107,16 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn v_perm_b32_dynamic_instruction_count() {
+        // Dynamic root constants feed all three sources; the result is
+        // stored to a UAV. Counts include loads, the store and terminators.
+        // The old per-output-byte sign selects needed 158 instructions.
+        let words = [0xD744_0000, 0x101 | 0x102 << 9 | 0x103 << 18];
+        let count = lower_valu(&words).unwrap().instructions;
+        assert_eq!(count, 107, "v_perm_b32 DXIL instruction count");
     }
 
     #[test]

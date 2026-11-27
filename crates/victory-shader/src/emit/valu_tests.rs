@@ -770,6 +770,57 @@ fn f16_max_and_min_order_negative_zero_below_positive_zero() {
 }
 
 #[test]
+fn v_perm_b32_dynamic_selectors_match_byte_reference() {
+    let shader = build_valu_cs(&vop3(0x344, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let mut cases = Vec::new();
+    // Every selector byte in every output position, with all combinations
+    // of the four sign bits selectors 8..11 replicate. The other bits give
+    // ordinary byte selectors distinct data to pick from either source.
+    for signs in 0..16u32 {
+        let a = 0x1234_5678 | (signs & 4) << 13 | (signs & 8) << 28;
+        let b = 0x6ABC_5EF0 | (signs & 1) << 15 | (signs & 2) << 30;
+        for selector in 0..256u32 {
+            let selectors = u32::from_le_bytes(std::array::from_fn(|i| {
+                selector.wrapping_add(i as u32 * 67) as u8
+            }));
+            cases.push([a, b, selectors, 0]);
+        }
+    }
+    // Raw bit patterns, including zero, all ones, single bits and selectors
+    // with four independently chosen bytes.
+    for bit in 0..32 {
+        for selector in [0x0001_0203, 0x0405_0607, 0x0809_0A0B, 0x0C0D_80FF] {
+            cases.push([1 << bit, !(1 << bit), selector, 0]);
+            cases.push([0, u32::MAX, selector, 0]);
+        }
+    }
+    let mut backends = std::collections::BTreeSet::new();
+    run_cases(&shader, &cases, |backend, _, [a, b, selectors, _], got| {
+        let bytes: [u8; 8] = (u64::from(a) << 32 | u64::from(b)).to_le_bytes();
+        let want = u32::from_le_bytes(selectors.to_le_bytes().map(|selector| match selector {
+            0..=7 => bytes[selector as usize],
+            8..=11 => {
+                if bytes[(selector as usize - 8) * 2 + 1] & 0x80 != 0 {
+                    0xFF
+                } else {
+                    0
+                }
+            }
+            12 => 0,
+            _ => 0xFF,
+        }));
+        assert_eq!(
+            got, want,
+            "{backend}: {a:08x}, {b:08x}, selectors {selectors:08x}"
+        );
+        backends.insert(backend.to_owned());
+    });
+    for backend in backends {
+        eprintln!("v_perm_b32: {backend}: {} cases matched", cases.len());
+    }
+}
+
+#[test]
 fn v_min3_max3_med3_integer_forms_match_rdna2() {
     // v_{min3,max3,med3}_{i32,u32} v0, v1, v2, v3 (VOP3 0x152..0x159).
     type Pick = fn([u32; 3]) -> u32;
