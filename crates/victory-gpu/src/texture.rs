@@ -222,7 +222,7 @@ unsafe impl Sync for Staging {}
 /// get its upload.
 pub(crate) fn host_writes(list: &HostList, resource: This) {
     if let Some(copy) = crate::resource::host_copy(resource) {
-        list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
+        list.defer_host(move || copy.note_host_written());
     }
 }
 
