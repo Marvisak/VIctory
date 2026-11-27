@@ -40,6 +40,7 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
+    adapter_name: Option<String>,
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
     queue: ID3D12CommandQueue,
@@ -106,8 +107,21 @@ pub fn on_failure(report: fn(&str) -> !) {
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
+    let text = failure_text(what, host());
+    tracing::error!("{text}");
+    match ON_FAILURE.get() {
+        Some(report) => report(&text),
+        None => std::process::abort(),
+    }
+}
+
+fn failure_text(what: std::fmt::Arguments, host: Option<&Host>) -> String {
     let mut text = what.to_string();
-    if let Some(host) = host() {
+    if let Some(host) = host {
+        if let Some(adapter) = &host.adapter_name {
+            use std::fmt::Write;
+            let _ = write!(text, "; D3D12 adapter: {adapter}");
+        }
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
@@ -120,11 +134,7 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
             None => {}
         }
     }
-    tracing::error!("{text}");
-    match ON_FAILURE.get() {
-        Some(report) => report(&text),
-        None => std::process::abort(),
-    }
+    text
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
@@ -248,6 +258,7 @@ fn create() -> windows::core::Result<Host> {
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
         Ok(Host {
+            adapter_name: device_adapter_name(&device),
             device,
             depth_bounds_supported,
             queue,
@@ -353,6 +364,27 @@ fn log_gpu_times(frames: f64) {
     }
 }
 
+fn device_adapter<T: Interface>(device: &ID3D12Device) -> Option<T> {
+    // SAFETY: plain device and DXGI queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        factory.EnumAdapterByLuid(device.GetAdapterLuid()).ok()
+    }
+}
+
+fn device_adapter_name(device: &ID3D12Device) -> Option<String> {
+    let adapter = device_adapter::<IDXGIAdapter1>(device)?;
+    // SAFETY: plain query on the device's live adapter.
+    let desc = unsafe { adapter.GetDesc1() }.ok()?;
+    let end = desc
+        .Description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(desc.Description.len());
+    let name = String::from_utf16_lossy(&desc.Description[..end]);
+    (!name.is_empty()).then_some(name)
+}
+
 /// Diagnostics: the host device's video memory use and budget, in MB, local
 /// (on the card) and non-local (system memory the GPU reads), as the
 /// system's memory manager sees them: use over budget makes it page
@@ -360,15 +392,7 @@ fn log_gpu_times(frames: f64) {
 pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
     static ADAPTER: OnceLock<Option<IDXGIAdapter3>> = OnceLock::new();
     let adapter = ADAPTER
-        .get_or_init(|| {
-            let device = &host()?.device;
-            // SAFETY: plain device and DXGI queries.
-            unsafe {
-                let luid = device.GetAdapterLuid();
-                let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-                factory.EnumAdapterByLuid(luid).ok()
-            }
-        })
+        .get_or_init(|| device_adapter(&host()?.device))
         .as_ref()?;
     let info = |group| {
         let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
@@ -639,6 +663,26 @@ pub(crate) mod tests {
         list.reset();
         assert_eq!(list.scratch(512).unwrap(), first);
         list.close();
+    }
+
+    #[test]
+    fn gpu_failure_report_names_the_created_devices_adapter() {
+        let what = "synthetic GPU failure";
+        assert_eq!(failure_text(format_args!("{what}"), None), what);
+        let Some(host) = host() else {
+            eprintln!("skipping adapter report: no D3D12 device");
+            return;
+        };
+        let Some(name) = device_adapter_name(&host.device) else {
+            eprintln!("skipping adapter report: DXGI adapter name unavailable");
+            return;
+        };
+        let text = failure_text(format_args!("{what}"), Some(host));
+        assert!(
+            text.starts_with(&format!("{what}; D3D12 adapter: {name}")),
+            "{text}"
+        );
+        eprintln!("{text}");
     }
 
     #[test]
