@@ -20,6 +20,9 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+mod buffer_store;
+#[cfg(test)]
+mod buffer_store_tests;
 mod bvh;
 
 type Why = &'static str;
@@ -214,15 +217,16 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    #[allow(clippy::type_complexity)]
+    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Handles made in the entry block for descriptors at addresses the
     /// root parameters alone give (table and heap loads with no other
     /// term), by base value, byte offset, dword, offset register, sampler
     /// heap and properties ([`Lower::entry_address`]).
-    entry_handles: HashMap<(EntryAddress, u8, bool, u32), V>,
+    entry_handles: HashMap<(EntryAddress, u8, bool, (u32, u32)), V>,
     /// Handles of descriptors chosen by control flow, made in their join
     /// block, by the choice (its `Debug` text), sampler heap and properties.
-    join_handles: HashMap<(String, bool, u32), V>,
+    join_handles: HashMap<(String, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -5368,7 +5372,7 @@ impl<'a> Lower<'a> {
                 // compiler reloads one before every use rather than keep it
                 // (ActivateRays: 2,399 loads of one), and one handle made in
                 // the entry block serves them all.
-                let key = (address, *first, sampler, props.0);
+                let key = (address, *first, sampler, props);
                 if let Some(&h) = self.entry_handles.get(&key) {
                     return Ok(h);
                 }
@@ -5381,7 +5385,7 @@ impl<'a> Lower<'a> {
                 Ok(h)
             }
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -5490,7 +5494,7 @@ impl<'a> Lower<'a> {
                 // One handle at the join for every access the choice reaches
                 // (each is in a block the join dominates).
                 let _ = site;
-                let key = (format!("{src:?}"), sampler, props.0);
+                let key = (format!("{src:?}"), sampler, props);
                 if let Some(&h) = self.join_handles.get(&key) {
                     return Ok(h);
                 }
@@ -9395,9 +9399,15 @@ impl<'a> Lower<'a> {
             Some(_) => return Err(name),
         };
         // d16: two 16-bit channels per VGPR, low half first (buffer and
-        // tbuffer formats alike).
+        // tbuffer formats alike); `_d16_hi` takes the high 16-bit half.
+        let hi16 = store && (name.ends_with("_d16_hi") || name == "buffer_store_format_d16_hi_x");
         let d16 = name.contains("_format_d16_");
-        let plain = name.replace("_format_d16_", "_format_");
+        let plain = if hi16 {
+            name.replace("_format_d16_hi_", "_format_")
+                .replace("_d16_hi", "")
+        } else {
+            name.replace("_format_d16_", "_format_")
+        };
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
@@ -9440,10 +9450,12 @@ impl<'a> Lower<'a> {
             let o = vaddr(self, u8::from(*idxen))?;
             off = self.s.m.bin(c, Bin::Add, off, o);
         }
-        if !matches!(
+        let record_off = off;
+        let has_soffset = !matches!(
             soffset,
             Operand::Scalar { code: NULL, .. } | Operand::Const(128)
-        ) {
+        );
+        if has_soffset {
             let so = self.operand(inst, soffset)?;
             off = self.s.m.bin(c, Bin::Add, off, so);
         }
@@ -9454,6 +9466,7 @@ impl<'a> Lower<'a> {
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
         let (base, extra) = self.built_offset(src)?;
+        let has_base_off = has_soffset || base != 0 || extra.is_some();
         if base != 0 {
             let b = self.s.m.i32(base);
             off = self.s.m.bin(c, Bin::Add, off, b);
@@ -9594,35 +9607,28 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let (true, Some((width, _))) = (store, sub) {
-            // The field of the dword holding it, by two atomics on that dword
-            // (clear, then set): other lanes' fields in it are left alone.
-            // shortcut: the field is taken not to cross a dword.
-            if index.is_some() {
-                return Err("a byte or half buffer store by index");
-            }
-            let d = data.as_ref().ok_or("buffer store data")?;
-            let x = self.vgprs(inst, d, 1)?[0];
-            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-            let at = self.s.m.bin(c, Bin::And, off, not3);
-            let byte = self.s.m.bin(c, Bin::And, off, three);
-            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-            let field = self.s.m.i32(if width == 8 { 0xFF } else { 0xFFFF });
-            let x = self.s.m.bin(c, Bin::And, x, field);
-            let x = self.s.m.bin(c, Bin::Shl, x, sh);
-            let mask = self.s.m.bin(c, Bin::Shl, field, sh);
-            let all = self.s.m.i32(u32::MAX);
-            let keep = self.s.m.bin(c, Bin::Xor, mask, all);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
-            let begin = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
-            for (op, v) in [(1, keep), (2, x)] {
-                let args = [h, self.s.m.i32(op), at, iu, iu, v];
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
-            }
-            self.mark_view_write(h, at, 4, None);
-            self.end_guarded(begin, &[]);
-            return Ok(());
+            let may_cross_dword = width == 16
+                && (*offen
+                    || has_base_off
+                    || (*idxen && index.is_none())
+                    || (u32::from(*offset) & 3) == 3);
+            return self.subword_buffer_store(
+                inst,
+                data.as_ref(),
+                buffer_store::SubwordStore {
+                    site,
+                    src,
+                    stride: used.map_or(0, |u| u.stride),
+                    index,
+                    off,
+                    record_off,
+                    has_base_off,
+                    may_cross_dword,
+                    width,
+                    hi16,
+                    guard,
+                },
+            );
         }
         if store {
             let regs = if d16 { count.div_ceil(2) } else { count };
@@ -9644,7 +9650,7 @@ impl<'a> Lower<'a> {
                 let mut wide = Vec::new();
                 for k in 0..count {
                     let mut x = vals[(k / 2) as usize];
-                    if k % 2 == 1 {
+                    if k % 2 == 1 || hi16 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(c, Bin::LShr, x, k16);
                     }
@@ -9665,15 +9671,22 @@ impl<'a> Lower<'a> {
                 }
                 vals = wide;
             }
+            if typed && count < 4 {
+                if *offen || *offset != 0 || has_base_off {
+                    return Err("a typed buffer store at an offset");
+                }
+                let h = typed_h.ok_or("a typed buffer store")?;
+                let element = index.unwrap_or(self.s.m.i32(0));
+                return self
+                    .partial_typed_buffer_store(site, src, u, h, element, &vals, count, guard);
+            }
             let mut args = Vec::new();
             // Where the write starts in the view, and how many bytes it may
             // cover (for its marks).
             let (byte, bytes);
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
+                if *offen || *offset != 0 || has_base_off {
+                    return Err("a typed buffer store at an offset");
                 }
                 let h = typed_h.ok_or("a typed buffer store")?;
                 let element = index.unwrap_or(self.s.m.i32(0));
@@ -10926,7 +10939,7 @@ mod tests {
     };
     use crate::{io, ir, resource, structure};
 
-    const S_ENDPGM: u32 = 0xBF81_0000;
+    pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
 
     /// A program's constant table starts after its instructions, unless a
     /// load at a fixed offset reads below that.
@@ -10989,7 +11002,7 @@ mod tests {
 
     /// Lowers a compute program with the root parameters `layout` (in user
     /// SGPRs from s0 on) and the used resources `used`.
-    fn lower_with(
+    pub(super) fn lower_with(
         words: &[u32],
         layout: Vec<RootParam>,
         used: Vec<UsedResource>,
