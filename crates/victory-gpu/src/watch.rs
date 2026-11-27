@@ -808,6 +808,15 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+/// A producer finished filling these title bytes. Its pre-write notification
+/// can already have been consumed while a DirectStorage worker was decoding.
+/// No guard needs opening again: the write has finished.
+pub fn title_bytes_written(bytes: &[u8]) {
+    if !bytes.is_empty() {
+        title_memory_remapped(bytes.as_ptr() as usize, bytes.len());
+    }
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {

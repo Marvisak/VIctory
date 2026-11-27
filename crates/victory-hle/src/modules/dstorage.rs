@@ -876,8 +876,24 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        // A file read into a title address is the kernel's write, and the
+        // kernel does not fault into the GPU side's guard: a block guarded
+        // again between `kernel_will_write` and the read (the guard over all
+        // the views of a page protects other views from other threads) made
+        // the read fail with ERROR_INVALID_USER_BUFFER, and the title stops
+        // at the failed request. It is read beside and copied in: our copy
+        // faults into the guard like the title's own writes.
+        let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
+        return into_destination(request, size, |out| {
+            if !bounce {
+                return read_into(request, out).map(|()| size);
+            }
+            let mut data = vec![0; size];
+            read_into(request, &mut data)?;
+            out.copy_from_slice(&data);
+            Ok(size)
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
@@ -1011,13 +1027,10 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        let _writing = victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        return fill_virtual_destination(out, fill, victory_gpu::title_bytes_written);
     }
     let offset = (request.page_offset & 0xffff) as usize;
     // SAFETY: the title passes a page number per 64 KiB of destination,
@@ -1075,6 +1088,22 @@ fn into_destination(
         "dstorage: a destination's physical pages could not be written; its request fails"
     );
     Err(E_INVALIDARG)
+}
+
+/// Open any guards before the write. After the producer succeeds, publish its
+/// completed extent before the queue signals completion to the title.
+fn fill_virtual_destination(
+    out: &mut [u8],
+    fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
+    publish: impl FnOnce(&[u8]),
+) -> Result<(), HRESULT> {
+    let _writing = victory_gpu::kernel_will_write(out.as_ptr() as usize, out.len());
+    let produced = fill(out)?;
+    let written = out.get(..produced).ok_or(INVALID_DATA)?;
+    if !written.is_empty() {
+        publish(written);
+    }
+    Ok(())
 }
 
 /// The file a request reads, as the title named it, or "memory".
@@ -1555,6 +1584,34 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(result(array, 0), E_PENDING);
         assert_eq!(out, [0; 16]);
+    }
+
+    #[test]
+    fn virtual_destination_publishes_only_completed_bytes() {
+        use std::cell::Cell;
+        let mut destination = [0xcc; 8];
+        let start = destination.as_ptr();
+        let published = Cell::new(false);
+        fill_virtual_destination(
+            &mut destination,
+            |out| {
+                assert!(!published.get());
+                out[..3].copy_from_slice(b"rgb");
+                Ok(3)
+            },
+            |bytes| {
+                assert_eq!(bytes.as_ptr(), start);
+                assert_eq!(bytes, b"rgb");
+                published.set(true);
+            },
+        )
+        .unwrap();
+        assert!(published.get());
+        assert_eq!(destination[3..], [0xcc; 5]);
+        for result in [Err(INVALID_DATA), Ok(0), Ok(9)] {
+            let answer = fill_virtual_destination(&mut destination, |_| result, |_| panic!("no completed bytes"));
+            assert_eq!(answer, if result == Ok(0) { Ok(()) } else { Err(INVALID_DATA) });
+        }
     }
 
     #[test]
