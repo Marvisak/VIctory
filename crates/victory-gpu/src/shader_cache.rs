@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{GroupSync, HostShader, StaticSampler, UserData, WaveMode};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -64,18 +64,46 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        key(victory_shader::SOURCE_HASH, ENCODING, limit, wave_mode())
     })
+}
+
+fn wave_mode() -> WaveMode {
+    static WAVE: OnceLock<WaveMode> = OnceLock::new();
+    *WAVE.get_or_init(|| {
+        let (max, min) = host_lanes();
+        WaveMode::new(max, min)
+    })
+}
+
+#[cfg(windows)]
+fn host_lanes() -> (u32, u32) {
+    crate::host::host().map_or((32, 32), |h| (h.max_wave_lanes, h.min_wave_lanes))
+}
+
+#[cfg(not(windows))]
+fn host_lanes() -> (u32, u32) {
+    (32, 32)
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, wave: WaveMode) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&[
+        wave.host_lanes as u8,
+        wave.min_lanes as u8,
+        u8::from(wave.wide64),
+        match wave.group_sync {
+            GroupSync::Auto => 0,
+            GroupSync::Strict => 1,
+            GroupSync::Relaxed => 2,
+        },
+    ]);
     *h.finalize().as_bytes()
 }
 
@@ -85,7 +113,10 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let wave = wave_mode();
+    let translate = |c: &[u8]| {
+        victory_shader::emit::translate_with(c, options, wave).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => (translate(container), false),
@@ -476,21 +507,23 @@ mod tests {
     }
 
     /// The key's parts: a change to any of them (the translator's sources,
-    /// this file's encoding, the loop limit) makes another key, so no entry
-    /// written before it is read.
+    /// this file's encoding, the loop limit, the wave settings) makes another
+    /// key, so no entry written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let wave = WaveMode::with(32, false, GroupSync::Auto);
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, wave);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, wave));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, wave));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, wave));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, wave));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                wave_mode()
             )
         );
         // The encoding part is this file as built.
@@ -499,6 +532,30 @@ mod tests {
                 .unwrap()
                 .contains("fn encode(translation: &Result<HostShader, String>)")
         );
+    }
+
+    #[test]
+    fn wave_settings_have_distinct_cache_keys() {
+        let base = "0123456789abcdef";
+        let k = |wave| key(base, b"encoding", 1 << 20, wave);
+        assert_ne!(
+            k(WaveMode::with(32, false, GroupSync::Auto)),
+            k(WaveMode::with(64, false, GroupSync::Auto))
+        );
+        assert_ne!(
+            k(WaveMode::with(32, false, GroupSync::Auto)),
+            k(WaveMode::with(32, false, GroupSync::Auto).with_min_lanes(4))
+        );
+        assert_ne!(
+            k(WaveMode::with(32, false, GroupSync::Auto)),
+            k(WaveMode::with(32, true, GroupSync::Auto))
+        );
+        for sync in [GroupSync::Strict, GroupSync::Relaxed] {
+            assert_ne!(
+                k(WaveMode::with(32, false, GroupSync::Auto)),
+                k(WaveMode::with(32, false, sync))
+            );
+        }
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

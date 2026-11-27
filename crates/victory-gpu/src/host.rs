@@ -35,6 +35,10 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
+fn wave_lane_count_max(reported: bool, lanes: u32) -> u32 {
+    if reported && lanes > 0 { lanes } else { 32 }
+}
+
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
@@ -42,6 +46,8 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    pub(crate) max_wave_lanes: u32,
+    pub(crate) min_wave_lanes: u32,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -195,6 +201,19 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let mut wave_options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        let lanes = device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut wave_options).cast(),
+            size_of_val(&wave_options) as u32,
+        );
+        let max_wave_lanes =
+            wave_lane_count_max(lanes.is_ok(), wave_options.WaveLaneCountMax);
+        let min_wave_lanes = if lanes.is_ok() && wave_options.WaveLaneCountMin > 0 {
+            wave_options.WaveLaneCountMin
+        } else {
+            1
+        };
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -250,6 +269,8 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             depth_bounds_supported,
+            max_wave_lanes,
+            min_wave_lanes,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -390,6 +411,17 @@ pub(crate) mod tests {
     /// The barriers built on this thread since the last call.
     pub(crate) fn issued() -> Vec<(usize, u32, u32)> {
         ISSUED.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+
+    #[test]
+    fn reported_wave_lane_count_max_is_not_rounded_up() {
+        use super::wave_lane_count_max;
+
+        assert_eq!(wave_lane_count_max(true, 4), 4);
+        assert_eq!(wave_lane_count_max(true, 32), 32);
+        assert_eq!(wave_lane_count_max(true, 64), 64);
+        assert_eq!(wave_lane_count_max(false, 4), 32);
+        assert_eq!(wave_lane_count_max(true, 0), 32);
     }
 
     /// Replays transitions in the order the GPU runs them from the states

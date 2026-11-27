@@ -628,6 +628,7 @@ impl<'a> Lanes<'a> {
                 l.kills.insert(*def);
             }
         }
+        l.restored.extend(p.restored.iter().map(|(&k, &v)| (k, v)));
         for inst in blocks.iter().flat_map(|b| &b.insts) {
             if let Fields::Valu(v) = &inst.fields
                 && inst.name() == "v_readlane_b32"

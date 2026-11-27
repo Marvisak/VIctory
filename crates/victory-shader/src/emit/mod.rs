@@ -377,14 +377,85 @@ pub struct Options {
     pub view_marks: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum GroupSync {
+    #[default]
+    Auto,
+    Strict,
+    Relaxed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WaveMode {
+    pub host_lanes: u32,
+    pub min_lanes: u32,
+    pub wide64: bool,
+    pub group_sync: GroupSync,
+}
+
+impl Default for WaveMode {
+    fn default() -> Self {
+        Self {
+            host_lanes: 64,
+            min_lanes: 64,
+            wide64: false,
+            group_sync: GroupSync::Auto,
+        }
+    }
+}
+
+impl WaveMode {
+    pub fn new(host_lanes: u32, min_lanes: u32) -> Self {
+        let wide64 = host_lanes >= 64
+            && std::env::var("VICTORY_WAVE_WIDE")
+                .ok()
+                .is_some_and(|v| !v.is_empty() && v != "0");
+        let group_sync = match std::env::var("VICTORY_GROUP_SYNC")
+            .ok()
+            .as_deref()
+            .unwrap_or("auto")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "strict" | "on" | "1" => GroupSync::Strict,
+            "relaxed" | "off" | "0" => GroupSync::Relaxed,
+            _ => GroupSync::Auto,
+        };
+        Self::with(host_lanes, wide64, group_sync).with_min_lanes(min_lanes)
+    }
+
+    pub fn with(host_lanes: u32, wide64: bool, group_sync: GroupSync) -> Self {
+        Self {
+            host_lanes,
+            min_lanes: host_lanes,
+            wide64,
+            group_sync,
+        }
+    }
+
+    pub fn with_min_lanes(mut self, min_lanes: u32) -> Self {
+        self.min_lanes = min_lanes;
+        self
+    }
+
+    pub fn relaxes_divergent_barriers(&self) -> bool {
+        !self.wide64 && self.group_sync != GroupSync::Strict
+    }
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, without write marks.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    translate_with(container, Options::default())
+    translate_with(container, Options::default(), WaveMode::default())
 }
 
 /// [`translate`] made as `options` say.
-pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+pub fn translate_with(
+    container: &[u8],
+    options: Options,
+    wave: WaveMode,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -408,7 +479,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    emit_with_wave(&c, &native, &p, &st, &io, &res, options, wave)
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.
@@ -432,6 +503,21 @@ pub fn emit_with(
     io: &io::Io,
     res: &resource::Resources,
     options: Options,
+) -> Result<HostShader, ShaderError> {
+    emit_with_wave(c, native, p, st, io, res, options, WaveMode::default())
+}
+
+/// [`emit`] made as `options` and `wave` say.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_with_wave(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+    wave: WaveMode,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -500,14 +586,14 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let l = match lower::lower_with(&parts(st, res), wave) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            lower::lower_with(&parts(&st, &res), wave)?
         }
         l => l?,
     };
@@ -634,8 +720,9 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 #[cfg(test)]
 mod tests {
     use super::bitcode::Attr;
-    use super::lower::LOOP_LIMIT;
+    use super::lower::{LOOP_LIMIT, Lowered, Parts, barrier_mode, lower_with};
     use super::parse_loop_limit;
+    use crate::native::{ComputeIo, StageIo};
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
@@ -647,10 +734,132 @@ mod tests {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
     }
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    fn lower_wave_mode(words: &[u32], wave: WaveMode, wave64: bool) -> Result<Lowered, ShaderError> {
+        lower_wave_mode_threads(words, wave, wave64, [32, 1, 1])
+    }
+
+    fn lower_wave_mode_threads(
+        words: &[u32],
+        wave: WaveMode,
+        wave64: bool,
+        threads: [u32; 3],
+    ) -> Result<Lowered, ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo { rsrc2: 0, threads }),
+            code,
+        };
+        let p = ir::build(&native.code, wave64, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native).unwrap();
+        lower_with(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+        }, wave)
+    }
+
+    #[test]
+    fn barrier_modes_keep_the_shared_and_uav_fences() {
+        assert_eq!(barrier_mode(false, false), 1 | 8);
+        assert_eq!(barrier_mode(false, true), 8);
+        assert_eq!(barrier_mode(true, false), 1 | 2 | 8);
+        assert_eq!(barrier_mode(true, true), 2 | 8);
+    }
+
+    #[test]
+    fn divergent_barriers_drop_group_sync_in_one_wave() {
+        let words = [0x7D84_0480, 0xBE84_3C6A, 0xBF86_0001, 0xBF8A_0000, S_ENDPGM];
+        let strict = lower_wave_mode(&words, WaveMode::with(32, false, GroupSync::Strict), false).unwrap();
+        assert_eq!(strict.barrier_modes, [1 | 8]);
+        let auto = lower_wave_mode(&words, WaveMode::with(32, false, GroupSync::Auto), false).unwrap();
+        assert_eq!(auto.barrier_modes, [8]);
+        let wide = lower_wave_mode(&words, WaveMode::with(32, true, GroupSync::Auto), false).unwrap();
+        assert_eq!(wide.barrier_modes, [1 | 8]);
+    }
+
+    #[test]
+    fn a_group_above_the_host_minimum_keeps_group_sync() {
+        let words = [0x7D84_0480, 0xBE84_3C6A, 0xBF86_0001, 0xBF8A_0000, S_ENDPGM];
+        for (wave, threads) in [
+            (WaveMode::with(64, false, GroupSync::Auto).with_min_lanes(32), [64, 1, 1]),
+            (WaveMode::with(32, false, GroupSync::Auto).with_min_lanes(4), [32, 1, 1]),
+        ] {
+            let l = lower_wave_mode_threads(&words, wave, false, threads).unwrap();
+            assert_eq!(l.barrier_modes, [1 | 8]);
+        }
+    }
+
+    #[test]
+    fn a_wave64_group_without_wave_size_keeps_group_sync() {
+        let words = [
+            0x7D84_0080, 0xBE80_246A, 0xBF88_0001, 0xBF8A_0000, 0xBEFE_0400, S_ENDPGM,
+        ];
+        for (max, min) in [(32, 32), (4, 4), (64, 32)] {
+            let wave = WaveMode::with(max, false, GroupSync::Auto).with_min_lanes(min);
+            let l = lower_wave_mode_threads(&words, wave, true, [64, 1, 1]).unwrap();
+            assert_eq!(l.wave_size, None, "max {max}, min {min}");
+            assert_eq!(l.barrier_modes, [1 | 8], "max {max}, min {min}");
+        }
+    }
+
+    #[test]
+    fn an_unrestricted_wave64_compute_lowers_on_a_32_lane_host() {
+        let l = lower_wave_mode(
+            &[S_ENDPGM],
+            WaveMode::with(32, false, GroupSync::Auto),
+            true,
+        )
+        .unwrap();
+        assert!(!l.wave_ops);
+    }
+
+    #[test]
+    fn wave64_wave_size_is_never_emitted_on_a_narrow_host() {
+        let words = [0xD760_0005, 0x0001_0701, S_ENDPGM];
+        for wave in [
+            WaveMode::with(32, false, GroupSync::Auto),
+            WaveMode::with(32, true, GroupSync::Auto),
+            WaveMode::with(4, true, GroupSync::Auto),
+        ] {
+            assert!(
+                matches!(
+                    lower_wave_mode(&words, wave, true),
+                    Err(ShaderError::Unsupported { .. })
+                ),
+                "wide64 {} on {} lanes",
+                wave.wide64,
+                wave.host_lanes
+            );
+        }
+        let wide = lower_wave_mode(
+            &words,
+            WaveMode::with(64, true, GroupSync::Auto).with_min_lanes(32),
+            true,
+        )
+        .unwrap();
+        assert_eq!(wide.wave_size, Some(64));
+    }
+
     use super::container::SigElement;
     use super::shader::Shader;
     use super::*;
-    use crate::native::{ComputeIo, StageIo};
 
     #[test]
     fn indexed_move_initializes_an_input_before_its_first_use() {

@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::UserData;
+use super::WaveMode;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
@@ -72,6 +73,10 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    #[cfg(test)]
+    pub barrier_modes: Vec<u32>,
+    #[cfg(test)]
+    pub wave_size: Option<u32>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -96,9 +101,13 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with(parts, WaveMode::default())
+}
+
+pub(crate) fn lower_with(parts: &Parts, wave: WaveMode) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, wave).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -110,6 +119,15 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             }
             Err(Stop::Fail(e)) => return Err(e),
         }
+    }
+}
+
+pub(crate) fn barrier_mode(writes_uavs: bool, relaxed: bool) -> u32 {
+    match (writes_uavs, relaxed) {
+        (true, false) => 1 | 2 | 8,
+        (true, true) => 2 | 8,
+        (false, false) => 1 | 8,
+        (false, true) => 8,
     }
 }
 
@@ -233,6 +251,9 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    relaxed_barriers: HashSet<(usize, usize)>,
+    wave64_unsupported: bool,
+    barrier_modes: Vec<u32>,
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
     heap: [bool; 2],
     /// src0 of the current instruction as DPP fetched it.
@@ -541,7 +562,7 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, wave: WaveMode) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -598,12 +619,39 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
-            let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
+            let console_wave = if x.native.wave64 { 64 } else { 32 };
+            let one_wave = cs.threads.iter().product::<u32>() <= console_wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
+                s.wave_size = Some(console_wave);
             }
         }
+        let group_lanes = match &x.native.io {
+            StageIo::Cs(cs) => Some(cs.threads.iter().product::<u32>()),
+            StageIo::Ms(ms) => Some(ms.threads),
+            _ => None,
+        };
+        let single_wave = group_lanes.is_some_and(|n| {
+            n > 0
+                && (n <= wave.min_lanes
+                    || s.wave_size.is_some_and(|w| w >= n && w <= wave.host_lanes))
+        });
+        let mut relaxed_barriers = HashSet::new();
+        if single_wave && wave.relaxes_divergent_barriers() {
+            for (b, block) in p.blocks.iter().enumerate() {
+                for (i, inst) in block.insts.iter().enumerate() {
+                    if inst.name() != "s_barrier" {
+                        continue;
+                    }
+                    let divergent = x.st.reach.get(b).is_some_and(|r| *r != Bool::TRUE)
+                        || x.st.guards.get(b).and_then(|g| g.get(i)).is_some_and(|g| *g != Some(Bool::TRUE));
+                    if divergent {
+                        relaxed_barriers.insert((b, i));
+                    }
+                }
+            }
+        }
+        let wave64_unsupported =
+            x.native.wave64 && wave.host_lanes < 64 && s.wave_size == Some(64);
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
@@ -688,6 +736,9 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            relaxed_barriers,
+            wave64_unsupported,
+            barrier_modes: Vec::new(),
             heap: [false; 2],
             src0: None,
             console_lanes,
@@ -1293,6 +1344,12 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
+        if self.wave64_unsupported {
+            return Err(Stop::Fail(ShaderError::Unsupported {
+                offset: 0,
+                what: "a wave64 program needing WaveSize(64) on a host with fewer than 64 lanes",
+            }));
+        }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -1412,6 +1469,10 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            barrier_modes: self.barrier_modes,
+            #[cfg(test)]
+            wave_size: self.s.wave_size,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3532,7 +3593,8 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+                let mode = barrier_mode(self.writes_uavs, self.relaxed_barriers.contains(&(b, i)));
+                self.barrier_modes.push(mode);
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
