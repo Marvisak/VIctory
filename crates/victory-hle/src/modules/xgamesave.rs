@@ -910,6 +910,11 @@ extern "system" fn write_blob(
     if size > MAX_UPDATE {
         return UPDATE_TOO_BIG;
     }
+    if update.changes.iter().any(|(n, _)| *n == name) {
+        // Only one change per blob is allowed in an update; reject before
+        // copying what can be 16 MiB of title data.
+        return E_INVALIDARG;
+    }
     let data = if size == 0 {
         Vec::new()
     } else {
@@ -923,7 +928,9 @@ extern "system" fn write_blob(
 extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char) -> HRESULT {
     // SAFETY: as in `write_blob`.
     match (unsafe { update.as_mut() }, text(name)) {
-        (Some(update), Some(name)) if !name.is_empty() => {
+        (Some(update), Some(name))
+            if !name.is_empty() && !update.changes.iter().any(|(n, _)| *n == name) =>
+        {
             update.changes.push((name, None));
             S_OK
         }
@@ -1283,7 +1290,16 @@ mod tests {
             S_OK
         );
         type Delete = extern "system" fn(This, *mut Update, *const c_char) -> HRESULT;
-        assert_eq!(method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()), S_OK);
+        assert_eq!(
+            method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()),
+            E_INVALIDARG,
+            "the same blob was already written in this update"
+        );
+        assert_eq!(
+            write(this, update, c"world".as_ptr(), b"again".as_ptr(), 5),
+            E_INVALIDARG,
+            "a second write of the same blob is refused too"
+        );
         type Submit = extern "system" fn(This, *const Update, *mut AsyncBlock) -> HRESULT;
         let mut b = block();
         assert_eq!(method::<Submit>(&OBJECT, 0xe0)(this, update, &mut b), S_OK);
@@ -1316,7 +1332,7 @@ mod tests {
             enumerate_containers(this, provider, context, Some(seen)),
             S_OK
         );
-        assert_eq!(found, [("Slot_1".into(), "Chapter 1".into(), 2, 7)]);
+        assert_eq!(found, [("Slot_1".into(), "Chapter 1".into(), 3, 8)]);
 
         let mut container = std::ptr::null_mut();
         assert_eq!(
