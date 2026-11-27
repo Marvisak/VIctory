@@ -98,7 +98,7 @@ impl Heap {
             .get_or_init(|| {
                 let step = u64::from(increment(self.desc.kind)?);
                 let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
-                for i in pending.drain(..) {
+                for i in std::mem::take(&mut *pending) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
                 Some(h)

@@ -101,6 +101,8 @@ struct Buffers {
     free_bytes: u64,
     /// Taken by the submission being prepared.
     used: Vec<(u64, ID3D12Resource, usize)>,
+    peak_used_bytes: u64,
+    window: u32,
 }
 
 // SAFETY: the mappings are persistent mappings of the upload buffers.
@@ -110,13 +112,18 @@ static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
     free: std::collections::VecDeque::new(),
     free_bytes: 0,
     used: Vec::new(),
+    peak_used_bytes: 0,
+    window: 0,
 });
 
 /// Free staging buffers kept at most.
 const KEPT_BYTES: u64 = 64 << 20;
+const BUFFERS_SPARE_BYTES: u64 = 8 << 20;
+const BUFFERS_IDLE_SUBMISSIONS: u32 = 64;
 
 /// Called before a submission's uploads: the buffers of the last one are
-/// free again (the oldest dropped past `KEPT_BYTES`).
+/// free again (the oldest dropped past `KEPT_BYTES`, and trimmed to recent
+/// peak usage every `BUFFERS_IDLE_SUBMISSIONS`).
 pub(crate) fn recycle() {
     {
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
@@ -125,11 +132,23 @@ pub(crate) fn recycle() {
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
+    let mut used_bytes = 0u64;
     for e in b.used.drain(..) {
+        used_bytes += e.0;
         b.free_bytes += e.0;
         b.free.push_back(e);
     }
-    while b.free_bytes > KEPT_BYTES
+    b.peak_used_bytes = b.peak_used_bytes.max(used_bytes);
+    b.window += 1;
+    let cap = if b.window >= BUFFERS_IDLE_SUBMISSIONS {
+        let target = b.peak_used_bytes.clamp(BUFFERS_SPARE_BYTES, KEPT_BYTES);
+        b.peak_used_bytes = 0;
+        b.window = 0;
+        target
+    } else {
+        KEPT_BYTES
+    };
+    while b.free_bytes > cap
         && let Some((n, ..)) = b.free.pop_front()
     {
         b.free_bytes -= n;
@@ -728,8 +747,8 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         // The largest textures' buffers are not kept.
-        const KEEP: usize = 32 << 20;
-        if self.0.len() <= KEEP {
+        const KEEP: usize = 16 << 20;
+        if self.0.capacity() <= KEEP {
             SCRATCH.set(std::mem::take(&mut self.0));
         }
     }

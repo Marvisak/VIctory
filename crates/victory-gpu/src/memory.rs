@@ -60,7 +60,7 @@ const BITMAP_WORDS: usize = BITMAP_BITS / 32;
 /// Byte size of a dirty-page bitmap buffer (256-byte aligned).
 const BITMAP_BYTES: u64 = (BITMAP_BITS / 8).next_multiple_of(256) as u64;
 /// Maximum number of dirty-page bitmaps kept in [`BITMAP_POOL`].
-const BITMAP_POOL_CAP: usize = 64;
+const BITMAP_POOL_CAP: usize = 16;
 /// The key of our own view heap ([`heap`]) among the title's.
 pub(crate) const OURS: usize = usize::MAX;
 

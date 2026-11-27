@@ -400,14 +400,17 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     res
 }
 
-/// Title pipelines created, and their distinct keys.
-static CREATED: Mutex<(u64, Option<HashSet<String>>)> = Mutex::new((0, None));
+/// Title pipelines created, and their distinct keys (16-byte BLAKE3 prefixes).
+static CREATED: Mutex<(u64, Option<HashSet<[u8; 16]>>)> = Mutex::new((0, None));
 
 /// The title created a pipeline with `key`.
 pub(crate) fn note_created(key: &str) {
+    let hash = blake3::hash(key.as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hash.as_bytes()[..16]);
     let mut created = CREATED.lock().unwrap_or_else(|e| e.into_inner());
     created.0 += 1;
-    created.1.get_or_insert_with(HashSet::new).insert(key.to_owned());
+    created.1.get_or_insert_with(HashSet::new).insert(id);
 }
 
 /// Title pipelines created so far, and how many distinct ones.
@@ -838,5 +841,16 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+
+    #[test]
+    fn note_created_counts_total_and_distinct_keys() {
+        let before = created();
+        note_created("test-distinct-key-a");
+        note_created("test-distinct-key-b");
+        note_created("test-distinct-key-a");
+        let after = created();
+        assert_eq!(after.0 - before.0, 3);
+        assert_eq!(after.1 - before.1, 2);
     }
 }

@@ -95,42 +95,94 @@ pub(crate) struct Shadow {
 /// Snapshot segments (offset, bytes) and the pieces compared.
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
 
-/// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+/// Snapshot memory kept for reuse (already touched, so no page faults),
+/// trimmed periodically to recent per-submission peak demand.
+#[derive(Default)]
+struct SnapshotPool {
+    buffers: Vec<Vec<u8>>,
+    submission_bytes: usize,
+    peak_bytes: usize,
+    window: u32,
+}
+
+impl SnapshotPool {
+    fn take(&mut self, n: usize) -> Vec<u8> {
+        let fit = self
+            .buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.capacity() >= n)
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i);
+        let mut v = match fit {
+            Some(i) => self.buffers.swap_remove(i),
+            None => Vec::with_capacity(n),
+        };
+        v.clear();
+        self.submission_bytes += v.capacity();
+        self.peak_bytes = self.peak_bytes.max(self.submission_bytes);
+        v
+    }
+
+    fn give_back(&mut self, v: Vec<u8>) {
+        self.buffers.push(v);
+        self.trim_to(POOL_BYTES);
+    }
+
+    fn trim_to(&mut self, max_bytes: usize) {
+        self.buffers.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+        let mut total = 0usize;
+        self.buffers.retain(|v| {
+            if total.saturating_add(v.capacity()) <= max_bytes {
+                total += v.capacity();
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn step_window(&mut self) {
+        self.submission_bytes = 0;
+        self.window += 1;
+        if self.window >= POOL_IDLE_SUBMISSIONS {
+            let budget = self.peak_bytes.clamp(POOL_SPARE_BYTES, POOL_BYTES);
+            self.peak_bytes = 0;
+            self.window = 0;
+            self.trim_to(budget);
+        }
+    }
+}
+
+static POOL: Mutex<SnapshotPool> = Mutex::new(SnapshotPool {
+    buffers: Vec::new(),
+    submission_bytes: 0,
+    peak_bytes: 0,
+    window: 0,
+});
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one.
 fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+    POOL.lock().unwrap_or_else(|e| e.into_inner()).take(n)
 }
 
 /// Returns a snapshot buffer to the pool, which keeps the largest up to
 /// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
 /// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
 fn give_back(v: Vec<u8>) {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut total = 0;
-    pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
-    });
+    POOL.lock().unwrap_or_else(|e| e.into_inner()).give_back(v);
+}
+
+/// Trims idle snapshot pool buffers past recent peak usage every
+/// [`POOL_IDLE_SUBMISSIONS`] submissions.
+pub(crate) fn trim_snapshot_pool() {
+    POOL.lock().unwrap_or_else(|e| e.into_inner()).step_window();
 }
 
 /// Snapshot memory kept for reuse.
 const POOL_BYTES: usize = 512 << 20;
+const POOL_SPARE_BYTES: usize = 32 << 20;
+const POOL_IDLE_SUBMISSIONS: u32 = 128;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
@@ -1656,5 +1708,46 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    #[test]
+    fn snapshot_pool_trims_after_idle_window() {
+        let mut pool = SnapshotPool::default();
+        let a = pool.take(32 << 20);
+        let b = pool.take(32 << 20);
+        let leaked = pool.take(32 << 20);
+        drop(leaked);
+        pool.give_back(a);
+        pool.give_back(b);
+        assert_eq!(pool.buffers.len(), 2);
+        for _ in 0..POOL_IDLE_SUBMISSIONS - 1 {
+            pool.step_window();
+            assert_eq!(pool.buffers.len(), 2);
+        }
+        pool.step_window();
+        assert_eq!(pool.buffers.len(), 2, "first window keeps peak 96 MiB");
+        for _ in 0..POOL_IDLE_SUBMISSIONS {
+            pool.step_window();
+        }
+        assert_eq!(
+            pool.buffers.len(),
+            1,
+            "second idle window trims buffers above 32 MiB spare even if a buffer was dropped"
+        );
+    }
+
+    #[test]
+    fn snapshot_pool_trim_to_retains_smaller_buffers_past_oversized() {
+        let mut pool = SnapshotPool {
+            buffers: vec![
+                Vec::with_capacity(64 << 20),
+                Vec::with_capacity(16 << 20),
+                Vec::with_capacity(8 << 20),
+            ],
+            ..SnapshotPool::default()
+        };
+        pool.trim_to(POOL_SPARE_BYTES);
+        let caps: Vec<usize> = pool.buffers.iter().map(Vec::capacity).collect();
+        assert_eq!(caps, [16 << 20, 8 << 20]);
     }
 }

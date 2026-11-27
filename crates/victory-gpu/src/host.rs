@@ -1426,6 +1426,7 @@ impl Host {
         // The submission has run and the next waits for our lock. Host
         // copies the title gave up meanwhile may have their last holder here.
         release_retired();
+        crate::shadow::trim_snapshot_pool();
         release_later(Box::new((batch, back, withheld, heaps)));
         self.log_messages();
         // A listed frame: what this submission's lists drew, as it is now
