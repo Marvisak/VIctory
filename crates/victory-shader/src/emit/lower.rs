@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod permlane;
 
 type Why = &'static str;
 
@@ -114,6 +115,7 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
+
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
 
@@ -571,7 +573,7 @@ impl<'a> Lower<'a> {
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
                     || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                    || matches!(n, "v_readlane_b32" | "v_writelane_b32" | "v_permlane16_b32" | "v_permlanex16_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || {
@@ -6675,6 +6677,7 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
             }
+            "v_permlane16_b32" | "v_permlanex16_b32" => self.permlane(inst, v, guard),
             "v_readfirstlane_b32"
                 if inst
                     .writes
@@ -12129,6 +12132,17 @@ mod tests {
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
         }
+    }
+
+    #[test]
+    fn permlane16_lowers() {
+        let words = [
+            // v_permlanex16_b32 v2, v0, s0, s1 (VOP3 opcode 0x378)
+            0xD778_0002,
+            (1 << 18) | 0x100,
+            S_ENDPGM,
+        ];
+        lowers(&words, 0).expect("v_permlanex16_b32 should lower");
     }
 
     #[test]
