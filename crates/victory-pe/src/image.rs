@@ -368,10 +368,8 @@ fn parse_exports(file: &PeFile64<'_>, image_base: u64) -> Result<Vec<ExportInfo>
                 NameOrOrdinal::Ordinal(_) => None,
             };
             let (rva, forward) = match e.target() {
-                // The generic iterator adds the image base to an address.
-                ReadTarget::Address { address } => {
-                    (Some(address.wrapping_sub(image_base) as u32), None)
-                }
+                // The generic iterator adds the image base to a 32-bit RVA.
+                ReadTarget::Address { address } => (Some(va_to_rva(address, image_base)?), None),
                 ReadTarget::Reexport { library, name } => {
                     let symbol = match name {
                         NameOrOrdinal::Name(name) => utf8(name),
@@ -690,6 +688,52 @@ mod tests {
                 (Some("beta"), 1, Some(0x1200)),
                 (Some("gamma"), 2, Some(0x1204)),
             ]
+        );
+    }
+
+    #[test]
+    fn keeps_valid_export_rva_when_image_base_is_high() {
+        let mut body = vec![0u8; 0x100];
+        let put32 =
+            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put32(&mut body, 12, 0x1040); // name of the DLL
+        put32(&mut body, 16, 1); // ordinal base
+        put32(&mut body, 20, 1); // number of functions
+        put32(&mut body, 24, 1); // number of names
+        put32(&mut body, 28, 0x1028); // address table
+        put32(&mut body, 32, 0x1034); // name pointer table
+        put32(&mut body, 36, 0x103C); // name ordinal table
+        put32(&mut body, 0x28, 0x1200); // address entry: object adds image_base to this RVA
+        put32(&mut body, 0x34, 0x1050);
+        body[0x40..0x46].copy_from_slice(b"t.dll\0");
+        body[0x50..0x56].copy_from_slice(b"alpha\0");
+
+        let info = ImageInfo::parse(&synthetic_image(&body)).unwrap();
+        let exports: Vec<_> = info
+            .exports
+            .iter()
+            .map(|e| (e.name.as_deref(), e.ordinal, e.rva))
+            .collect();
+        assert_eq!(exports, [(Some("alpha"), 1, Some(0x1200))]);
+    }
+
+    #[test]
+    fn va_to_rva_rejects_an_address_below_the_image_base() {
+        const BASE: u64 = 0x1_8000_0000;
+        assert_eq!(va_to_rva(BASE + 0x1200, BASE).unwrap(), 0x1200);
+        assert_eq!(
+            va_to_rva(BASE, BASE).unwrap(),
+            0,
+            "the base itself is RVA 0"
+        );
+        assert!(
+            va_to_rva(0x1200, BASE).is_err(),
+            "below the base has no RVA"
+        );
+        assert!(va_to_rva(u64::MAX, BASE).is_err());
+        assert!(
+            va_to_rva(BASE + 0x1_0000_0000, BASE).is_err(),
+            "an RVA past u32 is refused rather than truncated"
         );
     }
 }
