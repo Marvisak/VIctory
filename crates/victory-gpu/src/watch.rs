@@ -609,9 +609,36 @@ impl Tracked {
         saved.bytes.clear();
     }
 
+    /// Saves a marked submission's host bytes for changed pages of `[from, to)`
+    /// that have no title-side snapshot. `save` makes one page's bytes, and is
+    /// not called for clean pages or ones whose title-side snapshot must win.
+    pub(crate) fn save_missing_host(
+        &self,
+        from: usize,
+        to: usize,
+        mut save: impl FnMut(usize) -> Box<[u8]>,
+    ) {
+        if self.clean() {
+            return;
+        }
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to {
+            return;
+        }
+        // The same lock order as `take_split`: a title-side snapshot already
+        // saved wins, and a new fault waits rather than being overwritten.
+        let changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        for &page in changed.range(from / PAGE..to.div_ceil(PAGE)) {
+            saved.bytes.entry(page).or_insert_with(|| save(page));
+        }
+    }
+
     /// The bytes page `page` (a page number) held when it was first written
     /// since it was taken, if it was armed then (and so changed), with what
-    /// the copy took of it since: the copy's bytes before the submission.
+    /// the copy took of it since: the copy's bytes before the submission; or
+    /// the host baseline saved for a page already changed by an earlier
+    /// submission.
     pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
     }
@@ -1153,6 +1180,43 @@ pub(crate) mod tests {
         all();
         write(2, 5);
         assert_eq!(saved(2), None, "disarmed");
+        drop(t);
+        free(p);
+    }
+
+    /// Host baselines are made only for changed pages in the declared range
+    /// that have no title-side snapshot; clean and already saved pages do not
+    /// allocate or replace their earlier bytes.
+    #[test]
+    fn host_baselines_cover_only_missing_changed_pages_in_range() {
+        let p = pool(4);
+        let t = track(p, 4 * PAGE, true).expect("pool memory is tracked");
+        assert_eq!(t.take(p, p + 4 * PAGE), [(p, p + 4 * PAGE)]);
+        t.save_missing_host(p, p + 4 * PAGE, |_| panic!("a clean tracker copies nothing"));
+
+        // Page 1 gets a title-side snapshot; page 3 changes while unarmed.
+        t.arm(p + PAGE, p + 2 * PAGE);
+        // SAFETY: bytes of guarded pages in this test's allocation.
+        unsafe {
+            ((p + PAGE + 8) as *mut u8).write_volatile(1);
+            ((p + 3 * PAGE + 8) as *mut u8).write_volatile(1);
+        }
+        t.save_missing_host(p, p + 2 * PAGE, |_| {
+            panic!("the title-side snapshot takes precedence")
+        });
+        assert!(t.saved(p / PAGE + 3).is_none(), "page 3 is outside the range");
+
+        let mut calls = Vec::new();
+        t.save_missing_host(p + 2 * PAGE, p + 4 * PAGE, |page| {
+            calls.push(page);
+            vec![0x5a; PAGE].into_boxed_slice()
+        });
+        assert_eq!(calls, [p / PAGE + 3], "clean page 2 is not copied");
+        t.save_missing_host(p + 2 * PAGE, p + 4 * PAGE, |_| {
+            panic!("an existing host baseline is not replaced")
+        });
+        assert_eq!(t.saved(p / PAGE + 1).map(|bytes| bytes[8]), Some(0));
+        assert_eq!(t.saved(p / PAGE + 3).map(|bytes| bytes[8]), Some(0x5a));
         drop(t);
         free(p);
     }
