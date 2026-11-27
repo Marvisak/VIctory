@@ -42,6 +42,7 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    pub(crate) capped_heap: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -139,6 +140,22 @@ pub(crate) fn host() -> Option<&'static Host> {
         }
     })
     .as_ref()
+}
+
+/// Whether the host D3D12 device caps shader-visible CBV/SRV/UAV heaps below
+/// [`victory_shader::emit::HEAP_VIEWS`] (`1,000,000` on Tier-2 / NVIDIA).
+pub(crate) fn capped_heap() -> bool {
+    host().is_some_and(|h| h.capped_heap)
+}
+
+/// Maximum physical view-heap slots translated shaders clamp below on this host.
+#[cfg(test)]
+pub(crate) fn heap_views() -> u32 {
+    if capped_heap() {
+        victory_shader::emit::CAPPED_HEAP_VIEWS
+    } else {
+        victory_shader::emit::HEAP_VIEWS
+    }
 }
 
 fn create() -> windows::core::Result<Host> {
@@ -247,9 +264,25 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
+        let capped_heap = crate::switch::on("VICTORY_CAPPED_HEAP")
+            || device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: victory_shader::emit::HEAP_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .is_err();
+        if capped_heap {
+            tracing::info!(
+                limit = victory_shader::emit::CAPPED_HEAP_VIEWS,
+                "host view heaps capped; virtual view remapping enabled"
+            );
+        }
         Ok(Host {
             device,
             depth_bounds_supported,
+            capped_heap,
             queue,
             fence,
             submitted: Mutex::new(0),

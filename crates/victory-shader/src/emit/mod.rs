@@ -213,6 +213,8 @@ mod lower;
 mod rect;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
+mod remap_tests;
+#[cfg(all(test, windows))]
 mod memory_tests;
 mod sampler;
 #[cfg(all(test, windows))]
@@ -236,9 +238,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS,
-    VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    CAPPED_HEAP_VIEWS, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, REMAP_VIEWS,
+    ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS,
+    VIEW_READS, VIEW_REMAP, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS,
+    VIEW_WRITES,
 };
 
 /// The loop limit without an override: 2^20.
@@ -375,6 +378,11 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// Host resource heaps are capped at [`CAPPED_HEAP_VIEWS`] (`1,000,000`):
+    /// direct resource-heap indices (`RootType::ResourceHeap`) are translated
+    /// through root SRV `t`[`VIEW_REMAP`] in [`ROOT_CBV_SPACE`], and physical
+    /// heap indices and null buffer views stay below [`CAPPED_HEAP_VIEWS`].
+    pub capped_heap: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -500,14 +508,14 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let l = match lower::lower_with(&parts(st, res), options) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            lower::lower_with(&parts(&st, &res), options)?
         }
         l => l?,
     };

@@ -79,6 +79,11 @@ impl Heap {
         self.desc.kind == SAMPLERS
     }
 
+    /// Total descriptor slots the title created this heap with.
+    pub(crate) fn total_count(&self) -> u32 {
+        self.desc.count
+    }
+
     /// The host heap, made on first use from what the title wrote so far.
     /// Made late because a host view heap the size of Grand Theft Auto VI's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
@@ -218,7 +223,14 @@ pub(crate) fn make_read(slots: &[u32]) {
             .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
             .filter(|heap| heap.desc.kind == VIEWS_KIND)
             .filter_map(|heap| heap.host.get()?.as_ref().map(|host| (heap, host)))
-            .flat_map(|(heap, host)| slots.iter().filter(|&&i| i < heap.desc.count).filter_map(|&i| host.unmade_placed(i)))
+            .flat_map(|(heap, host)| {
+                slots
+                    .iter()
+                    .filter_map(|&phys| {
+                        let title = host.title_slot(phys)?;
+                        (title < heap.desc.count).then(|| host.unmade_placed(phys)).flatten()
+                    })
+            })
             .collect()
     };
     #[cfg(test)]
@@ -238,9 +250,11 @@ pub(crate) fn make_read(slots: &[u32]) {
         if heap.desc.kind != VIEWS_KIND {
             continue;
         }
-        for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
-            host.mirror(i, start + u64::from(i) * u64::from(step), true);
-            host.stamp_read(i);
+        for &phys in slots {
+            if let Some(title) = host.title_slot(phys).filter(|&t| t < heap.desc.count) {
+                host.mirror(title, start + u64::from(title) * u64::from(step), true);
+                host.stamp_read(phys);
+            }
         }
     }
 }

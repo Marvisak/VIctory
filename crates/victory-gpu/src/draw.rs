@@ -804,15 +804,25 @@ impl State {
             }
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
-                    if kind == 1 && slot == victory_shader::emit::VIEW_STRIDES {
-                        // The bound view heap's stride table; without one
-                        // the shader would read an unbound root view.
+                    if kind == 1
+                        && matches!(
+                            slot,
+                            victory_shader::emit::VIEW_STRIDES | victory_shader::emit::VIEW_REMAP
+                        )
+                    {
+                        // The bound view heap's stride or remap table; without
+                        // one the shader would read an unbound root view.
                         let heap = (self.heaps[0] != 0)
                             .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                             .flatten();
-                        let Some(table) = heap.and_then(|h| h.strides()) else {
-                            once!("a shader reads view strides without a view heap: dropped");
-                            not_run("view strides without a view heap");
+                        let table = if slot == victory_shader::emit::VIEW_STRIDES {
+                            heap.and_then(|h| h.strides())
+                        } else {
+                            heap.and_then(|h| h.remap())
+                        };
+                        let Some(table) = table else {
+                            once!("a shader reads view strides or remap without a view heap: dropped");
+                            not_run("view strides or remap without a view heap");
                             return false;
                         };
                         list.keep(table);
@@ -1266,14 +1276,15 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
                 continue;
             };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
+            let span = u.lower_bound.max(1) - 1;
+            let end = table + (u64::from(u.table_offset_dwords) + u64::from(span) * 8) * 4;
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
+            let Some(host) = heap.host() else {
                 continue;
             };
-            if index >= host.count() {
+            if !heap.index(end).is_some_and(|index| index < host.count()) {
                 fresh.push(u.slot);
             }
         }
@@ -1300,11 +1311,14 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
+            let base_index = heap.index(table).unwrap_or(0);
+            let avail = heap.total_count().saturating_sub(base_index).max(1);
             let n = entries
                 .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
+                .map(|u| u.table_offset_dwords / 8 + u.lower_bound.max(1))
                 .max()
-                .unwrap_or(1);
+                .unwrap_or(1)
+                .min(avail);
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -3399,7 +3413,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             &st,
             &io,
             &res,
-            Options { view_marks: true },
+            Options {
+                view_marks: true,
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(host_shader.view_marks);

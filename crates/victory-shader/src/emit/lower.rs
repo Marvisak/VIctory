@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
+use super::shader::{
+    Shader, VIEW_INTEGER, VIEW_REMAP, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags,
+};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -95,10 +97,26 @@ enum Stop {
     Fail(ShaderError),
 }
 
+/// [`lower_with`] with the default options (and the parts' write marks).
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with(
+        parts,
+        super::Options {
+            view_marks: parts.view_marks,
+            ..Default::default()
+        },
+    )
+}
+
+pub(crate) fn lower_with(parts: &Parts, options: super::Options) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        let mut l = Lower::new(parts, &bad);
+        if options.capped_heap {
+            l.capped_heap = true;
+            l.s.heap_views = super::CAPPED_HEAP_VIEWS;
+        }
+        match l.run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -235,6 +253,7 @@ struct Lower<'a> {
     writes_uavs: bool,
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
     heap: [bool; 2],
+    capped_heap: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -689,6 +708,7 @@ impl<'a> Lower<'a> {
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             heap: [false; 2],
+            capped_heap: false,
             src0: None,
             console_lanes,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -5549,7 +5569,7 @@ impl<'a> Lower<'a> {
             return index;
         }
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let last = self.s.m.i32(self.s.heap_views - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
@@ -5562,7 +5582,7 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
+        let null = (self.s.heap_views - 2) - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
     }
@@ -5591,6 +5611,27 @@ impl<'a> Lower<'a> {
         (fixed && heap).then_some((a.param, a.offset))
     }
 
+    /// Maps a virtual resource-heap index (`RootType::ResourceHeap`) through
+    /// [`VIEW_REMAP`] when [`Options::capped_heap`] is enabled.
+    fn remap_resource_index(&mut self, block: usize, param: usize, index: V, sampler: bool) -> V {
+        if sampler
+            || !self.capped_heap
+            || self.x.native.layout.get(param).map(|p| p.root) != Some(RootType::ResourceHeap)
+        {
+            return index;
+        }
+        let table = self.s.root_srv_handle(VIEW_REMAP);
+        let last = self.s.m.i32(super::REMAP_VIEWS - 1);
+        let over = self.s.m.cmp(block, pred::IUGT, index, last);
+        let clamped = self.s.m.select(block, over, last, index);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(block, Bin::Shl, clamped, two);
+        let here = std::mem::replace(&mut self.cur, block);
+        let phys = self.raw_dword(table, byte);
+        self.cur = here;
+        phys
+    }
+
     /// [`Lower::heap_index`] of a descriptor at a fixed address
     /// ([`Lower::entry_address`]), in the entry block.
     fn entry_heap_index(&mut self, (param, offset): EntryAddress, first: u8, sampler: bool) -> V {
@@ -5602,7 +5643,8 @@ impl<'a> Lower<'a> {
         let k = self.s.m.i32(offset.wrapping_add(4 * u32::from(first)));
         let addr = self.s.m.bin(entry, Bin::Add, base, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        self.s.m.bin(entry, Bin::LShr, addr, shift)
+        let index = self.s.m.bin(entry, Bin::LShr, addr, shift);
+        self.remap_resource_index(entry, param, index, sampler)
     }
 
     /// The heap index of a descriptor every lane shares, computed in the
@@ -5742,7 +5784,8 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let index = self.s.m.bin(c, Bin::LShr, at, shift);
+        Ok(self.remap_resource_index(c, a.param, index, sampler))
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -5782,7 +5825,8 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        Ok(self.remap_resource_index(c, a.param, index, sampler))
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {

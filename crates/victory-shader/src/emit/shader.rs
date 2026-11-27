@@ -12,6 +12,11 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// The root SRV slot (`t254` in [`ROOT_CBV_SPACE`], past every title root
+/// parameter) of the view-remap table: dword `i` (< [`REMAP_VIEWS`]) maps a
+/// virtual title view-heap index `i` to its physical host heap slot
+/// (< [`HEAP_VIEWS`]), or [`HEAP_VIEWS`] - 1 (null) when unmapped.
+pub const VIEW_REMAP: u8 = 254;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
 /// parameter) of the view-stride table: dword `i` is the byte stride of
 /// the buffer view at view-heap index `i` ([`VIEW_STRIDE_BITS`]), with
@@ -27,10 +32,15 @@ pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
-/// Heap indices are clamped below these (views, samplers): the host's heaps
-/// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
+/// Virtual view-heap index limit before remapping (`2^21`, the console's
+/// architectural view-heap limit).
+pub const REMAP_VIEWS: u32 = 1 << 21;
+/// Heap indices are clamped below these (views, samplers): uncapped host
+/// heaps are at least [`HEAP_VIEWS`] large, while Tier-2 / capped hosts clamp
+/// below [`CAPPED_HEAP_VIEWS`] (`1,000,000`), with the slots past their own
+/// kept null (`emit`, "Heap indices").
 pub const HEAP_VIEWS: u32 = 1 << 21;
+pub const CAPPED_HEAP_VIEWS: u32 = 1_000_000;
 pub const HEAP_SAMPLERS: u32 = 2048;
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
@@ -140,6 +150,8 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Physical resource-heap clamp limit ([`HEAP_VIEWS`] or [`CAPPED_HEAP_VIEWS`]).
+    pub heap_views: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -205,6 +217,7 @@ impl Shader {
             texture_reads: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            heap_views: HEAP_VIEWS,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -542,7 +555,7 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { self.heap_views } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
