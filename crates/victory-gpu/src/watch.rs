@@ -664,6 +664,10 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
     };
     let unmapped = |page: usize| {
+        #[cfg(feature = "diagnostics")]
+        let _querying = Timed(std::time::Instant::now(), crate::copystat::C::QueryUs);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Queries, 1);
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
@@ -1096,6 +1100,32 @@ pub(crate) mod tests {
         let t = track(p, 2 * PAGE, true).expect("tracked");
         assert_eq!(t.take_split(p, p + 2 * PAGE), (vec![(p, p + PAGE)], vec![(p + PAGE, p + 2 * PAGE)]));
         assert!(t.take(p, p + 2 * PAGE).is_empty(), "both taken");
+        drop(t);
+        free(p);
+    }
+
+    /// The `VirtualQuery` that finds an unprotectable page is attributed to
+    /// the copy term's *queries*, apart from the move, so the frame line can
+    /// say how much of the copy term is bookkeeping (FIND-49).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_virtual_query_on_an_unprotectable_page_is_counted() {
+        use crate::copystat::{get, C};
+        let before = get(C::Queries);
+        // SAFETY: a fresh write-watched reservation of two pages, the first
+        // committed; freed below.
+        let p = unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            assert_ne!(VirtualAlloc(p as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
+            p
+        };
+        let t = track(p, 2 * PAGE, true).expect("tracked");
+        let _ = t.take_split(p, p + 2 * PAGE);
+        assert!(
+            get(C::Queries) > before,
+            "the unprotectable page's VirtualQuery is attributed to queries"
+        );
         drop(t);
         free(p);
     }

@@ -2505,8 +2505,19 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // The copy stopped at an unmapped page. One of a title destination ends
     // it: the retries below write the destination themselves (zeros for
     // what cannot be read), and would fault there.
-    if title_dst && !crate::texture::committed(dst, len) {
-        return;
+    //
+    // `committed` walks the pages with `VirtualQuery`: that, not the move, is
+    // the copy term's per-run bookkeeping, so it is timed into its own bucket
+    // (FIND-49). The frame line already prints "queries … ms".
+    if title_dst {
+        #[cfg(feature = "diagnostics")]
+        let _querying =
+            crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::QueryUs);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Queries, 1);
+        if !crate::texture::committed(dst, len) {
+            return;
+        }
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
