@@ -5,8 +5,10 @@
 //! user data, root views for the title's root views, static samplers for
 //! the immediate samplers, and directly indexed heaps.
 
+use std::collections::HashSet;
 use std::ffi::{CStr, CString};
-use std::sync::Arc;
+use std::fmt::Write as _;
+use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -25,8 +27,9 @@ pub(crate) struct GraphicsState {
     rasterizer: D3D12_RASTERIZER_DESC,
     depth: D3D12_DEPTH_STENCIL_DESC,
     depth_bounds: bool,
-    /// Input elements, their names pointing into `names`.
+    /// Input elements, their names pointing into static/interned strings or `names`.
     inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
+    /// Owned fallback storage when the bounded semantic-name interner is full.
     names: Vec<CString>,
     strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
@@ -150,6 +153,174 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     host
 }
 
+/// Standard HLSL semantic names matched without locking or allocation.
+const COMMON_SEMANTICS: [&CStr; 16] = [
+    c"POSITION",
+    c"NORMAL",
+    c"TANGENT",
+    c"BINORMAL",
+    c"TEXCOORD",
+    c"COLOR",
+    c"BLENDINDICES",
+    c"BLENDWEIGHT",
+    c"POSITIONT",
+    c"PSIZE",
+    c"FOG",
+    c"TESSFACTOR",
+    c"SV_Position",
+    c"SV_POSITION",
+    c"SV_VertexID",
+    c"SV_InstanceID",
+];
+
+/// Cap on process-wide interned custom semantic names so adversarial streams
+/// cannot grow global memory without bound.
+const MAX_INTERNED_SEMANTICS: usize = 256;
+
+/// Returns a `'static` pointer for `name` when it is a common HLSL semantic
+/// or fits in the bounded interner; `None` once the interner is full (the
+/// caller then keeps an owned `CString` on the `GraphicsState`).
+fn intern_semantic(name: &CStr) -> Option<&'static CStr> {
+    let bytes = name.to_bytes();
+    for &common in &COMMON_SEMANTICS {
+        if common.to_bytes() == bytes {
+            return Some(common);
+        }
+    }
+    static INTERNED: Mutex<Option<HashSet<&'static CStr>>> = Mutex::new(None);
+    let mut set = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
+    let set = set.get_or_insert_with(HashSet::new);
+    if let Some(&existing) = set.get(name) {
+        return Some(existing);
+    }
+    if set.len() >= MAX_INTERNED_SEMANTICS {
+        return None;
+    }
+    let leaked: &'static CStr = Box::leak(name.to_owned().into_boxed_c_str());
+    set.insert(leaked);
+    Some(leaked)
+}
+
+/// Sink for streaming [`GraphicsState::write_describe`] into either a `String`
+/// or directly into a `blake3::Hasher` without intermediate allocations.
+trait DescSink {
+    fn push_str(&mut self, s: &str);
+
+    fn push_u32(&mut self, mut v: u32) {
+        let mut buf = [0u8; 10];
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        // SAFETY: `buf[i..]` holds ASCII digits.
+        self.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+    }
+
+    fn push_i32(&mut self, v: i32) {
+        if v < 0 {
+            self.push_str("-");
+        }
+        self.push_u32(v.unsigned_abs());
+    }
+
+    fn push_f32(&mut self, v: f32) {
+        if v.to_bits() == 0 {
+            self.push_str("0.0");
+            return;
+        }
+        let mut tmp = String::new();
+        let _ = write!(tmp, "{v:?}");
+        self.push_str(&tmp);
+    }
+
+    fn push_cstr_quoted(&mut self, name: &CStr) {
+        let bytes = name.to_bytes();
+        if bytes
+            .iter()
+            .all(|&b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\' && b != b'\'')
+        {
+            self.push_str("\\\"");
+            // SAFETY: checked printable ASCII above.
+            self.push_str(unsafe { std::str::from_utf8_unchecked(bytes) });
+            self.push_str("\\\"");
+            return;
+        }
+        // Fallback matching `format!("{:?}", format!("{name:?}"))` without outer quotes.
+        let inner = format!("{name:?}");
+        let escaped = format!("{inner:?}");
+        self.push_str(&escaped[1..escaped.len() - 1]);
+    }
+}
+
+impl DescSink for String {
+    fn push_str(&mut self, s: &str) {
+        String::push_str(self, s);
+    }
+}
+
+/// Stack-buffered sink that feeds `blake3::Hasher` in 512-byte chunks.
+struct HashSink<'a> {
+    hasher: &'a mut blake3::Hasher,
+    buf: [u8; 512],
+    len: usize,
+}
+
+impl<'a> HashSink<'a> {
+    fn new(hasher: &'a mut blake3::Hasher) -> Self {
+        Self {
+            hasher,
+            buf: [0; 512],
+            len: 0,
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.len > 0 {
+            self.hasher.update(&self.buf[..self.len]);
+            self.len = 0;
+        }
+    }
+}
+
+impl DescSink for HashSink<'_> {
+    fn push_str(&mut self, s: &str) {
+        let mut bytes = s.as_bytes();
+        while !bytes.is_empty() {
+            let room = self.buf.len() - self.len;
+            if bytes.len() <= room {
+                self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+                self.len += bytes.len();
+                return;
+            }
+            if self.len == 0 {
+                self.hasher.update(bytes);
+                return;
+            }
+            self.buf[self.len..].copy_from_slice(&bytes[..room]);
+            self.hasher.update(&self.buf);
+            self.len = 0;
+            bytes = &bytes[room..];
+        }
+    }
+}
+
+fn write_stencil_op(out: &mut impl DescSink, op: &D3D12_DEPTH_STENCILOP_DESC) {
+    out.push_str("D3D12_DEPTH_STENCILOP_DESC { StencilFailOp: D3D12_STENCIL_OP(");
+    out.push_i32(op.StencilFailOp.0);
+    out.push_str("), StencilDepthFailOp: D3D12_STENCIL_OP(");
+    out.push_i32(op.StencilDepthFailOp.0);
+    out.push_str("), StencilPassOp: D3D12_STENCIL_OP(");
+    out.push_i32(op.StencilPassOp.0);
+    out.push_str("), StencilFunc: D3D12_COMPARISON_FUNC(");
+    out.push_i32(op.StencilFunc.0);
+    out.push_str(") }");
+}
+
 impl GraphicsState {
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
@@ -192,21 +363,27 @@ impl GraphicsState {
                         layout.pInputElementDescs,
                         layout.NumElements as usize,
                     );
-                    self.names = elements
-                        .iter()
-                        .map(|e| CStr::from_ptr(e.SemanticName.0.cast()).to_owned())
-                        .collect();
-                    self.inputs = elements
-                        .iter()
-                        .zip(&self.names)
-                        .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
-                            SemanticName: PCSTR(name.as_ptr().cast()),
+                    let mut names = Vec::new();
+                    let mut inputs = Vec::with_capacity(elements.len());
+                    for e in elements {
+                        let cstr = CStr::from_ptr(e.SemanticName.0.cast());
+                        let ptr = match intern_semantic(cstr) {
+                            Some(s) => s.as_ptr(),
+                            None => {
+                                names.push(cstr.to_owned());
+                                names.last().expect("just pushed").as_ptr()
+                            }
+                        };
+                        inputs.push(D3D12_INPUT_ELEMENT_DESC {
+                            SemanticName: PCSTR(ptr.cast()),
                             Format: DXGI_FORMAT(
                                 crate::resource::pc_format(e.Format.0 as u32) as i32
                             ),
                             ..*e
-                        })
-                        .collect();
+                        });
+                    }
+                    self.names = names;
+                    self.inputs = inputs;
                 }
                 13 => {
                     self.strip_cut =
@@ -232,33 +409,149 @@ impl GraphicsState {
         }
     }
 
+    /// Streams the exact text of [`GraphicsState::describe`] into `out`
+    /// without intermediate heap allocations.
+    fn write_describe(&self, out: &mut impl DescSink) {
+        out.push_str("D3D12_BLEND_DESC { AlphaToCoverageEnable: BOOL(");
+        out.push_i32(self.blend.AlphaToCoverageEnable.0);
+        out.push_str("), IndependentBlendEnable: BOOL(");
+        out.push_i32(self.blend.IndependentBlendEnable.0);
+        out.push_str("), RenderTarget: [");
+        for (i, rt) in self.blend.RenderTarget.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str("D3D12_RENDER_TARGET_BLEND_DESC { BlendEnable: BOOL(");
+            out.push_i32(rt.BlendEnable.0);
+            out.push_str("), LogicOpEnable: BOOL(");
+            out.push_i32(rt.LogicOpEnable.0);
+            out.push_str("), SrcBlend: D3D12_BLEND(");
+            out.push_i32(rt.SrcBlend.0);
+            out.push_str("), DestBlend: D3D12_BLEND(");
+            out.push_i32(rt.DestBlend.0);
+            out.push_str("), BlendOp: D3D12_BLEND_OP(");
+            out.push_i32(rt.BlendOp.0);
+            out.push_str("), SrcBlendAlpha: D3D12_BLEND(");
+            out.push_i32(rt.SrcBlendAlpha.0);
+            out.push_str("), DestBlendAlpha: D3D12_BLEND(");
+            out.push_i32(rt.DestBlendAlpha.0);
+            out.push_str("), BlendOpAlpha: D3D12_BLEND_OP(");
+            out.push_i32(rt.BlendOpAlpha.0);
+            out.push_str("), LogicOp: D3D12_LOGIC_OP(");
+            out.push_i32(rt.LogicOp.0);
+            out.push_str("), RenderTargetWriteMask: ");
+            out.push_u32(u32::from(rt.RenderTargetWriteMask));
+            out.push_str(" }");
+        }
+        out.push_str("] } ");
+        out.push_u32(self.sample_mask);
+
+        out.push_str(" D3D12_RASTERIZER_DESC { FillMode: D3D12_FILL_MODE(");
+        out.push_i32(self.rasterizer.FillMode.0);
+        out.push_str("), CullMode: D3D12_CULL_MODE(");
+        out.push_i32(self.rasterizer.CullMode.0);
+        out.push_str("), FrontCounterClockwise: BOOL(");
+        out.push_i32(self.rasterizer.FrontCounterClockwise.0);
+        out.push_str("), DepthBias: ");
+        out.push_i32(self.rasterizer.DepthBias);
+        out.push_str(", DepthBiasClamp: ");
+        out.push_f32(self.rasterizer.DepthBiasClamp);
+        out.push_str(", SlopeScaledDepthBias: ");
+        out.push_f32(self.rasterizer.SlopeScaledDepthBias);
+        out.push_str(", DepthClipEnable: BOOL(");
+        out.push_i32(self.rasterizer.DepthClipEnable.0);
+        out.push_str("), MultisampleEnable: BOOL(");
+        out.push_i32(self.rasterizer.MultisampleEnable.0);
+        out.push_str("), AntialiasedLineEnable: BOOL(");
+        out.push_i32(self.rasterizer.AntialiasedLineEnable.0);
+        out.push_str("), ForcedSampleCount: ");
+        out.push_u32(self.rasterizer.ForcedSampleCount);
+        out.push_str(", ConservativeRaster: D3D12_CONSERVATIVE_RASTERIZATION_MODE(");
+        out.push_i32(self.rasterizer.ConservativeRaster.0);
+        out.push_str(") } ");
+
+        out.push_str("D3D12_DEPTH_STENCIL_DESC { DepthEnable: BOOL(");
+        out.push_i32(self.depth.DepthEnable.0);
+        out.push_str("), DepthWriteMask: D3D12_DEPTH_WRITE_MASK(");
+        out.push_i32(self.depth.DepthWriteMask.0);
+        out.push_str("), DepthFunc: D3D12_COMPARISON_FUNC(");
+        out.push_i32(self.depth.DepthFunc.0);
+        out.push_str("), StencilEnable: BOOL(");
+        out.push_i32(self.depth.StencilEnable.0);
+        out.push_str("), StencilReadMask: ");
+        out.push_u32(u32::from(self.depth.StencilReadMask));
+        out.push_str(", StencilWriteMask: ");
+        out.push_u32(u32::from(self.depth.StencilWriteMask));
+        out.push_str(", FrontFace: ");
+        write_stencil_op(out, &self.depth.FrontFace);
+        out.push_str(", BackFace: ");
+        write_stencil_op(out, &self.depth.BackFace);
+        out.push_str(" } [");
+
+        for (i, e) in self.inputs.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str("\"");
+            // SAFETY: every input element's `SemanticName` points to an
+            // interned `&'static CStr` or an entry kept in `self.names`.
+            let name = unsafe { CStr::from_ptr(e.SemanticName.0.cast()) };
+            out.push_cstr_quoted(name);
+            out.push_str(" ");
+            out.push_u32(e.SemanticIndex);
+            out.push_str(" ");
+            out.push_i32(e.Format.0);
+            out.push_str(" ");
+            out.push_u32(e.InputSlot);
+            out.push_str(" ");
+            out.push_u32(e.AlignedByteOffset);
+            out.push_str(" ");
+            out.push_i32(e.InputSlotClass.0);
+            out.push_str(" ");
+            out.push_u32(e.InstanceDataStepRate);
+            out.push_str("\"");
+        }
+        out.push_str("] ");
+        out.push_i32(self.strip_cut.0);
+        out.push_str(" ");
+        out.push_i32(self.topology.0);
+        out.push_str(" D3D12_RT_FORMAT_ARRAY { RTFormats: [");
+        for (i, f) in self.targets.RTFormats.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str("DXGI_FORMAT(");
+            out.push_i32(f.0);
+            out.push_str(")");
+        }
+        out.push_str("], NumRenderTargets: ");
+        out.push_u32(self.targets.NumRenderTargets);
+        out.push_str(" } ");
+        out.push_i32(self.depth_format.0);
+        out.push_str(" DXGI_SAMPLE_DESC { Count: ");
+        out.push_u32(self.samples.Count);
+        out.push_str(", Quality: ");
+        out.push_u32(self.samples.Quality);
+        out.push_str(" }");
+        if self.depth_bounds {
+            out.push_str(" depth bounds");
+        }
+    }
+
+    /// Feeds the exact bytes of [`GraphicsState::describe`] into `hasher`
+    /// without allocating.
+    pub(crate) fn hash_describe(&self, hasher: &mut blake3::Hasher) {
+        let mut sink = HashSink::new(hasher);
+        self.write_describe(&mut sink);
+        sink.flush();
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
-        let inputs: Vec<String> = self
-            .inputs
-            .iter()
-            .zip(&self.names)
-            .map(|(e, name)| {
-                format!(
-                    "{name:?} {} {} {} {} {} {}",
-                    e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0, e.InstanceDataStepRate
-                )
-            })
-            .collect();
-        let depth_bounds = if self.depth_bounds { " depth bounds" } else { "" };
-        format!(
-            "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}{depth_bounds}",
-            self.blend,
-            self.sample_mask,
-            self.rasterizer,
-            self.depth,
-            self.strip_cut.0,
-            self.topology.0,
-            self.targets,
-            self.depth_format.0,
-            self.samples
-        )
+        let mut out = String::with_capacity(4096);
+        self.write_describe(&mut out);
+        out
     }
 
     fn depth_with_bounds(&self, host: &crate::host::Host) -> Option<D3D12_DEPTH_STENCIL_DESC1> {
@@ -1041,5 +1334,157 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    /// The streaming formatter and direct hasher must produce byte-for-byte
+    /// identical output to `Debug` formatting so cached pipeline keys never drift.
+    #[test]
+    fn write_describe_matches_debug_format() {
+        fn debug_describe(g: &GraphicsState) -> String {
+            let inputs: Vec<String> = g
+                .inputs
+                .iter()
+                .map(|e| {
+                    // SAFETY: `e.SemanticName` is NUL-terminated.
+                    let name = unsafe { CStr::from_ptr(e.SemanticName.0.cast()) };
+                    format!(
+                        "{name:?} {} {} {} {} {} {}",
+                        e.SemanticIndex,
+                        e.Format.0,
+                        e.InputSlot,
+                        e.AlignedByteOffset,
+                        e.InputSlotClass.0,
+                        e.InstanceDataStepRate
+                    )
+                })
+                .collect();
+            let depth_bounds = if g.depth_bounds { " depth bounds" } else { "" };
+            format!(
+                "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}{depth_bounds}",
+                g.blend,
+                g.sample_mask,
+                g.rasterizer,
+                g.depth,
+                g.strip_cut.0,
+                g.topology.0,
+                g.targets,
+                g.depth_format.0,
+                g.samples
+            )
+        }
+
+        let check = |g: &GraphicsState| {
+            let expected = debug_describe(g);
+            assert_eq!(g.describe(), expected);
+            let mut h1 = blake3::Hasher::new();
+            h1.update(expected.as_bytes());
+            let mut h2 = blake3::Hasher::new();
+            g.hash_describe(&mut h2);
+            assert_eq!(h1.finalize(), h2.finalize());
+        };
+
+        check(&GraphicsState::default());
+
+        let mut custom = GraphicsState::default();
+        custom.blend.AlphaToCoverageEnable = true.into();
+        custom.blend.IndependentBlendEnable = true.into();
+        custom.blend.RenderTarget[0].BlendEnable = true.into();
+        custom.blend.RenderTarget[7].RenderTargetWriteMask = 0x5;
+        custom.sample_mask = 0x1234_5678;
+        custom.rasterizer.DepthBias = -42;
+        custom.rasterizer.DepthBiasClamp = -0.0;
+        custom.rasterizer.SlopeScaledDepthBias = 1.25;
+        custom.depth.StencilEnable = true.into();
+        custom.depth_bounds = true;
+        custom.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+        custom.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        custom.targets.NumRenderTargets = 2;
+        custom.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        custom.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        custom.depth_format = DXGI_FORMAT_D32_FLOAT;
+        custom.samples = DXGI_SAMPLE_DESC { Count: 4, Quality: 1 };
+        let weird = CString::new("A\"B\\C'D\tE\nF").unwrap();
+        let elems = [
+            element(DXGI_FORMAT_R32G32B32_FLOAT, 0),
+            D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(weird.as_ptr().cast()),
+                SemanticIndex: 3,
+                Format: DXGI_FORMAT_R16G16_UNORM,
+                InputSlot: 2,
+                AlignedByteOffset: 12,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+                InstanceDataStepRate: 1,
+            },
+        ];
+        #[repr(C)]
+        struct InputSub(u32, u32, D3D12_INPUT_LAYOUT_DESC);
+        let sub = InputSub(
+            12,
+            0,
+            D3D12_INPUT_LAYOUT_DESC {
+                pInputElementDescs: elems.as_ptr(),
+                NumElements: elems.len() as u32,
+            },
+        );
+        // SAFETY: `sub` is a valid kind-12 subobject.
+        unsafe { custom.read(12, std::ptr::from_ref(&sub).cast()) };
+        check(&custom);
+
+        custom.rasterizer.DepthBiasClamp = f32::NAN;
+        custom.rasterizer.SlopeScaledDepthBias = f32::INFINITY;
+        check(&custom);
+    }
+
+    #[test]
+    fn semantic_interning_reuses_common_and_caps_custom_names() {
+        #[repr(C)]
+        struct InputSub(u32, u32, D3D12_INPUT_LAYOUT_DESC);
+        let mut g = GraphicsState::default();
+        let std_elems = [
+            D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(c"POSITION".as_ptr().cast()),
+                ..element(DXGI_FORMAT_R32G32B32_FLOAT, 0)
+            },
+            element(DXGI_FORMAT_R32G32_FLOAT, 12),
+        ];
+        let sub = InputSub(
+            12,
+            0,
+            D3D12_INPUT_LAYOUT_DESC {
+                pInputElementDescs: std_elems.as_ptr(),
+                NumElements: std_elems.len() as u32,
+            },
+        );
+        // SAFETY: valid kind-12 subobject.
+        unsafe { g.read(12, std::ptr::from_ref(&sub).cast()) };
+        assert!(g.names.is_empty(), "standard semantics need no owned CString");
+
+        // Exceeding MAX_INTERNED_SEMANTICS falls back to owned storage on `self.names`.
+        let many: Vec<CString> = (0..MAX_INTERNED_SEMANTICS + 8)
+            .map(|i| CString::new(format!("TEST_OVERFLOW_SEM_{i}")).unwrap())
+            .collect();
+        let elems: Vec<D3D12_INPUT_ELEMENT_DESC> = many
+            .iter()
+            .map(|n| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(n.as_ptr().cast()),
+                ..element(DXGI_FORMAT_R32_FLOAT, 0)
+            })
+            .collect();
+        let sub = InputSub(
+            12,
+            0,
+            D3D12_INPUT_LAYOUT_DESC {
+                pInputElementDescs: elems.as_ptr(),
+                NumElements: elems.len() as u32,
+            },
+        );
+        // SAFETY: valid kind-12 subobject.
+        unsafe { g.read(12, std::ptr::from_ref(&sub).cast()) };
+        assert!(g.names.len() >= 8);
+        assert_eq!(g.inputs.len(), many.len());
+        for (e, expect) in g.inputs.iter().zip(&many) {
+            // SAFETY: every element's pointer stays valid while `g` lives.
+            assert_eq!(unsafe { CStr::from_ptr(e.SemanticName.0.cast()) }, expect.as_c_str());
+        }
     }
 }

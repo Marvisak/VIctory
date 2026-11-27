@@ -343,7 +343,7 @@ pub(crate) fn save(now: bool) {
             }
         }
     };
-    let used = used().as_ref().map(Used::list).unwrap_or_default();
+    let used = used_list();
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
@@ -400,14 +400,45 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     res
 }
 
-/// Title pipelines created, and their distinct keys.
-static CREATED: Mutex<(u64, Option<HashSet<String>>)> = Mutex::new((0, None));
+/// Parses a 32-digit hex pipeline key into its 16 raw BLAKE3 bytes.
+pub(crate) fn parse_key(hex: &str) -> Option<[u8; 16]> {
+    let bytes = hex.as_bytes();
+    if bytes.len() != 32 {
+        return None;
+    }
+    let nibble = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let mut out = [0u8; 16];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = (nibble(bytes[2 * i])? << 4) | nibble(bytes[2 * i + 1])?;
+    }
+    Some(out)
+}
+
+/// Formats 16 raw BLAKE3 key bytes as 32 lowercase hex digits.
+pub(crate) fn format_key(key: &[u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(32);
+    for &b in key {
+        out.push(HEX[(b >> 4) as usize]);
+        out.push(HEX[(b & 0xf) as usize]);
+    }
+    // SAFETY: `HEX` contains ASCII bytes only.
+    unsafe { String::from_utf8_unchecked(out) }
+}
+
+/// Title pipelines created, and their distinct 16-byte keys.
+static CREATED: Mutex<(u64, Option<HashSet<[u8; 16]>>)> = Mutex::new((0, None));
 
 /// The title created a pipeline with `key`.
-pub(crate) fn note_created(key: &str) {
+pub(crate) fn note_created_key(key: [u8; 16]) {
     let mut created = CREATED.lock().unwrap_or_else(|e| e.into_inner());
     created.0 += 1;
-    created.1.get_or_insert_with(HashSet::new).insert(key.to_owned());
+    created.1.get_or_insert_with(HashSet::new).insert(key);
 }
 
 /// Title pipelines created so far, and how many distinct ones.
@@ -422,8 +453,9 @@ fn created() -> (u64, usize) {
 struct Used {
     /// Each earlier key with its place in the list as loaded: the list is
     /// kept most recent run first, so a lower place is a more recent run.
-    before: HashMap<String, usize>,
-    now: HashSet<String>,
+    before: HashMap<[u8; 16], usize>,
+    #[cfg(test)]
+    now: HashSet<[u8; 16]>,
 }
 
 impl Used {
@@ -431,53 +463,92 @@ impl Used {
     /// in no order, as earlier builds saved it, reads as well).
     fn read(listed: &str) -> Used {
         let mut before = HashMap::new();
-        for (place, key) in listed.lines().filter(|l| !l.is_empty()).enumerate() {
-            before.entry(key.to_owned()).or_insert(place);
+        for (place, key) in listed
+            .lines()
+            .filter_map(|l| parse_key(l.trim()))
+            .enumerate()
+        {
+            before.entry(key).or_insert(place);
         }
-        Used { before, now: HashSet::new() }
+        Used {
+            before,
+            #[cfg(test)]
+            now: HashSet::new(),
+        }
     }
 
     /// The list to keep: this run's keys, then earlier runs' others, most
     /// recent first, at most `EARLY_MAX` (the oldest go once it is full).
-    fn list(&self) -> Vec<String> {
-        let mut earlier: Vec<_> = self.before.iter().filter(|(k, _)| !self.now.contains(*k)).collect();
+    fn list_parts(before: &HashMap<[u8; 16], usize>, now: &HashSet<[u8; 16]>) -> Vec<String> {
+        let mut earlier: Vec<_> = before.iter().filter(|(k, _)| !now.contains(*k)).collect();
         earlier.sort_unstable_by_key(|&(_, &place)| place);
         let earlier = earlier.into_iter().map(|(k, _)| k);
-        self.now.iter().chain(earlier).take(EARLY_MAX).cloned().collect()
+        now.iter()
+            .chain(earlier)
+            .take(EARLY_MAX)
+            .map(format_key)
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn list(&self) -> Vec<String> {
+        Self::list_parts(&self.before, &self.now)
     }
 }
 
-static USED: Mutex<Option<Used>> = Mutex::new(None);
+/// Keys from earlier runs: loaded once from `EARLY_FILE` and read lock-free
+/// on every pipeline creation.
+static BEFORE: OnceLock<HashMap<[u8; 16], usize>> = OnceLock::new();
+static NOW: Mutex<Option<HashSet<[u8; 16]>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
-    let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
-    if used.is_none() {
+fn before() -> &'static HashMap<[u8; 16], usize> {
+    BEFORE.get_or_init(|| {
         let listed = DIR
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
         let read = Used::read(&listed);
         tracing::info!(pipelines = read.before.len(), "title pipelines to start early");
-        *used = Some(read);
+        read.before
+    })
+}
+
+fn used_list() -> Vec<String> {
+    let before = before();
+    let now = NOW.lock().unwrap_or_else(|e| e.into_inner());
+    match now.as_ref() {
+        Some(now) => Used::list_parts(before, now),
+        None => Used::list_parts(before, &HashSet::new()),
     }
-    used
 }
 
 /// Reads the early list now if not yet (a pre-build asks for no title
 /// pipeline).
 pub(crate) fn keep_early_list() {
-    drop(used());
+    let _ = before();
 }
 
-/// Whether the title pipeline with `key` was drawn with in an earlier run.
+/// Whether the title pipeline with 16-byte `key` was drawn with in an earlier run.
+pub(crate) fn wanted_early_key(key: &[u8; 16]) -> bool {
+    let before = before();
+    !before.is_empty() && before.contains_key(key)
+}
+
+/// Whether the title pipeline with hex `key` was drawn with in an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
-    used().as_ref().is_some_and(|u| u.before.contains_key(key))
+    parse_key(key).is_some_and(|k| wanted_early_key(&k))
 }
 
-/// The title pipeline with `key` was drawn or dispatched with.
-pub(crate) fn note_used(key: &str) {
-    if used().get_or_insert_with(Used::default).now.insert(key.to_owned()) {
+/// The title pipeline with 16-byte `key` was drawn or dispatched with.
+pub(crate) fn note_used_key(key: [u8; 16]) {
+    let _ = before();
+    if NOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert(key)
+    {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -505,15 +576,30 @@ mod tests {
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
     }
 
+    #[test]
+    fn key_hex_roundtrip_and_rejection() {
+        let bytes = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10,
+        ];
+        let hex = format_key(&bytes);
+        assert_eq!(hex, "0123456789abcdeffedcba9876543210");
+        assert_eq!(parse_key(&hex), Some(bytes));
+        assert_eq!(parse_key(&hex.to_ascii_uppercase()), Some(bytes));
+        assert_eq!(parse_key("0123"), None);
+        assert_eq!(parse_key("0123456789abcdeffedcba987654321z"), None);
+    }
+
     /// This run's keys stay in the list; earlier runs' fill it up to the cap.
     #[test]
     fn the_early_list_keeps_this_run_first() {
-        let keys = |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<HashSet<_>>();
+        let key = |i: usize| parse_key(&format!("{i:032x}")).unwrap();
+        let keys = |r: std::ops::Range<usize>| r.map(key).collect::<HashSet<_>>();
         let before = keys(0..EARLY_MAX).into_iter().enumerate().map(|(i, k)| (k, i)).collect();
         let used = Used { before, now: keys(EARLY_MAX - 10..EARLY_MAX + 10) };
         let list = used.list();
         assert_eq!(list.len(), EARLY_MAX);
-        assert!(used.now.iter().all(|k| list.contains(k)));
+        assert!(used.now.iter().all(|k| list.contains(&format_key(k))));
         assert_eq!(list.iter().collect::<HashSet<_>>().len(), EARLY_MAX, "no key twice");
     }
 
@@ -521,17 +607,18 @@ mod tests {
     /// order across saves.
     #[test]
     fn a_full_early_list_drops_the_oldest_runs_keys() {
-        let key = |i: usize| format!("{i:032x}");
+        let key_hex = |i: usize| format!("{i:032x}");
+        let key = |i: usize| parse_key(&key_hex(i)).unwrap();
         // As saved: the last run's keys, then the run before's.
-        let saved: Vec<String> = (0..EARLY_MAX).map(key).collect();
+        let saved: Vec<String> = (0..EARLY_MAX).map(key_hex).collect();
         let mut used = Used::read(&saved.join("\n"));
         used.now = (EARLY_MAX..EARLY_MAX + 10).map(key).collect();
         used.now.insert(key(EARLY_MAX - 1)); // the oldest key, used again
         let list = used.list();
         assert_eq!(list.len(), EARLY_MAX);
-        assert!(used.now.iter().all(|k| list.contains(k)));
+        assert!(used.now.iter().all(|k| list.contains(&format_key(k))));
         // The ten that go are the oldest ones not used again.
-        let dropped: HashSet<String> = (EARLY_MAX - 11..EARLY_MAX - 1).map(key).collect();
+        let dropped: HashSet<String> = (EARLY_MAX - 11..EARLY_MAX - 1).map(key_hex).collect();
         assert!(list.iter().all(|k| !dropped.contains(k)));
         // Read back, this run's keys come first, then the earlier ones in order.
         let again = Used::read(&list.join("\n"));

@@ -210,7 +210,8 @@ fn with_resources(
 struct Pipeline {
     object: Object,
     packet: [u32; 8],
-    /// Each used stage's container.
+    /// Each used stage's container (on Windows `host` owns it, avoiding a duplicate Vec).
+    #[cfg(not(windows))]
     shaders: Vec<Arc<Shader>>,
     /// Whether a list has bound it yet (its shaders are logged then).
     bound: std::sync::atomic::AtomicBool,
@@ -220,6 +221,19 @@ struct Pipeline {
     host: Arc<make::Pending>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
+
+impl Pipeline {
+    fn shaders(&self) -> &[Arc<Shader>] {
+        #[cfg(windows)]
+        {
+            self.host.shaders()
+        }
+        #[cfg(not(windows))]
+        {
+            &self.shaders
+        }
+    }
+}
 
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
@@ -240,7 +254,7 @@ pub(crate) fn bound(this: This) {
         return;
     }
     let frame = crate::frame::current();
-    for shader in &p.shaders {
+    for shader in p.shaders() {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
     }
 }
@@ -319,7 +333,7 @@ pub(crate) fn shaders_of(this: This) -> String {
     if this.is_null() {
         return "no pipeline".into();
     }
-    format!("{:?}", pipeline(this).shaders)
+    format!("{:?}", pipeline(this).shaders())
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -380,7 +394,7 @@ fn hand_out(
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(
-        shaders.clone(),
+        shaders,
         graphics,
         #[cfg(feature = "diagnostics")]
         skip_hashes(),
@@ -392,6 +406,7 @@ fn hand_out(
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(not(windows))]
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -741,7 +756,7 @@ mod tests {
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
-            .shaders
+            .shaders()
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
@@ -783,8 +798,8 @@ mod tests {
         let mut q = std::ptr::null();
         create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q);
         assert!(Arc::ptr_eq(
-            &pipeline(p).shaders[1],
-            &pipeline(q).shaders[1]
+            &pipeline(p).shaders()[1],
+            &pipeline(q).shaders()[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
@@ -888,14 +903,14 @@ mod tests {
         // SAFETY: the stream points at live code and elements.
         let pre = unsafe { Prebuild::graphics(&stream) };
         let title = pipeline(p);
-        assert_eq!(pre.key(), title.host.key);
+        assert_eq!(pre.key(), make::key_hex(&title.host.key));
         let state = title.host.graphics.as_deref().unwrap().describe();
         assert!(state.contains(r#"\"TEXCOORD\" 2 16 1 8 0 0"#), "{state}");
-        assert_eq!(pre.describe(), format!("{:?}\t{state}", title.shaders));
+        assert_eq!(pre.describe(), format!("{:?}\t{state}", title.shaders()));
         // Another state is another pipeline.
         put(&mut stream, 0x1e0, 10 | 2 << 32);
         // SAFETY: as above.
-        assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
+        assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), make::key_hex(&title.host.key));
     }
 }
 

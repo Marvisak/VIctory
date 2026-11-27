@@ -38,9 +38,9 @@ pub(crate) struct Pending {
     made: OnceLock<Option<HostPipeline>>,
     #[cfg(feature = "diagnostics")]
     pub(super) skipped_shader: Option<String>,
-    /// What identifies it across runs (shader containers and state), and
-    /// whether a draw has used it yet.
-    pub(crate) key: String,
+    /// What identifies it across runs (first 16 bytes of the BLAKE3 hash of
+    /// shader containers and state), and whether a draw has used it yet.
+    pub(crate) key: [u8; 16],
     used: AtomicBool,
 }
 
@@ -51,12 +51,16 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
+    pub(crate) fn shaders(&self) -> &[Arc<Shader>] {
+        &self.shaders
+    }
+
     pub(crate) fn new(
         shaders: Vec<Arc<Shader>>,
         graphics: Option<Box<GraphicsState>>,
         #[cfg(feature = "diagnostics")] skip_hashes: &[String],
     ) -> Pending {
-        let key = key(&shaders, graphics.as_deref());
+        let key = key_bytes(&shaders, graphics.as_deref());
         #[cfg(feature = "diagnostics")]
         log("created", &key, || {
             let state = graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
@@ -89,7 +93,7 @@ impl Pending {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             #[cfg(feature = "diagnostics")]
-            log_built(&self.key);
+            log_built_key(&self.key);
             let (user, kernel) = super::thread_cpu_since(cpu);
             tracing::debug!(
                 shaders = ?self.shaders,
@@ -106,16 +110,31 @@ impl Pending {
     }
 }
 
-/// What identifies a title pipeline across runs: its shader containers
-/// and graphics state.
-pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
+/// First 16 bytes of the BLAKE3 hash identifying a title pipeline across runs:
+/// its shader containers and graphics state, streamed without allocating.
+pub(crate) fn key_bytes(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> [u8; 16] {
     let mut key = blake3::Hasher::new();
     for s in shaders {
         key.update(s.stage.as_bytes());
         key.update(s.hash.as_bytes());
     }
-    key.update(graphics.map(|g| g.describe()).unwrap_or_default().as_bytes());
-    key.finalize().to_hex()[..32].to_owned()
+    if let Some(g) = graphics {
+        g.hash_describe(&mut key);
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&key.finalize().as_bytes()[..16]);
+    out
+}
+
+/// Lowercase 32-digit hex representation of a 16-byte pipeline key.
+pub(crate) fn key_hex(key: &[u8; 16]) -> String {
+    super::library::format_key(key)
+}
+
+/// What identifies a title pipeline across runs: its shader containers
+/// and graphics state.
+pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
+    key_hex(&key_bytes(shaders, graphics))
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -146,6 +165,13 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log_built(key: &str) {
     if let Some((name, loaded)) = super::library::LAST.take() {
+        log_str("built", key, || format!("{name}\t{}", if loaded { "loaded" } else { "made" }));
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn log_built_key(key: &[u8; 16]) {
+    if let Some((name, loaded)) = super::library::LAST.take() {
         log("built", key, || format!("{name}\t{}", if loaded { "loaded" } else { "made" }));
     }
 }
@@ -156,12 +182,26 @@ pub(crate) fn log_built(key: &str) {
 /// once made or loaded (`built`, also from the pre-build), to compare what
 /// a run creates with what the pre-build makes.
 #[cfg(feature = "diagnostics")]
-fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
+fn log(what: &str, key: &[u8; 16], rest: impl FnOnce() -> String) {
+    if log_path().is_none() {
+        return;
+    }
+    log_str(what, &key_hex(key), rest);
+}
+
+#[cfg(feature = "diagnostics")]
+fn log_path() -> Option<&'static std::ffi::OsStr> {
+    static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_LOG"))
+        .as_deref()
+}
+
+#[cfg(feature = "diagnostics")]
+fn log_str(what: &str, key: &str, rest: impl FnOnce() -> String) {
     use std::collections::HashSet;
     use std::io::Write;
     static LOG: Mutex<Option<(std::fs::File, HashSet<String>)>> = Mutex::new(None);
-    static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
-    let Some(path) = PATH.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_LOG")) else {
+    let Some(path) = log_path() else {
         return;
     };
     let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
@@ -194,7 +234,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // Listed for an early start in later runs from its first use, made or
     // not: one a run never got made is the one it should start early.
     if !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
+        super::library::note_used_key(p.key);
         #[cfg(feature = "diagnostics")]
         log("used", &p.key, String::new);
     }
@@ -226,8 +266,8 @@ fn enqueue(p: &Pending, now: bool) -> Option<bool> {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    super::library::note_created(&p.key);
-    if p.made.get().is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    super::library::note_created_key(p.key);
+    if p.made.get().is_none() && !p.shaders.is_empty() && super::library::wanted_early_key(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, false);
     }
@@ -419,7 +459,7 @@ mod tests {
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
         let warm = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
         assert!(ready(&cold).is_none());
-        crate::pipeline::library::note_used(&warm.key);
+        crate::pipeline::library::note_used_key(warm.key);
         early(&warm);
         assert_eq!(
             (
