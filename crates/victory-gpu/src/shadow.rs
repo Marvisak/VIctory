@@ -96,37 +96,55 @@ pub(crate) struct Shadow {
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-
-/// An empty buffer with room for `n` bytes, from the pool if it has one.
-fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+/// Kept sorted by capacity, largest first.
+#[derive(Default)]
+struct SnapshotPool {
+    buffers: Mutex<Vec<Vec<u8>>>,
 }
 
-/// Returns a snapshot buffer to the pool, which keeps the largest up to
-/// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
-/// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
-fn give_back(v: Vec<u8>) {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut total = 0;
-    pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
-    });
+static POOL: SnapshotPool = SnapshotPool {
+    buffers: Mutex::new(Vec::new()),
+};
+
+impl SnapshotPool {
+    /// An empty buffer with room for `n` bytes, using the smallest fit.
+    fn take(&self, n: usize) -> Vec<u8> {
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let cut = buffers.partition_point(|v| v.capacity() >= n);
+        if let Some(index) = cut.checked_sub(1) {
+            let mut buffer = buffers.remove(index);
+            buffer.clear();
+            return buffer;
+        }
+
+        // If reserving fresh storage fails, discard the idle buffers
+        // (none fits) before one final attempt.
+        let mut buffer = Vec::new();
+        if buffer.try_reserve_exact(n).is_err() {
+            if !buffers.is_empty() {
+                tracing::warn!(
+                    bytes = n,
+                    "snapshot allocation failed; freeing the idle pool"
+                );
+                buffers.clear();
+            }
+            buffer.reserve_exact(n);
+        }
+        buffer
+    }
+
+    /// Retains the largest buffers up to `POOL_BYTES`. Reusing touched
+    /// pages avoids fresh page faults while a world submission snapshots.
+    fn give_back(&self, buffer: Vec<u8>) {
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let index = buffers.partition_point(|v| v.capacity() >= buffer.capacity());
+        buffers.insert(index, buffer);
+        let mut total = 0;
+        buffers.retain(|v| {
+            total += v.capacity();
+            total <= POOL_BYTES
+        });
+    }
 }
 
 /// Snapshot memory kept for reuse.
@@ -358,13 +376,13 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::copystat::snapshot(self.start, self.len, (end - start) as u64);
         // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
+        let mut grown = POOL.take(end - start);
         let mut at = start;
         for (taken, bytes) in segments.drain(first..last) {
             grown.extend_from_slice(host(at, taken));
             grown.extend_from_slice(&bytes);
             at = taken + bytes.len();
-            give_back(bytes);
+            POOL.give_back(bytes);
         }
         grown.extend_from_slice(host(at, end));
         segments.insert(first, (start, grown));
@@ -468,7 +486,7 @@ impl Shadow {
         if pending.is_empty() {
             compared.clear();
             for (_, bytes) in segments.drain(..) {
-                give_back(bytes);
+                POOL.give_back(bytes);
             }
             if let Some(t) = &self.tracked {
                 t.disarm();
@@ -1305,6 +1323,42 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn the_snapshot_pool_preserves_best_fit_and_order() {
+        let pool = SnapshotPool::default();
+        for i in 0..64 {
+            let mut buffer = Vec::with_capacity(4096 + i * 1024);
+            buffer.push(1);
+            pool.give_back(buffer);
+        }
+        let capacities = || {
+            pool.buffers
+                .lock()
+                .unwrap()
+                .iter()
+                .map(Vec::capacity)
+                .collect::<Vec<_>>()
+        };
+        let before = capacities();
+        assert_eq!(before.len(), 64);
+        assert!(before.windows(2).all(|w| w[0] >= w[1]));
+        let smallest_fit = before.iter().copied().filter(|&n| n >= 8192).min().unwrap();
+
+        let buffer = pool.take(8192);
+        assert_eq!(buffer.capacity(), smallest_fit);
+        assert!(buffer.is_empty());
+        let after = capacities();
+        assert_eq!(after.len(), 63);
+        assert!(after.windows(2).all(|w| w[0] >= w[1]));
+
+        pool.give_back(buffer);
+        assert_eq!(capacities(), before);
+
+        let fresh = pool.take(before[0] + 1);
+        assert!(fresh.capacity() > before[0] && fresh.is_empty());
+        assert_eq!(capacities(), before);
+    }
 
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.
