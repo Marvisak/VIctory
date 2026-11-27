@@ -81,8 +81,13 @@ fn random(bytes: &mut [u8; 16]) -> bool {
 }
 
 extern "system" fn UuidFromStringA(text: *const c_char, uuid: *mut Guid) -> i32 {
-    if text.is_null() || uuid.is_null() {
+    if uuid.is_null() {
         return INVALID_STRING_UUID;
+    }
+    if text.is_null() {
+        // SAFETY: `uuid` is guaranteed non-null.
+        unsafe { uuid.write(Guid::new(0, 0, 0, [0; 8])) };
+        return OK;
     }
     // SAFETY: a NUL-terminated string from the caller.
     let bytes = unsafe { std::ffi::CStr::from_ptr(text.cast()) }.to_bytes();
@@ -97,8 +102,13 @@ extern "system" fn UuidFromStringA(text: *const c_char, uuid: *mut Guid) -> i32 
 }
 
 extern "system" fn UuidFromStringW(text: *const u16, uuid: *mut Guid) -> i32 {
-    if text.is_null() || uuid.is_null() {
+    if uuid.is_null() {
         return INVALID_STRING_UUID;
+    }
+    if text.is_null() {
+        // SAFETY: `uuid` is guaranteed non-null.
+        unsafe { uuid.write(Guid::new(0, 0, 0, [0; 8])) };
+        return OK;
     }
     let mut units = Vec::new();
     // SAFETY: a NUL-terminated wide string from the caller.
@@ -131,8 +141,12 @@ extern "system" fn UuidToStringA(uuid: *const Guid, out: *mut *mut c_char) -> i3
     let mut bytes = Vec::with_capacity(37);
     bytes.extend_from_slice(&text);
     bytes.push(0);
+    let ptr = allocate(&bytes);
+    if ptr.is_null() {
+        return OUT_OF_MEMORY;
+    }
     // SAFETY: `out` is the caller's pointer variable.
-    unsafe { out.write(allocate(&bytes).cast()) };
+    unsafe { out.write(ptr.cast()) };
     OK
 }
 
@@ -148,8 +162,12 @@ extern "system" fn UuidToStringW(uuid: *const Guid, out: *mut *mut u16) -> i32 {
     let mut units: Vec<u16> = text.iter().map(|&b| u16::from(b)).collect();
     units.push(0);
     let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    let ptr = allocate(&bytes);
+    if ptr.is_null() {
+        return OUT_OF_MEMORY;
+    }
     // SAFETY: `out` is the caller's pointer variable.
-    unsafe { out.write(allocate(&bytes).cast()) };
+    unsafe { out.write(ptr.cast()) };
     OK
 }
 
@@ -199,29 +217,34 @@ fn format(g: &Guid) -> [u8; 36] {
     text
 }
 
-/// A GUID from its text, with or without braces and the dashes in place.
+/// A GUID from its canonical text (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
 fn parse(mut chars: impl Iterator<Item = impl Into<u32>>) -> Option<Guid> {
     let mut digits = [0u8; 32];
-    let mut n = 0;
-    for c in &mut chars {
-        let c = c.into();
-        if n == 32 {
-            // Only the closing brace may follow the last digit.
-            return (c == u32::from(b'}')).then(|| assemble(&digits));
+    let mut digit_idx = 0;
+    for idx in 0..36 {
+        let c = chars.next()?.into();
+        match idx {
+            8 | 13 | 18 | 23 => {
+                if c != u32::from(b'-') {
+                    return None;
+                }
+            }
+            _ => {
+                let digit = match c {
+                    0x30..=0x39 => c - 0x30,
+                    0x61..=0x66 => c - 0x61 + 10,
+                    0x41..=0x46 => c - 0x41 + 10,
+                    _ => return None,
+                };
+                digits[digit_idx] = digit as u8;
+                digit_idx += 1;
+            }
         }
-        if c == u32::from(b'-') || (n == 0 && c == u32::from(b'{')) {
-            continue;
-        }
-        let digit = match c {
-            0x30..=0x39 => c - 0x30,
-            0x61..=0x66 => c - 0x61 + 10,
-            0x41..=0x46 => c - 0x41 + 10,
-            _ => return None,
-        };
-        digits[n] = digit as u8;
-        n += 1;
     }
-    (n == 32).then(|| assemble(&digits))
+    if chars.next().is_some() {
+        return None;
+    }
+    Some(assemble(&digits))
 }
 
 fn assemble(digits: &[u8; 32]) -> Guid {
@@ -317,16 +340,20 @@ mod tests {
             "1234abcd-00ef-4a5b-8012-3456789abcde"
         );
         assert_eq!(parse(text.iter().copied()), Some(g));
-        // Upper case and braces are what `UuidFromString` also takes.
-        let upper: Vec<u8> = std::iter::once(b'{')
-            .chain(text.iter().map(|b| b.to_ascii_uppercase()))
+        // Upper case is accepted.
+        let upper: Vec<u8> = text.iter().map(|b| b.to_ascii_uppercase()).collect();
+        assert_eq!(parse(upper.iter().copied()), Some(g));
+        // Braced UUIDs are rejected.
+        let braced: Vec<u8> = std::iter::once(b'{')
+            .chain(text.iter().copied())
             .chain(std::iter::once(b'}'))
             .collect();
-        assert_eq!(parse(upper.iter().copied()), Some(g));
+        assert_eq!(parse(braced.iter().copied()), None);
     }
 
     #[test]
     fn garbage_is_refused() {
+        assert_eq!(parse(b"".iter().copied()), None);
         assert_eq!(parse(b"1234".iter().copied()), None);
         assert_eq!(
             parse(b"1234abcd-00ef-4a5b-8012-3456789abcde-".iter().copied()),
@@ -334,6 +361,30 @@ mod tests {
         );
         assert_eq!(
             parse(b"1234abcd-00ef-4a5b-8012-3456789abcdeZ".iter().copied()),
+            None
+        );
+        assert_eq!(
+            parse(b"{1234abcd-00ef-4a5b-8012-3456789abcde}GARBAGE".iter().copied()),
+            None
+        );
+        assert_eq!(
+            parse(b"{1234abcd-00ef-4a5b-8012-3456789abcde".iter().copied()),
+            None
+        );
+        assert_eq!(
+            parse(b"1234abcd-00ef-4a5b-8012-3456789abcde}".iter().copied()),
+            None
+        );
+        assert_eq!(
+            parse(b"{{1234abcd-00ef-4a5b-8012-3456789abcde}".iter().copied()),
+            None
+        );
+        assert_eq!(
+            parse(b"1234abcd00ef4a5b80123456789abcde".iter().copied()),
+            None
+        );
+        assert_eq!(
+            parse(b"1234abcd-00ef4a-5b8012-3456789abcde".iter().copied()),
             None
         );
     }
@@ -409,5 +460,227 @@ mod tests {
             UuidFromStringA(c"nope".as_ptr().cast(), &mut w),
             INVALID_STRING_UUID
         );
+    }
+
+    #[test]
+    fn uuid_from_string_a_matches_native_windows() {
+        let sentinel = Guid::new(
+            0xdead_beef,
+            0x1337,
+            0x4242,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02],
+        );
+        let expected = Guid::new(
+            0x1234_abcd,
+            0x00ef,
+            0x4a5b,
+            [0x80, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde],
+        );
+
+        // 1. Null string pointer with valid out: writes nil UUID and returns OK.
+        let mut out = sentinel;
+        assert_eq!(UuidFromStringA(std::ptr::null(), &mut out), OK);
+        assert_eq!(out, Guid::new(0, 0, 0, [0; 8]));
+
+        // Null out pointer guard (does not dereference out).
+        assert_eq!(
+            UuidFromStringA(std::ptr::null(), std::ptr::null_mut()),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(
+            UuidFromStringA(
+                c"1234abcd-00ef-4a5b-8012-3456789abcde".as_ptr().cast(),
+                std::ptr::null_mut()
+            ),
+            INVALID_STRING_UUID
+        );
+
+        // 2. Canonical UUID: writes parsed UUID to out and returns OK (case-insensitive ASCII hex).
+        let mut out = sentinel;
+        assert_eq!(
+            UuidFromStringA(
+                c"1234abcd-00ef-4a5b-8012-3456789abcde".as_ptr().cast(),
+                &mut out
+            ),
+            OK
+        );
+        assert_eq!(out, expected);
+
+        let mut out = sentinel;
+        assert_eq!(
+            UuidFromStringA(
+                c"1234ABCD-00EF-4A5B-8012-3456789ABCDE".as_ptr().cast(),
+                &mut out
+            ),
+            OK
+        );
+        assert_eq!(out, expected);
+
+        // 3. Matched braces: returns INVALID_STRING_UUID and leaves out untouched.
+        let mut out = sentinel;
+        assert_eq!(
+            UuidFromStringA(
+                c"{1234abcd-00ef-4a5b-8012-3456789abcde}".as_ptr().cast(),
+                &mut out
+            ),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(out, sentinel);
+
+        // 4. Matched braces followed by trailing characters: returns INVALID_STRING_UUID and leaves out untouched.
+        let mut out = sentinel;
+        assert_eq!(
+            UuidFromStringA(
+                c"{1234abcd-00ef-4a5b-8012-3456789abcde}trailing"
+                    .as_ptr()
+                    .cast(),
+                &mut out
+            ),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(out, sentinel);
+
+        // Canonical UUID followed by trailing characters: leaves out untouched.
+        let mut out = sentinel;
+        assert_eq!(
+            UuidFromStringA(
+                c"1234abcd-00ef-4a5b-8012-3456789abcde-extra"
+                    .as_ptr()
+                    .cast(),
+                &mut out
+            ),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(out, sentinel);
+
+        // 5. 32 hex digits with hyphens removed or misplaced: returns INVALID_STRING_UUID and leaves out untouched.
+        let mut out = sentinel;
+        assert_eq!(
+            UuidFromStringA(
+                c"1234abcd00ef4a5b80123456789abcde".as_ptr().cast(),
+                &mut out
+            ),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(out, sentinel);
+
+        let mut out = sentinel;
+        assert_eq!(
+            UuidFromStringA(
+                c"1234abcd-00ef4a-5b8012-3456789abcde".as_ptr().cast(),
+                &mut out
+            ),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(out, sentinel);
+
+        // 6. Empty string: returns INVALID_STRING_UUID and leaves out untouched.
+        let mut out = sentinel;
+        assert_eq!(
+            UuidFromStringA(c"".as_ptr().cast(), &mut out),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(out, sentinel);
+    }
+
+    #[test]
+    fn uuid_from_string_w_matches_native_windows() {
+        let sentinel = Guid::new(
+            0xdead_beef,
+            0x1337,
+            0x4242,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02],
+        );
+        let expected = Guid::new(
+            0x1234_abcd,
+            0x00ef,
+            0x4a5b,
+            [0x80, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde],
+        );
+        let to_wide = |s: &str| -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        };
+
+        // 1. Null string pointer with valid out: writes nil UUID and returns OK.
+        let mut out = sentinel;
+        assert_eq!(UuidFromStringW(std::ptr::null(), &mut out), OK);
+        assert_eq!(out, Guid::new(0, 0, 0, [0; 8]));
+
+        // Null out pointer guard (does not dereference out).
+        assert_eq!(
+            UuidFromStringW(std::ptr::null(), std::ptr::null_mut()),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(
+            UuidFromStringW(
+                to_wide("1234abcd-00ef-4a5b-8012-3456789abcde").as_ptr(),
+                std::ptr::null_mut()
+            ),
+            INVALID_STRING_UUID
+        );
+
+        // 2. Canonical UUID: writes parsed UUID to out and returns OK (case-insensitive ASCII hex).
+        let mut out = sentinel;
+        let wide = to_wide("1234abcd-00ef-4a5b-8012-3456789abcde");
+        assert_eq!(UuidFromStringW(wide.as_ptr(), &mut out), OK);
+        assert_eq!(out, expected);
+
+        let mut out = sentinel;
+        let wide_upper = to_wide("1234ABCD-00EF-4A5B-8012-3456789ABCDE");
+        assert_eq!(UuidFromStringW(wide_upper.as_ptr(), &mut out), OK);
+        assert_eq!(out, expected);
+
+        // 3. Matched braces: returns INVALID_STRING_UUID and leaves out untouched.
+        let mut out = sentinel;
+        let wide_braced = to_wide("{1234abcd-00ef-4a5b-8012-3456789abcde}");
+        assert_eq!(
+            UuidFromStringW(wide_braced.as_ptr(), &mut out),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(out, sentinel);
+
+        // 4. Matched braces followed by trailing characters: returns INVALID_STRING_UUID and leaves out untouched.
+        let mut out = sentinel;
+        let wide_braced_trailing = to_wide("{1234abcd-00ef-4a5b-8012-3456789abcde}trailing");
+        assert_eq!(
+            UuidFromStringW(wide_braced_trailing.as_ptr(), &mut out),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(out, sentinel);
+
+        // Canonical UUID followed by trailing characters: leaves out untouched.
+        let mut out = sentinel;
+        let wide_trailing = to_wide("1234abcd-00ef-4a5b-8012-3456789abcde-extra");
+        assert_eq!(
+            UuidFromStringW(wide_trailing.as_ptr(), &mut out),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(out, sentinel);
+
+        // 5. 32 hex digits with hyphens removed or misplaced: returns INVALID_STRING_UUID and leaves out untouched.
+        let mut out = sentinel;
+        let wide_hyphenless = to_wide("1234abcd00ef4a5b80123456789abcde");
+        assert_eq!(
+            UuidFromStringW(wide_hyphenless.as_ptr(), &mut out),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(out, sentinel);
+
+        let mut out = sentinel;
+        let wide_misplaced = to_wide("1234abcd-00ef4a-5b8012-3456789abcde");
+        assert_eq!(
+            UuidFromStringW(wide_misplaced.as_ptr(), &mut out),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(out, sentinel);
+
+        // 6. Empty string: returns INVALID_STRING_UUID and leaves out untouched.
+        let mut out = sentinel;
+        let wide_empty = to_wide("");
+        assert_eq!(
+            UuidFromStringW(wide_empty.as_ptr(), &mut out),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(out, sentinel);
     }
 }
