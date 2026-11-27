@@ -70,20 +70,46 @@ impl SigElement {
 /// signature, packed by the source's modes, had one (an int or a system
 /// value beside a float means the float was `nointerpolation`).
 pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
+    if elements.len() < 2 {
+        return;
+    }
     let free = |e: &SigElement| e.kind == 0 && e.comp == 9 && !(read && e.usage != 0);
-    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
-    rows.sort_unstable();
-    rows.dedup();
-    for row in rows {
-        let decided = |e: &&SigElement| e.row == Some(row) && !free(e) && e.interp != 0;
-        let mut modes = elements.iter().filter(decided).map(|e| e.interp);
+    let indexed = elements
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| e.row.map(|row| (row, i)));
+    // Keep small signatures off the heap.
+    let mut inline = [(0, 0); 16];
+    let mut heap;
+    let rows = if elements.len() <= inline.len() {
+        let mut len = 0;
+        for pair in indexed {
+            inline[len] = pair;
+            len += 1;
+        }
+        &mut inline[..len]
+    } else {
+        heap = indexed.collect::<Vec<_>>();
+        &mut heap[..]
+    };
+    rows.sort_unstable_by_key(|&(row, _)| row);
+    for group in rows.chunk_by(|a, b| a.0 == b.0) {
+        if group.len() < 2 {
+            continue;
+        }
+        let mut modes = group
+            .iter()
+            .map(|&(_, i)| &elements[i])
+            .filter(|e| !free(e) && e.interp != 0)
+            .map(|e| e.interp);
         let Some(mode) = modes.next() else { continue };
         if modes.any(|m| m != mode) {
             continue;
         }
-        let undecided = |e: &&mut SigElement| e.row == Some(row) && free(e);
-        for e in elements.iter_mut().filter(undecided) {
-            e.interp = mode;
+        for &(_, i) in group {
+            if free(&elements[i]) {
+                elements[i].interp = mode;
+            }
         }
     }
 }
@@ -423,6 +449,74 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sig(row: Option<u32>, comp: u8, interp: u8, usage: u8, index: u32) -> SigElement {
+        SigElement {
+            name: format!("TEXCOORD{index}"),
+            index,
+            kind: 0,
+            comp,
+            interp,
+            row,
+            col: 0,
+            cols: 1,
+            usage,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn interpolation_modes_follow_rows_without_reordering() {
+        let mut elements = [
+            sig(Some(80), 9, 7, 0, 0),
+            sig(Some(3), 9, 5, 1, 1),
+            sig(None, 9, 6, 0, 2),
+            sig(Some(u32::MAX), 9, 2, 0, 3),
+            sig(Some(3), 5, 1, 0, 4),
+            sig(Some(80), 5, 3, 0, 5),
+            sig(Some(3), 9, 4, 0, 6),
+            sig(Some(u32::MAX), 5, 4, 0, 7),
+            sig(Some(u32::MAX), 5, 3, 0, 8),
+            sig(Some(80), 5, 0, 0, 9),
+            sig(Some(80), 9, 6, 0, 10),
+            sig(Some(120), 9, 2, 0, 11),
+            sig(Some(120), 5, 0, 0, 12),
+            sig(Some(200), 5, 2, 0, 13),
+            sig(Some(200), 4, 2, 0, 14),
+            sig(Some(200), 9, 6, 0, 15),
+            sig(None, 5, 3, 0, 16),
+        ];
+        let original = elements.clone();
+        // Pixel input at index 1 is used. Its mode conflicts with the
+        // integer on row 3, so the unused float on that row stays unchanged.
+        let mut expected = original.clone();
+        expected[0].interp = 3;
+        expected[10].interp = 3;
+        expected[15].interp = 2;
+        same_mode_per_row(&mut elements, true);
+        assert_eq!(elements, expected);
+
+        // For outputs, usage does not make floats constrain their row.
+        expected[1].interp = 1;
+        expected[6].interp = 1;
+        elements = original;
+        same_mode_per_row(&mut elements, false);
+        assert_eq!(elements, expected);
+    }
+
+    #[test]
+    fn interpolation_modes_leave_empty_and_singleton_signatures_alone() {
+        same_mode_per_row(&mut [], true);
+        let mut singleton = [sig(Some(7), 9, 2, 0, 0)];
+        let expected = singleton.clone();
+        same_mode_per_row(&mut singleton, true);
+        assert_eq!(singleton, expected);
+
+        let mut shared = [sig(Some(91), 9, 2, 0, 2), sig(Some(91), 5, 1, 0, 1)];
+        let expected = [sig(Some(91), 9, 1, 0, 2), sig(Some(91), 5, 1, 0, 1)];
+        same_mode_per_row(&mut shared, false);
+        assert_eq!(shared, expected);
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {
