@@ -924,3 +924,122 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// A program that stores to title memory reads it back as stored (the
+/// console BVH builder's refit, then its treelet pass, read the boxes it has
+/// just written with `glc`): each of 64 threads loads its dword, stores it
+/// plus 1, loads it again with `glc` and stores what it read 0x400 bytes on.
+/// The second load must see the first store. Read through the page's raw
+/// SRV, which need not see this dispatch's writes, it gave the value from
+/// before the dispatch on an RTX 2080.
+#[test]
+fn a_program_reads_back_what_it_stored_to_title_memory() {
+    const THREADS: u32 = 64;
+    const GLC: u32 = 1 << 16;
+    let mut w = vec![0x3402_0082]; // v_lshlrev_b32 v1, 2, v0
+    w.extend(global(12, 2, 1, 0, 0, 0)); // global_load_dword v2, v1, s[0:1]
+    w.push(S_WAITCNT_ALL);
+    w.push(0x4A06_0481); // v_add_nc_u32 v3, 1, v2
+    w.extend(global(28, 0, 1, 3, 0, 0)); // global_store_dword v1, v3, s[0:1]
+    w.push(0xBBFD_0000); // s_waitcnt_vscnt null, 0
+    let [a, b] = global(12, 4, 1, 0, 0, 0); // global_load_dword v4, v1, s[0:1] glc
+    w.extend([a | GLC, b]);
+    w.push(S_WAITCNT_ALL);
+    w.extend(global(28, 0, 1, 4, 0, 0x400)); // global_store_dword v1, v4, s[0:1] offset:0x400
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 5,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: Vec::new(),
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [THREADS, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .expect("lower");
+    assert!(l.memory && l.memory_writes);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    let memory: Vec<u32> = (0..512).map(|i| 0x1000 * i + 7).collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            if u.root == RootType::Constants {
+                ud[u.index as usize] = (TITLE >> (32 * u.dword)) as u32;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: page_table(0, 2) }),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[View::Memory(&memory), View::Pair, View::NullPair, View::Pair],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let stored: Vec<u32> = (0..THREADS).map(|t| 0x1000 * t + 8).collect();
+        assert_eq!(out[0][..THREADS as usize], stored[..], "{label}: the stores");
+        assert_eq!(out[0][0x100..0x100 + THREADS as usize], stored[..], "{label}: read back");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}

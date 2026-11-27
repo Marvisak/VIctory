@@ -233,6 +233,11 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// The program stores to memory: it reads title memory through the
+    /// UAVs it writes, and `glc` accesses are coherent ([`Lower::memory`]).
+    writes_memory: bool,
+    /// The instruction being lowered has `glc`.
+    glc: bool,
     /// [`Lowered::heap`], [`Lowered::heap_writes`].
     heap: [bool; 2],
     /// src0 of the current instruction as DPP fetched it.
@@ -557,6 +562,10 @@ impl<'a> Lower<'a> {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        let writes_memory = insts().any(|i| {
+            matches!(i.fields, Fields::Buffer { .. } | Fields::Flat { .. })
+                && (i.name().contains("store") || i.name().contains("atomic"))
+        });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
@@ -688,6 +697,8 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            writes_memory,
+            glc: false,
             heap: [false; 2],
             src0: None,
             console_lanes,
@@ -3503,6 +3514,12 @@ impl<'a> Lower<'a> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
+        self.glc = match &inst.fields {
+            Fields::Smem { cache, .. }
+            | Fields::Buffer { cache, .. }
+            | Fields::Flat { cache, .. } => cache.glc,
+            _ => false,
+        };
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
             MaskData::Host => {
@@ -4780,9 +4797,14 @@ impl<'a> Lower<'a> {
         let null = self.raw_dword(map, first);
         let miss = self.s.m.cmp(c, pred::EQ, view, null);
         // Views come in pairs: the raw SRV, then the raw UAV of one copy.
-        let (view, props) = if write {
+        // A program that stores reads through the UAV too: a read through
+        // the SRV need not see this dispatch's writes (NVIDIA may read it as
+        // unchanging). A `glc` access is globally coherent, as the console's
+        // passes the compute unit's cache: it sees other groups' writes.
+        let (view, props) = if write || self.writes_memory {
             let one = k(self, 1);
-            (self.s.m.bin(c, Bin::Add, view, one), (11 | 0x1000, 0))
+            let coherent = if self.glc { 0x4000 } else { 0 };
+            (self.s.m.bin(c, Bin::Add, view, one), (11 | 0x1000 | coherent, 0))
         } else {
             (view, (11, 0))
         };
