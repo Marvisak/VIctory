@@ -195,6 +195,7 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        view_limit(&device);
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -266,6 +267,38 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
         })
+    }
+}
+
+/// Clamps translated shaders' view-heap indices below what `device` takes
+/// (`victory_shader::emit::heap_views`), before any translation: a host
+/// that refuses a shader-visible heap of `HEAP_VIEWS` (NVIDIA caps them at
+/// 10^6 slots) gets the portable limit, which every host takes. A clamp
+/// past the heap faulted the device there (#3330).
+fn view_limit(device: &ID3D12Device) {
+    use victory_shader::emit::{HEAP_VIEWS, PORTABLE_HEAP_VIEWS, set_heap_views};
+    // SAFETY: plain heap creation with a valid description; dropped at once.
+    let full = unsafe {
+        device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: HEAP_VIEWS,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })
+    };
+    let views = match full {
+        Ok(_) => HEAP_VIEWS,
+        Err(e) => {
+            tracing::info!(error = %e, "host view heaps capped at {PORTABLE_HEAP_VIEWS}: shaders index below it");
+            PORTABLE_HEAP_VIEWS
+        }
+    };
+    if !set_heap_views(views) && victory_shader::emit::heap_views() != views {
+        tracing::warn!(
+            views,
+            set = victory_shader::emit::heap_views(),
+            "view-heap limit read before the host device: shaders may index past its heaps"
+        );
     }
 }
 
