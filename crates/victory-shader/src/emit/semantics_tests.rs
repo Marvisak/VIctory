@@ -25,6 +25,9 @@ use crate::native::{
 };
 use crate::{gfx10, io, ir, resource, structure};
 
+#[path = "masked_sum_tests.rs"]
+mod masked_sum_tests;
+
 // ---- encodings ----
 
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -248,6 +251,10 @@ fn program(body: &[u32], scalar: bool) -> Vec<u32> {
 /// bytes of LDS; one view table at s4 (the input buffer, then the output
 /// UAV), the group id in s6.
 fn lower_program(words: &[u32]) -> Result<HostShader, String> {
+    lower_program_for_wave(words, false)
+}
+
+fn lower_program_for_wave(words: &[u32], wave64: bool) -> Result<HostShader, String> {
     let used = |kind, table_offset_dwords| UsedResource {
         kind,
         root: RootType::Table,
@@ -260,7 +267,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
     };
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 32,
         layout: vec![RootParam {
             root: RootType::Table,
