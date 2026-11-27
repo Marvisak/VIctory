@@ -423,10 +423,23 @@ struct Used {
     /// Each earlier key with its place in the list as loaded: the list is
     /// kept most recent run first, so a lower place is a more recent run.
     before: HashMap<String, usize>,
-    now: HashSet<String>,
+    /// The first distinct keys seen this run, with their first-use positions.
+    now: HashMap<String, usize>,
 }
 
 impl Used {
+    fn note(&mut self, key: &str) -> bool {
+        let place = self.now.len();
+        if place == EARLY_MAX {
+            return false;
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.now.entry(key.to_owned()) {
+            entry.insert(place);
+            return true;
+        }
+        false
+    }
+
     /// The list as saved: one key a line, most recent run first (a list
     /// in no order, as earlier builds saved it, reads as well).
     fn read(listed: &str) -> Used {
@@ -434,16 +447,31 @@ impl Used {
         for (place, key) in listed.lines().filter(|l| !l.is_empty()).enumerate() {
             before.entry(key.to_owned()).or_insert(place);
         }
-        Used { before, now: HashSet::new() }
+        Used { before, now: HashMap::new() }
     }
 
-    /// The list to keep: this run's keys, then earlier runs' others, most
-    /// recent first, at most `EARLY_MAX` (the oldest go once it is full).
+    /// This run's keys in first-use order, then other keys from the most
+    /// recent earlier runs, up to `EARLY_MAX`.
     fn list(&self) -> Vec<String> {
-        let mut earlier: Vec<_> = self.before.iter().filter(|(k, _)| !self.now.contains(*k)).collect();
+        let mut current: Vec<_> = self.now.iter().collect();
+        current.sort_unstable_by_key(|&(_, &place)| place);
+        let mut list: Vec<_> = current.into_iter().map(|(key, _)| key.clone()).collect();
+        if list.len() == EARLY_MAX {
+            return list;
+        }
+        let mut earlier: Vec<_> = self
+            .before
+            .iter()
+            .filter(|(k, _)| !self.now.contains_key(*k))
+            .collect();
         earlier.sort_unstable_by_key(|&(_, &place)| place);
-        let earlier = earlier.into_iter().map(|(k, _)| k);
-        self.now.iter().chain(earlier).take(EARLY_MAX).cloned().collect()
+        list.extend(
+            earlier
+                .into_iter()
+                .take(EARLY_MAX - list.len())
+                .map(|(key, _)| key.clone()),
+        );
+        list
     }
 }
 
@@ -477,7 +505,7 @@ pub(crate) fn wanted_early(key: &str) -> bool {
 
 /// The title pipeline with `key` was drawn or dispatched with.
 pub(crate) fn note_used(key: &str) {
-    if used().get_or_insert_with(Used::default).now.insert(key.to_owned()) {
+    if used().get_or_insert_with(Used::default).note(key) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -508,13 +536,46 @@ mod tests {
     /// This run's keys stay in the list; earlier runs' fill it up to the cap.
     #[test]
     fn the_early_list_keeps_this_run_first() {
-        let keys = |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<HashSet<_>>();
-        let before = keys(0..EARLY_MAX).into_iter().enumerate().map(|(i, k)| (k, i)).collect();
-        let used = Used { before, now: keys(EARLY_MAX - 10..EARLY_MAX + 10) };
+        let keys = |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<Vec<_>>();
+        let mut used = Used::read(&keys(0..EARLY_MAX).join("\n"));
+        let current = keys(EARLY_MAX - 10..EARLY_MAX + 10);
+        for key in &current {
+            assert!(used.note(key));
+        }
         let list = used.list();
         assert_eq!(list.len(), EARLY_MAX);
-        assert!(used.now.iter().all(|k| list.contains(k)));
+        assert_eq!(&list[..current.len()], current);
         assert_eq!(list.iter().collect::<HashSet<_>>().len(), EARLY_MAX, "no key twice");
+    }
+
+    #[test]
+    fn a_full_current_run_keeps_pipelines_used_at_startup() {
+        let keys: Vec<_> = (0..EARLY_MAX + 128).map(|i| format!("{i:032x}")).collect();
+        let mut used = Used::read("one-earlier-run-key");
+        for key in &keys {
+            used.note(key);
+            assert!(
+                !used.note(key),
+                "a repeated key must not move or use a slot"
+            );
+        }
+        let list = used.list();
+        let again = Used::read(&list.join("\n"));
+        assert_eq!(list.len(), EARLY_MAX);
+        let missing_startup = keys[..EARLY_MAX]
+            .iter()
+            .filter(|key| !again.before.contains_key(*key))
+            .count();
+        assert_eq!(
+            missing_startup, 0,
+            "pipelines used at startup disappeared from the list"
+        );
+        assert_eq!(used.now.len(), EARLY_MAX);
+        assert!(!used.note("another overflow key"));
+        assert!(
+            list == keys[..EARLY_MAX],
+            "the current run must retain first-use order"
+        );
     }
 
     /// A full list makes room by the oldest runs' keys, and keeps that
@@ -525,17 +586,19 @@ mod tests {
         // As saved: the last run's keys, then the run before's.
         let saved: Vec<String> = (0..EARLY_MAX).map(key).collect();
         let mut used = Used::read(&saved.join("\n"));
-        used.now = (EARLY_MAX..EARLY_MAX + 10).map(key).collect();
-        used.now.insert(key(EARLY_MAX - 1)); // the oldest key, used again
+        for i in EARLY_MAX..EARLY_MAX + 10 {
+            assert!(used.note(&key(i)));
+        }
+        assert!(used.note(&key(EARLY_MAX - 1))); // the oldest key, used again
         let list = used.list();
         assert_eq!(list.len(), EARLY_MAX);
-        assert!(used.now.iter().all(|k| list.contains(k)));
+        assert!(used.now.keys().all(|k| list.contains(k)));
         // The ten that go are the oldest ones not used again.
         let dropped: HashSet<String> = (EARLY_MAX - 11..EARLY_MAX - 1).map(key).collect();
         assert!(list.iter().all(|k| !dropped.contains(k)));
         // Read back, this run's keys come first, then the earlier ones in order.
         let again = Used::read(&list.join("\n"));
-        assert!(used.now.iter().all(|k| again.before[k] < used.now.len()));
+        assert!(used.now.keys().all(|k| again.before[k] < used.now.len()));
         assert!(again.before[&key(0)] < again.before[&key(1)]);
     }
 
