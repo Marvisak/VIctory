@@ -2686,6 +2686,23 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
 
+    /// Keep ordinary host-less unit runs portable, but fail closed when a
+    /// dedicated WARP validation step explicitly requested a D3D12 device.
+    #[cfg(windows)]
+    fn host_or_skip() -> bool {
+        if crate::host::host().is_some() {
+            if crate::switch::on("VICTORY_D3D12_WARP") {
+                println!("WARP host device created for forced-WARP regression");
+            }
+            return true;
+        }
+        assert!(
+            !crate::switch::on("VICTORY_D3D12_WARP"),
+            "VICTORY_D3D12_WARP=1 was set, but D3D12 WARP host creation failed"
+        );
+        false
+    }
+
     #[cfg(windows)]
     #[test]
     fn evictable_counter_tracks_host_write_and_drop_exactly_once() {
@@ -2906,8 +2923,8 @@ mod tests {
     #[test]
     fn oom_backoff_reuses_host_texture_from_another_resource_with_same_memory_key() {
         use windows::Win32::Foundation::E_OUTOFMEMORY;
-        if crate::host::host().is_none() {
-            return; // no host GPU here
+        if !host_or_skip() {
+            return; // no host GPU here outside forced-WARP validation
         }
         let null = std::ptr::null();
         const D32_FLOAT: u32 = 40;
@@ -3009,8 +3026,8 @@ mod tests {
     #[test]
     fn a_slot_left_null_for_want_of_memory_is_read_again() {
         use windows::Win32::Foundation::{E_INVALIDARG, E_OUTOFMEMORY};
-        if crate::host::host().is_none() {
-            return; // no host GPU here
+        if !host_or_skip() {
+            return; // no host GPU here outside forced-WARP validation
         }
         let null = std::ptr::null();
         let heap_desc: [u32; 8] = [0, 64, 1, 0, 0, 0, 0, 0];
