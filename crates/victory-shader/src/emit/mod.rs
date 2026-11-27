@@ -149,8 +149,11 @@
 //!   them: a buffer view's title address (high dword bits 0-15; stride bits
 //!   0), a texture view's width and height - 1 (dword 1 bits 30-31, dword 2
 //!   bits 0-13 and 14-29), first and last level (dword 3 bits 12-15, 16-19)
-//!   and type (bits 28-31) with an identity swizzle; zeros for anything
-//!   else.
+//!   and type (bits 28-31) with an identity swizzle. For a texture,
+//!   dword 0 is the title address in 256-byte units. A CBV supplies the
+//!   low dword of its byte address. Bit 16 of dword 1 ([`VIEW_NO_BUFFER_POINTER`])
+//!   marks a numeric base with no buffer pointer. Shader reads hide this
+//!   bit and a buffer-pointer read yields two zeros. Empty slots are zero.
 //! * **Write marks** ([`HostShader::view_marks`], with
 //!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
 //!   through an unordered buffer view from the heap (tables, the heap
@@ -241,6 +244,12 @@ pub use shader::{
     VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
+/// Byte stride of the host's per-slot view-address record at t1 in memory space.
+pub const VIEW_ADDRESS_BYTES: u32 = 16;
+/// Internal flag in word 1: word 0 is numeric only. Buffer addresses use
+/// the low 16 bits of word 1, and texture widths use bits 30-31.
+pub const VIEW_NO_BUFFER_POINTER: u32 = 1 << 16;
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
@@ -309,9 +318,9 @@ pub struct HostShader {
     /// Whether the host binds the page bitmap `u0` in [`MEMORY_SPACE`]
     /// (pages written and pages missed): whenever [`HostShader::memory`].
     pub memory_writes: bool,
-    /// Whether it reads buffer views' title addresses or texture views'
-    /// sizes from their descriptors: the host binds the view addresses `t1`
-    /// in [`MEMORY_SPACE`] (module notes, "View addresses").
+    /// Whether the shader reads a buffer pointer, native base word or
+    /// texture size from the host's view-address table at `t1` in
+    /// [`MEMORY_SPACE`] (module notes, "View addresses").
     pub view_addresses: bool,
     /// Whether it takes descriptors from the resource heap at indices it
     /// computes (root type 5, not through a table): the host cannot tell
@@ -633,7 +642,6 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 
 #[cfg(test)]
 mod tests {
-    use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
 
@@ -648,7 +656,6 @@ mod tests {
         }
     }
     use super::container::SigElement;
-    use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
 
@@ -1018,6 +1025,9 @@ mod tests {
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {
+        use super::bitcode::Attr;
+        use super::shader::Shader;
+
         let mut s = Shader::new(true);
         s.outputs.push(SigElement {
             name: "SV_Target".into(),
@@ -1218,6 +1228,7 @@ mod tests {
             TRIANGLE | EDGE_FLAGS | CULL,
         ] {
             let ms = triangle_mesh(prim).unwrap_or_else(|e| panic!("{prim:#x}: {e}"));
+            Container::parse(&ms.dxil).expect("mesh shader container");
             #[cfg(windows)]
             if let Some(v) = validator.as_mut() {
                 v.validate(&mut ms.dxil.clone())

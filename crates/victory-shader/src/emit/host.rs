@@ -954,6 +954,21 @@ pub struct Draw<'a> {
 
 #[cfg(test)]
 impl Host {
+    pub(super) fn supports_wave32(&self) -> Result<bool, String> {
+        let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the feature query writes the matching options structure.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut waves).cast(),
+                size_of_val(&waves) as u32,
+            )
+        }
+        .map_err(err)?;
+        Ok(waves.WaveOps.as_bool()
+            && (waves.WaveLaneCountMin..=waves.WaveLaneCountMax).contains(&32))
+    }
+
     /// Draws one triangle into an RGBA32F target and returns its texels.
     pub fn draw(
         &self,
