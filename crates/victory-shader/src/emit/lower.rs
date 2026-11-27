@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
+use super::shader::{
+    Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags,
+};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -21,6 +23,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod srgb;
 
 type Why = &'static str;
 
@@ -4613,7 +4616,7 @@ impl<'a> Lower<'a> {
     }
 
     /// Dword `index` of the view-stride table: the stride and the format
-    /// kind bits ([`VIEW_INTEGER`], [`VIEW_SIGNED`]).
+    /// kind bits ([`VIEW_INTEGER`], [`VIEW_SIGNED`], [`VIEW_SRGB`]).
     fn view_word(&mut self, index: V) -> V {
         let c = self.cur;
         let four = self.s.m.i32(4);
@@ -5558,7 +5561,9 @@ impl<'a> Lower<'a> {
         let (iu, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1));
         let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, iu, mask, four]);
         let x = self.s.m.extract(c, r, 0);
-        let stride = self.as_int(x);
+        let word = self.as_int(x);
+        let bits = self.s.m.i32(VIEW_STRIDE_BITS);
+        let stride = self.s.m.bin(c, Bin::And, word, bits);
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
@@ -8620,6 +8625,7 @@ impl<'a> Lower<'a> {
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
+            self.convert_srgb_uav_rgb(h, &mut vals[..3], Self::linear_to_srgb);
             let mut args = vec![h];
             args.extend(cs);
             args.extend(vals);
@@ -9020,15 +9026,23 @@ impl<'a> Lower<'a> {
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
         };
-        let mut xs = Vec::new();
-        for ch in channels {
-            let x = self.s.m.extract(c, r, ch);
+        let mut vals: Vec<V> = channels
+            .iter()
+            .map(|&ch| self.s.m.extract(c, r, ch))
+            .collect();
+        if op == 66 && uav {
+            let rgb_count = channels.iter().take_while(|&&ch| ch < 3).count();
+            self.convert_srgb_uav_rgb(h, &mut vals[..rgb_count], Self::srgb_to_linear);
+        }
+        let cur = self.cur;
+        let mut xs = Vec::with_capacity(vals.len());
+        for x in vals {
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
                 let i32t = self.s.t.i32;
                 self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                    .op(cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
             } else {
                 self.as_int(x)
             });
@@ -9040,8 +9054,8 @@ impl<'a> Lower<'a> {
                 .chunks(2)
                 .map(|p| match *p {
                     [lo, hi] => {
-                        let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                        self.s.m.bin(c, Bin::Or, lo, hi)
+                        let hi = self.s.m.bin(cur, Bin::Shl, hi, k16);
+                        self.s.m.bin(cur, Bin::Or, lo, hi)
                     }
                     _ => p[0],
                 })

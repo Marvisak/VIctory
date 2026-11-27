@@ -285,6 +285,9 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
+    if this.is_null() {
+        return None;
+    }
     let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
     // SAFETY: a live resource.

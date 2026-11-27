@@ -492,8 +492,8 @@ impl HostHeap {
     }
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
-    /// for slot `index` in the view-stride table, with the integer-format
-    /// bits of a typed buffer view ([`view_kind`]).
+    /// for slot `index` in the view-stride table, with the format-kind bits
+    /// of a typed integer buffer view or sRGB texture UAV ([`view_kind`]).
     fn set_stride(&self, index: u32, view: Option<&View>) {
         self.write_stride(index, view.map_or(0, |v| view_stride(v) | view_kind(v)));
     }
@@ -1008,20 +1008,42 @@ fn view_stride(view: &View) -> u32 {
     element.max(1) as u32
 }
 
-/// The view-stride table's format-kind bits of a buffer view: a typed view
-/// (no structure stride, not raw) of an integer format gets
-/// `VIEW_INTEGER`, a signed one also `VIEW_SIGNED`; anything else none.
-/// Translated shaders pass 16-bit typed data of such views as bits, not as
-/// halves (`victory_shader::emit`, "d16").
+/// The view-stride table's format-kind bits of a view: a typed buffer view
+/// (no structure stride, not raw) of an integer format gets `VIEW_INTEGER`
+/// (and `VIEW_SIGNED` if signed) so translated shaders pass 16-bit typed
+/// data as bits (`victory_shader::emit`, "d16"); a texture unordered view
+/// whose resolved title format is sRGB gets `VIEW_SRGB` so stores encode
+/// linear RGB to sRGB on the linear host view; anything else gets 0.
 fn view_kind(view: &View) -> u32 {
-    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED, VIEW_SRGB};
+    let is_srgb = |format: u32| {
+        let format = crate::resource::pc_format(format);
+        crate::resource::SRGB.iter().any(|&(s, _)| s == format)
+    };
     let (unordered, words): (bool, &[u32; 10]) = match view {
         View::Shader(_, Some(desc)) => (false, desc),
-        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Unordered(r, _, desc) => match desc {
+            Some(words) if words[1] == 1 => (true, words),
+            _ => {
+                let format = desc
+                    .map(|w| w[0])
+                    .filter(|&f| f != 0)
+                    .or_else(|| crate::resource::title_format(*r as crate::object::This));
+                return if format.is_some_and(is_srgb) {
+                    VIEW_SRGB
+                } else {
+                    0
+                };
+            }
+        },
         View::Placed(unordered, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
             Ok(words) => (*unordered, words),
             Err(_) => return 0,
         },
+        View::Placed(true, resource, desc) => {
+            let format = if desc[0] != 0 { desc[0] } else { resource[8] };
+            return if is_srgb(format) { VIEW_SRGB } else { 0 };
+        }
         _ => return 0,
     };
     // Buffer views only (dimension 1); a structured or raw one is no typed view.
@@ -1844,6 +1866,57 @@ mod tests {
         let srv = View::Shader(0, Some([62, 1, 5768, 0, 0, 0, 64, 0, 0, 0]));
         assert_eq!(view_kind(&srv), VIEW_INTEGER, "R8_UINT");
         assert_eq!(view_stride(&uav(12, 0, 0)) | view_kind(&uav(12, 0, 0)), 8 | VIEW_INTEGER);
+    }
+
+    /// Texture UAVs resolving to sRGB formats carry `VIEW_SRGB` with stride 0
+    /// in the view-stride table; linear texture UAVs and sRGB SRVs carry 0.
+    #[test]
+    fn srgb_texture_uavs_are_marked_in_the_stride_table() {
+        use victory_shader::emit::{VIEW_SRGB, VIEW_STRIDE_BITS};
+        let tex_uav = |format| View::Unordered(0, 0, Some([format, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        let tex_srv = |format| View::Shader(0, Some([format, 4, 5768, 0, 0, 1, 0, 0, 0, 0]));
+        for fmt in [29u32, 91, 93] {
+            let v = tex_uav(fmt);
+            assert_eq!(view_kind(&v), VIEW_SRGB, "direct sRGB UAV {fmt}");
+            assert_eq!(view_stride(&v), 0, "direct sRGB UAV {fmt} stride");
+            assert_eq!((view_stride(&v) | view_kind(&v)) & VIEW_STRIDE_BITS, 0);
+
+            let placed_explicit = View::Placed(
+                true,
+                placed_tex_desc(4, 4, 27, 4),
+                placed_tex_uav_desc(0x1_0000, fmt),
+            );
+            assert_eq!(view_kind(&placed_explicit), VIEW_SRGB, "placed explicit sRGB UAV {fmt}");
+            assert_eq!(view_stride(&placed_explicit), 0);
+
+            let placed_inherit = View::Placed(
+                true,
+                placed_tex_desc(4, 4, fmt, 4),
+                placed_tex_uav_desc(0x1_0000, 0),
+            );
+            assert_eq!(view_kind(&placed_inherit), VIEW_SRGB, "placed inherited sRGB UAV {fmt}");
+            assert_eq!(view_stride(&placed_inherit), 0);
+
+            assert_eq!(view_kind(&tex_srv(fmt)), 0, "sRGB SRV {fmt}");
+            let placed_srv = View::Placed(
+                false,
+                placed_tex_desc(4, 4, fmt, 4),
+                placed_tex_srv_desc(0x1_0000, fmt),
+            );
+            assert_eq!(view_kind(&placed_srv), 0, "placed sRGB SRV {fmt}");
+        }
+        for fmt in [28u32, 87] {
+            let v = tex_uav(fmt);
+            assert_eq!(view_kind(&v), 0, "linear UAV {fmt}");
+            assert_eq!(view_stride(&v), 0, "linear UAV {fmt} stride");
+            let placed = View::Placed(
+                true,
+                placed_tex_desc(4, 4, fmt, 4),
+                placed_tex_uav_desc(0x1_0000, 0),
+            );
+            assert_eq!(view_kind(&placed), 0, "placed linear UAV {fmt}");
+            assert_eq!(view_stride(&placed), 0);
+        }
     }
 
     /// A placed texture's view the title writes into a heap is left null

@@ -378,6 +378,12 @@ impl RtvRecord {
                 0,
             ]
         };
+        if self.described != 0
+            && words[0] == 0
+            && let Some(format) = crate::resource::view_format(self.resource)
+        {
+            words[0] = format;
+        }
         words[0] = crate::resource::pc_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
@@ -1054,5 +1060,48 @@ pub(crate) mod tests {
             release(h);
             assert!(queued, "the descriptor write reached the heap at the reused address");
         }
+    }
+
+    /// A described RTV with `Format = 0` (`DXGI_FORMAT_UNKNOWN`) on a texture
+    /// whose host copy is typeless (sRGB with UAV) fills in the title format
+    /// so D3D12 accepts the view.
+    #[cfg(windows)]
+    #[test]
+    fn described_rtv_with_unknown_format_fills_typeless_resource_format() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        // 2D 4x4 R8G8B8A8_UNORM_SRGB (29) with ALLOW_RENDER_TARGET (1) | ALLOW_UNORDERED_ACCESS (4).
+        let tex_desc: [u32; 14] = [3, 0, 0, 0, 4, 0, 4, 1 | (1 << 16), 29, 1, 0, 0, 1 | 4, 0];
+        let properties = [1u32, 0, 0, 0, 0];
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut res = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_committed(
+                std::ptr::null(),
+                properties.as_ptr().cast(),
+                0,
+                tex_desc.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &iid,
+                &mut res,
+            ),
+            S_OK
+        );
+        let mut slot_mem = [0u64; 16];
+        let handle = slot_mem.as_mut_ptr() as u64;
+        // Format = 0 (DXGI_FORMAT_UNKNOWN), ViewDimension = 4 (TEXTURE2D), MipSlice = 0, PlaneSlice = 0.
+        let rtv_desc: [u32; 6] = [0, 4, 0, 0, 0, 0];
+        create_rtv(std::ptr::null(), res, &rtv_desc, handle);
+        let record = rtv_record(handle).expect("recorded RTV");
+        let desc = record.desc().expect("described RTV");
+        assert_eq!(desc.Format.0, 29, "fills R8G8B8A8_UNORM_SRGB for typeless host copy");
+        slot::<extern "system" fn(This) -> u32>(res, 0x10)(res);
     }
 }
