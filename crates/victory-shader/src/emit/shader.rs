@@ -56,6 +56,7 @@ pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const VIEWPORT_RT_INDEX: u64 = 1 << 9;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     /// UAVs in a vertex, geometry or mesh program.
@@ -938,6 +939,9 @@ impl Shader {
         }
         if self.flags & flags::ROVS != 0 {
             features |= 0x1000;
+        }
+        if self.flags & flags::VIEWPORT_RT_INDEX != 0 {
+            features |= 0x2000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
