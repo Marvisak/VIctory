@@ -1310,16 +1310,24 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
-        let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-        SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        let submission = prepared.elapsed();
+        let preparation = prepared - started;
+        SUBMISSION_US[0].fetch_add(preparation.as_micros() as u64, Ordering::Relaxed);
+        SUBMISSION_US[1].fetch_add(submission.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
-        if gpu > std::time::Duration::from_millis(250) {
+        if submission > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
                 .iter()
                 .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
                 .collect();
-            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
+            // `ms` covers queue submission and the fence wait after preparation.
+            tracing::warn!(
+                ms = submission.as_millis(),
+                lists = runs.len(),
+                ?pipelines,
+                prepare_ms = preparation.as_millis(),
+                "slow host submission"
+            );
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
