@@ -256,11 +256,7 @@ fn watch(base: usize, size: usize) {
     let Ok(list) = std::env::var("VICTORY_WATCH") else {
         return;
     };
-    let rvas: Vec<usize> = list
-        .split(',')
-        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
-        .filter(|&rva| rva + 4 <= size)
-        .collect();
+    let rvas = watched_rvas(&list, size);
     std::thread::spawn(move || {
         let mut seen = vec![None; rvas.len()];
         loop {
@@ -275,6 +271,17 @@ fn watch(base: usize, size: usize) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     });
+}
+
+/// The hex rvas in the comma list whose four bytes lie in the image: a
+/// `VICTORY_WATCH` entry watches the u32 at each. A rva past the image is
+/// dropped, also one whose end would overflow the address space.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn watched_rvas(list: &str, size: usize) -> Vec<usize> {
+    list.split(',')
+        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
+        .filter(|&rva| rva.checked_add(4).is_some_and(|end| end <= size))
+        .collect()
 }
 
 /// Debugging aid: `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at
@@ -555,4 +562,20 @@ mod cpu_check_tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<u32> {
     anyhow::bail!("running titles requires Windows")
+}
+
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod watch_tests {
+    use super::watched_rvas;
+
+    /// A watch rva past the image is dropped, also one whose four bytes
+    /// would run past the address space's end: the poll would otherwise
+    /// read outside the image (and the plain add panicked in a debug
+    /// build).
+    #[test]
+    fn a_watch_rva_past_the_image_is_dropped_even_when_it_wraps() {
+        let huge = usize::MAX;
+        let list = format!("0x10,0xfc,0xfd,0x{:x},0x{:x}", huge - 3, huge);
+        assert_eq!(watched_rvas(&list, 0x100), [0x10, 0xfc]);
+    }
 }
