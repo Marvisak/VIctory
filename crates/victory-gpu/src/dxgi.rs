@@ -233,7 +233,7 @@ const _: () = assert!(size_of::<Mode>() == 32);
 /// a title paces by them.
 extern "system" fn modes(
     _: This,
-    _format: u32,
+    format: u32,
     _flags: u32,
     count: *mut u32,
     out: *mut Mode,
@@ -247,6 +247,7 @@ extern "system" fn modes(
         return S_OK;
     }
     if *count < 1 {
+        *count = 1;
         return MORE_DATA;
     }
     *count = 1;
@@ -254,7 +255,7 @@ extern "system" fn modes(
         width: 3840,
         height: 2160,
         refresh: [60, 1],
-        format: 0,
+        format,
         scanlines: 1, // progressive
         scaling: 0,
         flags: 0,
@@ -337,5 +338,57 @@ mod tests {
             assert_eq!(enumerate(object, 1, &mut out), NOT_FOUND, "{method}");
             assert!(out.is_null(), "{method} left a stale output pointer");
         }
+    }
+
+    #[test]
+    fn output_modes_reports_count_and_requested_format() {
+        type Modes = extern "system" fn(This, u32, u32, *mut u32, *mut Mode) -> HRESULT;
+        let get_modes = slot::<Modes>(&OUTPUT_OBJECT, 0xa8);
+        let format = 28; // DXGI_FORMAT_R8G8B8A8_UNORM
+
+        assert_eq!(
+            get_modes(
+                &OUTPUT_OBJECT,
+                format,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            E_INVALIDARG
+        );
+
+        let mut count = 0;
+        assert_eq!(
+            get_modes(&OUTPUT_OBJECT, format, 0, &mut count, std::ptr::null_mut()),
+            S_OK
+        );
+        assert_eq!(count, 1);
+
+        let mut mode = Mode {
+            width: 0,
+            height: 0,
+            refresh: [0, 0],
+            format: 0,
+            scanlines: 0,
+            scaling: 0,
+            flags: 0,
+        };
+        let mut small = 0;
+        assert_eq!(
+            get_modes(&OUTPUT_OBJECT, format, 0, &mut small, &mut mode),
+            MORE_DATA
+        );
+        assert_eq!(small, 1);
+
+        let mut room = 4;
+        assert_eq!(
+            get_modes(&OUTPUT_OBJECT, format, 0, &mut room, &mut mode),
+            S_OK
+        );
+        assert_eq!(room, 1);
+        assert_eq!(
+            (mode.width, mode.height, mode.refresh, mode.format),
+            (3840, 2160, [60, 1], format)
+        );
     }
 }
