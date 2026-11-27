@@ -1244,6 +1244,24 @@ impl State {
         }
     }
 
+    /// Makes one descriptor record a shader reads through a table, without
+    /// the resource states, copies and root bindings [`Self::bind`] records
+    /// after the argument clamp. Used by the opt-in indirect preflight so
+    /// only record preparation moves earlier.
+    fn preflight_table_entry(&self, u: &UsedResource, compute: bool) {
+        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+            return;
+        };
+        let handle = table + u64::from(u.table_offset_dwords) * 4;
+        let Some(heap) = self.heap_of(handle) else {
+            return;
+        };
+        let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
+            return;
+        };
+        let _ = host.mirror(index, handle, true);
+    }
+
     /// The descriptors a shader reads through tables, made from the
     /// title's slots. Constant buffers there are raw views of their data
     /// (translated shaders read them so: the host wants constant buffer
@@ -1691,6 +1709,40 @@ impl State {
 }
 
 impl State {
+    /// The optional descriptor-record preflight for an indirect call. It runs
+    /// after the argument and count copies, before the clamp dispatch, and
+    /// only when the switch is on. Nothing that depends on the records'
+    /// arguments moves: resource states, copies and bindings still happen in
+    /// [`Self::bind`] after the clamp.
+    fn preflight_indirect_tables(&self, kind: u32) {
+        if !crate::switch::indirect_descriptor_preflight() {
+            return;
+        }
+        const DRAW: u32 = 0;
+        const INDEXED: u32 = 1;
+        const DISPATCH: u32 = 2;
+        const MESH: u32 = 10;
+        if !matches!(kind, DRAW | INDEXED | DISPATCH | MESH) {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        let compute = kind == DISPATCH;
+        if p.compute != compute || p.mesh != (kind == MESH) {
+            return;
+        }
+        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES && !p.rectangles {
+            return;
+        }
+        for stage in &p.stages {
+            let t = stage.translated();
+            for u in t.used.iter().filter(|u| u.root == RootType::Table) {
+                self.preflight_table_entry(u, compute);
+            }
+        }
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
@@ -1763,6 +1815,9 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        // Opt-in: make the records the shader's tables name before the clamp
+        // runs. Only descriptors move; the clamp still sees earlier writes.
+        self.preflight_indirect_tables(kind);
         // Bounded first: the clamp binds a compute pipeline of its own.
         let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
@@ -2143,6 +2198,38 @@ void main() {
         let title_heap = crate::descriptor::heap(heap);
         let heap_host = title_heap.host().expect("a host view heap");
         (heap, title_heap, heap_host)
+    }
+
+    /// The opt-in indirect preflight makes a known table record before any
+    /// binding or clamp, leaving the later `bind` to set resource states.
+    #[test]
+    fn indirect_preflight_makes_a_known_table_record() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let (heap, title_heap, heap_host) = view_heap(8);
+        let slot = title_heap.start;
+        // A placed texture is deliberately left unmade until a draw reads it
+        // through a table, so it shows what the preflight moves earlier.
+        let address = title_memory(1 << 20);
+        let view = placed_view(address, texture_words(64, 64, 42, 0x105, 0));
+        let View::Placed(false, resource, desc) = view else {
+            panic!("a placed shader view");
+        };
+        crate::descriptor::create_placed_srv(
+            std::ptr::null(),
+            std::ptr::from_ref(&resource),
+            std::ptr::from_ref(&desc),
+            slot,
+        );
+
+        let mut state = State::default();
+        state.heaps[0] = heap as usize;
+        state.compute = vec![Root::Table(slot)];
+        assert!(!heap_host.kept(0));
+        state.preflight_table_entry(&used(ResourceType::Srv), true);
+        assert!(heap_host.made(0));
+        assert!(heap_host.kept(0));
     }
 
     fn dispatch_marked_uav(

@@ -1,6 +1,7 @@
 //! The `VICTORY_*` on/off switches (`VICTORY_D3D12_DEBUG=1` and its siblings).
 
 use std::ffi::OsStr;
+use std::sync::OnceLock;
 
 /// Whether a switch's value turns it on: it is set, and is not `0`.
 ///
@@ -13,6 +14,13 @@ fn value_is_on(value: Option<&OsStr>) -> bool {
 /// Whether the environment variable `name` switches something on.
 pub(crate) fn on(name: &str) -> bool {
     value_is_on(std::env::var_os(name).as_deref())
+}
+
+/// Whether indirect calls prepare their known descriptor records before the
+/// clamp dispatch. Read once so a long run does not reread the environment.
+pub(crate) fn indirect_descriptor_preflight() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| on("VICTORY_GPU_INDIRECT_DESCRIPTOR_PREFLIGHT"))
 }
 
 #[cfg(test)]
@@ -32,6 +40,14 @@ mod tests {
 
     #[test]
     fn one_is_on() {
+        assert!(value_is_on(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn indirect_preflight_is_default_off() {
+        // The switch is read with `on`; only `0` turns it off once set.
+        assert!(!value_is_on(None));
+        assert!(!value_is_on(Some(OsStr::new("0"))));
         assert!(value_is_on(Some(OsStr::new("1"))));
     }
 
