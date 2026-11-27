@@ -36,6 +36,8 @@ mod hold;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+pub use host::set_mouse_locked;
+#[cfg(windows)]
 mod indirect;
 pub mod list;
 #[cfg(windows)]

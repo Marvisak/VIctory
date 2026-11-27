@@ -116,6 +116,10 @@ trait Source: Send {
     fn scripted_keys(&mut self) -> Vec<KeyState> {
         Vec::new()
     }
+    /// Mouse look / buttons mapped to the fallback pad's right stick and triggers.
+    fn mouse_look(&mut self) -> PadState {
+        PadState::default()
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -142,8 +146,7 @@ fn fallback(keys: &[KeyState]) -> PadState {
     }
 }
 
-/// Combines `extra` (from `VICTORY_KEYS`) onto `base` (a physical host pad).
-#[cfg(any(test, feature = "diagnostics"))]
+/// Combines `extra` onto `base` (e.g. `VICTORY_KEYS` or mouse look).
 fn merge_pad(base: PadState, extra: PadState) -> PadState {
     PadState {
         buttons: base.buttons | extra.buttons,
@@ -436,16 +439,16 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys, scripted) = {
+        let (pads, keys, scripted, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             #[cfg(any(test, feature = "diagnostics"))]
             let scripted = source.scripted_keys();
             #[cfg(not(any(test, feature = "diagnostics")))]
             let scripted: [KeyState; 0] = [];
-            (pads, source.keys(), scripted)
+            (pads, source.keys(), scripted, source.mouse_look())
         };
-        let events = self.state().poll(&self.devices, pads, keys, &scripted);
+        let events = self.state().poll(&self.devices, pads, keys, &scripted, mouse);
         self.deliver(events);
     }
 
@@ -491,6 +494,7 @@ impl State {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         scripted: &[KeyState],
+        mouse: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -515,7 +519,7 @@ impl State {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
         let fallback = (!any_pad).then(|| {
-            let base = fallback(&keys);
+            let base = merge_pad(fallback(&keys), mouse);
             #[cfg(any(test, feature = "diagnostics"))]
             if !scripted.is_empty() {
                 return Value::Pad(merge_pad(base, fallback(scripted)));
@@ -1144,6 +1148,7 @@ pub(crate) fn module() -> HleModule {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::{POINT, RECT};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1157,7 +1162,7 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, SetCursorPos,
     };
 
     use super::*;
@@ -1202,6 +1207,9 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        mouse_centered: bool,
+        mouse_unlocked: bool,
+        f2_down: bool,
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1257,6 +1265,86 @@ mod host {
             #[cfg(not(feature = "diagnostics"))]
             {
                 Vec::new()
+            }
+        }
+
+        fn mouse_look(&mut self) -> PadState {
+            static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            static SENS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+            if !*ENABLED.get_or_init(|| {
+                std::env::var_os("VICTORY_MOUSE_LOOK").is_none_or(|v| v != "0")
+            }) {
+                victory_gpu::set_mouse_locked(false);
+                crate::modules::lifecycle::set_mouse_locked(false);
+                return PadState::default();
+            }
+            if !focused() {
+                self.mouse_centered = false;
+                self.f2_down = false;
+                victory_gpu::set_mouse_locked(false);
+                crate::modules::lifecycle::set_mouse_locked(false);
+                return PadState::default();
+            }
+            // F2 toggles cursor lock so the user can free the mouse if needed.
+            // SAFETY: plain key-state query (VK_F2 = 0x71).
+            let f2 = unsafe { GetAsyncKeyState(0x71) } < 0;
+            if f2 && !self.f2_down {
+                self.mouse_unlocked = !self.mouse_unlocked;
+                self.mouse_centered = false;
+            }
+            self.f2_down = f2;
+            victory_gpu::set_mouse_locked(!self.mouse_unlocked);
+            crate::modules::lifecycle::set_mouse_locked(!self.mouse_unlocked);
+            if self.mouse_unlocked {
+                return PadState::default();
+            }
+            // SAFETY: plain query returning the foreground window (may be null).
+            let hwnd = unsafe { GetForegroundWindow() };
+            let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            // SAFETY: `rect` is valid writable storage; null `hwnd` safely returns 0.
+            if unsafe { GetWindowRect(hwnd, &mut rect) } == 0
+                || rect.right - rect.left < 100
+                || rect.bottom - rect.top < 100
+            {
+                self.mouse_centered = false;
+                return PadState::default();
+            }
+            let cx = (rect.left + rect.right) / 2;
+            let cy = (rect.top + rect.bottom) / 2;
+            if !self.mouse_centered {
+                // SAFETY: plain cursor warp to the foreground window's center.
+                unsafe { SetCursorPos(cx, cy) };
+                self.mouse_centered = true;
+                return PadState::default();
+            }
+            let mut cur = POINT { x: cx, y: cy };
+            // SAFETY: `cur` is valid writable storage.
+            if unsafe { GetCursorPos(&mut cur) } == 0 {
+                return PadState::default();
+            }
+            let dx = (cur.x - cx) as f32;
+            let dy = (cur.y - cy) as f32;
+            if cur.x != cx || cur.y != cy {
+                // SAFETY: plain cursor re-centering after reading delta.
+                unsafe { SetCursorPos(cx, cy) };
+            }
+            let sens = *SENS.get_or_init(|| {
+                std::env::var("VICTORY_MOUSE_SENS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .unwrap_or(0.045)
+            });
+            // SAFETY: plain key-state query (VK_LBUTTON = 0x01).
+            let lmb = unsafe { GetAsyncKeyState(0x01) } < 0;
+            // SAFETY: plain key-state query (VK_RBUTTON = 0x02).
+            let rmb = unsafe { GetAsyncKeyState(0x02) } < 0;
+            PadState {
+                right_x: (dx * sens).clamp(-1.0, 1.0),
+                right_y: (-dy * sens).clamp(-1.0, 1.0),
+                right_trigger: if lmb { 1.0 } else { 0.0 },
+                left_trigger: if rmb { 1.0 } else { 0.0 },
+                ..Default::default()
             }
         }
 

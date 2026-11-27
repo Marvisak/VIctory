@@ -3864,12 +3864,98 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     Ok(HWND(hwnd as *mut _))
 }
 
+static MOUSE_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static WINDOW_HWND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CURSOR_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_mouse_locked(locked: bool) {
+    let prev = MOUSE_LOCKED.swap(locked, Ordering::Relaxed);
+    if prev != locked {
+        let raw = WINDOW_HWND.load(Ordering::Relaxed);
+        if raw != 0 {
+            // SAFETY: posting a wakeup message to our own window thread.
+            unsafe {
+                let _ = PostMessageW(Some(HWND(raw as *mut _)), WM_APP, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+}
+
+fn sync_cursor(hwnd: HWND, lock: bool) {
+    // SAFETY: called exclusively on the victory-window thread.
+    unsafe {
+        let fg = GetForegroundWindow();
+        let fg_ours = if fg.0.is_null() {
+            false
+        } else {
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(fg, Some(&mut pid));
+            pid == std::process::id()
+        };
+        let want_hide = lock && fg_ours;
+        let was_hidden = CURSOR_HIDDEN.swap(want_hide, Ordering::Relaxed);
+        if want_hide && !was_hidden {
+            ShowCursor(false);
+        } else if !want_hide && was_hidden {
+            ShowCursor(true);
+        }
+        if want_hide {
+            SetCursor(None);
+            let mut rect = RECT::default();
+            if GetClientRect(hwnd, &mut rect).is_ok() {
+                let mut tl = windows::Win32::Foundation::POINT {
+                    x: rect.left,
+                    y: rect.top,
+                };
+                let mut br = windows::Win32::Foundation::POINT {
+                    x: rect.right,
+                    y: rect.bottom,
+                };
+                let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut tl);
+                let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut br);
+                let clip = RECT {
+                    left: tl.x,
+                    top: tl.y,
+                    right: br.x,
+                    bottom: br.y,
+                };
+                let _ = ClipCursor(Some(&clip));
+            }
+        } else {
+            let _ = ClipCursor(None);
+        }
+    }
+}
+
 extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let locked = MOUSE_LOCKED.load(Ordering::Relaxed);
+    match message {
+        WM_CREATE => {
+            WINDOW_HWND.store(hwnd.0 as usize, Ordering::Relaxed);
+            sync_cursor(hwnd, locked);
+        }
+        WM_APP | WM_SETFOCUS | WM_MOUSEMOVE => sync_cursor(hwnd, locked),
+        WM_ACTIVATE => sync_cursor(hwnd, locked && (wparam.0 & 0xFFFF) != 0),
+        WM_KILLFOCUS | WM_DESTROY => sync_cursor(hwnd, false),
+        WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
+            sync_cursor(hwnd, locked);
+            if !CURSOR_HIDDEN.load(Ordering::Relaxed) {
+                // SAFETY: restore standard arrow when unlocked.
+                unsafe {
+                    if let Ok(arrow) = LoadCursorW(None, IDC_ARROW) {
+                        SetCursor(Some(arrow));
+                    }
+                }
+            }
+            return LRESULT(1);
+        }
+        _ => {}
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
@@ -3884,7 +3970,6 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             lpfnWndProc: Some(window_proc),
             hInstance: instance.into(),
             lpszClassName: CLASS,
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
             ..Default::default()
         };
         RegisterClassExW(&class);

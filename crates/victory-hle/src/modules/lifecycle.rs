@@ -413,6 +413,53 @@ pub extern "system" fn ShowWindow(hwnd: HWND, command: i32) -> i32 {
     unsafe { wm::ShowWindow(target, command) }
 }
 
+static MOUSE_LOCKED: AtomicBool = AtomicBool::new(true);
+static TITLE_HWND: AtomicUsize = AtomicUsize::new(0);
+static CURSOR_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_mouse_locked(locked: bool) {
+    let prev = MOUSE_LOCKED.swap(locked, Ordering::Relaxed);
+    if prev != locked {
+        let raw = TITLE_HWND.load(Ordering::Relaxed);
+        if raw != 0 {
+            // SAFETY: posting a wakeup to the title's own window thread.
+            unsafe {
+                wm::PostMessageW(raw as HWND, wm::WM_APP, 0, 0);
+            }
+        }
+    }
+}
+
+fn sync_cursor(hwnd: HWND, lock: bool) {
+    // SAFETY: called on the title's own window thread.
+    unsafe {
+        let fg = wm::GetForegroundWindow();
+        let fg_ours = if fg.is_null() {
+            false
+        } else {
+            let mut pid: u32 = 0;
+            wm::GetWindowThreadProcessId(fg, &mut pid);
+            pid == std::process::id()
+        };
+        let want_hide = lock && fg_ours;
+        let was_hidden = CURSOR_HIDDEN.swap(want_hide, Ordering::Relaxed);
+        if want_hide && !was_hidden {
+            wm::ShowCursor(0);
+        } else if !want_hide && was_hidden {
+            wm::ShowCursor(1);
+        }
+        if want_hide {
+            wm::SetCursor(std::ptr::null_mut());
+            let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            if wm::GetWindowRect(hwnd, &mut rect) != 0 {
+                wm::ClipCursor(&rect);
+            }
+        } else {
+            wm::ClipCursor(std::ptr::null());
+        }
+    }
+}
+
 /// Puts our procedure in front of the title's.
 fn hook(hwnd: HWND) {
     if hwnd.is_null() {
@@ -421,9 +468,13 @@ fn hook(hwnd: HWND) {
     // SAFETY: a window this thread just created. The title's procedure is
     // stored before ours can run.
     unsafe {
+        if wm::GetParent(hwnd).is_null() {
+            TITLE_HWND.store(hwnd as usize, Ordering::Relaxed);
+        }
         let title = wm::GetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC);
         wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
+        wm::PostMessageW(hwnd, wm::WM_APP, 0, 0);
     }
 }
 
@@ -436,6 +487,7 @@ extern "system" fn window_proc(
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
+        sync_cursor(hwnd, false);
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
@@ -447,6 +499,27 @@ extern "system" fn window_proc(
     // menu. The mouse still opens it from the title bar.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
+    }
+    let locked = MOUSE_LOCKED.load(Ordering::Relaxed);
+    match message {
+        wm::WM_APP | wm::WM_SETFOCUS | wm::WM_MOUSEMOVE => sync_cursor(hwnd, locked),
+        wm::WM_ACTIVATE => sync_cursor(hwnd, locked && (wparam & 0xFFFF) != 0),
+        wm::WM_KILLFOCUS | wm::WM_NCDESTROY => sync_cursor(hwnd, false),
+        wm::WM_SETCURSOR if (lparam & 0xFFFF) as u32 == wm::HTCLIENT => {
+            sync_cursor(hwnd, locked);
+            if CURSOR_HIDDEN.load(Ordering::Relaxed) {
+                return 1;
+            }
+            // SAFETY: restore standard arrow when unlocked.
+            unsafe {
+                let arrow = wm::LoadCursorW(std::ptr::null_mut(), wm::IDC_ARROW);
+                if !arrow.is_null() {
+                    wm::SetCursor(arrow);
+                }
+            }
+            return 1;
+        }
+        _ => {}
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
