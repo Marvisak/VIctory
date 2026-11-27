@@ -56,6 +56,7 @@ pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const MSAD: u64 = 1 << 7;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     /// UAVs in a vertex, geometry or mesh program.
@@ -580,6 +581,7 @@ impl Shader {
             (flags::SAMPLER_HEAP, uses.sampler_heap),
             (flags::WAVE_OPS, uses.wave),
             (flags::INT64, uses.int64),
+            (flags::MSAD, uses.msad),
         ] {
             self.flags = if used { self.flags | flag } else { self.flags & !flag };
         }
@@ -927,6 +929,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::MSAD != 0 {
+            features |= 0x40;
+        }
         if self.flags & flags::UAVS_EVERY_STAGE != 0 {
             features |= 0x4;
         }

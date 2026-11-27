@@ -539,6 +539,8 @@ impl Module {
                     u.sampler_heap |= sampler;
                 }
                 u.wave |= name.starts_with("dx.op.wave") || name.starts_with("dx.op.quad");
+                u.msad |= name == "dx.op.tertiary.i32"
+                    && args.first().and_then(|&a| self.int_value(a)) == Some(50);
             }
         }
         u
@@ -599,6 +601,24 @@ impl Module {
             .filter(|&&i| plan.live[i as usize])
             .filter(|&&i| matches!(self.insts[i as usize].op, Op::Call(f, _) if self.funcs[f as usize].name == name))
             .count()
+    }
+
+    /// Instructions (including terminators) that [`Module::write`] writes.
+    #[cfg(test)]
+    pub fn written_instructions(&self) -> usize {
+        let plan = self.plan();
+        plan.layout
+            .iter()
+            .map(|&b| {
+                let block = &self.blocks[b];
+                let live = block
+                    .phis
+                    .iter()
+                    .chain(&block.body)
+                    .filter(|&&i| plan.live[i as usize]);
+                live.count() + 1
+            })
+            .sum()
     }
 
     /// The globals and functions [`Module::write`] declares, each kept
@@ -1033,6 +1053,8 @@ pub struct Uses {
     pub wave: bool,
     /// 64-bit integers.
     pub int64: bool,
+    /// Masked sum of absolute differences.
+    pub msad: bool,
 }
 
 /// What [`Module::write`] writes ([`Module::plan`]).
@@ -1600,6 +1622,12 @@ mod tests {
         let heap = m.function("dx.op.createHandleFromHeap", heap_ty, Some(Attr::ReadNone), false);
         let (op, zero, no) = (m.i32(218), m.i32(0), m.bool(false));
         let yes = m.bool(true);
+        let msad_ty = m.func_ty(i32t, vec![i32t; 4]);
+        let msad = m.function("dx.op.tertiary.i32", msad_ty, Some(Attr::ReadNone), false);
+        let msad_op = m.i32(50);
+        let _ = m.call(entry, msad, vec![msad_op, zero, zero, zero]);
+        let masked = m.call(dead, msad, vec![msad_op, zero, zero, zero]);
+        let _ = m.call(dead, sink, vec![masked]);
         // An unread heap handle and 64-bit add where the program goes; a
         // read sampler-heap handle behind a constant branch's other edge.
         let _ = m.call(entry, heap, vec![op, zero, no, no]);
@@ -1619,8 +1647,16 @@ mod tests {
         let wide = m.bin(live, Bin::Add, five, five);
         let t = m.cast(live, Cast::Trunc, wide, i32t);
         let _ = (m.call(live, sink, vec![t]), h);
+        // Another opcode sharing the declaration must not enable MSAD.
+        let umad_op = m.i32(49);
+        let product = m.call(live, msad, vec![umad_op, one, one, one]);
+        let _ = m.call(live, sink, vec![product]);
+        assert!(!m.uses().msad);
+        let masked = m.call(live, msad, vec![msad_op, zero, zero, zero]);
+        let _ = m.call(live, sink, vec![masked]);
         let u = m.uses();
         assert!(u.int64 && !u.heap && !u.sampler_heap, "{u:?}");
+        assert!(u.msad, "{u:?}");
     }
 
     #[test]

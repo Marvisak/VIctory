@@ -236,6 +236,62 @@ fn run_cases(
 }
 
 #[test]
+fn vector_masked_sad_matches_rdna2() {
+    let shader = build_valu_cs(&vop3(0x171, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let mut cases = Vec::new();
+    // Every combination of zero/nonzero mask bytes, asymmetric operands,
+    // byte extremes and accumulators on both sides of wrapping boundaries.
+    for mask in 0..16 {
+        for reference in [0x0101_0101u32, 0x7F80_FEFF, u32::MAX] {
+            let reference = (0..4).fold(0, |word, i| {
+                word | if mask & (1 << i) != 0 {
+                    reference & (0xFF << (i * 8))
+                } else {
+                    0
+                }
+            });
+            for source in [0, u32::MAX, 0xFF00_0180, 0x017F_FE00, reference] {
+                for accum in [
+                    0,
+                    1,
+                    0x7FFF_FFFF,
+                    0x8000_0000,
+                    u32::MAX - 1020,
+                    u32::MAX - 1,
+                    u32::MAX,
+                ] {
+                    cases.push([source, reference, accum, 0]);
+                }
+            }
+        }
+    }
+    // Sweep every byte value through each position, including 0/255 and
+    // the signed-byte boundary. The other reference bytes are masked out.
+    for i in 0..4 {
+        for byte in 0..=255u32 {
+            cases.push([byte << (i * 8), (255 - byte) << (i * 8), u32::MAX, 0]);
+        }
+    }
+    run_cases(&shader, &cases, |backend, index, inputs, got| {
+        if index == 0 {
+            eprintln!("v_msad_u8: running {} cases on {backend}", cases.len());
+        }
+        let [source, reference, accum, _] = inputs;
+        // Byte arrays keep this reference independent of the DXIL lowering.
+        let sum: u32 = source
+            .to_le_bytes()
+            .into_iter()
+            .zip(reference.to_le_bytes())
+            .filter(|&(_, r)| r != 0)
+            .map(|(s, r)| u32::from(s.abs_diff(r)))
+            .sum();
+        let want = (u64::from(accum) + u64::from(sum)) as u32;
+        assert_eq!(got, want, "{backend}: v_msad_u8{inputs:?}");
+    });
+    eprintln!("v_msad_u8: {} cases per available backend", cases.len());
+}
+
+#[test]
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
         [

@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1407,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -7601,11 +7606,26 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Mul, a, b);
                 self.s.m.bin(c, Bin::Add, m, d)
             }
-            "v_sad_u8" | "v_sad_hi_u8" | "v_sad_u16" | "v_sad_u32" | "v_msad_u8" => {
+            "v_msad_u8" => {
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                // Msad masks zero bytes of its first operand. Start at zero
+                // so its sum (at most 1020) cannot overflow: DXIL permits
+                // saturation there. Add src2 separately to guarantee wrapping.
+                let zero = k(self, 0);
+                let sum = self.s.op(
+                    c,
+                    "tertiary.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    50,
+                    &[b, a, zero],
+                );
+                self.s.m.bin(c, Bin::Add, sum, d)
+            }
+            "v_sad_u8" | "v_sad_hi_u8" | "v_sad_u16" | "v_sad_u32" => {
                 // src2 plus the sum of the unsigned differences |a - b| of
                 // the operands' bytes, halves or whole dwords, wrapping at 32
-                // bits. v_sad_hi_u8 adds the sum shifted to the high half;
-                // v_msad_u8 leaves out a byte whose mask byte (src1) is 0.
+                // bits. v_sad_hi_u8 adds the sum shifted to the high half.
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 let (width, parts) = match name {
                     "v_sad_u16" => (16, 2),
@@ -7626,11 +7646,7 @@ impl<'a> Lower<'a> {
                     let above = self.s.m.cmp(c, pred::IUGT, x, y);
                     let hi = self.s.m.select(c, above, x, y);
                     let lo = self.s.m.select(c, above, y, x);
-                    let mut diff = self.s.m.bin(c, Bin::Sub, hi, lo);
-                    if name == "v_msad_u8" {
-                        let masked = self.s.m.cmp(c, pred::NE, y, zero);
-                        diff = self.s.m.select(c, masked, diff, zero);
-                    }
+                    let diff = self.s.m.bin(c, Bin::Sub, hi, lo);
                     sum = self.s.m.bin(c, Bin::Add, sum, diff);
                 }
                 if name == "v_sad_hi_u8" {
@@ -11089,6 +11105,15 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn vector_masked_sad_instruction_count() {
+        // v_msad_u8 v0, v1, v2, v3: runtime inputs, result stored to a UAV.
+        let words = [0xD571_0000, 0x101 | 0x102 << 9 | 0x103 << 18];
+        let count = lower_valu(&words).unwrap().instructions;
+        eprintln!("v_msad_u8 DXIL instruction count: {count}");
+        assert_eq!(count, 20, "v_msad_u8 DXIL instruction count");
     }
 
     #[test]
