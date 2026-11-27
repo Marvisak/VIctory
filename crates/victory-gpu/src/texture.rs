@@ -541,6 +541,8 @@ impl Staging {
     /// A staging buffer with the texture memory detiled into it if it
     /// changed since the last time (and is mapped at all), and the
     /// subresources that changed (only those are detiled and to be copied).
+    /// The byte counter receives only bytes staged for upload, not bytes read
+    /// to check whether the texture changed.
     pub(crate) fn refresh(&self) -> Option<Upload> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
@@ -551,8 +553,8 @@ impl Staging {
         buffer
     }
 
-    /// Returns the bytes of title memory read, and the buffer it detiled
-    /// into with the subresources detiled.
+    /// Returns the bytes staged for upload, and the buffer it detiled into
+    /// with the subresources detiled.
     fn refresh_now(&self) -> (usize, Option<Upload>) {
         let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let size = self.layout.size as usize;
@@ -617,7 +619,7 @@ impl Staging {
                 .map(|i| i as u32)
                 .collect();
             if fresh.is_empty() {
-                return (bytes, None);
+                return (0, None);
             }
             let buffer = self.detile(read, &fresh);
             if buffer.is_none() {
@@ -627,7 +629,12 @@ impl Staging {
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
-            return (bytes, buffer.map(|(b, at)| (b, at, fresh)));
+            let staged = if buffer.is_some() {
+                self.staged_size(&fresh)
+            } else {
+                0
+            };
+            return (staged, buffer.map(|(b, at)| (b, at, fresh)));
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -654,14 +661,38 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
-            return (size, None);
+            return (0, None);
         }
         let every = all();
         let buffer = self.detile(tiled, &every);
+        let staged = if buffer.is_some() {
+            self.staged_size(&every)
+        } else {
+            0
+        };
         last.hash = buffer.is_some().then_some(hash);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, buffer.map(|(b, at)| (b, at, every)))
+        (staged, buffer.map(|(b, at)| (b, at, every)))
+    }
+
+    /// Bytes written into the staging buffer for `subresources` (the bytes
+    /// the frame line counts as uploaded), whether or not they were detiled.
+    fn staged_size(&self, subresources: &[u32]) -> usize {
+        subresources
+            .iter()
+            .map(|&i| {
+                let i = i as usize;
+                let f = &self.footprints[i];
+                subresource_len(
+                    f.Offset,
+                    f.Footprint.RowPitch as usize,
+                    self.rows[i],
+                    f.Footprint.Depth,
+                    self.size,
+                )
+            })
+            .sum()
     }
 
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
@@ -844,6 +875,87 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unchanged_texture_reports_no_staged_bytes() {
+        use std::sync::atomic::AtomicU64;
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let desc = Desc {
+            dimension: Dimension::Tex2d,
+            width: 64,
+            height: 64,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        };
+        let layout = Layout::new(&desc).unwrap();
+        let memory = vec![0u8; layout.size as usize];
+        let staging = Staging {
+            size: layout.size,
+            footprints: Vec::new(),
+            rows: Vec::new(),
+            layout,
+            mips: 1,
+            memory: memory.as_ptr(),
+            tracked: None,
+            spans: Vec::new(),
+            last: Mutex::new(Last {
+                hash: Some(blake3::hash(&memory)),
+                hashes: Vec::new(),
+            }),
+            uploads: AtomicU64::new(0),
+            copied: AtomicU64::new(0),
+        };
+        let (staged, upload) = staging.refresh_now();
+        assert_eq!(staged, 0);
+        assert!(upload.is_none());
+    }
+
+    #[test]
+    fn staged_size_counts_only_the_subresources_passed() {
+        use std::sync::atomic::AtomicU64;
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let desc = Desc {
+            dimension: Dimension::Tex2d,
+            width: 64,
+            height: 64,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        };
+        let layout = Layout::new(&desc).unwrap();
+        let footprint = |offset| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: offset,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                RowPitch: 256,
+                Height: 4,
+                Depth: 1,
+                ..Default::default()
+            },
+        };
+        let staging = Staging {
+            size: 2048,
+            footprints: vec![footprint(0), footprint(1024)],
+            rows: vec![4, 4],
+            layout,
+            mips: 2,
+            memory: std::ptr::null(),
+            tracked: None,
+            spans: Vec::new(),
+            last: Mutex::new(Last::default()),
+            uploads: AtomicU64::new(0),
+            copied: AtomicU64::new(0),
+        };
+        assert_eq!(staging.staged_size(&[0]), 1024);
+        assert_eq!(staging.staged_size(&[1]), 1024);
+        assert_eq!(staging.staged_size(&[0, 1]), 2048);
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {

@@ -84,7 +84,8 @@ static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
-/// refreshes (microseconds, bytes hashed), since the last frame-rate line.
+/// refreshes (microseconds, bytes detiled/staged), since the last frame-rate
+/// line.
 pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
