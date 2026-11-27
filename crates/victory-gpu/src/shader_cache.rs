@@ -53,7 +53,7 @@ pub fn counts() -> (u64, u64) {
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
 /// the compiler), the entry's encoding (this file's text) and the
 /// translation settings (the loop limit, which a diagnostics build can
-/// change at run time).
+/// change at run time, and [`host_settings`]).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -64,18 +64,48 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        key(
+            victory_shader::SOURCE_HASH,
+            ENCODING,
+            limit,
+            host_settings(),
+        )
+    })
+}
+
+/// Tells the translator, once, what the host's shader compiler needs, and
+/// returns it: whether atomic subtractions on group memory are written as
+/// compare-exchange loops ([`victory_shader::emit::atomic_sub_loops`]),
+/// which NVIDIA's compiler needs (it refuses such a pipeline as out of
+/// memory). Decided by the vendor of the adapter the host device is made
+/// on; `VICTORY_ATOMIC_SUB_LOOP=1` or `=0` says otherwise. Called before
+/// anything is translated or a cache keyed.
+pub fn host_settings() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| {
+        const NVIDIA: u32 = 0x10DE;
+        let on = match std::env::var("VICTORY_ATOMIC_SUB_LOOP").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => crate::host::default_adapter_vendor() == Some(NVIDIA),
+        };
+        victory_shader::emit::set_atomic_sub_loops(on);
+        if on {
+            tracing::info!("atomic subtractions on group memory are compare-exchange loops");
+        }
+        on
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, sub_loops: bool) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&[u8::from(sub_loops)]);
     *h.finalize().as_bytes()
 }
 
@@ -85,6 +115,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true };
+    host_settings();
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
@@ -476,21 +507,23 @@ mod tests {
     }
 
     /// The key's parts: a change to any of them (the translator's sources,
-    /// this file's encoding, the loop limit) makes another key, so no entry
-    /// written before it is read.
+    /// this file's encoding, the loop limit, the atomic subtraction loops)
+    /// makes another key, so no entry written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, false);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                host_settings()
             )
         );
         // The encoding part is this file as built.

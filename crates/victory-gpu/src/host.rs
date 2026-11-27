@@ -283,6 +283,17 @@ fn process_memory() -> (u64, u64) {
     (c.PagefileUsage as u64, c.WorkingSetSize as u64)
 }
 
+/// The PCI vendor of the adapter the host device is made on (the first
+/// DXGI enumerates, as `D3D12CreateDevice` takes without one), if any.
+pub(crate) fn default_adapter_vendor() -> Option<u32> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = factory.EnumAdapters1(0).ok()?;
+        adapter.GetDesc1().ok().map(|d| d.VendorId)
+    }
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {

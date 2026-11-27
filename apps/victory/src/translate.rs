@@ -175,6 +175,9 @@ pub fn run(
     }
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
+        // Translated as the runtime does for this host, so a pipeline it
+        // refuses here is one the game sees too.
+        victory_gpu::shader_cache::host_settings();
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()

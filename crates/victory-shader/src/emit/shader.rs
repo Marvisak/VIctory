@@ -572,6 +572,11 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // Before the flags are read from the module: no feature comes or
+        // goes with the loops.
+        if super::atomic_sub_loops() {
+            self.m.atomic_subtracts();
+        }
         // The flags of what lowering made, as the module writes it: what only
         // unread values or never-taken edges used is not written.
         let uses = self.m.uses();
