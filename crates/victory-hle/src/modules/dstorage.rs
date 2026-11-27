@@ -884,7 +884,12 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
+        let n = inflate(&source, &mut packed).map_err(|why| {
+            fail(
+                INVALID_DATA,
+                &format!("{why}, into the intermediate buffer"),
+            )
+        })?;
         packed.truncate(n);
         Cow::Owned(packed)
     } else {
@@ -894,7 +899,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => inflate(&source, out).map_err(|why| fail(INVALID_DATA, &why)),
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -907,12 +912,22 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
-/// nothing says that is required.
-fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
+/// nothing says that is required. A failure says why, for the request's
+/// warning: a short or cut stream and a too-small destination look alike
+/// otherwise.
+fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, String> {
+    use miniz_oxide::inflate::TINFLStatus;
     miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
         .map_err(|status| {
-            tracing::debug!(?status, "dstorage: zlib stream");
-            INVALID_DATA
+            let why = match status {
+                TINFLStatus::HasMoreOutput => "the output is larger than the destination",
+                TINFLStatus::NeedsMoreInput | TINFLStatus::FailedCannotMakeProgress => {
+                    "the stream ends early"
+                }
+                TINFLStatus::Adler32Mismatch => "the checksum does not match",
+                _ => "the stream is corrupt",
+            };
+            format!("zlib: {why} ({status:?})")
         })
 }
 
@@ -1255,6 +1270,23 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
         assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+    }
+
+    #[test]
+    fn zlib_failures_say_why() {
+        let plain = pattern(70_000);
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        let mut out = vec![0u8; plain.len()];
+        assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
+
+        let small = inflate(&packed, &mut out[..1000]).unwrap_err();
+        assert!(small.contains("larger than the destination"), "{small}");
+        let cut = inflate(&packed[..packed.len() / 2], &mut out).unwrap_err();
+        assert!(cut.contains("ends early"), "{cut}");
+        let mut bad_sum = packed.clone();
+        *bad_sum.last_mut().unwrap() ^= 1;
+        let sum = inflate(&bad_sum, &mut out).unwrap_err();
+        assert!(sum.contains("checksum"), "{sum}");
     }
 
     #[test]
