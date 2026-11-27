@@ -21,6 +21,11 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+/// The tests of the stride records: a module of this file, kept in its own
+/// file beside this file's size limit (xtask's asset policy).
+#[cfg(test)]
+#[path = "lower/stride_record.rs"]
+mod stride_record;
 
 type Why = &'static str;
 
@@ -4250,11 +4255,11 @@ impl<'a> Lower<'a> {
     /// the code also reads as numbers: the console compiler computes sizes
     /// from descriptor bits (an image's width, height, depth, levels; a
     /// buffer's record count) instead of querying them. Those fields are
-    /// rebuilt from the host view's dimensions in the GFX10 layout (image
+    /// rebuilt from the host's view's dimensions in the GFX10 layout (image
     /// dword 1 bits 30-31 and dword 2 bits 0-13 width - 1, dword 2 bits
     /// 14-29 height - 1, dword 3 identity swizzle, last level at 16, type at
     /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count).
-    // shortcut: the base level reads 0 (the host view starts at its own
+    // shortcut: the base level reads 0 (the host's view starts at its own
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
@@ -5324,6 +5329,19 @@ impl<'a> Lower<'a> {
                     && u.table_offset_dwords <= dword
             })
             .max_by_key(|u| u.table_offset_dwords)
+    }
+
+    /// The stride an access by element takes, from the used-resource
+    /// record. Whether the record is missing or names none (the FSPX parser
+    /// leaves unread strides at zero), the element size is the host's view's,
+    /// known only at runtime — the access is refused, its error separate
+    /// from the unknown ones so runs can tell them apart.
+    fn index_stride(&self, used: Option<&UsedResource>) -> Result<u32, Why> {
+        match used.map_or(0, |u| u.stride) {
+            0 => Err("a structured buffer whose record names no stride"),
+            s if s >= 4 && s.is_multiple_of(4) => Ok(s),
+            _ => Err("a structured buffer of unknown stride"),
+        }
     }
 
     /// A handle for the descriptor `src` read at `site`; the heap index of
@@ -9541,10 +9559,7 @@ impl<'a> Lower<'a> {
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
             let (h, coords, byte) = match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
+                    let stride = self.index_stride(used)?;
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     let s = self.s.m.i32(stride);
                     let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
@@ -9694,10 +9709,7 @@ impl<'a> Lower<'a> {
             } else {
                 match index {
                     Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
-                        }
+                        let stride = self.index_stride(used)?;
                         args.push(self.handle(site, src, false, (12 | u, stride))?);
                         args.extend([index, off]);
                         let s = self.s.m.i32(stride);
@@ -9804,10 +9816,7 @@ impl<'a> Lower<'a> {
             let align = self.s.m.i32(4);
             match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
+                    let stride = self.index_stride(used)?;
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     self.s.op(
                         c,
@@ -11578,6 +11587,7 @@ mod tests {
         let layout = vec![root(RootType::Table, 0, 0)];
         let l = lower_with(&words, layout, used).unwrap();
         assert_eq!(l.nonuniform_handles, 0);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -11631,6 +11641,7 @@ mod tests {
         let l = lower_with(&words, layout, used).unwrap();
         // One image handle from the joins' heap index, the same in all lanes.
         assert_eq!(l.nonuniform_handles, 0);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {
@@ -11681,6 +11692,7 @@ mod tests {
         // One image handle made in the entry block for both loads, and the
         // UAV's.
         assert_eq!(l.heap_handles, 2);
+        #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
         ) {

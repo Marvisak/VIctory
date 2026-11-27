@@ -1088,7 +1088,7 @@ impl<'a> Tracer<'a> {
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
         // A byte access through a buffer descriptor made raw reads what the
-        // descriptor's view does with a raw host view.
+        // descriptor's view does with a raw host's view.
         if !inst.name().contains("format")
             && let Some(raw) = self.made_raw(&words)
         {
