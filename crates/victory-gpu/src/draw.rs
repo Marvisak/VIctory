@@ -76,9 +76,9 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds: title heap, host heap identity,
+    /// first, count; given back when the list is reset or released.
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// The title-memory page table made for this list (`crate::memory`)
@@ -110,10 +110,10 @@ struct Fixed {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
+        for &(heap, id, first, n) in &self.dynamic {
             match (heap, crate::memory::heap()) {
-                (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
-                _ => crate::descriptor::release_dynamic(heap, first, n),
+                (MEMORY_HEAP, Some(ours)) => ours.release(id, first, n),
+                _ => crate::descriptor::release_dynamic(heap, id, first, n),
             }
         }
     }
@@ -967,7 +967,7 @@ impl State {
                 not_run("no dynamic slots for root views");
                 return None;
             };
-            self.dynamic.push((key, first, ROOT_VIEW_RUN));
+            self.dynamic.push((key, host.id(), first, ROOT_VIEW_RUN));
             self.root_run = (key, first, first + ROOT_VIEW_RUN);
         }
         let index = self.root_run.1;
@@ -1058,7 +1058,7 @@ impl State {
             return;
         };
         self.dynamic
-            .push((std::ptr::from_ref(heap) as usize, slot, 1));
+            .push((std::ptr::from_ref(heap) as usize, visible.id(), slot, 1));
         visible.make_at(slot, &view);
         let at = host.cpu_view();
         let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
@@ -1337,7 +1337,7 @@ impl State {
             };
             self.fresh_tables.insert(key, first);
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.id(), first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -2143,6 +2143,45 @@ void main() {
         let title_heap = crate::descriptor::heap(heap);
         let heap_host = title_heap.host().expect("a host view heap");
         (heap, title_heap, heap_host)
+    }
+
+    /// A list can outlive its title heap, and a replacement at the same
+    /// address must keep the dynamic slots its own lists still hold.
+    #[test]
+    fn old_state_reset_does_not_free_a_replacement_heaps_dynamic_slots() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let (a, _, host_a) = view_heap(4);
+        let first = host_a.dynamic(1).unwrap();
+        let mut old = State::default();
+        old.dynamic.push((a as usize, host_a.id(), first, 1));
+
+        let (b, _, _) = view_heap(4);
+        crate::descriptor::tests::reuse_heap_address(a, b);
+        let host_b = crate::descriptor::heap(a).host().unwrap();
+        assert_eq!(host_b.dynamic(1), Some(first));
+        let mut new = State::default();
+        new.dynamic.push((a as usize, host_b.id(), first, 1));
+        // Fill the rest so the next allocation can only use this slot if
+        // the old list wrongly gives the replacement's range back.
+        while host_b.dynamic(1).is_some() {}
+        old.reset(std::ptr::null());
+        assert_eq!(
+            host_b.dynamic(1),
+            None,
+            "the replacement's slot is still held"
+        );
+        new.reset(std::ptr::null());
+        assert_eq!(
+            host_b.dynamic(1),
+            Some(first),
+            "its own list gives the slot back"
+        );
+        assert_eq!(
+            crate::object::slot::<extern "system" fn(This) -> u32>(a, 0x10)(a),
+            0
+        );
     }
 
     fn dispatch_marked_uav(

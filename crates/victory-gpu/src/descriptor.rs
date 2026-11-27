@@ -277,15 +277,16 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// `heap`, if that heap still exists and `id` names the host heap that took
+/// them. A later heap at the same address must keep its own slots.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.release(first, n);
+        host.release(id, first, n);
     }
 }
 
@@ -847,6 +848,27 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// Replaces a live title heap at exactly the same address, so lifetime
+    /// tests do not depend on the allocator reusing a freed box.
+    pub(crate) fn reuse_heap_address(old: This, new: This) {
+        SHADER_HEAPS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(_, _, h)| h != new as usize);
+        // SAFETY: both are live boxed heaps owned by the test. Moving the
+        // replacement frees its box; dropping the old value unregisters it
+        // before its box receives the replacement.
+        unsafe {
+            *old.cast_mut().cast::<Heap>() = *Box::from_raw(new.cast_mut().cast::<Heap>());
+        }
+        let heap = heap(old);
+        let size = u64::from(increment(heap.desc.kind).unwrap()) * u64::from(heap.desc.count);
+        SHADER_HEAPS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((heap.start, heap.start + size, old as usize));
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
