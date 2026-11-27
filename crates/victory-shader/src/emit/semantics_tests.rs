@@ -1538,6 +1538,22 @@ fn conversion_probes() -> Vec<Probe> {
             unsigned.extend([midpoint - 1, midpoint, midpoint + 1]);
         }
     }
+    // The same midpoints for a signed source, of either sign, and the
+    // halfway points next to i32::MAX and i32::MIN.
+    let mut signed = U32_EDGES.to_vec();
+    for exponent in 24..31 {
+        let base = 1u32 << exponent;
+        let ulp = base >> 23;
+        for midpoint in [base + ulp / 2, base + ulp + ulp / 2] {
+            for x in [midpoint - 1, midpoint, midpoint + 1] {
+                signed.extend([x, x.wrapping_neg()]);
+            }
+        }
+    }
+    let midpoint = 0x7FFF_FFC0u32;
+    for x in [midpoint - 1, midpoint, midpoint + 1] {
+        signed.extend([x, x.wrapping_neg()]);
+    }
     let mut p = vec![
         probe([vop1(0x08, 5, v(1))], xs.clone(), INT, |i| {
             vec![to_i32(i[0])]
@@ -1564,7 +1580,7 @@ fn conversion_probes() -> Vec<Probe> {
                 }]
             },
         ),
-        probe([vop1(0x05, 5, v(1))], ints.clone(), F32, |i| {
+        probe([vop1(0x05, 5, v(1))], unary(&signed), F32, |i| {
             vec![(i[0] as i32 as f32).to_bits()]
         }),
         probe([vop1(0x06, 5, v(1))], unary(&unsigned), INT, |i| {
