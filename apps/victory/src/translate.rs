@@ -338,6 +338,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     let seen = Mutex::new(HashSet::new());
     // Containers already cached, translated now, refused now.
     let counts = [const { AtomicUsize::new(0) }; 3];
+    let cached_refusals = AtomicUsize::new(0);
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -378,6 +379,9 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                     2
                                 };
                                 counts[k].fetch_add(1, Ordering::Relaxed);
+                                if cached && done.is_err() {
+                                    cached_refusals.fetch_add(1, Ordering::Relaxed);
+                                }
                                 tracing::debug!(
                                     hash = %&hash.to_hex()[..16],
                                     ms = one.elapsed().as_millis() as u64,
@@ -424,6 +428,10 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         cached + translated + refused,
         started.elapsed().as_secs_f64()
     );
+    let cached_refusals = cached_refusals.into_inner();
+    if cached_refusals != 0 {
+        println!("cached refusals {cached_refusals} of {cached} cache hits");
+    }
     if pipelines {
         crate::prebuild::run(&paths, threads)?;
     }
