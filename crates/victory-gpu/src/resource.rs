@@ -1539,13 +1539,6 @@ pub(crate) const IDLE_FRAMES: u64 = 300;
 /// A use stamp's frame for "never" (tests).
 #[cfg(windows)]
 const NEVER: u64 = u64::MAX;
-/// Past this share of the card's memory budget, host textures fed from
-/// title memory are given up least recently used first, until the card's
-/// use is back under [`BUDGET_LOW`].
-#[cfg(windows)]
-const BUDGET_HIGH: f64 = 0.90;
-#[cfg(windows)]
-const BUDGET_LOW: f64 = 0.85;
 /// A texture made again within this many frames of being given up counts
 /// as remade soon ([`EVICTIONS`]): too eager an [`IDLE_MS`].
 #[cfg(windows)]
@@ -1583,8 +1576,8 @@ fn evictable(t: &HostTexture) -> bool {
 
 /// Once per presented frame, before a submission (`Host::execute`, one at a
 /// time, the last one has run): gives up host textures fed from title memory
-/// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
-/// the card's budget the least recently used ones until [`BUDGET_LOW`].
+/// that the title has not used for [`IDLE_MS`], and past the card's effective
+/// budget the least recently used ones until the excess is gone.
 #[cfg(windows)]
 pub(crate) fn evict_unused() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1593,11 +1586,11 @@ pub(crate) fn evict_unused() {
     if LAST.swap(frame, Relaxed) == frame {
         return;
     }
-    let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {
+    let over = crate::host::video_memory().map_or(0, |[(local, budget), _]| {
         // Free space in the heaps of textures takes the card's memory but
         // is not in use: new textures go there first.
-        let used = used - crate::placement::free_bytes() as f64 / 1e6;
-        if used > BUDGET_HIGH * budget { ((used - BUDGET_LOW * budget) * 1e6) as u64 } else { 0 }
+        let used = (local - crate::placement::free_bytes() as f64 / 1e6).max(0.0);
+        crate::guards::over_budget(used, budget, crate::guards::host_budget_mb())
     });
     evict(frame, now_ms(), over);
 }

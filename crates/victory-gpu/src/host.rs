@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCSTR, PCWSTR, s, w};
 
@@ -1152,6 +1152,37 @@ impl Host {
         }
     }
 
+    fn wait_for_submission(&self, value: u64, budget: Duration) -> crate::guards::Wait {
+        let deadline = Instant::now() + budget;
+        crate::guards::wait_deadline(
+            Instant::now,
+            deadline,
+            crate::guards::wait_slice(),
+            // SAFETY: a plain fence query.
+            || unsafe { self.fence.GetCompletedValue() } >= value,
+            |slice| {
+                // SAFETY: our event, waited for under the submission lock.
+                let raw = unsafe { WaitForSingleObject(self.event, slice.as_millis() as u32) };
+                crate::guards::Wait::from_raw(raw.0)
+            },
+        )
+    }
+
+    fn poll_fence(&self, value: u64, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            // SAFETY: a plain fence query.
+            if unsafe { self.fence.GetCompletedValue() } >= value {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1).min(deadline - now));
+        }
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -1266,6 +1297,7 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         let mut removed_in = None;
+        let mut incomplete = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1274,16 +1306,46 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                // A late completion from an earlier submission can leave the
+                // auto-reset event signalled: clear it before arming this one.
+                let _ = ResetEvent(self.event);
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                let outcome = match waited {
+                    Ok(()) => self.wait_for_submission(*submitted, crate::guards::submission_wait()),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "host submission not waited for");
+                        crate::guards::Wait::Failed
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                };
+                match outcome.fallback() {
+                    crate::guards::Fallback::None => {}
+                    crate::guards::Fallback::Poll => {
+                        let budget = crate::guards::fallback_wait();
+                        tracing::warn!(
+                            ms = budget.as_millis(),
+                            value = *submitted,
+                            "host submission wait ran out; falling back to fence polling"
+                        );
+                        if !self.poll_fence(*submitted, budget) {
+                            incomplete = Some(*submitted);
+                        }
+                    }
+                    // A failed wait cannot be replaced with polling: the
+                    // event may never signal this completion at all.
+                    crate::guards::Fallback::Stop => {
+                        incomplete = Some(*submitted);
+                    }
                 }
+                // A completion arriving after the wait must not satisfy the
+                // next submission's wait either.
+                let _ = ResetEvent(self.event);
+            }
+            if incomplete.is_some() {
+                tracing::error!(value = *submitted, "host submission did not complete");
+                break;
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
@@ -1329,6 +1391,11 @@ impl Host {
                 self.removal_data(runs),
                 last_notes(runs),
                 removed_during(runs, removed_in)
+            ));
+        }
+        if let Some(value) = incomplete {
+            fail(format_args!(
+                "host submission {value} did not complete: shader writes cannot be copied back and its lists cannot be reset while the GPU still uses them"
             ));
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
