@@ -19,6 +19,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
+#[cfg(feature = "diagnostics")]
+use crate::frame_budget::Kind;
 use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
@@ -1121,7 +1123,10 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.note_timed(
+            || self.op_text(format!("dispatch {x}x{y}x{z}"), true),
+            || Some(p.timed(Kind::Dispatch, Some([x, y, z]))),
+        );
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
@@ -1205,7 +1210,13 @@ impl State {
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    list.note_timed(
+                        || self.op_text(format!("mesh {x}"), false),
+                        || {
+                            let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+                            Some(p.timed(Kind::Mesh, Some([x, 1, 1])))
+                        },
+                    );
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1802,9 +1813,20 @@ impl State {
             return false;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
-        });
+        list.note_timed(
+            || {
+                let text = format!("indirect kind {kind} max {max} at {arguments:#x}");
+                self.op_text(text, kind == DISPATCH)
+            },
+            || {
+                let kind = match kind {
+                    DISPATCH => Kind::IndirectDispatch,
+                    MESH => Kind::IndirectMesh,
+                    _ => return None,
+                };
+                Some(crate::pipeline::host_pipeline(self.pipeline as This)?.timed(kind, None))
+            },
+        );
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {

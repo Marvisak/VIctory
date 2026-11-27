@@ -252,6 +252,7 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    crate::frame_budget::waited(started.elapsed());
 }
 
 /// Pipelines for the workers: those draws wait for, then those started

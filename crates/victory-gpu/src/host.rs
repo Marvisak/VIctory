@@ -837,6 +837,10 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With timing on, the noted commands slow-frame reports describe
+    /// (`crate::frame_budget`): each one's note and command.
+    #[cfg(feature = "diagnostics")]
+    timed: Mutex<Vec<(usize, crate::frame_budget::Command)>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; a host list is recorded by the
@@ -867,6 +871,10 @@ type States = std::collections::HashMap<
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
 pub(crate) fn dred_on() -> bool {
+    #[cfg(all(test, feature = "diagnostics"))]
+    if TIMED_HERE.with(std::cell::Cell::get) {
+        return true;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED"))
 }
@@ -874,10 +882,20 @@ pub(crate) fn dred_on() -> bool {
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
-#[cfg(feature = "diagnostics")]
-fn timing() -> bool {
+pub(crate) fn timing() -> bool {
+    #[cfg(all(test, feature = "diagnostics"))]
+    if TIMED_HERE.with(std::cell::Cell::get) {
+        return true;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_GPU_TIMING"))
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+thread_local! {
+    /// Tests: commands are noted and timed on this thread, whatever the
+    /// switches.
+    pub(crate) static TIMED_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -1148,6 +1166,8 @@ impl Host {
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                timed: Mutex::default(),
             })
         }
     }
@@ -1172,6 +1192,7 @@ impl Host {
         crate::descriptor::sync_heaps();
         #[cfg(feature = "diagnostics")]
         drop(syncing);
+        let synced = std::time::Instant::now();
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -1208,6 +1229,7 @@ impl Host {
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(uploading);
+        let uploaded = std::time::Instant::now();
         let runs: Vec<&HostList> = uploads
             .as_ref()
             .map(|u| u.list())
@@ -1311,6 +1333,15 @@ impl Host {
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
+        // The noted commands' GPU times, for slow-frame reports.
+        #[cfg(feature = "diagnostics")]
+        if timing() && dred_on() {
+            // SAFETY: a plain query.
+            let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+            for r in runs {
+                crate::frame_budget::ran(r.timed(frequency));
+            }
+        }
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
@@ -1416,6 +1447,13 @@ impl Host {
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        crate::frame_budget::submitted(crate::frame_budget::Phases {
+            sync: synced - started,
+            uploads: uploaded - synced,
+            refresh: prepared - uploaded,
+            gpu,
+            copy_back: copying.elapsed(),
+        });
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
         for list in runs {
@@ -1713,7 +1751,35 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn slowest(&self, frequency: u64, n: usize) -> Vec<(f64, String)> {
         let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+        let times = self.times(frequency, notes.len().min(STAMPS as usize - 1));
+        let mut times: Vec<(f64, String)> = times
+            .into_iter()
+            .zip(notes.iter())
+            .map(|(ms, note)| (ms, note.0.chars().take(300).collect()))
+            .collect();
+        times.sort_by(|a, b| b.0.total_cmp(&a.0));
+        times.truncate(n);
+        times
+    }
+
+    /// The noted commands slow-frame reports describe, each with its GPU
+    /// time in ms (diagnostics, timing on, after the list ran).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn timed(&self, frequency: u64) -> Vec<(crate::frame_budget::Command, f64)> {
+        let timed = self.timed.lock().unwrap_or_else(|e| e.into_inner());
+        if timed.is_empty() {
+            return Vec::new();
+        }
+        let count = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let times = self.times(frequency, count.min(STAMPS as usize - 1));
+        timed.iter().filter_map(|(k, c)| Some((c.clone(), *times.get(*k)?))).collect()
+    }
+
+    /// The first `count` noted commands' GPU times in ms, in order
+    /// (diagnostics, timing on, after the list ran).
+    #[cfg(feature = "diagnostics")]
+    fn times(&self, frequency: u64, count: usize) -> Vec<f64> {
+        let Some((_, back)) = self.stamps() else {
             return Vec::new();
         };
         let mut data = std::ptr::null_mut();
@@ -1727,15 +1793,9 @@ impl HostList {
             back.Unmap(0, None);
             s
         };
-        let mut times: Vec<(f64, String)> = (0..count)
-            .map(|i| {
-                let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
-            })
-            .collect();
-        times.sort_by(|a, b| b.0.total_cmp(&a.0));
-        times.truncate(n);
-        times
+        (0..count)
+            .map(|i| stamps[i + 1].saturating_sub(stamps[i]) as f64 * 1e3 / frequency.max(1) as f64)
+            .collect()
     }
 
     /// Whether `node` of the device-removed data (its breadcrumbs) is this
@@ -1787,6 +1847,8 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.timed.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -2003,6 +2065,24 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     pub(crate) fn note_read(&self, what: impl FnOnce() -> String, range: (u64, u64)) {
         self.note(what, Some(range));
+    }
+
+    /// As [`HostList::note_op`], for a command slow-frame reports describe
+    /// when it is timed (`crate::frame_budget`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_timed(
+        &self,
+        what: impl FnOnce() -> String,
+        command: impl FnOnce() -> Option<crate::frame_budget::Command>,
+    ) {
+        let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+        self.note(what, None);
+        if dred_on()
+            && self.stamps().is_some()
+            && let Some(command) = command()
+        {
+            self.timed.lock().unwrap_or_else(|e| e.into_inner()).push((at, command));
+        }
     }
 
     #[cfg(feature = "diagnostics")]
@@ -3184,6 +3264,8 @@ impl Host {
     /// captures are on). `None` if nothing was shown; else, in diagnostics
     /// builds, whether the frame was black.
     pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
+        // A frame ends: the frame budget reports it if it was slow.
+        crate::frame_budget::presented();
         self.present_with_compositor(
             planes,
             frame,
