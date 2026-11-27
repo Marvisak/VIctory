@@ -901,3 +901,6 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod depth_bounds_test;
+
+#[cfg(all(test, windows))]
+mod shading_rate_test;

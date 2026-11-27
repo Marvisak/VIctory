@@ -42,6 +42,8 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    pub(crate) shading_rate_tier: D3D12_VARIABLE_SHADING_RATE_TIER,
+    pub(crate) additional_shading_rates: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -204,6 +206,22 @@ fn create() -> windows::core::Result<Host> {
             )
             .is_ok()
             && options.DepthBoundsTestSupported.as_bool();
+        let mut options6 = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+        let (shading_rate_tier, additional_shading_rates) = if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS6,
+                (&raw mut options6).cast(),
+                size_of_val(&options6) as u32,
+            )
+            .is_ok()
+        {
+            (
+                options6.VariableShadingRateTier,
+                options6.AdditionalShadingRatesSupported.as_bool(),
+            )
+        } else {
+            (D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED, false)
+        };
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -250,6 +268,8 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             depth_bounds_supported,
+            shading_rate_tier,
+            additional_shading_rates,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -787,6 +807,9 @@ pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
+    pub(crate) shading_rate: Option<ID3D12GraphicsCommandList5>,
+    pub(crate) shading_rate_tier: D3D12_VARIABLE_SHADING_RATE_TIER,
+    pub(crate) additional_shading_rates: bool,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -849,6 +872,30 @@ unsafe impl Sync for HostList {}
 pub(crate) fn warn_depth_bounds() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| tracing::warn!("the host GPU has no depth bounds test; depth bounds are ignored"));
+}
+
+pub(crate) fn warn_shading_rate() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!("the host GPU has no variable-rate shading; RSSetShadingRate is ignored")
+    });
+}
+
+pub(crate) fn warn_invalid_shading_rate(rate: u32) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(rate, "invalid shading rate; falling back to 1x1");
+    });
+}
+
+pub(crate) fn warn_invalid_shading_rate_combiner(combiner: u32) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            combiner,
+            "invalid shading rate combiner; falling back to passthrough"
+        );
+    });
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -1129,6 +1176,12 @@ impl Host {
             Ok(HostList {
                 allocator,
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
+                shading_rate: (self.shading_rate_tier
+                    != D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED)
+                    .then(|| list.cast().ok())
+                    .flatten(),
+                shading_rate_tier: self.shading_rate_tier,
+                additional_shading_rates: self.additional_shading_rates,
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),

@@ -5,8 +5,8 @@
 //! user data the translated shaders read, the host copies of the buffers
 //! and descriptors they read, and the states of the textures involved.
 //! State the host keeps across draws (viewports, scissors, blend factor,
-//! stencil reference, depth bounds, topology, targets) is set on the host
-//! list as the title sets it.
+//! stencil reference, depth bounds, shading rate, topology, targets) is
+//! set on the host list as the title sets it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -66,6 +66,8 @@ pub(crate) struct State {
     depth: usize,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
+    /// None leaves the host list's default shading rate (1x1, passthrough) in place.
+    shading_rate: Option<(u32, Option<[u32; 2]>)>,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -301,17 +303,16 @@ impl State {
     /// `crate::list`): the state it set is given to `list` again.
     ///
     /// Replayed: topology, viewports, scissors, blend factor, stencil
-    /// reference, render targets and depth (set at once); heaps, root
-    /// signatures, pipelines, root arguments, vertex and index buffers are
-    /// set by the next draw or dispatch from what this state holds (the
-    /// host caches are cleared). Made again in the new segment, so their
-    /// submission-time work (refreshes, uploads) runs with it: fresh tables,
-    /// root views and the title-memory page table. Not replayed, as nothing
-    /// of it is on the host list: depth bounds and shading rate (ignored),
-    /// queries (resolved with plain values), the 0x4a0 upload memory (the
-    /// title list's own), texture states and twins (each segment has its
-    /// own, made from the real states at its submission). Clears and copies
-    /// are commands, recorded once in the segment they belong to.
+    /// reference, shading rate, render targets and depth (set at once); heaps,
+    /// root signatures, pipelines, depth bounds, root arguments, vertex and
+    /// index buffers are set by the next draw or dispatch from what this state
+    /// holds (the host caches are cleared). Made again in the new segment, so
+    /// their submission-time work (refreshes, uploads) runs with it: fresh
+    /// tables, root views and the title-memory page table. Not replayed:
+    /// queries (resolved with plain values), the 0x4a0 upload memory (the title
+    /// list's own), texture states and twins (each segment has its own, made
+    /// from the real states at its submission). Clears and copies are
+    /// commands, recorded once in the segment they belong to.
     pub(crate) fn cut(&mut self, list: &HostList) {
         self.host_state_lost();
         self.fresh_tables.clear();
@@ -333,6 +334,7 @@ impl State {
         if let Some(s) = fixed.stencil_ref {
             self.stencil_ref(list, s);
         }
+        self.apply_shading_rate(list);
         if let Some((targets, depth)) = &fixed.targets {
             self.set_targets(list, targets, *depth);
         }
@@ -523,6 +525,53 @@ impl State {
         }
     }
 
+    pub(crate) fn set_shading_rate(
+        &mut self,
+        list: &HostList,
+        base_rate: u32,
+        combiners: Option<[u32; 2]>,
+    ) {
+        self.shading_rate = Some((base_rate, combiners));
+        if list.shading_rate.is_none() {
+            crate::host::warn_shading_rate();
+        }
+        self.apply_shading_rate(list);
+    }
+
+    fn apply_shading_rate(&self, list: &HostList) {
+        let (Some(cmd), Some((rate, combiners))) = (&list.shading_rate, self.shading_rate) else {
+            return;
+        };
+        let Some(sanitized) = crate::list::sanitize_shading_rate(
+            rate,
+            combiners,
+            list.shading_rate_tier.0 as u32,
+            list.additional_shading_rates,
+        ) else {
+            return;
+        };
+        if sanitized.invalid_rate {
+            crate::host::warn_invalid_shading_rate(rate);
+        }
+        if let Some(bad) = sanitized.invalid_combiner {
+            crate::host::warn_invalid_shading_rate_combiner(bad);
+        }
+        let host_combiners = sanitized.combiners.map(|[a, b]| {
+            [
+                D3D12_SHADING_RATE_COMBINER(a as i32),
+                D3D12_SHADING_RATE_COMBINER(b as i32),
+            ]
+        });
+        // SAFETY: the host supports variable-rate shading at `list.shading_rate_tier`,
+        // the rate and combiners were validated for that tier, and the list is open.
+        unsafe {
+            cmd.RSSetShadingRate(
+                D3D12_SHADING_RATE(sanitized.rate as i32),
+                host_combiners.as_ref().map(|c| c.as_ptr()),
+            );
+        }
+    }
+
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
@@ -649,6 +698,7 @@ impl State {
             // Also reached after the indirect clamp invalidates the pipeline.
             if !compute {
                 self.apply_depth_bounds(list);
+                self.apply_shading_rate(list);
             }
             self.host_pipeline = p.pso.as_raw() as usize;
             list.used_pipeline(&p.name);

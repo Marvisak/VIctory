@@ -1319,7 +1319,7 @@ pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 /// Draw state the host has no use for (root signatures: ours come with
-/// the pipeline; depth bounds, depth order and shading rate hints): any
+/// the pipeline; pixel-shader depth order and discard hints): any
 /// arguments, nothing returned.
 extern "system" fn ignored_state(_: This) {}
 
@@ -1328,6 +1328,95 @@ extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
     with_state(this, |list, s| s.set_depth_bounds(list, min, max));
     #[cfg(not(windows))]
     let _ = (this, min, max);
+}
+
+/// Validated `RSSetShadingRate` parameters for a host adapter's VRS tier.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SanitizedShadingRate {
+    pub(crate) rate: u32,
+    pub(crate) combiners: Option<[u32; 2]>,
+    pub(crate) invalid_rate: bool,
+    pub(crate) invalid_combiner: Option<u32>,
+}
+
+/// Sanitizes console `RSSetShadingRate` parameters against the host's
+/// `D3D12_VARIABLE_SHADING_RATE_TIER` (`0` unsupported, `1` tier 1, `2` tier 2)
+/// and `AdditionalShadingRatesSupported`.
+///
+/// - Tier 0 returns `None`.
+/// - Additional 4x rates (`2x4`, `4x2`, `4x4`) fall back to `2x2` when the
+///   host does not advertise `AdditionalShadingRatesSupported`.
+/// - Unknown base rates fall back to `1x1` (`0`) with `invalid_rate = true`.
+/// - Tier 1 drops combiners to `None` (D3D12 forbids non-passthrough combiners
+///   on Tier 1).
+/// - Tier 2 validates each combiner against `0..=4` (`PASSTHROUGH..=SUM`),
+///   replacing out-of-range entries with `PASSTHROUGH` (`0`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn sanitize_shading_rate(
+    rate: u32,
+    combiners: Option<[u32; 2]>,
+    tier: u32,
+    additional: bool,
+) -> Option<SanitizedShadingRate> {
+    const RATE_1X1: u32 = 0x0;
+    const RATE_1X2: u32 = 0x1;
+    const RATE_2X1: u32 = 0x4;
+    const RATE_2X2: u32 = 0x5;
+    const RATE_2X4: u32 = 0x6;
+    const RATE_4X2: u32 = 0x9;
+    const RATE_4X4: u32 = 0xA;
+    const COMBINER_PASSTHROUGH: u32 = 0;
+    const COMBINER_SUM: u32 = 4;
+
+    if tier == 0 {
+        return None;
+    }
+    let (rate, invalid_rate) = match rate {
+        RATE_1X1 | RATE_1X2 | RATE_2X1 | RATE_2X2 => (rate, false),
+        RATE_2X4 | RATE_4X2 | RATE_4X4 => (if additional { rate } else { RATE_2X2 }, false),
+        _ => (RATE_1X1, true),
+    };
+    let mut invalid_combiner = None;
+    let combiners = if tier < 2 {
+        None
+    } else {
+        combiners.map(|[c0, c1]| {
+            let check = |c: u32, bad: &mut Option<u32>| {
+                if c <= COMBINER_SUM {
+                    c
+                } else {
+                    if bad.is_none() {
+                        *bad = Some(c);
+                    }
+                    COMBINER_PASSTHROUGH
+                }
+            };
+            [
+                check(c0, &mut invalid_combiner),
+                check(c1, &mut invalid_combiner),
+            ]
+        })
+    };
+    Some(SanitizedShadingRate {
+        rate,
+        combiners,
+        invalid_rate,
+        invalid_combiner,
+    })
+}
+
+extern "system" fn shading_rate(this: This, base_rate: u32, combiners: *const u32) {
+    let combiners = if combiners.is_null() {
+        None
+    } else {
+        // SAFETY: `RSSetShadingRate` takes null or a 2-element combiner array.
+        Some(unsafe { [combiners.read_unaligned(), combiners.add(1).read_unaligned()] })
+    };
+    #[cfg(windows)]
+    with_state(this, |list, s| s.set_shading_rate(list, base_rate, combiners));
+    #[cfg(not(windows))]
+    let _ = (this, base_rate, combiners);
 }
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or
@@ -1787,7 +1876,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
-    (124, ignored_state as *const ()),            // 0x3e0 shading rate
+    (124, shading_rate as *const ()),             // 0x3e0 shading rate (newer 0x3f0)
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
@@ -2045,5 +2134,69 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[test]
+    fn sanitize_shading_rate_enforces_tier_and_validates_inputs() {
+        assert_eq!(sanitize_shading_rate(0x5, None, 0, false), None);
+
+        // Tier 1 keeps standard rates, clamps 4x rates when additional rates
+        // are unavailable, and drops combiners to None.
+        assert_eq!(
+            sanitize_shading_rate(0x5, Some([1, 3]), 1, false),
+            Some(SanitizedShadingRate {
+                rate: 0x5,
+                combiners: None,
+                invalid_rate: false,
+                invalid_combiner: None,
+            })
+        );
+        for extra in [0x6, 0x9, 0xA] {
+            assert_eq!(
+                sanitize_shading_rate(extra, None, 1, false).unwrap().rate,
+                0x5
+            );
+            assert_eq!(
+                sanitize_shading_rate(extra, None, 1, true).unwrap().rate,
+                extra
+            );
+        }
+
+        // Tier 2 forwards valid combiners and falls back on out-of-range values.
+        assert_eq!(
+            sanitize_shading_rate(0x4, Some([2, 4]), 2, true),
+            Some(SanitizedShadingRate {
+                rate: 0x4,
+                combiners: Some([2, 4]),
+                invalid_rate: false,
+                invalid_combiner: None,
+            })
+        );
+        assert_eq!(
+            sanitize_shading_rate(0x1, Some([1, 99]), 2, false),
+            Some(SanitizedShadingRate {
+                rate: 0x1,
+                combiners: Some([1, 0]),
+                invalid_rate: false,
+                invalid_combiner: Some(99),
+            })
+        );
+
+        // Unknown base shading rate falls back to 1x1 and is flagged.
+        assert_eq!(
+            sanitize_shading_rate(0x7, None, 2, true),
+            Some(SanitizedShadingRate {
+                rate: 0x0,
+                combiners: None,
+                invalid_rate: true,
+                invalid_combiner: None,
+            })
+        );
+    }
+
+    #[test]
+    fn shading_rate_slot_is_wired_in_both_layouts() {
+        assert_eq!(LIST_FUNCTIONS.0[0x3e0 / 8], shading_rate as *const ());
+        assert_eq!(NEWER_LIST_FUNCTIONS.0[0x3f0 / 8], shading_rate as *const ());
     }
 }
