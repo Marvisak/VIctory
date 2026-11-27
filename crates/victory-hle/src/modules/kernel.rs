@@ -361,6 +361,57 @@ fn refuse(file: &str) {
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
+pub extern "system" fn VirtualFree(
+    address: *mut c_void,
+    size: usize,
+    free_type: u32,
+) -> i32 {
+    const MEM_DECOMMIT: u32 = 0x4000;
+    const MEM_RELEASE: u32 = 0x8000;
+    if address.is_null() {
+        return host::virtual_free(address, size, free_type);
+    }
+    let addr = address as usize;
+    if free_type & MEM_RELEASE != 0 {
+        let retired = crate::modules::xmem::FreeSnapshot::of(addr);
+        let ok = host::virtual_free(address, size, free_type);
+        if ok != 0 {
+            crate::modules::xmem::on_virtual_free_release(retired);
+        }
+        return ok;
+    }
+    if free_type & MEM_DECOMMIT != 0 {
+        if size == 0 {
+            let retired = crate::modules::xmem::FreeSnapshot::of(addr);
+            let ok = host::virtual_free(address, size, free_type);
+            if ok != 0 {
+                crate::modules::xmem::on_virtual_free_decommit_all(retired);
+            }
+            return ok;
+        }
+        crate::modules::xmem::commit_partial_boundaries(addr, size);
+        let generation = crate::modules::xmem::reservation_generation(addr);
+        let ok = host::virtual_free(address, size, free_type);
+        if ok != 0 {
+            crate::modules::xmem::on_virtual_free_decommit_interior(addr, size, generation);
+        }
+        return ok;
+    }
+    host::virtual_free(address, size, free_type)
+}
+
+pub extern "system" fn VirtualProtect(
+    address: *const c_void,
+    size: usize,
+    new_protect: u32,
+    old_protect: *mut u32,
+) -> i32 {
+    if !address.is_null() && size > 0 {
+        crate::modules::xmem::ensure_committed(address as usize, size);
+    }
+    host::virtual_protect(address, size, new_protect, old_protect)
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -368,6 +419,7 @@ pub(crate) fn module() -> HleModule {
             "kernel32.dll",
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
+            "api-ms-win-core-memory-*",
             "api-ms-win-core-processthreads-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
@@ -393,6 +445,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(VirtualFree),
+            hle_export!(VirtualProtect),
         ],
     }
 }
@@ -413,6 +467,7 @@ mod host {
         DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA,
         GetModuleHandleW, GetProcAddress, LoadLibraryExA, LoadLibraryExW,
     };
+    use windows_sys::Win32::System::Memory::{VirtualFree, VirtualProtect};
     use windows_sys::Win32::System::Threading::TerminateProcess;
 
     unsafe extern "C" {
@@ -519,6 +574,21 @@ mod host {
     }
 
     /// Our caller's callers, as `module+rva`.
+    pub(super) fn virtual_free(address: *mut c_void, size: usize, free_type: u32) -> i32 {
+        // SAFETY: see above.
+        unsafe { VirtualFree(address, size, free_type) }
+    }
+
+    pub(super) fn virtual_protect(
+        address: *const c_void,
+        size: usize,
+        new_protect: u32,
+        old_protect: *mut u32,
+    ) -> i32 {
+        // SAFETY: see above.
+        unsafe { VirtualProtect(address, size, new_protect, old_protect) }
+    }
+
     pub(super) fn callers() -> String {
         let mut frames = [std::ptr::null_mut(); 12];
         // SAFETY: fills at most `frames.len()` return addresses.
@@ -597,6 +667,14 @@ mod host {
     pub(super) fn report_unhandled(_: *const c_void) {}
 
     pub(super) fn note_title_output(_: &str) {}
+
+    pub(super) fn virtual_free(_: *mut c_void, _: usize, _: u32) -> i32 {
+        0
+    }
+
+    pub(super) fn virtual_protect(_: *const c_void, _: usize, _: u32, _: *mut u32) -> i32 {
+        0
+    }
 
     pub(super) fn callers() -> String {
         String::new()

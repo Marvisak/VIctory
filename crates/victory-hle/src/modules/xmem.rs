@@ -122,19 +122,45 @@ pub extern "system" fn XMemVirtualAlloc(
     if placeholder {
         kind |= MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
     }
+    let lazy_eligible = !placeholder && lazy_commit::eligible(size, kind, protect);
+    let alloc_kind = if lazy_eligible {
+        kind & !MEM_COMMIT
+    } else {
+        kind
+    };
     let mut parameter = MEM_EXTENDED_PARAMETER::default();
     parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
     parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
     // Address requirements apply to reservations at an address of our choice.
     let constrained = base.is_null();
+    let mut alloc_kind = alloc_kind;
     if constrained {
-        kind |= MEM_RESERVE;
+        alloc_kind |= MEM_RESERVE;
         // The GPU side copies only the pages the title wrote since its last
         // copy (`victory_gpu`, decision 0007); placeholders cannot be
         // watched (their physical-page views are copied whole).
-        if kind & MEM_RESERVE_PLACEHOLDER == 0 {
-            kind |= MEM_WRITE_WATCH;
+        if alloc_kind & MEM_RESERVE_PLACEHOLDER == 0 {
+            alloc_kind |= MEM_WRITE_WATCH;
         }
+    }
+    if lazy_eligible
+        && !constrained
+        && kind & MEM_RESERVE == 0
+        && (base as usize).is_multiple_of(lazy_commit::PAGE)
+        && size.is_multiple_of(lazy_commit::PAGE)
+        && lazy_commit::is_non_placeholder_reservation(base as usize, size)
+    {
+        // Committing into an existing non-placeholder reservation: mark exact
+        // 64 KiB pages lazy without committing upfront or touching placeholders.
+        lazy_commit::mark_range(base as usize, size);
+        return base;
+    }
+    let eager_recommit = !constrained && kind & MEM_COMMIT != 0 && !base.is_null();
+    if eager_recommit {
+        // If an eager commit (e.g. non-RW protect or < 4 MiB) overlaps a lazy
+        // 64 KiB block partially, commit boundary blocks first so sibling 4 KiB
+        // pages stay live while VirtualAlloc2 applies `protect` to `[base, base+size)`.
+        lazy_commit::commit_partial_boundaries(base as usize, size);
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
@@ -143,7 +169,7 @@ pub extern "system" fn XMemVirtualAlloc(
             GetCurrentProcess(),
             base,
             size,
-            kind,
+            if constrained { alloc_kind } else { kind },
             protect,
             if constrained {
                 parameter
@@ -158,6 +184,15 @@ pub extern "system" fn XMemVirtualAlloc(
     // make way for it.
     if at.is_null() && constrained && highest < FOUR_GIB {
         at = low_guards::retry(size, || allocate(&mut parameter));
+    }
+    if !at.is_null() && eager_recommit {
+        lazy_commit::unmark_aligned_interior(base as usize, size);
+    }
+    if !at.is_null() && constrained && !placeholder {
+        lazy_commit::record_reservation(at as usize, size);
+        if lazy_eligible {
+            lazy_commit::mark_range(at as usize, size);
+        }
     }
     if at.is_null() {
         let error = std::io::Error::last_os_error();
@@ -212,6 +247,17 @@ pub extern "system" fn XMemVirtualQuery(
             return 0;
         }
         let info = &mut *out;
+        if info.host.State == MEM_RESERVE {
+            let query_base = info.host.BaseAddress as usize;
+            let region_end = query_base.saturating_add(info.host.RegionSize);
+            if let Some((marked, run_end)) = lazy_commit::query_run(query_base, region_end) {
+                info.host.RegionSize = run_end.saturating_sub(query_base);
+                if marked {
+                    info.host.State = MEM_COMMIT;
+                    info.host.Protect = PAGE_READWRITE;
+                }
+            }
+        }
         info.flags = if info.host.State == MEM_COMMIT {
             GRAPHICS
         } else {
@@ -339,7 +385,11 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            let addr = address as usize;
+            let retired = FreeSnapshot::of(addr);
+            if VirtualFree(address, 0, MEM_RELEASE) != 0 {
+                on_virtual_free_release(retired);
+            }
             return;
         }
         let user = address.cast::<u8>();
@@ -831,10 +881,29 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
-        // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
-        return false;
+    let has_alias = (0..len / PAGE).any(|k| {
+        physical
+            .shown
+            .get(&slice.key(k))
+            .is_some_and(|addrs| !addrs.is_empty())
+    });
+    if lazy_commit::physical_enabled() && !on_wine() && !has_alias {
+        lazy_commit::mark_range(base, len);
+    } else {
+        if has_alias {
+            for k in 0..len / PAGE {
+                if let Some(addrs) = physical.shown.get(&slice.key(k)) {
+                    for &other in addrs {
+                        lazy_commit::ensure(other, PAGE);
+                    }
+                }
+            }
+        }
+        if !commit(base, len) {
+            // SAFETY: the view just mapped, back to a placeholder.
+            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+            return false;
+        }
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
@@ -975,6 +1044,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
+        lazy_commit::unmark_range(at, size);
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1656,6 +1726,1131 @@ pub mod low_guards {
                 VirtualFree(taken as *mut _, 0, MEM_RELEASE);
                 VirtualFree((hole + GRANULE) as *mut _, 0, MEM_RELEASE);
             }
+        }
+    }
+}
+
+/// Ensures any demand-committed lazy pages in `[address, address + len)` are
+/// committed before a kernel syscall (`ReadFile`, `fread`, DirectStorage,
+/// `VirtualProtect`) accesses them.
+pub(crate) fn ensure_committed(address: usize, len: usize) {
+    lazy_commit::ensure(address, len);
+}
+
+/// The allocation a `VirtualFree` is about to retire, captured *before* the
+/// native call.
+///
+/// `MEM_RELEASE` makes the address reusable as soon as the native free
+/// returns, while the HLE cleanup hook runs afterwards: a replacement
+/// allocation can take the same address and record its lazy metadata in that
+/// window. The snapshot carries the admission generation so the hook retires
+/// only the metadata the freed allocation still owns (see [`lazy_commit`]).
+pub(crate) struct FreeSnapshot {
+    base: usize,
+    span: usize,
+    generation: Option<u64>,
+}
+
+impl FreeSnapshot {
+    pub(crate) fn of(address: usize) -> Self {
+        Self {
+            base: address,
+            span: lazy_commit::allocation_span(address),
+            generation: lazy_commit::reservation_generation(address),
+        }
+    }
+}
+
+/// Clears lazy-commit tracking and reservation metadata after a successful
+/// `VirtualFree(..., MEM_RELEASE)`, only while the snapshot still owns the
+/// address.
+pub(crate) fn on_virtual_free_release(retired: FreeSnapshot) {
+    lazy_commit::retire_release(retired.base, retired.span, retired.generation);
+}
+
+/// Clears lazy-commit tracking after a successful whole-allocation
+/// `VirtualFree(address, 0, MEM_DECOMMIT)`.
+pub(crate) fn on_virtual_free_decommit_all(retired: FreeSnapshot) {
+    lazy_commit::retire_decommit_all(retired.base, retired.span, retired.generation);
+}
+
+/// Admission generation owning `address`, captured before a partial
+/// `MEM_DECOMMIT` so its post-call hook can prove ownership too.
+pub(crate) fn reservation_generation(address: usize) -> Option<u64> {
+    lazy_commit::reservation_generation(address)
+}
+
+/// Commits any partially overlapped 64 KiB lazy boundary blocks ahead of a
+/// sub-64 KiB `MEM_DECOMMIT` or eager `MEM_COMMIT` so surviving sibling 4 KiB
+/// pages remain committed.
+pub(crate) fn commit_partial_boundaries(address: usize, len: usize) {
+    lazy_commit::commit_partial_boundaries(address, len);
+}
+
+/// Clears full 64 KiB lazy blocks strictly inside `[address, address + len)`
+/// after a successful partial `MEM_DECOMMIT`, only while `generation` still
+/// owns the reservation (a concurrent release may have reused the address).
+pub(crate) fn on_virtual_free_decommit_interior(
+    address: usize,
+    len: usize,
+    generation: Option<u64>,
+) {
+    lazy_commit::retire_decommit_interior(address, len, generation);
+}
+
+/// Opt-in demand-commit (`VICTORY_XMEM_LAZY_COMMIT=1`, off by default) for large
+/// (`>= 4 MiB`) writable `XMemVirtualAlloc` allocations, plus opt-in demand-commit
+/// (`VICTORY_XMEM_LAZY_PHYSICAL=1`, off by default) for non-aliased mapped
+/// `SEC_RESERVE` physical-page views: reserves without committing upfront and
+/// commits 64 KiB pages on first CPU touch via a lock-free atomic-state vectored
+/// exception handler, or ahead of kernel syscalls via [`ensure_committed`].
+///
+/// Ownership invariant: lazy marks and reservation records belong to one
+/// admission generation, never to an address. A successful `MEM_RELEASE`
+/// publishes its address for exact reuse *before* the HLE cleanup hook runs, so
+/// a replacement can be admitted at the same base in that window; retirement is
+/// therefore validated against the generation captured before the native free
+/// and never applied blindly by address (see `RESERVATIONS` and
+/// `retire_release`).
+mod lazy_commit {
+    use std::collections::BTreeMap;
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{LazyLock, Mutex, Once, RwLock};
+
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_POINTERS,
+    };
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ,
+        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY,
+        PAGE_READWRITE, PAGE_WRITECOPY, VirtualAlloc, VirtualQueryEx,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    pub(super) const PAGE: usize = 0x1_0000;
+    const MIN_BYTES: usize = 4 << 20;
+    const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+
+    // 2-bit per-page state packed 32 pages per AtomicU64:
+    // 0 = COMMITTED / unmarked, 1 = LAZY, 2 = COMMITTING (single-writer claim).
+    const STATE_COMMITTED: u64 = 0;
+    const STATE_LAZY: u64 = 1;
+    const STATE_COMMITTING: u64 = 2;
+
+    #[derive(PartialEq, Eq)]
+    enum CommitClaim {
+        Claimed,
+        AlreadyCommitted,
+    }
+
+    /// One contiguous lazy-tracked range `[base, end)` with 2 atomic state bits
+    /// per 64 KiB page. The VEH only ever takes `REGIONS.read()` and performs
+    /// atomic state transitions in-place, never allocating or freeing heap memory.
+    struct LazyRegion {
+        base: usize,
+        end: usize,
+        states: Box<[AtomicU64]>,
+    }
+
+    impl LazyRegion {
+        fn new_marked(base: usize, end: usize) -> (Self, usize) {
+            let pages = (end - base) / PAGE;
+            let words = pages.div_ceil(32);
+            let mut vec = Vec::with_capacity(words);
+            for w in 0..words {
+                let rem = (pages - w * 32).min(32);
+                let mut val = 0u64;
+                for i in 0..rem {
+                    val |= STATE_LAZY << (i * 2);
+                }
+                vec.push(AtomicU64::new(val));
+            }
+            (
+                Self {
+                    base,
+                    end,
+                    states: vec.into_boxed_slice(),
+                },
+                pages,
+            )
+        }
+
+        fn slot(&self, page: usize) -> (&AtomicU64, u32) {
+            let idx = (page - self.base) / PAGE;
+            (&self.states[idx / 32], ((idx % 32) * 2) as u32)
+        }
+
+        fn is_marked(&self, page: usize) -> bool {
+            if page < self.base || page >= self.end {
+                return false;
+            }
+            let (word, shift) = self.slot(page);
+            ((word.load(Ordering::Acquire) >> shift) & 0b11) == STATE_LAZY
+        }
+
+        /// Atomically claims `LAZY -> COMMITTING` so at most one thread calls
+        /// `VirtualAlloc` for `page`, spinning while another thread finishes.
+        fn begin_commit(&self, page: usize) -> CommitClaim {
+            let (word, shift) = self.slot(page);
+            let mask = 0b11u64 << shift;
+            loop {
+                let cur = word.load(Ordering::Acquire);
+                match (cur >> shift) & 0b11 {
+                    STATE_LAZY => {
+                        let next = (cur & !mask) | (STATE_COMMITTING << shift);
+                        if word
+                            .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            return CommitClaim::Claimed;
+                        }
+                    }
+                    STATE_COMMITTING => std::hint::spin_loop(),
+                    _ => return CommitClaim::AlreadyCommitted,
+                }
+            }
+        }
+
+        fn finish_commit(&self, page: usize) {
+            let (word, shift) = self.slot(page);
+            let mask = 0b11u64 << shift;
+            word.fetch_and(!mask, Ordering::Release);
+        }
+
+        fn abort_commit(&self, page: usize) {
+            let (word, shift) = self.slot(page);
+            let mask = 0b11u64 << shift;
+            loop {
+                let cur = word.load(Ordering::Acquire);
+                let next = (cur & !mask) | (STATE_LAZY << shift);
+                if word
+                    .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+        }
+
+        fn set_lazy(&self, page: usize) -> bool {
+            let (word, shift) = self.slot(page);
+            let mask = 0b11u64 << shift;
+            loop {
+                let cur = word.load(Ordering::Acquire);
+                let st = (cur >> shift) & 0b11;
+                if st == STATE_LAZY {
+                    return false;
+                }
+                if st == STATE_COMMITTING {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                let next = (cur & !mask) | (STATE_LAZY << shift);
+                if word
+                    .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+        }
+
+        fn clear_lazy(&self, page: usize) -> bool {
+            let (word, shift) = self.slot(page);
+            let mask = 0b11u64 << shift;
+            loop {
+                let cur = word.load(Ordering::Acquire);
+                let st = (cur >> shift) & 0b11;
+                if st == STATE_COMMITTED {
+                    return false;
+                }
+                if st == STATE_COMMITTING {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                let next = cur & !mask;
+                if word
+                    .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+        }
+
+        fn clear_range(&self, start: usize, end: usize) -> usize {
+            let from = start.max(self.base);
+            let to = end.min(self.end);
+            let mut cleared = 0usize;
+            let mut p = from;
+            while p < to {
+                if self.clear_lazy(p) {
+                    cleared += 1;
+                }
+                p += PAGE;
+            }
+            cleared
+        }
+
+        fn set_range(&self, start: usize, end: usize) -> usize {
+            let from = start.max(self.base);
+            let to = end.min(self.end);
+            let mut added = 0usize;
+            let mut p = from;
+            while p < to {
+                if self.set_lazy(p) {
+                    added += 1;
+                }
+                p += PAGE;
+            }
+            added
+        }
+
+        fn has_any_bit(&self) -> bool {
+            self.states.iter().any(|w| w.load(Ordering::Acquire) != 0)
+        }
+    }
+
+    static REGIONS: LazyLock<RwLock<Vec<LazyRegion>>> = LazyLock::new(|| RwLock::new(Vec::new()));
+    static REGIONS_NONEMPTY: AtomicBool = AtomicBool::new(false);
+    static LAZY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    /// One admitted non-placeholder `XMemVirtualAlloc` reservation: where it
+    /// ends and the admission generation that owns its lazy metadata.
+    struct Reservation {
+        end: usize,
+        generation: u64,
+    }
+
+    /// Non-placeholder `XMemVirtualAlloc` reservations (`base -> entry`)
+    /// eligible for two-step `MEM_COMMIT` lazy marking. Generations are never
+    /// reused, so a post-free hook can prove the entry at the freed base is
+    /// still the allocation it captured, not a replacement admitted in the
+    /// native-free window.
+    static RESERVATIONS: LazyLock<Mutex<BTreeMap<usize, Reservation>>> =
+        LazyLock::new(|| Mutex::new(BTreeMap::new()));
+    static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+    fn enabled_for(val: Option<&str>) -> bool {
+        val.is_some_and(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0"
+        })
+    }
+
+    fn enabled() -> bool {
+        static ON: LazyLock<bool> = LazyLock::new(|| {
+            !cfg!(test) && enabled_for(std::env::var("VICTORY_XMEM_LAZY_COMMIT").ok().as_deref())
+        });
+        *ON
+    }
+
+    pub(super) fn physical_enabled() -> bool {
+        static ON: LazyLock<bool> = LazyLock::new(|| {
+            !cfg!(test)
+                && enabled_for(std::env::var("VICTORY_XMEM_LAZY_PHYSICAL").ok().as_deref())
+        });
+        *ON
+    }
+
+    pub(super) fn eligible(size: usize, kind: u32, protect: u32) -> bool {
+        enabled() && eligible_policy(size, kind, protect)
+    }
+
+    fn eligible_policy(size: usize, kind: u32, protect: u32) -> bool {
+        size >= MIN_BYTES && kind & MEM_COMMIT != 0 && protect == PAGE_READWRITE
+    }
+
+    pub(super) fn record_reservation(base: usize, len: usize) {
+        if base == 0 || len == 0 {
+            return;
+        }
+        let end = base.saturating_add(len.next_multiple_of(PAGE));
+        let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        RESERVATIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(base, Reservation { end, generation });
+    }
+
+    /// Admission generation owning `base`, or `None` when no reservation is
+    /// tracked there. Captured before a native free/decommit so its post-call
+    /// hook can validate ownership afterwards.
+    pub(super) fn reservation_generation(base: usize) -> Option<u64> {
+        if base == 0 {
+            return None;
+        }
+        RESERVATIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&base)
+            .map(|reservation| reservation.generation)
+    }
+
+    /// Whether the captured generation still owns `base`. An untracked capture
+    /// (`None`, e.g. lazy marks without a reservation record) owns the address
+    /// only while no replacement has recorded a reservation there.
+    fn owns(
+        reservations: &BTreeMap<usize, Reservation>,
+        base: usize,
+        generation: Option<u64>,
+    ) -> bool {
+        match generation {
+            Some(generation) => reservations
+                .get(&base)
+                .is_some_and(|reservation| reservation.generation == generation),
+            None => !reservations.contains_key(&base),
+        }
+    }
+
+    /// Retires a successful `MEM_RELEASE`: its reservation record and lazy
+    /// marks, only while the captured generation still owns the address.
+    ///
+    /// Called after the native free, which may already have handed the address
+    /// to a replacement (`record_reservation` + `mark_range`). The reservation
+    /// lock stays held across the ownership check and the unmark while
+    /// admission records before it marks, so a replacement can only record
+    /// after this unmark and its marks always survive.
+    pub(super) fn retire_release(base: usize, span: usize, generation: Option<u64>) {
+        let mut reservations = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let owned = owns(&reservations, base, generation);
+        if owned {
+            reservations.remove(&base);
+        }
+        if owned && span > 0 {
+            unmark_range(base, span);
+        }
+    }
+
+    /// Clears lazy marks after a successful whole-allocation `MEM_DECOMMIT`.
+    /// The reservation survives (only its commits go), so the ownership check
+    /// only guards against a concurrent release/replacement of the address.
+    pub(super) fn retire_decommit_all(base: usize, span: usize, generation: Option<u64>) {
+        let reservations = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if span > 0 && owns(&reservations, base, generation) {
+            unmark_range(base, span);
+        }
+    }
+
+    /// Clears full 64 KiB lazy blocks strictly inside a successful partial
+    /// `MEM_DECOMMIT`, under the same ownership guard.
+    pub(super) fn retire_decommit_interior(base: usize, len: usize, generation: Option<u64>) {
+        let reservations = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if len > 0 && owns(&reservations, base, generation) {
+            unmark_aligned_interior(base, len);
+        }
+    }
+
+    pub(super) fn is_non_placeholder_reservation(base: usize, len: usize) -> bool {
+        let Some(end) = base.checked_add(len) else {
+            return false;
+        };
+        let tracked = {
+            let g = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+            g.range(..=base)
+                .next_back()
+                .is_some_and(|(_, reservation)| reservation.end >= end)
+        };
+        if !tracked {
+            return false;
+        }
+        is_reserved_span(base, len)
+    }
+
+    pub(super) fn is_reserved_span(base: usize, len: usize) -> bool {
+        let Some(end) = base.checked_add(len) else {
+            return false;
+        };
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: querying VA metadata only.
+        let n = unsafe {
+            VirtualQueryEx(
+                GetCurrentProcess(),
+                base as *const c_void,
+                &mut mbi,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        let mbi_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+        n != 0 && mbi.State == MEM_RESERVE && mbi_end >= end
+    }
+
+    fn install() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            // SAFETY: `handler` is a valid VEH callback.
+            unsafe {
+                AddVectoredExceptionHandler(1, Some(handler));
+            }
+        });
+    }
+
+    unsafe fn allows(access: usize, at: usize) -> bool {
+        let mut m = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: querying current process VA metadata only.
+        let n = unsafe {
+            VirtualQueryEx(
+                GetCurrentProcess(),
+                at as *const c_void,
+                &mut m,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if n == 0 || m.State != MEM_COMMIT || m.Protect & PAGE_GUARD != 0 {
+            return false;
+        }
+        let writes = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        let reads = writes | PAGE_READONLY | PAGE_EXECUTE_READ;
+        match access {
+            0 => m.Protect & reads != 0,
+            1 => m.Protect & writes != 0,
+            _ => false,
+        }
+    }
+
+    unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+        if !REGIONS_NONEMPTY.load(Ordering::Acquire) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // SAFETY: Windows passes a valid EXCEPTION_POINTERS with ExceptionRecord.
+        let r = unsafe { &*(*info).ExceptionRecord };
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let fault_addr = r.ExceptionInformation[1];
+        let page = fault_addr & !(PAGE - 1);
+
+        let action = {
+            let g = REGIONS.read().unwrap_or_else(|e| e.into_inner());
+            let idx = g.partition_point(|reg| reg.end <= page);
+            if idx >= g.len() || page < g[idx].base {
+                None
+            } else {
+                match g[idx].begin_commit(page) {
+                    CommitClaim::Claimed => {
+                        // SAFETY: `page` is a 64 KiB reserved page owned by the process.
+                        let committed = unsafe {
+                            VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE)
+                        };
+                        if committed.is_null() {
+                            g[idx].abort_commit(page);
+                            Some(Err(()))
+                        } else {
+                            g[idx].finish_commit(page);
+                            LAZY_COUNT.fetch_sub(1, Ordering::Release);
+                            Some(Ok(true))
+                        }
+                    }
+                    CommitClaim::AlreadyCommitted => Some(Ok(false)),
+                }
+            }
+        };
+
+        match action {
+            Some(Ok(true)) => {
+                victory_gpu::title_memory_committed(page, PAGE);
+                EXCEPTION_CONTINUE_EXECUTION
+            }
+            Some(Ok(false)) => {
+                // SAFETY: verifying a concurrent commit inside our own LazyRegion.
+                if unsafe { allows(r.ExceptionInformation[0], fault_addr) } {
+                    EXCEPTION_CONTINUE_EXECUTION
+                } else {
+                    EXCEPTION_CONTINUE_SEARCH
+                }
+            }
+            // No heap allocation or I/O in the VEH even on commit failure.
+            Some(Err(())) | None => EXCEPTION_CONTINUE_SEARCH,
+        }
+    }
+
+    pub(super) fn mark_range(start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        install();
+        let first = start & !(PAGE - 1);
+        let end = start.saturating_add(len).div_ceil(PAGE).saturating_mul(PAGE);
+        if end <= first {
+            return;
+        }
+        // Pre-allocate the common non-overlapping region before acquiring the write lock.
+        let (candidate, candidate_pages) = LazyRegion::new_marked(first, end);
+        let mut to_drop: Vec<LazyRegion> = Vec::new();
+        {
+            let mut g = REGIONS.write().unwrap_or_else(|e| e.into_inner());
+            let mut idx = g.partition_point(|r| r.end <= first);
+            let overlaps = idx < g.len() && g[idx].base < end;
+            if !overlaps {
+                g.insert(idx, candidate);
+                LAZY_COUNT.fetch_add(candidate_pages, Ordering::Release);
+            } else {
+                to_drop.push(candidate);
+                let mut cur = first;
+                while cur < end {
+                    if idx < g.len() && g[idx].base < end {
+                        let r_base = g[idx].base;
+                        let r_end = g[idx].end;
+                        if cur < r_base {
+                            let gap_end = r_base.min(end);
+                            let (gap, pages) = LazyRegion::new_marked(cur, gap_end);
+                            g.insert(idx, gap);
+                            LAZY_COUNT.fetch_add(pages, Ordering::Release);
+                            idx += 1;
+                            cur = gap_end;
+                            continue;
+                        }
+                        let seg_end = r_end.min(end);
+                        let added = g[idx].set_range(cur, seg_end);
+                        LAZY_COUNT.fetch_add(added, Ordering::Release);
+                        cur = seg_end;
+                        idx += 1;
+                    } else {
+                        let (tail, pages) = LazyRegion::new_marked(cur, end);
+                        g.insert(idx, tail);
+                        LAZY_COUNT.fetch_add(pages, Ordering::Release);
+                        break;
+                    }
+                }
+            }
+            REGIONS_NONEMPTY.store(!g.is_empty(), Ordering::Release);
+        }
+        drop(to_drop);
+    }
+
+    pub(super) fn unmark_range(start: usize, len: usize) {
+        if len == 0 || !REGIONS_NONEMPTY.load(Ordering::Acquire) {
+            return;
+        }
+        let first = start & !(PAGE - 1);
+        let end = start.saturating_add(len).div_ceil(PAGE).saturating_mul(PAGE);
+        let mut removed: Vec<LazyRegion> = Vec::new();
+        {
+            let mut g = REGIONS.write().unwrap_or_else(|e| e.into_inner());
+            let mut i = g.partition_point(|r| r.end <= first);
+            while i < g.len() && g[i].base < end {
+                let cleared = g[i].clear_range(first, end);
+                if cleared > 0 {
+                    LAZY_COUNT.fetch_sub(cleared, Ordering::Release);
+                }
+                if !g[i].has_any_bit() {
+                    removed.push(g.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            REGIONS_NONEMPTY.store(!g.is_empty(), Ordering::Release);
+        }
+        drop(removed);
+    }
+
+    pub(super) fn allocation_span(base: usize) -> usize {
+        if base == 0 || !REGIONS_NONEMPTY.load(Ordering::Acquire) {
+            return 0;
+        }
+        let mut span = 0usize;
+        let mut cur = base;
+        let mut m = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: querying VA metadata only.
+        while unsafe {
+            VirtualQueryEx(
+                GetCurrentProcess(),
+                cur as *const c_void,
+                &mut m,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        } != 0
+            && m.AllocationBase as usize == base
+            && m.RegionSize > 0
+        {
+            span = span.saturating_add(m.RegionSize);
+            match cur.checked_add(m.RegionSize) {
+                Some(next) => cur = next,
+                None => break,
+            }
+        }
+        span
+    }
+
+    pub(super) fn commit_partial_boundaries(start: usize, len: usize) {
+        if len == 0 || LAZY_COUNT.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        if !start.is_multiple_of(PAGE) {
+            ensure(start & !(PAGE - 1), PAGE);
+        }
+        if !end.is_multiple_of(PAGE) {
+            let tail = end & !(PAGE - 1);
+            if tail != (start & !(PAGE - 1)) || start.is_multiple_of(PAGE) {
+                ensure(tail, PAGE);
+            }
+        }
+    }
+
+    pub(super) fn unmark_aligned_interior(start: usize, len: usize) {
+        if len == 0 || !REGIONS_NONEMPTY.load(Ordering::Acquire) {
+            return;
+        }
+        let end = start.saturating_add(len);
+        let first_full = start.div_ceil(PAGE).saturating_mul(PAGE);
+        let last_full = end & !(PAGE - 1);
+        if last_full > first_full {
+            unmark_range(first_full, last_full - first_full);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn unmark_allocation(base: usize) {
+        let span = allocation_span(base);
+        if span > 0 {
+            unmark_range(base, span);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_marked(addr: usize) -> bool {
+        if LAZY_COUNT.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let page = addr & !(PAGE - 1);
+        let g = REGIONS.read().unwrap_or_else(|e| e.into_inner());
+        let idx = g.partition_point(|r| r.end <= page);
+        idx < g.len() && g[idx].is_marked(page)
+    }
+
+    /// Returns `(marked, run_end)` for the contiguous marked or unmarked run
+    /// starting at `query_base` within `[query_base, region_end)`, or `None` if
+    /// no lazy region overlaps `[query_base, region_end)`.
+    pub(super) fn query_run(query_base: usize, region_end: usize) -> Option<(bool, usize)> {
+        if LAZY_COUNT.load(Ordering::Acquire) == 0 || query_base >= region_end {
+            return None;
+        }
+        let g = REGIONS.read().unwrap_or_else(|e| e.into_inner());
+        let first_page = query_base & !(PAGE - 1);
+        let mut idx = g.partition_point(|r| r.end <= first_page);
+        if idx >= g.len() || g[idx].base >= region_end {
+            return None;
+        }
+        let page_marked = |p: usize, i: &mut usize| -> bool {
+            while *i < g.len() && g[*i].end <= p {
+                *i += 1;
+            }
+            *i < g.len() && g[*i].is_marked(p)
+        };
+        let initial = page_marked(first_page, &mut idx);
+        let mut cur = first_page.saturating_add(PAGE);
+        while cur < region_end && page_marked(cur, &mut idx) == initial {
+            match cur.checked_add(PAGE) {
+                Some(next) => cur = next,
+                None => break,
+            }
+        }
+        Some((initial, cur.min(region_end)))
+    }
+
+    pub(super) fn ensure(p: usize, len: usize) {
+        if len == 0 || LAZY_COUNT.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let first = p & !(PAGE - 1);
+        let end = p.saturating_add(len).div_ceil(PAGE).saturating_mul(PAGE);
+        let mut committed_pages = Vec::new();
+        {
+            let g = REGIONS.read().unwrap_or_else(|e| e.into_inner());
+            let mut idx = g.partition_point(|r| r.end <= first);
+            while idx < g.len() && g[idx].base < end {
+                let mut cur = first.max(g[idx].base);
+                let stop = end.min(g[idx].end);
+                while cur < stop {
+                    if g[idx].begin_commit(cur) == CommitClaim::Claimed {
+                        // SAFETY: `cur` is a 64 KiB reserved page owned by the process.
+                        let ok = unsafe {
+                            !VirtualAlloc(cur as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE)
+                                .is_null()
+                        };
+                        if ok {
+                            g[idx].finish_commit(cur);
+                            LAZY_COUNT.fetch_sub(1, Ordering::Release);
+                            committed_pages.push(cur);
+                        } else {
+                            g[idx].abort_commit(cur);
+                        }
+                    }
+                    cur += PAGE;
+                }
+                idx += 1;
+            }
+        }
+        for page in committed_pages {
+            victory_gpu::title_memory_committed(page, PAGE);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+
+        #[test]
+        fn policy_requires_4_mib_commit_readwrite_and_defaults_off() {
+            assert!(!enabled_for(None));
+            assert!(!enabled_for(Some("0")));
+            assert!(enabled_for(Some("1")));
+            assert!(eligible_policy(4 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            assert!(!eligible_policy((4 << 20) - 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            assert!(!eligible_policy(4 << 20, MEM_RESERVE, PAGE_READWRITE));
+            assert!(!eligible_policy(4 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY));
+        }
+
+        #[test]
+        fn lazy_pages_commit_on_first_touch_and_ensure_commits_without_fault() {
+            // SAFETY: fresh 4-page reservation for test.
+            let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+            assert_ne!(base, 0);
+            mark_range(base, 4 * PAGE);
+            assert!(is_marked(base));
+            assert!(is_marked(base + 3 * PAGE));
+
+            // First read/write commits via VEH.
+            // SAFETY: marked lazy page inside our reservation.
+            unsafe {
+                assert_eq!(std::ptr::read_volatile((base + 16) as *const u32), 0);
+                std::ptr::write_volatile((base + 16) as *mut u32, 0x1234_5678);
+                assert_eq!(std::ptr::read_volatile((base + 16) as *const u32), 0x1234_5678);
+            }
+            assert!(!is_marked(base));
+            assert!(is_marked(base + PAGE));
+
+            // `ensure` commits proactively for kernel syscalls.
+            ensure(base + PAGE + 4, PAGE);
+            assert!(!is_marked(base + PAGE));
+            assert!(!is_marked(base + 2 * PAGE));
+            assert!(is_marked(base + 3 * PAGE));
+
+            unmark_allocation(base);
+            assert!(!is_marked(base + 3 * PAGE));
+            // SAFETY: ours.
+            assert_ne!(unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) }, 0);
+        }
+
+        #[test]
+        fn concurrent_first_touch_on_shared_lazy_pages_succeeds() {
+            const THREADS: usize = 8;
+            const PAGES: usize = 64;
+            // SAFETY: fresh reservation for test.
+            let base = unsafe { VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+            assert_ne!(base, 0);
+            mark_range(base, PAGES * PAGE);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let b = barrier.clone();
+                    std::thread::spawn(move || {
+                        for i in 0..PAGES {
+                            b.wait();
+                            // SAFETY: disjoint 8-byte slot per thread inside `base`.
+                            unsafe {
+                                std::ptr::write_volatile(
+                                    (base + i * PAGE + t * 64) as *mut u64,
+                                    (i * THREADS + t) as u64,
+                                );
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            for i in 0..PAGES {
+                for t in 0..THREADS {
+                    // SAFETY: written above.
+                    let v = unsafe { std::ptr::read_volatile((base + i * PAGE + t * 64) as *const u64) };
+                    assert_eq!(v, (i * THREADS + t) as u64);
+                }
+            }
+            unmark_allocation(base);
+            // SAFETY: ours.
+            assert_ne!(unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) }, 0);
+        }
+
+        #[test]
+        fn lazy_physical_sec_reserve_view_commits_on_touch_and_ensure() {
+            use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+            use windows_sys::Win32::System::Memory::{
+                CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, SEC_RESERVE, UnmapViewOfFile,
+            };
+
+            const LEN: usize = 4 * PAGE;
+            // SAFETY: creating a temporary pagefile-backed SEC_RESERVE section for test.
+            let section = unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE | SEC_RESERVE,
+                    0,
+                    LEN as u32,
+                    std::ptr::null(),
+                )
+            };
+            assert!(!section.is_null());
+
+            // SAFETY: mapping our section as a writable view.
+            let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, LEN) };
+            let base = view.Value as usize;
+            assert_ne!(base, 0);
+
+            mark_range(base, LEN);
+            assert!(is_reserved_span(base, LEN));
+            assert!(is_marked(base));
+
+            // First CPU write commits page 0 via VEH; page 1 stays reserved.
+            // SAFETY: page 0 is marked lazy inside our mapped section view.
+            unsafe { std::ptr::write_volatile(base as *mut u32, 0xCAFE_BABE) };
+            // SAFETY: page 0 is now committed.
+            assert_eq!(unsafe { std::ptr::read_volatile(base as *const u32) }, 0xCAFE_BABE);
+            assert!(!is_marked(base));
+            assert!(is_marked(base + PAGE));
+
+            // `ensure` commits page 2 ahead of a kernel write without faulting.
+            ensure(base + 2 * PAGE, PAGE);
+            assert!(!is_marked(base + 2 * PAGE));
+            assert!(is_marked(base + 3 * PAGE));
+
+            unmark_range(base, LEN);
+            assert!(!is_marked(base + PAGE));
+            assert!(!is_marked(base + 3 * PAGE));
+
+            // SAFETY: unmapping and closing our test section.
+            unsafe {
+                UnmapViewOfFile(view);
+                CloseHandle(section);
+            }
+        }
+
+        #[test]
+        fn virtual_free_and_virtual_protect_clear_and_commit_lazy_pages() {
+            use windows_sys::Win32::System::Memory::MEM_DECOMMIT;
+
+            const LEN: usize = 4 * PAGE;
+            // SAFETY: fresh reservation for test.
+            let base = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE, PAGE_READWRITE) } as usize;
+            assert_ne!(base, 0);
+            record_reservation(base, LEN);
+            mark_range(base, LEN);
+            assert!(is_marked(base));
+
+            // VirtualProtect commits lazy pages before changing protection.
+            let mut old = 0u32;
+            assert_ne!(
+                crate::modules::kernel::VirtualProtect(
+                    (base + 2 * PAGE) as *const c_void,
+                    PAGE,
+                    PAGE_READONLY,
+                    &mut old,
+                ),
+                0
+            );
+            assert!(!is_marked(base + 2 * PAGE));
+
+            // VirtualFree(MEM_DECOMMIT) clears lazy marks for the decommitted sub-range.
+            assert_ne!(
+                crate::modules::kernel::VirtualFree(
+                    (base + PAGE) as *mut c_void,
+                    PAGE,
+                    MEM_DECOMMIT,
+                ),
+                0
+            );
+            assert!(!is_marked(base + PAGE));
+            assert!(is_marked(base));
+            assert!(is_marked(base + 3 * PAGE));
+
+            // VirtualFree(MEM_RELEASE) with non-zero size fails and must NOT clear marks/reservations.
+            assert_eq!(
+                crate::modules::kernel::VirtualFree(base as *mut c_void, 4096, MEM_RELEASE),
+                0
+            );
+            assert!(is_marked(base), "failed MEM_RELEASE must preserve lazy marks");
+            assert!(is_non_placeholder_reservation(base, PAGE));
+
+            // Sub-64 KiB MEM_DECOMMIT commits sibling 4 KiB pages while unmarking the block.
+            assert_ne!(
+                crate::modules::kernel::VirtualFree(
+                    (base + 4096) as *mut c_void,
+                    4096,
+                    MEM_DECOMMIT,
+                ),
+                0
+            );
+            assert!(!is_marked(base));
+            // Sibling 4 KiB page at `base` must remain committed and writable without AV.
+            // SAFETY: sibling 4 KiB page inside our allocation.
+            unsafe { std::ptr::write_volatile(base as *mut u32, 0x1234_5678) };
+            // SAFETY: read back sibling 4 KiB page.
+            assert_eq!(unsafe { std::ptr::read_volatile(base as *const u32) }, 0x1234_5678);
+
+            // Eager non-RW XMemVirtualAlloc(MEM_COMMIT, PAGE_READONLY) clears lazy marks.
+            let p3 = base + 3 * PAGE;
+            assert!(is_marked(p3));
+            let committed = super::super::XMemVirtualAlloc(
+                p3 as *mut c_void,
+                PAGE,
+                MEM_COMMIT,
+                0,
+                PAGE_READONLY,
+            );
+            assert_eq!(committed as usize, p3);
+            assert!(!is_marked(p3), "eager non-RW commit must clear lazy mark");
+
+            // Whole-allocation VirtualFree(base, 0, MEM_DECOMMIT) clears all remaining marks.
+            mark_range(base + 2 * PAGE, PAGE);
+            assert!(is_marked(base + 2 * PAGE));
+            assert_ne!(
+                crate::modules::kernel::VirtualFree(base as *mut c_void, 0, MEM_DECOMMIT),
+                0
+            );
+            assert!(!is_marked(base + 2 * PAGE));
+
+            // VirtualFree(MEM_RELEASE) clears all remaining marks and reservation record.
+            assert_ne!(
+                crate::modules::kernel::VirtualFree(base as *mut c_void, 0, MEM_RELEASE),
+                0
+            );
+            assert!(!is_marked(base));
+            assert!(!is_marked(base + 3 * PAGE));
+            assert!(!is_non_placeholder_reservation(base, LEN));
+        }
+
+        /// A retired `MEM_RELEASE` cleanup that runs after the host already
+        /// handed the address to a replacement must not erase the replacement's
+        /// reservation record or lazy marks.
+        #[test]
+        fn retired_release_cleanup_does_not_erase_reused_address_generation() {
+            const LEN: usize = PAGE;
+            // 1. A native reservation admitted by hand (cfg(test) disables
+            //    automatic lazy admission), then freed natively while its
+            //    production cleanup is paused. Other tests allocate in
+            //    parallel, so retry if one takes the freed hole first; a
+            //    fixed-address reservation either lands on `base` or fails.
+            let (base, retired) = loop {
+                // SAFETY: fresh reservation for the test.
+                let base = unsafe {
+                    VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE, PAGE_READWRITE)
+                } as usize;
+                assert_ne!(base, 0);
+                record_reservation(base, LEN);
+                mark_range(base, LEN);
+                let retired = super::super::FreeSnapshot::of(base);
+                // SAFETY: ours.
+                assert_ne!(unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) }, 0);
+                // SAFETY: the address was just freed; the probe reserves it again.
+                let reused = unsafe {
+                    VirtualAlloc(base as *const c_void, LEN, MEM_RESERVE, PAGE_READWRITE)
+                } as usize;
+                if reused == base {
+                    break (base, retired);
+                }
+                // The hole was taken: retire this attempt's metadata and retry.
+                super::super::on_virtual_free_release(retired);
+            };
+
+            // 2. The replacement holds exactly the freed address; admit it like
+            //    the production two-step path (record, then mark).
+            record_reservation(base, LEN);
+            mark_range(base, LEN);
+            assert!(is_marked(base));
+
+            // Resume the first caller's cleanup: it must not touch the new owner.
+            super::super::on_virtual_free_release(retired);
+
+            let mut info = super::super::BasicInformation {
+                host: MEMORY_BASIC_INFORMATION::default(),
+                flags: 0,
+                tag_code: 0,
+                tag: [0; 4],
+            };
+            // SAFETY: returns the pseudo-handle for the current process.
+            let process = unsafe { GetCurrentProcess() };
+            assert_eq!(
+                super::super::XMemVirtualQuery(process, base as *const c_void, &mut info),
+                1
+            );
+            assert_eq!(
+                info.host.State, MEM_COMMIT,
+                "the replacement's lazy mark must survive the retired release cleanup"
+            );
+            assert_eq!(info.host.RegionSize, LEN);
+            assert!(
+                is_non_placeholder_reservation(base, LEN),
+                "the replacement's reservation record must survive too"
+            );
+
+            // The replacement still releases through the real hook, which
+            // retires the metadata the stale callback correctly left alone.
+            assert_ne!(
+                crate::modules::kernel::VirtualFree(base as *mut c_void, 0, MEM_RELEASE),
+                0
+            );
+            assert!(!is_non_placeholder_reservation(base, LEN));
+        }
+
+        #[test]
+        fn xmem_virtual_query_clamps_region_size_and_rejects_placeholders() {
+            const HALF: usize = 4 * super::super::MIB;
+            const TOTAL: usize = 8 * super::super::MIB;
+            // SAFETY: fresh 8 MiB reservation for test.
+            let base = unsafe { VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE, PAGE_READWRITE) } as usize;
+            assert_ne!(base, 0);
+            mark_range(base, HALF);
+
+            let mut info = super::super::BasicInformation {
+                host: MEMORY_BASIC_INFORMATION::default(),
+                flags: 0,
+                tag_code: 0,
+                tag: [0; 4],
+            };
+            // SAFETY: returns the pseudo-handle for the current process.
+            let process = unsafe { GetCurrentProcess() };
+            assert_eq!(
+                super::super::XMemVirtualQuery(process, base as *const c_void, &mut info),
+                1
+            );
+            assert_eq!(info.host.State, MEM_COMMIT);
+            assert_eq!(info.host.Protect, PAGE_READWRITE);
+            assert_eq!(info.host.RegionSize, HALF, "RegionSize clamped to marked run");
+
+            assert_eq!(
+                super::super::XMemVirtualQuery(
+                    process,
+                    (base + HALF) as *const c_void,
+                    &mut info
+                ),
+                1
+            );
+            assert_eq!(info.host.State, MEM_RESERVE);
+            assert_eq!(info.host.RegionSize, HALF, "unmarked tail stays MEM_RESERVE");
+
+            unmark_range(base, HALF);
+            // SAFETY: ours.
+            assert_ne!(unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) }, 0);
+
+            // Placeholders created with PAGES_64K must never be accepted by the two-step lazy path.
+            let ph = super::super::XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                HALF,
+                MEM_RESERVE | super::super::PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            ) as usize;
+            assert_ne!(ph, 0);
+            assert!(!is_non_placeholder_reservation(ph, HALF));
+            // SAFETY: ours.
+            assert_ne!(unsafe { VirtualFree(ph as *mut c_void, 0, MEM_RELEASE) }, 0);
         }
     }
 }
