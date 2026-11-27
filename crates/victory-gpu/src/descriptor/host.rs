@@ -29,8 +29,9 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    /// With it the view's own copy of title memory, if it has one.
-    kept: Mutex<Vec<Kept>>,
+    /// With it the view's own copy of title memory, if it has one. Stored
+    /// sparsely by slot index so unpopulated slots take no host RAM.
+    kept: Mutex<std::collections::HashMap<u32, KeptEntry>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -195,7 +196,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: Mutex::new(std::collections::HashMap::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
@@ -538,27 +539,36 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Kept) {
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
-            let old = std::mem::replace(slot, resource);
-            #[cfg(feature = "diagnostics")]
-            if let Some((old, _)) = &old
-                && !self.sampler
-                && slot.as_ref().map(|s| windows::core::Interface::as_raw(&s.0)) != Some(windows::core::Interface::as_raw(old))
-                // SAFETY: a live resource.
-                && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
-            {
-                use windows::core::Interface;
-                let left = crate::resource::life::holders(old);
-                crate::resource::life::note(old.as_raw() as usize, crate::resource::life::SLOT, u64::from(index), left);
+        if index >= self.count + self.dynamic {
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        let new_raw = resource.as_ref().map(|s| windows::core::Interface::as_raw(&s.0));
+        let old = {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            match resource {
+                Some(entry) => kept.insert(index, entry),
+                None => kept.remove(&index),
             }
-            // Title threads rewrite slots while the GPU runs a submission;
-            // one of its shaders may hold the old descriptor (or read the
-            // slot at an index from wrong data): what it views is freed
-            // only once that work has run.
-            if let Some((old, _)) = old {
-                crate::host::retire(old);
-            }
+        };
+        #[cfg(feature = "diagnostics")]
+        if let Some((old, _)) = &old
+            && !self.sampler
+            && new_raw != Some(windows::core::Interface::as_raw(old))
+            // SAFETY: a live resource.
+            && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+        {
+            use windows::core::Interface;
+            let left = crate::resource::life::holders(old);
+            crate::resource::life::note(old.as_raw() as usize, crate::resource::life::SLOT, u64::from(index), left);
+        }
+        // Title threads rewrite slots while the GPU runs a submission;
+        // one of its shaders may hold the old descriptor (or read the
+        // slot at an index from wrong data): what it views is freed
+        // only once that work has run.
+        if let Some((old, shadow)) = old {
+            crate::host::retire(old);
+            drop(shadow);
         }
     }
 
@@ -758,8 +768,8 @@ impl HostHeap {
             if !for_draw || !is_texture(&view) {
                 return false;
             }
-            let held = self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize]
-                .as_ref()
+            let held = self.kept.lock().unwrap_or_else(|e| e.into_inner())
+                .get(&index)
                 .map(|(res, _)| windows::core::Interface::as_raw(res));
             let Some(held) = held else {
                 return true;
@@ -840,7 +850,7 @@ impl HostHeap {
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&index);
         if key == 0 || (!kept && !self.sampler) {
             return Some("null".into());
         }
@@ -867,11 +877,10 @@ impl HostHeap {
     pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
         let slots: Vec<u32> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            (0..kept.len() as u32)
-                .filter(|&i| {
-                    kept[i as usize]
-                        .as_ref()
-                        .is_some_and(|k| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
+            kept.iter()
+                .filter_map(|(&i, k)| {
+                    (k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
+                        .then_some(i)
                 })
                 .collect()
         };
@@ -896,7 +905,7 @@ impl HostHeap {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         slots
             .iter()
-            .filter_map(|&i| kept.get(i as usize)?.as_ref().filter(|k| k.1.is_none()))
+            .filter_map(|&i| kept.get(&i).filter(|k| k.1.is_none()))
             .map(|k| windows::core::Interface::as_raw(&k.0) as usize)
             .collect()
     }
@@ -906,7 +915,7 @@ impl HostHeap {
     pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&index);
         (is_placed_texture(&view) && !kept).then_some(view)
     }
 
@@ -934,7 +943,7 @@ impl HostHeap {
     /// Whether slot `index` holds a host view of a resource (tests).
     #[cfg(test)]
     pub(crate) fn kept(&self, index: u32) -> bool {
-        self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some()
+        self.kept.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&index)
     }
 }
 
@@ -1210,7 +1219,8 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 /// The host resource a slot made by [`make`] views, if any, and the view's
 /// own copy of title memory ([`crate::shadow::for_view`]): the slot holds
 /// it, so that draws reading the view find and refresh that copy.
-type Kept = Option<(ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>>)>;
+type KeptEntry = (ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>>);
+type Kept = Option<KeptEntry>;
 
 /// Buffer views refused so far (diagnostics: the first are logged).
 #[cfg(feature = "diagnostics")]
@@ -2422,16 +2432,16 @@ mod tests {
             ));
             assert!(heap.mirror(idx as u32, slot_addr, false).is_some());
             assert!(
-                heap.kept.lock().unwrap()[idx].is_none(),
+                !heap.kept.lock().unwrap().contains_key(&(idx as u32)),
                 "case {idx} mirror(false) should defer host creation"
             );
             let mirrored = heap.mirror(idx as u32, slot_addr, true).unwrap();
             let dyn_slot = heap.count + idx as u32;
             heap.make_at(dyn_slot, &mirrored);
             let kept = heap.kept.lock().unwrap();
-            assert_eq!(kept[idx].is_some(), expect_real, "case {idx} mirror");
+            assert_eq!(kept.contains_key(&(idx as u32)), expect_real, "case {idx} mirror");
             assert_eq!(
-                kept[dyn_slot as usize].is_some(),
+                kept.contains_key(&dyn_slot),
                 expect_real,
                 "case {idx} make_at"
             );
@@ -2453,7 +2463,7 @@ mod tests {
             crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &desc, slot_addr);
             heap.mirror(idx as u32, slot_addr, true).unwrap();
             assert_eq!(
-                heap.kept.lock().unwrap()[idx].is_some(),
+                heap.kept.lock().unwrap().contains_key(&(idx as u32)),
                 expect_real,
                 "srv case {offset}"
             );
