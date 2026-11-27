@@ -214,6 +214,9 @@ struct Pipeline {
     shaders: Vec<Arc<Shader>>,
     /// Whether a list has bound it yet (its shaders are logged then).
     bound: std::sync::atomic::AtomicBool,
+    /// The console state a deserialized graphics pipeline carries until its
+    /// fixed-function format is decoded; ordinary creations have none.
+    offline: Option<deserialize::OfflineGraphics>,
     /// What its host pipeline is made from, and the host pipeline once made
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
@@ -374,6 +377,7 @@ fn code_of(code: &Bytecode) -> Option<*const [u8]> {
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    offline: Option<deserialize::OfflineGraphics>,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -394,6 +398,7 @@ fn hand_out(
         host,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
+        offline,
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
@@ -415,6 +420,7 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        None,
         iid,
         out,
     )
@@ -434,6 +440,7 @@ pub(crate) extern "system" fn create_compute(
     hand_out(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
+        None,
         None,
         iid,
         out,
@@ -514,6 +521,7 @@ pub(crate) extern "system" fn create_stream(
         shaders,
         #[cfg(windows)]
         Some(Box::new(graphics)),
+        None,
         iid,
         out,
     )
@@ -581,6 +589,7 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+pub(crate) mod deserialize;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
