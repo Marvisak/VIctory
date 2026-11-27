@@ -642,6 +642,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn list_upload_and_readback_pool_reuses_and_bounds_buffers() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let (u1, p1) = list.upload(host, 4096).unwrap();
+        let (r1, rp1) = list.readback(host, 4096).unwrap();
+        drop((u1, r1));
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        // After reset, the 64 KiB class buffers are returned to the pool and reused.
+        let (u2, p2) = list.upload(host, 8192).unwrap();
+        let (r2, rp2) = list.readback(host, 8192).unwrap();
+        assert_eq!(p2, p1, "pooled upload buffer reused across list reset");
+        assert_eq!(rp2, rp1, "pooled readback buffer reused across list reset");
+        drop((u2, r2));
+
+        // Pool cap evicts oldest buffers when free_bytes exceeds limit.
+        let mut pool = MappedPool::default();
+        let (b1, d1) = host.upload_buffer(1 << 16).unwrap();
+        let (b2, d2) = host.upload_buffer(1 << 16).unwrap();
+        assert!(pool.give_back(1 << 16, b1, d1 as usize, 1 << 16).is_empty());
+        let evicted = pool.give_back(1 << 16, b2, d2 as usize, 1 << 16);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(pool.free_bytes, 1 << 16);
+        list.close();
+    }
+
+    #[test]
     fn present_compositor_builds_both_pipeline_states() {
         let Some(host) = host() else {
             eprintln!("skipping compositor initialization: no D3D12 device");
@@ -1005,6 +1033,8 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Pooled upload/readback buffers returned to their pools on list reset/drop.
+    pooled_uploads: Vec<PooledMapped>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -1781,7 +1811,8 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
+        let old_deferred = std::mem::take(&mut *self.deferred());
+        drop(old_deferred);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2150,7 +2181,12 @@ impl HostList {
     /// over).
     pub(crate) fn is_empty(&self) -> bool {
         let d = self.deferred();
-        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
+        let deferred_empty = d.copies.is_empty()
+            && d.uploads.is_empty()
+            && d.pooled_uploads.is_empty()
+            && d.writes.is_empty()
+            && d.after.is_empty()
+            && d.missed.is_empty();
         drop(d);
         deferred_empty
             && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
@@ -2159,21 +2195,53 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// reset. Pooled by power-of-two size class up to [`LIST_POOL_MAX_BUFFER`].
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().uploads.push(buffer.clone());
-        Some((buffer, data))
+        self.mapped_from_pool(host, size, false)
     }
 
     /// A mapped readback buffer of `size` bytes, alive until the list is
-    /// reset.
+    /// reset. Pooled by power-of-two size class up to [`LIST_POOL_MAX_BUFFER`].
     pub(crate) fn readback(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.mapped_buffer(size, true)?;
-        name(&buffer, || format!("list readback {size:#x}"));
+        self.mapped_from_pool(host, size, true)
+    }
+
+    fn mapped_from_pool(&self, host: &Host, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
+        if size <= LIST_POOL_MAX_BUFFER {
+            let class = size.max(1 << 16).next_power_of_two();
+            let pool = if readback { &READBACK_POOL } else { &UPLOAD_POOL };
+            let reused = pool.lock().unwrap_or_else(|e| e.into_inner()).take(class);
+            let (buffer, data) = match reused {
+                Some(hit) => hit,
+                None => {
+                    let (buffer, data) = host.mapped_buffer(class, readback)?;
+                    name(&buffer, || {
+                        if readback {
+                            format!("list readback pool {class:#x}")
+                        } else {
+                            format!("list upload pool {class:#x}")
+                        }
+                    });
+                    (buffer, data as usize)
+                }
+            };
+            let ret = (buffer.clone(), data as *mut u8);
+            self.deferred().pooled_uploads.push(PooledMapped {
+                class,
+                buffer: Some(buffer),
+                data,
+                readback,
+            });
+            return Some(ret);
+        }
+        let (buffer, data) = host.mapped_buffer(size, readback)?;
+        name(&buffer, || {
+            if readback {
+                format!("list readback {size:#x}")
+            } else {
+                format!("list upload {size:#x}")
+            }
+        });
         self.deferred().uploads.push(buffer.clone());
         Some((buffer, data))
     }
@@ -3669,6 +3737,88 @@ impl Host {
                 None
             }
         }
+    }
+}
+
+/// Maximum size of a single upload/readback buffer kept in the list pool;
+/// larger one-off transfers bypass the pool so they are freed on list reset.
+const LIST_POOL_MAX_BUFFER: u64 = 16 << 20;
+/// Maximum total idle bytes retained per list mapped-buffer pool (upload and
+/// readback each).
+const LIST_POOL_BYTES: u64 = 32 << 20;
+
+#[derive(Default)]
+struct MappedPool {
+    free: std::collections::VecDeque<(u64, ID3D12Resource, usize)>,
+    free_bytes: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; mappings are persistent and only
+// accessed while exclusively owned by a recording/executing list.
+unsafe impl Send for MappedPool {}
+
+impl MappedPool {
+    fn take(&mut self, class: u64) -> Option<(ID3D12Resource, usize)> {
+        let i = self.free.iter().position(|e| e.0 == class)?;
+        let (_, buffer, data) = self.free.remove(i)?;
+        self.free_bytes -= class;
+        Some((buffer, data))
+    }
+
+    fn give_back(
+        &mut self,
+        class: u64,
+        buffer: ID3D12Resource,
+        data: usize,
+        limit: u64,
+    ) -> Vec<ID3D12Resource> {
+        let mut evicted = Vec::new();
+        if class > limit {
+            evicted.push(buffer);
+            return evicted;
+        }
+        self.free_bytes += class;
+        self.free.push_back((class, buffer, data));
+        while self.free_bytes > limit
+            && let Some((n, old, _)) = self.free.pop_front()
+        {
+            self.free_bytes -= n;
+            evicted.push(old);
+        }
+        evicted
+    }
+}
+
+static UPLOAD_POOL: Mutex<MappedPool> = Mutex::new(MappedPool {
+    free: std::collections::VecDeque::new(),
+    free_bytes: 0,
+});
+static READBACK_POOL: Mutex<MappedPool> = Mutex::new(MappedPool {
+    free: std::collections::VecDeque::new(),
+    free_bytes: 0,
+});
+
+struct PooledMapped {
+    class: u64,
+    buffer: Option<ID3D12Resource>,
+    data: usize,
+    readback: bool,
+}
+
+// SAFETY: persistent mapping owned exclusively by this handle until Drop.
+unsafe impl Send for PooledMapped {}
+
+impl Drop for PooledMapped {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        let pool = if self.readback { &READBACK_POOL } else { &UPLOAD_POOL };
+        let evicted = pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .give_back(self.class, buffer, self.data, LIST_POOL_BYTES);
+        drop(evicted);
     }
 }
 
