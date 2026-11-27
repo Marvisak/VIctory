@@ -18,7 +18,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
@@ -59,6 +59,7 @@ pub struct Status {
 
 pub struct Stream {
     dsp: *mut Dsp,
+    convolution: bool,
     frames: u32,
     channels: u32,
     status: Box<Status>,
@@ -166,6 +167,7 @@ pub extern "system" fn XDspActivate(
     }
     let new = Box::new(Stream {
         dsp,
+        convolution: kind == CONVOLUTION,
         frames: desc.frames,
         channels: desc.channels,
         status: Box::new(Status {
@@ -210,6 +212,16 @@ pub extern "system" fn XDspSubmitCommand(
         let samples = (stream.frames * stream.channels) as usize;
         // SAFETY: the title's output buffer holds one block of the stream.
         unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        if stream.convolution {
+            static SILENCE: Once = Once::new();
+            SILENCE.call_once(|| {
+                tracing::warn!(
+                    frames = stream.frames,
+                    channels = stream.channels,
+                    "audio DSP convolution wrote a silent block"
+                );
+            });
+        }
     }
     let status = &mut *stream.status;
     let next = status.submitted.wrapping_add(1);
