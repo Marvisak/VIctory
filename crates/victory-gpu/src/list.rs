@@ -132,12 +132,37 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
+///
+/// Diagnosed: the call, the time in its handler, and apart from both the
+/// time it waited for the list's own two locks before the handler ran.
+/// Nothing else on the frame line times recording, and nothing splits what
+/// a handler waits for from what it does: a handler held up counts as the
+/// call's time. A call with no host list does no work, and is not counted.
 #[cfg(windows)]
 pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    let handler = std::time::Instant::now();
+    f(list, &mut state);
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        // The wait ends where the handler starts: `started` to `handler` is
+        // the two locks a call takes before it does anything (the segment's
+        // host list, then the draw state), and none of the handler's time.
+        // What `f` waits for (the heaps' lock, say) counts in `CallUs` with
+        // what it did. Both are sampled before the counters are updated.
+        let elapsed = handler.elapsed().as_micros() as u64;
+        let waiting = handler.duration_since(started).as_micros() as u64;
+        add(C::Calls, 1);
+        add(C::CallUs, elapsed);
+        add(C::CallLockWaitUs, waiting);
+    }
 }
 
 /// The host list a title list's calls record into (its current segment),
@@ -2045,5 +2070,89 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+}
+
+/// What the frame line says of the title's calls (`copystat`'s call
+/// counters), which only diagnostics builds keep.
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod call_counters {
+    use super::*;
+    use crate::copystat::{C, count};
+    use crate::object::slot;
+
+    use std::time::{Duration, Instant};
+
+    fn new_test_list() -> (This, This) {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        (list, allocator)
+    }
+
+    fn release_test_list(list: This, allocator: This) {
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// A live handler counts once even while another thread records into
+    /// a different list. Only the time before the handler counts as lock wait.
+    #[test]
+    fn a_call_with_a_live_host_list_is_counted() {
+        let (list, allocator) = new_test_list();
+        if host_list(list).is_none() {
+            release_test_list(list, allocator);
+            return;
+        }
+        let calls = count(C::Calls);
+        let us = count(C::CallUs);
+        let waits = count(C::CallLockWaitUs);
+        let started = Instant::now();
+        let mut handler_times = None;
+        with_state(list, |_, _| {
+            let entered = Instant::now();
+            std::thread::spawn(|| {
+                let (other, allocator) = new_test_list();
+                assert!(host_list(other).is_some());
+                with_state(other, |_, _| {});
+                release_test_list(other, allocator);
+            })
+            .join()
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+            handler_times = Some((entered, Instant::now()));
+        });
+        release_test_list(list, allocator);
+
+        let (entered, left) = handler_times.expect("the handler ran");
+        assert_eq!(count(C::Calls) - calls, 1, "only this call is counted");
+        let us = count(C::CallUs) - us;
+        let waits = count(C::CallLockWaitUs) - waits;
+        assert!(us >= left.duration_since(entered).as_micros() as u64);
+        assert!(
+            waits <= entered.duration_since(started).as_micros() as u64,
+            "handler time must not be counted as a list lock wait: {waits} us"
+        );
+    }
+
+    /// A call without a live host list has nothing to record into: it runs
+    /// nothing and is not counted (`Calls` counts the calls that had a host
+    /// list).
+    #[test]
+    fn a_call_without_a_host_list_is_not_counted() {
+        let calls = count(C::Calls);
+        with_state(std::ptr::null(), |_, _| {
+            panic!("a call with no host list runs nothing")
+        });
+        assert_eq!(count(C::Calls), calls, "not counted");
     }
 }
