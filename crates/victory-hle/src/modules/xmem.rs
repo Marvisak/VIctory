@@ -395,6 +395,20 @@ struct Physical {
     /// its page in every view showing it (the GPU side's change tracking
     /// follows writes through one view to the others, `aliases`).
     shown: HashMap<(usize, usize), Vec<usize>>,
+    /// Writes into physical pages through views of our own, under way by
+    /// slice key: views of them mapped meanwhile stay open until they end.
+    writes: HashMap<(usize, usize), ActiveWrite>,
+}
+
+/// Writes into one physical page through views of our own, overlapping.
+struct ActiveWrite {
+    /// Keeps the section alive: its `Arc` address is half of the key.
+    _slice: Slice,
+    /// How many writes are under way.
+    writers: usize,
+    /// Title views of the page mapped while a write is under way, kept open
+    /// for it until the last one ends.
+    views: BTreeMap<usize, victory_gpu::KernelWrite>,
 }
 
 impl Slice {
@@ -457,6 +471,48 @@ fn report_written(shown: &[usize]) {
 thread_local! {
     /// The title addresses this thread's writes into physical pages reported.
     static REPORTED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The physical pages a write through a view of our own is under way on:
+/// title views they gain meanwhile are opened until this drops.
+struct PhysicalWrite {
+    keys: Vec<(usize, usize)>,
+}
+
+impl PhysicalWrite {
+    fn begin(pages: &[usize]) -> Self {
+        let mut physical = physical();
+        let mut keys = Vec::new();
+        for &page in pages {
+            let Some(slice) = physical.pages.get(&page).cloned() else {
+                continue;
+            };
+            let key = slice.key(0);
+            let write = physical.writes.entry(key).or_insert_with(|| ActiveWrite {
+                _slice: slice,
+                writers: 0,
+                views: BTreeMap::new(),
+            });
+            write.writers += 1;
+            keys.push(key);
+        }
+        Self { keys }
+    }
+}
+
+impl Drop for PhysicalWrite {
+    fn drop(&mut self) {
+        let mut physical = physical();
+        for key in self.keys.drain(..) {
+            let done = physical.writes.get_mut(&key).is_some_and(|write| {
+                write.writers -= 1;
+                write.writers == 0
+            });
+            if done {
+                physical.writes.remove(&key);
+            }
+        }
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -636,6 +692,10 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
+    let written = pages
+        .get(offset / PAGE..(offset + data.len()).div_ceil(PAGE))
+        .unwrap_or(&[]);
+    let _write = PhysicalWrite::begin(written);
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -646,7 +706,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         (within, done) = (0, done + k);
     }
     // Where the pages show once written (see `PageWindow`).
-    report_written(&shown_at(pages.get(offset / PAGE..(offset + data.len()).div_ceil(PAGE)).unwrap_or(&[])));
+    report_written(&shown_at(written));
     true
 }
 
@@ -664,6 +724,9 @@ pub(crate) struct PageWindow {
     /// the page there before the bytes landed would never hear of them. An
     /// address that stops showing a page meanwhile was told by the unmap.
     pages: Vec<usize>,
+    /// The write these bytes are for, while it is under way: views of its
+    /// pages mapped meanwhile are opened until it ends.
+    _write: PhysicalWrite,
 }
 
 impl Drop for PageWindow {
@@ -689,11 +752,17 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let view = View::map(slice, *n)?;
+    let pages = pages
+        .get(offset / PAGE..(offset + len).div_ceil(PAGE))
+        .unwrap_or(&[])
+        .to_vec();
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view,
         within: offset % PAGE,
         len,
-        pages: pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or(&[]).to_vec(),
+        _write: PhysicalWrite::begin(&pages),
+        pages,
     })
 }
 
@@ -839,10 +908,20 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     for k in 0..len / PAGE {
-        let shown = physical.shown.entry(slice.key(k)).or_default();
+        let (key, at) = (slice.key(k), base + k * PAGE);
+        // A write into the page through a view of our own is under way: this
+        // view joins it now, or taking it could mark it clean before the
+        // write is reported.
+        if let Some(write) = physical.writes.get_mut(&key) {
+            write
+                .views
+                .entry(at)
+                .or_insert_with(|| victory_gpu::kernel_will_write(at, PAGE));
+        }
+        let shown = physical.shown.entry(key).or_default();
         // Pages shown elsewhere already: guarded here too if they are there.
-        victory_gpu::title_memory_aliased(base + k * PAGE, shown);
-        shown.push(base + k * PAGE);
+        victory_gpu::title_memory_aliased(at, shown);
+        shown.push(at);
     }
     physical.views.insert(base, (len, slice));
     true
@@ -967,9 +1046,14 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         for k in 0..size / PAGE {
-            let key = slice.key(k);
+            let (key, address) = (slice.key(k), at + k * PAGE);
+            // The write this view joined is over for it here (the unmap
+            // reports it); do not keep what replaces the view open too.
+            if let Some(write) = physical.writes.get_mut(&key) {
+                write.views.remove(&address);
+            }
             if let Some(addresses) = physical.shown.get_mut(&key) {
-                addresses.retain(|&a| a != at + k * PAGE);
+                addresses.retain(|&a| a != address);
                 if addresses.is_empty() {
                     physical.shown.remove(&key);
                 }
@@ -1416,6 +1500,59 @@ mod tests {
         );
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// Integration probe of a real window and a title view mapped later:
+    /// (clean before the window drops, saved byte then, dirty after it,
+    /// saved byte then). `open_late_view` is the positive control, holding
+    /// the late view open for the kernel write before anyone takes it.
+    fn late_window_observation(open_late_view: bool) -> (bool, Option<u8>, bool, Option<u8>) {
+        let pages = allocate(1);
+        let mut window = page_window(&pages, 0, PAGE).expect("one physical page");
+        let address = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!address.is_null());
+        assert_eq!(XMemMapPhysicalPages(address, 1, pages.as_ptr()), address);
+        let at = address as usize;
+        // Positive control: open this late view before anyone takes it.
+        let held = open_late_view.then(|| victory_gpu::kernel_will_write(at, PAGE));
+        let tracked = victory_gpu::track(at, PAGE, true).expect("mapped title view");
+        assert_eq!(tracked.take(at, at + PAGE), [(at, at + PAGE)]);
+        tracked.arm(at, at + PAGE);
+        window.bytes()[0] = 0x22;
+        // SAFETY: committed title mapping of the same physical page.
+        assert_eq!(unsafe { address.cast::<u8>().read_volatile() }, 0x22);
+        let before = (tracked.clean(), tracked.saved(at / PAGE).map(|bytes| bytes[0]));
+        drop(window);
+        drop(held);
+        let after = (!tracked.clean(), tracked.saved(at / PAGE).map(|bytes| bytes[0]));
+        drop(tracked);
+        assert_eq!(XMemMapPhysicalPages(address, 1, std::ptr::null()), address);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        (before.0, before.1, after.0, after.1)
+    }
+
+    #[test]
+    fn late_window_view_must_be_dirty_before_window_drop() {
+        let (clean_before, saved_before, dirty_after, saved_after) = late_window_observation(false);
+        assert!(
+            !clean_before,
+            "late title view is still clean after streamed bytes landed, before drop"
+        );
+        assert_eq!(saved_before, None);
+        assert!(dirty_after);
+        assert_eq!(saved_after, None);
+    }
+
+    #[test]
+    fn late_window_view_opened_before_take_stays_dirty() {
+        let observed = late_window_observation(true);
+        assert_eq!(observed, (false, None, true, None));
     }
 
     /// A page mapped at a second address while a window writes it is
