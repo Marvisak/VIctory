@@ -127,6 +127,23 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+/// Whether translated shaders do the console's f16 arithmetic in native
+/// `half` (`victory_shader::emit::Options::native16`): the host GPU runs
+/// native 16-bit operations and rounds a 16-bit `FMad` once (a dispatch,
+/// as `fuses_fmad`'s). `VICTORY_F16_IN_F32=1` keeps it in f32 on any host.
+/// Asked once.
+pub(crate) fn native16() -> bool {
+    static NATIVE: OnceLock<bool> = OnceLock::new();
+    *NATIVE.get_or_init(|| {
+        let native = !crate::switch::on("VICTORY_F16_IN_F32")
+            && host().is_some_and(|h| {
+                victory_shader::emit::host::Host::from_device(h.device.clone()).native16()
+            });
+        tracing::info!(native, "host native 16-bit float operations");
+        native
+    })
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
@@ -139,6 +156,38 @@ pub(crate) fn host() -> Option<&'static Host> {
         }
     })
     .as_ref()
+}
+
+/// Largest shader-visible CBV/SRV/UAV descriptor heap the host accepts, up to
+/// [`victory_shader::emit::HEAP_VIEWS`]. NVIDIA caps shader-visible heaps at
+/// `1_000_000` (Tier 2/3 limit). Logged once.
+pub(crate) fn host_heap_views() -> u32 {
+    static VIEWS: OnceLock<u32> = OnceLock::new();
+    *VIEWS.get_or_init(|| {
+        let Some(host) = host() else {
+            return victory_shader::emit::HEAP_VIEWS;
+        };
+        for n in [victory_shader::emit::HEAP_VIEWS, 1 << 20, 1_000_000] {
+            // SAFETY: temporary descriptor heap query; released on drop.
+            let ok = unsafe {
+                host.device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(
+                    &D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: n,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    },
+                )
+            }
+            .is_ok();
+            if ok {
+                tracing::info!(views = n, "host view descriptor heap limit");
+                return n;
+            }
+        }
+        tracing::warn!("descriptor heap query failed for all sizes; assuming 1_000_000");
+        1_000_000
+    })
 }
 
 fn create() -> windows::core::Result<Host> {
@@ -1201,11 +1250,25 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
+        // VICTORY_HEAP_WORKER: post the texture-refresh work to the
+        // background worker before running buffer refreshes, so both happen
+        // in parallel.  On the synchronous path, texture refresh is part of
+        // `bindless::uploads` and runs first.
+        let have_work = !heaps.is_empty() || !textures.is_empty();
+        let worker_on = crate::bindless::heap_worker_on();
+        if worker_on && have_work {
+            let work = crate::bindless::collect_work(&heaps, &textures);
+            crate::texture::recycle();
+            crate::bindless::start_heap_worker(work);
+        }
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
-        let uploads = (!heaps.is_empty() || !textures.is_empty())
-            .then(|| crate::bindless::uploads(&heaps, &textures))
-            .flatten();
+        let uploads = if worker_on {
+            // Worker path: synchronous uploads is skipped; worker list collected after run_deferred.
+            None
+        } else {
+            have_work.then(|| crate::bindless::uploads(&heaps, &textures)).flatten()
+        };
         #[cfg(feature = "diagnostics")]
         drop(uploading);
         let runs: Vec<&HostList> = uploads
@@ -1234,9 +1297,9 @@ impl Host {
                 }
             }
         }
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len() + 2);
         // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
+        let mut firsts = Vec::with_capacity(runs.len() + 1);
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
@@ -1249,6 +1312,31 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Worker path: collect the texture-upload list that ran in parallel
+        // with the buffer refreshes above.  Prepend it to the submission so
+        // textures are ready before any title list samples them.
+        let _worker_list = if worker_on {
+            crate::bindless::wait_heap_worker()
+        } else {
+            None
+        };
+        if let Some(ref wl) = _worker_list {
+            // Build the worker list's state prelude (texture transitions).
+            let prelude = wl.prelude();
+            let prelude_count = usize::from(prelude.is_some());
+            let inserted = prelude_count + 1; // prelude (optional) + main list
+            if let Some(prelude) = prelude {
+                lists.insert(0, Some(prelude));
+            }
+            lists.insert(prelude_count, wl.list.cast().ok());
+            // Shift all existing firsts by the number of slots added.
+            // The worker list is not represented in `firsts` (which is used
+            // for per-list diagnostics timing only); shift existing entries
+            // so they still index their own list slices correctly.
+            for f in firsts.iter_mut() {
+                *f += inserted;
+            }
+        }
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));

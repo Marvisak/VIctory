@@ -174,6 +174,27 @@
 //!   [`VIEW_READS`] + the view's heap index in the same bitmap, after the
 //!   written pages, where still clear: the host makes views it left null
 //!   until a shader reads them (textures the title placed itself).
+//! * **16-bit floats** (native `half` with [`Options::native16`]; added
+//!   2026-11-25). Without it, an f16 operation is done in f32 on its
+//!   widened sources and the result rounded to f16 in integer code (the
+//!   host's own conversion rounds as it likes). With it, where the program
+//!   rounds 16-bit results to nearest even, `v_add/sub/subrev/mul_f16`,
+//!   `v_fma/fmac_f16`, `v_min/max/min3/max3/med3_f16` and the packed
+//!   `v_pk_add/mul/fma/fmac/min/max_f16` are `half` arithmetic (SM 6.2
+//!   16-bit types, flagged as native low precision): the same result for
+//!   sums, differences and products (f32 holds 2 × 11 + 2 bits, so
+//!   rounding there first never changes the f16 result) and for the exact
+//!   minima and maxima, NaN payloads aside (the host's, where the f32 path
+//!   quiets them as RDNA2 converts). Fused multiply-adds round once, as
+//!   the console's do: the option is only for hosts whose 16-bit `FMad`
+//!   does (the RTX 4070 Ti and RTX 5070 Ti measured, as RDNA's
+//!   `v_fma_f16`); WARP rounds it in f32 first and keeps the f32 path,
+//!   which rounds `v_fma_f16` once with a two-sum and the packed ones
+//!   twice (one f16 ULP off where the f32 value lands on an f16 tie the
+//!   exact one is not on). Toward zero
+//!   (the title's around its 16-bit interpolation) or toward an infinity,
+//!   conversions, interpolation, `v_mad/mac_f16`, `v_fma_mix*` and the
+//!   transcendental and rounding operations stay on the f32 path.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -237,8 +258,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS,
-    VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_RAW_OFFSET_BITS,
+    VIEW_RAW_OFFSET_SHIFT, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES,
+    VIEW_WRITE_BITS, VIEW_WRITES,
 };
 
 /// The loop limit without an override: 2^20.
@@ -368,6 +390,12 @@ pub struct UserData {
     pub dword: u32,
 }
 
+/// The null raw buffer SRV index (UAV sits one slot below) for a host view
+/// heap of `views` slots (clamped to at least 4).
+pub fn null_buffer_view(views: u32) -> u32 {
+    views.max(4) - 2
+}
+
 /// How a translation is made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {
@@ -375,6 +403,29 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// The host runs native 16-bit float operations (D3D12
+    /// `Native16BitShaderOpsSupported`; SM 6.2 and up, which the
+    /// translation needs anyway) and rounds a 16-bit `FMad` once
+    /// (`host::Host::native16` checks both): f16 arithmetic is done in
+    /// `half` (module notes, "16-bit floats"), not in f32 with each result
+    /// rounded in integer code.
+    pub native16: bool,
+    /// View descriptor slots in the host's heap (indices above this are
+    /// clamped to the last slot, and null buffer views sit at
+    /// [`null_buffer_view`]); `0` means [`HEAP_VIEWS`].
+    pub host_heap_views: u32,
+}
+
+impl Options {
+    /// Effective view descriptor heap size, clamped to at least 4 (`0`
+    /// means [`HEAP_VIEWS`]).
+    pub fn heap_views(self) -> u32 {
+        if self.host_heap_views == 0 {
+            HEAP_VIEWS
+        } else {
+            self.host_heap_views.max(4)
+        }
+    }
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -499,6 +550,8 @@ pub fn emit_with(
         prims: prims.clone(),
         mesh_stride,
         view_marks: options.view_marks,
+        native16: options.native16,
+        host_heap_views: options.heap_views(),
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving

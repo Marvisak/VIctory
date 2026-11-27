@@ -18,7 +18,15 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats.
 pub const VIEW_STRIDES: u8 = 255;
 /// The bits of a view-stride table dword holding the stride.
-pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+pub const VIEW_STRIDE_BITS: u32 = (1 << 28) - 1;
+/// Shift of the 2-bit raw-view start bias (in dwords: 0..=3 -> 0, 4, 8, or 12
+/// bytes) in a view-stride table dword. Used when a structured buffer whose
+/// offset in its host copy is 4-byte aligned (not 16-byte aligned) is viewed
+/// raw from the preceding 16-byte boundary so overlapping views share one copy.
+pub const VIEW_RAW_OFFSET_SHIFT: u32 = 28;
+/// The bits of a view-stride table dword holding the raw-view start bias in
+/// dwords.
+pub const VIEW_RAW_OFFSET_BITS: u32 = 3 << VIEW_RAW_OFFSET_SHIFT;
 /// In a view-stride table dword: a typed buffer view of an integer format
 /// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
 pub const VIEW_INTEGER: u32 = 1 << 31;
@@ -56,6 +64,9 @@ pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// 16-bit types are used; with [`NATIVE_LOW_PRECISION`], as native
+    /// 16-bit ones (SM 6.2), not minimum precision.
+    pub const LOW_PRECISION: u64 = 1 << 5;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     /// UAVs in a vertex, geometry or mesh program.
@@ -63,6 +74,7 @@ pub(crate) mod flags {
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const NATIVE_LOW_PRECISION: u64 = 1 << 23;
     pub const ATOMIC64_TYPED: u64 = 1 << 27;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
@@ -146,6 +158,8 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// View descriptor slots in the host's heap.
+    pub host_heap_views: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -208,6 +222,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            host_heap_views: HEAP_VIEWS,
             lds: None,
             main,
             entry,
@@ -542,7 +557,11 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self.m.i32(if sampler {
+            HEAP_SAMPLERS
+        } else {
+            self.host_heap_views
+        } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
@@ -555,10 +574,10 @@ impl Shader {
             &[index, s, n],
         );
         let h = self.annotate(block, h, props.0, props.1);
-        // Unordered typed, raw and structured buffers (kinds 10-12), and
-        // typed buffers read (their format kind, `Lower::view_word`).
+        // Buffer views (kinds 10-12, both SRV and UAV): needed for write marks,
+        // typed integer format bits, and raw-view start bias (`Lower::view_word`).
         let kind = props.0 & 0xFF;
-        if !sampler && (kind == 10 || props.0 & 0x1000 != 0 && (11..=12).contains(&kind)) {
+        if !sampler && (10..=12).contains(&kind) {
             self.view_index.insert(h, index);
         }
         // Texture shader views (kinds 1-9).
@@ -580,9 +599,14 @@ impl Shader {
             (flags::SAMPLER_HEAP, uses.sampler_heap),
             (flags::WAVE_OPS, uses.wave),
             (flags::INT64, uses.int64),
+            (
+                flags::LOW_PRECISION | flags::NATIVE_LOW_PRECISION,
+                uses.native16,
+            ),
         ] {
             self.flags = if used { self.flags | flag } else { self.flags & !flag };
         }
+        self.m.native16 = uses.native16;
         // UAVs outside pixel and compute programs (the write and read marks
         // of vertex, geometry and mesh programs), as DXC counts them: UAV
         // ranges declared below, not UAVs indexed from the heap.
@@ -944,6 +968,9 @@ impl Shader {
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::NATIVE_LOW_PRECISION != 0 {
+            features |= 0x4_0000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;

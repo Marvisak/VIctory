@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use crate::descriptor::View;
 use crate::host::HostList;
@@ -296,6 +296,215 @@ pub(crate) struct Uploads(std::sync::MutexGuard<'static, Holder>);
 impl Uploads {
     pub(crate) fn list(&self) -> &HostList {
         self.0.0.as_ref().expect("made before it is handed out")
+    }
+}
+
+// ── VICTORY_HEAP_WORKER ──────────────────────────────────────────────────────
+//
+// A dedicated thread runs `texture::refresh_all` (the expensive texture
+// detiling and staging phase) in parallel with the submit thread's buffer
+// refresh work (`run_deferred` on the title lists).  The worker produces a
+// closed `HostList` with the texture upload commands ready to submit; the
+// submit thread collects it after its own buffer-refresh pass and prepends
+// it to the submission.
+//
+// Enabled with `VICTORY_HEAP_WORKER=1`; off by default.
+
+type WorkItem = Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)>;
+
+/// State shared between the submit thread and the heap worker.
+struct HeapWorker {
+    state: Mutex<HeapWorkerState>,
+    wake_worker: Condvar, // submit → worker: work available
+    wake_submit: Condvar, // worker → submit: result ready
+}
+
+struct HeapWorkerState {
+    /// Work the submit thread posted; `None` while idle.
+    pending: Option<WorkItem>,
+    /// A closed, ready-to-submit list produced by the worker.
+    result: WorkResult,
+    /// Set to signal a clean shutdown (never actually used at runtime).
+    shutdown: bool,
+}
+
+/// The worker's result for the current frame.
+enum WorkResult {
+    /// No result yet (worker still running or no work was posted).
+    Waiting,
+    /// Worker finished: the closed upload list (or `None` when nothing to upload).
+    Ready(Option<Arc<HostList>>),
+}
+
+static HEAP_WORKER: OnceLock<Arc<HeapWorker>> = OnceLock::new();
+
+/// Whether `VICTORY_HEAP_WORKER` is set, evaluated once.
+pub(crate) fn heap_worker_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_WORKER"))
+}
+
+/// Initialises the worker thread on the first call; returns the shared handle.
+fn heap_worker() -> Option<&'static Arc<HeapWorker>> {
+    HEAP_WORKER.get_or_init(|| {
+        let worker = Arc::new(HeapWorker {
+            state: Mutex::new(HeapWorkerState {
+                pending: None,
+                result: WorkResult::Waiting,
+                shutdown: false,
+            }),
+            wake_worker: Condvar::new(),
+            wake_submit: Condvar::new(),
+        });
+        let w = Arc::clone(&worker);
+        // The worker thread lives for the process lifetime.
+        std::thread::Builder::new()
+            .name("victory-heap-worker".into())
+            .spawn(move || heap_worker_thread(&w))
+            .expect("failed to spawn heap worker thread");
+        worker
+    });
+    HEAP_WORKER.get()
+}
+
+/// The heap worker thread body.
+fn heap_worker_thread(worker: &HeapWorker) {
+    // The worker's own upload list, made once and reset each pass (never
+    // shared with the submit thread's LIST static; the clones handed out
+    // keep it alive, and the worker's own Arc keeps it for reuse).
+    let mut list: Option<Arc<HostList>> = None;
+    loop {
+        // Block until the submit thread posts work.
+        let work = {
+            let mut guard = worker.state.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if guard.shutdown {
+                    return;
+                }
+                if guard.pending.is_some() {
+                    break guard.pending.take().unwrap_or_default();
+                }
+                guard = worker.wake_worker.wait(guard).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+
+        let result = if work.is_empty() {
+            // No textures: nothing to upload.
+            None
+        } else {
+            // Reset the worker's list, or make it on the first pass.
+            let made = match &list {
+                Some(l) => {
+                    l.reset();
+                    Some(l.clone())
+                }
+                None => match crate::host::host().and_then(|h| h.new_list().ok()) {
+                    None => None,
+                    Some(l) => {
+                        l.set_ours();
+                        let l = Arc::new(l);
+                        list = Some(l.clone());
+                        Some(l)
+                    }
+                },
+            };
+            match made {
+                None => None,
+                Some(list) => {
+                    let mut recorded = false;
+                    let mut readable = Vec::new();
+                    for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
+                        if let Some(upload) = upload {
+                            readable.extend(crate::texture::record_upload(&list, copy, staging, &upload));
+                            recorded = true;
+                        }
+                    }
+                    if !readable.is_empty() {
+                        // SAFETY: an open list; the barriers name live textures.
+                        unsafe { list.list.ResourceBarrier(&readable) };
+                    }
+                    list.close();
+                    // A list recording nothing is not run (its reset next
+                    // time is fine).
+                    recorded.then_some(list)
+                }
+            }
+        };
+
+        // Signal the submit thread with the result.
+        let mut guard = worker.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.result = WorkResult::Ready(result);
+        worker.wake_submit.notify_one();
+    }
+}
+
+/// Assembles the texture-upload work list from the heaps and table-textures
+/// of a submission, without running the refresh.  Used by both the
+/// synchronous path ([`uploads`]) and the worker path.
+pub(crate) fn collect_work(
+    heaps: &[Arc<Viewed>],
+    textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+) -> WorkItem {
+    let mut work: WorkItem = Vec::new();
+    let mut staged = std::collections::HashSet::new();
+    for (staging, copy) in textures {
+        if copy.host_written.load(Relaxed) {
+            continue;
+        }
+        if staged.insert(Arc::as_ptr(staging)) {
+            work.push((staging.clone(), copy.clone()));
+        }
+    }
+    let mut done = std::collections::HashSet::new();
+    for viewed in heaps {
+        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for &r in inner.textures.keys() {
+            if !done.insert(r) {
+                continue;
+            }
+            let Some(texture) = crate::resource::made_copy(r as This) else {
+                continue;
+            };
+            if !texture.used_recently() {
+                continue;
+            }
+            if texture.host_written.load(Relaxed) {
+                continue;
+            }
+            if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
+                && staged.insert(Arc::as_ptr(&staging))
+            {
+                work.push((staging, texture));
+            }
+        }
+    }
+    work
+}
+
+/// Posts texture-upload work to the heap worker and returns immediately.
+/// The submit thread must call [`wait_heap_worker`] to collect the result
+/// before submitting to the GPU.
+pub(crate) fn start_heap_worker(work: WorkItem) {
+    let Some(w) = heap_worker() else { return };
+    let mut guard = w.state.lock().unwrap_or_else(|e| e.into_inner());
+    guard.pending = Some(work);
+    guard.result = WorkResult::Waiting;
+    w.wake_worker.notify_one();
+}
+
+/// Waits for the heap worker started by [`start_heap_worker`] and returns
+/// the upload list it produced.  Returns `None` when no uploads were needed
+/// or the worker is unavailable.
+pub(crate) fn wait_heap_worker() -> Option<Arc<HostList>> {
+    let w = heap_worker()?;
+    let mut guard = w.state.lock().unwrap_or_else(|e| e.into_inner());
+    while let WorkResult::Waiting = &guard.result {
+        guard = w.wake_submit.wait(guard).unwrap_or_else(|e| e.into_inner());
+    }
+    if let WorkResult::Ready(list) = std::mem::replace(&mut guard.result, WorkResult::Waiting) {
+        list
+    } else {
+        None
     }
 }
 

@@ -285,23 +285,25 @@ pub(crate) fn held_times() -> Vec<(u64, f64, f64)> {
     out
 }
 
-/// (page, other page) for the pages (page numbers) showing the same memory
-/// as `pages` elsewhere.
-fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
-    pages
+/// Guards the other mappings of `pages`, returning those that still have an
+/// unguarded mapping (cannot be taken yet). Skips allocation when none of
+/// `pages` is aliased.
+fn unguarded_aliases(g: &mut Guards, pages: &[usize]) -> BTreeSet<usize> {
+    if g.alias_of.is_empty() || !pages.iter().any(|p| g.alias_of.contains_key(p)) {
+        return BTreeSet::new();
+    }
+    let pairs: Vec<(usize, usize)> = pages
         .iter()
         .flat_map(|&p| g.alias_of.get(&p).into_iter().flatten().map(move |&a| (p, a)))
-        .collect()
-}
-
-/// Guards the other mappings of taken pages, returning those that still
-/// have an unguarded mapping (cannot be taken yet).
-fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
+        .collect();
     if pairs.is_empty() {
         return BTreeSet::new();
     }
     let others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
-    let guarded: BTreeSet<usize> = protect(g, &others).into_iter().collect();
+    let mut guarded = BTreeSet::new();
+    protect_each(g, &others, None, |page| {
+        guarded.insert(page);
+    });
     pairs
         .iter()
         .filter(|(_, a)| !guarded.contains(a))
@@ -506,16 +508,17 @@ impl Tracked {
         drop(waited);
         #[cfg(feature = "diagnostics")]
         let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
-        let others = aliases(&g, &whole);
-        let unguarded = guard_aliases(&mut g, &others);
+        let unguarded = unguarded_aliases(&mut g, &whole);
         #[cfg(feature = "diagnostics")]
         drop(asked);
-        whole.retain(|p| !unguarded.contains(p));
+        if !unguarded.is_empty() {
+            whole.retain(|p| !unguarded.contains(p));
+        }
         let mut unmapped = Vec::new();
-        for page in protect_noting(&mut g, &whole, &mut unmapped) {
+        protect_each(&mut g, &whole, Some(&mut unmapped), |page| {
             changed.remove(&page);
             self.changed.taken(page);
-        }
+        });
         set_dirty(self.changed.2, !changed.is_empty());
         drop(changed);
         drop(g);
@@ -545,16 +548,22 @@ impl Tracked {
     pub(crate) fn taken(&self, pages: &[usize]) {
         let mut g = guards();
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        let others = aliases(&g, pages);
-        let unguarded = guard_aliases(&mut g, &others);
-        let pages: Vec<usize> = pages
-            .iter()
-            .copied()
-            .filter(|p| !unguarded.contains(p))
-            .collect();
-        for page in protect(&mut g, &pages) {
-            changed.remove(&page);
-            self.changed.taken(page);
+        let unguarded = unguarded_aliases(&mut g, pages);
+        if unguarded.is_empty() {
+            protect_each(&mut g, pages, None, |page| {
+                changed.remove(&page);
+                self.changed.taken(page);
+            });
+        } else {
+            let filtered: Vec<usize> = pages
+                .iter()
+                .copied()
+                .filter(|p| !unguarded.contains(p))
+                .collect();
+            protect_each(&mut g, &filtered, None, |page| {
+                changed.remove(&page);
+                self.changed.taken(page);
+            });
         }
         set_dirty(self.changed.2, !changed.is_empty());
     }
@@ -638,16 +647,41 @@ impl Tracked {
     }
 }
 
-/// Makes `pages` read-only where not already (in runs), and returns those
-/// now guarded or with nothing mapped (taken either way); a page that is
-/// mapped but cannot be guarded is left out (it stays changed).
-fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
-    protect_noting(g, pages, &mut Vec::new())
+/// Makes `pages` read-only where not already (in runs), calling `on_taken`
+/// for each page now guarded or with nothing mapped (appended to
+/// `unmapped_pages` when provided). Skips filtering allocations when no
+/// page in `pages` overlaps an active `Writing` range.
+fn protect_each(
+    g: &mut Guards,
+    pages: &[usize],
+    mut unmapped_pages: Option<&mut Vec<usize>>,
+    mut on_taken: impl FnMut(usize),
+) {
+    if pages.is_empty() {
+        return;
+    }
+    if g.busy.is_empty()
+        || !pages
+            .iter()
+            .any(|&p| g.busy.iter().any(|&(a, b)| (a..b).contains(&p)))
+    {
+        protect_slice(g, pages, unmapped_pages.as_deref_mut(), &mut on_taken);
+        return;
+    }
+    let filtered: Vec<usize> = pages
+        .iter()
+        .copied()
+        .filter(|&p| !g.busy.iter().any(|&(a, b)| (a..b).contains(&p)))
+        .collect();
+    protect_slice(g, &filtered, unmapped_pages, &mut on_taken);
 }
 
-/// [`protect`], also listing in `unmapped` the pages taken because nothing
-/// is mapped there.
-fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usize>) -> Vec<usize> {
+fn protect_slice(
+    g: &mut Guards,
+    pages: &[usize],
+    mut unmapped_pages: Option<&mut Vec<usize>>,
+    on_taken: &mut impl FnMut(usize),
+) {
     #[cfg(feature = "diagnostics")]
     let counted = |calls: u64, pages: u64| {
         crate::copystat::add(crate::copystat::C::ProtectCalls, calls);
@@ -670,13 +704,10 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
         n == 0 || info.State != MEM_COMMIT
     };
-    let mut taken = Vec::with_capacity(pages.len());
-    let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
-    let pages: Vec<usize> = pages.iter().copied().filter(|&p| !busy(p)).collect();
     let mut i = 0;
     while i < pages.len() {
         if g.protected.contains(&pages[i]) {
-            taken.push(pages[i]);
+            on_taken(pages[i]);
             i += 1;
             continue;
         }
@@ -691,20 +722,23 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         counted(1, run.len() as u64);
         if set(run[0], run[run.len() - 1] + 1) {
             g.protected.extend(run);
-            taken.extend(run);
+            for &page in run {
+                on_taken(page);
+            }
             continue;
         }
         for &page in run {
             if set(page, page + 1) {
                 g.protected.insert(page);
-                taken.push(page);
+                on_taken(page);
             } else if unmapped(page) {
-                taken.push(page);
-                unmapped_pages.push(page);
+                on_taken(page);
+                if let Some(unmapped_list) = unmapped_pages.as_deref_mut() {
+                    unmapped_list.push(page);
+                }
             }
         }
     }
-    taken
 }
 
 /// Pages `[first, last)` changed, and so the pages showing the same memory
@@ -712,7 +746,42 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
 fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+    if first >= last {
+        return false;
+    }
+    if first + 1 == last {
+        let guarded = g.protected.contains(&first);
+        let others = g.alias_of.get(&first).cloned();
+        #[cfg(feature = "diagnostics")]
+        if let Some(others) = &others {
+            let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
+            crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
+        }
+        mark_page_changed(g, first, save);
+        if let Some(others) = &others {
+            for &page in others {
+                mark_page_changed(g, page, save);
+            }
+        }
+        if guarded {
+            open(g, first);
+        }
+        if let Some(others) = others {
+            for page in others {
+                open(g, page);
+            }
+        }
+        return guarded;
+    }
     let guarded = g.protected.range(first..last).next().is_some();
+    let has_aliases = !g.alias_of.is_empty() && g.alias_of.range(first..last).next().is_some();
+    if !has_aliases {
+        mark_changed(g, first, last, save);
+        if guarded {
+            open_guarded(g, first, last);
+        }
+        return guarded;
+    }
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
@@ -724,21 +793,41 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     // after it would keep that write as the page's old bytes.
     mark_changed(g, first, last, save);
     for &page in &others {
-        mark_changed(g, page, page + 1, save);
+        mark_page_changed(g, page, save);
     }
     open_guarded(g, first, last);
     for page in others {
-        open_guarded(g, page, page + 1);
+        open(g, page);
     }
     guarded
 }
 
 /// Gives write access back to the pages of `[first, last)` we guarded.
 fn open_guarded(g: &mut Guards, first: usize, last: usize) {
-    let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for page in guarded {
+    let mut at = first;
+    while let Some(&page) = g.protected.range(at..last).next() {
         open(g, page);
+        at = page + 1;
     }
+}
+
+/// Marks a single page `page` changed in every tracker holding it.
+fn mark_page_changed(g: &mut Guards, page: usize, save: bool) {
+    let Some(holders) = g.holders.get(&page) else {
+        return;
+    };
+    for c in holders {
+        let first_write = {
+            let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
+            set_dirty(c.2, true);
+            set.insert(page)
+        };
+        if first_write && save {
+            c.save(page);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    g.written.insert(page);
 }
 
 /// Marks `[first, last)` changed in the trackers holding its pages. With
@@ -877,10 +966,12 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     // If the new mapping cannot be guarded (a write the guards do not see is
     // under way through it), the page is changed; its bytes now may hold that
     // write already, so nothing is saved of them.
-    if others.iter().any(|&o| g.protected.contains(&(o / PAGE)))
-        && protect(&mut g, &[page]).is_empty()
-    {
-        changed(&mut g, page, page + 1, false);
+    if others.iter().any(|&o| g.protected.contains(&(o / PAGE))) {
+        let mut guarded = false;
+        protect_each(&mut g, &[page], None, |_| guarded = true);
+        if !guarded {
+            changed(&mut g, page, page + 1, false);
+        }
     }
 }
 
@@ -1445,5 +1536,76 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// Single-page and multi-page `changed` + `taken` round-trips open and
+    /// re-guard every page cleanly without skipping aliases or busy runs.
+    #[test]
+    fn single_and_multi_page_guard_paths_preserve_tracking_invariants() {
+        let p = pool(4);
+        let t = track(p, 4 * PAGE, true).expect("tracked");
+        assert_eq!(t.take(p, p + 4 * PAGE), [(p, p + 4 * PAGE)]);
+        assert!(t.clean());
+
+        // Single-page `changed` fast path via `writing` opens only that page.
+        drop(writing(p + PAGE + 4, 8));
+        assert!(t.changed(p / PAGE + 1));
+        assert!(!t.changed(p / PAGE));
+        // Re-guard that single page via `taken`.
+        t.taken(&[p / PAGE + 1]);
+        assert!(!t.changed(p / PAGE + 1));
+        assert!(t.clean());
+
+        // Multi-page `changed` + `open_guarded` without aliases opens the whole span.
+        drop(writing(p, 3 * PAGE));
+        for k in 0..3 {
+            assert!(t.changed(p / PAGE + k));
+        }
+        assert!(!t.changed(p / PAGE + 3));
+
+        // While a page is `busy`, `taken` leaves it changed.
+        let busy = writing(p + PAGE, 16);
+        t.taken(&[p / PAGE, p / PAGE + 1, p / PAGE + 2]);
+        assert!(!t.changed(p / PAGE));
+        assert!(t.changed(p / PAGE + 1));
+        assert!(!t.changed(p / PAGE + 2));
+        drop(busy);
+        drop(t);
+        free(p);
+    }
+
+    #[test]
+    #[ignore = "microbenchmark: cargo test --release -p victory-gpu watch_guard_lock_alloc_bench -- --ignored --nocapture"]
+    fn watch_guard_lock_alloc_bench() {
+        let p = pool(64);
+        let t = track(p, 64 * PAGE, true).expect("tracked");
+        assert_eq!(t.take(p, p + 64 * PAGE), [(p, p + 64 * PAGE)]);
+        let pages: Vec<usize> = (0..64).map(|i| p / PAGE + i).collect();
+
+        // Warm up once.
+        for &pg in &pages {
+            drop(writing(pg * PAGE, 8));
+            t.taken(&[pg]);
+        }
+
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            // Simulate 1,200 marked copy-back single-page `taken` + `writing`
+            // cycles per frame under GUARDS.
+            for round in 0..1_200usize {
+                let pg = pages[round % pages.len()];
+                drop(writing(pg * PAGE, 8));
+                t.taken(&[pg]);
+            }
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        println!(
+            "1200x (writing + taken single-page) median: {:.3} ms",
+            samples[3].as_secs_f64() * 1e3
+        );
+        drop(t);
+        free(p);
     }
 }

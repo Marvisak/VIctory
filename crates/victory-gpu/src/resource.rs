@@ -233,8 +233,14 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 /// 24-bit depth it never tested EQUAL against a draw on the RX 6700 XT.
 /// shortcut: a depth bias on such a target counts in float steps, not
 /// 1/65535; scale it if a title's 16-bit depth biased draws show acne.
+/// NVIDIA hosts also reject 16-bit B5G6R5 (85), B5G5R5A1 (86) and B4G4R4A4 (115)
+/// for render target and typed unordered access:
+/// B8G8R8A8 (format 87) stands in for host textures and views.
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
+        85 => 87,
+        86 => 87,
+        115 => 87,
         118 => 20,
         119 => 21,
         120 => 22,

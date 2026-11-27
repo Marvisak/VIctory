@@ -16,7 +16,9 @@
 //! themselves, every buffer range the heap's views reach
 //! (`crate::bindless`).
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -978,15 +980,87 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// Counts copies made and title buffers released: [`all`] may differ when
 /// it changed.
-static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// The generation of [`all`]: read it before calling that.
 pub(crate) fn generation() -> u64 {
-    GENERATION.load(std::sync::atomic::Ordering::Acquire)
+    GENERATION.load(Ordering::Acquire)
 }
 
 fn changed() {
-    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    GENERATION.fetch_add(1, Ordering::Release);
+}
+
+/// Bumped whenever the result of [`find`] may differ from a cached call:
+/// a buffer registered or released, or a shadow first made.
+/// Used by [`LOOKUP_CACHE`] (`VICTORY_LOOKUP_CACHE`).
+static LOOKUP_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn lookup_changed() {
+    LOOKUP_GEN.fetch_add(1, Ordering::Release);
+}
+
+/// Per-thread cache of recent [`find`] results (opt-in: `VICTORY_LOOKUP_CACHE=1`).
+///
+/// Stores up to [`CACHE_ENTRIES`] exact `(address, len)` queries with the
+/// shadow they returned, valid while the cache's `epoch` matches `LOOKUP_GEN`.
+/// Entries are keyed by the exact query, not by the shadow's range: a
+/// nested title buffer inside a larger one makes different queries in the
+/// same range resolve to different shadows, so only an identical query is
+/// answered from the cache.
+struct LookupCache {
+    epoch: u64,
+    entries: [(u64, u64); CACHE_ENTRIES], // (address, len) asked
+    arcs: [Option<Arc<Shadow>>; CACHE_ENTRIES],
+    next: usize,
+}
+
+const CACHE_ENTRIES: usize = 8;
+
+impl LookupCache {
+    const fn new() -> Self {
+        LookupCache { epoch: u64::MAX, entries: [(0, 0); CACHE_ENTRIES], arcs: [const { None }; CACHE_ENTRIES], next: 0 }
+    }
+
+    /// Drops every entry if the generation changed.
+    fn validate(&mut self) {
+        let g = LOOKUP_GEN.load(Ordering::Acquire);
+        if self.epoch != g {
+            self.epoch = g;
+            self.entries = [(0, 0); CACHE_ENTRIES];
+            self.arcs = [const { None }; CACHE_ENTRIES];
+            self.next = 0;
+        }
+    }
+
+    /// The cached shadow of the exact query `(address, len)`, or `None`.
+    fn get(&mut self, address: u64, len: u64) -> Option<Arc<Shadow>> {
+        self.validate();
+        self.entries
+            .iter()
+            .position(|&(a, l)| a == address && l == len)
+            .and_then(|i| self.arcs[i].clone())
+    }
+
+    /// Remembers that the query `(address, len)` returned `shadow`, in a
+    /// ring that evicts the oldest entry.
+    fn insert(&mut self, address: u64, len: u64, shadow: &Arc<Shadow>) {
+        self.validate();
+        let i = self.next % CACHE_ENTRIES;
+        self.entries[i] = (address, len);
+        self.arcs[i] = Some(shadow.clone());
+        self.next = self.next.wrapping_add(1);
+    }
+}
+
+/// Whether `VICTORY_LOOKUP_CACHE` is set, checked once.
+fn lookup_cache_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_LOOKUP_CACHE"))
+}
+
+thread_local! {
+    static CACHE: RefCell<LookupCache> = const { RefCell::new(LookupCache::new()) };
 }
 
 /// A title buffer exists at `start` (`len` bytes).
@@ -998,10 +1072,18 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    // A new buffer entry changes which shadow find() returns for addresses
+    // that fall inside it; invalidate per-thread lookup caches.
+    lookup_changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
+    // Invalidate before the entry is dropped so that any racing cache hit
+    // on another thread sees the generation mismatch before accessing the
+    // entry.  The Arc in each cache entry keeps the Shadow alive until
+    // that thread evicts or invalidates its own entry.
+    lookup_changed();
     if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
         changed();
     }
@@ -1010,6 +1092,16 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    // Per-thread cache: skip the global Mutex when the same address+len is
+    // looked up repeatedly in the same frame (the submit thread calls this
+    // 245–540k times a frame on the same few buffers).
+    if lookup_cache_on()
+        && let Ok(Some(shadow)) = CACHE.try_with(|c| {
+            c.try_borrow_mut().ok().and_then(|mut g| g.get(address, len))
+        })
+    {
+        return Some(shadow);
+    }
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -1046,8 +1138,20 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         }
         entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
         changed();
+        // A first shadow made for this address range: earlier cached
+        // lookups returned None, which the cache does not store, so only
+        // the entries of other ranges stay valid; still, bump so a lookup
+        // that ran while the shadow was being made is not skipped.
+        lookup_changed();
     }
-    entry.shadow.clone()
+    let shadow = entry.shadow.clone();
+    if let (Some(shadow), true) = (&shadow, lookup_cache_on()) {
+        let _ = CACHE.try_with(|c| {
+            c.try_borrow_mut()
+                .map(|mut g| g.insert(address, len, shadow))
+        });
+    }
+    shadow
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand

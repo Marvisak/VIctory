@@ -11,7 +11,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
+use super::shader::{
+    Shader, VIEW_INTEGER, VIEW_RAW_OFFSET_SHIFT, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES,
+    flags,
+};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -21,6 +24,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod half;
+mod marks;
 
 type Why = &'static str;
 
@@ -87,6 +92,21 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    /// The host has native 16-bit float operations
+    /// ([`super::Options::native16`]).
+    pub native16: bool,
+    /// View descriptor slots in the host's heap (`0` means [`super::HEAP_VIEWS`]).
+    pub host_heap_views: u32,
+}
+
+impl Parts<'_> {
+    fn heap_views(&self) -> u32 {
+        if self.host_heap_views == 0 {
+            super::HEAP_VIEWS
+        } else {
+            self.host_heap_views.max(4)
+        }
+    }
 }
 
 enum Stop {
@@ -550,6 +570,7 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.host_heap_views = x.heap_views();
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -1798,6 +1819,14 @@ impl<'a> Lower<'a> {
             let h = self.handle(site, src, false, props)?;
             let off = match self.root_view_offset(src) {
                 Some(at) => self.s.m.bin(self.cur, Bin::Add, off, at),
+                None if self.is_heap_direct(src)
+                    || self.used_kind(src).is_some_and(|u| u.stride >= 4) =>
+                {
+                    match self.view_raw_bias(h) {
+                        Some(bias) => self.s.m.bin(self.cur, Bin::Add, off, bias),
+                        None => off,
+                    }
+                }
                 None => off,
             };
             return Ok((h, off));
@@ -4330,7 +4359,7 @@ impl<'a> Lower<'a> {
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
+        let (props, image, div_stride) = match &ui.fields {
             Fields::Image { dim, .. } => {
                 let kind = match dim {
                     0 => 1,
@@ -4340,23 +4369,25 @@ impl<'a> Lower<'a> {
                     5 => 7,
                     _ => return Err("an image dimension (cube or MSAA)"),
                 };
-                ((kind | u, 0x409), Some(kind))
+                ((kind | u, 0x409), Some(kind), None)
             }
             Fields::Buffer { idxen, format, .. } => {
                 let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
+                let (props, div) = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
                 {
-                    (10 | u, 0x409)
+                    ((10 | u, 0x409), None)
                 } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
+                    // Structured buffers are viewed raw on the host; raw
+                    // `getDimensions` returns bytes, so divide by the stride.
+                    ((11 | u, 0), Some(stride))
                 } else {
-                    (11 | u, 0)
+                    ((11 | u, 0), None)
                 };
                 if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
                     return Err("a constant buffer's descriptor read as data");
                 }
-                (props, None)
+                (props, None, div)
             }
             // A buffer the code reads with scalar loads (`buf[buf.Length - 1]`
             // at a uniform index): structured by the used-resource entry's
@@ -4366,12 +4397,12 @@ impl<'a> Lower<'a> {
                 if used.kind == ResourceType::Cbv {
                     return Err("a constant buffer's descriptor read as data");
                 }
-                let props = match used.stride {
-                    0 | 1 => (11 | u, 0),
-                    s if s.is_multiple_of(4) => (12 | u, s),
+                let div = match used.stride {
+                    0 | 1 => None,
+                    s if s.is_multiple_of(4) => Some(s),
                     _ => return Err("a scalar-loaded buffer of odd stride read as data"),
                 };
-                (props, None)
+                ((11 | u, 0), None, div)
             }
             _ => return Err("a scalar memory read as data"),
         };
@@ -4425,7 +4456,19 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                let mut records = field(self, 0);
+                if (div_stride.is_some() || self.is_heap_direct(&src))
+                    && let Some(bias) = self.view_raw_bias(h)
+                {
+                    records = self.s.m.bin(c, Bin::Sub, records, bias);
+                }
+                if let Some(stride) = div_stride {
+                    let s = self.s.m.i32(stride);
+                    records = self.s.m.bin(c, Bin::UDiv, records, s);
+                }
+                vec![(2, records)]
+            }
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
@@ -4587,6 +4630,9 @@ impl<'a> Lower<'a> {
             let word = self.s.m.bin(c, Bin::Shl, word, k2);
             let bit = self.s.m.bin(c, Bin::And, n, k31);
             let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+            let lead = self.mark_lead(n);
+            let led = self.begin_guarded(lead);
+            let c = self.cur;
             // Most writes find their page marked: a load, not an atomic.
             let old = self.raw_dword(bitmap, word);
             let set = self.s.m.bin(c, Bin::And, old, bit);
@@ -4600,6 +4646,7 @@ impl<'a> Lower<'a> {
             // Operation 2 is OR.
             self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
             self.end_guarded(inner, &[]);
+            self.end_guarded(led, &[]);
         }
         self.end_guarded(outer, &[]);
     }
@@ -4636,6 +4683,20 @@ impl<'a> Lower<'a> {
             self.s.m.cmp(c, pred::NE, x, zero)
         });
         Some((int, signed))
+    }
+
+    /// Byte offset (`0`, `4`, `8`, or `12`) from a raw view's 16-byte-aligned
+    /// host descriptor start to the title view's actual start, stored in
+    /// [`VIEW_STRIDES`] bits 28..29; `None` if the handle's heap index is not
+    /// known.
+    fn view_raw_bias(&mut self, h: V) -> Option<V> {
+        let index = *self.s.view_index.get(&h)?;
+        let word = self.view_word(index);
+        let c = self.cur;
+        let shift = self.s.m.i32(VIEW_RAW_OFFSET_SHIFT - 2);
+        let mask = self.s.m.i32(0xC);
+        let shifted = self.s.m.bin(c, Bin::LShr, word, shift);
+        Some(self.s.m.bin(c, Bin::And, shifted, mask))
     }
 
     /// Title memory at a raw GPU address (decision 0005: the unified-memory
@@ -5549,7 +5610,7 @@ impl<'a> Lower<'a> {
             return index;
         }
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let last = self.s.m.i32(self.s.host_heap_views - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
@@ -5562,7 +5623,7 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
+        let null = super::null_buffer_view(self.s.host_heap_views) - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
     }
@@ -6973,6 +7034,9 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
+        if let Some(r) = self.valu16_native(inst, name, guard) {
+            return r;
+        }
         let c = self.cur;
         let i32t = self.s.t.i32;
         let f32t = self.s.t.f32;
@@ -7010,18 +7074,7 @@ impl<'a> Lower<'a> {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
             let acc = if matches!(name, "v_fmac_f16" | "v_mac_f16") {
                 // The accumulator is the destination's half that is written.
-                let Some(Operand::Vector { reg, .. }) = v.dst else {
-                    return Err("an accumulator");
-                };
-                let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
-                let x = if v.opsel >> 3 & 1 != 0 {
-                    let k16 = self.s.m.i32(16);
-                    self.s.m.bin(c, Bin::LShr, x, k16)
-                } else {
-                    x
-                };
-                let m = self.s.m.i32(0xFFFF);
-                let x = self.s.m.bin(c, Bin::And, x, m);
+                let x = self.mac_acc_bits(inst)?;
                 self.s
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
             } else {
@@ -7313,6 +7366,7 @@ impl<'a> Lower<'a> {
         }
         let c = self.cur;
         let f32t = self.s.t.f32;
+        let native = float && self.native16();
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
@@ -7322,7 +7376,17 @@ impl<'a> Lower<'a> {
                 } else {
                     self.packed_src(inst, k, high, float)?
                 };
-                if float {
+                if native {
+                    // The sign flipped on the bits, as `half` arithmetic
+                    // reads them.
+                    let neg = if high { v.neg_hi } else { v.neg };
+                    xs.push(if neg >> k & 1 != 0 {
+                        let sign = self.s.m.i32(0x8000);
+                        self.s.m.bin(c, Bin::Xor, h, sign)
+                    } else {
+                        h
+                    });
+                } else if float {
                     let mut f = self
                         .s
                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
@@ -7336,7 +7400,16 @@ impl<'a> Lower<'a> {
                     xs.push(h);
                 }
             }
-            let r = if float {
+            let r = if native {
+                let r = match op {
+                    "add_f16" => self.half_bin(Bin::Add, xs[0], xs[1]),
+                    "mul_f16" => self.half_bin(Bin::Mul, xs[0], xs[1]),
+                    "min_f16" => self.max_min16(false, xs[0], xs[1]),
+                    "max_f16" => self.max_min16(true, xs[0], xs[1]),
+                    _ => self.fma16(xs[0], xs[1], xs[2]),
+                };
+                if v.clamp { self.clamp16(r) } else { r }
+            } else if float {
                 let mut f = match op {
                     "add_f16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
                     "mul_f16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),
@@ -8360,6 +8433,9 @@ impl<'a> Lower<'a> {
         let word = self.s.m.bin(c, Bin::Shl, word, k2);
         let bit = self.s.m.bin(c, Bin::And, n, k31);
         let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+        let lead = self.mark_lead(n);
+        let led = self.begin_guarded(lead);
+        let c = self.cur;
         // Most reads find their slot marked: a load, not an atomic.
         let old = self.raw_dword(bitmap, word);
         let set = self.s.m.bin(c, Bin::And, old, bit);
@@ -8369,6 +8445,7 @@ impl<'a> Lower<'a> {
         // Operation 2 is OR.
         self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
         self.end_guarded(at, &[]);
+        self.end_guarded(led, &[]);
     }
 
     fn image_op(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -9545,11 +9622,11 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
                     let s = self.s.m.i32(stride);
                     let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
                     let byte = self.s.m.bin(self.cur, Bin::Add, row, off);
-                    (h, [index, off, iu], byte)
+                    let (h, byte) = self.raw_view(site, src, byte, 4, (11 | u, 0), true, guard)?;
+                    (h, [byte, iu, iu], byte)
                 }
                 None => {
                     let (h, off) = self.raw_view(site, src, off, 4, (11 | u, 0), true, guard)?;
@@ -9698,11 +9775,14 @@ impl<'a> Lower<'a> {
                         if stride < 4 || !stride.is_multiple_of(4) {
                             return Err("a structured buffer of unknown stride");
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
                         let s = self.s.m.i32(stride);
                         let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
-                        (byte, bytes) = (self.s.m.bin(self.cur, Bin::Add, row, off), 4 * count);
+                        let off = self.s.m.bin(self.cur, Bin::Add, row, off);
+                        let n = 4 * count;
+                        let (h, off) =
+                            self.raw_view(site, src, off, n, (11 | u, 0), true, guard)?;
+                        args.extend([h, off, iu]);
+                        (byte, bytes) = (off, n);
                     }
                     None => {
                         let n = 4 * count;
@@ -9808,14 +9888,19 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let s = self.s.m.i32(stride);
+                    let row = self.s.m.bin(c, Bin::Mul, index, s);
+                    let off = self.s.m.bin(c, Bin::Add, row, off);
+                    let bytes = 4 * count;
+                    let (h, off) =
+                        self.raw_view(site, src, off, bytes, (11 | u, 0), false, guard)?;
                     self.s.op(
-                        c,
+                        self.cur,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         139,
-                        &[h, index, off, mask, align],
+                        &[h, off, iu, mask, align],
                     )
                 }
                 None => {
@@ -10983,6 +11068,8 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            native16: false,
+            host_heap_views: 0,
         })
         .map(|_| ())
     }
@@ -11034,6 +11121,8 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            native16: false,
+            host_heap_views: 0,
         })
     }
 
@@ -11254,6 +11343,8 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            native16: false,
+            host_heap_views: 0,
         })
         .unwrap();
 
@@ -12176,6 +12267,8 @@ mod tests {
                 prims: vec![],
                 mesh_stride: 0,
                 view_marks: false,
+                native16: false,
+                host_heap_views: 0,
             })
             .unwrap();
             assert!(lowered.wave_ops);

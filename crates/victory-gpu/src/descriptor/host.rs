@@ -13,6 +13,10 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at, views_current};
 use crate::host::host;
 
+#[cfg(test)]
+#[path = "overlap_test.rs"]
+mod overlap_test;
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -20,7 +24,7 @@ pub(crate) struct HostHeap {
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// where the host takes them, else [`CAPPED_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -33,7 +37,7 @@ pub(crate) struct HostHeap {
     kept: Mutex<Vec<Kept>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Mutex<DynamicSlots>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -95,13 +99,20 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// each a device removal shortly after; #59).
 const DYNAMIC: u32 = 1 << 18;
 
-/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
-const MIN_DYNAMIC: u32 = 1 << 16;
+/// Dynamic slots kept on a capped heap when the title's slots plus
+/// [`DYNAMIC`] exceed the host limit (`1 << 16` ran out in the world,
+/// while `1 << 17` leaves room for the title's slots and pairs).
+const CAPPED_DYNAMIC: u32 = 1 << 17;
+
+/// Slot pairs kept on a capped heap for unified title memory copies
+/// (`crate::memory`; measured in the prologue on an RTX 4060 / 1M-slot
+/// host, where ~4,100 copies take ~8,200 slots).
+const CAPPED_PAIRS: u32 = 24_576;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
+        let views = crate::host::host_heap_views();
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
         } else {
@@ -121,14 +132,14 @@ impl HostHeap {
         };
         // Every slot a shader can index (title slots, also past a capped
         // heap, and dynamic ones): shaders read the table as a root view,
-        // which has no bounds, at indices clamped below `HEAP_VIEWS`.
+        // which has no bounds, at indices clamped below `host_heap_views()`.
         let strides = (!sampler)
-            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
+            .then(|| host.upload_buffer(u64::from(count.max(views)) * 4))
             .flatten()
             .map(|(buffer, data)| (buffer, data as usize));
         let marks = (!sampler)
             .then(|| {
-                let bytes = u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 8;
+                let bytes = u64::from(count.max(views)) * 8;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 crate::host::name(&buffer, || "view marks".into());
                 // Every slot unmarked (all ones) until a view is made there.
@@ -139,9 +150,9 @@ impl HostHeap {
             .flatten();
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
-        // Translated shaders clamp their indices below `HEAP_VIEWS` or
+        // Translated shaders clamp their indices below `views` or
         // `HEAP_SAMPLERS`: slots up to there exist and stay null.
-        let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
+        let samplers = victory_shader::emit::HEAP_SAMPLERS;
         let (heap, count, extra) = if sampler {
             match make(count.max(samplers)) {
                 Ok(heap) => (heap, count, 0),
@@ -153,20 +164,29 @@ impl HostHeap {
         } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
             (heap, count, DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+            // A heap capped below `count + DYNAMIC`: reserve dynamic slots,
+            // memory pairs and the 3 top null/clamp slots inside `views`.
+            let cap = views.max(PORTABLE_VIEWS);
+            let reserve = CAPPED_PAIRS + 3;
+            if count + CAPPED_DYNAMIC + reserve <= cap {
+                match make((count + CAPPED_DYNAMIC).max(views)) {
+                    Ok(heap) => (heap, count, CAPPED_DYNAMIC),
+                    Err(e) => {
+                        tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                        return None;
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
+            } else {
+                let title_slots = cap.saturating_sub(CAPPED_DYNAMIC + reserve);
+                tracing::warn!(
+                    title_count = count,
+                    cap,
+                    kept = title_slots,
+                    dynamic = CAPPED_DYNAMIC,
+                    pairs = CAPPED_PAIRS,
+                    "host view heap capped"
+                );
+                (make(cap).ok()?, title_slots, CAPPED_DYNAMIC)
             }
         };
         // SAFETY: a live heap.
@@ -196,9 +216,9 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new(DynamicSlots::new(extra)),
             pairs: Mutex::new((count + extra, Vec::new())),
-            pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
+            pairs_end: match victory_shader::emit::null_buffer_view(views) {
                 null if !sampler && null > count + extra && null < total => null - 1,
                 _ => total,
             },
@@ -222,7 +242,7 @@ impl HostHeap {
         // What shaders read instead of a slot without a buffer view where
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.
-        let null = victory_shader::emit::NULL_BUFFER_VIEW;
+        let null = victory_shader::emit::null_buffer_view(views);
         if !sampler && null > count + extra && null < total {
             h.raw_view_at(null, None, 0, 0, false);
             h.raw_view_at(null - 1, None, 0, 0, true);
@@ -309,6 +329,155 @@ pub(crate) fn fallback_samplers() -> Option<&'static HostHeap> {
     .as_ref()
 }
 
+/// Dynamic-slot bitmap (`1` = taken, `0` = free, 64 slots per word) with a
+/// next-fit cursor and the smallest run size that failed since a slot was
+/// last freed.
+struct DynamicSlots {
+    len: u32,
+    next: u32,
+    min_failed: u32,
+    words: Vec<u64>,
+}
+
+impl DynamicSlots {
+    fn new(len: u32) -> Self {
+        let mut words = vec![0u64; (len as usize).div_ceil(64)];
+        let rem = len as usize % 64;
+        if rem != 0
+            && let Some(last) = words.last_mut()
+        {
+            *last = !0u64 << rem;
+        }
+        Self {
+            len,
+            next: 0,
+            min_failed: u32::MAX,
+            words,
+        }
+    }
+
+    fn take(&mut self, n: u32) -> Option<u32> {
+        if n == 0 || n > self.len || n >= self.min_failed {
+            return None;
+        }
+        let (need, end, cursor) = (n as usize, self.len as usize, self.next as usize);
+        // Search from `next` on, then from the start (extending past cursor by
+        // n - 1 so contiguous runs crossing the cursor are not missed).
+        let second_end = cursor.saturating_add(need - 1).min(end);
+        let found = find_free_run(&self.words, cursor, end, need).or_else(|| {
+            (cursor > 0)
+                .then(|| find_free_run(&self.words, 0, second_end, need))
+                .flatten()
+        });
+        let Some(first) = found else {
+            self.min_failed = self.min_failed.min(n);
+            return None;
+        };
+        set_bits(&mut self.words, first, need);
+        self.next = ((first + need) % end) as u32;
+        Some(first as u32)
+    }
+
+    fn release(&mut self, at: u32, n: u32) {
+        let start = (at as usize).min(self.len as usize);
+        let end = (at as usize).saturating_add(n as usize).min(self.len as usize);
+        if start < end && clear_bits(&mut self.words, start, end - start) {
+            self.min_failed = u32::MAX;
+        }
+    }
+}
+
+/// Earliest run of `need` zero bits wholly inside `[from, to)`.
+fn find_free_run(words: &[u64], from: usize, to: usize, need: usize) -> Option<usize> {
+    if need == 0 || to.saturating_sub(from) < need {
+        return None;
+    }
+    let (first_word, last_word) = (from / 64, (to - 1) / 64);
+    let mut run = 0usize;
+    for (offset, &raw) in words[first_word..=last_word].iter().enumerate() {
+        let w = first_word + offset;
+        let mut word = raw;
+        if w == first_word && !from.is_multiple_of(64) {
+            word |= (1u64 << (from % 64)) - 1;
+        }
+        if w == last_word && !to.is_multiple_of(64) {
+            word |= !0u64 << (to % 64);
+        }
+        if word == u64::MAX {
+            run = 0;
+            continue;
+        }
+        if word == 0 {
+            if run + 64 >= need {
+                return Some(w * 64 - run);
+            }
+            run += 64;
+            continue;
+        }
+        let low = word.trailing_zeros() as usize;
+        if run + low >= need {
+            return Some(w * 64 - run);
+        }
+        if need < 64
+            && let Some(bit) = first_zero_run(word, need)
+        {
+            return Some(w * 64 + bit);
+        }
+        run = word.leading_zeros() as usize;
+    }
+    None
+}
+
+/// Bit index of the earliest run of `need` (`1..64`) zero bits in `word`.
+#[inline]
+fn first_zero_run(word: u64, need: usize) -> Option<usize> {
+    let mut free = !word;
+    let mut span = 1usize;
+    while span * 2 <= need {
+        free &= free >> span;
+        span *= 2;
+    }
+    free &= free >> (need - span);
+    (free != 0).then(|| free.trailing_zeros() as usize)
+}
+
+fn set_bits(words: &mut [u64], first: usize, len: usize) {
+    let end = first + len;
+    let (w0, w1) = (first / 64, (end - 1) / 64);
+    let lo = !0u64 << (first % 64);
+    let hi = !0u64 >> (63 - (end - 1) % 64);
+    if w0 == w1 {
+        words[w0] |= lo & hi;
+    } else {
+        words[w0] |= lo;
+        words[w0 + 1..w1].fill(u64::MAX);
+        words[w1] |= hi;
+    }
+}
+
+/// Clears `len` (`> 0`) bits from `first`; true if any bit was set.
+fn clear_bits(words: &mut [u64], first: usize, len: usize) -> bool {
+    let end = first + len;
+    let (w0, w1) = (first / 64, (end - 1) / 64);
+    let lo = !0u64 << (first % 64);
+    let hi = !0u64 >> (63 - (end - 1) % 64);
+    if w0 == w1 {
+        let mask = lo & hi;
+        let freed = words[w0] & mask != 0;
+        words[w0] &= !mask;
+        freed
+    } else {
+        let mut freed = (words[w0] & lo) | (words[w1] & hi) != 0;
+        words[w0] &= !lo;
+        for word in &mut words[w0 + 1..w1] {
+            freed |= *word != 0;
+            *word = 0;
+        }
+        words[w1] &= !hi;
+        freed
+    }
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -317,37 +486,12 @@ impl HostHeap {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
-        let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let Some(first) = guard.take(n) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             return None;
         };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
-        Some(self.count + first as u32)
+        Some(self.count + first)
     }
 
     /// Two consecutive slots (view heaps only) kept until
@@ -394,22 +538,21 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
-        }
+        self.next
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(at, n);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let (kept, mark) = make_marked(view, self.cpu(index));
+        let (kept, mark, bias) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
-        self.set_stride(index, Some(view));
+        self.set_stride(index, Some(view), bias);
         self.set_mark(index, mark);
         // A table made afresh: shaders reading a view's address there (e.g.
         // the BVH builder's base) index the view addresses at this slot.
@@ -483,7 +626,7 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
-        self.set_stride(index, None);
+        self.set_stride(index, None, 0);
         self.set_mark(index, None);
         self.note_address(index, None);
         if index < self.count {
@@ -493,18 +636,24 @@ impl HostHeap {
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
     /// for slot `index` in the view-stride table, with the integer-format
-    /// bits of a typed buffer view ([`view_kind`]).
-    fn set_stride(&self, index: u32, view: Option<&View>) {
-        self.write_stride(index, view.map_or(0, |v| view_stride(v) | view_kind(v)));
+    /// bits of a typed buffer view ([`view_kind`]) and the 0..12-byte
+    /// raw-view start bias (`raw_bias`, a multiple of 4).
+    fn set_stride(&self, index: u32, view: Option<&View>, raw_bias: u32) {
+        use victory_shader::emit::{VIEW_RAW_OFFSET_SHIFT, VIEW_STRIDE_BITS};
+        let bias = ((raw_bias / 4) & 3) << VIEW_RAW_OFFSET_SHIFT;
+        self.write_stride(
+            index,
+            view.map_or(0, |v| (view_stride(v) & VIEW_STRIDE_BITS) | view_kind(v) | bias),
+        );
     }
 
     fn write_stride(&self, index: u32, stride: u32) {
         let Some((_, data)) = &self.strides else { return };
-        if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
+        if index >= self.count.max(crate::host::host_heap_views()) {
             return;
         }
         // SAFETY: a dword of the mapped table, which has one per slot below
-        // the larger of the title's count and `HEAP_VIEWS`.
+        // the larger of the title's count and `host_heap_views()`.
         unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
     }
 
@@ -518,7 +667,7 @@ impl HostHeap {
     /// none for anything else.
     pub(crate) fn set_mark(&self, index: u32, entry: Option<(u32, u32)>) {
         let Some((_, data)) = &self.marks else { return };
-        if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
+        if index >= self.count.max(crate::host::host_heap_views()) {
             return;
         }
         let entry = entry.unwrap_or((victory_shader::emit::VIEW_MARK_NONE, 0));
@@ -721,16 +870,24 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
-                tracing::warn!(
-                    index,
-                    count = self.count,
-                    for_draw,
-                    "title slot past the host heap"
-                );
+            // Diagnostic (NVIDIA heap cap): report only slots that actually hold
+            // a title view record, throttled so scanning empty heap pages is silent.
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let [tag, _, _] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            if tag == VIEW_TAG {
+                static PAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let past_views = PAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let prev = HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed);
+                if prev < index || past_views.is_power_of_two() {
+                    tracing::warn!(
+                        index,
+                        count = self.count,
+                        past_views,
+                        for_draw,
+                        "title view slot past the host heap"
+                    );
+                }
             }
             return None;
         }
@@ -808,18 +965,18 @@ impl HostHeap {
             }
         }
         {
-            self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             if later {
                 // Made once a shader reads it (`crate::shadow::take_reads`).
                 crate::shadow::forget_read(index);
             }
             made[index as usize] = key;
-            let (kept, mark) = if later {
-                (None, None)
+            let (kept, mark, bias) = if later {
+                (None, None, 0)
             } else {
                 make_marked(&view, self.cpu(index))
             };
+            self.set_stride(index, Some(&view), bias);
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -1181,11 +1338,43 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     ))
 }
 
+/// D3D12 raw buffer views (`D3D12_BUFFER_{SRV,UAV}_FLAG_RAW`) require
+/// `FirstElement * 4` to be 16-byte aligned (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`).
+/// Structured buffers starting at any 4-byte-aligned offset (`RAW_WORD_ALIGN`)
+/// share the containing host copy by rounding `FirstElement` down to 16 bytes
+/// and carrying the `0..12` byte remainder in `VIEW_STRIDES`.
+const RAW_VIEW_ALIGN: u64 = 16;
+const RAW_WORD_ALIGN: u64 = 4;
+
+/// The alignment [`crate::shadow::for_view`] uses for `view`, matching
+/// [`buffer_srv`] and [`buffer_uav`].
+fn view_align(view: &View) -> u64 {
+    let stride = u64::from(view_stride(view));
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Shader(_, Some(w)) => (false, w),
+        View::Unordered(_, _, Some(w)) => (true, w),
+        View::Placed(unordered, r, d) if r[0] == 1 => match d[..10].try_into() {
+            Ok(w) => (*unordered, w),
+            Err(_) => return stride,
+        },
+        _ => return stride,
+    };
+    // SAFETY: buffer view union member (`view` is a buffer view).
+    let structured = unsafe {
+        if unordered {
+            uav_desc(words).Anonymous.Buffer.StructureByteStride > 0
+        } else {
+            srv_desc(words).Anonymous.Buffer.StructureByteStride > 0
+        }
+    };
+    if structured { RAW_WORD_ALIGN } else { stride }
+}
+
 /// The host copy a buffer view's bytes are in (the one its host view
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    let (shadow, _) = crate::shadow::for_view(address, len, view_align(view))?;
     Some((shadow, address, len))
 }
 
@@ -1229,25 +1418,59 @@ fn buffer_srv(
         once!(len, "buffer view of elements without a size");
         return None;
     }
+    let structured = buffer.StructureByteStride > 0;
+    let total_bytes = u64::from(buffer.NumElements).checked_mul(element)?;
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
-    let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
-    else {
+    // Structured buffers are always viewed raw (R32_TYPELESS + FLAG_RAW) on
+    // the host so both table-bound and heap-indexed accesses use raw handles
+    // cleanly on NVIDIA, AMD, and WARP (NVIDIA misreads structured descriptors
+    // through raw handles as `element = byte_offset / 4`). Overlapping views
+    // at any 4-byte-aligned offset share one host copy: `FirstElement` rounds
+    // down to 16 bytes and the 0..12-byte remainder travels in `VIEW_STRIDES`.
+    // Views that cannot be represented raw are refused rather than leaving a
+    // native structured descriptor behind a raw shader handle.
+    if structured && (total_bytes == 0 || !total_bytes.is_multiple_of(4)) {
+        once!(total_bytes, element, "refused structured buffer view: byte length not a positive multiple of 4");
+        return None;
+    }
+    let align = if structured { RAW_WORD_ALIGN } else { element };
+    let Some((shadow, own)) = crate::shadow::for_view(start, total_bytes, align) else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
             tracing::info!(start = format_args!("{start:#x}"), len, element, count = buffer.NumElements, "refused buffer view: no host copy");
         }
         return None;
     };
-    buffer.FirstElement = shadow.offset(start) / element;
-    let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
+    let offset = shadow.offset(start);
+    let (view_element, first, count, bias) = if structured {
+        if !offset.is_multiple_of(RAW_WORD_ALIGN) {
+            once!(offset, element, "refused structured buffer view: host offset not 4-byte aligned");
+            return None;
+        }
+        let bias = offset & (RAW_VIEW_ALIGN - 1);
+        let aligned = offset - bias;
+        let raw_dwords = total_bytes.checked_add(bias)? / 4;
+        let Ok(raw_count) = u32::try_from(raw_dwords) else {
+            once!(raw_dwords, element, "refused structured buffer view: exceeds u32 raw elements");
+            return None;
+        };
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.FirstElement = aligned / 4;
+        buffer.NumElements = raw_count;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        (4, buffer.FirstElement, buffer.NumElements, bias as u32)
+    } else {
+        buffer.FirstElement = offset / element;
+        (element, buffer.FirstElement, buffer.NumElements, 0)
+    };
+    if !in_buffer(&shadow.buffer, first, count, view_element) {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
-            tracing::info!(start = format_args!("{start:#x}"), first, count, element, "refused buffer view: empty or past its copy");
+            tracing::info!(start = format_args!("{start:#x}"), first, count, element = view_element, "refused buffer view: empty or past its copy");
         }
-        once!(first, count, element, "buffer view empty or past its host copy");
+        once!(first, count, view_element, "buffer view empty or past its host copy");
         return None;
     }
     let host = host()?;
@@ -1256,6 +1479,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
+    RAW_BIAS.with(|b| b.set(bias));
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
 
@@ -1284,7 +1508,8 @@ fn buffer_uav(
 ) -> Option<Kept> {
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
+    let structured = buffer.StructureByteStride > 0;
+    let element = if structured {
         u64::from(buffer.StructureByteStride)
     } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
         4
@@ -1295,19 +1520,48 @@ fn buffer_uav(
         once!(len, "unordered buffer view of elements without a size");
         return None;
     }
+    let total_bytes = u64::from(buffer.NumElements).checked_mul(element)?;
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    // View structured UAVs raw on the host, matching [`buffer_srv`] and
+    // `victory-shader`'s raw-handle lowering.
+    if structured && (total_bytes == 0 || !total_bytes.is_multiple_of(4)) {
+        once!(total_bytes, element, "refused structured UAV: byte length not a positive multiple of 4");
+        return None;
+    }
+    let align = if structured { RAW_WORD_ALIGN } else { element };
+    let (shadow, own) = crate::shadow::for_view(start, total_bytes, align)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
-    buffer.FirstElement = shadow.offset(start) / element;
+    let offset = shadow.offset(start);
+    let (view_element, first, count, bias) = if structured {
+        if !offset.is_multiple_of(RAW_WORD_ALIGN) {
+            once!(offset, element, "refused structured UAV: host offset not 4-byte aligned");
+            return None;
+        }
+        let bias = offset & (RAW_VIEW_ALIGN - 1);
+        let aligned = offset - bias;
+        let raw_dwords = total_bytes.checked_add(bias)? / 4;
+        let Ok(raw_count) = u32::try_from(raw_dwords) else {
+            once!(raw_dwords, element, "refused structured UAV: exceeds u32 raw elements");
+            return None;
+        };
+        desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        buffer.FirstElement = aligned / 4;
+        buffer.NumElements = raw_count;
+        buffer.StructureByteStride = 0;
+        buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        (4, buffer.FirstElement, buffer.NumElements, bias as u32)
+    } else {
+        buffer.FirstElement = offset / element;
+        (element, buffer.FirstElement, buffer.NumElements, 0)
+    };
     buffer.CounterOffsetInBytes = 0;
-    let (first, count) = (buffer.FirstElement, buffer.NumElements);
-    if !in_buffer(&shadow.buffer, first, count, element) {
-        once!(first, count, element, "unordered buffer view empty or past its host copy");
+    if !in_buffer(&shadow.buffer, first, count, view_element) {
+        once!(first, count, view_element, "unordered buffer view empty or past its host copy");
         return None;
     }
     let host = host()?;
@@ -1316,7 +1570,8 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    MARK.with(|m| m.set(shadow.mark_entry(start)));
+    RAW_BIAS.with(|b| b.set(bias));
+    MARK.with(|m| m.set(shadow.mark_entry(start - u64::from(bias))));
     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
 }
 
@@ -1324,15 +1579,26 @@ thread_local! {
     /// The view-mark entry of the unordered buffer view [`make`] last made
     /// on this thread ([`make_marked`]).
     static MARK: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+    /// The 0..12-byte raw-view start bias of the structured buffer view
+    /// [`make`] last made on this thread ([`make_marked`]).
+    static RAW_BIAS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// [`make`], and the view-mark entry of the view if it is an unordered
-/// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
-/// marks").
-fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+/// [`make`], the view-mark entry of the view if it is an unordered buffer
+/// view whose writes shaders mark (`victory_shader::emit`, "Write marks"),
+/// and the 0..12-byte raw-view start bias for `VIEW_STRIDES`.
+fn make_marked(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> (Option<Kept>, Option<(u32, u32)>, u32) {
     MARK.with(|m| m.set(None));
+    RAW_BIAS.with(|b| b.set(0));
     let kept = make(view, at);
-    (kept, MARK.with(std::cell::Cell::take))
+    (
+        kept,
+        MARK.with(std::cell::Cell::take),
+        RAW_BIAS.with(std::cell::Cell::take),
+    )
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -2220,10 +2486,10 @@ mod tests {
             return; // no host GPU
         };
         // Every index a translated shader can reach exists (clamped below
-        // `HEAP_VIEWS`, `HEAP_SAMPLERS`).
+        // `host_heap_views()`, `HEAP_SAMPLERS`).
         // SAFETY: plain queries of live heaps.
         unsafe {
-            assert!(heap.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_VIEWS);
+            assert!(heap.heap.GetDesc().NumDescriptors >= crate::host::host_heap_views());
             let samplers = HostHeap::new(true, 128).unwrap();
             assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
         }
@@ -2307,6 +2573,16 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    #[test]
+    fn min_dynamic_fallback_keeps_at_least_host_heap_views() {
+        let Some(heap) = HostHeap::new(false, 800_000) else {
+            return; // no host GPU
+        };
+        // SAFETY: plain query of a live heap.
+        let num = unsafe { heap.heap.GetDesc().NumDescriptors };
+        assert!(num >= crate::host::host_heap_views());
     }
 
     /// A texture view's size words are the console image descriptor's
@@ -2458,6 +2734,378 @@ mod tests {
                 "srv case {offset}"
             );
         }
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(host.log_messages(), None);
+    }
+
+    /// Reference byte-per-slot allocator matching the original `(u32, Vec<bool>)`
+    /// behaviour, used to prove `DynamicSlots` returns identical offsets.
+    struct RefDynamicSlots {
+        next: u32,
+        taken: Vec<bool>,
+    }
+
+    impl RefDynamicSlots {
+        fn new(len: u32) -> Self {
+            Self {
+                next: 0,
+                taken: vec![false; len as usize],
+            }
+        }
+
+        fn take(&mut self, n: u32) -> Option<u32> {
+            let end = self.taken.len();
+            let n = n as usize;
+            if n == 0 || n > end {
+                return None;
+            }
+            let cursor = self.next as usize;
+            let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+            let starts = (cursor..end).chain(0..second_end);
+            let (mut run, mut found, mut last) = (0, None, usize::MAX);
+            for at in starts {
+                if at != last.wrapping_add(1) {
+                    run = 0;
+                }
+                last = at;
+                run = if self.taken[at] { 0 } else { run + 1 };
+                if run == n {
+                    found = Some(at + 1 - n);
+                    break;
+                }
+            }
+            let first = found?;
+            self.taken[first..first + n].fill(true);
+            self.next = ((first + n) % end) as u32;
+            Some(first as u32)
+        }
+
+        fn release(&mut self, at: u32, n: u32) {
+            let start = (at as usize).min(self.taken.len());
+            let end = (at as usize).saturating_add(n as usize).min(self.taken.len());
+            if start < end {
+                self.taken[start..end].fill(false);
+            }
+        }
+    }
+
+    /// Word boundaries, partial tail words, multi-word runs (`ROOT_VIEW_RUN`),
+    /// cursor wrap-around without end wrap, and `min_failed` fast rejection.
+    #[test]
+    fn dynamic_slot_bitmap_handles_word_boundaries_and_failed_watermark() {
+        let mut empty = DynamicSlots::new(0);
+        assert_eq!(empty.take(0), None);
+        assert_eq!(empty.take(1), None);
+        empty.release(0, 10);
+
+        // Partial tail word (len = 130 => 2 full words + 2 tail bits; bits 2..64
+        // of word 2 stay masked out and never join free runs).
+        let mut s = DynamicSlots::new(130);
+        assert_eq!(s.take(63), Some(0));
+        assert_eq!(s.take(3), Some(63), "crosses word 0 -> word 1");
+        assert_eq!(s.take(62), Some(66), "reaches slot 128 across word 1 -> word 2");
+        assert_eq!(s.take(3), None, "only 2 tail bits remain; padding bits stay taken");
+        assert_eq!(s.min_failed, 3);
+        assert_eq!(s.take(4), None, "rejected by min_failed without scanning");
+        assert_eq!(s.take(2), Some(128), "smaller request below min_failed still succeeds");
+        assert_eq!(s.take(1), None);
+        assert_eq!(s.min_failed, 1);
+
+        // Releasing an already-free or out-of-range slice keeps min_failed intact;
+        // freeing a taken slot resets it.
+        s.release(130, 8);
+        assert_eq!(s.min_failed, 1);
+        s.release(62, 4); // frees 62..66 across the 64-bit boundary
+        assert_eq!(s.min_failed, u32::MAX);
+        s.release(62, 4); // already free now
+        assert_eq!(s.take(5), None);
+        assert_eq!(s.min_failed, 5);
+        s.release(62, 4); // still free: min_failed must stay 5
+        assert_eq!(s.min_failed, 5);
+        assert_eq!(s.take(4), Some(62));
+
+        // Multi-word runs (256-slot root view blocks) across fragmented words.
+        let mut big = DynamicSlots::new(600);
+        assert_eq!(big.take(60), Some(0));
+        assert_eq!(big.take(256), Some(60));
+        assert_eq!(big.take(256), Some(316));
+        assert_eq!(big.take(256), None);
+        big.release(60, 256);
+        assert_eq!(big.take(256), Some(60), "found on wrap-around pass");
+    }
+
+    /// Differential check: `DynamicSlots` matches the byte-per-slot reference
+    /// allocator step for step across capacities and fragmented churn.
+    #[test]
+    fn dynamic_slot_bitmap_matches_reference_allocator() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next_rand = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        for len in [1u32, 2, 63, 64, 65, 127, 128, 129, 511, 512, 520, 4096] {
+            let mut bitmap = DynamicSlots::new(len);
+            let mut reference = RefDynamicSlots::new(len);
+            let mut live: Vec<(u32, u32)> = Vec::new();
+
+            for step in 0..2_500 {
+                let r = next_rand();
+                if !live.is_empty() && (r & 3 == 0 || live.len() > 96) {
+                    let idx = (r as usize >> 4) % live.len();
+                    let (at, count) = live.swap_remove(idx);
+                    // Occasionally release in two halves to fragment runs across word edges.
+                    if count > 2 && (r & 4 != 0) {
+                        let half = count / 2;
+                        bitmap.release(at, half);
+                        reference.release(at, half);
+                        live.push((at + half, count - half));
+                    } else {
+                        bitmap.release(at, count);
+                        reference.release(at, count);
+                    }
+                } else {
+                    let n = match (r >> 8) % 8 {
+                        0 => 0,
+                        1 => 1,
+                        2 => 2,
+                        3 => ((r >> 16) % 16 + 1) as u32,
+                        4 => ((r >> 16) % 64 + 1) as u32,
+                        5 => 64,
+                        6 => 256.min(len.saturating_add(4)),
+                        _ => ((r >> 16) % (u64::from(len) + 8)) as u32,
+                    };
+                    let got = bitmap.take(n);
+                    let want = reference.take(n);
+                    assert_eq!(got, want, "len={len} step={step} n={n}");
+                    if let Some(at) = got {
+                        live.push((at, n));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "microbenchmark: cargo test --release -p victory-gpu dynamic_slot_bitmap_bench -- --ignored --nocapture"]
+    fn dynamic_slot_bitmap_bench() {
+        fn run_workload<A>(
+            len: u32,
+            mut make: impl FnMut(u32) -> A,
+            mut take: impl FnMut(&mut A, u32) -> Option<u32>,
+            mut release: impl FnMut(&mut A, u32, u32),
+        ) -> (std::time::Duration, std::time::Duration, u64) {
+            let mut alloc = make(len);
+            // Scatter long-lived 2-slot shadow pairs across ~75% of the dynamic
+            // range so `ROOT_VIEW_RUN` (256) and medium tables must skip past
+            // fragmented regions rather than landing immediately at the cursor.
+            let stride = 96u32;
+            let mut cursor_fill = Vec::new();
+            let pinned_limit = (len * 3 / 4) / stride;
+            for i in 0..pinned_limit {
+                let _ = take(&mut alloc, 2);
+                let gap = stride - 2 - (i % 7);
+                if let Some(at) = take(&mut alloc, gap) {
+                    cursor_fill.push((at, gap));
+                }
+            }
+            for (at, gap) in cursor_fill {
+                release(&mut alloc, at, gap);
+            }
+
+            let mut checksum = 0u64;
+            let mut batches: std::collections::VecDeque<Vec<(u32, u32)>> =
+                std::collections::VecDeque::with_capacity(4);
+
+            // Part 1: 20 frames with 3 in-flight batches held simultaneously
+            // (all allocations succeed; exercises pure bitmap vs bool scanning).
+            let calls_per_frame = if len <= CAPPED_DYNAMIC { 450u32 } else { 1_800u32 };
+            let t_churn = std::time::Instant::now();
+            for frame in 0..20u32 {
+                if batches.len() == 3
+                    && let Some(done) = batches.pop_front()
+                {
+                    for (at, n) in done {
+                        release(&mut alloc, at, n);
+                    }
+                }
+                let mut cur = Vec::with_capacity(calls_per_frame as usize);
+                for call in 0..calls_per_frame {
+                    let n = if call % 32 == 0 {
+                        256
+                    } else {
+                        2 + ((call.wrapping_mul(11) + frame) % 28)
+                    };
+                    if let Some(at) = take(&mut alloc, n) {
+                        checksum = checksum.wrapping_add(u64::from(at));
+                        cur.push((at, n));
+                    }
+                }
+                batches.push_back(cur);
+            }
+            let churn_elapsed = t_churn.elapsed();
+
+            // Part 2: fill remaining dynamic slots and simulate 2,500 draws
+            // asking for fresh tables / root views in a saturated frame.
+            let mut extra = Vec::new();
+            while let Some(at) = take(&mut alloc, 4) {
+                extra.push((at, 4));
+            }
+            let t_sat = std::time::Instant::now();
+            for call in 0..2_500u32 {
+                let n = if call % 32 == 0 { 256 } else { 4 + (call % 16) };
+                if let Some(at) = take(&mut alloc, n) {
+                    checksum = checksum.wrapping_add(u64::from(at));
+                }
+            }
+            let sat_elapsed = t_sat.elapsed();
+            let _ = (batches, extra);
+            (churn_elapsed, sat_elapsed, checksum)
+        }
+
+        for (label, len) in [("capped_64k (NVIDIA)", CAPPED_DYNAMIC), ("uncapped_256k", DYNAMIC)] {
+            let mut old_churn = Vec::new();
+            let mut old_sat = Vec::new();
+            let mut new_churn = Vec::new();
+            let mut new_sat = Vec::new();
+            for _ in 0..7 {
+                let (c1, s1, ck1) = run_workload(
+                    len,
+                    RefDynamicSlots::new,
+                    RefDynamicSlots::take,
+                    RefDynamicSlots::release,
+                );
+                let (c2, s2, ck2) = run_workload(
+                    len,
+                    DynamicSlots::new,
+                    DynamicSlots::take,
+                    DynamicSlots::release,
+                );
+                assert_eq!(ck1, ck2);
+                old_churn.push(c1);
+                old_sat.push(s1);
+                new_churn.push(c2);
+                new_sat.push(s2);
+            }
+            old_churn.sort_unstable();
+            old_sat.sort_unstable();
+            new_churn.sort_unstable();
+            new_sat.sort_unstable();
+            let (oc, nc) = (
+                old_churn[3].as_secs_f64() * 1e3 / 20.0,
+                new_churn[3].as_secs_f64() * 1e3 / 20.0,
+            );
+            let (os, ns) = (old_sat[3].as_secs_f64() * 1e3, new_sat[3].as_secs_f64() * 1e3);
+            println!(
+                "{label}: fragmented churn/frame {oc:.3} ms -> {nc:.3} ms ({:.1}x), saturated 2500 asks {os:.3} ms -> {ns:.4} ms ({:.0}x)",
+                oc / nc,
+                os / ns
+            );
+        }
+    }
+
+    #[test]
+    fn structured_buffer_views_stay_raw_on_host_and_keep_stride_table() {
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 16) else {
+            return;
+        };
+        let _ = host.log_messages();
+        let va = placed_memory();
+        crate::shadow::register(va as usize, va, 4096);
+
+        // Structured SRV (stride 12, 32 elements) starting at an offset (+4,
+        // not divisible by 12) and a structured UAV (stride 20, 16 elements).
+        // `D3D12_SHADER_RESOURCE_VIEW_DESC` has 4 bytes of padding at word 3
+        // before the 8-byte `FirstElement` union member.
+        let buf_desc = [
+            1u32, 0, 0, 0, 4096, 0, 1, 1 | (1 << 16), 0, 1, 0, 1, 4, 0,
+        ];
+        let mut srv_words = [0u32; 16];
+        srv_words[0] = 0; // DXGI_FORMAT_UNKNOWN
+        srv_words[1] = 1; // D3D12_SRV_DIMENSION_BUFFER
+        srv_words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_words[4] = 0; // FirstElement lo
+        srv_words[5] = 0; // FirstElement hi
+        srv_words[6] = 32; // NumElements
+        srv_words[7] = 12; // StructureByteStride
+        srv_words[8] = 0; // Flags (not RAW)
+        srv_words[10] = (va + 4) as u32;
+        srv_words[11] = ((va + 4) >> 32) as u32;
+
+        let mut uav_words = [0u32; 16];
+        uav_words[0] = 0; // DXGI_FORMAT_UNKNOWN
+        uav_words[1] = 1; // D3D12_UAV_DIMENSION_BUFFER
+        uav_words[2] = 0; // FirstElement lo
+        uav_words[3] = 0; // FirstElement hi
+        uav_words[4] = 16; // NumElements
+        uav_words[5] = 20; // StructureByteStride
+        uav_words[6] = 0; // CounterOffset lo
+        uav_words[7] = 0; // CounterOffset hi
+        uav_words[8] = 0; // Flags (not RAW)
+        uav_words[10] = (va + 512) as u32;
+        uav_words[11] = ((va + 512) >> 32) as u32;
+
+        let mut slots = [[0u32; 8]; 4];
+        let s0 = slots[0].as_mut_ptr() as u64;
+        let s1 = slots[1].as_mut_ptr() as u64;
+        let s2 = slots[2].as_mut_ptr() as u64;
+        let s3 = slots[3].as_mut_ptr() as u64;
+        crate::descriptor::create_placed_srv(std::ptr::null(), &buf_desc, &srv_words, s0);
+        crate::descriptor::create_placed_uav(std::ptr::null(), &buf_desc, &uav_words, s1);
+
+        // Structured SRV starting at +12 (3 dwords past the 16-byte boundary).
+        let mut srv12_words = srv_words;
+        srv12_words[10] = (va + 12) as u32;
+        srv12_words[11] = ((va + 12) >> 32) as u32;
+        crate::descriptor::create_placed_srv(std::ptr::null(), &buf_desc, &srv12_words, s2);
+
+        // Non-4-byte-length structured SRV (stride 2, count 3 => 6 bytes):
+        // must be refused rather than creating a native structured descriptor.
+        let mut odd_words = srv_words;
+        odd_words[6] = 3;
+        odd_words[7] = 2;
+        odd_words[10] = va as u32;
+        odd_words[11] = (va >> 32) as u32;
+        crate::descriptor::create_placed_srv(std::ptr::null(), &buf_desc, &odd_words, s3);
+
+        let v0 = crate::descriptor::view(s0).expect("srv view");
+        let v1 = crate::descriptor::view(s1).expect("uav view");
+        // The view-stride table MUST still record the title's original element strides.
+        assert_eq!(view_stride(&v0), 12);
+        assert_eq!(view_kind(&v0), 0);
+        assert_eq!(view_stride(&v1), 20);
+        assert_eq!(view_kind(&v1), 0);
+
+        assert!(heap.mirror(0, s0, true).is_some());
+        assert!(heap.mirror(1, s1, true).is_some());
+        assert!(heap.mirror(2, s2, true).is_some());
+        assert!(heap.mirror(3, s3, true).is_some());
+        let kept = heap.kept.lock().unwrap();
+        // All 4-byte-aligned structured views share the buffer's main copy (no
+        // private exact copy) so overlapping views stay coherent.
+        assert!(kept[0].as_ref().is_some_and(|(_, own)| own.is_none()), "+4 shares main copy");
+        assert!(kept[1].as_ref().is_some_and(|(_, own)| own.is_none()), "+512 shares main copy");
+        assert!(kept[2].as_ref().is_some_and(|(_, own)| own.is_none()), "+12 shares main copy");
+        assert!(kept[3].is_none(), "non-4-byte structured length is refused");
+
+        // Verify `VIEW_STRIDES` carries the exact stride + 0..12-byte raw bias.
+        let (_, stride_data) = heap.strides.as_ref().expect("stride table");
+        // SAFETY: mapped stride table covers slots 0..4.
+        let entry = |i: usize| unsafe { (*stride_data as *const u32).add(i).read_volatile() };
+        let shift = victory_shader::emit::VIEW_RAW_OFFSET_SHIFT;
+        assert_eq!(entry(0), 12 | (1 << shift), "+4 => bias 4 bytes (1 dword)");
+        assert_eq!(entry(1), 20 | (0 << shift), "+512 => bias 0 bytes");
+        assert_eq!(entry(2), 12 | (3 << shift), "+12 => bias 12 bytes (3 dwords)");
+        drop(kept);
+        drop(heap);
+        crate::shadow::unregister(va as usize, va);
+
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
