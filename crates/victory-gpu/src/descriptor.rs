@@ -163,8 +163,10 @@ fn mirror(handle: u64) {
 /// as bytes, so only a change of its memory shows them. Each slot of a page
 /// written since the last sync is made again if its record changed (in the
 /// world 1,300-14,400 slots a frame, against a few hundred views made by
-/// calls). Called before each submission: shaders take descriptors from the
-/// heap at indices in their data, where a slot never mirrored reads nothing.
+/// calls), and the slots past the host heap's count are left out of the scan
+/// as [`host::HostHeap::mirror`] refuses them. Called before each submission:
+/// shaders take descriptors from the heap at indices in their data, where a
+/// slot never mirrored reads nothing.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
     // Held throughout: a heap is not dropped while its slots are made.
@@ -178,6 +180,9 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
+        // The highest slot of a written page past the host heap's count, if
+        // any (a page's resolution: the title wrote somewhere on that page).
+        let mut past: Option<u32> = None;
         for (from, to) in written.take(start as usize, usize::MAX) {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
@@ -188,13 +193,28 @@ pub(crate) fn sync_heaps() {
                     continue;
                 }
                 let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
+                let last = last.min(u64::from(heap.desc.count));
+                if last > u64::from(host.count()) {
+                    past = past.max(Some(last as u32 - 1));
+                }
+                // Slots past the host heap's count have no host slot at all
+                // (HostHeap::mirror refuses them), so they are left out of the
+                // read too: where the host caps its heap (NVIDIA, below the
+                // title's 1,245,184 slots) the upper pages are most of what a
+                // world frame marks.
+                let (first, last) = host::host_slots(host.count(), first as u32, last as u32);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(
                     crate::copystat::C::SyncSlots,
-                    last.min(u64::from(heap.desc.count)).saturating_sub(first),
+                    u64::from(last.saturating_sub(first)),
                 );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+                host.sync_slots(first, last, start, step);
             }
+        }
+        // That slot has no host slot: the scan above leaves it out, and
+        // HostHeap::mirror reports the refusal once per new highest index.
+        if let Some(highest) = past {
+            host.mirror(highest, start + u64::from(highest) * step, false);
         }
     }
 }

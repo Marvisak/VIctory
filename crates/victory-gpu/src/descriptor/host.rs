@@ -99,6 +99,15 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// The slots of `first..last` a host heap of `count` slots has: the rest
+/// have no host slot, so a sync neither reads nor mirrors them
+/// ([`HostHeap::mirror`] refuses them). Where the host caps its heap
+/// (NVIDIA) the title's upper pages are most of what a world frame marks,
+/// and scanning them was 44 % of the sync's slots.
+pub(crate) fn host_slots(count: u32, first: u32, last: u32) -> (u32, u32) {
+    (first.min(count), last.min(count))
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -691,8 +700,17 @@ impl HostHeap {
     /// index × `step`: [`HostHeap::mirror`] of each slot whose record
     /// differs from what the slot holds, the rest passed by as `mirror`
     /// would, with one lock of each kind for them all instead of two per slot
-    /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
+    /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms). The slots
+    /// past this heap's count are not looked at ([`host_slots`]).
     pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
+        // Slots past the host heap's count have no host slot
+        // ([`HostHeap::mirror`] refuses them), so they are not read either:
+        // where the host caps its heap (NVIDIA) the title's upper pages are
+        // most of what a world frame marks.
+        let (first, last) = host_slots(self.count, first, last);
+        if first >= last {
+            return;
+        }
         let at = |i: u32| start + u64::from(i) * step;
         // SAFETY: records in title heap memory the caller found mapped.
         let records: Vec<[u32; 3]> =
@@ -2085,6 +2103,29 @@ mod tests {
         unsafe { std::ptr::write_bytes((start + 32) as *mut u8, 0, 32) };
         host.sync_slots(0, 4, start, 32);
         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
+    }
+
+    /// A heap sync stops at the host heap's count: a slot past it has no host
+    /// slot ([`HostHeap::mirror`] refuses it), so it is neither read nor
+    /// mirrored, and the slots below it are the sync they were.
+    #[test]
+    fn a_heap_sync_stops_at_the_host_heaps_count() {
+        // Below the count: the caller's range, unchanged.
+        assert_eq!(host_slots(4, 0, 4), (0, 4));
+        assert_eq!(host_slots(4, 1, 3), (1, 3));
+        // Straddling it: the slots the host has, and nothing past them.
+        assert_eq!(host_slots(4, 0, 40), (0, 4));
+        // Past it: an empty range, which `sync_slots` returns on before it
+        // reads a record.
+        let (first, last) = host_slots(4, 40, 80);
+        assert_eq!((first, last), (4, 4));
+        assert!(first >= last, "nothing is read past the count");
+        // The world's title heap on a host that caps its heaps (NVIDIA): the
+        // last 310,720 slots of 1,245,184 have no host slot.
+        let (a, b) = host_slots(934_464, 1_240_000, 1_245_184);
+        assert_eq!((a, b), (934_464, 934_464));
+        // A page that ends in the cap reads up to it and no further.
+        assert_eq!(host_slots(934_464, 933_000, 1_245_184), (933_000, 934_464));
     }
 
     /// The world's 16-byte view of 0 elements removed the device.
