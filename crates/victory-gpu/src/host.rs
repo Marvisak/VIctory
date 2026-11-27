@@ -42,6 +42,7 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    supports_shader_model_6_6: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -195,6 +196,7 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let supports_shader_model_6_6 = check_shader_model(&device);
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -250,6 +252,7 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             depth_bounds_supported,
+            supports_shader_model_6_6,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -266,6 +269,41 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
         })
+    }
+}
+
+/// Translated shaders target 6.6. Report an incompatible device before
+/// individual root signatures or pipelines fail.
+fn check_shader_model(device: &ID3D12Device) -> bool {
+    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_6,
+    };
+    // SAFETY: the query writes a live structure of the given size.
+    let result = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_SHADER_MODEL,
+            (&raw mut model).cast(),
+            size_of_val(&model) as u32,
+        )
+    };
+    match result {
+        Ok(()) if model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0 => true,
+        Ok(()) => {
+            let major = model.HighestShaderModel.0 >> 4;
+            let minor = model.HighestShaderModel.0 & 0xF;
+            tracing::warn!(
+                shader_model = %format_args!("{major}.{minor}"),
+                "translated shaders require Shader Model 6.6. Check the selected D3D12 adapter and runtime."
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "could not query Shader Model 6.6, which translated shaders require. Check the selected D3D12 adapter and runtime."
+            );
+            false
+        }
     }
 }
 
@@ -1039,30 +1077,18 @@ impl Host {
         static MESH: OnceLock<bool> = OnceLock::new();
         *MESH.get_or_init(|| {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
-            let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
-            // SAFETY: each query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS7,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .is_ok()
-                    && self
-                        .device
+            // SAFETY: the query writes a live structure of the given size.
+            let mesh = self.supports_shader_model_6_6
+                && unsafe {
+                    self.device
                         .CheckFeatureSupport(
-                            D3D12_FEATURE_SHADER_MODEL,
-                            (&raw mut model).cast(),
-                            size_of_val(&model) as u32,
+                            D3D12_FEATURE_D3D12_OPTIONS7,
+                            (&raw mut options).cast(),
+                            size_of_val(&options) as u32,
                         )
                         .is_ok()
-            };
-            let mesh = ok
-                && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
-                && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+                }
+                && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
             tracing::info!(mesh, "host mesh shader support");
             mesh
         })
