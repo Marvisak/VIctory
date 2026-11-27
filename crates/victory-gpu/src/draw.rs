@@ -64,6 +64,10 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// The targets and depth [`State::bind`] last ensured, with the list's
+    /// states generation then: ensuring them again is skipped while nothing
+    /// the list named has moved since.
+    ensured: Option<(Vec<usize>, usize, u64)>,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
     /// The title's primitive topology (the host's may differ).
@@ -121,6 +125,12 @@ impl Drop for State {
 
 /// The key of our own view heap (`crate::memory::heap`) among the title's.
 const MEMORY_HEAP: usize = crate::memory::OURS;
+
+/// The host state a draw's render targets need.
+const RENDER_TARGET: u32 = 0x4;
+
+/// The host state a draw's depth resource needs.
+const DEPTH_WRITE: u32 = 0x10;
 
 /// The sampler heap we bind when the title binds none (a value no title heap
 /// address takes).
@@ -313,6 +323,10 @@ impl State {
     /// own, made from the real states at its submission). Clears and copies
     /// are commands, recorded once in the segment they belong to.
     pub(crate) fn cut(&mut self, list: &HostList) {
+        // The state goes to a fresh host list: the ensured-targets memo names
+        // the old list's states generation, and the fresh one may read the
+        // same counter, so it must not survive the cut.
+        self.ensured = None;
         self.host_state_lost();
         self.fresh_tables.clear();
         self.root_slots.clear();
@@ -523,6 +537,54 @@ impl State {
         }
     }
 
+    /// Ensures the host states of the targets and the depth a draw binds,
+    /// once per states generation.
+    ///
+    /// The transition comes in as a parameter rather than calling
+    /// [`crate::list::ensure_state`] directly, so that a test can count what
+    /// the loop asks for without a host GPU: the counter stands in for the
+    /// barrier, and [`Generation`](crate::host::Generation) is bumped as
+    /// [`HostList::track`](crate::host::HostList::track) bumps it.
+    fn ensure_targets(
+        &mut self,
+        states: &crate::host::Generation,
+        mut ensure: impl FnMut(This, u32),
+    ) {
+        // Every draw binds the same targets, and each `ensure_state` costs a
+        // host copy lookup, a twin check, a state legalisation and a hash
+        // entry before finding out nothing changed: skip them while the
+        // list's states have not moved since the last draw ensured them.
+        if self.ensured_valid(states.get()) {
+            return;
+        }
+        for &t in &self.targets {
+            ensure(t as This, RENDER_TARGET);
+        }
+        if self.depth != 0 {
+            ensure(self.depth as This, DEPTH_WRITE);
+        }
+        // The generation after the loop: what the loop itself moved is now
+        // recorded, so the next draw with the same targets sees it unchanged
+        // and skips.
+        self.ensured = Some((self.targets.clone(), self.depth, states.get()));
+    }
+
+    /// Whether the targets and depth this draw binds are already ensured: the
+    /// last draw ensured these very ones, and the list's states generation has
+    /// not moved since.
+    ///
+    /// Sound because the list's states are only changed by `HostList::track`
+    /// (and cleared by `HostList::reset`), which bump the generation, and
+    /// [`State::cut`] forgets the memo for a fresh list's states.
+    fn ensured_valid(&self, generation: u64) -> bool {
+        match &self.ensured {
+            Some((targets, depth, at)) => {
+                *at == generation && *depth == self.depth && targets == &self.targets
+            }
+            None => false,
+        }
+    }
+
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
@@ -589,14 +651,9 @@ impl State {
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
-        const RENDER_TARGET: u32 = 0x4;
-        const DEPTH_WRITE: u32 = 0x10;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
-        }
-        if self.depth != 0 {
-            crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
-        }
+        self.ensure_targets(list.states_generation(), |target, state| {
+            crate::list::ensure_state(list, target, state)
+        });
         // A depth copy of ours (`crate::twin`) ran a compute pipeline.
         if list.take_rebind() {
             // SAFETY: an open list and a live pipeline.
@@ -2046,6 +2103,128 @@ mod tests {
         // A title sampler heap stays whatever the views are.
         assert_eq!(State::wanted([0, 0x20], true), [MEMORY_HEAP, 0x20]);
     }
+    /// A segment cut hands the state to a fresh host list, whose states
+    /// generation may read the same as the old list's counter: the
+    /// ensured-targets memo must not survive the cut, or the new segment's
+    /// state map never enrolls the targets and a later transition reports no
+    /// previous state.
+    #[test]
+    fn a_cut_to_a_fresh_list_forgets_the_ensured_targets() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let first = host.new_list().unwrap();
+        let second = host.new_list().unwrap();
+        assert_eq!(
+            first.states_generation().get(),
+            second.states_generation().get(),
+            "two fresh lists read the same counter"
+        );
+        let mut state = State::default();
+        state.ensured = Some((vec![1], 0, first.states_generation().get()));
+        state.cut(&second);
+        assert!(
+            state.ensured.is_none(),
+            "the memo named the old list's generation"
+        );
+    }
+
+    /// One draw's ensure pass, as [`State::prepare`] runs it: the transition
+    /// stands in for `crate::list::ensure_state` (which needs a host list) and
+    /// moves the generation the way `HostList::track` does when it names a
+    /// texture first or moves one. Returns the transitions the draw asked for.
+    fn ensure_pass(state: &mut State, states: &crate::host::Generation) -> Vec<(usize, u32)> {
+        let mut asked = Vec::new();
+        state.ensure_targets(states, |target, to| {
+            asked.push((target as usize, to));
+            states.bump();
+        });
+        asked
+    }
+
+    /// Two consecutive draws with the same targets and depth ask for no
+    /// transition the second time, because nothing of the list's states moved
+    /// between them: the skip rests on the generation the first pass left, not
+    /// on the loop being run and finding nothing to do.
+    ///
+    /// The transitions are counted off the ensure loop itself, with a counter
+    /// in place of `crate::list::ensure_state`: recording real barriers needs a
+    /// host list, and a test that gives up without a host GPU proves nothing
+    /// where it matters.
+    #[test]
+    fn a_second_draw_with_the_same_targets_ensures_nothing() {
+        let states = crate::host::Generation::default();
+        let mut state = State::default();
+        state.targets = vec![0x20, 0x24];
+        state.depth = 0x28;
+        assert_eq!(
+            ensure_pass(&mut state, &states),
+            [
+                (0x20, RENDER_TARGET),
+                (0x24, RENDER_TARGET),
+                (0x28, DEPTH_WRITE)
+            ],
+            "the first draw ensures both targets and the depth"
+        );
+        assert!(
+            ensure_pass(&mut state, &states).is_empty(),
+            "the same targets at the same generation are already ensured"
+        );
+        // A title that binds a third target, or asks for another depth, is
+        // ensured again: the memo names what the last draw bound.
+        state.targets = vec![0x20, 0x24, 0x2c];
+        assert_eq!(
+            ensure_pass(&mut state, &states),
+            [
+                (0x20, RENDER_TARGET),
+                (0x24, RENDER_TARGET),
+                (0x2c, RENDER_TARGET),
+                (0x28, DEPTH_WRITE)
+            ],
+            "a third target brings the transitions back"
+        );
+        state.depth = 0x30;
+        assert_eq!(
+            ensure_pass(&mut state, &states),
+            [
+                (0x20, RENDER_TARGET),
+                (0x24, RENDER_TARGET),
+                (0x2c, RENDER_TARGET),
+                (0x30, DEPTH_WRITE)
+            ],
+            "another depth brings them back too"
+        );
+    }
+
+    /// A state the list moves after a draw brings the transitions back: the
+    /// mutator [`crate::host::HostList::track`] and
+    /// [`crate::host::HostList::reset`] use is `Generation::bump`, which this
+    /// test calls as they do.
+    #[test]
+    fn a_generation_bump_ensures_the_targets_again() {
+        let states = crate::host::Generation::default();
+        let mut state = State::default();
+        state.targets = vec![0x20];
+        state.depth = 0x28;
+        let first = ensure_pass(&mut state, &states);
+        assert_eq!(first.len(), 2, "a target and the depth");
+        assert!(
+            ensure_pass(&mut state, &states).is_empty(),
+            "nothing moved between the two draws"
+        );
+        // A depth copy of ours ran (`crate::twin::route` bumps), a title
+        // barrier moved a target, or the list was reset.
+        states.bump();
+        assert_eq!(
+            ensure_pass(&mut state, &states),
+            first,
+            "a moved states generation brings the transitions back"
+        );
+        // The pass that saw the bump leaves the memo standing: the draw after
+        // it skips again.
+        assert!(ensure_pass(&mut state, &states).is_empty(), "skipped again");
+    }
+
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;

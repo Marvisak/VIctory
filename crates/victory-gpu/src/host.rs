@@ -782,6 +782,31 @@ pub(crate) mod tests {
     }
 }
 
+/// A host list's texture-states generation: bumped whenever the list's
+/// `states` gain an entry, move one, or are cleared ([`HostList::track`],
+/// [`HostList::reset`]), so that a draw which ensured its targets against a
+/// generation skips ensuring them again while it stands.
+///
+/// Relaxed both ways, which is enough: every bump is made by the code that
+/// records into the list, and a draw holds the same title list's state mutex
+/// while it reads (`crate::list::with_state`), so a bump made before it —
+/// earlier in that thread, or under that mutex — is seen. The states it
+/// stands for are ordered by their own mutex.
+#[derive(Debug, Default)]
+pub(crate) struct Generation(std::sync::atomic::AtomicU64);
+
+impl Generation {
+    /// The list's states gained an entry, moved one, or were cleared.
+    pub(crate) fn bump(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// What the generation stood at when it was last read.
+    pub(crate) fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -799,6 +824,10 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Bumped whenever `states` gains or changes an entry (and when it is
+    /// cleared): a draw that ensured its targets against this generation
+    /// need not ensure them again.
+    states_generation: Generation,
     /// Depth textures with a writable twin the list uses (`crate::twin`),
     /// by host copy: the side its first use needs and the side it leaves
     /// newer.
@@ -1133,6 +1162,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                states_generation: Generation::default(),
                 twins: Mutex::default(),
                 rebind: false.into(),
                 ours: false.into(),
@@ -1783,6 +1813,7 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.states_generation.bump();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -1819,14 +1850,24 @@ impl HostList {
         // One host texture for the whole move (`crate::resource::evict` may
         // give it up meanwhile; this list then holds it).
         let copy = crate::resource::host_copy(resource)?;
-        let texture = copy.texture.clone();
         if let Some(Some(twin)) = copy.twin.get()
             && crate::twin::route(self, &copy, twin, wanted)
         {
+            // The twin's side moved: a later draw must be ensured again.
+            self.states_generation.bump();
             return None;
         }
-        let wanted = legal_state(&texture, wanted);
-        self.track(&copy, wanted).map(|before| (texture, before))
+        let wanted = legal_state(&copy.texture, wanted);
+        // The texture is cloned only when a barrier is owed, not on every
+        // call that finds the state already right.
+        self.track(&copy, wanted)
+            .map(|before| (copy.texture.clone(), before))
+    }
+
+    /// The generation of the list's texture states: unchanged when nothing
+    /// the list named has moved since it was last read.
+    pub(crate) fn states_generation(&self) -> &Generation {
+        &self.states_generation
     }
 
     /// The list's state for host texture `copy` becomes `wanted` (a legal
@@ -1836,6 +1877,7 @@ impl HostList {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
+                self.states_generation.bump();
                 copy.note_used();
                 if !self.ours.load(Ordering::Relaxed) {
                     copy.stamp();
@@ -1845,7 +1887,14 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some(before)
+                // Only a real move counts: an entry already at `wanted` leaves
+                // the generation alone, so a draw's targets stay ensured.
+                if before != wanted {
+                    self.states_generation.bump();
+                    Some(before)
+                } else {
+                    None
+                }
             }
         }
     }
