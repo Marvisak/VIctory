@@ -88,6 +88,7 @@ impl Pending {
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            super::library::note_time(&self.key, started.elapsed().as_millis() as u64);
             #[cfg(feature = "diagnostics")]
             log_built(&self.key);
             let (user, kernel) = super::thread_cpu_since(cpu);
@@ -114,7 +115,12 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
         key.update(s.stage.as_bytes());
         key.update(s.hash.as_bytes());
     }
-    key.update(graphics.map(|g| g.describe()).unwrap_or_default().as_bytes());
+    key.update(
+        graphics
+            .map(|g| g.describe())
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     key.finalize().to_hex()[..32].to_owned()
 }
 
@@ -146,7 +152,9 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log_built(key: &str) {
     if let Some((name, loaded)) = super::library::LAST.take() {
-        log("built", key, || format!("{name}\t{}", if loaded { "loaded" } else { "made" }));
+        log("built", key, || {
+            format!("{name}\t{}", if loaded { "loaded" } else { "made" })
+        });
     }
 }
 
@@ -166,9 +174,13 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
     };
     let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     if log.is_none() {
-        *log = std::fs::File::create(path).ok().map(|f| (f, HashSet::new()));
+        *log = std::fs::File::create(path)
+            .ok()
+            .map(|f| (f, HashSet::new()));
     }
-    let Some((file, seen)) = log.as_mut() else { return };
+    let Some((file, seen)) = log.as_mut() else {
+        return;
+    };
     if seen.insert(format!("{what} {key}")) {
         let _ = writeln!(file, "{what}\t{key}\t{}", rest());
     }
@@ -217,7 +229,10 @@ fn start(p: &Arc<Pending>, now: bool) {
 fn enqueue(p: &Pending, now: bool) -> Option<bool> {
     let first = !p.queued.swap(true, Ordering::Relaxed);
     if first {
-        PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        PEAK.fetch_max(
+            WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+            Ordering::Relaxed,
+        );
     }
     let ahead = now && !p.now.swap(true, Ordering::Relaxed);
     (first || ahead && !p.taken.load(Ordering::Relaxed)).then_some(ahead)
@@ -249,15 +264,73 @@ fn wait(p: &Pending, frame: u64) {
         if rest.is_zero() {
             break;
         }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        held = done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Pipelines for the workers: those draws wait for, then those started
-/// early.
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
-    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
+/// How many workers may make early pipelines known to take long at once:
+/// a quarter of the worker pool (`VICTORY_PIPELINE_SLOW=0` disables).
+fn slow_limit(workers: usize) -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
+            usize::MAX
+        } else {
+            (workers / 4).max(1)
+        }
+    })
+}
+
+struct Queues {
+    /// `[0]` = requested by a draw, `[1]` = early normal, `[2]` = early slow.
+    lists: [VecDeque<Arc<Pending>>; 3],
+    slow_now: usize,
+}
+
+impl Queues {
+    const fn new() -> Self {
+        Self {
+            lists: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
+            slow_now: 0,
+        }
+    }
+
+    fn push(&mut self, p: Arc<Pending>, now: bool, slow: bool) {
+        let idx = if now {
+            0
+        } else if slow {
+            2
+        } else {
+            1
+        };
+        self.lists[idx].push_back(p);
+    }
+
+    /// The second field owns a slot in the slow-worker budget.
+    fn pop(&mut self, slow_cap: usize) -> Option<(Arc<Pending>, bool)> {
+        if let Some(p) = self.lists[0]
+            .pop_front()
+            .or_else(|| self.lists[1].pop_front())
+        {
+            return Some((p, false));
+        }
+        if self.slow_now < slow_cap
+            && let Some(p) = self.lists[2].pop_front()
+        {
+            self.slow_now += 1;
+            return Some((p, true));
+        }
+        None
+    }
+}
+
+/// Pipelines for the workers: those draws wait for, those started early, and
+/// slow early pipelines.
+static QUEUES: (Mutex<Queues>, Condvar) = (Mutex::new(Queues::new()), Condvar::new());
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
@@ -285,8 +358,11 @@ fn queue(p: Arc<Pending>, now: bool) {
         }
         return;
     }
+    let slow = !now && slow_limit(workers) != usize::MAX && super::library::slow(&p.key);
     let (lock, work) = &QUEUES;
-    lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
+    lock.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(p, now, slow);
     work.notify_one();
 }
 
@@ -299,12 +375,14 @@ fn work() {
         use windows::Win32::System::Threading::*;
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
+    let slow_cap =
+        slow_limit(std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)));
     let (lock, work) = &QUEUES;
     loop {
-        let p = {
+        let entry = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(p) = queues.iter_mut().find_map(VecDeque::pop_front) {
+                if let Some(p) = queues.pop(slow_cap) {
                     break p;
                 }
                 let (held, waited) = work
@@ -318,16 +396,32 @@ fn work() {
                 }
             }
         };
-        if p.taken.swap(true, Ordering::Relaxed) {
+        if !run_queued(entry, &QUEUES, Pending::make) {
             continue; // its other queue entry
         }
-        p.make();
         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
             drained();
         } else {
             super::library::save(false);
         }
     }
+}
+
+/// Compiles the first entry for a pipeline and returns this entry's slot.
+fn run_queued(
+    (pending, reserved_slow_slot): (Arc<Pending>, bool),
+    (lock, work): &(Mutex<Queues>, Condvar),
+    make: impl FnOnce(&Pending),
+) -> bool {
+    let first = !pending.taken.swap(true, Ordering::Relaxed);
+    if first {
+        make(&pending);
+    }
+    if reserved_slow_slot {
+        lock.lock().unwrap_or_else(|e| e.into_inner()).slow_now -= 1;
+        work.notify_one();
+    }
+    first
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -404,6 +498,76 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn a_discarded_draw_entry_cannot_release_another_workers_slow_slot() {
+        let new = || {
+            Arc::new(Pending::new(
+                Vec::new(),
+                None,
+                #[cfg(feature = "diagnostics")]
+                &[],
+            ))
+        };
+        let (first, second) = (new(), new());
+        let queue = (Mutex::new(Queues::new()), Condvar::new());
+        {
+            let mut waiting = queue.0.lock().unwrap();
+            waiting.push(first.clone(), false, true);
+            waiting.push(second.clone(), false, true);
+        }
+
+        // The draw passed enqueue's taken check, but it has not acquired
+        // the queue lock to push the urgent entry yet.
+        assert!(!first.taken.load(Ordering::Relaxed));
+        let slow = queue.0.lock().unwrap().pop(1).unwrap();
+        assert!(Arc::ptr_eq(&slow.0, &first));
+        assert!(run_queued(slow, &queue, |_| {
+            let duplicate = {
+                let mut waiting = queue.0.lock().unwrap();
+                waiting.push(first.clone(), true, false);
+                waiting.pop(1).unwrap()
+            };
+            assert!(!run_queued(duplicate, &queue, |_| {
+                panic!("the pipeline is already compiling")
+            }));
+            assert!(
+                queue.0.lock().unwrap().pop(1).is_none(),
+                "the running slow compile still owns the only slot"
+            );
+        }));
+        let next = queue.0.lock().unwrap().pop(1).unwrap();
+        assert!(Arc::ptr_eq(&next.0, &second));
+    }
+
+    #[test]
+    fn pipelines_known_to_take_long_leave_workers_for_the_others() {
+        let new = || {
+            Arc::new(Pending::new(
+                Vec::new(),
+                None,
+                #[cfg(feature = "diagnostics")]
+                &[],
+            ))
+        };
+        let (long, longer, asked, quick) = (new(), new(), new(), new());
+        let mut queues = Queues::new();
+        queues.push(long.clone(), false, true);
+        queues.push(longer.clone(), false, true);
+        queues.push(asked.clone(), true, true);
+        queues.push(quick.clone(), false, false);
+        // Requested and quick early pipelines go ahead of slow early ones;
+        // at most `slow_cap` slow early pipelines run concurrently.
+        let (pending, reserved_slow_slot) = queues.pop(1).unwrap();
+        assert!(Arc::ptr_eq(&pending, &asked));
+        assert!(!reserved_slow_slot);
+        assert!(Arc::ptr_eq(&queues.pop(1).unwrap().0, &quick));
+        assert!(Arc::ptr_eq(&queues.pop(1).unwrap().0, &long));
+        assert!(queues.pop(1).is_none());
+        queues.slow_now -= 1;
+        assert!(Arc::ptr_eq(&queues.pop(1).unwrap().0, &longer));
+        assert!(queues.pop(1).is_none());
     }
 
     #[cfg(feature = "diagnostics")]
