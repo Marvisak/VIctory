@@ -709,7 +709,7 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
 /// instruction up, by the unwind data of each image (the Windows loader
 /// registered it for title images too). Code without unwind data (our
 /// thunks, leaf functions) is taken to have its return address at `rsp`.
-fn unwind(context: CONTEXT) -> Vec<u64> {
+pub(crate) fn unwind(context: CONTEXT) -> Vec<u64> {
     let (mut low, mut high) = (0, 0);
     // SAFETY: writes the current thread's stack bounds.
     unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };

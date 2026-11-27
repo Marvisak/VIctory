@@ -25,6 +25,10 @@ pub struct Config {
     /// The user's copy of AMD FidelityFX for PC (the folder with its
     /// upscaler DLL), which replaces a title's console build.
     pub fidelityfx_dir: Option<PathBuf>,
+    /// Preferred upscaler for the native Graphics settings.
+    pub graphics_upscaler: GraphicsUpscaler,
+    /// Frame generation for the native Graphics settings.
+    pub frame_generation: FrameGeneration,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -34,6 +38,35 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    graphics: FileGraphics,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileGraphics {
+    #[serde(default)]
+    upscaler: GraphicsUpscaler,
+    #[serde(default)]
+    frame_generation: FrameGeneration,
+}
+
+/// Whether VIctory inserts AMD FSR frame generation (`[graphics]
+/// frame_generation`). Applies after a restart.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameGeneration {
+    #[default]
+    Off,
+    AmdFsr,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphicsUpscaler {
+    #[default]
+    TitleDefault,
+    AmdFsr,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -74,7 +107,10 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        let mut config = Self::resolve(parsed.paths, source, |k| std::env::var_os(k))?;
+        config.graphics_upscaler = parsed.graphics.upscaler;
+        config.frame_generation = parsed.graphics.frame_generation;
+        Ok(config)
     }
 
     fn resolve(
@@ -101,6 +137,8 @@ impl Config {
             data_dir,
             test_titles,
             fidelityfx_dir: env_path("VICTORY_FIDELITYFX_DIR").or(file.fidelityfx_dir),
+            graphics_upscaler: GraphicsUpscaler::default(),
+            frame_generation: FrameGeneration::default(),
             source,
         })
     }
@@ -217,6 +255,22 @@ mod tests {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+        assert_eq!(parsed.graphics.upscaler, GraphicsUpscaler::TitleDefault);
+    }
+
+    #[test]
+    fn frame_generation_defaults_off_and_can_select_amd_fsr() {
+        let parsed: FileConfig = toml::from_str("[graphics]").unwrap();
+        assert_eq!(parsed.graphics.frame_generation, FrameGeneration::Off);
+        let parsed: FileConfig =
+            toml::from_str("[graphics]\nframe_generation = 'amd_fsr'").unwrap();
+        assert_eq!(parsed.graphics.frame_generation, FrameGeneration::AmdFsr);
+    }
+
+    #[test]
+    fn graphics_upscaler_can_select_amd_fsr() {
+        let parsed: FileConfig = toml::from_str("[graphics]\nupscaler = 'amd_fsr'").unwrap();
+        assert_eq!(parsed.graphics.upscaler, GraphicsUpscaler::AmdFsr);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use windows_sys::Wdk::System::Threading::{
 };
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext,
+    CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext, RtlCaptureContext,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -19,7 +19,7 @@ use windows_sys::Win32::System::Threading::{
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
-use crate::crash::{MAX_FRAMES, locate, unwind_into};
+use crate::crash::{Aligned16, MAX_FRAMES, locate, unwind, unwind_into};
 
 /// Reads `VICTORY_STACKS` and, if set, starts a thread that prints every
 /// thread's stack at each listed time (seconds from now).
@@ -35,6 +35,21 @@ pub fn dump_stacks_on_schedule() {
             dump_stacks();
         }
     });
+}
+
+/// The calling thread's stack as `module+rva` frames, innermost first, at
+/// most `max`: for diagnostics that log where a call into us came from.
+pub fn stack_here(max: usize) -> Vec<String> {
+    // SAFETY: zeroed is a valid CONTEXT.
+    let mut context = Aligned16(unsafe { std::mem::zeroed() });
+    // SAFETY: fills the context of the calling thread, 16-byte aligned.
+    unsafe { RtlCaptureContext(&mut context.0) };
+    let frames = unwind(context.0);
+    frames
+        .into_iter()
+        .take(max)
+        .map(|f| locate(f as usize))
+        .collect()
 }
 
 /// The times in a `VICTORY_STACKS` list (seconds, comma-separated), in
@@ -234,6 +249,13 @@ mod tests {
         dump_stacks();
         stop_tx.send(()).unwrap();
         parked.join().unwrap();
+    }
+
+    #[test]
+    fn stack_here_names_this_binary() {
+        let frames = stack_here(8);
+        assert!(!frames.is_empty() && frames.len() <= 8, "{frames:?}");
+        assert!(frames[0].contains('+'), "{frames:?}");
     }
 
     /// Times no `Duration` holds are left out instead of panicking the dump

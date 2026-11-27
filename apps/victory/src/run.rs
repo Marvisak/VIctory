@@ -180,7 +180,7 @@ pub fn run(
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
-    diagnostics(&image, &cfg);
+    diagnostics(&image, &cfg, console)?;
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
@@ -225,7 +225,13 @@ fn check_startup_archive(path: &Path) -> Result<()> {
 /// The debugging aids (README): scheduled stack dumps, watched values and
 /// memory saved on a crash.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
+fn diagnostics(
+    image: &victory_loader::LoadedImage,
+    cfg: &victory_core::Config,
+    console: Console,
+) -> Result<()> {
+    crate::title_patch::apply(image, cfg, console)?;
+    crate::menu_trace::start(image, cfg)?;
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
@@ -247,6 +253,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
             })
             .collect(),
     );
+    Ok(())
 }
 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each

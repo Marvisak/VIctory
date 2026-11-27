@@ -459,6 +459,9 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = std::time::Instant::now();
         let result = execute(&job.request);
+        if result.is_ok() {
+            recent_reads::landed(&job.request);
+        }
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -846,6 +849,71 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// Watches loaded data for one 4-byte word (such as a reflected type hash),
+/// so a structure the title loads from a file is known the moment its read
+/// lands, on the reading thread, instead of being searched for later.
+pub mod recent_reads {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{BCPACK, PAGE_DESTINATION, Request};
+
+    /// Hits kept, newest last: only words found, so loads never push a
+    /// rare structure out.
+    const KEPT: usize = 256;
+    /// Larger reads are bulk data (models, audio), not small tables.
+    const MAX_SIZE: usize = 16 << 20;
+    /// Bit 32 set: watching the low 32 bits.
+    static WATCHED: AtomicU64 = AtomicU64::new(0);
+    static HITS: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
+
+    /// From now on, every plain read that lands is checked for `word` at
+    /// 8-aligned addresses.
+    pub fn watch(word: u32) {
+        WATCHED.store(1 << 32 | u64::from(word), Ordering::Release);
+    }
+
+    /// Addresses of the watched word in loaded data, newest first. The data
+    /// may have changed since: check before use.
+    pub fn hits() -> Vec<usize> {
+        let hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
+        hits.iter().rev().copied().collect()
+    }
+
+    /// A read completed successfully.
+    pub(super) fn landed(request: &Request) {
+        let watched = WATCHED.load(Ordering::Acquire);
+        let size = request.destination_size as usize;
+        if watched == 0
+            || request.options & (PAGE_DESTINATION | BCPACK) != 0
+            || size == 0
+            || size > MAX_SIZE
+        {
+            return;
+        }
+        let at = request.destination as usize;
+        // SAFETY: a plain read just wrote `destination_size` bytes there on
+        // this thread; the title gets the completion only after this.
+        let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, size) };
+        let needle = (watched as u32).to_le_bytes();
+        let found: Vec<usize> = memchr::memmem::find_iter(bytes, &needle)
+            .map(|hit| at + hit)
+            .filter(|addr| addr % 8 == 0)
+            .collect();
+        if found.is_empty() {
+            return;
+        }
+        let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
+        for addr in found {
+            if hits.len() == KEPT {
+                hits.pop_front();
+            }
+            hits.push_back(addr);
+        }
+    }
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
@@ -869,6 +937,17 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     if request.source.is_null() || request.destination.is_null() {
         return Err(fail(E_INVALIDARG, "no source or destination"));
     }
+    // Diagnostics (off unless `dstorage_dest=debug`): where each read lands,
+    // to tell which loaded file holds a structure found in memory.
+    tracing::debug!(
+        target: "dstorage_dest",
+        destination = format_args!("{:#x}", request.destination as usize),
+        size = request.destination_size,
+        offset = request.offset,
+        options = format_args!("{options:#x}"),
+        name = text(request.name),
+        "dstorage: read"
+    );
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
     if options & (ZLIB | BCPACK) == 0 {

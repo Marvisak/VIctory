@@ -195,6 +195,9 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
+| `VICTORY_MENU_TRACE=1` | logs Settings section registration, controller changes, and settings save changes |
+| `VICTORY_MENU_GRAPHICS=1` | exposes the title's hidden Graphics tab for inspection on recognized builds. Browse without editing values. Confirming changes can crash the title |
+| `VICTORY_MENU_ROW_TRACE=1` | with `VICTORY_MENU_GRAPHICS=1`, logs row IDs for Video and Graphics |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |

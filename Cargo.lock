@@ -651,6 +651,7 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
+ "tempfile",
  "tracing",
  "victory-core",
  "victory-game",
@@ -706,6 +707,7 @@ dependencies = [
 name = "victory-hle"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "miniz_oxide",
  "opus-pure",
  "tempfile",

@@ -11,7 +11,7 @@ fn value_is_on(value: Option<&OsStr>) -> bool {
 }
 
 /// Whether the environment variable `name` switches something on.
-pub(crate) fn on(name: &str) -> bool {
+pub fn on(name: &str) -> bool {
     value_is_on(std::env::var_os(name).as_deref())
 }
 

@@ -23,8 +23,14 @@
 
 #[cfg(windows)]
 mod crash;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod memory;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod patch;
 pub mod prepare;
 pub(crate) mod publish;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod redirect;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
@@ -37,16 +43,22 @@ mod tls;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use crash::save_on_crash;
 #[cfg(windows)]
 pub use crash::{
     locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
 };
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use crash::save_on_crash;
+pub use memory::{mapped_regions, read_memory};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use patch::CodeWrite;
 pub use prepare::{PrepareError, PreparedImage, prepare};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use redirect::Redirect;
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use stacks::{dump_stacks, dump_stacks_on_schedule};
+pub use stacks::{dump_stacks, dump_stacks_on_schedule, stack_here};
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
 #[cfg(windows)]

@@ -29,6 +29,8 @@ pub mod media;
 #[cfg(windows)]
 pub mod net;
 pub mod rpcrt4;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod settings_trace;
 pub mod speech;
 pub mod storage;
 pub mod xasync;

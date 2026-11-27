@@ -22,3 +22,10 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+# Diagnostics builds, Series X. Applies the next time the title starts.
+# AMD FSR requires the PC SDK above and starts at a 0.5 render scale.
+# The VICTORY_UPSCALER and VICTORY_FFX_SCALE diagnostics override this choice.
+# [graphics]
+# upscaler = 'amd_fsr'  # or 'title_default'
+# frame_generation = 'amd_fsr'  # or 'off' (saved only: not applied in this build yet)
