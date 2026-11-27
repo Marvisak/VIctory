@@ -2761,11 +2761,11 @@ uint ps() : SV_Target { return 1; }
             Slots(heap, step)
         }
 
-        fn make(&self, i: u32, view: &View) {
+        fn make(&self, i: u32, view: &View) -> ID3D12Resource {
             // SAFETY: a live heap.
             let mut at = unsafe { self.0.GetCPUDescriptorHandleForHeapStart() };
             at.ptr += (i * self.1) as usize;
-            assert!(crate::descriptor::host::make_view(view, at).is_some(), "slot {i} made");
+            crate::descriptor::host::make_view(view, at).unwrap_or_else(|| panic!("slot {i} not made"))
         }
 
         fn gpu(&self, i: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
@@ -2810,6 +2810,11 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
+    #[test]
+    fn an_rgb9e5_placed_view_reads_through_distinct_host_textures() {
+        check_placed_texture_aliases(true);
+    }
+
     /// One texture memory written through an unordered view of a resource
     /// object in one format and read through a placed view in another: a
     /// castable pair shares one host texture (no copy), a pair of other
@@ -2817,7 +2822,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// bridged by a copy at the read.
     #[test]
     fn a_texture_written_in_one_format_reads_in_another_through_a_placed_view() {
+        check_placed_texture_aliases(false);
+    }
+
+    fn check_placed_texture_aliases(distinct_rgb9e5: bool) {
         let Some(host) = crate::host::host() else {
+            assert!(!distinct_rgb9e5, "RGB9E5 fallback test needs a D3D12 device");
             return; // no host GPU here
         };
         let slots = Slots::new(4);
@@ -2835,7 +2845,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 67,
                 64,
                 [1.0, 0.5, 0.25, 1.0],
-                true,
+                false,
             ),
             // R32G32_UINT blocks read as BC1: solid red blocks.
             (
@@ -2849,6 +2859,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             ),
         ];
         for (round, (written, size, put, format, read_size, want, shared)) in cases.into_iter().enumerate() {
+            if distinct_rgb9e5 && round != 0 {
+                break;
+            }
             let address = title_memory(1 << 20);
             let object = texture_at_address(address, &texture_words(size, size, written, 0x105, 4));
             let view = placed_view(address, texture_words(read_size, read_size, format, 0x105, 0));
@@ -2857,10 +2870,16 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let a = crate::resource::host_copy(object).unwrap();
             let b = crate::resource::host_copy(placed as This).unwrap();
-            assert_eq!(std::sync::Arc::ptr_eq(&a, &b), shared, "round {round}: one host texture");
+            let one_texture = std::sync::Arc::ptr_eq(&a, &b);
+            assert_eq!(one_texture, shared, "round {round}: one host texture");
             let unordered = View::Unordered(object as usize, 0, Some([written, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
-            slots.make(0, &unordered);
-            slots.make(1, &view);
+            let _ = host.log_messages();
+            let write_bound = slots.make(0, &unordered);
+            let bound = slots.make(1, &view);
+            if distinct_rgb9e5 {
+                assert!(bound != write_bound, "SRV must bind a different texture from the UAV");
+            }
+            assert_eq!(host.log_messages(), None, "round {round}: descriptor creation validation");
             let write = compile_cs(&format!(
                 "#define RS \"DescriptorTable(UAV(u0))\"\n{put}\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ put(id.xy); }}"
             ));
@@ -2872,6 +2891,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             run(&list, &slots, &read, 1, Some(&out), (read_size / 8, read_size / 8));
             list.close();
             host.execute(&[&list]);
+            if distinct_rgb9e5 {
+                assert_eq!(host.log_messages(), None, "alias copy and dispatch validation");
+                eprintln!("exercised the RGB9E5 two-resource fallback");
+            }
             let copied = crate::texture::ALIAS_COPIES.load(Ordering::Relaxed) > copies;
             assert_eq!(copied, !shared, "round {round}: a copy only where not shared");
             let n = read_size as usize;

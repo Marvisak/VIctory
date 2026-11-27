@@ -1184,7 +1184,8 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
 /// format list casting allows (uncompressed among uncompressed, block
 /// formats among block formats of the same block size), but depth ones
 /// (refused in lists on the RX 6700 XT and WARP alike) and typeless ones
-/// (no view takes them).
+/// (no view takes them). Keep RGB9E5 and R32_UINT separate: the virtual
+/// adapter accepts the format list but rejects the cross-format SRV.
 pub(crate) fn castable(format: u32) -> Vec<u32> {
     const DEPTH_FAMILIES: [u32; 10] = [19, 20, 21, 22, 40, 44, 45, 46, 47, 55];
     let Some(e) = element(format) else {
@@ -1192,8 +1193,13 @@ pub(crate) fn castable(format: u32) -> Vec<u32> {
     };
     (1..=115)
         .filter(|&f| f != format && element(f) == Some(e) && !DEPTH_FAMILIES.contains(&f))
+        .filter(|&f| !separate_formats(format, f))
         .filter(|&f| !(family(f) == f && family(f + 1) == f))
         .collect()
+}
+
+fn separate_formats(format: u32, other: u32) -> bool {
+    matches!((format, other), (42, 67) | (67, 42))
 }
 
 /// Live host textures by texture memory: title textures (resource objects
@@ -1238,8 +1244,11 @@ fn shared_texture(
     if let Some(k) = key {
         let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         for r in at.get(&address).into_iter().flatten().map(|&r| resource(r as This)) {
-            if memory_key(address, &r.desc) == Some(k) {
-                d.flags |= host_desc(&r.desc).map_or(0, |h| h.flags & USES);
+            if memory_key(address, &r.desc) == Some(k)
+                && let Some(other) = host_desc(&r.desc)
+                && !separate_formats(d.format, other.format)
+            {
+                d.flags |= other.flags & USES;
             }
         }
     }
@@ -1272,8 +1281,7 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     let td = unsafe { t.texture.GetDesc() };
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
     d.flags & USES & !flags == 0
-        && (family(d.format) == family(own)
-            || t.castable.iter().any(|&c| family(c) == family(d.format)))
+        && (family(d.format) == family(own) || t.castable.contains(&d.format))
 }
 
 /// Whether `this`'s host texture is still its memory's (not replaced by one
@@ -2510,17 +2518,17 @@ mod tests {
         assert_eq!(memory_key(0x1_0000, &buffer(256)), None);
     }
 
-    /// Castable formats: every format of the same element but typeless and
-    /// depth ones; block formats among block formats of their block size.
+    /// Castable formats retain compatible elements but exclude unsupported pairs.
     #[test]
     fn castable_formats_share_the_element() {
         let c = castable(42);
-        for f in [67, 28, 29, 41, 24, 26, 87, 35] {
+        for f in [28, 29, 41, 24, 26, 87, 35] {
             assert!(c.contains(&f), "{f}");
         }
-        for f in [42, 39, 40, 45, 27, 10, 56] {
+        for f in [42, 39, 40, 45, 27, 10, 56, 67] {
             assert!(!c.contains(&f), "{f}");
         }
+        assert!(!castable(67).contains(&42));
         let bc1 = castable(71);
         assert!(bc1.contains(&72) && bc1.contains(&80) && bc1.contains(&81));
         assert!(!bc1.contains(&70) && !bc1.contains(&98) && !bc1.contains(&17));
