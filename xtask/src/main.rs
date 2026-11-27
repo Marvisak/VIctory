@@ -1,6 +1,7 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod policy;
+mod switch_docs;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,7 +25,9 @@ enum Cmd {
         #[arg(long)]
         staged: bool,
     },
-    /// Point git at .githooks/ so every commit runs the policy check.
+    /// Check that `VICTORY_*` switches named in the docs are read in Rust.
+    CheckSwitches,
+    /// Point git at .githooks/ so every commit runs the repository checks.
     InstallHooks,
 }
 
@@ -32,6 +35,7 @@ fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::CheckSwitches => switch_docs::run(&root),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
@@ -42,7 +46,10 @@ fn main() -> Result<()> {
                 status.success(),
                 "git config failed (is this a git repository?)"
             );
-            println!("hooks installed: commits now run `cargo xtask policy --staged`");
+            println!(
+                "hooks installed: commits now run `cargo xtask policy --staged` and \
+                 `cargo xtask check-switches`"
+            );
             Ok(())
         }
     }

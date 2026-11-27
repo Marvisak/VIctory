@@ -1,3 +1,4 @@
 #!/bin/sh
-# Enforces the asset policy on every commit. Install with: cargo xtask install-hooks
-exec cargo xtask policy --staged
+# Enforces the asset policy and documented switch names on every commit. Install with: cargo xtask install-hooks
+cargo xtask policy --staged || exit $?
+exec cargo xtask check-switches

@@ -80,8 +80,9 @@ Performance → Memory**. If `crashes.log` reports Windows error 1455, close
 other applications or increase the Windows paging file size, then retry.
 
 ```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
+cargo xtask install-hooks                # asset-policy and switch-doc checks on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
+cargo xtask check-switches              # every documented VICTORY_* switch is read in Rust
 cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
