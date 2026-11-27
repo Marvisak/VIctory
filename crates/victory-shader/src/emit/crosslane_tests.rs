@@ -205,6 +205,48 @@ fn lane_v3_rhs(lane: u32) -> u32 {
     0x0001_0000u32.wrapping_add(lane)
 }
 
+// The selector's low and high dwords select nibbles for lanes 0..7 and
+// 8..15 respectively; permlanex reads the other row of this 32-lane wave.
+fn ref_permlanex(exec: u32, selector: u64, bound_ctrl: bool) -> [u32; 32] {
+    std::array::from_fn(|lane| {
+        let lane = lane as u32;
+        let old = lane_v2_old(lane);
+        if exec & (1 << lane) == 0 {
+            return old;
+        }
+        let pick = ((selector >> (4 * (lane & 15))) & 15) as u32;
+        let src = ((lane & 16) ^ 16) | pick;
+        if exec & (1 << src) != 0 {
+            lane_v1(src)
+        } else if bound_ctrl {
+            0
+        } else {
+            old
+        }
+    })
+}
+
+#[test]
+fn permlanex_partial_exec_matches_reference() {
+    let mut cases = Vec::new();
+    for bc in [false, true] {
+        // s13=4, s14=5. Distinct selector registers exercise both halves.
+        let words = [
+            s_mov_b32(13, 0x84),
+            s_mov_b32(14, 0x85),
+            (0x35 << 26) | (0x378 << 16) | 2 | (u32::from(bc) << 12),
+            257 | (13 << 9) | (14 << 18),
+        ];
+        let shader = build_wave32_cs(MaskPattern::Even, Divergence::Guarded, &words);
+        cases.push((
+            if bc { "partial EXEC, BC=1" } else { "partial EXEC, BC=0" },
+            shader,
+            ref_permlanex(0x5555_5555, 4 | (5u64 << 32), bc),
+        ));
+    }
+    check_cases("permlanex", &cases);
+}
+
 /// Exact CPU reference model for AMD RDNA2 (GFX10.3) `DPP16` and `DPP8`/`DPP8FI`.
 fn ref_dpp(dpp: Dpp, add_rhs: bool, exec: u32) -> [u32; 32] {
     let mut out = [0u32; 32];
