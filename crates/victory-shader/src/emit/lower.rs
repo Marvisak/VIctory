@@ -8748,11 +8748,12 @@ impl<'a> Lower<'a> {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
+            let cube_face = cs[2];
             if kind == 5 {
                 if *unorm || op == 81 {
                     return Err("a cube sample with texel coordinates or a level query");
                 }
-                let dir = self.cube_direction(cs[0], cs[1], cs[2]);
+                let dir = self.cube_direction(cs[0], cs[1], cube_face);
                 cs[..3].copy_from_slice(&dir);
             }
             if *unorm {
@@ -8842,16 +8843,9 @@ impl<'a> Lower<'a> {
                         &args,
                     )
                 }
-                63 if kind == 5 => {
-                    // A cube's gradients are the face's: ds, dt per step in x,
-                    // then in y, in face coordinates (a face spans 1). The level
-                    // the hardware picks from them, isotropically: log2 of the
-                    // longer gradient in texels of a face, then the clamp.
-                    // shortcut: sampled at that level, so a sampler's
-                    // anisotropy is lost and its LOD bias comes after the
-                    // clamp (the console adds it before); D3D12 cube sampling
-                    // takes 3D gradients only. Upgrade if cube lookups blur or
-                    // a biased sampler meets a binding clamp.
+                63 if kind == 5 && name == "image_sample_d" => {
+                    // Preserve the isotropic LOD approximation for the
+                    // ordinary, unclamped cube gradient sample.
                     let mut g = [fu; 4];
                     for (k, x) in g.iter_mut().enumerate() {
                         let v = addr_val(self, first + k)?;
@@ -8877,12 +8871,7 @@ impl<'a> Lower<'a> {
                     let m = self.s.m.bin(c, Bin::Mul, m, w2);
                     let half = self.s.m.f32(0.5f32.to_bits());
                     let l = self.unary(23, m);
-                    let mut lod = self.s.m.bin(c, Bin::Mul, l, half);
-                    if name.ends_with("_cl") {
-                        let x = addr_val(self, first + grads + coords)?;
-                        let clamp = to_float(self, x);
-                        lod = self.binary(35, lod, clamp);
-                    }
+                    let lod = self.s.m.bin(c, Bin::Mul, l, half);
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(
@@ -8896,15 +8885,33 @@ impl<'a> Lower<'a> {
                 }
                 63 => {
                     // With a16 each direction's gradients start a VGPR.
-                    if *a16 && spatial % 2 == 1 {
+                    if *a16 && kind != 5 && spatial % 2 == 1 {
                         return Err("16-bit gradients of a 1D or 3D image");
                     }
-                    let mut g = vec![fu; 6];
-                    for k in 0..spatial {
-                        let x = addr_val(self, first + k)?;
-                        g[k] = to_float(self, x);
-                        let y = addr_val(self, first + spatial + k)?;
-                        g[3 + k] = to_float(self, y);
+                    let mut g = [fu; 6];
+                    if kind == 5 {
+                        // SampleGrad applies sampler bias before the MinLOD operand.
+                        // Invert the host's projection on the selected face.
+                        // Its half-scale cancels ours and the major derivative is zero.
+                        let two = self.s.m.f32(2.0f32.to_bits());
+                        let zero = self.s.m.f32(0);
+                        let face = self.s.m.cast(c, Cast::FpToUi, cube_face, self.s.t.i32);
+                        for (axis, result) in g.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                            let ds = addr_val(self, first + 2 * axis)?;
+                            let dt = addr_val(self, first + 2 * axis + 1)?;
+                            let ds = to_float(self, ds);
+                            let dt = to_float(self, dt);
+                            let du = self.s.m.bin(c, Bin::Mul, ds, two);
+                            let dv = self.s.m.bin(c, Bin::Mul, dt, two);
+                            *result = self.cube_vector(du, dv, face, [zero; 2]);
+                        }
+                    } else {
+                        for k in 0..spatial {
+                            let x = addr_val(self, first + k)?;
+                            g[k] = to_float(self, x);
+                            let y = addr_val(self, first + spatial + k)?;
+                            g[3 + k] = to_float(self, y);
+                        }
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -9067,24 +9074,29 @@ impl<'a> Lower<'a> {
         let u = self.s.m.bin(c, Bin::Sub, u, three);
         let v = self.s.m.bin(c, Bin::Mul, t, two);
         let v = self.s.m.bin(c, Bin::Sub, v, three);
+        let face = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
+        let axis = [k(self, 1.0), k(self, -1.0)];
+        self.cube_vector(u, v, face, axis)
+    }
+
+    fn cube_vector(&mut self, u: V, v: V, face: V, [positive, negative]: [V; 2]) -> [V; 3] {
+        let c = self.cur;
         let z = self.s.m.f32(0x8000_0000);
         let (nu, nv) = (
             self.s.m.bin(c, Bin::Sub, z, u),
             self.s.m.bin(c, Bin::Sub, z, v),
         );
-        let (one, mone) = (k(self, 1.0), k(self, -1.0));
-        let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
         // Per face +x, -x, +y, -y, +z, -z.
         let table = [
-            [one, mone, u, u, u, nu],
-            [nv, nv, one, mone, nv, nv],
-            [nu, u, v, nv, one, mone],
+            [positive, negative, u, u, u, nu],
+            [nv, nv, positive, negative, nv, nv],
+            [nu, u, v, nv, positive, negative],
         ];
         table.map(|row| {
             let mut r = row[0];
             for (n, &x) in row.iter().enumerate().skip(1) {
                 let kn = self.s.m.i32(n as u32);
-                let is = self.s.m.cmp(c, pred::EQ, f, kn);
+                let is = self.s.m.cmp(c, pred::EQ, face, kn);
                 r = self.s.m.select(c, is, x, r);
             }
             r
