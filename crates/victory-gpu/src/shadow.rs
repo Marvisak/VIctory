@@ -484,11 +484,12 @@ impl Shadow {
     /// submission: title memory where the title has not written the page
     /// since the copy took it, else what the page held when the title first
     /// wrote it ([`crate::watch::Tracked::saved`], if the page was armed).
-    /// Returns the bytes written.
+    /// Returns the bytes written. The caller reuses the scratch buffer
+    /// across the marked pages of a submission.
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
-    pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+    pub(crate) fn copy_back_marked(&self, page: usize, scratch: &mut Vec<u8>) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -508,8 +509,11 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) {
+        if scratch.len() < n {
+            scratch.resize(n, 0);
+        }
+        let title = &mut scratch[..n];
+        if !crate::host::read_into(from as *const u8, title) {
             return 0;
         }
         let written = match &saved {
@@ -518,7 +522,7 @@ impl Shadow {
             None => (*host != title[..]).then_some(host.as_ptr()),
             Some(before) => {
                 let before = &before[from - page..to - page];
-                merge_writeback(&mut title, host, before).then_some(title.as_ptr())
+                merge_writeback(title, host, before).then_some(title.as_ptr())
             }
         };
         if let Some(bytes) = written {
@@ -946,6 +950,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
+    let mut scratch = Vec::new();
     for (copy, page) in pages {
         if withheld
             .iter()
@@ -953,7 +958,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         {
             continue;
         }
-        let written = copy.copy_back_marked(page);
+        let written = copy.copy_back_marked(page, &mut scratch);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
@@ -1629,8 +1634,9 @@ pub(crate) mod tests {
         copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
         write(20, 0x66);
         write(PAGE + 20, 0x77);
-        copy.copy_back_marked(p);
-        copy.copy_back_marked(p + PAGE);
+        let mut scratch = Vec::new();
+        copy.copy_back_marked(p, &mut scratch);
+        copy.copy_back_marked(p + PAGE, &mut scratch);
         // SAFETY: bytes of our pool.
         let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
         assert_eq!(
