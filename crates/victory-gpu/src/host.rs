@@ -195,6 +195,27 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // Diagnostics, `VICTORY_NO_DRIVER_CACHE`: the driver's own shader
+        // cache (and the runtime's, for a driver without one) is not used by
+        // this run, so a run with an empty `VICTORY_CACHE_DIR` compiles every
+        // pipeline cold on the driver too. Needs Windows developer mode.
+        // Switched off for this process only, never cleared.
+        if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_NO_DRIVER_CACHE") {
+            let off = device.cast::<ID3D12Device9>().and_then(|device9| {
+                device9.ShaderCacheControl(
+                    D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED
+                        | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER,
+                    D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE,
+                )
+            });
+            match off {
+                Ok(()) => tracing::info!("the driver's shader cache is off for this run"),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "the driver's shader cache could not be switched off (developer mode?)"
+                ),
+            }
+        }
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
