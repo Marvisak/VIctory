@@ -99,6 +99,26 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// Dynamic descriptor budget on a heap capped at [`PORTABLE_VIEWS`].
+/// Defaults to [`DYNAMIC`] (up to half the heap via `VICTORY_DYNAMIC_SLOTS`).
+fn dynamic_capped_slots() -> u32 {
+    static BUDGET: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("VICTORY_DYNAMIC_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(DYNAMIC, |n| n.clamp(MIN_DYNAMIC, PORTABLE_VIEWS / 2))
+    })
+}
+
+/// Title and dynamic slot counts `(kept_title, dynamic)` when the host caps
+/// shader-visible view heaps at [`PORTABLE_VIEWS`].
+fn capped_heap_slots(count: u32, dynamic_budget: u32) -> (u32, u32) {
+    let dynamic = dynamic_budget.clamp(MIN_DYNAMIC, PORTABLE_VIEWS / 2);
+    let kept = count.min(PORTABLE_VIEWS - dynamic);
+    (kept, dynamic)
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -154,19 +174,31 @@ impl HostHeap {
             (heap, count, DYNAMIC)
         } else {
             // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+            // faults on an index past them, as before the clamp. Keep as much
+            // of the dynamic budget (`DYNAMIC`, or `VICTORY_DYNAMIC_SLOTS`) as
+            // fits within `PORTABLE_VIEWS`, falling back to `MIN_DYNAMIC` only
+            // if the larger allocation itself fails.
+            let (kept, extra) = capped_heap_slots(count, dynamic_capped_slots());
+            match make(kept + extra) {
+                Ok(heap) => {
+                    if kept < count {
+                        tracing::warn!(count, kept, extra, "host view heap capped at {PORTABLE_VIEWS}");
+                    }
+                    (heap, kept, extra)
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
-                }
+                Err(_) => match make(count + MIN_DYNAMIC) {
+                    Ok(heap) => (heap, count, MIN_DYNAMIC),
+                    Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
+                        // shortcut: descriptors past the host's limit are left
+                        // out; a title that reaches them needs remapping.
+                        tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
+                        (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                        return None;
+                    }
+                },
             }
         };
         // SAFETY: a live heap.
@@ -2211,6 +2243,23 @@ mod tests {
         assert_eq!(unsafe { past.read_unaligned() }, mark);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn capped_heap_slots_preserves_dynamic_budget_and_clamps() {
+        assert_eq!(super::capped_heap_slots(500_000, super::DYNAMIC), (500_000, super::DYNAMIC));
+        assert_eq!(
+            super::capped_heap_slots(900_000, super::DYNAMIC),
+            (super::PORTABLE_VIEWS - super::DYNAMIC, super::DYNAMIC)
+        );
+        assert_eq!(
+            super::capped_heap_slots(900_000, 1024),
+            (900_000, super::MIN_DYNAMIC)
+        );
+        assert_eq!(
+            super::capped_heap_slots(900_000, 800_000),
+            (super::PORTABLE_VIEWS / 2, super::PORTABLE_VIEWS / 2)
+        );
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
