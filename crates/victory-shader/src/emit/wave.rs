@@ -11,9 +11,8 @@
 //! sequence is matched; any step the simulation does not model leaves the
 //! values it writes unknown.
 
-use std::collections::HashMap;
-
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::hash::HashMap;
 use crate::ir::{EXEC, Inst, Program, Reg, Value};
 
 /// An associative operation and its identity.
@@ -131,7 +130,7 @@ pub(crate) struct Section {
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     let mut i = 0;
     while i < insts.len() {
         let inst = &insts[i];
@@ -319,8 +318,8 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
         u64::from(u32::MAX)
     };
     let mut exec = all;
-    let mut vec: HashMap<Value, Vec<Sym>> = HashMap::new();
-    let mut uni: HashMap<Value, Sym> = HashMap::new();
+    let mut vec: HashMap<Value, Vec<Sym>> = HashMap::default();
+    let mut uni: HashMap<Value, Sym> = HashMap::default();
     // Masks the section derives from the saved EXEC (`s_and` with it).
     let mut masked = vec![saved];
     for inst in insts {
@@ -617,7 +616,7 @@ fn shapes(
     } else {
         u64::from(u32::MAX)
     };
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     let single = |s: Sym| match s {
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
