@@ -118,7 +118,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
-    if path.is_null() {
+    if path.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
     // Goes through `files`, so paths on our virtual drives work too.
@@ -156,6 +156,9 @@ extern "system" fn create_status_array(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     tracing::info!(
         capacity,
         name = text(name),
@@ -191,6 +194,9 @@ extern "system" fn create_queue(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     let name = text(desc.name);
     tracing::info!(
         source = desc.source_type,
@@ -1791,5 +1797,52 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn factory_rejects_null_out_pointers_without_creating_lanes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("probe.bin");
+        std::fs::write(&file_path, b"data").unwrap();
+        let wide: Vec<u16> = file_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        assert_eq!(
+            open_file(
+                std::ptr::null(),
+                wide.as_ptr(),
+                &FACTORY,
+                std::ptr::null_mut()
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create_status_array(
+                std::ptr::null(),
+                4,
+                std::ptr::null(),
+                &FACTORY,
+                std::ptr::null_mut()
+            ),
+            E_INVALIDARG
+        );
+
+        let before = scheduler().map(|s| s.lock().lanes.len());
+        let desc = QueueDesc {
+            source_type: 0,
+            capacity: 8,
+            priority: 0,
+            name: std::ptr::null(),
+            unknown: 1,
+        };
+        assert_eq!(
+            create_queue(std::ptr::null(), &desc, &FACTORY, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        let after = scheduler().map(|s| s.lock().lanes.len());
+        assert_eq!(after, before, "null out must not leak a scheduler lane");
     }
 }
