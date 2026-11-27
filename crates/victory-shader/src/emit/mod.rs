@@ -279,6 +279,31 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+pub fn shader_opt() -> u32 {
+    static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+fn parse_shader_opt(value: Option<&str>) -> u32 {
+    let parsed = value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        });
+    parsed.map_or(63, |n| n & 127)
+}
+
+static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_host_rdna(on: bool) {
+    HOST_RDNA.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn host_rdna() -> bool {
+    HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
@@ -377,14 +402,85 @@ pub struct Options {
     pub view_marks: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum GroupSync {
+    #[default]
+    Auto,
+    Strict,
+    Relaxed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WaveMode {
+    pub host_lanes: u32,
+    pub min_lanes: u32,
+    pub wide64: bool,
+    pub group_sync: GroupSync,
+}
+
+impl Default for WaveMode {
+    fn default() -> Self {
+        Self {
+            host_lanes: 64,
+            min_lanes: 64,
+            wide64: false,
+            group_sync: GroupSync::Strict,
+        }
+    }
+}
+
+impl WaveMode {
+    pub fn new(host_lanes: u32, min_lanes: u32) -> Self {
+        let wide64 = host_lanes >= 64
+            && std::env::var("VICTORY_WAVE_WIDE")
+                .ok()
+                .is_some_and(|v| !v.is_empty() && v != "0");
+        let group_sync = match std::env::var("VICTORY_GROUP_SYNC")
+            .ok()
+            .as_deref()
+            .unwrap_or("strict")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "auto" => GroupSync::Auto,
+            "relaxed" | "off" | "0" => GroupSync::Relaxed,
+            _ => GroupSync::Strict,
+        };
+        Self::with(host_lanes, wide64, group_sync).with_min_lanes(min_lanes)
+    }
+
+    pub fn with(host_lanes: u32, wide64: bool, group_sync: GroupSync) -> Self {
+        Self {
+            host_lanes,
+            min_lanes: host_lanes,
+            wide64,
+            group_sync,
+        }
+    }
+
+    pub fn with_min_lanes(mut self, min_lanes: u32) -> Self {
+        self.min_lanes = min_lanes;
+        self
+    }
+
+    pub fn relaxes_divergent_barriers(&self) -> bool {
+        !self.wide64 && self.group_sync != GroupSync::Strict
+    }
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, without write marks.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    translate_with(container, Options::default())
+    translate_with(container, Options::default(), WaveMode::default())
 }
 
 /// [`translate`] made as `options` say.
-pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+pub fn translate_with(
+    container: &[u8],
+    options: Options,
+    wave: WaveMode,
+) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -408,7 +504,7 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    emit_with_wave(&c, &native, &p, &st, &io, &res, options, wave)
 }
 
 /// Emits a program whose earlier stages already ran, without write marks.
@@ -433,6 +529,21 @@ pub fn emit_with(
     res: &resource::Resources,
     options: Options,
 ) -> Result<HostShader, ShaderError> {
+    emit_with_wave(c, native, p, st, io, res, options, WaveMode::default())
+}
+
+/// [`emit`] made as `options` and `wave` say.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_with_wave(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+    wave: WaveMode,
+) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -451,10 +562,16 @@ pub fn emit_with(
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
             (13, _) => 1,
+            (28, _) => 2,
             (0 | 6 | 7, 9) => 2,
             (0, _) => 1,
             _ => 0,
         };
+    }
+    if native.stage == HwStage::Vs
+        && let Some(psv) = c.part(FourCC::PSV0)
+    {
+        vertex_output_interpolation(psv.data, &mut outputs)?;
     }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
@@ -500,14 +617,14 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let l = match lower::lower_with(&parts(st, res), wave) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            lower::lower_with(&parts(&st, &res), wave)?
         }
         l => l?,
     };
@@ -538,6 +655,62 @@ pub fn emit_with(
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
     })
+}
+
+fn vertex_output_interpolation(
+    mut data: &[u8],
+    outputs: &mut [container::SigElement],
+) -> Result<(), ShaderError> {
+    const TRUNCATED: ShaderError =
+        ShaderError::Malformed("truncated vertex pipeline validation data");
+    fn take<'a>(data: &mut &'a [u8], len: usize) -> Result<&'a [u8], ShaderError> {
+        let (head, tail) = data.split_at_checked(len).ok_or(TRUNCATED)?;
+        *data = tail;
+        Ok(head)
+    }
+    fn size(data: &mut &[u8]) -> Result<usize, ShaderError> {
+        Ok(u32::from_le_bytes(take(data, 4)?.try_into().unwrap()) as usize)
+    }
+    let info_size = size(&mut data)?;
+    let info = take(&mut data, info_size)?;
+    if info.len() < 36 || info[24] != 1 || info[29] == 0 {
+        return Ok(());
+    }
+    let resources = size(&mut data)?;
+    if resources != 0 {
+        let stride = size(&mut data)?;
+        take(&mut data, resources.checked_mul(stride).ok_or(TRUNCATED)?)?;
+    }
+    let strings = size(&mut data)?;
+    take(&mut data, strings)?;
+    let indices = size(&mut data)?;
+    take(&mut data, indices.checked_mul(4).ok_or(TRUNCATED)?)?;
+    let stride = size(&mut data)?;
+    if stride < 16 {
+        return Err(TRUNCATED);
+    }
+    let count = usize::from(info[28]) + usize::from(info[29]);
+    let elements = take(&mut data, count.checked_mul(stride).ok_or(TRUNCATED)?)?;
+    for record in elements.chunks_exact(stride).skip(usize::from(info[28])) {
+        let packed = record[10];
+        if packed & 0x40 == 0 {
+            continue;
+        }
+        if record[13] > 7 {
+            return Err(ShaderError::Malformed("invalid vertex output interpolation"));
+        }
+        let first = u32::from(record[9]);
+        let rows = first..first + u32::from(record[8]);
+        for output in outputs.iter_mut().filter(|e| {
+            e.row.is_some_and(|r| rows.contains(&r))
+                && e.col == ((packed >> 4) & 3)
+                && e.cols == (packed & 15)
+                && e.kind == record[11]
+        }) {
+            output.interp = record[13];
+        }
+    }
+    Ok(())
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -634,8 +807,9 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 #[cfg(test)]
 mod tests {
     use super::bitcode::Attr;
-    use super::lower::LOOP_LIMIT;
+    use super::lower::{LOOP_LIMIT, Lowered, Parts, barrier_mode, lower_with};
     use super::parse_loop_limit;
+    use crate::native::{ComputeIo, StageIo};
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
@@ -647,10 +821,181 @@ mod tests {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
     }
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    fn lower_wave_mode(words: &[u32], wave: WaveMode, wave64: bool) -> Result<Lowered, ShaderError> {
+        lower_wave_mode_threads(words, wave, wave64, [32, 1, 1])
+    }
+
+    fn lower_wave_mode_threads(
+        words: &[u32],
+        wave: WaveMode,
+        wave64: bool,
+        threads: [u32; 3],
+    ) -> Result<Lowered, ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo { rsrc2: 0, threads }),
+            code,
+        };
+        let p = ir::build(&native.code, wave64, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native).unwrap();
+        lower_with(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+        }, wave)
+    }
+
+    #[test]
+    fn barrier_modes_keep_the_shared_and_uav_fences() {
+        assert_eq!(barrier_mode(false, false), 1 | 8);
+        assert_eq!(barrier_mode(false, true), 8);
+        assert_eq!(barrier_mode(true, false), 1 | 2 | 8);
+        assert_eq!(barrier_mode(true, true), 2 | 8);
+    }
+
+    #[test]
+    fn divergent_barriers_drop_group_sync_in_one_wave() {
+        let words = [0x7D84_0480, 0xBE84_3C6A, 0xBF86_0001, 0xBF8A_0000, S_ENDPGM];
+        let strict = lower_wave_mode(&words, WaveMode::with(32, false, GroupSync::Strict), false).unwrap();
+        assert_eq!(strict.barrier_modes, [1 | 8]);
+        let auto = lower_wave_mode(&words, WaveMode::with(32, false, GroupSync::Auto), false).unwrap();
+        assert_eq!(auto.barrier_modes, [8]);
+        let wide = lower_wave_mode(&words, WaveMode::with(32, true, GroupSync::Auto), false).unwrap();
+        assert_eq!(wide.barrier_modes, [1 | 8]);
+    }
+
+    #[test]
+    fn a_group_above_the_host_minimum_keeps_group_sync() {
+        let words = [0x7D84_0480, 0xBE84_3C6A, 0xBF86_0001, 0xBF8A_0000, S_ENDPGM];
+        for (wave, threads) in [
+            (WaveMode::with(64, false, GroupSync::Auto).with_min_lanes(32), [64, 1, 1]),
+            (WaveMode::with(32, false, GroupSync::Auto).with_min_lanes(4), [32, 1, 1]),
+        ] {
+            let l = lower_wave_mode_threads(&words, wave, false, threads).unwrap();
+            assert_eq!(l.barrier_modes, [1 | 8]);
+        }
+    }
+
+    #[test]
+    fn a_wave64_group_without_wave_size_keeps_group_sync() {
+        let words = [
+            0x7D84_0080, 0xBE80_246A, 0xBF88_0001, 0xBF8A_0000, 0xBEFE_0400, S_ENDPGM,
+        ];
+        for (max, min) in [(32, 32), (4, 4), (64, 32)] {
+            let wave = WaveMode::with(max, false, GroupSync::Auto).with_min_lanes(min);
+            let l = lower_wave_mode_threads(&words, wave, true, [64, 1, 1]).unwrap();
+            assert_eq!(l.wave_size, None, "max {max}, min {min}");
+            assert_eq!(l.barrier_modes, [1 | 8], "max {max}, min {min}");
+        }
+    }
+
+    #[test]
+    fn an_unrestricted_wave64_compute_lowers_on_a_32_lane_host() {
+        let l = lower_wave_mode(
+            &[S_ENDPGM],
+            WaveMode::with(32, false, GroupSync::Auto),
+            true,
+        )
+        .unwrap();
+        assert!(!l.wave_ops);
+    }
+
+    #[test]
+    fn wave64_wave_size_is_never_emitted_on_a_narrow_host() {
+        let words = [0xD760_0005, 0x0001_0701, S_ENDPGM];
+        for wave in [
+            WaveMode::with(32, false, GroupSync::Auto),
+            WaveMode::with(32, true, GroupSync::Auto),
+            WaveMode::with(4, true, GroupSync::Auto),
+        ] {
+            assert!(
+                matches!(
+                    lower_wave_mode(&words, wave, true),
+                    Err(ShaderError::Unsupported { .. })
+                ),
+                "wide64 {} on {} lanes",
+                wave.wide64,
+                wave.host_lanes
+            );
+        }
+        let wide = lower_wave_mode(
+            &words,
+            WaveMode::with(64, true, GroupSync::Auto).with_min_lanes(32),
+            true,
+        )
+        .unwrap();
+        assert_eq!(wide.wave_size, Some(64));
+    }
+
+    #[test]
+    fn wave_mode_defaults_keep_group_sync() {
+        let wave = WaveMode::default();
+        assert_eq!(wave.host_lanes, 64);
+        assert!(!wave.wide64);
+        assert_eq!(wave.group_sync, GroupSync::Strict);
+    }
+
+    #[test]
+    fn shader_opt_defaults_to_the_safe_pass_set() {
+        assert_eq!(parse_shader_opt(None), 63);
+        assert_eq!(parse_shader_opt(Some("0x7f")), 127);
+        assert_eq!(parse_shader_opt(Some("0xffff")), 127);
+        assert_eq!(parse_shader_opt(Some("bad")), 63);
+    }
+
+    #[test]
+    fn vertex_output_interpolation_preserves_the_declared_psv_mode() {
+        let mut psv = Vec::new();
+        psv.extend_from_slice(&48u32.to_le_bytes());
+        let mut info = [0u8; 48];
+        info[24] = 1;
+        info[29] = 1;
+        psv.extend_from_slice(&info);
+        for count in [0u32, 0, 0, 16] {
+            psv.extend_from_slice(&count.to_le_bytes());
+        }
+        let mut record = [0u8; 16];
+        record[8] = 1;
+        record[9] = 2;
+        record[10] = 0x41;
+        record[13] = 1;
+        psv.extend_from_slice(&record);
+        let mut outputs = vec![SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(2),
+            col: 0,
+            cols: 1,
+            usage: 0,
+            half: false,
+        }];
+        vertex_output_interpolation(&psv, &mut outputs).unwrap();
+        assert_eq!(outputs[0].interp, 1);
+    }
+
     use super::container::SigElement;
     use super::shader::Shader;
     use super::*;
-    use crate::native::{ComputeIo, StageIo};
 
     #[test]
     fn indexed_move_initializes_an_input_before_its_first_use() {

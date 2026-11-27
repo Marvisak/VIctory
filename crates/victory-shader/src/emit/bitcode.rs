@@ -590,6 +590,18 @@ impl Module {
         }
     }
 
+    /// The arguments of the calls of functions named `name`.
+    #[cfg(test)]
+    pub fn call_args(&self, name: &str) -> Vec<Vec<V>> {
+        self.insts
+            .iter()
+            .filter_map(|i| match &i.op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == name => Some(args.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Calls of functions named `name` that [`Module::write`] writes.
     #[cfg(test)]
     pub fn written_calls(&self, name: &str) -> usize {

@@ -51,6 +51,9 @@ pub struct Program {
     /// hardware or a called fetch routine set up (user SGPRs, system values,
     /// vertex inputs).
     pub inputs: Vec<(Reg, Value)>,
+    /// Scalar values put back by a lane-relative read after being parked in
+    /// a VGPR lane, by the read's result value.
+    pub restored: HashMap<Value, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,12 +289,80 @@ pub fn build_bounded(
         }
     }
     remove_trivial_phis(&mut blocks, values);
+    let restored = restores(&blocks);
     Ok(Program {
         wave64,
         vgprs,
         blocks,
         inputs,
+        restored,
     })
+}
+
+fn operand_number(op: Operand) -> Option<u32> {
+    match op {
+        Operand::Literal(x) => Some(x),
+        Operand::Const(c) => crate::resource::inline(c),
+        _ => None,
+    }
+}
+
+fn parked_scalar(inst: &Inst, op: Operand) -> Option<Value> {
+    match op {
+        Operand::Scalar { code, .. } if code != gfx10::NULL => inst.read(Reg::S(code)),
+        _ => None,
+    }
+}
+
+fn restores(blocks: &[Block]) -> HashMap<Value, Value> {
+    let mut out = HashMap::new();
+    for block in blocks {
+        let mut parked: HashMap<(u8, u32), Value> = HashMap::new();
+        for inst in &block.insts {
+            let name = inst.name();
+            let Fields::Valu(v) = &inst.fields else {
+                for (reg, _) in &inst.writes {
+                    if let Reg::V(r) = *reg {
+                        parked.retain(|&(p, _), _| p != r);
+                    }
+                }
+                continue;
+            };
+            if name == "v_writelane_b32" {
+                if let (Some(Operand::Vector { reg, .. }), [value, at]) = (v.dst, &v.src[..]) {
+                    match operand_number(*at) {
+                        Some(lane) => {
+                            parked.remove(&(reg, lane));
+                            if let Some(scalar) = parked_scalar(inst, *value) {
+                                parked.insert((reg, lane), scalar);
+                            }
+                        }
+                        None => parked.retain(|&(p, _), _| p != reg),
+                    }
+                }
+                continue;
+            }
+            if name == "v_readlane_b32" {
+                let lane = v.src.get(1).copied().and_then(operand_number);
+                let reg = match v.src.first() {
+                    Some(Operand::Vector { reg, .. }) => Some(*reg),
+                    _ => None,
+                };
+                if let (Some(reg), Some(lane)) = (reg, lane)
+                    && let Some(&scalar) = parked.get(&(reg, lane))
+                    && let Some((_, result)) = inst.writes.first()
+                {
+                    out.insert(*result, scalar);
+                }
+            }
+            for (reg, _) in &inst.writes {
+                if let Reg::V(r) = *reg {
+                    parked.retain(|&(p, _), _| p != r);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Placeholder before renaming.
@@ -1477,5 +1548,154 @@ mod tests {
         assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
         assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
         assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
+    }
+
+    #[test]
+    fn parked_lane_restores_look_past_other_registers() {
+        let p = build_words(
+            &[
+                0x7D84_0080,
+                0xBE80_036A,
+                0xD761_0001,
+                0x0001_0600,
+                0xBF80_0000,
+                0x7E04_0280,
+                0xD760_0005,
+                0x0001_0701,
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let saved = p.blocks[0].insts[1].write(Reg::S(0)).unwrap();
+        let restored = p.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "v_readlane_b32")
+            .and_then(|i| i.write(Reg::S(5)))
+            .unwrap();
+        assert_eq!(p.restored.get(&restored), Some(&saved));
+    }
+
+    #[test]
+    fn a_conflicting_write_forgets_the_parked_lane() {
+        let p = build_words(
+            &[
+                0x7D84_0080,
+                0xBE80_036A,
+                0xD761_0001,
+                0x0001_0600,
+                0x7E02_0280,
+                0xD760_0005,
+                0x0001_0701,
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let restored = p.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "v_readlane_b32")
+            .and_then(|i| i.write(Reg::S(5)))
+            .unwrap();
+        assert!(!p.restored.contains_key(&restored));
+    }
+
+    #[test]
+    fn a_non_scalar_lane_write_forgets_the_parked_scalar() {
+        let p = build_words(
+            &[
+                0x7D84_0080,
+                0xBE80_036A,
+                0xD761_0001,
+                0x0001_0600,
+                0xD761_0001,
+                0x0001_06FF,
+                7,
+                0xD760_0005,
+                0x0001_0701,
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let restored = p.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "v_readlane_b32")
+            .and_then(|i| i.write(Reg::S(5)))
+            .unwrap();
+        assert!(!p.restored.contains_key(&restored));
+    }
+
+    #[test]
+    fn a_dynamic_lane_write_forgets_every_parked_lane() {
+        let p = build_words(
+            &[
+                0x7D84_0080,
+                0xBE80_036A,
+                0xD761_0001,
+                0x0001_0600,
+                0xD761_0001,
+                0x0000_0400,
+                0xD760_0005,
+                0x0001_0701,
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let restored = p.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "v_readlane_b32")
+            .and_then(|i| i.write(Reg::S(5)))
+            .unwrap();
+        assert!(!p.restored.contains_key(&restored));
+    }
+
+    #[test]
+    fn m0_relative_moves_do_not_broadcast_a_parked_scalar() {
+        for words in [
+            &[
+                0x7D84_0080,
+                0xBE80_036A,
+                0xD761_0007,
+                0x0001_0000,
+                0xBEFC_0383,
+                0x7E00_8704,
+                S_ENDPGM,
+            ][..],
+            &[
+                0x7D84_0080,
+                0xBE80_036A,
+                0xD761_0004,
+                0x0001_0600,
+                0xBEFC_0383,
+                0x7E04_8501,
+                S_ENDPGM,
+            ][..],
+            &[
+                0x7D84_0080,
+                0xBE80_036A,
+                0xD761_0004,
+                0x0001_0600,
+                0xBEFC_0383,
+                0x7E00_D101,
+                S_ENDPGM,
+            ][..],
+        ] {
+            let p = build_words(words, false);
+            let writes: Vec<Value> = p.blocks[0]
+                .insts
+                .iter()
+                .filter(|i| {
+                    matches!(
+                        i.name(),
+                        "v_movrels_b32" | "v_movreld_b32" | "v_swaprel_b32"
+                    )
+                })
+                .flat_map(|i| i.writes.iter().map(|(_, v)| *v))
+                .collect();
+            assert!(!writes.is_empty());
+            assert!(writes.iter().all(|v| !p.restored.contains_key(v)));
+        }
     }
 }

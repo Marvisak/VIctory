@@ -6,7 +6,6 @@
 //! and run on the host GPU and WARP.
 
 use windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC;
-
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R16G16B16A16_FLOAT,
     DXGI_FORMAT_R16G16B16A16_UINT,
@@ -579,6 +578,7 @@ fn a_sampler_chosen_by_a_uniform_branch_samples_as_chosen() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
 /// User data: s0 a table with a typed buffer UAV, s1 a table with a raw
 /// buffer of 2 dwords a lane, s2 a table with a raw UAV. Each lane stores
 /// its 4 halves to element `lane` of the typed view (`_d16`), loads them

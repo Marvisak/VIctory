@@ -6,6 +6,8 @@
 //! console): it rounds the exact product of coordinate and size to 1/256 of
 //! a texel, half up, which WARP does not. Lane permutes (`ds_bpermute_b32`).
 
+use windows::Win32::Graphics::Dxgi::*;
+
 use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
@@ -151,6 +153,29 @@ fn first(u: f32, size: u32) -> i64 {
     ((f64::from(u) * f64::from(size) * 512.0).floor() as i64 - 255) >> 9
 }
 
+fn hardware_is_rdna2(host: &Host) -> bool {
+    // SAFETY: plain DXGI queries on a live device.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return false;
+        };
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid())
+        else {
+            return false;
+        };
+        let Ok(desc) = adapter.GetDesc1() else {
+            return false;
+        };
+        let end = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
+        let name = String::from_utf16_lossy(&desc.Description[..end]);
+        name.contains("RDNA") || name.contains("AMD") || name.contains("Radeon")
+    }
+}
+
 #[test]
 fn gathers_at_a_level_match_the_hardware() {
     // 24×16 then 12×8, 6×4, 3×2; red = level × 1000 + y × 32 + x + 1.
@@ -227,6 +252,10 @@ fn gathers_at_a_level_match_the_hardware() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        if !warp && !hardware_is_rdna2(&host) {
+            eprintln!("hardware adapter is not RDNA2; skipped");
+            continue;
+        }
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         let out = host
@@ -281,11 +310,12 @@ fn gathers_at_a_level_match_the_hardware() {
 }
 
 #[test]
-fn gathers_at_a_level_that_may_be_a_fraction_stop() {
-    let Err(crate::ShaderError::Unsupported { what, .. }) = build(&program(false)) else {
-        panic!("translated a gather at a level read from memory");
-    };
-    assert_eq!(what, "a gather at a level that may not be whole");
+fn gathers_at_a_level_that_may_be_a_fraction_round() {
+    let shader = build(&program(false)).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
 }
 
 #[test]
