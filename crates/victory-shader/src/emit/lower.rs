@@ -260,6 +260,9 @@ struct Lower<'a> {
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
+    /// SCC values of mask operations read as data
+    /// ([`mask_sccs_read_as_data`]).
+    mask_sccs: HashSet<Value>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -421,6 +424,37 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+/// Mask operations whose SCC is read as scalar data (e.g. by s_cselect).
+/// Direct branches on that same SCC are currently incompatible with this
+/// lowering because structurisation treats their condition as per lane.
+fn mask_sccs_read_as_data(p: &Program, st: &Structured) -> HashSet<Value> {
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let bitwise = |name: &str| {
+        let op = name
+            .strip_prefix("s_")
+            .and_then(|n| n.strip_suffix("_b32").or_else(|| n.strip_suffix("_b64")));
+        matches!(
+            op,
+            Some("and" | "or" | "xor" | "andn2" | "orn2" | "nand" | "nor" | "xnor" | "not")
+        )
+    };
+    let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+    let sccs: HashSet<Value> = insts()
+        .filter(|i| bitwise(i.name()) && i.write(Reg::S(EXEC)).is_none())
+        .filter(|i| {
+            i.writes
+                .iter()
+                .any(|&(r, w)| matches!(r, Reg::S(_)) && is_mask(w))
+        })
+        .filter_map(|i| i.write(Reg::Scc))
+        .collect();
+    insts()
+        .filter(|i| !i.name().starts_with("s_cbranch"))
+        .filter_map(|i| i.read(Reg::Scc))
+        .filter(|v| sccs.contains(v))
+        .collect()
+}
+
 /// Where half `h` (dword h / 2, the high half when odd) of the parameter
 /// whose first element is in row `a` comes from, when the console packs
 /// 16-bit values two per dword: a row and channel of `elements`, none for
@@ -560,6 +594,7 @@ impl<'a> Lower<'a> {
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
+        let mask_sccs = mask_sccs_read_as_data(p, x.st);
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -598,6 +633,8 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
+            // So does the SCC of a mask operation read as data.
+            console_lanes |= !mask_sccs.is_empty();
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
@@ -704,6 +741,7 @@ impl<'a> Lower<'a> {
             },
             mask_ok: false,
             ballots: HashMap::new(),
+            mask_sccs,
             balloting: HashSet::new(),
             def_block: p
                 .blocks
@@ -1807,6 +1845,28 @@ impl<'a> Lower<'a> {
         let mask = self.s.m.i32(0xFFFF);
         let hi = self.s.m.bin(self.cur, Bin::And, hi, mask);
         Ok(self.memory(lo, hi, bytes, write, active))
+    }
+
+    /// Whether lane mask `lo` (its low dword's value), as a number, is not
+    /// zero: both dwords of a wave64 mask.
+    fn mask_nonzero(&mut self, lo: Value) -> Result<V, Why> {
+        if self
+            .s
+            .threads
+            .is_some_and(|threads| !threads.iter().product::<u32>().is_multiple_of(self.wave()))
+        {
+            // A partial host wave cannot ballot guest bits outside the group.
+            let words = self.mask_number(lo)?;
+            self.ballots.insert(lo, words);
+        }
+        let mut n = self.mask_dword(lo)?;
+        if self.x.native.wave64 {
+            // `mask_dword` keeps both dwords of the mask it made.
+            let (_, high) = *self.ballots.get(&lo).ok_or(LANE_MASK)?;
+            n = self.s.m.bin(self.cur, Bin::Or, n, high);
+        }
+        let zero = self.s.m.i32(0);
+        Ok(self.s.m.cmp(self.cur, pred::NE, n, zero))
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
@@ -3579,6 +3639,21 @@ impl<'a> Lower<'a> {
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
         if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+            // A mask operation whose SCC is read as data: with console
+            // lanes, whether the mask's number is not zero. The mask itself
+            // stays a mask (read as a number where it is read).
+            if let (Some(lo), Some(scc)) = (lo, scc.filter(|s| self.mask_sccs.contains(s)))
+                && self.mask_data == MaskData::Console
+            {
+                let nonzero = self.mask_nonzero(lo)?;
+                for &(r, v) in &inst.writes {
+                    if r != Reg::Scc {
+                        self.vals.insert(v, Val::Missing(LANE_MASK));
+                    }
+                }
+                self.set(Some(scc), Val::Bit(nonzero));
+                return Ok(());
+            }
             return Err(LANE_MASK);
         }
         if matches!(
@@ -10148,10 +10223,19 @@ impl<'a> Lower<'a> {
     }
 
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
-        let offset = self.x.p.blocks[b]
-            .insts
-            .last()
-            .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
+        let block = &self.x.p.blocks[b];
+        let last = block.insts.last();
+        let offset = last.map_or(block.offset, |i| i.machine.offset);
+        if last.is_some_and(|i| {
+            matches!(i.name(), "s_cbranch_scc0" | "s_cbranch_scc1")
+                && i.read(Reg::Scc)
+                    .is_some_and(|scc| self.mask_sccs.contains(&scc))
+        }) {
+            return Err(unsupported(
+                offset,
+                "a lane mask SCC read as both data and branch condition",
+            ));
+        }
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);

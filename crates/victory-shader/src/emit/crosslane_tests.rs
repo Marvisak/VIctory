@@ -361,7 +361,10 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
     w.push(v_lshlrev_b32_imm(5, 2, 0));
     w.extend_from_slice(&buffer_store_dword_offen(2, 5, 4));
     w.push(S_ENDPGM);
+    try_build_crosslane_cs(&w, 32).expect("lower")
+}
 
+fn try_build_crosslane_cs(w: &[u32], size: u32) -> Result<HostShader, crate::ShaderError> {
     let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
     let decoded = gfx10::decode(&code).expect("decode synthetic RDNA2 program");
     assert_eq!(decoded.last().and_then(|i| i.name()), Some("s_endpgm"));
@@ -390,7 +393,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 1,
-            threads: [32, 1, 1],
+            threads: [size, 1, 1],
         }),
         code,
     };
@@ -411,8 +414,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
-    })
-    .expect("lower");
+    })?;
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -439,7 +441,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
     } else {
         eprintln!("no dxil.dll; validation skipped");
     }
-    shader
+    Ok(shader)
 }
 
 fn wave32_hardware_info(host: &Host) -> Option<String> {
@@ -1022,4 +1024,315 @@ fn pixel_quad_swizzle_and_dpp_validate_and_create_pipeline() {
             .pipeline(&vs, &ps)
             .unwrap_or_else(|e| panic!("{label}: graphics pipeline creation failed: {e}"));
     }
+}
+
+// ---- the SCC of a mask operation read as data ----
+
+const INLINE_0: u8 = 0x80;
+const INLINE_1: u8 = 0x81;
+const INLINE_2: u8 = 0x82;
+const INLINE_5: u8 = 0x85;
+const INLINE_64: u8 = 0xC0;
+const INLINE_MINUS_1: u8 = 0xC1;
+
+/// SOP2 `op sdst, src0, src1`.
+const fn sop2(op: u32, sdst: u8, src0: u8, src1: u8) -> u32 {
+    0x8000_0000 | op << 23 | (sdst as u32) << 16 | (src1 as u32) << 8 | src0 as u32
+}
+
+/// SOP1 `op sdst, src0`.
+const fn sop1(op: u32, sdst: u8, src0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | op << 8 | src0 as u32
+}
+
+/// SOPC `op src0, src1`.
+const fn sopc(op: u32, src0: u8, src1: u8) -> u32 {
+    0xBF00_0000 | op << 16 | (src1 as u32) << 8 | src0 as u32
+}
+
+/// VOPC `op vcc, src0, vsrc1` (`src0` an SGPR or an inline constant).
+const fn vopc(op: u32, src0: u8, vsrc1: u8) -> u32 {
+    0x7C00_0000 | op << 17 | (vsrc1 as u32) << 9 | src0 as u32
+}
+
+/// `v_mov_b32 vdst, s<src0>`.
+const fn v_mov_b32_s(vdst: u8, src0: u8) -> u32 {
+    0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | src0 as u32
+}
+
+const S_ADD_U32: u32 = 0x00;
+const S_CSELECT_B32: u32 = 0x0A;
+const S_AND_B32: u32 = 0x0E;
+const S_AND_B64: u32 = 0x0F;
+const S_ANDN2_B32: u32 = 0x14;
+const S_ORN2_B32: u32 = 0x16;
+const S_MOV_B32: u32 = 0x03;
+const S_NOT_B32: u32 = 0x07;
+const S_CMP_GE_U32: u32 = 0x09;
+const V_CMP_LT_U32: u32 = 0xC1;
+const V_CMP_GT_U32: u32 = 0xC4;
+
+/// `cmp` into VCC, then the mask operation `op` (into s20), whose SCC
+/// `s_cselect_b32 s21, 1, 2` takes; v2 = s21.
+fn mask_scc_selected(cmp: u32, op: u32) -> Vec<u32> {
+    vec![
+        cmp,
+        op,
+        sop2(S_CSELECT_B32, 21, INLINE_1, INLINE_2),
+        v_mov_b32_s(2, 21),
+    ]
+}
+
+/// v2 of the lanes in `exec`: 1 if `scc`, else 2; the others keep theirs.
+fn selected(scc: bool, exec: u32) -> [u32; 32] {
+    std::array::from_fn(|l| match (exec >> l & 1 != 0, scc) {
+        (false, _) => lane_v2_old(l as u32),
+        (true, true) => 1,
+        (true, false) => 2,
+    })
+}
+
+/// The SCC of a bitwise operation that writes a lane mask says whether the
+/// whole mask, as a number, is not zero: some lane is set (the lanes
+/// outside EXEC too, which a complement sets), the same in every lane of
+/// the wave. An `s_cselect` of it (the console's FidelityFX passes poll in
+/// such loops) was refused as "a lane mask read as data".
+#[test]
+fn mask_operation_scc_read_as_data_is_the_waves_any_on_gpu() {
+    let (exec, vcc) = (EXEC_LO, VCC_LO);
+    // vcc = the lanes below 5: some.
+    let some = mask_scc_selected(
+        vopc(V_CMP_GT_U32, INLINE_5, 0),
+        sop2(S_AND_B32, 20, vcc, exec),
+    );
+    // vcc = the lanes below 0: none.
+    let none = mask_scc_selected(
+        vopc(V_CMP_GT_U32, INLINE_0, 0),
+        sop2(S_AND_B32, 20, vcc, exec),
+    );
+    // The even lanes run and all of them set vcc (lanes below 64), so its
+    // complement holds only odd lanes, which do not run: still not zero.
+    let complement = mask_scc_selected(vopc(V_CMP_GT_U32, INLINE_64, 0), sop1(S_NOT_B32, 20, vcc));
+    // EXEC without vcc is zero.
+    let none_left = mask_scc_selected(
+        vopc(V_CMP_GT_U32, INLINE_64, 0),
+        sop2(S_ANDN2_B32, 20, exec, vcc),
+    );
+    // A wait loop of the console compiler's form: s22 counts up until some
+    // lane has lane + 5 < s22, or s22 reaches 64; then v2 = s22. Lane 0
+    // ends it at 6 for the whole wave.
+    let body = [
+        sop2(S_ADD_U32, 22, 22, INLINE_1),
+        vopc(V_CMP_GT_U32, 22, 4), // vcc = s22 > v4
+        sop2(S_AND_B32, 20, vcc, exec),
+        sop2(S_CSELECT_B32, 21, INLINE_0, INLINE_MINUS_1), // s21 = no lane set
+        sopc(S_CMP_GE_U32, 22, INLINE_64),
+        sop2(S_CSELECT_B32, 23, INLINE_MINUS_1, INLINE_0), // s23 = s22 >= 64
+        sop2(S_ORN2_B32, 23, 23, 21),                      // SCC = s23 | ~s21 != 0
+    ];
+    let back = -(body.len() as i16 + 1);
+    let mut poll = vec![
+        0x25 << 25 | 4 << 17 | u32::from(INLINE_5), // v_add_nc_u32 v4, 5, v0
+        sop1(S_MOV_B32, 22, INLINE_0),
+    ];
+    poll.extend(body);
+    poll.push(0xBF84_0000 | back as u16 as u32); // s_cbranch_scc0 to the add
+    poll.push(v_mov_b32_s(2, 22));
+    let (all, even) = (MaskPattern::All.mask(), MaskPattern::Even.mask());
+    let items = [
+        (
+            "s_and_b32 of a mask with lanes set",
+            build_wave32_cs(MaskPattern::All, Divergence::Full, &some),
+            selected(true, all),
+        ),
+        (
+            "s_and_b32 of an empty mask",
+            build_wave32_cs(MaskPattern::All, Divergence::Full, &none),
+            selected(false, all),
+        ),
+        (
+            "s_not_b32 of a mask set in every running lane (branched, 0x55555555)",
+            build_wave32_cs(MaskPattern::Even, Divergence::Branched, &complement),
+            selected(true, even),
+        ),
+        (
+            "s_andn2_b32 of EXEC and a mask holding it (branched, 0x55555555)",
+            build_wave32_cs(MaskPattern::Even, Divergence::Branched, &none_left),
+            selected(false, even),
+        ),
+        (
+            "a loop polling whether some lane compares true",
+            build_wave32_cs(MaskPattern::All, Divergence::Full, &poll),
+            [6; 32],
+        ),
+    ];
+    check_cases("mask operation SCC", &items);
+}
+
+/// The same in a wave64 program: the lanes above 40 compare true, all in
+/// the mask's high dword, so its SCC needs both dwords. Run where the host
+/// has 64-lane waves, else lowered and validated only.
+#[test]
+fn wave64_mask_operation_scc_reads_both_dwords() {
+    for (above, want) in [(40u8, 1u32), (63, 2)] {
+        let mut w = vec![sop1(S_MOV_B32, 1, INLINE_0)];
+        w.extend_from_slice(&s_load_dwordx4(4, 0));
+        w.extend([
+            vopc(V_CMP_LT_U32, INLINE_0 + above, 0), // vcc = above < lane
+            sop2(S_AND_B64, 20, VCC_LO, EXEC_LO),    // s_and_b64 s[20:21], vcc, exec
+            sop2(S_CSELECT_B32, 22, INLINE_1, INLINE_2),
+            v_mov_b32_s(2, 22),
+            v_lshlrev_b32_imm(5, 2, 0),
+        ]);
+        w.extend_from_slice(&buffer_store_dword_offen(2, 5, 4));
+        w.push(S_ENDPGM);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [64, 1, 1],
+            }),
+            code: w.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: false,
+        })
+        .expect("lower");
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            memory: lowered.memory,
+            memory_writes: lowered.memory_writes,
+            view_addresses: lowered.view_addresses,
+            heap: lowered.heap,
+            heap_writes: lowered.heap_writes,
+            view_marks: lowered.view_marks,
+        };
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 hardware device; skipped");
+            continue;
+        };
+        let mut opts1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: a capability query on a live device, into a structure of
+        // the size given.
+        let queried = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut opts1).cast(),
+                size_of_val(&opts1) as u32,
+            )
+        };
+        if queried.is_err() || !opts1.WaveOps.as_bool() || opts1.WaveLaneCountMax < 64 {
+            eprintln!("hardware device runs no 64-lane waves; lowered and validated only");
+            continue;
+        }
+        let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            assert_eq!(u.root, RootType::Table);
+            ud[u.index as usize] = 0;
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        assert_eq!(out[0][..64], [want; 64], "lanes above {above}");
+    }
+}
+
+fn mask_scc_test_program(body: &[u32]) -> Vec<u32> {
+    let mut w = vec![s_mov_b32(1, 0x80)];
+    w.extend(s_load_dwordx4(4, 0));
+    w.extend_from_slice(body);
+    w.push(v_lshlrev_b32_imm(5, 2, 0));
+    w.extend(buffer_store_dword_offen(2, 5, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn complement_sets_mask_scc_even_in_a_partial_wave() {
+    let body = mask_scc_selected(
+        vopc(V_CMP_GT_U32, INLINE_64, 0),
+        sop1(S_NOT_B32, 20, VCC_LO),
+    );
+    let shader = try_build_crosslane_cs(&mask_scc_test_program(&body), 16).unwrap();
+    if let Some((info, got)) = dispatch_wave32(&shader) {
+        assert_eq!(got[..16], [1; 16], "{info}");
+    }
+}
+
+#[test]
+fn a_mask_scc_used_as_data_and_branch_is_rejected() {
+    let body = [
+        vopc(V_CMP_GT_U32, INLINE_1, 0),
+        sop2(S_AND_B32, 20, VCC_LO, EXEC_LO),
+        sop2(S_CSELECT_B32, 21, INLINE_1, INLINE_2),
+        0xBF85_0001, // s_cbranch_scc1 -> move s21 to v2
+        sop1(S_MOV_B32, 21, INLINE_0),
+        v_mov_b32_s(2, 21),
+    ];
+    assert!(matches!(
+        try_build_crosslane_cs(&mask_scc_test_program(&body), 32),
+        Err(crate::ShaderError::Unsupported {
+            what: "a lane mask SCC read as both data and branch condition",
+            ..
+        })
+    ));
 }
