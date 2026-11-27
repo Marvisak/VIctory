@@ -178,24 +178,23 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
+        let limit = u64::from(heap.desc.count);
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
         for (from, to) in written.take(start as usize, usize::MAX) {
-            // By page: one with nothing mapped (the title unmaps heap pages
-            // too) holds no records.
-            let page_size = crate::watch::PAGE;
-            for page in (from & !(page_size - 1)..to).step_by(page_size) {
-                let (page, end) = (page.max(from), (page + page_size).min(to));
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
-                    continue;
-                }
-                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(
-                    crate::copystat::C::SyncSlots,
-                    last.min(u64::from(heap.desc.count)).saturating_sub(first),
-                );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+            let first = ((from as u64 - start) / step).min(limit) as u32;
+            let last = (to as u64 - start).div_ceil(step).min(limit) as u32;
+            if first < last {
+                ranges.push((first, last));
             }
         }
+        if ranges.is_empty() {
+            continue;
+        }
+        let synced = host.sync_ranges(&ranges, start, step);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SyncSlots, synced);
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = synced;
     }
 }
 
@@ -542,16 +541,11 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     (*current == generation).then(|| view.clone())
 }
 
-/// For each record (tag, index, generation): whether it names a view that
-/// is current, as [`view_at`] would find it (one lock for them all).
-fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
+/// Runs `f` with the recorded views table (`VIEWS`) locked once.
+#[cfg(windows)]
+fn with_views<R>(f: impl FnOnce(&[(View, u32)]) -> R) -> R {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    records
-        .iter()
-        .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
-        })
-        .collect()
+    f(&views.list)
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
