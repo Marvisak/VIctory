@@ -1664,6 +1664,11 @@ fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usiz
     let idle = |&(f, ms, _): &(u64, u64, u64)| frame.saturating_sub(f) >= IDLE_FRAMES && now.saturating_sub(ms) >= IDLE_MS;
     let (mut gone, mut rest): (Vec<usize>, Vec<usize>) = (0..uses.len()).partition(|&i| idle(&uses[i]));
     let mut over = over.saturating_sub(gone.iter().map(|&i| uses[i].2).sum());
+    // The sort below is only for the least-recently-used pick; nothing to
+    // free means nothing to sort.
+    if over == 0 {
+        return gone;
+    }
     rest.sort_by_key(|&i| uses[i].1);
     for i in rest {
         if over == 0 {
@@ -2292,6 +2297,14 @@ pub(crate) fn test_buffer(width: u64) -> This {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn choose_keeps_only_idle_when_nothing_is_over_budget() {
+        // one idle texture (256 bytes) and one recently used one; with no
+        // over-budget bytes the recently used one must not be given up.
+        let uses = [(0, 0, 256), (u64::MAX, u64::MAX, 1)];
+        assert_eq!(choose(&uses, IDLE_FRAMES, IDLE_MS, 0), vec![0]);
+    }
 
     #[cfg(windows)]
     #[test]

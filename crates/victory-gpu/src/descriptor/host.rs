@@ -865,13 +865,20 @@ impl HostHeap {
     /// slots had its list searched each time; 62,000 slots a frame, run
     /// evict3).
     pub(crate) fn evict(&self, textures: &std::collections::HashSet<usize>) {
+        // Sorted once per call (per heap per pass), so each kept slot asks a
+        // binary search instead of a SipHash probe.
+        let mut gone: Vec<usize> = textures.iter().copied().collect();
+        gone.sort_unstable();
         let slots: Vec<u32> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             (0..kept.len() as u32)
                 .filter(|&i| {
-                    kept[i as usize]
-                        .as_ref()
-                        .is_some_and(|k| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
+                    kept[i as usize].as_ref().is_some_and(|k| {
+                        k.1.is_none()
+                            && gone
+                                .binary_search(&(windows::core::Interface::as_raw(&k.0) as usize))
+                                .is_ok()
+                    })
                 })
                 .collect()
         };
