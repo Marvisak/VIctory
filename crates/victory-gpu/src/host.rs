@@ -3672,23 +3672,87 @@ impl Host {
     }
 }
 
-/// Host resources that view heap slots stopped viewing while a submission
-/// may have been running ([`retire`]).
-static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
-
-/// Keeps `resource` alive until the GPU work running now (or the next
-/// submission's) has run: title threads rewrite view heap slots while the
-/// GPU runs, and a shader that took the old descriptor still reads what it
-/// views.
-pub(crate) fn retire(resource: ID3D12Resource) {
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+/// `VICTORY_BURY_LAG`: how many completed submissions to keep [`retire`]d
+/// host resources before releasing them (0: release after the submission
+/// that may have seen them).
+fn bury_lag() -> usize {
+    static LAG: OnceLock<usize> = OnceLock::new();
+    *LAG.get_or_init(|| {
+        std::env::var("VICTORY_BURY_LAG")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
 }
 
-/// After a submission has run, with none running: the retired resources go.
+/// Queue of [`retire`]d host resources waiting for `lag` completed submissions.
+struct Retired<T> {
+    pending: Vec<T>,
+    lagging: std::collections::VecDeque<Vec<T>>,
+}
+
+impl<T> Retired<T> {
+    const fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            lagging: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, resource: T) {
+        self.pending.push(resource);
+    }
+
+    fn drain_ready(&mut self, lag: usize) -> Vec<Vec<T>> {
+        let pending = std::mem::take(&mut self.pending);
+        let mut ready = Vec::new();
+        if lag == 0 {
+            for batch in self.lagging.drain(..) {
+                if !batch.is_empty() {
+                    ready.push(batch);
+                }
+            }
+            if !pending.is_empty() {
+                ready.push(pending);
+            }
+            return ready;
+        }
+        self.lagging.push_back(pending);
+        while self.lagging.len() > lag {
+            if let Some(batch) = self.lagging.pop_front()
+                && !batch.is_empty()
+            {
+                ready.push(batch);
+            }
+        }
+        ready
+    }
+}
+
+/// Host resources that view heap slots stopped viewing while a submission
+/// may have been running ([`retire`]).
+static RETIRED: Mutex<Retired<ID3D12Resource>> = Mutex::new(Retired::new());
+
+/// Keeps `resource` alive until the GPU work running now (and `VICTORY_BURY_LAG`
+/// additional submissions, if set) has run: title threads rewrite view heap
+/// slots while the GPU runs, and a shader that took the old descriptor still
+/// reads what it views.
+pub(crate) fn retire(resource: ID3D12Resource) {
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(resource);
+}
+
+/// After a submission has run, with none running: the retired resources whose
+/// `VICTORY_BURY_LAG` window has elapsed go.
 pub(crate) fn release_retired() {
-    let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
-    if !retired.is_empty() {
-        release_later(Box::new(retired));
+    let ready = RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain_ready(bury_lag());
+    if !ready.is_empty() {
+        release_later(Box::new(ready));
     }
 }
 
@@ -4129,5 +4193,27 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+    }
+
+    #[test]
+    fn retired_resources_release_immediately_when_lag_is_zero() {
+        let mut retired = Retired::new();
+        assert!(retired.drain_ready(0).is_empty());
+        retired.push(1u32);
+        retired.push(2);
+        assert_eq!(retired.drain_ready(0), vec![vec![1, 2]]);
+        assert!(retired.drain_ready(0).is_empty());
+    }
+
+    #[test]
+    fn retired_resources_wait_for_bury_lag_submissions() {
+        let mut retired = Retired::new();
+        retired.push(10u32);
+        assert!(retired.drain_ready(2).is_empty());
+        retired.push(20);
+        assert!(retired.drain_ready(2).is_empty());
+        assert_eq!(retired.drain_ready(2), vec![vec![10]]);
+        assert_eq!(retired.drain_ready(2), vec![vec![20]]);
+        assert!(retired.drain_ready(2).is_empty());
     }
 }
