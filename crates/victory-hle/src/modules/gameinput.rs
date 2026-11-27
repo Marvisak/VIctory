@@ -156,15 +156,17 @@ fn merge_pad(base: PadState, extra: PadState) -> PadState {
     }
 }
 
-/// Applies `scripted` keys to the first connected host pad, so `VICTORY_KEYS`
-/// works even when an XInput or virtual controller disables `FALLBACK`.
+/// Applies `scripted` keys to every connected host pad, so `VICTORY_KEYS`
+/// works whichever slot the title listens to: the host may put the real
+/// pad in any slot, and a title that listens to a different slot than
+/// the first would otherwise see nothing.
 #[cfg(any(test, feature = "diagnostics"))]
 fn merge_scripted(pads: &mut [Option<PadState>; PADS], scripted: &[KeyState]) {
     if scripted.is_empty() {
         return;
     }
     let extra = fallback(scripted);
-    if let Some(pad) = pads.iter_mut().flatten().next() {
+    for pad in pads.iter_mut().flatten() {
         *pad = merge_pad(*pad, extra);
     }
 }
@@ -1761,39 +1763,58 @@ mod tests {
     }
 
     #[test]
-    fn scripted_keys_merge_into_connected_host_pad() {
+    fn scripted_keys_merge_into_every_connected_host_pad() {
         let (hub, host) = fake();
-        let physical = PadState {
-            buttons: B,
-            left_x: -0.5,
-            ..Default::default()
-        };
+        let physical = [
+            (
+                1,
+                PadState {
+                    buttons: B,
+                    left_x: -0.5,
+                    ..Default::default()
+                },
+            ),
+            (
+                3,
+                PadState {
+                    buttons: X,
+                    left_y: 0.5,
+                    right_trigger: 0.25,
+                    right_x: 0.75,
+                    ..Default::default()
+                },
+            ),
+        ];
         {
             let mut h = host.lock().unwrap();
-            h.pads[1] = Some(physical);
+            for (slot, pad) in physical {
+                h.pads[slot] = Some(pad);
+            }
             h.scripted = vec![key(0x0D), key(b'W'), key(b'C')];
         }
         hub.poll();
 
-        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
-        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
-        assert_eq!(
-            pad(r),
-            PadState {
-                buttons: B | A,
-                left_x: -0.5,
-                left_y: 1.0,
-                right_trigger: 1.0,
-                ..Default::default()
-            }
-        );
-        release(r);
+        for slot in [0, 2, FALLBACK] {
+            assert_eq!(current(hub, GAMEPAD_KIND, slot), Err(DEVICE_DISCONNECTED));
+        }
+        for (slot, mut want) in physical {
+            want.buttons |= A;
+            want.left_y = 1.0;
+            want.right_trigger = 1.0;
+            let reading = current(hub, GAMEPAD_KIND, slot).unwrap();
+            let got = pad(reading);
+            release(reading);
+            assert_eq!(got, want, "active script in pad slot {slot}");
+        }
 
         host.lock().unwrap().scripted.clear();
         hub.poll();
-        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
-        assert_eq!(pad(r), physical);
-        release(r);
+        for (slot, want) in physical {
+            let reading = current(hub, GAMEPAD_KIND, slot).unwrap();
+            let got = pad(reading);
+            release(reading);
+            assert_eq!(got, want, "released script in pad slot {slot}");
+        }
     }
 
     #[test]
