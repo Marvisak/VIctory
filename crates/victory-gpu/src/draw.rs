@@ -2182,6 +2182,7 @@ void main() {
     /// guest bytes intact.
     #[test]
     fn marked_subpage_uav_writes_copy_back_and_keep_neighbor_bytes() {
+        let _bitmap_lock = crate::shadow::lock_test_bitmaps();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -3312,6 +3313,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 
     #[test]
     fn compute_view_marks_rebind_after_depth_twin_conversion() {
+        let _bitmap_lock = crate::shadow::lock_test_bitmaps();
         use victory_shader::emit::{Options, emit_with};
         use victory_shader::native::{ComputeIo, HwStage, NativeProgram, RootParam, StageIo};
         use victory_shader::{Container, io, ir, resource, structure};
