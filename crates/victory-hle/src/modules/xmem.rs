@@ -706,7 +706,9 @@ pub extern "system" fn XMemMapPhysicalPages(
 ) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
-    unmap(&mut physical, base, n * PAGE);
+    if !unmap(&mut physical, base, n * PAGE) {
+        return std::ptr::null_mut();
+    }
     if pages.is_null() {
         return address;
     }
@@ -773,7 +775,9 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
-    unmap(&mut physical, to, len);
+    if !unmap(&mut physical, to, len) {
+        return false;
+    }
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
@@ -941,13 +945,38 @@ fn refusal_message(
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
-/// are mapped again outside it.
-fn unmap(physical: &mut Physical, base: usize, len: usize) {
+/// are mapped again outside it. A failure does not undo earlier changes.
+fn unmap(physical: &mut Physical, base: usize, len: usize) -> bool {
+    unmap_with(physical, base, len, |at| {
+        // SAFETY: `at` is the base of a tracked view mapped over a placeholder in this process.
+        let unmapped = unsafe {
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: at as *mut c_void,
+                },
+                MEM_PRESERVE_PLACEHOLDER,
+            )
+        };
+        if unmapped == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn unmap_with(
+    physical: &mut Physical,
+    base: usize,
+    len: usize,
+    mut unmap_view: impl FnMut(usize) -> std::io::Result<()>,
+) -> bool {
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).
     if len == 0 {
-        return;
+        return true;
     }
     let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
@@ -963,9 +992,11 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
     for at in hit {
-        let Some((size, slice)) = physical.views.remove(&at) else {
-            continue;
-        };
+        if let Err(error) = unmap_view(at) {
+            tracing::warn!(address = format_args!("{at:#x}"), size = physical.views[&at].0, %error, "unmapping physical pages failed");
+            return false;
+        }
+        let (size, slice) = physical.views.remove(&at).expect("tracked view");
         for k in 0..size / PAGE {
             let key = slice.key(k);
             if let Some(addresses) = physical.shown.get_mut(&key) {
@@ -976,24 +1007,18 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
         }
         victory_gpu::title_memory_remapped(at, size);
-        // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
-            UnmapViewOfFile2(
-                GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: at as *mut c_void,
-                },
-                MEM_PRESERVE_PLACEHOLDER,
-            )
-        };
-        if at < base {
-            map(physical, at, base - at, slice.clone());
-        }
-        if at + size > end {
+        let left_restored = at >= base || map(physical, at, base - at, slice.clone());
+        let right_restored = if at + size > end {
             let index = slice.index + (end - at) / PAGE;
-            map(physical, end, at + size - end, Slice { index, ..slice });
+            map(physical, end, at + size - end, Slice { index, ..slice })
+        } else {
+            true
+        };
+        if !left_restored || !right_restored {
+            return false;
         }
     }
+    true
 }
 
 /// The oldest layout we know; newer titles pass other flag values (Minecraft
@@ -1220,6 +1245,43 @@ mod tests {
         let fallback = allocator_refusal_message(4 * MIB, None);
         assert!(fallback.contains("4194304 bytes of APU heap memory"));
         assert!(!fallback.contains("System commit:"));
+    }
+
+    #[test]
+    fn failed_unmap_preserves_view_and_alias_bookkeeping() {
+        let pages = allocate(1);
+        let reserve = || {
+            XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE)
+        };
+        let (source, alias) = (reserve(), reserve());
+        assert!(!source.is_null() && !alias.is_null());
+        assert_eq!(XMemMapPhysicalPages(source, 1, pages.as_ptr()), source);
+        assert!(map_alias(alias as u64, source as u64, PAGE as u64));
+
+        let mut tracker = physical();
+        let mut attempts = 0;
+        assert!(!unmap_with(&mut tracker, source as usize, PAGE, |at| {
+            assert_eq!(at, source as usize);
+            attempts += 1;
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        }));
+        assert_eq!(attempts, 1);
+        assert_eq!(tracker.views[&(source as usize)].0, PAGE);
+        drop(tracker);
+
+        let mut remaining = Vec::new();
+        aliases(source as usize, PAGE, &mut remaining);
+        assert_eq!(remaining, [(source as usize, alias as usize)]);
+        assert_eq!(query(source).host.State, MEM_COMMIT);
+        assert_eq!(XMemMapPhysicalPages(source, 1, std::ptr::null()), source);
+        assert_eq!(query(source).host.State, MEM_RESERVE);
+        assert!(map_alias(alias as u64, 0, PAGE as u64));
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+        for reservation in [source, alias] {
+            // SAFETY: These are the original reservation bases, restored to placeholders above.
+            let released = unsafe { VirtualFree(reservation, 0, MEM_RELEASE) };
+            assert_ne!(released, 0);
+        }
     }
 
     #[test]
