@@ -78,7 +78,7 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 /// After submissions: shader-written ranges compared and copied back into
-/// title memory (microseconds, bytes that differed), since the last
+/// title memory (microseconds, bytes written), since the last
 /// frame-rate line.
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
@@ -1393,7 +1393,7 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
-        crate::shadow::copy_back_marks(&withheld, withholding);
+        let mut written = crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
@@ -1402,13 +1402,15 @@ impl Host {
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
-                let written = shadow.copy_back(address, len);
-                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                written += shadow.copy_back(address, len);
             } else {
                 shadow.keep_writes(address, len);
                 crate::memory::note_withheld(len as u64);
                 crate::memory::drop_withheld(address, len);
             }
+        }
+        if written != 0 {
+            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         for list in runs {
             for work in &list.deferred().after {
