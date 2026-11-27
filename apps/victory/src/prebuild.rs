@@ -12,7 +12,7 @@
 //! interrupted pre-build keeps its work, and the next one finds those
 //! pipelines there.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -195,18 +195,27 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     }
     let skipped: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
     let skip = |why: String| *lock(&skipped).entry(why).or_default() += 1;
-    // First every record's key, which needs no translation: what a
-    // pre-build put in the library is skipped, what an earlier run drew
-    // with is made first.
+    // Check each pipeline key once before translation. Earlier runs'
+    // keys still go first. The diagnostic listing includes every record.
     let lines: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let todo: Mutex<Vec<(bool, Job)>> = Mutex::new(Vec::new());
+    let seen = Mutex::new(HashSet::new());
     let listed = AtomicUsize::new(0);
     each(&jobs, threads, |job| match prepare(job) {
         Ok(p) if keys_only.is_some() => {
             lock(&lines).push(format!("{}\t{job:?}\t{}", p.key(), p.describe()))
         }
-        Ok(p) if pipeline::prebuilt(&p.key()) => drop(listed.fetch_add(1, Ordering::Relaxed)),
-        Ok(p) => lock(&todo).push((!pipeline::wanted_early(&p.key()), job)),
+        Ok(p) => {
+            let key = p.key();
+            if !lock(&seen).insert(key.clone()) {
+                skip("duplicate pipeline key".into());
+            } else if pipeline::prebuilt(&key) {
+                listed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let later = !pipeline::wanted_early(&key);
+                lock(&todo).push((later, job));
+            }
+        }
         Err(why) => {
             if keys_only.is_some() {
                 lock(&lines).push(format!("-\t{job:?}\t{}\t{why}", shaders_of(job)));
@@ -214,6 +223,7 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
             skip(why);
         }
     });
+    drop(seen);
     let listed = listed.into_inner();
     if let Some(file) = keys_only {
         std::fs::write(file, lock(&lines).join("\n"))?;
