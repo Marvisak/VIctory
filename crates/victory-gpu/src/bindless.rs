@@ -53,7 +53,7 @@ struct Inner {
     slots: HashMap<u32, Seen>,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
     textures: BTreeMap<usize, u32>,
-    /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
+    /// `ranges` merged per copy and kind (`Viewed::ranges`), kept current
     /// as ranges come and go (each list running heap shaders asks for all
     /// of them; rebuilt whole after every change, they cost 13-27 ms a frame,
     /// run perf4).

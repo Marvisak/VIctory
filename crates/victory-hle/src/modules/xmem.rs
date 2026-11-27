@@ -1481,7 +1481,7 @@ const FOUR_GIB: usize = 1 << 32;
 /// 32-bit placeholder at startup, the request was refused
 /// (`ERROR_NOT_ENOUGH_MEMORY`) and the title stopped at an assertion. The
 /// debug layer's memory did the same. So the free space below 4 GiB is
-/// reserved at startup, past [`low_guards::SLACK`] left for the host, and a
+/// reserved at startup, past `low_guards::SLACK` left for the host, and a
 /// 32-bit request that finds no room releases guards and tries again.
 pub mod low_guards {
     use std::sync::Mutex;
@@ -1539,7 +1539,7 @@ pub mod low_guards {
         at as usize == base
     }
 
-    /// Reserves the free space below 4 GiB but the lowest [`SLACK`]. Call
+    /// Reserves the free space below 4 GiB but the lowest `SLACK`. Call
     /// once, before the host allocates much (the GPU device, the caches).
     pub fn install() {
         let mut guards = guards();

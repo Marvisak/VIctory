@@ -816,7 +816,7 @@ pub(crate) struct HostTexture {
     bytes: u64,
     /// A list used it (counted once).
     used: std::sync::atomic::AtomicBool,
-    /// A shader-visible heap slot viewed it (diagnostics: [`texture_census`]).
+    /// A shader-visible heap slot viewed it (diagnostics: `texture_census`).
     pub(crate) viewed: std::sync::atomic::AtomicBool,
     /// The memory it copies, for title textures fed from it.
     key: Option<MemoryKey>,
