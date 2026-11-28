@@ -2034,6 +2034,85 @@ fn integers_match_the_hardware() {
     assert_clean(check(&integer_probes()));
 }
 
+#[test]
+fn bfi_selects_each_bit_with_overlapping_destinations_and_exec() {
+    let values = [
+        0,
+        1,
+        0xFF,
+        0xFFFF,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        u32::MAX,
+        0x5555_5555,
+        0xAAAA_AAAA,
+        0x1234_5678,
+    ];
+    let mut masks = values.to_vec();
+    for bit in 0..32 {
+        masks.extend([1 << bit, !(1 << bit)]);
+    }
+    let mut inputs = triples(&masks, &values, &values);
+    // All eight per-bit truth-table entries at every bit position.
+    for bit in 0..32 {
+        for truth in 0..8 {
+            inputs.push([
+                (truth & 1) << bit,
+                (truth >> 1 & 1) << bit,
+                (truth >> 2 & 1) << bit,
+                OLD,
+            ]);
+        }
+    }
+    let mut seed = 0x7182_9345u32;
+    for _ in 0..4096 {
+        let mut input = [0; 4];
+        for x in &mut input[..3] {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            *x = seed;
+        }
+        input[3] = OLD;
+        inputs.push(input);
+    }
+    let mut probes = Vec::new();
+    for dst in [5, 1, 2, 3] {
+        for guarded in [false, true] {
+            let mut body = Vec::new();
+            if guarded {
+                body.push(vopc(0xC4, v(2), 3)); // v_cmp_gt_u32 vcc, v2, v3
+                body.push(sop1(0x3C, 20, VCC)); // s_and_saveexec_b32 s20, vcc
+            }
+            body.extend(vop3(0x14A, dst, [v(1), v(2), v(3)], NONE));
+            if guarded {
+                body.push(sop1(0x03, 126, s(20))); // restore EXEC
+            }
+            if dst != 5 {
+                body.push(vop1(0x01, 5, v(dst)));
+            }
+            probes.push(probe(body, inputs.clone(), INT, move |i| {
+                if guarded && i[1] <= i[2] {
+                    return vec![if dst == 5 {
+                        OLD
+                    } else {
+                        i[usize::from(dst - 1)]
+                    }];
+                }
+                // Select independently at each bit, without the lowering's
+                // word-wide Boolean expression.
+                let mut result = 0;
+                for bit in 0..32 {
+                    let source = if i[0] >> bit & 1 != 0 { i[1] } else { i[2] };
+                    result |= (source >> bit & 1) << bit;
+                }
+                vec![result]
+            }));
+        }
+    }
+    assert_clean(check(&probes));
+}
+
 /// Carries as lane masks: `v_add_co_u32` into VCC, `v_add_co_ci_u32`
 /// taking and giving VCC, the last carry read back by `v_cndmask_b32`.
 #[test]

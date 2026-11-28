@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1407,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -7530,11 +7535,11 @@ impl<'a> Lower<'a> {
             }
             "v_bfi_b32" => {
                 let (m, a, b) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let ones = k(self, u32::MAX);
-                let nm = self.s.m.bin(c, Bin::Xor, m, ones);
-                let x = self.s.m.bin(c, Bin::And, m, a);
-                let y = self.s.m.bin(c, Bin::And, nm, b);
-                self.s.m.bin(c, Bin::Or, x, y)
+                // Flip b's bits that differ from a only where m is set:
+                // b ^ ((a ^ b) & m) = (a & m) | (b & !m).
+                let different = self.s.m.bin(c, Bin::Xor, a, b);
+                let flip = self.s.m.bin(c, Bin::And, different, m);
+                self.s.m.bin(c, Bin::Xor, b, flip)
             }
             "v_max_i32" | "v_min_i32" | "v_max_u32" | "v_min_u32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
@@ -11126,6 +11131,21 @@ mod tests {
             let word = op << 25 | 2 << 9 | 0x101;
             lowers_valu(&[word]).unwrap_or_else(|e| panic!("VOP2 {op:#x}: {e}"));
         }
+    }
+
+    #[test]
+    fn bfi_selects_bits_with_three_operations() {
+        // Dynamic root constants feed the three sources, and a UAV store
+        // keeps the result live. XOR3 uses two operations with the same
+        // setup: a bit select needs just one more.
+        let count = |op: u32| {
+            lower_valu(&[0xD400_0000 | op << 16, 0x101 | 0x102 << 9 | 0x103 << 18])
+                .unwrap()
+                .instructions
+        };
+        let (bfi, xor3) = (count(0x14a), count(0x178));
+        eprintln!("v_bfi_b32: {bfi} DXIL instructions; v_xor3_b32 control: {xor3}");
+        assert_eq!(bfi, xor3 + 1);
     }
 
     #[test]
