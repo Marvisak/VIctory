@@ -495,6 +495,9 @@ extern "system" fn present(
     account_frame(frame);
     #[cfg(feature = "diagnostics")]
     crate::frame::presented();
+    // What the frame drew says whether pipelines may take more processors.
+    #[cfg(windows)]
+    crate::pipeline::frame_presented(crate::draw::asked());
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

@@ -17,14 +17,18 @@
 //! shortcut: the budget (half a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
+//!
+//! With `VICTORY_SHADER_TURBO_PAUSE=1`, more workers compile while the title
+//! draws little (a pause menu, loading): [`super::turbo`].
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
+use super::turbo;
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -254,27 +258,33 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Pipelines for the workers: those draws wait for, then those started
-/// early.
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
-    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
+/// What the workers take from.
+struct Jobs {
+    /// Pipelines draws wait for, then those started early.
+    queues: [VecDeque<Arc<Pending>>; 2],
+    /// Whether the extra workers of turbo take from them too.
+    load: turbo::Load,
+}
+
+static JOBS: Mutex<Jobs> = Mutex::new(Jobs {
+    queues: [VecDeque::new(), VecDeque::new()],
+    load: turbo::Load::new(),
+});
+
+static SIGNALS: turbo::Signals = turbo::Signals::new();
+
+/// How many logical processors the workers are counted from.
+fn processors() -> Option<usize> {
+    std::thread::available_parallelism().ok().map(std::num::NonZeroUsize::get)
+}
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        (0..n)
-            .filter(|i| {
-                let spawned = std::thread::Builder::new()
-                    .name(format!("victory-pipelines-{i}"))
-                    .spawn(work);
-                if let Err(e) = &spawned {
-                    tracing::warn!(error = %e, "no pipeline worker");
-                }
-                spawned.is_ok()
-            })
+        (0..turbo::base_workers(processors()))
+            .filter(|&i| spawn_worker(i, false))
             .count()
     });
     if workers == 0 {
@@ -285,39 +295,49 @@ fn queue(p: Arc<Pending>, now: bool) {
         }
         return;
     }
-    let (lock, work) = &QUEUES;
-    lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
-    work.notify_one();
+    {
+        let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.queues[usize::from(!now)].push_back(p);
+        SIGNALS.queued(jobs.load.on());
+    }
+    turbo_for_backlog();
+}
+
+/// Starts worker `i`, one that is always at work or an `extra` one of turbo;
+/// whether it started.
+fn spawn_worker(i: usize, extra: bool) -> bool {
+    let spawned = std::thread::Builder::new()
+        .name(format!("victory-pipelines-{i}"))
+        .spawn(move || work(extra));
+    if let Err(e) = &spawned {
+        tracing::warn!(error = %e, "no pipeline worker");
+    }
+    spawned.is_ok()
 }
 
 /// A worker: makes queued pipelines, those draws wait for first, and saves
-/// the cache when idle (first uses of pipelines made before).
-fn work() {
+/// the cache when idle (first uses of pipelines made before). An `extra` one
+/// takes jobs only while turbo is on.
+fn work(extra: bool) {
     // Below the title's own threads (loading, recording).
     // SAFETY: a plain call on our own thread.
     unsafe {
         use windows::Win32::System::Threading::*;
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
-    let (lock, work) = &QUEUES;
     loop {
-        let p = {
-            let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
-            loop {
-                if let Some(p) = queues.iter_mut().find_map(VecDeque::pop_front) {
-                    break p;
+        let p = SIGNALS.next(
+            &JOBS,
+            extra,
+            Duration::from_secs(20),
+            |jobs: &mut Jobs| {
+                if extra && !jobs.load.on() {
+                    return None;
                 }
-                let (held, waited) = work
-                    .wait_timeout(queues, Duration::from_secs(20))
-                    .unwrap_or_else(|e| e.into_inner());
-                queues = held;
-                if waited.timed_out() {
-                    drop(queues);
-                    super::library::save(false);
-                    queues = lock.lock().unwrap_or_else(|e| e.into_inner());
-                }
-            }
-        };
+                jobs.queues.iter_mut().find_map(VecDeque::pop_front)
+            },
+            || super::library::save(false),
+        );
         if p.taken.swap(true, Ordering::Relaxed) {
             continue; // its other queue entry
         }
@@ -326,6 +346,73 @@ fn work() {
             drained();
         } else {
             super::library::save(false);
+        }
+        turbo_for_backlog();
+    }
+}
+
+/// The workers in gameplay and in turbo.
+#[derive(Clone, Copy)]
+struct Turbo {
+    base: usize,
+    all: usize,
+}
+
+/// `None` unless `VICTORY_SHADER_TURBO_PAUSE` is on and it adds workers here
+/// (read once).
+fn turbo_counts() -> Option<Turbo> {
+    static COUNTS: OnceLock<Option<Turbo>> = OnceLock::new();
+    *COUNTS.get_or_init(|| {
+        if !crate::switch::on("VICTORY_SHADER_TURBO_PAUSE") {
+            return None;
+        }
+        let base = turbo::base_workers(processors());
+        let asked = std::env::var("VICTORY_SHADER_TURBO_THREADS").ok();
+        let all = turbo::turbo_workers(processors(), asked.as_deref());
+        tracing::info!(gameplay = base, turbo = all, "shader compile turbo while little is drawn");
+        (all > base).then_some(Turbo { base, all })
+    })
+}
+
+/// A frame was presented; the title has asked for `work_so_far` draws and
+/// dispatches since the start.
+pub(super) fn presented(work_so_far: u64) {
+    if turbo_counts().is_none() {
+        return;
+    }
+    let waiting = waiting();
+    let change = JOBS.lock().unwrap_or_else(|e| e.into_inner()).load.frame(work_so_far, waiting, Instant::now());
+    switch_turbo(change, waiting);
+}
+
+/// Between frames (a pipeline queued or made): a loading stall with many
+/// waiting switches turbo on without a frame to say so.
+fn turbo_for_backlog() {
+    let waiting = waiting();
+    if waiting <= turbo::STALL_BACKLOG || turbo_counts().is_none() {
+        return;
+    }
+    let change = JOBS.lock().unwrap_or_else(|e| e.into_inner()).load.backlog(waiting, Instant::now());
+    switch_turbo(change, waiting);
+}
+
+/// Acts on a switch of turbo that [`Jobs::load`] has made. The extra
+/// workers are started at the first one, then kept parked while it is off.
+fn switch_turbo(change: Option<turbo::Change>, waiting: u64) {
+    let (Some(change), Some(counts)) = (change, turbo_counts()) else { return };
+    match change {
+        turbo::Change::On => {
+            static EXTRA: Once = Once::new();
+            tracing::info!(workers = counts.all, waiting, "shader compile turbo on");
+            EXTRA.call_once(|| {
+                for i in counts.base..counts.all {
+                    spawn_worker(i, true);
+                }
+            });
+            SIGNALS.engaged();
+        }
+        turbo::Change::Off => {
+            tracing::info!(workers = counts.base, waiting, "shader compile turbo off");
         }
     }
 }

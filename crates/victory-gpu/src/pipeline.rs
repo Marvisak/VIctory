@@ -262,6 +262,13 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// A frame was presented, after `work_so_far` draws and dispatches asked for
+/// since the start: what [`turbo`] goes by (`VICTORY_SHADER_TURBO_PAUSE`).
+#[cfg(windows)]
+pub(crate) fn frame_presented(work_so_far: u64) {
+    make::presented(work_so_far);
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -589,6 +596,9 @@ mod library;
 mod make;
 #[cfg(all(test, windows, feature = "diagnostics"))]
 mod placed_uav_tests;
+// Portable, so that its tests run wherever the crate builds.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod turbo;
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.

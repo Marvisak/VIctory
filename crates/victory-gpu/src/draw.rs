@@ -158,9 +158,19 @@ pub(crate) fn take_frame() -> Vec<String> {
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
 /// (no host pipeline) since the last call.
 pub(crate) fn take_dropped() -> u64 {
-    DROPPED.swap(0, Ordering::Relaxed)
+    let dropped = DROPPED.swap(0, Ordering::Relaxed);
+    DROPPED_TAKEN.fetch_add(dropped, Ordering::Relaxed);
+    dropped
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+/// What [`take_dropped`] has given so far.
+static DROPPED_TAKEN: AtomicU64 = AtomicU64::new(0);
+
+/// Draws and dispatches the title has asked for so far, run or dropped. Only
+/// exact on the thread that calls [`take_dropped`], the presenting one.
+pub(crate) fn asked() -> u64 {
+    drawn() + dispatched() + DROPPED_TAKEN.load(Ordering::Relaxed) + DROPPED.load(Ordering::Relaxed)
+}
 
 /// Marks the last traced draw as not run on the host, counts it by why
 /// (the reason [`not_run`] gave, if its pipeline has a host one) and notes
