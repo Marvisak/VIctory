@@ -411,6 +411,9 @@ impl Module {
         self.push(block, t, Op::Cmp(pred, a, b))
     }
     pub fn select(&mut self, block: usize, c: V, t: V, f: V) -> V {
+        if let Some(condition) = self.int_value(c) {
+            return if condition == 0 { f } else { t };
+        }
         let ty = self.type_of(t);
         self.push(block, ty, Op::Select(c, t, f))
     }
@@ -1428,6 +1431,27 @@ mod tests {
     /// A branch on a constant takes its one edge: what only the other side
     /// reaches is not written, and a phi loses that side's entry and keeps
     /// the others.
+    #[test]
+    fn a_constant_select_uses_only_the_chosen_value() {
+        let mut m = Module::default();
+        let block = m.new_block();
+        let yes = m.bool(true);
+        let no = m.bool(false);
+        let t = m.i32(17);
+        let f = m.i32(42);
+        assert_eq!(m.select(block, yes, t, f), t);
+        assert_eq!(m.select(block, no, t, f), f);
+        assert!(m.blocks[block].body.is_empty());
+
+        let ty = m.int(1);
+        let unknown = m.undef(ty);
+        let V::Inst(i) = m.select(block, unknown, t, f) else {
+            panic!("select with an unknown condition must still be emitted");
+        };
+        assert!(matches!(m.insts[i as usize].op, Op::Select(c, a, b)
+            if (c, a, b) == (unknown, t, f)));
+    }
+
     #[test]
     fn a_constant_branch_drops_its_other_side_and_that_side_s_phi_entry() {
         let (mut m, b, sink) = module(6);
