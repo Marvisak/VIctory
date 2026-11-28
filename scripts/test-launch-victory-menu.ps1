@@ -59,8 +59,57 @@ try {
     Assert ($ui.ExitCode -eq 0) "Valid menu construction failed: $($ui.Output)"
     $view = $ui.Output | ConvertFrom-Json
     Assert ($view.tabs -contains 'Debugging') 'Debugging tab is missing.'
+    Assert ($view.autoFindButton -eq 'Find game files in this folder') 'Game file search control is missing.'
     Assert ($view.vramSlider.value -eq 91 -and $view.systemRamSlider.value -eq 4875) 'Saved memory limits did not populate sliders.'
     Assert ($view.cookDialog.rows -eq 9 -and $view.cookDialog.pathFields.Count -eq 6) 'One-time cook dialog is incomplete.'
+
+    # Exercise the same persistence functions used by Save and FormClosing,
+    # then construct the menu again from the file on disk.
+    $tokens = $null; $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($launcher, [ref]$tokens, [ref]$parseErrors)
+    Assert (-not $parseErrors) 'Launcher script did not parse.'
+    foreach ($name in @('Assert-LocalFixedPath', 'Save-LauncherSettings', 'Find-GameFiles')) {
+        $definition = $ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+        }, $true) | Select-Object -First 1
+        Assert ($null -ne $definition) "Missing launcher function $name."
+        Invoke-Expression $definition.Extent.Text
+    }
+    $script:SettingsPath = $settingsPath
+    $view.settings.quality = 'medium'
+    $view.settings.gameRoot = $testRoot
+    Save-LauncherSettings $view.settings
+    $savedOutput = & $pwsh -NoProfile -ExecutionPolicy Bypass -File $launcher -ValidateUi -SettingsPath $settingsPath 2>&1 | Out-String
+    Assert ($LASTEXITCODE -eq 0) "Saved menu failed to reopen: $savedOutput"
+    $savedView = $savedOutput | ConvertFrom-Json
+    foreach ($property in $view.settings.PSObject.Properties) {
+        Assert ("$($savedView.settings.$($property.Name))" -ceq "$($property.Value)") "Setting $($property.Name) did not persist."
+    }
+    Assert (@($savedView.settings.PSObject.Properties).Count -eq @($view.settings.PSObject.Properties).Count) 'Saved settings lost fields.'
+    $draft = $savedView.settings.PSObject.Copy(); $draft.title = ''
+    Save-LauncherSettings $draft
+    Assert ((Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json).title -ceq '') 'Incomplete game selection could not be saved.'
+    Assert (-not @(Get-ChildItem -LiteralPath $testRoot -File | Where-Object { $_.Extension -in @('.tmp', '.bak') }).Count) 'Save left temporary settings files.'
+
+    $scanRoot = Join-Path $testRoot 'game-files'
+    $gameDir = Join-Path $scanRoot 'game\bin'
+    $ffxDir = Join-Path $scanRoot 'game\plugins\amd'
+    New-Item -ItemType Directory -Force -Path $gameDir, $ffxDir | Out-Null
+    [IO.File]::WriteAllBytes((Join-Path $gameDir 'game_scarlett_master.exe'), [byte[]]@())
+    [IO.File]::WriteAllBytes((Join-Path $ffxDir 'amd_fidelityfx_loader_dx12.dll'), [byte[]]@())
+    $partial = Find-GameFiles $scanRoot
+    Assert ($partial.gameExecutables.Count -eq 1 -and $partial.fidelityFxFolders.Count -eq 0) 'Incomplete FidelityFX pair was accepted.'
+    [IO.File]::WriteAllBytes((Join-Path $ffxDir 'amd_fidelityfx_upscaler_dx12.dll'), [byte[]]@())
+    $found = Find-GameFiles $scanRoot
+    Assert ($found.gameExecutables.Count -eq 1 -and $found.fidelityFxFolders.Count -eq 1) 'Nested game files were not found.'
+    Assert ($found.gameExecutables[0] -eq (Join-Path $gameDir 'game_scarlett_master.exe') -and
+        $found.fidelityFxFolders[0] -eq $ffxDir) 'Game file search chose the wrong paths.'
+    $otherDir = Join-Path $scanRoot 'game\other'
+    New-Item -ItemType Directory -Force -Path $otherDir | Out-Null
+    [IO.File]::WriteAllBytes((Join-Path $otherDir 'game_scarlett_master.exe'), [byte[]]@())
+    Assert ((Find-GameFiles $scanRoot).gameExecutables.Count -eq 2) 'Ambiguous game executables were not reported.'
+    try { Find-GameFiles '\\example.invalid\share' | Out-Null; throw 'UNC game search was accepted.' }
+    catch { Assert ($_.Exception.Message -ne 'UNC game search was accepted.') 'UNC game search was accepted.' }
 
     $profile720 = Invoke-Menu $base 'ValidateUi' '720p'
     Assert ($profile720.ExitCode -eq 0) "720p selection failed: $($profile720.Output)"

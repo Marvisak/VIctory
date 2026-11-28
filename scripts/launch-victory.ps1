@@ -41,6 +41,7 @@ $SettingsPath = Assert-LocalFixedPath $SettingsPath 'Launcher settings file'
 $logRoot = Assert-LocalFixedPath (Join-Path $stateDir 'logs') 'Launcher log folder'
 
 $defaults = [ordered]@{
+    gameRoot = ''
     title = ''
     fidelityfx = ''
     useFidelityFx = $false
@@ -102,8 +103,8 @@ $defaults = [ordered]@{
 
 function Read-LauncherSettings {
     $value = [pscustomobject]$defaults
-    if (Test-Path -LiteralPath $SettingsPath -PathType Leaf) {
-        $saved = Get-Content -LiteralPath $SettingsPath -Raw | ConvertFrom-Json
+    if (Test-Path -LiteralPath $script:SettingsPath -PathType Leaf) {
+        $saved = Get-Content -LiteralPath $script:SettingsPath -Raw | ConvertFrom-Json
         foreach ($name in $defaults.Keys) {
             if ($saved.PSObject.Properties.Name -contains $name) {
                 $value.$name = $saved.$name
@@ -114,6 +115,7 @@ function Read-LauncherSettings {
 }
 
 function New-LaunchPlan([pscustomobject] $settings) {
+    if ($settings.gameRoot) { [void](Assert-LocalFixedPath ([string]$settings.gameRoot) 'Game folder') }
     if ($settings.console -notin @('series-s', 'series-x')) { throw 'Choose Series S or Series X.' }
     if ($settings.resolutionProfile -notin @('720p', '1080p', 'native', 'custom')) { throw 'Choose a resolution profile.' }
     $cookedManifest = $null
@@ -258,10 +260,68 @@ function New-LaunchPlan([pscustomobject] $settings) {
 }
 
 function Save-LauncherSettings([pscustomobject] $settings) {
-    $directory = Assert-LocalFixedPath (Split-Path -Parent $SettingsPath) 'Launcher settings folder'
-    [void](Assert-LocalFixedPath $SettingsPath 'Launcher settings file')
+    $directory = Assert-LocalFixedPath (Split-Path -Parent $script:SettingsPath) 'Launcher settings folder'
+    [void](Assert-LocalFixedPath $script:SettingsPath 'Launcher settings file')
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
-    $settings | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $SettingsPath -Encoding UTF8
+    $temporary = Assert-LocalFixedPath (Join-Path $directory ([IO.Path]::GetFileName($script:SettingsPath) + '.' + [guid]::NewGuid().ToString('N') + '.tmp')) 'Temporary settings file'
+    $backup = Assert-LocalFixedPath (Join-Path $directory ([IO.Path]::GetFileName($script:SettingsPath) + '.' + [guid]::NewGuid().ToString('N') + '.bak')) 'Settings backup file'
+    try {
+        $json = $settings | ConvertTo-Json -Depth 4
+        [IO.File]::WriteAllText($temporary, $json, [Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $script:SettingsPath -PathType Leaf) {
+            [IO.File]::Replace($temporary, $script:SettingsPath, $backup)
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+        } else {
+            [IO.File]::Move($temporary, $script:SettingsPath)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
+function Find-GameFiles([string] $root) {
+    $root = Assert-LocalFixedPath $root 'Game folder'
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw "Game folder does not exist: $root" }
+    $pending = [Collections.Generic.Queue[string]]::new()
+    $pending.Enqueue($root)
+    $games = [Collections.Generic.List[string]]::new()
+    $ffxFolders = [Collections.Generic.List[string]]::new()
+    $scanned = 0
+    while ($pending.Count) {
+        if (++$scanned -gt 20000) { throw 'Game folder search exceeded 20,000 subfolders. Choose a narrower folder.' }
+        $folder = $pending.Dequeue()
+        $dlls = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        try { $entries = @(Get-ChildItem -LiteralPath $folder -Force -ErrorAction Stop) }
+        catch { continue }
+        foreach ($entry in $entries) {
+            if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            if ($entry.PSIsContainer) {
+                $pending.Enqueue($entry.FullName)
+            } elseif ($entry.Name -ieq 'game_scarlett_master.exe') {
+                $games.Add($entry.FullName)
+            } elseif ($entry.Name -ieq 'amd_fidelityfx_loader_dx12.dll' -or
+                      $entry.Name -ieq 'amd_fidelityfx_upscaler_dx12.dll') {
+                [void]$dlls.Add($entry.Name)
+            }
+        }
+        if ($dlls.Contains('amd_fidelityfx_loader_dx12.dll') -and
+            $dlls.Contains('amd_fidelityfx_upscaler_dx12.dll')) {
+            $ffxFolders.Add($folder)
+        }
+    }
+    return [pscustomobject]@{
+        gameExecutables = @($games | Sort-Object)
+        fidelityFxFolders = @($ffxFolders | Sort-Object)
+        scannedFolders = $scanned
+    }
+}
+
+function Test-PcFidelityFxFolder([string] $folder) {
+    if (-not $folder) { return $false }
+    try { $folder = Assert-LocalFixedPath $folder 'FidelityFX folder' }
+    catch { return $false }
+    return (Test-Path -LiteralPath (Join-Path $folder 'amd_fidelityfx_loader_dx12.dll') -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $folder 'amd_fidelityfx_upscaler_dx12.dll') -PathType Leaf)
 }
 
 function Invoke-CookedProfileValidation([pscustomobject] $plan, [string] $outputDirectory) {
@@ -556,6 +616,18 @@ $gameTab.Controls.Add($gamePanel)
 $graphicsTab.Controls.Add($graphicsPanel)
 $performanceTab.Controls.Add($performancePanel)
 $debugTab.Controls.Add($debugPanel)
+
+$initialGameRoot = [string]$settings.gameRoot
+if (-not $initialGameRoot -and $settings.title) {
+    $initialGameRoot = Split-Path -Parent ([string]$settings.title)
+}
+if (-not $initialGameRoot) { $initialGameRoot = $repo }
+$gameRootBox = Add-PathPickerRow $gamePanel 'Game folder (search here)' $initialGameRoot $true
+$findGameFilesButton = New-Object System.Windows.Forms.Button
+$findGameFilesButton.Text = 'Find game files in this folder'
+$findGameFilesButton.Width = 250
+$findGameFilesButton.Height = 32
+Add-Row $gamePanel 'Auto find' $findGameFilesButton
 
 $titleBox = New-Object System.Windows.Forms.TextBox
 $titleBox.Text = [string]$settings.title
@@ -852,7 +924,7 @@ $saveButton.Text = 'Save settings'
 $saveButton.Width = 120
 $saveButton.Height = 34
 $cancelButton = New-Object System.Windows.Forms.Button
-$cancelButton.Text = 'Cancel'
+$cancelButton.Text = 'Close'
 $cancelButton.Width = 90
 $cancelButton.Height = 34
 $buttons.Controls.AddRange(@($launchButton, $saveButton, $cancelButton))
@@ -863,6 +935,7 @@ $form.CancelButton = $cancelButton
 
 function Read-FormSettings {
     return [pscustomobject]@{
+        gameRoot = $gameRootBox.Text.Trim()
         title = $titleBox.Text.Trim(); fidelityfx = $ffxBox.Text.Trim(); useFidelityFx = $useFfx.Checked
         console = [string]$console.SelectedItem; resolutionProfile = [string]$resolutionProfile.SelectedItem
         useCookedTextures = $useCooked.Checked; cookedRoot = $cookedRootBox.Text.Trim()
@@ -894,6 +967,62 @@ function Read-FormSettings {
         diagGpuTiming = $diagGpuTiming.Checked; diagD3dDebug = $diagD3dDebug.Checked; diagDred = $diagDred.Checked
     }
 }
+
+$findGameFilesButton.Add_Click({
+    try {
+        $root = $gameRootBox.Text.Trim()
+        $rootAvailable = $false
+        if ($root) {
+            try {
+                $root = Assert-LocalFixedPath $root 'Game folder'
+                $rootAvailable = Test-Path -LiteralPath $root -PathType Container
+            } catch { $rootAvailable = $false }
+        }
+        if (-not $rootAvailable) {
+            $folderPicker = New-Object System.Windows.Forms.FolderBrowserDialog
+            $folderPicker.Description = 'Choose the folder containing the game files and their subfolders.'
+            if ($folderPicker.ShowDialog($form) -ne 'OK') { return }
+            $root = $folderPicker.SelectedPath
+        }
+        $found = Find-GameFiles $root
+        $gameRootBox.Text = $root
+        if ($found.gameExecutables.Count -eq 1) {
+            $titleBox.Text = $found.gameExecutables[0]
+        } else {
+            $picker = New-Object System.Windows.Forms.OpenFileDialog
+            $picker.Title = if ($found.gameExecutables.Count) { 'Several game executables found; choose one' } else { 'Game executable not found; choose it manually' }
+            $picker.Filter = 'Executable (*.exe)|*.exe'
+            $picker.InitialDirectory = $root
+            if ($picker.ShowDialog($form) -eq 'OK') {
+                $titleBox.Text = Assert-LocalFixedPath $picker.FileName 'Game executable'
+            }
+        }
+        $existingFfxValid = Test-PcFidelityFxFolder $ffxBox.Text.Trim()
+        if ($found.fidelityFxFolders.Count -eq 1) {
+            $ffxBox.Text = $found.fidelityFxFolders[0]
+        } elseif ($useFfx.Checked -and -not $existingFfxValid) {
+            $folderPicker = New-Object System.Windows.Forms.FolderBrowserDialog
+            $folderPicker.Description = 'Choose the folder containing both PC FidelityFX DX12 DLLs.'
+            $folderPicker.SelectedPath = $root
+            if ($folderPicker.ShowDialog($form) -eq 'OK') {
+                $chosen = Find-GameFiles $folderPicker.SelectedPath
+                if ($chosen.fidelityFxFolders.Count -eq 1) {
+                    $ffxBox.Text = $chosen.fidelityFxFolders[0]
+                } else {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "Found $($chosen.fidelityFxFolders.Count) folders with both PC FidelityFX DX12 DLLs. Choose a narrower folder and search again.",
+                        'FidelityFX folder needed') | Out-Null
+                }
+            }
+        }
+        Save-LauncherSettings (Read-FormSettings)
+        [System.Windows.Forms.MessageBox]::Show(
+            "Searched $($found.scannedFolders) local folder(s). Found $($found.gameExecutables.Count) game EXE(s) and $($found.fidelityFxFolders.Count) PC FidelityFX folder(s).`nSelected paths were saved to $script:SettingsPath",
+            'VIctory game file search') | Out-Null
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Game file search failed') | Out-Null
+    }
+})
 
 function Show-CookDialog([bool] $constructOnly = $false) {
     $dialog = New-Object System.Windows.Forms.Form
@@ -1030,6 +1159,7 @@ if ($ValidateUi) {
         debuggingRows = $debugPanel.RowCount
         detectedGpu = $gpuLabel.Text
         selectedCookedManifest = $cookedManifestLabel.Text
+        autoFindButton = $findGameFilesButton.Text
         cookDialog = Show-CookDialog $true
         vramSlider = [pscustomobject]@{ min = $localPercentSlider.Track.Minimum; max = $localPercentSlider.Track.Maximum; value = $localPercentSlider.Track.Value }
         systemRamSlider = [pscustomobject]@{ min = $rootSystemSlider.Track.Minimum; max = $rootSystemSlider.Track.Maximum; value = $rootSystemSlider.Track.Value }
@@ -1042,14 +1172,33 @@ if ($ValidateUi) {
 $saveButton.Add_Click({
     try {
         $candidate = Read-FormSettings
-        [void](New-LaunchPlan $candidate)
         Save-LauncherSettings $candidate
-        [System.Windows.Forms.MessageBox]::Show('Settings saved locally.', 'VIctory') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("Settings saved to $script:SettingsPath", 'VIctory') | Out-Null
     } catch {
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Settings error') | Out-Null
     }
 })
 $cancelButton.Add_Click({ $form.DialogResult = 'Cancel'; $form.Close() })
+$form.Add_FormClosing({
+    param($sender, $eventArgs)
+    try {
+        Save-LauncherSettings (Read-FormSettings)
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Settings were not saved') | Out-Null
+    }
+})
+$form.Add_Shown({
+    $missingTitle = $true
+    if ($titleBox.Text.Trim()) {
+        try {
+            $selectedTitle = Assert-LocalFixedPath $titleBox.Text.Trim() 'Game executable'
+            $missingTitle = -not (Test-Path -LiteralPath $selectedTitle -PathType Leaf)
+        } catch { $missingTitle = $true }
+    }
+    if ($missingTitle -or ($useFfx.Checked -and -not (Test-PcFidelityFxFolder $ffxBox.Text.Trim()))) {
+        $findGameFilesButton.PerformClick()
+    }
+})
 $launchButton.Add_Click({
     try {
         $candidate = Read-FormSettings

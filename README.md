@@ -172,7 +172,16 @@ its image is correct on that card.
 
 Double-click [Launch VIctory.cmd](Launch%20VIctory.cmd) to open the local
 launcher. It has Game, Graphics, Performance, and Debugging tabs. The Game tab
-shows a detected graphics adapter and offers 720p, 1080p, native, and custom
+has **Game folder (search here)** and **Find game files in this folder**.
+Keep the game executable and, if used, both PC FidelityFX DX12 DLLs beside
+the launcher or in its subfolders. You can also choose another top folder;
+the launcher searches
+local subfolders and fills the EXE and DLL folder paths when each has one
+match. If a file is missing or ambiguous, it opens a picker. The search
+skips junctions and symlinks and never follows a network path.
+On first open, the launcher starts this search automatically when the saved
+game EXE or enabled PC FidelityFX folder is missing.
+It also shows a detected graphics adapter and offers 720p, 1080p, native, and custom
 resolution profiles. A profile fills the render, final composite, and streamed
 texture edge controls; changing one of those controls selects custom. A
 one-time shader/pipeline prebuild caches missing work for the GPU and driver
@@ -204,6 +213,10 @@ its shader and rendering choices, but the port has no separate compiler
 precision setting for “shader quality.”
 
 Settings are saved locally at `%LOCALAPPDATA%\VIctory\launcher.json`.
+**Save settings** and **Close** persist the current menu choices, including
+unfinished game or cooked-texture paths. **Launch offline** validates the
+complete plan before starting the game. Saving replaces the settings file
+atomically, so an interrupted write leaves the previous choices available.
 Each launch writes its plan and logs under `%LOCALAPPDATA%\VIctory\logs`.
 The launcher rejects network drives, UNC paths, and reparse points for its
 state, settings, logs, game executable, and selected cooked inputs. It sets
