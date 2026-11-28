@@ -1,7 +1,8 @@
 //! Presented frames written to PNG files, to see what reaches the screen:
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
-//! size. Only in builds with diagnostics.
+//! size by default. `VICTORY_CAPTURE_FULL_RES=1` keeps the original frame size.
+//! Only in builds with diagnostics.
 
 use std::path::PathBuf;
 
@@ -62,20 +63,47 @@ pub(crate) fn wanted(n: u64) -> bool {
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    let full_resolution = crate::switch::on("VICTORY_CAPTURE_FULL_RES");
+    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows, full_resolution);
 }
 
-/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
-fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
+/// Saves 8-bit RGBA or BGRA rows as `<name>.png`.
+fn save_as(
+    name: &str,
+    width: u32,
+    height: u32,
+    pitch: usize,
+    bgra: bool,
+    rows: &[u8],
+    full_resolution: bool,
+) {
     let Some(folder) = folder() else { return };
-    let (w, h) = ((width / 2).max(1), (height / 2).max(1));
-    // Filter byte 0 per row, then RGB of every other pixel of every other row.
+    let png = encode_rgb_png(width, height, pitch, bgra, rows, full_resolution);
+    let path = folder.join(format!("{name}.png"));
+    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
+        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+    }
+}
+
+fn encode_rgb_png(
+    width: u32,
+    height: u32,
+    pitch: usize,
+    bgra: bool,
+    rows: &[u8],
+    full_resolution: bool,
+) -> Vec<u8> {
+    let step = if full_resolution { 1 } else { 2 };
+    let (w, h) = ((width / step).max(1), (height / step).max(1));
+    let step = step as usize;
+    // Filter byte 0 per row, then RGB of each sampled pixel.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
     for y in 0..h as usize {
         raw.push(0);
-        let row = &rows[(2 * y).min(height as usize - 1) * pitch..];
+        let row = &rows[(step * y).min(height as usize - 1) * pitch..];
         for x in 0..w as usize {
-            let p = &row[(2 * x).min(width as usize - 1) * 4..][..3];
+            let p = &row[(step * x).min(width as usize - 1) * 4..][..3];
             if bgra {
                 raw.extend([p[2], p[1], p[0]]);
             } else {
@@ -95,11 +123,7 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
         &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
     );
     chunk(&mut png, b"IEND", &[]);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
-        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
-    }
+    png
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -580,7 +604,7 @@ fn dump_one(
             if rgba.chunks(4).all(|p| p[..3] == [0, 0, 0]) {
                 name.push_str("-black");
             }
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba, false);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
@@ -1016,5 +1040,45 @@ mod r32_tests {
         let expected = Some([0, 0, 0, 255].repeat(2));
         assert_eq!(super::to_rgba(42, 2, 1, 8, &[0; 8]), expected);
         assert_eq!(super::to_rgba(43, 2, 1, 8, &[0; 8]), expected);
+    }
+}
+
+#[cfg(test)]
+mod frame_png_tests {
+    #[test]
+    fn full_resolution_retains_one_pixel_features_and_ignores_padding() {
+        use super::encode_rgb_png;
+
+        let mut rgba = [0u8; 72];
+        for row in rgba.as_chunks_mut::<24>().0 {
+            row[20..].fill(241);
+        }
+        rgba[28..32].copy_from_slice(&[171, 63, 29, 11]);
+        rgba[64..68].copy_from_slice(&[91, 10, 221, 17]);
+        let mut bgra = rgba;
+        for row in bgra.as_chunks_mut::<24>().0 {
+            for pixel in row[..20].as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+        }
+
+        for (rows, bgra) in [(&rgba, false), (&bgra, true)] {
+            // The encoder emits a single IDAT immediately after IHDR.
+            let decode = |full_resolution| {
+                let png = encode_rgb_png(5, 3, 24, bgra, rows, full_resolution);
+                let width = u32::from_be_bytes(png[16..20].try_into().unwrap());
+                let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
+                let len = u32::from_be_bytes(png[33..37].try_into().unwrap()) as usize;
+                assert_eq!(&png[37..41], b"IDAT");
+                let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + len]).unwrap();
+                (width, height, raw)
+            };
+            assert_eq!(decode(false), (2, 1, vec![0; 7]));
+
+            let mut expected = vec![0; 48]; // Three filter bytes and fifteen RGB pixels.
+            expected[20..23].copy_from_slice(&[171, 63, 29]);
+            expected[45..48].copy_from_slice(&[91, 10, 221]);
+            assert_eq!(decode(true), (5, 3, expected));
+        }
     }
 }
