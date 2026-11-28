@@ -360,23 +360,74 @@ fn log_gpu_times(frames: f64) {
 pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
     static ADAPTER: OnceLock<Option<IDXGIAdapter3>> = OnceLock::new();
     let adapter = ADAPTER
-        .get_or_init(|| {
-            let device = &host()?.device;
-            // SAFETY: plain device and DXGI queries.
-            unsafe {
-                let luid = device.GetAdapterLuid();
-                let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-                factory.EnumAdapterByLuid(luid).ok()
-            }
-        })
+        .get_or_init(|| video_memory_adapter(&host()?.device))
         .as_ref()?;
+    Some([
+        video_memory_info(adapter, DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?,
+        video_memory_info(adapter, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?,
+    ])
+}
+
+fn video_memory_adapter(device: &ID3D12Device) -> Option<IDXGIAdapter3> {
+    // SAFETY: plain device and DXGI queries.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        factory.EnumAdapterByLuid(luid).ok()
+    }
+}
+
+fn video_memory_info(
+    adapter: &IDXGIAdapter3,
+    group: DXGI_MEMORY_SEGMENT_GROUP,
+) -> Option<(f64, f64)> {
+    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    // SAFETY: a valid out pointer.
+    unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }.ok()?;
+    Some((info.CurrentUsage as f64 / 1e6, info.Budget as f64 / 1e6))
+}
+
+#[cfg(feature = "diagnostics")]
+fn report_buffer_budget(
+    device: &ID3D12Device,
+    error: windows::core::HRESULT,
+    size: u64,
+    buffer: &str,
+) {
+    if error != windows::Win32::Foundation::E_OUTOFMEMORY
+        || !tracing::enabled!(tracing::Level::WARN)
+    {
+        return;
+    }
+
+    // One failure can be followed by many allocation attempts. Sample only
+    // once per interval and keep the ordinary warnings for every failure.
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(20)) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+
+    let adapter = video_memory_adapter(device);
     let info = |group| {
-        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        // SAFETY: a valid out pointer.
-        unsafe { adapter.QueryVideoMemoryInfo(0, group, &mut info) }.ok()?;
-        Some((info.CurrentUsage as f64 / 1e6, info.Budget as f64 / 1e6))
+        adapter
+            .as_ref()
+            .and_then(|adapter| video_memory_info(adapter, group))
     };
-    Some([info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL)?, info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)?])
+    let (local_used_mb, local_budget_mb) = info(DXGI_MEMORY_SEGMENT_GROUP_LOCAL).unzip();
+    let (nonlocal_used_mb, nonlocal_budget_mb) = info(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL).unzip();
+    tracing::warn!(
+        buffer,
+        size,
+        local_used_mb,
+        local_budget_mb,
+        nonlocal_used_mb,
+        nonlocal_budget_mb,
+        "DXGI memory budget at buffer allocation failure"
+    );
 }
 
 #[cfg(test)]
@@ -2757,6 +2808,8 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, readback, "no mapped buffer");
+                #[cfg(feature = "diagnostics")]
+                report_buffer_budget(&self.device, e.code(), size, "mapped");
                 None
             }
         }
@@ -3666,6 +3719,8 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                #[cfg(feature = "diagnostics")]
+                report_buffer_budget(&self.device, e.code(), size, "shared");
                 None
             }
         }
