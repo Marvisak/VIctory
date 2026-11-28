@@ -31,6 +31,9 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# Windows 10: load the Direct3D 12 Agility SDK runtime from a `D3D12`
+# folder beside victory.exe (src/sdkpath.rs). The folder is then required.
+agility-sdk = []
 
 [lints]
 workspace = true

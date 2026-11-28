@@ -7,6 +7,7 @@ mod census;
 mod inspect;
 mod prebuild;
 mod run;
+mod sdkpath;
 mod shader;
 mod translate;
 
@@ -150,6 +151,15 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
+    if matches!(
+        &cli.command,
+        Command::Translate {
+            pipelines: true,
+            ..
+        } | Command::Run { execute: true, .. }
+    ) {
+        sdkpath::check()?;
+    }
     match cli.command {
         Command::Inspect {
             file,

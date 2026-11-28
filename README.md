@@ -73,6 +73,17 @@ absolute path (`$env:CARGO_TARGET_DIR = 'C:\vt'`; `victory.exe` is then
 in `C:\vt\release` instead of `target\release`), or check out the
 repository nearer the drive's root.
 
+On Windows 10 the in-box Direct3D 12 runtime refuses directly indexed
+descriptor heaps (shader model 6.6), so every host pipeline is refused and
+the title crashes once it draws. Build with `--features agility-sdk`:
+`victory.exe` then loads the Agility SDK 1.620 runtime from a `D3D12`
+folder beside it. From the
+[Microsoft.Direct3D.D3D12](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12)
+1.620.x package (a `.nupkg` is a zip), copy `build\native\bin\x64\D3D12Core.dll`
+(and `d3d12SDKLayers.dll` for the debug layer) to `target\release\D3D12\`.
+With the feature enabled, commands that use Direct3D 12 require the folder.
+Those commands report what to install if the folder is missing.
+
 A run in the world takes about 33 GB of Windows commit (RAM plus paging
 file) and about 10 GB of video memory. The tested machine has 32 GB of RAM
 and a commit limit of about 80 GB. Check **Committed** under **Task Manager →
