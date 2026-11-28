@@ -241,6 +241,18 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+fn dispatch_counts(
+    flags: Option<u32>,
+    guarded: bool,
+    threads: Option<[u32; 3]>,
+    counts: [u32; 3],
+) -> ([u32; 3], bool) {
+    let Some(size) = threads.filter(|_| guarded && flags.is_some_and(|f| f & 0x20 != 0)) else {
+        return (counts, false);
+    };
+    (std::array::from_fn(|i| counts[i].div_ceil(size[i])), true)
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -469,6 +481,8 @@ impl State {
             (Some(Root::Constants(c)), RootType::Constants) => {
                 c.get(dword as usize).copied().unwrap_or(0)
             }
+            // The real X thread count is set just before the dispatch.
+            (_, RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X)) => 0,
             _ => {
                 once!(
                     slot,
@@ -506,6 +520,24 @@ impl State {
             .filter(|&&h| h != 0)
             .map(|&h| crate::descriptor::heap(h as This))
             .find(|h| h.index(handle).is_some())
+    }
+
+    /// The GPU address of the host's table of the buffer views' title
+    /// addresses by heap slot (`SLOT_VIEWS`), for a shader that reads a
+    /// descriptor at a computed index.
+    fn heap_views(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.views_gpu()?;
+        if let Some(buffer) = host.views_buffer() {
+            list.keep(buffer);
+        }
+        Some(gpu)
     }
 
     pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
@@ -828,6 +860,25 @@ impl State {
                         }
                         continue;
                     }
+                    if kind == 1 && slot == victory_shader::emit::SLOT_VIEWS {
+                        // The host's table of view addresses by slot, for a
+                        // descriptor read at an index the shader computes.
+                        let Some(gpu) = self.heap_views(list) else {
+                            once!("a shader reads view addresses without a view heap: dropped");
+                            not_run("view addresses without a view heap");
+                            return false;
+                        };
+                        // SAFETY: an open list; the table lives while the list
+                        // holds it.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
+                            }
+                        }
+                        continue;
+                    }
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
@@ -1093,7 +1144,7 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: Option<u32>) {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1120,12 +1171,36 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        let stage = p.stages.first().map(|s| (s, s.translated()));
+        let tail = stage.filter(|(_, t)| t.partial_dispatch).and_then(|(s, t)| {
+            let (param, _) = s.user_data?;
+            let word = t.host.user_data.iter().find(|u| {
+                u.root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X)
+            })?;
+            Some((param, word.index))
+        });
+        let counts = [x, y, z];
+        let ([x, y, z], converted) = dispatch_counts(
+            flags,
+            tail.is_some(),
+            stage.and_then(|(_, t)| t.compute_threads),
+            counts,
+        );
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // SAFETY: an open list with everything set; `tail` names a declared
+        // root word.
+        unsafe {
+            if let Some((param, word)) = tail.filter(|_| converted) {
+                list.list.SetComputeRoot32BitConstant(param, counts[0], word);
+            }
+            list.list.Dispatch(x, y, z);
+            if let Some((param, word)) = tail.filter(|_| converted) {
+                list.list.SetComputeRoot32BitConstant(param, 0, word);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2028,6 +2103,28 @@ const QUAD_STRIP: u32 = 20;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_x_counts_are_groups_without_a_partial_dispatch_guard() {
+        let sizes = Some([64, 1, 1]);
+        let counts = [129, 1, 1];
+        assert_eq!(
+            dispatch_counts(Some(0x20), true, sizes, counts),
+            ([3, 1, 1], true)
+        );
+        assert_eq!(
+            dispatch_counts(Some(0x20), false, sizes, counts),
+            (counts, false)
+        );
+        assert_eq!(
+            dispatch_counts(None, true, sizes, counts),
+            (counts, false)
+        );
+        assert_eq!(
+            dispatch_counts(Some(0x20), true, None, counts),
+            (counts, false)
+        );
+    }
 
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title
@@ -3407,6 +3504,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             "compute",
             crate::pipeline::Translated {
                 host: host_shader,
+                compute_threads: None,
+                partial_dispatch: false,
                 used: used_entries,
             },
         );

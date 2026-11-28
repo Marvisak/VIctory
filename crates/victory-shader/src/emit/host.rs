@@ -787,7 +787,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
     let st = crate::structure::structure(&p)?;
     let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = crate::io::raise(&p, &native)?;
-    let lowered = super::lower::lower(&super::lower::Parts {
+    let lowered = super::lower::lower_with_thread_limit(&super::lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -798,7 +798,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
-    })?;
+    }, false)?;
     Ok(HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,

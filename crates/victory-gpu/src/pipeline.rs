@@ -110,6 +110,8 @@ impl Shader {
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
+    pub(crate) compute_threads: Option<[u32; 3]>,
+    pub(crate) partial_dispatch: bool,
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
@@ -187,23 +189,39 @@ fn with_resources(
     container: &[u8],
     host: victory_shader::emit::HostShader,
 ) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, FourCC, HwStage, RootType};
+    use victory_shader::emit::USER_DISPATCH_THREADS_X;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
-        Some(part) => victory_shader::native_programs(part.data)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|p| {
-                matches!(
-                    p.stage,
-                    HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-                )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
+    let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
+        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    Ok(Translated { host, used })
+    let used = programs
+        .iter()
+        .find(|p| {
+            matches!(
+                p.stage,
+                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+            )
+        })
+        .map(|p| p.used.to_vec())
+        .unwrap_or_default();
+    let compute_threads = programs.iter().find_map(|p| match &p.io {
+        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => {
+            Some(cs.threads)
+        }
+        _ => None,
+    });
+    let partial_dispatch = host
+        .user_data
+        .iter()
+        .any(|u| u.root == RootType::Other(USER_DISPATCH_THREADS_X));
+    Ok(Translated {
+        host,
+        compute_threads,
+        partial_dispatch,
+        used,
+    })
 }
 
 #[repr(C)]
