@@ -111,13 +111,28 @@ fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     png.extend(crc.to_be_bytes());
 }
 
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
+const fn crc32_table() -> [u32; 256] {
+    let mut table = [0; 256];
+    let mut i = 0;
+    while i < table.len() {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
             crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
+            bit += 1;
         }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = crc32_table();
+    let mut crc = !0u32;
+    for &byte in bytes {
+        let index = usize::from(crc as u8 ^ byte);
+        crc = (crc >> 8) ^ TABLE[index];
     }
     !crc
 }
@@ -951,6 +966,8 @@ mod tests {
 
     #[test]
     fn crc_matches_the_png_check_value() {
+        assert_eq!(super::crc32(b""), 0);
+        assert_eq!(super::crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
     }
 
