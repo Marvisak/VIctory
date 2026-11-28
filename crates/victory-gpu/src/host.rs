@@ -873,11 +873,17 @@ pub(crate) fn dred_on() -> bool {
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
-/// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
+/// builds). It records its own command notes; DRED is not required.
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
+}
+
+/// Whether list commands are noted for DRED breadcrumbs or GPU timing.
+#[cfg(feature = "diagnostics")]
+fn notes_on() -> bool {
+    crate::switch::notes_enabled(dred_on(), timing())
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -1763,10 +1769,14 @@ impl HostList {
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+            let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+            let count = notes.min(STAMPS as usize - 1) as u32;
             // SAFETY: an open list, our heap and read-back buffer.
             unsafe {
-                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+                // At capacity the first untimed note already closed the last sample.
+                if notes < STAMPS as usize {
+                    self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+                }
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
@@ -1989,10 +1999,10 @@ impl HostList {
         list.cast().ok()
     }
 
-    /// Notes what the command about to be recorded does, as a marker
-    /// command whose text the list keeps (diagnostics, with device-removed
-    /// data on): the report pairs the breadcrumbs' marker commands with the
-    /// texts in order and names the commands a fault stopped among.
+    /// Notes what the command about to be recorded does (diagnostics, with
+    /// DRED or GPU timing on): the list keeps the text and a timestamp for
+    /// each note. DRED also records it as a marker command so a removal
+    /// report can pair breadcrumbs with the commands in order.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn note_op(&self, what: impl FnOnce() -> String) {
         self.note(what, None);
@@ -2007,13 +2017,18 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
+        if !notes_on() {
+            return;
+        }
+        let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+        if let Some((heap, _)) = self.stamps()
+            && at < STAMPS
+        {
+            // SAFETY: an open list and our query heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+        }
+        let what = what();
         if dred_on() {
-            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
-                // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
-            }
-            let what = what();
             traced(&what);
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
@@ -2021,11 +2036,11 @@ impl HostList {
             unsafe {
                 self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
             };
-            self.notes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((what, range));
         }
+        self.notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((what, range));
     }
 
     /// Notes a texture the list renders to or writes, in a listed frame.
