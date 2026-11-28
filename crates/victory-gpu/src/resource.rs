@@ -2934,7 +2934,10 @@ mod tests {
         }
         let null = std::ptr::null();
         const D32_FLOAT: u32 = 40;
-        let desc = ResourceDesc { flags: DEPTH, ..texture(64, 64, D32_FLOAT, 1) };
+        let desc = ResourceDesc {
+            flags: DEPTH,
+            ..texture(64, 64, D32_FLOAT, 1)
+        };
         let clear = [D32_FLOAT, 1.0f32.to_bits(), 0, 0, 0];
         let h = heap(1 << 20);
         let placed = || {
