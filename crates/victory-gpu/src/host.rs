@@ -44,6 +44,7 @@ pub(crate) struct Host {
     pub(crate) depth_bounds_supported: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
+    copy_lane: Option<crate::copyqueue::CopyLane>,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
@@ -212,6 +213,20 @@ fn create() -> windows::core::Result<Host> {
             ..Default::default()
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let copy_lane = if crate::copyqueue::enabled() {
+            match crate::copyqueue::CopyLane::new(&device) {
+                Ok(lane) => {
+                    tracing::info!("copy queue lane ready");
+                    Some(lane)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "no copy queue lane; bookkeeping copies stay on the direct queue");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -252,6 +267,7 @@ fn create() -> windows::core::Result<Host> {
             depth_bounds_supported,
             queue,
             fence,
+            copy_lane,
             submitted: Mutex::new(0),
             event,
             rtvs,
@@ -980,6 +996,8 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
+    /// Zero a list's indirect budget on the copy queue.
+    Budget(ID3D12Resource),
     /// Shaders write a range (address, bytes) of a buffer's host copy;
     /// whether they mark the pages they write (no snapshot then), and
     /// whether their program uses title memory (then the range is withheld
@@ -1265,6 +1283,20 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        if let Some(lane) = &self.copy_lane {
+            let after = [(&self.fence, *submitted)];
+            match lane.flush(&after) {
+                Ok(Some(job)) => {
+                    // SAFETY: the job has just been signalled on the lane's
+                    // queue and the direct queue is ours.
+                    if let Err(e) = unsafe { self.queue.Wait(lane.fence(), job) } {
+                        tracing::warn!(error = %e, "direct queue did not wait for the copy lane");
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "copy lane submission failed"),
+            }
+        }
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -2231,11 +2263,15 @@ impl HostList {
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
-            deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+            if host().is_some_and(|h| h.copy_lane.is_some()) {
+                deferred.copies.push(Step::Budget(buffer.clone()));
+            } else {
+                let at = *data;
+                // SAFETY: the list's own mapped word, written before it runs.
+                deferred
+                    .copies
+                    .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+            }
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
@@ -2308,7 +2344,7 @@ impl HostList {
                 match step {
                     Step::Refresh(..) => C::StepRefreshUs,
                     Step::Copy(..) | Step::Fill(..) => C::StepCopyUs,
-                    Step::Run(_) | Step::Host(_) => C::StepWorkUs,
+                    Step::Run(_) | Step::Host(_) | Step::Budget(_) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
                     Step::Texture(..) => C::StepTextureUs,
                     Step::Heap(_) => C::StepHeapUs,
@@ -2353,6 +2389,14 @@ impl HostList {
                     {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
+                    }
+                    continue;
+                }
+                Step::Budget(buffer) => {
+                    if let Some(lane) = host().and_then(|h| h.copy_lane.as_ref())
+                        && let Err(e) = lane.stage_zero(buffer, 4)
+                    {
+                        tracing::warn!(error = %e, "bookkeeping copy not staged");
                     }
                     continue;
                 }
@@ -2718,10 +2762,7 @@ impl Host {
     /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
     /// readback memory in the copy-destination state.
     fn mapped_buffer(&self, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: if readback { D3D12_HEAP_TYPE_READBACK } else { D3D12_HEAP_TYPE_UPLOAD },
-            ..Default::default()
-        };
+        let rebar = !readback && crate::rebar::placement(size, &self.device);
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),
@@ -2735,31 +2776,67 @@ impl Host {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
-        let mut buffer: Option<ID3D12Resource> = None;
-        let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    if readback { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_GENERIC_READ },
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
+        // A GPU upload heap can fail under VRAM pressure: the plain upload
+        // heap is the fallback. Buffers in it start common; in a normal
+        // upload heap, generic read.
+        let heaps: &[D3D12_HEAP_TYPE] = if rebar {
+            &[D3D12_HEAP_TYPE_GPU_UPLOAD, D3D12_HEAP_TYPE_UPLOAD]
+        } else if readback {
+            &[D3D12_HEAP_TYPE_READBACK]
+        } else {
+            &[D3D12_HEAP_TYPE_UPLOAD]
         };
-        match made {
-            Ok(()) => Some((buffer?, data.cast())),
-            Err(e) => {
-                tracing::warn!(error = %e, size, readback, "no mapped buffer");
-                None
+        let mut error = None;
+        for (i, &kind) in heaps.iter().enumerate() {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: kind,
+                ..Default::default()
+            };
+            let state = if rebar && i == 0 {
+                D3D12_RESOURCE_STATE_COMMON
+            } else if readback {
+                D3D12_RESOURCE_STATE_COPY_DEST
+            } else {
+                D3D12_RESOURCE_STATE_GENERIC_READ
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain creation and mapping of a committed buffer.
+            let made = unsafe {
+                self.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        None,
+                        &mut buffer,
+                    )
+                    .and_then(|()| {
+                        let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                        b.Map(0, None, Some(&mut data))
+                    })
+            };
+            match made {
+                Ok(()) => {
+                    let buffer = buffer?;
+                    if rebar && i == 0 {
+                        crate::rebar::track(&buffer, size);
+                    }
+                    return Some((buffer, data.cast()));
+                }
+                Err(e) => {
+                    if rebar && i == 0 {
+                        tracing::warn!(error = %e, size, "ReBAR buffer failed; trying the upload heap");
+                    }
+                    error = Some(e);
+                }
             }
         }
+        if let Some(e) = error {
+            tracing::warn!(error = %e, size, readback, "no mapped buffer");
+        }
+        None
     }
 }
 
@@ -4129,5 +4206,91 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+    }
+}
+
+#[cfg(test)]
+mod copy_lane {
+    use super::{Host, host};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+    fn zero_target(host: &Host) -> ID3D12Resource {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 4,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut dest = None;
+        // SAFETY: a plain buffer creation on the live device.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut dest,
+                )
+                .unwrap();
+        }
+        dest.unwrap()
+    }
+
+    #[test]
+    fn repeated_stage_zero_flush_cycles_recover_budget_after_reset() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let lane = crate::copyqueue::CopyLane::new(&host.device).unwrap();
+        let dest = zero_target(host);
+        let mut last = 0;
+        for _ in 0..3 {
+            lane.stage_zero(&dest, 4).unwrap();
+            let job = lane.flush(&[]).unwrap().expect("the zero copy was staged");
+            assert!(job > last, "each cycle submits a new job");
+            last = job;
+        }
+        let list = host.new_list().unwrap();
+        let steps = list.deferred().copies.len();
+        assert!(list.budget().is_some());
+        assert_eq!(list.deferred().copies.len(), steps + 1);
+        assert!(list.budget().is_some());
+        assert_eq!(list.deferred().copies.len(), steps + 1, "one zero per list");
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        assert!(list.budget().is_some());
+        assert_eq!(list.deferred().copies.len(), steps + 1, "after reset, a new zero");
+    }
+
+    #[test]
+    fn consecutive_stage_zero_calls_keep_one_pending_job() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let lane = crate::copyqueue::CopyLane::new(&host.device).unwrap();
+        let first = zero_target(host);
+        let second = zero_target(host);
+        lane.stage_zero(&first, 4).unwrap();
+        lane.stage_zero(&second, 4).unwrap();
+        let job = lane.flush(&[]).unwrap().expect("both zeros are in one job");
+        assert!(lane.flush(&[]).unwrap().is_none(), "nothing is pending after a flush");
+        // SAFETY: a fence on the live device, signalled by the flush above.
+        while unsafe { lane.fence().GetCompletedValue() } < job {
+            std::thread::yield_now();
+        }
+        lane.stage_zero(&first, 4).unwrap();
+        assert!(lane.flush(&[]).unwrap().is_some(), "the allocator is reusable after its fence");
     }
 }

@@ -228,17 +228,20 @@ mod tests {
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
         assert!(second > first);
         assert!(before.elapsed() <= Duration::from_millis(50));
-        assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
+        // A zero time-out can still take a tick that has already passed.
+        let before = second;
+        let hr = wait(null, 0, 0, std::ptr::null(), 0, &mut second);
+        assert!(hr == S_OK || hr == TIMEOUT);
+        assert_eq!(second, before + u64::from(hr == S_OK));
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
         let flags = TOKEN_ON_TIMEOUT;
-        assert_eq!(
-            wait(null, 0, 0, std::ptr::null(), flags, &mut early),
-            TIMEOUT
-        );
+        let hr = wait(null, 0, 0, std::ptr::null(), flags, &mut early);
+        assert!(hr == S_OK || hr == TIMEOUT);
+        assert_eq!(early, second + 1);
         let mut next = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut next), S_OK);
-        assert!(early == second + 1 && next == early + 1);
+        assert_eq!(next, early + 1);
         assert!(LAST[0].load(Ordering::Relaxed) >= 2);
 
         // The title's loop (the clock is global, so in the same test): an

@@ -115,9 +115,74 @@ void main(uint lane : SV_GroupIndex) {
 }
 "#;
 
+const MESH_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0)"
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+ByteAddressBuffer args : register(t0);
+RWByteAddressBuffer dest : register(u0);
+RWByteAddressBuffer budget : register(u1);
+static const uint BUDGET = 1u << 27;
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint lane : SV_GroupIndex) {
+    // One group walks the records in tiles of 64, as the general clamp does.
+    for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
+        uint record = tile * 64 + lane;
+        if (record >= records) {
+            continue;
+        }
+        uint at = record * stride;
+        uint3 asked = args.Load3(at);
+        uint3 g = uint3(min(asked.x, 65535u), min(asked.y, 1u), min(asked.z, 1u));
+        uint cost = g.x * g.y * g.z * 128u;
+        bool fit = true;
+        if (cost > 0u) {
+            uint before;
+            budget.InterlockedOr(0, 0, before);
+            fit = false;
+            [allow_uav_condition]
+            while (before < BUDGET) {
+                uint next = (BUDGET - before < cost) ? BUDGET : (before + cost);
+                uint prev;
+                budget.InterlockedCompareExchange(0, before, next, prev);
+                if (prev == before) {
+                    fit = BUDGET - before >= cost;
+                    break;
+                }
+                before = prev;
+            }
+        }
+        dest.Store3(at, fit ? g : uint3(0, 0, 0));
+        uint was;
+        budget.InterlockedMax(4, asked.x, was);
+        budget.InterlockedAdd(8, min(asked.x, 1u << 24), was);
+    }
+}
+"#;
+
+pub(crate) fn mesh_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_MESH_LAUNCH"))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn mesh_clamp(asked: [u32; 3], left: u64) -> ([u32; 3], u64, bool) {
+    let groups = [asked[0].min(65_535), asked[1].min(1), asked[2].min(1)];
+    let cost = u64::from(groups[0]) * u64::from(groups[1]) * u64::from(groups[2]) * 128;
+    let fits = cost <= left;
+    (if fits { groups } else { [0; 3] }, if fits { left - cost } else { 0 }, fits)
+}
+
+/// The clamp shaders walk 64 records per group; every record past the first
+/// wave needs another group, and the partial last tile needs one too.
+fn clamp_groups(records: u32) -> u32 {
+    records.div_ceil(64)
+}
+
 struct Clamp {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    mesh: Option<ID3D12PipelineState>,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -138,15 +203,14 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-fn make() -> windows::core::Result<Clamp> {
-    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+fn compile(device: &ID3D12Device, source: &str) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -181,8 +245,25 @@ fn make() -> windows::core::Result<Clamp> {
             },
             ..Default::default()
         })?;
-        Ok(Clamp { root, pso })
+        Ok((root, pso))
     }
+}
+
+fn make() -> windows::core::Result<Clamp> {
+    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    let (root, pso) = compile(device, SOURCE)?;
+    let mesh = if mesh_enabled() {
+        match compile(device, MESH_SOURCE) {
+            Ok((_, pso)) => Some(pso),
+            Err(e) => {
+                tracing::warn!(error = %e, "no lightweight mesh launch; using the general clamp");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    Ok(Clamp { root, pso, mesh })
 }
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
@@ -212,6 +293,17 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
     }
     let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
     let l = &list.list;
+    let mesh = if kind == 10 && mesh_enabled() {
+        c.mesh.as_ref()
+    } else {
+        None
+    };
+    let (pso, groups) = match mesh {
+        Some(mesh) => (mesh, clamp_groups(records)),
+        // SOURCE charges the budget in one group; several would race and
+        // reject every record on hosts that run the tiles concurrently.
+        None => (&c.pso, records.min(1)),
+    };
     let constants = [kind, stride, records, 0];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // a title buffer's copy the caller's list holds.
@@ -222,13 +314,12 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
             transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         l.SetComputeRootSignature(&c.root);
-        l.SetPipelineState(&c.pso);
+        l.SetPipelineState(pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootShaderResourceView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
-        // One group walks every record.
-        l.Dispatch(records.min(1), 1, 1);
+        l.Dispatch(groups, 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
             transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
@@ -261,6 +352,49 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn both_clamp_shaders_walk_records_in_tiles_of_64() {
+        let tile = "for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++)";
+        assert!(super::SOURCE.contains(tile));
+        assert!(super::MESH_SOURCE.contains(tile), "the mesh clamp must cover every tile");
+        for (records, groups) in [(0, 0), (1, 1), (63, 1), (64, 1), (65, 2), (70, 2), (600, 10)] {
+            assert_eq!(super::clamp_groups(records), groups, "{records} records");
+        }
+    }
+
+    #[test]
+    fn mesh_records_are_clamped_to_one_dimension() {
+        let (groups, left, fit) = super::mesh_clamp([100_000, 4, 9], 1 << 27);
+        assert_eq!(groups, [65_535, 1, 1]);
+        assert_eq!(left, (1 << 27) - 65_535 * 128);
+        assert!(fit);
+    }
+
+    #[test]
+    fn mesh_records_that_do_not_fit_run_empty() {
+        let budget = 128;
+        let (groups, left, fit) = super::mesh_clamp([2, 1, 1], budget);
+        assert_eq!(groups, [0; 3]);
+        assert_eq!(left, 0);
+        assert!(!fit);
+        let (groups, left, fit) = super::mesh_clamp([1, 1, 1], budget);
+        assert_eq!(groups, [1, 1, 1]);
+        assert_eq!(left, 0);
+        assert!(fit);
+    }
+
+    #[test]
+    fn an_empty_mesh_record_costs_no_budget() {
+        let (groups, left, fit) = super::mesh_clamp([u32::MAX, u32::MAX, u32::MAX], 0);
+        assert_eq!(groups, [0; 3]);
+        assert_eq!(left, 0);
+        assert!(!fit);
+        let (groups, left, fit) = super::mesh_clamp([0, u32::MAX, u32::MAX], 0);
+        assert_eq!(groups, [0, 1, 1], "an empty record keeps its clamped groups");
+        assert_eq!(left, 0);
+        assert!(fit);
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -311,6 +445,16 @@ mod tests {
             let first = |i: usize| out_data.cast::<u32>().add(i * per).read_volatile();
             Some((0..records as usize).map(first).collect())
         }
+    }
+
+    /// The clamp covers records past the first 64-lane tile: none of the 70
+    /// mesh records is left unwritten when two groups are dispatched.
+    #[test]
+    fn mesh_records_past_the_first_wave_are_clamped() {
+        let Some(meshes) = clamped(10, &[10, 1, 1], 70, 1) else {
+            return; // no host GPU here
+        };
+        assert_eq!(meshes, vec![10; 70], "every tile ran");
     }
 
     /// Rejected records do not wrap the budget: of 128 garbage draws (2^26
