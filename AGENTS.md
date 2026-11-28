@@ -88,29 +88,7 @@ Before merging an implementation PR into `dev`, the coordinating agent must:
 5. Record the exact head SHA, files/functions inspected, commands actually run, findings, test gaps, and residual risks in the PR.
 6. Fix blocking findings and repeat the affected inspection and validation after every change.
 
-Optional peer reviews may add confidence, but are not mandatory in the current single-operator mode. Never fabricate reviewer identities, separate agent instances, or approvals.
-1. Obtain at least **two independent AI reviews** of the exact PR head:
-   - **Correctness reviewer:** checks semantics, architecture, API/ABI compatibility, ownership/lifetimes, concurrency, error paths, and regressions.
-   - **Adversarial reviewer:** assumes the implementation is wrong and actively searches for counterexamples, boundary cases, races, resource exhaustion, malformed input, and tests that would pass while the implementation is still incorrect.
-2. Reviewers must be separate agent instances with separate review contexts. Prefer different model families or materially different reasoning configurations when available. Two passes by the same agent do not count as two independent reviews.
-3. The implementation author must not write either review, approve their own work, or present their own self-review as independent evidence.
-4. Reviewers must inspect the actual diff and relevant call sites. Do not rely solely on the PR description, author's summary, another reviewer's conclusion, or green CI.
-5. Each reviewer must publish a review in the PR containing:
-   - exact head SHA reviewed;
-   - unique review `TASK-ID` from #50, with a direct link to the claim and handoff;
-   - a non-secret agent-instance identifier, model family/name, and reasoning configuration/effort used for this review;
-   - files/functions and invariants inspected;
-   - concrete checks and counterexamples attempted;
-   - findings with severity and evidence, or explicit statement that no blocking finding was found;
-   - test gaps and residual risks;
-   - verdict: `APPROVE`, `REQUEST_CHANGES`, or `BLOCKED`.
-
-The #50 claim is the auditable record of a separate review context. Multiple reviews posted under one GitHub account may count as independent only when their TASK-IDs and agent-instance identifiers show distinct instances that inspected the diff separately. A GitHub username, different wording, or separate comment alone is not proof of independence.
-6. A review is not independent if its author merely paraphrases an earlier review. Reviewers should initially inspect independently, then challenge each other's findings.
-7. The implementer must respond to every finding. Fixes require a fresh review of the changed lines and affected invariants. A reviewer must not silently withdraw a finding because the author disagrees.
-8. Any unresolved P0/P1 finding blocks merge. P2/P3 findings may remain only when their impact, rationale, and follow-up issue are recorded and they do not undermine correctness or safety.
-9. If two reviewers disagree, a third independent reviewer adjudicates. Do not resolve a technical disagreement by majority vote without evidence.
-10. If separate reviewers are unavailable, do not fabricate reviewer identities or claim a multi-agent review occurred. Keep the PR open and request review.
+Optional peer reviews may add confidence, but they are not mandatory in the current single-operator mode. Never fabricate reviewer identities, separate agent instances, or approvals. Resolve technical disagreements through evidence and targeted tests, not vote-counting.
 
 ### 4.2 Required validation for every PR
 
