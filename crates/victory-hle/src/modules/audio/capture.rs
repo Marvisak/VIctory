@@ -23,11 +23,11 @@ use windows::Win32::Media::Audio::{
     VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVE_FORMAT_PCM, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-use windows::Win32::Foundation::WAIT_OBJECT_0;
+use windows::Win32::Foundation::{E_ILLEGAL_METHOD_CALL, E_POINTER, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_SYNCHRONIZE, Sleep, WaitForSingleObject,
 };
-use windows::core::{HRESULT, IUnknown, Interface, Ref, implement};
+use windows::core::{Error, HRESULT, IUnknown, Interface, Ref, implement};
 
 const RATE: u32 = 48_000;
 const FRAME_BYTES: usize = 4;
@@ -115,6 +115,35 @@ fn header(frames: u64) -> [u8; 44] {
     h
 }
 
+/// Waits for the client, or returns early when the target exits.
+///
+/// # Safety
+/// The target process handle must stay open during the wait.
+unsafe fn wait_for_client(
+    operation: &IActivateAudioInterfaceAsyncOperation,
+    target: HANDLE,
+) -> windows::core::Result<Option<IAudioClient>> {
+    loop {
+        let (mut hr, mut client) = (HRESULT(0), None::<IUnknown>);
+        // SAFETY: valid storage for the activation result and interface.
+        match unsafe { operation.GetActivateResult(&mut hr, &mut client) } {
+            Ok(()) => {
+                hr.ok()?;
+                let client = client.ok_or_else(|| Error::new(E_POINTER, "no audio client"))?;
+                return client.cast().map(Some);
+            }
+            Err(error) if error.code() == E_ILLEGAL_METHOD_CALL => {
+                // SAFETY: the caller keeps the target process handle open.
+                match unsafe { WaitForSingleObject(target, 10) } {
+                    WAIT_OBJECT_0 => return Ok(None),
+                    WAIT_TIMEOUT => {}
+                    _ => return Err(Error::from_thread()),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: COM calls with parameters built here; buffers are used only
     // between `GetBuffer` and `ReleaseBuffer`.
@@ -151,14 +180,8 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             Some((&raw const blob).cast()),
             &handler,
         )?;
-        let client = loop {
-            let (mut hr, mut client) = (HRESULT(0), None::<IUnknown>);
-            // Fails (`E_ILLEGAL_METHOD_CALL`) until activation completes.
-            if operation.GetActivateResult(&mut hr, &mut client).is_ok() {
-                hr.ok()?;
-                break client.ok_or("no audio client")?.cast::<IAudioClient>()?;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        let Some(client) = wait_for_client(&operation, target)? else {
+            return Ok(());
         };
         let format = WAVEFORMATEX {
             wFormatTag: WAVE_FORMAT_PCM as u16,
@@ -225,5 +248,45 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::{CloseHandle, E_FAIL};
+    use windows::Win32::Media::Audio::IActivateAudioInterfaceAsyncOperation_Impl;
+    use windows::Win32::System::Threading::CreateEventW;
+    use windows::core::{IUnknownImpl, OutRef, PCWSTR};
+
+    #[implement(IActivateAudioInterfaceAsyncOperation)]
+    struct ActivationError(HRESULT);
+
+    impl IActivateAudioInterfaceAsyncOperation_Impl for ActivationError_Impl {
+        fn GetActivateResult(
+            &self,
+            _: *mut HRESULT,
+            _: OutRef<IUnknown>,
+        ) -> windows::core::Result<()> {
+            Err(Error::from_hresult(self.get_impl().0))
+        }
+    }
+
+    #[test]
+    fn activation_wait_stops_on_target_exit_or_method_failure() {
+        // SAFETY: a signaled event acts like an already exited target.
+        let target = unsafe { CreateEventW(None, true, true, PCWSTR::null()) }.unwrap();
+        let pending: IActivateAudioInterfaceAsyncOperation =
+            ActivationError(E_ILLEGAL_METHOD_CALL).into();
+        let broken: IActivateAudioInterfaceAsyncOperation = ActivationError(E_FAIL).into();
+        // SAFETY: the event stays open until both waits finish.
+        let (ended, failed) = unsafe {
+            let ended = wait_for_client(&pending, target);
+            let failed = wait_for_client(&broken, target);
+            CloseHandle(target).unwrap();
+            (ended, failed)
+        };
+        assert!(ended.unwrap().is_none());
+        assert_eq!(failed.unwrap_err().code(), E_FAIL);
     }
 }
