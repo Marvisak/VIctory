@@ -641,6 +641,23 @@ pub(crate) mod tests {
         list.close();
     }
 
+    /// A list that was reset and not recorded again — an idle segment
+    /// handed back to the pool (`crate::list::idle_tail`) — is still open:
+    /// an allocator cannot be reset while a list using it records, so a
+    /// reset has to close it first. Without that, the second reset fails
+    /// with `E_FAIL` ("an actively recording command list referencing the
+    /// command allocator") and ends the run.
+    #[test]
+    fn a_list_reset_and_left_open_resets_again() {
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        list.reset();
+        list.reset();
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+    }
+
     #[test]
     fn present_compositor_builds_both_pipeline_states() {
         let Some(host) = host() else {
@@ -809,6 +826,10 @@ pub(crate) struct HostList {
     /// A list of ours (uploads), whose uses are no use of the title's
     /// (`crate::resource::evict`).
     ours: std::sync::atomic::AtomicBool,
+    /// Whether the list is closed (not recording): `reset` may only reset
+    /// its allocator then (an open list makes `ID3D12CommandAllocator::Reset`
+    /// fail with `E_FAIL`).
+    closed: std::sync::atomic::AtomicBool,
     /// The draw or dispatch being recorded runs a program using title
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
@@ -1136,6 +1157,7 @@ impl Host {
                 twins: Mutex::default(),
                 rebind: false.into(),
                 ours: false.into(),
+                closed: false.into(),
                 memory_writer: false.into(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
@@ -1776,11 +1798,19 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        self.closed.store(true, Ordering::Relaxed);
     }
 
     /// Only after the list's last submission finished (every one is waited
-    /// for).
+    /// for), and never while it is open: `ID3D12CommandAllocator::Reset`
+    /// returns `E_FAIL` for "an actively recording command list referencing
+    /// the command allocator". A list that was reset and not recorded again
+    /// (an idle segment handed back, `crate::list`) is still open, so it is
+    /// closed first (an empty list closes as one that never recorded).
     pub(crate) fn reset(&self) {
+        if !self.closed.load(Ordering::Relaxed) {
+            self.close();
+        }
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1802,6 +1832,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.closed.store(false, Ordering::Relaxed);
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
