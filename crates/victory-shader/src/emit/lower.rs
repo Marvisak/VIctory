@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+#[cfg(test)]
+mod u24_tests;
 
 type Why = &'static str;
 
@@ -60,6 +62,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1405,6 +1410,8 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
             #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
+            #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
@@ -2484,6 +2491,19 @@ impl<'a> Lower<'a> {
         let size = self.unary(6, part);
         let exact = self.s.m.cmp(c, pred::OEQ, size, at);
         self.s.m.select(c, exact, zero, r)
+    }
+
+    /// The low 24 bits, sign- or zero-extended to a full dword.
+    fn extend24(&mut self, x: V, signed: bool) -> V {
+        let c = self.cur;
+        if signed {
+            let eight = self.s.m.i32(8);
+            let x = self.s.m.bin(c, Bin::Shl, x, eight);
+            self.s.m.bin(c, Bin::AShr, x, eight)
+        } else {
+            let mask = self.s.m.i32(0x00FF_FFFF);
+            self.s.m.bin(c, Bin::And, x, mask)
+        }
     }
 
     /// The high dword of a 32 × 32-bit product.
@@ -7497,18 +7517,9 @@ impl<'a> Lower<'a> {
             }
             "v_mul_u32_u24" | "v_mul_i32_i24" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let (sh, op) = (
-                    k(self, 8),
-                    if name == "v_mul_i32_i24" {
-                        Bin::AShr
-                    } else {
-                        Bin::LShr
-                    },
-                );
-                let a = self.s.m.bin(c, Bin::Shl, a, sh);
-                let a = self.s.m.bin(c, op, a, sh);
-                let b = self.s.m.bin(c, Bin::Shl, b, sh);
-                let b = self.s.m.bin(c, op, b, sh);
+                let signed = name == "v_mul_i32_i24";
+                let a = self.extend24(a, signed);
+                let b = self.extend24(b, signed);
                 self.s.m.bin(c, Bin::Mul, a, b)
             }
             "v_mul_hi_u32_u24" | "v_mul_hi_i32_i24" => {
@@ -7516,11 +7527,8 @@ impl<'a> Lower<'a> {
                 // of each operand, zero- or sign-extended, multiplied.
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let signed = name == "v_mul_hi_i32_i24";
-                let (sh, op) = (k(self, 8), if signed { Bin::AShr } else { Bin::LShr });
-                let a = self.s.m.bin(c, Bin::Shl, a, sh);
-                let a = self.s.m.bin(c, op, a, sh);
-                let b = self.s.m.bin(c, Bin::Shl, b, sh);
-                let b = self.s.m.bin(c, op, b, sh);
+                let a = self.extend24(a, signed);
+                let b = self.extend24(b, signed);
                 self.mul_hi(a, b, signed)
             }
             "v_bfe_u32" | "v_bfe_i32" => {
@@ -7586,18 +7594,9 @@ impl<'a> Lower<'a> {
             }
             "v_mad_u32_u24" | "v_mad_i32_i24" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let (sh, op) = (
-                    k(self, 8),
-                    if name == "v_mad_i32_i24" {
-                        Bin::AShr
-                    } else {
-                        Bin::LShr
-                    },
-                );
-                let a = self.s.m.bin(c, Bin::Shl, a, sh);
-                let a = self.s.m.bin(c, op, a, sh);
-                let b = self.s.m.bin(c, Bin::Shl, b, sh);
-                let b = self.s.m.bin(c, op, b, sh);
+                let signed = name == "v_mad_i32_i24";
+                let a = self.extend24(a, signed);
+                let b = self.extend24(b, signed);
                 let m = self.s.m.bin(c, Bin::Mul, a, b);
                 self.s.m.bin(c, Bin::Add, m, d)
             }
@@ -11052,7 +11051,7 @@ mod tests {
     /// Lowers a one-thread compute program that copies four root constants
     /// (s0..s3) into v1..v4, runs `body`, and stores v0 to a raw buffer from a
     /// descriptor table, so the vector instructions in `body` have an effect.
-    fn lower_valu(body: &[u32]) -> Result<Lowered, crate::ShaderError> {
+    pub(super) fn lower_valu(body: &[u32]) -> Result<Lowered, crate::ShaderError> {
         let mut words = vec![
             0xBE85_0380, // s_mov_b32 s5, 0
             0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0

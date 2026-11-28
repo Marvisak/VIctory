@@ -2030,6 +2030,75 @@ fn integer_probes() -> Vec<Probe> {
 }
 
 #[test]
+fn multiplies_of_24_bits_ignore_the_upper_byte() {
+    let edges = [
+        0,
+        1,
+        0x007F_FFFF,
+        0x0080_0000,
+        0x00FF_FFFF,
+        0x0100_0000,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        0xAB12_3456,
+        0xFF80_0000,
+        u32::MAX,
+    ];
+    let mut inputs = triples(&edges, &edges, &[0, 1, 0x8000_0000, u32::MAX]);
+    let mut seed = 0x1234_5678u32;
+    for _ in 0..4096 {
+        let mut row = [0; 4];
+        for x in &mut row[..3] {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            *x = seed;
+        }
+        row[3] = OLD;
+        inputs.push(row);
+    }
+    let mut probes = Vec::new();
+    for (op, signed, high, mad) in [
+        (0x09, true, false, false),
+        (0x0A, true, true, false),
+        (0x0B, false, false, false),
+        (0x0C, false, true, false),
+        (0x142, true, false, true),
+        (0x143, false, false, true),
+    ] {
+        let opcode = if mad { op } else { 0x100 + op };
+        let mut bodies = vec![vop3(opcode, 5, [v(1), v(2), v(3)], NONE).to_vec()];
+        if !mad {
+            bodies.push(vec![vop2(op, 5, v(1), 2)]);
+        }
+        for body in bodies {
+            probes.push(probe(body, inputs.clone(), INT, move |i| {
+                let operand = |x: u32| {
+                    let low = i64::from(x & 0x00FF_FFFF);
+                    if signed && low >= 0x0080_0000 {
+                        low - 0x0100_0000
+                    } else {
+                        low
+                    }
+                };
+                let product = operand(i[0]) * operand(i[1]);
+                let result = if high {
+                    (product >> 32) as u32
+                } else {
+                    product as u32
+                };
+                vec![if mad {
+                    result.wrapping_add(i[2])
+                } else {
+                    result
+                }]
+            }));
+        }
+    }
+    assert_clean(check(&probes));
+}
+
+#[test]
 fn integers_match_the_hardware() {
     assert_clean(check(&integer_probes()));
 }
