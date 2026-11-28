@@ -2034,6 +2034,40 @@ fn integers_match_the_hardware() {
     assert_clean(check(&integer_probes()));
 }
 
+/// Signed 24-bit multiply inputs ignore the high byte and extend bit 23.
+#[test]
+fn signed_mul24_uses_the_low_24_bits() {
+    let factors = [
+        0x0000_0000,
+        0xFF00_0000,
+        0x8000_0001,
+        0x0000_0002,
+        0xFF7F_FFFE,
+        0x007F_FFFF,
+        0xFF7F_FFFF,
+        0x0080_0000,
+        0x7F80_0000,
+        0x0080_0001,
+        0x00FF_FFFE,
+        0x00FF_FFFF,
+    ];
+    let addends = [0, 1, 0x8000_0000, 0xFFFF_FFFF];
+    let mut words = vop3(0x109, 5, [v(1), v(2), 0], NONE).to_vec(); // v_mul_i32_i24
+    words.extend(vop3(0x10A, 6, [v(1), v(2), 0], NONE)); // v_mul_hi_i32_i24
+    words.extend(vop3(0x142, 7, [v(1), v(2), v(3)], NONE)); // v_mad_i32_i24
+    assert_clean(check(&[probe(
+        words,
+        triples(&factors, &factors, &addends),
+        INT,
+        |i| {
+            let signed = |bits: u32| i64::from((bits << 8) as i32 >> 8);
+            let product = signed(i[0]) * signed(i[1]);
+            let lo = product as u32;
+            vec![lo, (product >> 32) as u32, lo.wrapping_add(i[2])]
+        },
+    )]));
+}
+
 /// Carries as lane masks: `v_add_co_u32` into VCC, `v_add_co_ci_u32`
 /// taking and giving VCC, the last carry read back by `v_cndmask_b32`.
 #[test]
