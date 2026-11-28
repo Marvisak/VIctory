@@ -1523,6 +1523,33 @@ fn class_compares_match_the_hardware() {
     )]));
 }
 
+#[test]
+fn immediate_class_masks_match_raw_f32_classification() {
+    let masks = [
+        0xFFFF_FC00,
+        u32::MAX,
+        0x003,
+        0x060,
+        0x1F8,
+        0x204,
+        0x207,
+        0x3FC,
+        0x155,
+    ];
+    let probes: Vec<_> = masks
+        .into_iter()
+        .map(|mask| {
+            let mut body = vop3(0x88, 22, [v(1), 255, 0], NONE).to_vec();
+            body.push(mask);
+            body.extend(vop3(0x101, 5, [int(0), int(1), s(22)], NONE));
+            probe(body, unary(F32_EDGES), INT, move |i| {
+                vec![(mask >> class(i[0])) & 1]
+            })
+        })
+        .collect();
+    assert_clean(check(&probes));
+}
+
 /// Conversions, whose results become indices, addresses and counts.
 fn conversion_probes() -> Vec<Probe> {
     let xs = unary(F32_EDGES);

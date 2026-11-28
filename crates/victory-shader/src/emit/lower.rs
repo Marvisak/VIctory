@@ -7844,6 +7844,31 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// Some constant class masks are a single comparison on magnitude bits.
+    fn known_float_class_mask(&mut self, x: V, mask: V, f16: bool) -> Option<V> {
+        let classes = self.s.m.int_value(mask)? as u32 & 0x3FF;
+        let (magnitude_bits, infinity) = if f16 {
+            (0x7FFF, 0x7C00)
+        } else {
+            (0x7FFF_FFFF, 0x7F80_0000)
+        };
+        let (predicate, boundary) = match classes {
+            0 => return Some(self.s.m.bool(false)),
+            0x3FF => return Some(self.s.m.bool(true)),
+            0x003 => (pred::IUGT, infinity), // NaNs
+            0x060 => (pred::EQ, 0),          // signed zeros
+            0x1F8 => (pred::IULT, infinity), // finite values
+            0x204 => (pred::EQ, infinity),   // infinities
+            0x207 => (pred::IUGE, infinity), // infinities and NaNs
+            0x3FC => (pred::IULE, infinity), // all except NaNs
+            _ => return None,
+        };
+        let sig = self.s.m.i32(magnitude_bits);
+        let limit = self.s.m.i32(boundary);
+        let mag = self.s.m.bin(self.cur, Bin::And, x, sig);
+        Some(self.s.m.cmp(self.cur, predicate, mag, limit))
+    }
+
     fn compare(&mut self, inst: &Inst, rest: &str) -> Result<(), Why> {
         let (op, ty) = rest.rsplit_once('_').ok_or("a compare")?;
         let c = self.cur;
@@ -7871,6 +7896,10 @@ impl<'a> Lower<'a> {
                     self.as_int(x)
                 };
                 let mask = self.src(inst, 1)?;
+                if let Some(r) = self.known_float_class_mask(x, mask, f16) {
+                    self.lane_bits_for(inst, r);
+                    return Ok(());
+                }
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
                 let (exp_sh, sign_sh, exp_mask, mant_mask, quiet_bit) = if f16 {
                     (10, 15, 0x1F, 0x03FF, 0x0200)
