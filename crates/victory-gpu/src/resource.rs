@@ -2878,7 +2878,10 @@ mod tests {
         // the creation the failure is injected in.
         const D32_FLOAT: u32 = 40;
         let clear = [D32_FLOAT, 1.0f32.to_bits(), 0, 0, 0];
-        let desc = ResourceDesc {\n            flags: DEPTH,\n            ..texture(64, 64, D32_FLOAT, 1)\n        };
+        let desc = ResourceDesc {
+            flags: DEPTH,
+            ..texture(64, 64, D32_FLOAT, 1)
+        };
         let wait = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
         // `host_copy` with the next creation failing: whether it was asked
         // for (the failure taken), and what it gave.
