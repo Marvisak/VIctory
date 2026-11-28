@@ -586,6 +586,9 @@ fn end() {
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();
+    // No CRT exit runs after `TerminateProcess`.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    victory_gpu::flush_probe();
     // SAFETY: ends this process, as the console ends a suspended title.
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }

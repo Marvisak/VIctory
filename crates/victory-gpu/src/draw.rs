@@ -427,6 +427,8 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
+            #[cfg(feature = "diagnostics")]
+            crate::probe::note_target(record.resource, false);
             rtvs.push(host.rtv(&texture, record.desc().as_ref()));
         }
         self.depth = 0;
@@ -435,6 +437,8 @@ impl State {
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
+            #[cfg(feature = "diagnostics")]
+            crate::probe::note_target(record.resource, false);
             Some(host.dsv(&texture, record.depth_desc().as_ref()))
         });
         // SAFETY: an open list; the views were just made.
@@ -1095,6 +1099,8 @@ impl State {
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
+        let mut probed = crate::probe::Call::new(self.pipeline);
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             dropped(list, self.pipeline, "dispatch");
@@ -1129,6 +1135,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        probed.ran(&[], 0);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1200,6 +1208,8 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
+        let mut probed = crate::probe::Call::new(self.pipeline);
+        #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
@@ -1209,6 +1219,8 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    probed.ran(&self.targets, self.depth);
                     true
                 }
                 Err(_) => false,
@@ -1561,6 +1573,8 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
+        let mut probed = crate::probe::Call::new(self.pipeline);
+        #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
         // expanded into vertex buffers of their own.
@@ -1587,6 +1601,8 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            probed.ran(&self.targets, self.depth);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1665,6 +1681,8 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
+        let mut probed = crate::probe::Call::new(self.pipeline);
+        #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
         if rects {
@@ -1681,6 +1699,8 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            probed.ran(&self.targets, self.depth);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1704,6 +1724,8 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let mut probed = crate::probe::Call::new(self.pipeline);
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -1835,6 +1857,12 @@ impl State {
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            probed.ran(&[], 0);
+        } else {
+            probed.ran(&self.targets, self.depth);
+        }
         true
     }
 }
@@ -1940,6 +1968,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, *resource as This);
+            #[cfg(feature = "diagnostics")]
+            crate::probe::note_target(*resource as This, true);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}

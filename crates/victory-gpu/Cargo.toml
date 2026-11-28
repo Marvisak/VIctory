@@ -12,6 +12,7 @@ blake3.workspace = true
 miniz_oxide.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+victory-core.workspace = true
 victory-formats.workspace = true
 victory-pipeline.workspace = true
 victory-shader = { workspace = true, features = ["host"] }
@@ -38,5 +39,6 @@ windows = { workspace = true, features = [
     "Win32_Security",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

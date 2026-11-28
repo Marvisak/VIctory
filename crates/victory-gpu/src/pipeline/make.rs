@@ -141,6 +141,28 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
+/// For `crate::probe`: how `p`'s host pipeline stands.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn probe_status(p: &Pending) -> crate::probe::coverage::Status {
+    use crate::probe::coverage::Status;
+    if p.skipped_shader.is_some() {
+        return Status::Skipped;
+    }
+    match p.made.get() {
+        Some(Some(_)) => Status::Ok,
+        None if p.queued.load(Ordering::Relaxed) => Status::Compiling,
+        None => Status::NotRequested,
+        Some(None) => {
+            let untranslated = |s: &Arc<Shader>| matches!(s.translated.get(), Some(None));
+            if p.shaders.iter().any(untranslated) {
+                Status::NotTranslated
+            } else {
+                Status::HostRefused
+            }
+        }
+    }
+}
+
 /// Logs the library name of the host pipeline this thread just made or
 /// loaded for `key` (diagnostics).
 #[cfg(feature = "diagnostics")]

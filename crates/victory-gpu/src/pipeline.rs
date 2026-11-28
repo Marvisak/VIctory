@@ -395,7 +395,28 @@ fn hand_out(
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if crate::probe::on() {
+        probe_created(&pipeline);
+    }
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
+}
+
+/// For `crate::probe`: a title pipeline was made.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn probe_created(p: &Pipeline) {
+    let host = Arc::downgrade(&p.host);
+    crate::probe::coverage::created(
+        std::ptr::from_ref(p) as usize,
+        format!("{:?}", p.shaders),
+        Box::new(move || host.upgrade().map(|h| make::probe_status(&h))),
+    );
+}
+
+/// For `crate::probe`: how `this` stands, without waiting for it.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn probe_status(this: This) -> Option<crate::probe::coverage::Status> {
+    (!this.is_null()).then(|| make::probe_status(&pipeline(this).host))
 }
 
 /// Device method.

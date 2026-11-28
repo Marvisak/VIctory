@@ -83,6 +83,16 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
             }
         }
     }
+    let png = png_rgb(w, h, &raw);
+    let path = folder.join(format!("{name}.png"));
+    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
+        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+    }
+}
+
+/// A `w` x `h` 8-bit RGB PNG of `raw`: per row a filter byte 0, then the pixels.
+pub(crate) fn png_rgb(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::new();
     header.extend(w.to_be_bytes());
@@ -92,14 +102,10 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     chunk(
         &mut png,
         b"IDAT",
-        &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
+        &miniz_oxide::deflate::compress_to_vec_zlib(raw, 3),
     );
     chunk(&mut png, b"IEND", &[]);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
-        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
-    }
+    png
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -588,7 +594,7 @@ fn dump_one(
     }
 }
 
-fn half(h: u16) -> f32 {
+pub(crate) fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
         0 => man * 2f32.powi(-24),
@@ -601,7 +607,7 @@ fn half(h: u16) -> f32 {
 
 /// A float packed in `bits` with a 5-bit exponent and `man` mantissa bits
 /// (the 11- and 10-bit floats of R11G11B10).
-fn small_float(bits: u32, man: u32) -> f32 {
+pub(crate) fn small_float(bits: u32, man: u32) -> f32 {
     let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
     match exp {
         0 => m / (1 << man) as f32 * 2f32.powi(-14),

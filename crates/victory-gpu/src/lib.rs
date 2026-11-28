@@ -46,6 +46,8 @@ pub mod pipeline;
 mod placement;
 #[cfg(windows)]
 mod primitive;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod probe;
 pub mod query;
 pub mod queue;
 pub mod resource;
@@ -71,6 +73,9 @@ mod watch;
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
+/// The probe's coverage reports, written at the title's end (`VICTORY_PROBE`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use probe::flush as flush_probe;
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
