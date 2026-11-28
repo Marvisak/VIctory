@@ -891,6 +891,34 @@ impl HostHeap {
         }
     }
 
+    /// Makes again, from the same records, the shader views of the host
+    /// textures `textures` (raw pointers).
+    pub(crate) fn remake_views(&self, textures: &std::collections::HashSet<usize>) {
+        let slots: Vec<u32> = {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            (0..kept.len() as u32)
+                .filter(|&i| {
+                    kept[i as usize]
+                        .as_ref()
+                        .is_some_and(|k| k.1.is_none() && textures.contains(&(windows::core::Interface::as_raw(&k.0) as usize)))
+                })
+                .collect()
+        };
+        // Held while the slots are made: a title thread may write one.
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        for index in slots {
+            let key = made.get(index as usize).copied().unwrap_or(0);
+            let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
+                continue;
+            };
+            if matches!(view, View::Shader(..) | View::Placed(false, ..))
+                && let Some(kept) = make(&view, self.cpu(index))
+            {
+                self.keep(index, kept);
+            }
+        }
+    }
+
     /// The host textures (raw pointers) slots `slots` view.
     pub(crate) fn textures_at(&self, slots: &[u32]) -> Vec<usize> {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -1462,6 +1490,26 @@ pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<
     make(view, at).flatten().map(|k| k.0)
 }
 
+/// Keeps a 2D (or 2D array) shader view of a texture of `mips` mips from the
+/// mips before `first`. `ResourceMinLODClamp` counts from the resource's mip
+/// 0, so it stays.
+fn start_at_mip(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, mips: u32) {
+    use victory_formats::texture::start_view_at;
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the member `ViewDimension` names.
+            let view = unsafe { &mut desc.Anonymous.Texture2D };
+            (view.MostDetailedMip, view.MipLevels) = start_view_at(view.MostDetailedMip, view.MipLevels, first, mips);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the member `ViewDimension` names.
+            let view = unsafe { &mut desc.Anonymous.Texture2DArray };
+            (view.MostDetailedMip, view.MipLevels) = start_view_at(view.MostDetailedMip, view.MipLevels, first, mips);
+        }
+        _ => {}
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -1507,6 +1555,16 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
                 if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                // Mips without title memory yet are not shown
+                // (`crate::texture::partial_mip_clamp`; 0 unless on).
+                let first = copy.shown_from.load(std::sync::atomic::Ordering::Relaxed);
+                if first > 0
+                    && !copy.host_written.load(std::sync::atomic::Ordering::Relaxed)
+                    && let Some(desc) = desc.as_mut()
+                {
+                    // SAFETY: a live resource.
+                    start_at_mip(desc, first, u32::from(unsafe { texture.GetDesc() }.MipLevels));
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {

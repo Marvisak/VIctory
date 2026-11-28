@@ -221,10 +221,19 @@ pub(crate) fn uploads(
     // lock meanwhile (run evict5).
     let mut work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)> = Vec::new();
     let mut staged = std::collections::HashSet::new();
+    // Host textures whose views start at another mip from now on
+    // (`crate::texture::partial_mip_clamp`).
+    let mut moved = std::collections::HashSet::new();
+    let mut show_from = |copy: &crate::resource::HostTexture, mip: u32| {
+        if copy.shown_from.swap(mip, Relaxed) != mip {
+            moved.insert(windows::core::Interface::as_raw(&copy.texture) as usize);
+        }
+    };
     for (staging, copy) in textures {
         // A host copy wrote it in a submission made before this one (it
         // was not when the list was recorded).
         if copy.host_written.load(Relaxed) {
+            show_from(copy, 0);
             continue;
         }
         if staged.insert(Arc::as_ptr(staging)) {
@@ -255,6 +264,7 @@ pub(crate) fn uploads(
             }
             // Its contents are the host's since a host copy wrote it.
             if texture.host_written.load(Relaxed) {
+                show_from(&texture, 0);
                 continue;
             }
             if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
@@ -278,6 +288,16 @@ pub(crate) fn uploads(
     if !readable.is_empty() {
         // SAFETY: an open list; the barriers name live textures.
         unsafe { list.list.ResourceBarrier(&readable) };
+    }
+    // The refreshes above found which mips have memory: views of textures
+    // where that changed are made again before the submission's lists run.
+    if crate::texture::partial_mip_clamp() {
+        for (staging, copy) in &work {
+            show_from(copy, staging.present_from());
+        }
+        if !moved.is_empty() {
+            crate::descriptor::remake_views(&moved);
+        }
     }
     list.close();
     // A list recording nothing is not run (its reset next time is fine).

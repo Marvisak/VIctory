@@ -276,6 +276,21 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
     }
 }
 
+/// Every shader-visible view heap's shader views of the host textures
+/// `textures` (raw pointers) are made again: they start at another mip
+/// (`crate::texture::partial_mip_clamp`).
+#[cfg(windows)]
+pub(crate) fn remake_views(textures: &std::collections::HashSet<usize>) {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), VIEWS_KIND) = (heap.host.get(), heap.desc.kind) {
+            host.remake_views(textures);
+        }
+    }
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]

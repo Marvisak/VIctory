@@ -547,6 +547,34 @@ impl Layout {
         }
     }
 
+    /// The first mip from which every mip has its bytes, as `there` says of
+    /// a span of the slice (from, to): a streamed texture gets its smallest
+    /// mips first and mip 0 last. 0 when all are there, when not even the
+    /// smallest is, and for more than one slice, which this does not judge.
+    /// A mip before the tail takes the bytes from its offset to the next
+    /// finer mip's (mip 0: to the slice's end); the tail takes the block at
+    /// the slice's start.
+    pub fn first_present_mip(&self, mut there: impl FnMut(u64, u64) -> bool) -> u32 {
+        let mips = &self.mips;
+        if self.slices != 1 || mips.is_empty() {
+            return 0;
+        }
+        let tail = (self.first_tail_mip as usize).min(mips.len());
+        if tail < mips.len() && !there(0, self.alignment.min(self.slice_size)) {
+            return 0;
+        }
+        let mut first = tail;
+        while first > 0 {
+            let mip = first - 1;
+            let end = if mip == 0 { self.slice_size } else { mips[mip - 1].offset };
+            if !there(mips[mip].offset, end) {
+                break;
+            }
+            first = mip;
+        }
+        if first == mips.len() { 0 } else { first as u32 }
+    }
+
     /// Byte offset of element (`x`, `y`) of mip `mip` in array slice or
     /// depth slice `z`. Coordinates must lie inside the mip.
     pub fn offset(&self, mip: u32, x: u32, y: u32, z: u32) -> Result<u64, Error> {
@@ -865,9 +893,64 @@ impl Texture {
     }
 }
 
+/// A texture view's first mip and mip count (`u32::MAX`: all the rest),
+/// moved so that it starts no finer than mip `first` of a texture of `mips`
+/// mips. Unchanged if it starts there or coarser already.
+///
+/// Edge case: a view whose own range ends before `first` overlaps no mip
+/// that is there. It then gets exactly one mip, `first`, which the title's
+/// descriptor excluded (a view cannot be empty).
+pub fn start_view_at(most_detailed: u32, count: u32, first: u32, mips: u32) -> (u32, u32) {
+    if first <= most_detailed || first >= mips {
+        return (most_detailed, count);
+    }
+    let count = if count == u32::MAX {
+        count
+    } else {
+        count.saturating_sub(first - most_detailed).clamp(1, mips - first)
+    };
+    (first, count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_present_mip_is_where_every_coarser_one_is_there() {
+        let l = Layout::new(&desc(1024, 1024, 11, 4, Swizzle::SW_64KB_R_X)).unwrap();
+        let tail = l.first_tail_mip;
+        assert!((3..11).contains(&tail), "{tail}");
+        // Memory that has arrived from the texture's start up to `to`.
+        let up_to = |end: u64| l.first_present_mip(|_, to| to <= end);
+        assert_eq!(up_to(l.size), 0, "all there");
+        assert_eq!(up_to(0), 0, "not even the tail: nothing better to show");
+        assert_eq!(up_to(l.alignment), tail, "the tail alone");
+        assert_eq!(up_to(l.mips[0].offset), 1, "all but mip 0");
+        assert_eq!(up_to(l.size - 1), 1, "mip 0 in part");
+        // A hole at mip 2: from mip 3 on.
+        assert_eq!(l.first_present_mip(|from, _| from != l.mips[2].offset), 3);
+
+        // Without a tail: the smallest mip lies first.
+        let linear = Layout::new(&desc(256, 256, 3, 4, Swizzle::LINEAR)).unwrap();
+        assert_eq!(linear.first_present_mip(|_, to| to <= linear.mips[0].offset), 1);
+        assert_eq!(linear.first_present_mip(|_, _| false), 0);
+
+        // Arrays are not judged.
+        let array = Desc { depth: 4, ..desc(1024, 1024, 11, 4, Swizzle::SW_64KB_R_X) };
+        assert_eq!(Layout::new(&array).unwrap().first_present_mip(|_, _| false), 0);
+    }
+
+    #[test]
+    fn a_view_moves_to_a_coarser_first_mip_and_keeps_its_last() {
+        assert_eq!(start_view_at(0, 11, 3, 11), (3, 8));
+        assert_eq!(start_view_at(0, u32::MAX, 3, 11), (3, u32::MAX));
+        assert_eq!(start_view_at(1, 4, 3, 11), (3, 2));
+        assert_eq!(start_view_at(0, 1, 3, 11), (3, 1), "at least one mip");
+        assert_eq!(start_view_at(5, 2, 3, 11), (5, 2), "coarser already");
+        assert_eq!(start_view_at(0, 11, 0, 11), (0, 11));
+        assert_eq!(start_view_at(0, 4, 11, 11), (0, 4), "no such mip");
+    }
 
     fn desc(w: u32, h: u32, mips: u32, bpe: u32, swizzle: Swizzle) -> Desc {
         Desc {

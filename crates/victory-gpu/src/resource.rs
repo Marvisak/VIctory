@@ -807,6 +807,9 @@ pub(crate) struct HostTexture {
     /// A host copy or resolve wrote it: its contents are the host's, not
     /// title memory's (`crate::texture`).
     pub(crate) host_written: std::sync::atomic::AtomicBool,
+    /// The mip its shader views start at where the title's start finer
+    /// (`crate::texture::partial_mip_clamp`); 0: as the title says.
+    pub(crate) shown_from: std::sync::atomic::AtomicU32,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
@@ -847,6 +850,7 @@ impl HostTexture {
             state: state.into(),
             castable,
             host_written: false.into(),
+            shown_from: 0.into(),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,

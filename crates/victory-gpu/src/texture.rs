@@ -55,6 +55,9 @@ pub(crate) struct Staging {
     /// its start, whole layout blocks); empty where the layout gives none.
     spans: Vec<(usize, usize)>,
     last: Mutex<Last>,
+    /// With [`partial_mip_clamp`]: the first mip from which every mip had
+    /// memory when changed pages were last taken (0: all had).
+    present_from: std::sync::atomic::AtomicU32,
     /// Uploads [`record_upload`] recorded, and the subresources they
     /// copied.
     uploads: std::sync::atomic::AtomicU64,
@@ -531,7 +534,40 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
     out
 }
 
+/// `VICTORY_PARTIAL_MIP_CLAMP=1` (off by default): shader views of a texture
+/// whose finer mips have no title memory yet start at the first mip from
+/// which all have one. A streamed texture gets its smallest mips first; the
+/// others read as zeros in the host texture until their pages arrive, so a
+/// view starting at mip 0 reads black up close. The runtime reports every
+/// mapping (`crate::watch::title_memory_remapped`), so the pages' arrival is
+/// taken like any other change and the views are made again
+/// (`crate::descriptor::remake_views`). Only textures in the runtime's own
+/// memory (the others upload nothing until whole) and of one slice.
+///
+/// shortcut: a table made afresh in dynamic slots keeps the view it was
+/// made with, and a view without a description is not clamped.
+pub(crate) fn partial_mip_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PARTIAL_MIP_CLAMP"))
+}
+
+/// Whether every 64 KiB page of `[at, at + len)` has memory: a byte of each,
+/// read in the kernel (asking `VirtualQuery` walks the page tables of big
+/// pools, `crate::host::copy_mapped`).
+fn mapped(at: usize, len: usize) -> bool {
+    let page = crate::watch::PAGE;
+    let end = at.saturating_add(len);
+    std::iter::once(at)
+        .chain((at / page + 1..).map(|p| p * page).take_while(|&p| p < end))
+        .all(|p| crate::host::read_into(p as *const u8, &mut [0u8; 1]))
+}
+
 impl Staging {
+    /// [`partial_mip_clamp`]: the mip its views should start at.
+    pub(crate) fn present_from(&self) -> u32 {
+        self.present_from.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {
@@ -568,6 +604,13 @@ impl Staging {
             let ranges = t.take(start, start + size);
             if ranges.is_empty() {
                 return (0, None);
+            }
+            // Pages arriving or going are changes too.
+            if partial_mip_clamp() {
+                let from = self
+                    .layout
+                    .first_present_mip(|a, b| mapped(start + a as usize, b.saturating_sub(a) as usize));
+                self.present_from.store(from, std::sync::atomic::Ordering::Relaxed);
             }
             // Only the subresources in the pages that changed (streamed
             // textures change page by page; a whole re-read and detile of
@@ -834,6 +877,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         tracked: crate::watch::track(memory as usize, layout_size, true),
         spans,
         last: Mutex::default(),
+        present_from: Default::default(),
         uploads: Default::default(),
         copied: Default::default(),
     });
