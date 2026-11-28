@@ -1929,3 +1929,21 @@ builds the 4K temporary. This narrows the producer to the temporary's
 construction/decode/callback path; it does not prove which operation
 selects 4K. The run quit at the source write, saw no network endpoints
 under WFP, and is not a world or performance test.
+
+The subsequent offline CDB watch `rx5700-offline-20261128-152510Z`
+stopped at the first write of 3840 into the stack temporary's width.
+The writer is title RVA `+0x1e0fb58`: a callback obtains the width from
+`+0x5b943c0`, then the height from `+0x5b94380`. Static disassembly of
+the cached relocated title image shows both wrappers call `+0x7b4e10`.
+That function reads primary width/height from the display object at
+`+0x204/+0x208`, applies a ratio selected by its `+0x144` field to a
+separate output pair, and selects the alternate width/height at
+`+0x1ec/+0x1f0` when its `+0x1e8` flag is set. The observed callback
+returns 3840 and 2160 and sets that flag to one. This establishes that
+the secondary dimensions are chosen in the title's display object before
+the global copy; clamping the global fields alone would leave the source
+object and its users inconsistent. It remains unproven which earlier
+assignment sets the object's alternate pair and flag. A focused write
+watchpoint on those three object fields, before the callback, is the next
+safe diagnostic step. The debugger quit before gameplay; the WFP preflight
+passed, and the run is not an FPS or visual-quality test.
