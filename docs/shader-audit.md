@@ -1916,3 +1916,16 @@ would leave the object's source state and other 4K render targets intact.
 The debugger quit at the watched write, before gameplay. WFP preflight
 passed and the monitor recorded no TCP or UDP endpoints. This run is not
 an FPS or picture-quality test.
+
+A second bounded offline watch run, `rx5700-offline-20261128-152039Z`,
+watched the source display object's `+0x164` width field from immediately
+after its constructor. It began at zero and later became 3840 during a
+0x1e8-byte `memmove` from a stack temporary at title return RVA
+`+0x43a48de`. The adjacent source fields then held 2160 and flag one.
+The call path was `+0x43a47a8` via `+0x224110f` and `+0x81b253`.
+Earlier snapshots of one initialization pass were zero after its
+constructor, settings decode, and callback, so the later invocation
+builds the 4K temporary. This narrows the producer to the temporary's
+construction/decode/callback path; it does not prove which operation
+selects 4K. The run quit at the source write, saw no network endpoints
+under WFP, and is not a world or performance test.
