@@ -5,6 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::borrow::Cow;
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -468,7 +469,7 @@ impl HostHeap {
                     .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index));
             }
         }
-        self.keep(index, buffer.map(|b| (b.clone(), None)));
+        self.keep_ref(index, buffer.map(|b| (Cow::Borrowed(b), None)));
         self.write_stride(index, 4);
         self.set_mark(index, None);
         // Not a title view: no entry an earlier table left there stays.
@@ -538,27 +539,48 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Kept) {
+        self.keep_ref(index, resource.map(|(r, s)| (Cow::Owned(r), s)));
+    }
+
+    /// [`Self::keep`] for a resource the caller may only borrow: it is
+    /// cloned (one `AddRef`) only if the slot is to hold it, and a slot that
+    /// already holds the very resource keeps it as it is, retiring nothing.
+    fn keep_ref(&self, index: u32, resource: Option<(Cow<'_, ID3D12Resource>, Option<std::sync::Arc<crate::shadow::Shadow>>)>) {
+        use windows::core::Interface;
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
-            let old = std::mem::replace(slot, resource);
-            #[cfg(feature = "diagnostics")]
-            if let Some((old, _)) = &old
-                && !self.sampler
-                && slot.as_ref().map(|s| windows::core::Interface::as_raw(&s.0)) != Some(windows::core::Interface::as_raw(old))
-                // SAFETY: a live resource.
-                && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
-            {
-                use windows::core::Interface;
-                let left = crate::resource::life::holders(old);
-                crate::resource::life::note(old.as_raw() as usize, crate::resource::life::SLOT, u64::from(index), left);
+        let Some(slot) = kept.get_mut(index as usize) else { return };
+        if let (Some((old, old_shadow)), Some((new, new_shadow))) = (slot.as_mut(), &resource)
+            && old.as_raw() == new.as_raw()
+        {
+            // The same resource: still held once by the slot, so nothing
+            // the GPU may read is released.
+            let same_shadow = match (&*old_shadow, new_shadow) {
+                (None, None) => true,
+                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                _ => false,
+            };
+            if !same_shadow {
+                *old_shadow = new_shadow.clone();
             }
-            // Title threads rewrite slots while the GPU runs a submission;
-            // one of its shaders may hold the old descriptor (or read the
-            // slot at an index from wrong data): what it views is freed
-            // only once that work has run.
-            if let Some((old, _)) = old {
-                crate::host::retire(old);
-            }
+            return;
+        }
+        let old = std::mem::replace(slot, resource.map(|(r, s)| (r.into_owned(), s)));
+        #[cfg(feature = "diagnostics")]
+        if let Some((old, _)) = &old
+            && !self.sampler
+            && slot.as_ref().map(|s| s.0.as_raw()) != Some(old.as_raw())
+            // SAFETY: a live resource.
+            && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+        {
+            let left = crate::resource::life::holders(old);
+            crate::resource::life::note(old.as_raw() as usize, crate::resource::life::SLOT, u64::from(index), left);
+        }
+        // Title threads rewrite slots while the GPU runs a submission;
+        // one of its shaders may hold the old descriptor (or read the
+        // slot at an index from wrong data): what it views is freed
+        // only once that work has run.
+        if let Some((old, _)) = old {
+            crate::host::retire(old);
         }
     }
 
@@ -660,8 +682,8 @@ impl HostHeap {
             host.device
                 .CreateUnorderedAccessView(buffer, None, Some(&uav), self.cpu(index + 1));
         }
-        self.keep(index, buffer.map(|b| (b.clone(), None)));
-        self.keep(index + 1, buffer.map(|b| (b.clone(), None)));
+        self.keep_ref(index, buffer.map(|b| (Cow::Borrowed(b), None)));
+        self.keep_ref(index + 1, buffer.map(|b| (Cow::Borrowed(b), None)));
         self.write_stride(index, 4);
         self.write_stride(index + 1, 4);
         // Writes through these are title memory's, marked in its page table.
@@ -2461,5 +2483,42 @@ mod tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.log_messages(), None);
+    }
+
+    /// A slot keeping the resource it already holds neither clones nor
+    /// retires it; a different resource, or none, replaces it and retires
+    /// the old one.
+    #[test]
+    fn keeping_the_same_resource_retires_nothing() {
+        use windows::core::Interface;
+        let Some(gpu) = host() else { return }; // no host GPU here
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let host = title_heap.host().expect("a host view heap");
+        let (a, _) = gpu.upload_buffer(256).expect("a buffer");
+        let (b, _) = gpu.upload_buffer(256).expect("a buffer");
+        let held = |i: usize| host.kept.lock().unwrap().get(i).and_then(|k| k.as_ref().map(|k| k.0.as_raw()));
+        crate::host::take_retire_log();
+
+        host.keep_ref(0, Some((Cow::Borrowed(&a), None)));
+        assert_eq!(held(0), Some(a.as_raw()));
+        assert!(crate::host::take_retire_log().is_empty(), "nothing was held before");
+
+        host.keep_ref(0, Some((Cow::Borrowed(&a), None)));
+        host.keep(0, Some((a.clone(), None)));
+        assert_eq!(held(0), Some(a.as_raw()), "the slot still holds it");
+        assert!(crate::host::take_retire_log().is_empty(), "the same resource retires nothing");
+
+        host.keep_ref(0, Some((Cow::Borrowed(&b), None)));
+        assert_eq!(held(0), Some(b.as_raw()));
+        assert_eq!(crate::host::take_retire_log(), [a.as_raw() as usize], "the old one is retired");
+
+        host.keep(0, None);
+        assert_eq!(held(0), None);
+        assert_eq!(crate::host::take_retire_log(), [b.as_raw() as usize], "so is the one left for none");
     }
 }

@@ -3681,7 +3681,21 @@ static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
 /// GPU runs, and a shader that took the old descriptor still reads what it
 /// views.
 pub(crate) fn retire(resource: ID3D12Resource) {
+    #[cfg(test)]
+    RETIRE_LOG.with(|log| log.borrow_mut().push(windows::core::Interface::as_raw(&resource) as usize));
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The resources this thread retired (tests).
+    static RETIRE_LOG: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The resources this thread retired since the last call (tests).
+#[cfg(test)]
+pub(crate) fn take_retire_log() -> Vec<usize> {
+    RETIRE_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
 }
 
 /// After a submission has run, with none running: the retired resources go.
