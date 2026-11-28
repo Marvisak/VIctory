@@ -573,6 +573,9 @@ extern "system" fn present(
                     crate::resource::host_transition(resource, state);
                 }
             }
+            // The frame boundary, under no lock of ours: the title reads the
+            // next frame's input after this (`VICTORY_ANTILAG2`).
+            crate::antilag2::frame_start();
             #[cfg(feature = "diagnostics")]
             blinks(frame, resources[0].0, resources[0].2, shown);
             #[cfg(not(feature = "diagnostics"))]

@@ -131,6 +131,11 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
+Set `VICTORY_ANTILAG2=1` on an AMD Radeon card to ask the driver for
+Radeon Anti-Lag 2 (input latency; it does not raise the framerate). No
+file is needed. With the variable unset or `0` nothing is asked; without
+the driver's interface one log line says so and nothing else changes.
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 
