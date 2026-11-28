@@ -24,7 +24,7 @@ mod bvh;
 pub(super) mod console;
 pub(super) mod pairs;
 
-use pairs::{PairMeetings, SEVERAL_CONSOLE_WAVES, barriers_once};
+use pairs::{BARRIERS_OUT_OF_STEP, PairMeetings, SEVERAL_CONSOLE_WAVES, barriers_in_step};
 
 type Why = &'static str;
 
@@ -844,8 +844,8 @@ impl<'a> Lower<'a> {
                     && s.lds_dwords + pairs::state_dwords(group / 64) <= 8192;
                 no_console_flow = if group > 64 && !(PairMeetings::on() && pairs_fit) {
                     Some(SEVERAL_CONSOLE_WAVES)
-                } else if group > 64 && !barriers_once(p) {
-                    Some("a title barrier not met once by every console wave of a group in halves")
+                } else if group > 64 && !barriers_in_step(p) {
+                    Some(BARRIERS_OUT_OF_STEP)
                 } else if insts()
                     .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
                 {

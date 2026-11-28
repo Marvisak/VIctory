@@ -17,8 +17,9 @@
 //! the other reads after it: an exchange ([`Lower::pair_exchange`]) and
 //! the order of the console wave's LDS accesses are exact as with a group
 //! barrier. Console waves are ordered among themselves only by the title's
-//! `s_barrier`s, as on the console, which stay group barriers: each must
-//! be met exactly once by every console wave ([`barriers_once`]).
+//! `s_barrier`s, as on the console, which stay group barriers: the console
+//! waves must meet them in one order, each once, as far as each wave goes
+//! ([`barriers_in_step`]).
 //!
 //! Idea from the half-wave pair meetings of trustno1-coder/VIctory-NVIDIA
 //! (`emit/lower.rs`: `with_pair_meetings`, `Lower::meet`,
@@ -27,7 +28,7 @@
 use super::{LANE_MASK, Lower, Val, reads_mask_as_data};
 use crate::emit::bitcode::{Attr, Bin, Rmw, Term, V, pred};
 use crate::emit::shader::flags;
-use crate::ir::{Exit, Inst, Program, Reg, Value};
+use crate::ir::{Inst, Program, Reg, Value};
 
 /// Why a console wave64 program whose group holds several console waves
 /// stays out of the console flow on a host without 64-lane waves.
@@ -93,35 +94,63 @@ pub(super) fn state_dwords(waves: u32) -> u32 {
     waves + 1 + 4 * waves
 }
 
-/// Whether each block holding an `s_barrier` runs exactly once on every
-/// path from the entry to the end: in no cycle, and no path to an end
-/// passes around it. Every console wave then meets the title's barriers in
-/// the same order, once each.
-pub(super) fn barriers_once(p: &Program) -> bool {
+/// Why a console wave64 program whose group holds several console waves
+/// stays out of the console flow in halves: its barriers
+/// ([`barriers_in_step`]).
+pub(crate) const BARRIERS_OUT_OF_STEP: &str =
+    "title barriers not met in one order by the console waves of a group in halves";
+
+/// Whether the console waves of a group meet the title's barriers in step:
+/// no block holding an `s_barrier` is in a cycle, and of any two such
+/// blocks one dominates the other. The barriers are then a chain, and a
+/// console wave meets a first stretch of it, each barrier once: up to where
+/// the wave ends, or goes a way that holds no barrier. A console wave may so
+/// end before a barrier the others meet (all its lanes switched off: the
+/// title's classification programs, whose threads past the count leave at
+/// the top); the barrier goes on without it, on the console and on the host
+/// alike, both waiting only for threads still running. What stays out is a
+/// barrier in a loop (nothing shows that every console wave runs it equally
+/// often) and two barriers on different ways (console waves could wait at
+/// different ones).
+pub(super) fn barriers_in_step(p: &Program) -> bool {
     let n = p.blocks.len();
-    let succs = |b: usize| p.blocks[b].exit.successors();
-    // The blocks reached from `from` without entering `avoid`.
-    let reach = |from: &[usize], avoid: Option<usize>| {
-        let mut seen = vec![false; n];
-        let mut work: Vec<usize> = from.iter().copied().filter(|&b| Some(b) != avoid).collect();
-        while let Some(b) = work.pop() {
-            if std::mem::replace(&mut seen[b], true) {
-                continue;
-            }
-            work.extend(
-                succs(b)
-                    .into_iter()
-                    .filter(|&s| Some(s) != avoid && !seen[s]),
-            );
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; n];
+    for (i, &b) in order.iter().enumerate() {
+        index[b] = i;
+    }
+    let idom = crate::ir::idoms(&p.blocks, &order, &index);
+    let dominates = |a: usize, mut b: usize| {
+        while b != a && idom[b] != b {
+            b = idom[b];
         }
-        seen
+        b == a
     };
-    let ends = |seen: &[bool]| {
-        (0..n).any(|b| seen[b] && matches!(p.blocks[b].exit, Exit::End | Exit::Indirect))
+    // Whether a way leads from `from` back to it.
+    let in_cycle = |from: usize| {
+        let mut seen = vec![false; n];
+        let mut work = p.blocks[from].exit.successors();
+        while let Some(b) = work.pop() {
+            if b == from {
+                return true;
+            }
+            if !std::mem::replace(&mut seen[b], true) {
+                work.extend(p.blocks[b].exit.successors());
+            }
+        }
+        false
     };
-    (0..n)
+    // (blocks nothing leads to are not run)
+    let barriers: Vec<usize> = order
+        .iter()
+        .copied()
         .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
-        .all(|b| !reach(&succs(b), None)[b] && (b == 0 || !ends(&reach(&[0], Some(b)))))
+        .collect();
+    barriers.iter().all(|&b| !in_cycle(b))
+        && barriers
+            .iter()
+            .enumerate()
+            .all(|(i, &a)| barriers[i + 1..].iter().all(|&b| dominates(a, b)))
 }
 
 impl Lower<'_> {

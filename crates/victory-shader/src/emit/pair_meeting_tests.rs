@@ -202,6 +202,147 @@ fn a_lane_read_in_a_loop_each_console_wave_leaves_on_its_own() {
     }
 }
 
+/// A group of 256 threads counts its threads below `limit` through LDS
+/// between two barriers, as the title's classification programs do: threads
+/// from `limit` on are switched off for the rest of the program, and a
+/// console wave left with none ends before the first barrier. Thread 0
+/// zeroes the count; after the first barrier every thread left adds 1 to
+/// it; after the second each stores the count plus the number of lanes left
+/// in its console wave (`s_bcnt1_i32_b64` of EXEC: both halves) at its own
+/// dword. With `looped` the first barrier is in a loop instead.
+fn counting(limit: u32, looped: bool) -> crate::NativeProgram {
+    let body: &[u32] = &[
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xD834_0000,
+        0x0000_0202, // ds_write_b32 v2, v2
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xBE8E_0380, // s_mov_b32 s14, 0
+        // again:
+        0xBF8A_0000, // s_barrier
+        0x810E_810E, // s_add_i32 s14, s14, 1
+        0xBF06_810E, // s_cmp_eq_u32 s14, 1
+        if looped {
+            0xBF84_FFFC // s_cbranch_scc0 again
+        } else {
+            0xBF80_0000 // s_nop
+        },
+        0xBE89_107E, // s_bcnt1_i32_b64 s9, exec
+        0x7E08_0281, // v_mov_b32 v4, 1
+        0xD880_0000,
+        0x0600_0402, // ds_add_rtn_u32 v6, v2, v4
+        0xBF8A_0000, // s_barrier
+        0xD8D8_0000,
+        0x0500_0002, // ds_read_b32 v5, v2
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A0A_0A09, // v_add_nc_u32 v5, s9, v5
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0xE070_1000,
+        0x8001_0503, // buffer_store_dword v5, v3, s[4:7], 0 offen
+    ];
+    let words = [
+        &[
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0101,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7D88_00FF,
+            limit,                           // v_cmp_gt_u32 vcc, limit, v0
+            0xBE8A_246A,                     // s_and_saveexec_b64 s[10:11], vcc
+            0xBF88_0000 | body.len() as u32, // s_cbranch_execz end
+        ],
+        body,
+        // end:
+        &[0xBF81_0000], // s_endpgm
+    ]
+    .concat();
+    crate::NativeProgram {
+        stage: crate::HwStage::Cs,
+        wave64: true,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            // (LDS_SIZE: one block of 512 bytes)
+            rsrc2: 1 << 1 | 1 << 15,
+            threads: [256, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// A console wave may end before the title's barriers (the path around
+/// them leads to no other): the program translates. A barrier in a loop
+/// stays refused: nothing shows that every console wave runs the loop
+/// equally often.
+#[test]
+fn console_waves_may_end_before_the_title_barriers() {
+    emit(&counting(96, false), NVIDIA, true).expect("waves that end before the barriers");
+    let refused = emit(&counting(96, true), NVIDIA, true).expect_err("a barrier in a loop");
+    assert!(
+        refused.contains(lower::pairs::BARRIERS_OUT_OF_STEP),
+        "{refused}"
+    );
+}
+
+/// The count on a 32-lane host, with console waves that end before the
+/// barriers (limits 40 and 96), one half of a console wave left without
+/// threads (96, 200) and no wave ending (200, 256): every thread as the
+/// console computes it, and no thread from the limit on stores.
+#[test]
+fn barriers_go_on_without_the_console_waves_that_ended() {
+    let Some(host) = hardware() else { return };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for limit in [40u32, 96, 200, 256] {
+        let cs = emit(&counting(limit, false), host.target(), true).unwrap();
+        let (root, pso) = host.compute_pipeline(&cs).unwrap();
+        let views = [View::RawUav(2 * 256)];
+        let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(data))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [2, 1, 1],
+                },
+            )
+            .unwrap()
+            .remove(0);
+        // (both groups write the same dwords: the same values)
+        let want: Vec<u32> = (0..256)
+            .map(|t| {
+                let wave = 64 * (t / 64);
+                let left = limit.clamp(wave, wave + 64) - wave;
+                if t < limit { limit + left } else { 0 }
+            })
+            .collect();
+        let bad: Vec<String> = (0..256usize)
+            .filter(|&t| out[t] != want[t])
+            .map(|t| format!("{t}: {} (want {})", out[t], want[t]))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "limit {limit}: {} threads wrong: {}",
+            bad.len(),
+            bad.join(", ")
+        );
+    }
+}
+
 // ---- the BVH builder's programs ----
 
 /// Where the title-memory copy of a run lies (one 64 KiB page).
