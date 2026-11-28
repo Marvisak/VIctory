@@ -2863,6 +2863,21 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void, recycled_onl
     if recycled_only && chosen.is_none() {
         let reason = if placeable { 1 } else { 0 };
         RECYCLED_PLACEMENT_FAILURE[reason].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if placeable {
+            type Misses = std::collections::HashSet<(u64, u32, u16, i32, u64, i32)>;
+            static SHAPES: std::sync::OnceLock<std::sync::Mutex<Misses>> = std::sync::OnceLock::new();
+            let key = (plain.Width, plain.Height, plain.MipLevels, plain.Format.0, plain.Alignment, plain.Flags.0);
+            let mut shapes = SHAPES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+            if shapes.len() < 24 && shapes.insert(key) {
+                // SAFETY: a plain allocation-info query for the same host
+                // description that place_existing just found no room for.
+                let info = unsafe { host.device.GetResourceAllocationInfo(0, &[plain]) };
+                tracing::info!(width = plain.Width, height = plain.Height, mips = plain.MipLevels,
+                    format = plain.Format.0, flags = plain.Flags.0,
+                    alignment = info.Alignment, required_mb = info.SizeInBytes as f64 / 1e6,
+                    "sampled texture had no reusable host heap range");
+            }
+        }
     }
     if let Some((heap, p)) = chosen {
         let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();

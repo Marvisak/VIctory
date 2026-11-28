@@ -1885,6 +1885,12 @@ It now skips an oversized candidate and continues through the sorted list,
 still honoring the same byte allowance and recent/held protections. Unit
 tests cover both idle and budget-driven selection. Its effect on the RX
 5700 XT's closed-cap missing views is not yet measured in a world run.
+The existing heap census distinguishes reusable from pristine bytes; at
+the busiest measured interval, all 2.20 MB free was reusable, but the
+largest contiguous range was 1.31 MB. Diagnostics now also log the first
+24 distinct failed host-texture shapes, including their requested D3D12
+allocation size and alignment, so the next closed-cap run can match each
+miss to the available contiguous ranges rather than infer it from totals.
 
 ### 2026-11-28: `uiOverlay` A/B for the secondary 4K path
 
