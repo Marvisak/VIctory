@@ -4,6 +4,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::{Scope, ScopedJoinHandle};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
@@ -202,29 +204,25 @@ pub fn run(
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
-                let workers: Vec<_> = (0..threads.min(jobs.len()))
-                    .map(|_| {
-                        s.spawn(|| {
-                            let mut t = Tally {
-                                list,
-                                ..Tally::default()
-                            };
-                            let mut checks = Checks {
-                                keep: (!pairs.is_empty()).then(|| kept.clone()),
-                                validator: validate
-                                    .then(|| Validator::load(dll.as_deref()).ok())
-                                    .flatten(),
-                                host: pipelines
-                                    .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                    .flatten(),
-                            };
-                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                                translate(job, entry.path(), &seen, &mut t, &mut checks);
-                            }
-                            lock(&total).merge(t);
-                        })
-                    })
-                    .collect();
+                let workers = ReportWorkers::spawn(s, threads.min(jobs.len()), || {
+                    let mut t = Tally {
+                        list,
+                        ..Tally::default()
+                    };
+                    let mut checks = Checks {
+                        keep: (!pairs.is_empty()).then(|| kept.clone()),
+                        validator: validate
+                            .then(|| Validator::load(dll.as_deref()).ok())
+                            .flatten(),
+                        host: pipelines
+                            .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
+                            .flatten(),
+                    };
+                    while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        translate(job, entry.path(), &seen, &mut t, &mut checks);
+                    }
+                    lock(&total).merge(t);
+                });
                 report(
                     entry.path(),
                     jobs.len(),
@@ -352,43 +350,39 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
-                let workers: Vec<_> = (0..threads.min(jobs.len()))
-                    .map(|_| {
-                        s.spawn(|| {
-                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                                let Some(bytes) = job.bytes() else { continue };
-                                // As the title passes it: the container's own size
-                                // (a raw source runs on to the end of the file).
-                                let size = bytes.get(0x18..0x1c).map_or(0, |b| {
-                                    u32::from_le_bytes(b.try_into().expect("4")) as usize
-                                });
-                                let container = &bytes[..size.min(bytes.len())];
-                                let hash = blake3::hash(container);
-                                if !lock(&seen).insert(hash) {
-                                    continue;
-                                }
-                                let one = std::time::Instant::now();
-                                let (done, cached) =
-                                    victory_gpu::shader_cache::host_shader(container);
-                                let k = if cached {
-                                    0
-                                } else if done.is_ok() {
-                                    1
-                                } else {
-                                    2
-                                };
-                                counts[k].fetch_add(1, Ordering::Relaxed);
-                                tracing::debug!(
-                                    hash = %&hash.to_hex()[..16],
-                                    ms = one.elapsed().as_millis() as u64,
-                                    cached,
-                                    ok = done.is_ok(),
-                                    "warm-up"
-                                );
-                            }
-                        })
-                    })
-                    .collect();
+                let workers = ReportWorkers::spawn(s, threads.min(jobs.len()), || {
+                    while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        let Some(bytes) = job.bytes() else { continue };
+                        // As the title passes it: the container's own size
+                        // (a raw source runs on to the end of the file).
+                        let size = bytes.get(0x18..0x1c).map_or(0, |b| {
+                            u32::from_le_bytes(b.try_into().expect("4")) as usize
+                        });
+                        let container = &bytes[..size.min(bytes.len())];
+                        let hash = blake3::hash(container);
+                        if !lock(&seen).insert(hash) {
+                            continue;
+                        }
+                        let one = std::time::Instant::now();
+                        let (done, cached) =
+                            victory_gpu::shader_cache::host_shader(container);
+                        let k = if cached {
+                            0
+                        } else if done.is_ok() {
+                            1
+                        } else {
+                            2
+                        };
+                        counts[k].fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            hash = %&hash.to_hex()[..16],
+                            ms = one.elapsed().as_millis() as u64,
+                            cached,
+                            ok = done.is_ok(),
+                            "warm-up"
+                        );
+                    }
+                });
                 let [c, t, r] = &counts;
                 report(
                     entry.path(),
@@ -430,27 +424,53 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     Ok(())
 }
 
-/// Shows on stderr how far `workers` are through `file`'s `jobs` (`next`
-/// hands them out) until they finish: on a terminal one line rewritten
-/// every second, else a line every 10 s; then the file's last line.
+/// The workers of one reported batch. Their completion closes the channel
+/// and wakes the reporter immediately, including if a worker unwinds.
+pub(crate) struct ReportWorkers<'scope, T> {
+    handles: Vec<ScopedJoinHandle<'scope, T>>,
+    finished: Receiver<()>,
+}
+
+impl<'scope, T: Send + 'scope> ReportWorkers<'scope, T> {
+    pub(crate) fn spawn(
+        scope: &'scope Scope<'scope, '_>,
+        count: usize,
+        work: impl Fn() -> T + Copy + Send + 'scope,
+    ) -> Self {
+        let (pending, finished) = mpsc::channel();
+        let handles = (0..count)
+            .map(|_| {
+                let pending = pending.clone();
+                scope.spawn(move || {
+                    let _pending = pending;
+                    work()
+                })
+            })
+            .collect();
+        Self { handles, finished }
+    }
+}
+
+/// Shows on stderr how far the workers are through the file's jobs.
+/// On a terminal one line is rewritten every second, otherwise a line
+/// every 10 s. Prints the final line as soon as all workers finish.
 pub(crate) fn report<T>(
     file: &Path,
     jobs: usize,
     what: &str,
     next: &AtomicUsize,
     started: std::time::Instant,
-    workers: &[std::thread::ScopedJoinHandle<'_, T>],
+    workers: &ReportWorkers<'_, T>,
     extra: impl Fn() -> String,
 ) {
     use std::io::IsTerminal;
-    if workers.is_empty() {
+    if workers.handles.is_empty() {
         return;
     }
     let terminal = std::io::stderr().is_terminal();
     let every = std::time::Duration::from_secs(if terminal { 1 } else { 10 });
-    let line = || {
-        // `next` counts jobs handed out; a worker still running holds one.
-        let busy = workers.iter().filter(|w| !w.is_finished()).count();
+    let line = |busy| {
+        // The next index counts jobs handed out; a running worker holds one.
         let taken = next.load(Ordering::Relaxed).min(jobs);
         let done = taken.saturating_sub(busy);
         format!(
@@ -461,19 +481,15 @@ pub(crate) fn report<T>(
             extra()
         )
     };
-    let mut shown = std::time::Instant::now();
-    while !workers.iter().all(|w| w.is_finished()) {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if shown.elapsed() >= every {
-            shown = std::time::Instant::now();
-            if terminal {
-                eprint!("\r{}", line());
-            } else {
-                eprintln!("{}", line());
-            }
+    while workers.finished.recv_timeout(every) == Err(RecvTimeoutError::Timeout) {
+        let busy = workers.handles.iter().filter(|w| !w.is_finished()).count();
+        if terminal {
+            eprint!("\r{}", line(busy));
+        } else {
+            eprintln!("{}", line(busy));
         }
     }
-    eprintln!("{}{}", if terminal { "\r" } else { "" }, line());
+    eprintln!("{}{}", if terminal { "\r" } else { "" }, line(0));
 }
 
 fn translate(
