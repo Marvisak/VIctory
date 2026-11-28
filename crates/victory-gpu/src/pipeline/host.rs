@@ -6,6 +6,7 @@
 //! the immediate samplers, and directly indexed heaps.
 
 use std::ffi::{CStr, CString};
+use std::ops::Range;
 use std::sync::Arc;
 
 use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
@@ -804,6 +805,95 @@ fn host_topology(g: &GraphicsState) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
 #[repr(C, align(8))]
 struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
 
+impl<T> Sub<T> {
+    /// The offset of the description inside the subobject: after the type,
+    /// at the description's own alignment.
+    fn data_at() -> usize {
+        size_of::<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE>().next_multiple_of(align_of::<T>())
+    }
+
+    /// The bytes of the subobject that no field of it reads: between the
+    /// type and a description that needs eight-byte alignment, and after
+    /// a description that does not end on an eight-byte boundary.
+    fn padding() -> [Range<usize>; 2] {
+        let kind = size_of::<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE>();
+        let at = Self::data_at();
+        [kind..at, at + size_of::<T>()..size_of::<Sub<T>>()]
+    }
+}
+
+/// Zeroes the bytes of `value` at `padding`, in place: the host's
+/// pipeline library tells a stored pipeline from a new one by the bytes
+/// of the description, padding included, and what lay between the fields
+/// of a description is not ours to hand it.
+fn zero_padding<T>(value: &mut T, padding: &[Range<usize>]) {
+    // SAFETY: `value` is a whole `T`; the ranges name bytes no field reads,
+    // and `write_bytes` initializes those bytes without reading them first.
+    unsafe {
+        let base = std::ptr::from_mut(value).cast::<u8>();
+        for range in padding {
+            debug_assert!(range.end <= size_of::<T>());
+            base.add(range.start).write_bytes(0, range.len());
+        }
+    }
+}
+
+/// Where the padding of a blend description lies: after each target's
+/// write mask, a byte in a four-byte field.
+fn blend_padding() -> [Range<usize>; 8] {
+    std::array::from_fn(|i| {
+        let target = std::mem::offset_of!(D3D12_BLEND_DESC, RenderTarget)
+            + i * size_of::<D3D12_RENDER_TARGET_BLEND_DESC>();
+        target + std::mem::offset_of!(D3D12_RENDER_TARGET_BLEND_DESC, RenderTargetWriteMask) + 1
+            ..target + size_of::<D3D12_RENDER_TARGET_BLEND_DESC>()
+    })
+}
+
+/// Where the padding of an input layout description lies: after its
+/// four-byte element count, to the end of the eight-byte structure.
+fn input_padding() -> Range<usize> {
+    std::mem::offset_of!(D3D12_INPUT_LAYOUT_DESC, NumElements) + size_of::<u32>()
+        ..size_of::<D3D12_INPUT_LAYOUT_DESC>()
+}
+
+/// A depth-stencil description: the bytes of it that no field reads.
+trait DepthDesc {
+    /// The bytes of the description that no field reads: between the
+    /// byte-wide stencil write mask and the front face's operations.
+    fn padding(&self) -> Range<usize>;
+}
+
+impl DepthDesc for D3D12_DEPTH_STENCIL_DESC {
+    fn padding(&self) -> Range<usize> {
+        std::mem::offset_of!(D3D12_DEPTH_STENCIL_DESC, StencilWriteMask) + size_of::<u8>()
+            ..std::mem::offset_of!(D3D12_DEPTH_STENCIL_DESC, FrontFace)
+    }
+}
+
+impl DepthDesc for D3D12_DEPTH_STENCIL_DESC1 {
+    fn padding(&self) -> Range<usize> {
+        std::mem::offset_of!(D3D12_DEPTH_STENCIL_DESC1, StencilWriteMask) + size_of::<u8>()
+            ..std::mem::offset_of!(D3D12_DEPTH_STENCIL_DESC1, FrontFace)
+    }
+}
+
+/// A group of stream subobjects: the bytes between them that no
+/// description reads.
+trait Subobjects {
+    /// The bytes of the group, as ranges from its start, that no
+    /// description of it reads.
+    fn padding(&self) -> Vec<Range<usize>>;
+}
+
+impl<T> Subobjects for Sub<T> {
+    fn padding(&self) -> Vec<Range<usize>> {
+        Sub::<T>::padding()
+            .into_iter()
+            .filter(|range| !range.is_empty())
+            .collect()
+    }
+}
+
 /// What a vertex pipeline's stream has in place of the mesh shader (the
 /// geometry shader is the rectangle lists' one, or empty).
 #[repr(C)]
@@ -812,6 +902,106 @@ struct VertexStream {
     gs: Sub<D3D12_SHADER_BYTECODE>,
     input: Sub<D3D12_INPUT_LAYOUT_DESC>,
     strip_cut: Sub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>,
+}
+
+impl Subobjects for VertexStream {
+    fn padding(&self) -> Vec<Range<usize>> {
+        let vs = std::mem::offset_of!(VertexStream, vs);
+        let gs = std::mem::offset_of!(VertexStream, gs);
+        let input = std::mem::offset_of!(VertexStream, input);
+        let strip_cut = std::mem::offset_of!(VertexStream, strip_cut);
+        let mut ranges = Vec::new();
+        for (at, padding) in [
+            (vs, Sub::<D3D12_SHADER_BYTECODE>::padding()),
+            (gs, Sub::<D3D12_SHADER_BYTECODE>::padding()),
+            (input, Sub::<D3D12_INPUT_LAYOUT_DESC>::padding()),
+            (
+                strip_cut,
+                Sub::<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>::padding(),
+            ),
+        ] {
+            for range in padding {
+                if !range.is_empty() {
+                    ranges.push(at + range.start..at + range.end);
+                }
+            }
+        }
+        // The input layout's own padding: its four-byte element count
+        // leaves the tail of the eight-byte structure unread.
+        let layout = input + Sub::<D3D12_INPUT_LAYOUT_DESC>::data_at();
+        let padding = input_padding();
+        ranges.push(layout + padding.start..layout + padding.end);
+        ranges
+    }
+}
+
+/// The stream a pipeline is made from: its subobjects, each with its type
+/// and its description.
+#[repr(C)]
+struct Stream<S, D> {
+    root: Sub<*mut std::ffi::c_void>,
+    stages: S,
+    ps: Sub<D3D12_SHADER_BYTECODE>,
+    blend: Sub<D3D12_BLEND_DESC>,
+    mask: Sub<u32>,
+    raster: Sub<D3D12_RASTERIZER_DESC>,
+    depth: Sub<D>,
+    targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+    dsv: Sub<DXGI_FORMAT>,
+    samples: Sub<DXGI_SAMPLE_DESC>,
+    topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+}
+
+/// The bytes of the stream that no description of it reads: the padding
+/// of every subobject, the padding between them, and the padding inside
+/// the descriptions that carry any.
+fn stream_padding<S: Subobjects, D: DepthDesc>(stream: &Stream<S, D>) -> Vec<Range<usize>> {
+    /// The padding of one subobject, and where its description lies.
+    fn add<T>(ranges: &mut Vec<Range<usize>>, at: &mut usize) -> usize {
+        let aligned = (*at).next_multiple_of(align_of::<Sub<T>>());
+        if aligned > *at {
+            ranges.push(*at..aligned);
+        }
+        *at = aligned;
+        for range in Sub::<T>::padding() {
+            if !range.is_empty() {
+                ranges.push(*at + range.start..*at + range.end);
+            }
+        }
+        let data = *at + Sub::<T>::data_at();
+        *at += size_of::<Sub<T>>();
+        data
+    }
+    let mut ranges = Vec::new();
+    let mut at = 0;
+    add::<*mut std::ffi::c_void>(&mut ranges, &mut at);
+    // The stages are a group of subobjects of their own.
+    let aligned = at.next_multiple_of(align_of::<S>());
+    if aligned > at {
+        ranges.push(at..aligned);
+    }
+    at = aligned;
+    for range in stream.stages.padding() {
+        ranges.push(at + range.start..at + range.end);
+    }
+    at += size_of::<S>();
+    add::<D3D12_SHADER_BYTECODE>(&mut ranges, &mut at);
+    // The blend description has padding of its own.
+    let blend = add::<D3D12_BLEND_DESC>(&mut ranges, &mut at);
+    for range in blend_padding() {
+        ranges.push(blend + range.start..blend + range.end);
+    }
+    add::<u32>(&mut ranges, &mut at);
+    add::<D3D12_RASTERIZER_DESC>(&mut ranges, &mut at);
+    // The depth description too.
+    let depth = add::<D>(&mut ranges, &mut at);
+    let padding = stream.depth.1.padding();
+    ranges.push(depth + padding.start..depth + padding.end);
+    add::<D3D12_RT_FORMAT_ARRAY>(&mut ranges, &mut at);
+    add::<DXGI_FORMAT>(&mut ranges, &mut at);
+    add::<DXGI_SAMPLE_DESC>(&mut ranges, &mut at);
+    add::<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(&mut ranges, &mut at);
+    ranges
 }
 
 /// The stream form used by mesh pipelines and vertex pipelines with depth bounds.
@@ -823,38 +1013,51 @@ fn stream_pipeline<S, D>(
     g: &GraphicsState,
     depth: Sub<D>,
     name: &str,
-) -> windows::core::Result<ID3D12PipelineState> {
-    #[repr(C)]
-    struct Stream<S, D> {
-        root: Sub<*mut std::ffi::c_void>,
-        stages: S,
-        ps: Sub<D3D12_SHADER_BYTECODE>,
-        blend: Sub<D3D12_BLEND_DESC>,
-        mask: Sub<u32>,
-        raster: Sub<D3D12_RASTERIZER_DESC>,
-        depth: Sub<D>,
-        targets: Sub<D3D12_RT_FORMAT_ARRAY>,
-        dsv: Sub<DXGI_FORMAT>,
-        samples: Sub<DXGI_SAMPLE_DESC>,
-        topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
-    }
+) -> windows::core::Result<ID3D12PipelineState>
+where
+    S: Subobjects,
+    D: DepthDesc,
+{
     let mut stream = Stream {
-        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+        root: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+            root.as_raw(),
+        ),
         stages,
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(&g.blend, &g.targets)),
-        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
+        blend: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND,
+            host_blend(&g.blend, &g.targets),
+        ),
+        mask: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+            g.sample_mask,
+        ),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth,
-        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
-        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
+        targets: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+            g.targets,
+        ),
+        dsv: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+            g.depth_format,
+        ),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
         // A vertex pipeline needs its type. A mesh pipeline's, which the
         // host derives from the mesh shader anyway, is given too: a
         // pipeline library compares descriptions with it, and loads none
         // made from a stream without it.
-        topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, host_topology(g)),
+        topology: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+            host_topology(g),
+        ),
     };
+    // The bytes of the stream that no description reads are the same
+    // every time: the host's pipeline library tells a stored pipeline
+    // from a new one by the bytes of the description, padding included.
+    let padding = stream_padding(&stream);
+    zero_padding(&mut stream, &padding);
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
         SizeInBytes: size_of_val(&stream),
         pPipelineStateSubobjectStream: (&raw mut stream).cast(),
@@ -1041,5 +1244,312 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    fn raw<T>(value: &T) -> &[std::mem::MaybeUninit<u8>] {
+        // SAFETY: `value` is a whole `T`; padding may be uninitialized, so
+        // expose it as `MaybeUninit` rather than as `u8`.
+        unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(value).cast::<std::mem::MaybeUninit<u8>>(),
+                size_of::<T>(),
+            )
+        }
+    }
+
+    fn raw_mut<T>(value: &mut T) -> &mut [std::mem::MaybeUninit<u8>] {
+        // SAFETY: `value` is a whole `T`, uniquely borrowed; padding may be
+        // uninitialized, so expose it as `MaybeUninit` rather than as `u8`.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                std::ptr::from_mut(value).cast::<std::mem::MaybeUninit<u8>>(),
+                size_of::<T>(),
+            )
+        }
+    }
+
+    /// The ranges a `Sub<T>` reads at `at`: its type and its description.
+    fn sub_fields<T>(at: usize) -> [Range<usize>; 2] {
+        let kind = size_of::<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE>();
+        let data = Sub::<T>::data_at();
+        [at..at + kind, at + data..at + data + size_of::<T>()]
+    }
+
+    fn shifted(ranges: impl IntoIterator<Item = Range<usize>>, at: usize) -> Vec<Range<usize>> {
+        ranges
+            .into_iter()
+            .map(|range| at + range.start..at + range.end)
+            .collect()
+    }
+
+    fn normalize(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+        ranges.retain(|range| !range.is_empty());
+        ranges.sort_by_key(|range| range.start);
+        let mut out: Vec<Range<usize>> = Vec::new();
+        for range in ranges {
+            match out.last_mut() {
+                Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+                _ => out.push(range),
+            }
+        }
+        out
+    }
+
+    /// The complement of `read` within a structure: bytes no field reads.
+    fn unread(size: usize, read: &[Range<usize>]) -> Vec<Range<usize>> {
+        let mut seen = vec![false; size];
+        for range in read {
+            for i in range.clone() {
+                seen[i] = true;
+            }
+        }
+        let mut ranges = Vec::new();
+        let mut start = None;
+        for (i, read) in seen.iter().enumerate() {
+            match (*read, start) {
+                (false, None) => start = Some(i),
+                (true, Some(s)) => {
+                    ranges.push(s..i);
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            ranges.push(s..size);
+        }
+        ranges
+    }
+
+    /// Poisons the expected padding, zeroes the computed padding, then
+    /// checks that every field kept its bytes and every gap was cleared.
+    fn assert_padding<T>(value: &mut T, expected: Vec<Range<usize>>, computed: &[Range<usize>]) {
+        fn write(bytes: &mut [std::mem::MaybeUninit<u8>], ranges: &[Range<usize>], byte: u8) {
+            for range in ranges {
+                for slot in &mut bytes[range.clone()] {
+                    slot.write(byte);
+                }
+            }
+        }
+
+        let expected = normalize(expected);
+        // Fields are initialized; initialize padding before reading bytes.
+        write(raw_mut(value), &expected, 0);
+        // SAFETY: every byte of `value` is now initialized.
+        let before: Vec<u8> = raw(value)
+            .iter()
+            .map(|byte| unsafe { byte.assume_init() })
+            .collect();
+        write(raw_mut(value), &expected, 0xaa);
+        zero_padding(value, computed);
+        let after = raw(value);
+        let mut padding = vec![false; after.len()];
+        for range in &expected {
+            for i in range.clone() {
+                padding[i] = true;
+            }
+        }
+        for (i, (before, after)) in before.iter().zip(after).enumerate() {
+            // SAFETY: padding was zeroed by `zero_padding` and fields were
+            // initialized before the first byte read.
+            let after = unsafe { after.assume_init() };
+            if padding[i] {
+                assert_eq!(after, 0, "padding byte {i} was not zeroed");
+            } else {
+                assert_eq!(after, *before, "field byte {i} was changed");
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_stream_padding_is_zeroed_without_touching_fields() {
+        type Mesh = Stream<Sub<D3D12_SHADER_BYTECODE>, D3D12_DEPTH_STENCIL_DESC>;
+        let code = D3D12_SHADER_BYTECODE {
+            pShaderBytecode: std::ptr::without_provenance(0x10),
+            BytecodeLength: 0x20,
+        };
+        let g = GraphicsState {
+            samples: DXGI_SAMPLE_DESC {
+                Count: 4,
+                Quality: 7,
+            },
+            ..GraphicsState::default()
+        };
+        let mut stream: Mesh = Stream {
+            root: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+                0x10 as *mut std::ffi::c_void,
+            ),
+            stages: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code),
+            ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, code),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            mask: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+                g.sample_mask,
+            ),
+            raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+            depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
+            targets: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+                g.targets,
+            ),
+            dsv: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+                g.depth_format,
+            ),
+            samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
+            topology: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                host_topology(&g),
+            ),
+        };
+        let mut read = Vec::new();
+        read.extend(sub_fields::<*mut std::ffi::c_void>(std::mem::offset_of!(
+            Mesh, root
+        )));
+        read.extend(sub_fields::<D3D12_SHADER_BYTECODE>(std::mem::offset_of!(
+            Mesh, stages
+        )));
+        read.extend(sub_fields::<D3D12_SHADER_BYTECODE>(std::mem::offset_of!(
+            Mesh, ps
+        )));
+        read.extend(sub_fields::<D3D12_BLEND_DESC>(std::mem::offset_of!(
+            Mesh, blend
+        )));
+        read.extend(sub_fields::<u32>(std::mem::offset_of!(Mesh, mask)));
+        read.extend(sub_fields::<D3D12_RASTERIZER_DESC>(std::mem::offset_of!(
+            Mesh, raster
+        )));
+        read.extend(sub_fields::<D3D12_DEPTH_STENCIL_DESC>(
+            std::mem::offset_of!(Mesh, depth),
+        ));
+        read.extend(sub_fields::<D3D12_RT_FORMAT_ARRAY>(std::mem::offset_of!(
+            Mesh, targets
+        )));
+        read.extend(sub_fields::<DXGI_FORMAT>(std::mem::offset_of!(Mesh, dsv)));
+        read.extend(sub_fields::<DXGI_SAMPLE_DESC>(std::mem::offset_of!(
+            Mesh, samples
+        )));
+        read.extend(sub_fields::<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(
+            std::mem::offset_of!(Mesh, topology),
+        ));
+        let mut expected = unread(size_of::<Mesh>(), &read);
+        let blend = std::mem::offset_of!(Mesh, blend) + Sub::<D3D12_BLEND_DESC>::data_at();
+        expected.extend(shifted(blend_padding(), blend));
+        let depth = std::mem::offset_of!(Mesh, depth) + Sub::<D3D12_DEPTH_STENCIL_DESC>::data_at();
+        expected.extend(shifted([stream.depth.1.padding()], depth));
+
+        let computed = stream_padding(&stream);
+        assert_padding(&mut stream, expected, &computed);
+        assert_eq!(stream.root.1, 0x10 as *mut std::ffi::c_void);
+        assert_eq!(stream.stages.1.BytecodeLength, 0x20);
+        assert_eq!(stream.depth.1, g.depth);
+        assert_eq!(stream.samples.1, g.samples);
+    }
+
+    #[test]
+    fn vertex_stream_padding_is_zeroed_without_touching_fields() {
+        type Vertex = Stream<VertexStream, D3D12_DEPTH_STENCIL_DESC1>;
+        let code = D3D12_SHADER_BYTECODE {
+            pShaderBytecode: std::ptr::without_provenance(0x10),
+            BytecodeLength: 0x20,
+        };
+        let input = D3D12_INPUT_LAYOUT_DESC {
+            pInputElementDescs: std::ptr::without_provenance(0x20),
+            NumElements: 3,
+        };
+        let depth = D3D12_DEPTH_STENCIL_DESC1::default();
+        let g = GraphicsState::default();
+        let mut stream: Vertex = Stream {
+            root: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+                0x10 as *mut std::ffi::c_void,
+            ),
+            stages: VertexStream {
+                vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, code),
+                gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, code),
+                input: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, input),
+                strip_cut: Sub(
+                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE,
+                    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
+                ),
+            },
+            ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, code),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            mask: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+                g.sample_mask,
+            ),
+            raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+            depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
+            targets: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+                g.targets,
+            ),
+            dsv: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+                g.depth_format,
+            ),
+            samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
+            topology: Sub(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                host_topology(&g),
+            ),
+        };
+        let group = std::mem::offset_of!(Vertex, stages);
+        let mut read = Vec::new();
+        read.extend(sub_fields::<*mut std::ffi::c_void>(std::mem::offset_of!(
+            Vertex, root
+        )));
+        read.extend(sub_fields::<D3D12_SHADER_BYTECODE>(
+            group + std::mem::offset_of!(VertexStream, vs),
+        ));
+        read.extend(sub_fields::<D3D12_SHADER_BYTECODE>(
+            group + std::mem::offset_of!(VertexStream, gs),
+        ));
+        read.extend(sub_fields::<D3D12_INPUT_LAYOUT_DESC>(
+            group + std::mem::offset_of!(VertexStream, input),
+        ));
+        read.extend(sub_fields::<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>(
+            group + std::mem::offset_of!(VertexStream, strip_cut),
+        ));
+        read.extend(sub_fields::<D3D12_SHADER_BYTECODE>(std::mem::offset_of!(
+            Vertex, ps
+        )));
+        read.extend(sub_fields::<D3D12_BLEND_DESC>(std::mem::offset_of!(
+            Vertex, blend
+        )));
+        read.extend(sub_fields::<u32>(std::mem::offset_of!(Vertex, mask)));
+        read.extend(sub_fields::<D3D12_RASTERIZER_DESC>(std::mem::offset_of!(
+            Vertex, raster
+        )));
+        read.extend(sub_fields::<D3D12_DEPTH_STENCIL_DESC1>(
+            std::mem::offset_of!(Vertex, depth),
+        ));
+        read.extend(sub_fields::<D3D12_RT_FORMAT_ARRAY>(std::mem::offset_of!(
+            Vertex, targets
+        )));
+        read.extend(sub_fields::<DXGI_FORMAT>(std::mem::offset_of!(Vertex, dsv)));
+        read.extend(sub_fields::<DXGI_SAMPLE_DESC>(std::mem::offset_of!(
+            Vertex, samples
+        )));
+        read.extend(sub_fields::<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(
+            std::mem::offset_of!(Vertex, topology),
+        ));
+        let mut expected = unread(size_of::<Vertex>(), &read);
+        let blend = std::mem::offset_of!(Vertex, blend) + Sub::<D3D12_BLEND_DESC>::data_at();
+        expected.extend(shifted(blend_padding(), blend));
+        let d = std::mem::offset_of!(Vertex, depth) + Sub::<D3D12_DEPTH_STENCIL_DESC1>::data_at();
+        expected.extend(shifted([stream.depth.1.padding()], d));
+        let layout = group
+            + std::mem::offset_of!(VertexStream, input)
+            + Sub::<D3D12_INPUT_LAYOUT_DESC>::data_at();
+        expected.extend(shifted([input_padding()], layout));
+
+        let computed = stream_padding(&stream);
+        assert_padding(&mut stream, expected, &computed);
+        assert_eq!(stream.stages.input.1.NumElements, 3);
+        assert_eq!(stream.depth.1, depth);
+        assert_eq!(stream.samples.1, g.samples);
     }
 }
