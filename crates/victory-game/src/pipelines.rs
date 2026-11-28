@@ -402,7 +402,7 @@ fn blend_from_registers(regs: &[u32; 14], formats: &[u8; 8], mut f: impl FnMut([
     if per_target.iter().any(Vec::is_empty) {
         return;
     }
-    let build = |head: [u8; 4], targets: &[[u8; 8]]| {
+    let build = |head: [u8; 4], targets: &[[u8; 8]; 8]| {
         let mut b = [0u8; BLEND];
         b[..4].copy_from_slice(&head);
         for (i, t) in targets.iter().enumerate() {
@@ -418,10 +418,9 @@ fn blend_from_registers(regs: &[u32; 14], formats: &[u8; 8], mut f: impl FnMut([
                 // have no format (whose registers repeat another target's)
                 // left at D3D12's default, writing nothing up to some target
                 // and everything from there; then one target changed.
-                let first: Vec<[u8; 8]> = per_target.iter().map(|c| c[0]).collect();
-                let mut bases = vec![first.clone()];
-                for split in 0..=8 {
-                    let mut base = first.clone();
+                let first = std::array::from_fn(|i| per_target[i][0]);
+                let bases = std::iter::once(first).chain((0..=8).map(|split| {
+                    let mut base = first;
                     for (i, t) in base
                         .iter_mut()
                         .enumerate()
@@ -430,13 +429,13 @@ fn blend_from_registers(regs: &[u32; 14], formats: &[u8; 8], mut f: impl FnMut([
                         *t = DEFAULT_TARGET;
                         t[7] = if i < split { 0 } else { 15 };
                     }
-                    bases.push(base);
-                }
-                for base in &bases {
-                    f(build(head, base));
+                    base
+                }));
+                for base in bases {
+                    f(build(head, &base));
                     for (i, c) in per_target.iter().enumerate() {
                         for &t in c {
-                            let mut targets = base.clone();
+                            let mut targets = base;
                             targets[i] = t;
                             f(build(head, &targets));
                         }
@@ -456,8 +455,7 @@ fn blend_from_registers(regs: &[u32; 14], formats: &[u8; 8], mut f: impl FnMut([
                     disabled[0] = 0;
                     for fill in [DEFAULT_TARGET, keep_off, default_off, [0; 8], off, disabled] {
                         for n in 1..8 {
-                            let targets: Vec<[u8; 8]> =
-                                (0..8).map(|i| if i < n { c0 } else { fill }).collect();
+                            let targets = std::array::from_fn(|i| if i < n { c0 } else { fill });
                             f(build(head, &targets));
                         }
                     }
