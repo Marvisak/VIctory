@@ -417,15 +417,38 @@ pub(crate) mod tests {
         let mut attempts = 0;
         // Two seconds at 60 Hz, with a failure on every eligible attempt.
         for frame in 0..120 {
-            retry.attempt(start + Duration::from_millis(frame * 1000 / 60), || {
+            retry.attempt(|| start + Duration::from_millis(frame * 1000 / 60), || {
                 attempts += 1;
                 Err::<(), _>("desktop unavailable")
             });
         }
         assert_eq!(attempts, 2);
         let recovered = start + Duration::from_secs(2);
-        assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(42)), Some(Ok(42)));
-        assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(43)), Some(Ok(43)));
+        assert_eq!(retry.attempt(|| recovered, || Ok::<_, ()>(42)), Some(Ok(42)));
+        assert_eq!(retry.attempt(|| recovered, || Ok::<_, ()>(43)), Some(Ok(43)));
+    }
+
+    #[test]
+    fn swap_chain_retry_waits_a_second_after_a_slow_failure() {
+        use std::cell::Cell;
+
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        let now = || clock.get();
+        let failure_return = start + Duration::from_millis(1_500);
+        let mut retry = SwapChainRetry::default();
+        assert_eq!(
+            retry.attempt(now, || {
+                clock.set(failure_return);
+                Err::<(), _>("desktop unavailable")
+            }),
+            Some(Err("desktop unavailable"))
+        );
+        assert_eq!(retry.attempt(now, || Ok::<_, ()>(())), None);
+        clock.set(failure_return + Duration::from_millis(999));
+        assert_eq!(retry.attempt(now, || Ok::<_, ()>(())), None);
+        clock.set(failure_return + Duration::from_secs(1));
+        assert_eq!(retry.attempt(now, || Ok::<_, ()>(())), Some(Ok(())));
     }
 
     use super::*;
@@ -2985,18 +3008,18 @@ impl SwapChainRetry {
         self.next_attempt.is_none_or(|next| now >= next)
     }
 
-    /// A desktop can become presentable again. Keep retrying while limiting
-    /// the DXGI calls and warnings during the outage.
+    /// A desktop can become presentable again. Wait a second after a DXGI
+    /// failure returns before retrying.
     fn attempt<T, E>(
         &mut self,
-        now: Instant,
+        now: impl Fn() -> Instant,
         operation: impl FnOnce() -> Result<T, E>,
     ) -> Option<Result<T, E>> {
-        if !self.ready(now) {
+        if !self.ready(now()) {
             return None;
         }
         let result = operation();
-        self.next_attempt = result.is_err().then(|| now + Duration::from_secs(1));
+        self.next_attempt = result.is_err().then(|| now() + Duration::from_secs(1));
         Some(result)
     }
 }
@@ -3243,7 +3266,7 @@ impl Host {
         }
         if presenter.is_none() {
             *presenter = match retry
-                .attempt(Instant::now(), || self.presenter(width, height, format))?
+                .attempt(Instant::now, || self.presenter(width, height, format))?
             {
                 Ok(p) => Some(p),
                 Err((step, e)) => {
@@ -3257,7 +3280,7 @@ impl Host {
             p.compositor = Some(c);
         }
         if (p.width, p.height, p.format) != (width, height, format) {
-            let resized = retry.attempt(Instant::now(), || {
+            let resized = retry.attempt(Instant::now, || {
                 // SAFETY: no back buffer is held; every submission was waited for.
                 unsafe {
                     p.swap_chain.ResizeBuffers(
