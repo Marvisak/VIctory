@@ -248,6 +248,10 @@ fn program(body: &[u32], scalar: bool) -> Vec<u32> {
 /// bytes of LDS; one view table at s4 (the input buffer, then the output
 /// UAV), the group id in s6.
 fn lower_program(words: &[u32]) -> Result<HostShader, String> {
+    lower_program_wave(words, false)
+}
+
+fn lower_program_wave(words: &[u32], wave64: bool) -> Result<HostShader, String> {
     let used = |kind, table_offset_dwords| UsedResource {
         kind,
         root: RootType::Table,
@@ -260,7 +264,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
     };
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 32,
         layout: vec![RootParam {
             root: RootType::Table,
@@ -2815,6 +2819,112 @@ fn scalar_alu_matches_the_hardware() {
 }
 
 // ---- lanes ----
+
+/// MBCNT counts source bits below the console lane, then adds src1 modulo
+/// 2^32. Check both halves and their usual chain, including lanes 0/31/32/63.
+#[test]
+fn mbcnt_counts_each_half_before_the_lane() {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let mut masks = U32_EDGES.to_vec();
+    for bit in 0..32 {
+        masks.extend([1 << bit, !(1 << bit)]);
+    }
+    let mut seed = 0x7182_9345u32;
+    for _ in 0..256 {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        masks.push(seed);
+    }
+    let mut inputs = Vec::new();
+    for (i, &lo) in masks.iter().enumerate() {
+        let hi = masks[(i * 17 + 3) % masks.len()];
+        for acc in [0, 1, u32::MAX, u32::MAX - 31, 0x8000_0000] {
+            inputs.extend(std::iter::repeat_n([lo, hi, acc, OLD], 64));
+        }
+    }
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("{label}: no SM 6.6 device; skipped");
+            continue;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes a structure of the given size.
+        unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .expect("wave capabilities");
+        for wave in [32, 64] {
+            if !options.WaveOps.as_bool()
+                || wave < options.WaveLaneCountMin
+                || wave > options.WaveLaneCountMax
+            {
+                eprintln!("{label}: no wave{wave} support; skipped");
+                continue;
+            }
+            for guarded in [false, true] {
+                let mut body = Vec::new();
+                if guarded {
+                    body.push(vop2(0x1B, 11, int(1), 0)); // lane parity
+                    body.push(vopc(0xC2, int(0), 11)); // v_cmp_eq_u32: even lanes
+                    body.push(sop1(if wave == 64 { 0x24 } else { 0x3C }, 20, VCC));
+                    body.push(0xBF88_0006); // s_cbranch_execz -> restore EXEC
+                }
+                body.extend(vop3(0x365, 5, [v(1), v(3), 0], NONE));
+                body.extend(vop3(0x366, 6, [v(2), v(3), 0], NONE));
+                body.extend(vop3(0x366, 7, [v(2), v(5), 0], NONE));
+                if guarded {
+                    body.push(sop1(if wave == 64 { 0x04 } else { 0x03 }, 126, s(20)));
+                }
+                let shader =
+                    lower_program_wave(&program(&body, false), wave == 64).expect("mbcnt lowers");
+                if let Ok(mut v) =
+                    validator::Validator::load(validator::Validator::default_path().as_deref())
+                {
+                    v.validate(&mut shader.dxil.clone()).expect("valid DXIL");
+                }
+                if warp && host.compute_pipeline(&shader).is_err() {
+                    eprintln!("WARP refuses fixed WaveSize({wave}) pipelines; skipped");
+                    break;
+                }
+                let out = run(&host, &shader, &inputs, false).expect("mbcnt dispatch");
+                for (i, (&[lo, hi, acc, old], got)) in inputs.iter().zip(&out).enumerate() {
+                    let lane = i as u32 % wave;
+                    let want = if guarded && lane & 1 != 0 {
+                        [old; 4]
+                    } else {
+                        // Enumerate individual bits independently of the DXIL
+                        // extraction and mask-building implementations.
+                        let low = (0..lane.min(32)).filter(|bit| lo >> bit & 1 != 0).count();
+                        let high = (32..lane).filter(|bit| hi >> (bit - 32) & 1 != 0).count();
+                        [
+                            acc.wrapping_add(low as u32),
+                            acc.wrapping_add(high as u32),
+                            acc.wrapping_add((low + high) as u32),
+                            old,
+                        ]
+                    };
+                    assert_eq!(
+                        *got, want,
+                        "{label} wave{wave}, guarded={guarded}, input {i}"
+                    );
+                }
+                eprintln!(
+                    "{label} wave{wave}, guarded={guarded}: {} inputs matched",
+                    inputs.len()
+                );
+            }
+        }
+    }
+}
 
 /// Masked lanes keep their registers: `s_and_saveexec_b32` narrowing to the
 /// lanes of a compare, writes there, then EXEC restored (no branch, as the

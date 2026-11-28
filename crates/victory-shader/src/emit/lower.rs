@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1407,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -7827,14 +7832,19 @@ impl<'a> Lower<'a> {
                     let low = self.s.m.cmp(c, pred::IULT, lane, k32);
                     self.s.m.select(c, low, z, t)
                 };
-                // (1 << below) - 1, all ones from 32 on.
-                let (one, k32, ones) = (k(self, 1), k(self, 32), k(self, u32::MAX));
-                let sh = m31(self, below);
-                let m = self.s.m.bin(c, Bin::Shl, one, sh);
-                let m = self.s.m.bin(c, Bin::Sub, m, one);
+                // Extract the low `below` bits. Ubfe masks its width to five
+                // bits, so from 32 on the whole source must be counted.
+                let (zero, k32) = (k(self, 0), k(self, 32));
+                let field = self.s.op(
+                    c,
+                    "tertiary.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    52, // Ubfe
+                    &[below, zero, a],
+                );
                 let full = self.s.m.cmp(c, pred::IUGE, below, k32);
-                let m = self.s.m.select(c, full, ones, m);
-                let x = self.s.m.bin(c, Bin::And, a, m);
+                let x = self.s.m.select(c, full, a, field);
                 let n = self
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[x]);
@@ -11089,6 +11099,25 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn mbcnt_extracts_the_bits_below_the_lane() {
+        let mut counts = Vec::new();
+        for (op, name, expected) in [
+            (0x365u32, "v_mbcnt_lo_u32_b32", 24),
+            (0x366, "v_mbcnt_hi_u32_b32", 27),
+        ] {
+            // Dynamic mask in v1, accumulator in v2, result in v0.
+            let lowered =
+                lower_valu(&[0xD400_0000 | op << 16, 0x101 | 0x102 << 9]).expect("mbcnt lowers");
+            eprintln!("{name}: {} DXIL instructions", lowered.instructions);
+            counts.push((lowered.instructions, expected));
+        }
+        assert!(
+            counts.iter().all(|(actual, expected)| actual == expected),
+            "{counts:?}"
+        );
     }
 
     #[test]
