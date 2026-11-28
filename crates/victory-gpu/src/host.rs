@@ -321,15 +321,28 @@ fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
     let mut times = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner());
     let (by, wall_ms, sum) = times.get_or_insert_with(Default::default);
     *wall_ms += wall.as_secs_f64() * 1e3;
+    if commands.is_empty() {
+        return;
+    }
+    let mut label = String::new();
     for (ms, note) in commands {
         // "draw 3x1 [mesh 1f.., pixel 2e..] | ...": the kind and the pipeline.
         let head = note.split(" | ").next().unwrap_or_default();
         let kind = head.split(' ').next().unwrap_or_default();
-        let key = match head.find('[') {
-            Some(at) => format!("{kind} {}", &head[at..]),
-            None => kind.to_owned(),
+        let key = if let Some(at) = head.find('[') {
+            label.clear();
+            label.push_str(kind);
+            label.push(' ');
+            label.push_str(&head[at..]);
+            label.as_str()
+        } else {
+            kind
         };
-        let e = by.entry(key).or_default();
+        let e = if let Some(e) = by.get_mut(key) {
+            e
+        } else {
+            by.entry(key.to_owned()).or_default()
+        };
         (e.0, e.1) = (e.0 + ms, e.1 + 1);
         *sum += ms;
     }
