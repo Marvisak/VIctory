@@ -18,7 +18,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
+use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar, WideCharToMultiByte};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
 use crate::{HleExport, HleModule, hle_export};
@@ -40,6 +40,146 @@ pub(crate) use host;
 /// Mounted drives: upper-case letter and host root (UTF-16, no trailing
 /// separator, no NUL).
 static DRIVES: Mutex<Vec<(u16, Vec<u16>)>> = Mutex::new(Vec::new());
+
+/// What `GetCommandLineA` / `GetCommandLineW` return. The title imports
+/// `GetCommandLineA` and would otherwise parse this process's own flags
+/// (`run`, `--execute`, `--console`) as its startup arguments.
+struct TitleCommand {
+    narrow: Vec<u8>,
+    wide: Vec<u16>,
+}
+
+static TITLE_COMMAND: Mutex<Option<TitleCommand>> = Mutex::new(None);
+
+/// Installs the command line the title reads: its own executable, then
+/// only the arguments after `--` on our command line. A normal launch has
+/// none, which is how the console starts a title.
+pub fn install_title_command_line(exe: &Path) -> String {
+    let exe = std::path::absolute(exe).unwrap_or_else(|_| exe.to_owned());
+    let line = title_command_line(&exe, std::env::args_os());
+    let wide: Vec<u16> = line.encode_utf16().chain([0]).collect();
+    let narrow = wide_to_acp(&wide[..wide.len() - 1]);
+    tracing::info!(%line, "title command line");
+    *TITLE_COMMAND.lock().unwrap_or_else(|e| e.into_inner()) = Some(TitleCommand { narrow, wide });
+    line
+}
+
+/// `exe` as argv[0], then any arguments that follow a `--` in `args`
+/// (argv[0] of `args` is this process and is dropped).
+pub fn title_command_line(exe: &Path, args: impl IntoIterator<Item = std::ffi::OsString>) -> String {
+    let mut args = args.into_iter();
+    let _ours = args.next();
+    let mut title = Vec::new();
+    let mut after = false;
+    for arg in args {
+        if !after {
+            if arg == "--" {
+                after = true;
+            }
+            continue;
+        }
+        title.push(arg);
+    }
+    let mut line = quote_arg(exe.as_os_str());
+    for arg in &title {
+        line.push(' ');
+        line.push_str(&quote_arg(arg));
+    }
+    line
+}
+
+/// CommandLineToArgvW quoting: leave a token bare when it has no space,
+/// tab, or quote; otherwise wrap it and escape embedded quotes.
+fn quote_arg(arg: &std::ffi::OsStr) -> String {
+    let text = arg.to_string_lossy();
+    if !text.is_empty() && !text.contains([' ', '\t', '"']) {
+        return text.into_owned();
+    }
+    let mut out = String::from("\"");
+    let mut slashes = 0usize;
+    for c in text.chars() {
+        if c == '\\' {
+            slashes += 1;
+            continue;
+        }
+        if c == '"' {
+            out.extend(std::iter::repeat_n('\\', slashes * 2 + 1));
+            out.push('"');
+            slashes = 0;
+            continue;
+        }
+        out.extend(std::iter::repeat_n('\\', slashes));
+        slashes = 0;
+        out.push(c);
+    }
+    out.extend(std::iter::repeat_n('\\', slashes * 2));
+    out.push('"');
+    out
+}
+
+fn wide_to_acp(wide: &[u16]) -> Vec<u8> {
+    if wide.is_empty() {
+        return vec![0];
+    }
+    // SAFETY: `wide` is a counted UTF-16 string; a null output asks for the size.
+    let n = unsafe {
+        WideCharToMultiByte(
+            CP_ACP,
+            0,
+            wide.as_ptr(),
+            wide.len() as i32,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        )
+    };
+    if n <= 0 {
+        let mut out: Vec<u8> = wide
+            .iter()
+            .map(|u| if *u < 0x80 { *u as u8 } else { b'?' })
+            .collect();
+        out.push(0);
+        return out;
+    }
+    let mut out = vec![0u8; n as usize + 1];
+    // SAFETY: `out` has room for `n` bytes plus the NUL this writes after them.
+    unsafe {
+        WideCharToMultiByte(
+            CP_ACP,
+            0,
+            wide.as_ptr(),
+            wide.len() as i32,
+            out.as_mut_ptr(),
+            n,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+    }
+    out[n as usize] = 0;
+    out
+}
+
+/// The title's command line, or the host process command line if none was
+/// installed (a tool that loads this module without launching a title).
+pub extern "system" fn GetCommandLineA() -> *const u8 {
+    let held = TITLE_COMMAND.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(line) = held.as_ref() {
+        return line.narrow.as_ptr();
+    }
+    drop(held);
+    host!("kernel32.dll", "GetCommandLineA": extern "system" fn() -> *const u8)()
+}
+
+/// See [`GetCommandLineA`].
+pub extern "system" fn GetCommandLineW() -> *const u16 {
+    let held = TITLE_COMMAND.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(line) = held.as_ref() {
+        return line.wide.as_ptr();
+    }
+    drop(held);
+    host!("kernel32.dll", "GetCommandLineW": extern "system" fn() -> *const u16)()
+}
 
 fn drives() -> MutexGuard<'static, Vec<(u16, Vec<u16>)>> {
     DRIVES.lock().unwrap_or_else(|e| e.into_inner())
@@ -713,6 +853,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(FindFirstFileExW),
             hle_export!(MoveFileExW),
             hle_export!(SetCurrentDirectoryA),
+            hle_export!(GetCommandLineA),
+            hle_export!(GetCommandLineW),
             hle_export!(_wfopen),
             hle_export!(_wfopen_s),
             hle_export!(_wfsopen),
@@ -955,5 +1097,54 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    #[test]
+    fn the_title_command_line_is_its_exe_and_only_its_arguments() {
+        use std::ffi::OsString;
+        use std::path::Path;
+        let exe = Path::new(r"C:\Game\game.exe");
+        let launched = [
+            "victory.exe",
+            "run",
+            exe.to_str().unwrap(),
+            "--execute",
+            "--console",
+            "series-s",
+        ]
+        .map(OsString::from);
+        assert_eq!(title_command_line(exe, launched), exe.to_str().unwrap());
+
+        let relaunch = [
+            "victory.exe",
+            "run",
+            r"C:\Game\game.exe",
+            "--execute",
+            "--console",
+            "series-s",
+            "--",
+            "-profile",
+            "slot 1",
+        ]
+        .map(OsString::from);
+        assert_eq!(
+            title_command_line(Path::new(r"C:\Game\game.exe"), relaunch),
+            r#"C:\Game\game.exe -profile "slot 1""#
+        );
+        assert_eq!(
+            quote_arg(std::ffi::OsStr::new(r"C:\Program Files\game.exe")),
+            r#""C:\Program Files\game.exe""#
+        );
+        assert_eq!(
+            crate::registry::lookup(
+                "api-ms-win-core-processenvironment-l1-1-0.dll",
+                "GetCommandLineA"
+            ),
+            Some(GetCommandLineA as *const () as usize)
+        );
+        assert_eq!(
+            crate::registry::lookup("kernel32.dll", "GetCommandLineW"),
+            Some(GetCommandLineW as *const () as usize)
+        );
     }
 }

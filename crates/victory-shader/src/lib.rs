@@ -29,6 +29,24 @@ pub use native::{
 /// translation.
 pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
 
+/// Whether a reachable native instruction traverses a ray-tracing BVH.
+/// This inspects the original GFX10 program, so it also works for shaders
+/// whose translated DXIL came from the on-disk cache.
+pub fn uses_ray_traversal(container: &[u8]) -> Result<bool, ShaderError> {
+    let container = Container::parse(container)?;
+    let dxil = container
+        .part(FourCC::DXIL)
+        .or(container.part(FourCC::ACCC))
+        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = native_programs(dxil.data)?
+        .into_iter()
+        .find(|program| matches!(program.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms))
+        .ok_or(ShaderError::Malformed("no translated native program"))?;
+    Ok(gfx10::decode(&native.patched_code())?
+        .iter()
+        .any(|instruction| instruction.name().is_some_and(|name| name.starts_with("image_bvh"))))
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
     #[error("not a DXBC container")]

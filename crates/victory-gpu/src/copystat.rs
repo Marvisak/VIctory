@@ -94,6 +94,13 @@ pub(crate) enum C {
     MarkedUs,
     MarkedKept,
     SavedPages,
+    /// Time inside marked page copy-back, split from bitmap/owner/filter
+    /// work; kernel read, compare/merge, kernel write with watch, and retake.
+    MarkedPageUs,
+    MarkedReadUs,
+    MarkedCompareUs,
+    MarkedWriteUs,
+    MarkedTakenUs,
     /// Preparing submissions: descriptors the title copied into its heaps
     /// as bytes, made on the host first.
     SyncHeapsUs,
@@ -105,7 +112,7 @@ pub(crate) enum C {
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
 }
-const COUNTERS: usize = 61;
+const COUNTERS: usize = 66;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -125,6 +132,47 @@ pub(crate) fn mode() -> u8 {
 /// Per source range (start, length): copies, bytes, microseconds, memory type.
 type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32)>;
 static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
+
+/// Initial kernel reads that failed before `copy_mapped` retried smaller
+/// pieces. Their source range is the actual read call, which may be smaller
+/// than the surrounding shadow refresh recorded in `RANGES`.
+type FailedReads = HashMap<(usize, usize, bool), u64>;
+const FAILED_SOURCE_LIMIT: usize = 1024;
+static FAILED_READS: Mutex<Option<FailedReads>> = Mutex::new(None);
+static FAILED_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+fn record_failed_read(map: &mut FailedReads, key: (usize, usize, bool), limit: usize) -> bool {
+    if let Some(count) = map.get_mut(&key) {
+        *count += 1;
+        false
+    } else if map.len() < limit {
+        map.insert(key, 1);
+        false
+    } else {
+        true
+    }
+}
+
+/// One full-range `ReadProcessMemory` failed; the caller will use its normal
+/// retry path. Retain at most `FAILED_SOURCE_LIMIT` distinct source ranges
+/// per report, with an overflow count for further distinct failures.
+pub(crate) fn failed_read(src: usize, len: usize, title_dst: bool) {
+    let mut slot = FAILED_READS.lock().unwrap_or_else(|e| e.into_inner());
+    if record_failed_read(slot.get_or_insert_with(HashMap::new), (src, len, title_dst), FAILED_SOURCE_LIMIT) {
+        FAILED_OVERFLOW.fetch_add(1, Relaxed);
+    }
+}
+
+#[test]
+fn failed_read_sources_stay_bounded_and_count_repeats() {
+    let mut map = FailedReads::new();
+    assert!(!record_failed_read(&mut map, (1, 64, false), 2));
+    assert!(!record_failed_read(&mut map, (2, 64, true), 2));
+    assert!(record_failed_read(&mut map, (3, 64, false), 2));
+    assert!(!record_failed_read(&mut map, (1, 64, false), 2));
+    assert_eq!(map.len(), 2);
+    assert_eq!(map[&(1, 64, false)], 2);
+}
 
 /// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
 pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
@@ -310,6 +358,15 @@ pub(crate) fn log(frames: f64) {
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
         .collect();
     tracing::info!("  guard lock held per frame: {}", held.join(", "));
+    tracing::info!(
+        "  marked path ms/frame: page calls {:.2}, read {:.2}, compare/merge {:.2}, write/watch {:.2}, retake/guard {:.2}, outside page calls {:.2}",
+        ms(c[C::MarkedPageUs as usize]),
+        ms(c[C::MarkedReadUs as usize]),
+        ms(c[C::MarkedCompareUs as usize]),
+        ms(c[C::MarkedWriteUs as usize]),
+        ms(c[C::MarkedTakenUs as usize]),
+        ms((c[C::MarkedUs as usize] - c[C::MarkedPageUs as usize]).max(0.0)),
+    );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
     snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
@@ -322,7 +379,7 @@ pub(crate) fn log(frames: f64) {
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
-    for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
+    for &((src, len), (n, bytes, us, _)) in ranges.iter().take(10) {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -335,6 +392,36 @@ pub(crate) fn log(frames: f64) {
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
         );
+    }
+    ranges.sort_by_key(|&(_, (_, _, us, _))| std::cmp::Reverse(us));
+    for &((src, len), (n, bytes, us, _)) in ranges.iter().take(10) {
+        tracing::info!(
+            "  time-ranked copy from {src:#x}+{len:#x}: {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame",
+            n as f64 / frames,
+            bytes as f64 / 1e6 / frames,
+            us as f64 / 1e3 / frames
+        );
+    }
+    let mut failed: Vec<_> = FAILED_READS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .into_iter()
+        .flatten()
+        .collect();
+    failed.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    let overflow = FAILED_OVERFLOW.swap(0, Relaxed);
+    if !failed.is_empty() || overflow != 0 {
+        tracing::info!(
+            "  full-range reads failed at {} distinct sources ({} failures beyond the {}-source cap)",
+            failed.len(), overflow, FAILED_SOURCE_LIMIT
+        );
+        for ((src, len, title_dst), n) in failed.into_iter().take(10) {
+            tracing::info!(
+                "  failed full read from {src:#x}+{len:#x}: {:.1}x/frame, title destination {title_dst}",
+                n as f64 / frames
+            );
+        }
     }
 }
 

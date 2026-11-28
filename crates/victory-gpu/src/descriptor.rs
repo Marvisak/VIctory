@@ -196,6 +196,58 @@ pub(crate) fn sync_heaps() {
                 host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
             }
         }
+        host.retry_failed_buffers(start, step);
+    }
+    drop(heaps);
+    retry_observed_textures();
+}
+
+/// A shader's read mark arrives after its submission. If its placed sampled
+/// texture was denied then, the mark will not name that slot again. Retry
+/// only those observed misses after an existing texture range is freed or
+/// ordinary streaming reopens. Preparation happens outside `SHADER_HEAPS`
+/// so title threads may continue writing descriptors while copies are made.
+#[cfg(windows)]
+fn retry_observed_textures() {
+    const MAX_RETRIES_PER_SYNC: usize = 128;
+    let pending = {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        heaps.iter().any(|&(_, _, at)| {
+            // SAFETY: a registered heap lives while SHADER_HEAPS is locked.
+            let heap = unsafe { &*(at as *const Heap) };
+            heap.desc.kind == VIEWS_KIND
+                && heap.host.get().and_then(Option::as_ref).is_some_and(host::HostHeap::has_observed_texture_misses)
+        })
+    };
+    if !pending { return; }
+    let epoch = crate::placement::texture_reuse_epoch();
+    let room = crate::resource::stream_room();
+    let candidates: Vec<(u64, u64, u32, u64, View)> = {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut work = Vec::new();
+        for &(start, _, at) in heaps.iter() {
+            // SAFETY: a registered heap lives while SHADER_HEAPS is locked.
+            let heap = unsafe { &*(at as *const Heap) };
+            let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else { continue };
+            if heap.desc.kind != VIEWS_KIND || work.len() >= MAX_RETRIES_PER_SYNC { continue; }
+            let remaining = MAX_RETRIES_PER_SYNC - work.len();
+            work.extend(host.observed_texture_retry_candidates(start, u64::from(step), epoch, room,
+                remaining)
+                .into_iter().map(|(index, key, view)| (start, u64::from(step), index, key, view)));
+        }
+        work
+    };
+    crate::texture::in_parallel(candidates.len(), |i| host::prepare(&candidates[i].4));
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for (start, step, index, key, _) in candidates {
+        let Some(&(_, _, at)) = heaps.iter().find(|&&(registered, _, _)| registered == start) else { continue };
+        // SAFETY: the registration stays live under SHADER_HEAPS.
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(current_step)) = (heap.host.get(), increment(heap.desc.kind)) else { continue };
+        if heap.desc.kind != VIEWS_KIND || u64::from(current_step) != step { continue; }
+        if let Some(handle) = u64::from(index).checked_mul(step).and_then(|at| start.checked_add(at)) {
+            host.finish_observed_texture_retry(index, key, handle);
+        }
     }
 }
 
@@ -239,7 +291,14 @@ pub(crate) fn make_read(slots: &[u32]) {
             continue;
         }
         for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
-            host.mirror(i, start + u64::from(i) * u64::from(step), true);
+            let view = host.mirror(i, start + u64::from(i) * u64::from(step), true);
+            host.note_observed_texture_result(i, view.as_ref());
+            #[cfg(feature = "diagnostics")]
+            host.note_used_null(i, view.as_ref(), false, host::UsedNullSource::ObservedHeap, 0, u8::MAX);
+            #[cfg(feature = "diagnostics")]
+            host.note_used_texture_null(i, view.as_ref(), host::UsedNullSource::ObservedHeap, 0, u8::MAX);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = view;
             host.stamp_read(i);
         }
     }
@@ -261,6 +320,137 @@ pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
     textures
 }
 
+/// Diagnostic only: classify title descriptor slots that still hold host
+/// resources by whether their saved view generation remains current. A
+/// resource held by both kinds of slots belongs to the mixed group, so its
+/// allocation size is counted only once. This measures possible stale-slot
+/// retention, not bytes necessarily safe to release (other owners may exist).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn log_kept_census() {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_BUFFER;
+    use windows::core::Interface;
+
+    let mut slots = Vec::new();
+    let mut resources = std::collections::HashMap::new();
+    let mut failed_buffer_slots = 0usize;
+    let mut observed_texture_miss_slots = 0usize;
+    let mut shadow_pin_slots = [0u64; 3];
+    let mut shadow_pins = std::collections::HashMap::<usize, (u64, u8)>::new();
+    {
+        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        for &(_, _, at) in heaps.iter() {
+            // SAFETY: registered heaps remain live while SHADER_HEAPS is locked.
+            let heap = unsafe { &*(at as *const Heap) };
+            if heap.desc.kind != VIEWS_KIND {
+                continue;
+            }
+            let Some(Some(host)) = heap.host.get() else { continue };
+            failed_buffer_slots += host.failed_buffer_count();
+            observed_texture_miss_slots += host.observed_texture_miss_count();
+            let (pins, unique_pins) = host.shadow_pin_snapshot();
+            for i in 0..3 {
+                shadow_pin_slots[i] += pins[i];
+            }
+            for (ptr, bytes, groups) in unique_pins {
+                let pin = shadow_pins.entry(ptr).or_insert((bytes, 0));
+                pin.1 |= groups;
+            }
+            let (held, distinct) = host.kept_snapshot();
+            slots.extend(held);
+            for resource in distinct {
+                resources.entry(resource.as_raw() as usize).or_insert(resource);
+            }
+        }
+    }
+    let records: Vec<[u32; 3]> = slots
+        .iter()
+        .map(|&(key, _)| [VIEW_TAG, key as u32, (key >> 32) as u32])
+        .collect();
+    let current = views_current(&records);
+    let mut slot_counts = [0u64; 2]; // current, stale
+    let mut status = std::collections::HashMap::<usize, u8>::new();
+    for ((_, ptr), valid) in slots.into_iter().zip(current) {
+        let kind = usize::from(!valid);
+        slot_counts[kind] += 1;
+        *status.entry(ptr).or_default() |= if valid { 1 } else { 2 };
+    }
+    let mut groups = [(0u64, 0u64, 0u64); 3]; // current-only, stale-only, both; count, bytes, texture bytes
+    if let Some(host) = crate::host::host() {
+        for (ptr, resource) in resources {
+            let Some(&bits) = status.get(&ptr) else { continue };
+            let group = match bits { 1 => 0, 2 => 1, _ => 2 };
+            // SAFETY: the snapshot keeps this resource live through the query.
+            let desc = unsafe { resource.GetDesc() };
+            // SAFETY: the host device and the copied resource description are live.
+            let bytes = unsafe { host.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
+            groups[group].0 += 1;
+            groups[group].1 += bytes;
+            if desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER {
+                groups[group].2 += bytes;
+            }
+        }
+    }
+    tracing::info!(
+        "kept descriptor title slots current {} stale {}; unique host resources current-only {} / {:.0} MB \
+         (textures {:.0} MB), stale-only {} / {:.0} MB (textures {:.0} MB), mixed {} / {:.0} MB \
+         (textures {:.0} MB); allocation sizes may overlap for aliases",
+        slot_counts[0], slot_counts[1],
+        groups[0].0, groups[0].1 as f64 / 1e6, groups[0].2 as f64 / 1e6,
+        groups[1].0, groups[1].1 as f64 / 1e6, groups[1].2 as f64 / 1e6,
+        groups[2].0, groups[2].1 as f64 / 1e6, groups[2].2 as f64 / 1e6,
+    );
+    tracing::info!(failed_buffer_slots, "budget-denied buffer descriptors awaiting ordinary-copy recovery");
+    let [attempted, recovered, stale] = host::take_observed_texture_retry();
+    tracing::info!(observed_texture_miss_slots, attempted, recovered, stale,
+        "shader-observed sampled-texture admission retries");
+    let loose_blocked = crate::shadow::loose_pin_snapshot();
+    // This snapshot precedes memory::drop_gone(), so the final group can
+    // include temporary page-table pins that pressure trim later releases.
+    let mut blocked = [(0u64, 0u64); 3]; // title, dynamic, no descriptor pin here
+    for (ptr, bytes) in &loose_blocked {
+        let group = match shadow_pins.get(ptr).map(|(_, flags)| *flags) {
+            Some(flags) if flags & 1 != 0 => 0,
+            Some(flags) if flags & 6 != 0 => 1,
+            _ => 2,
+        };
+        blocked[group].0 += 1;
+        blocked[group].1 += *bytes;
+    }
+    tracing::info!(
+        blocked_loose_copies = loose_blocked.len(),
+        title_pinned = blocked[0].0, title_pinned_mb = format_args!("{:.1}", blocked[0].1 as f64 / 1e6),
+        dynamic_pinned = blocked[1].0, dynamic_pinned_mb = format_args!("{:.1}", blocked[1].1 as f64 / 1e6),
+        other_at_snapshot = blocked[2].0, other_at_snapshot_mb = format_args!("{:.1}", blocked[2].1 as f64 / 1e6),
+        "old quiescent loose copies with external references at report time"
+    );
+    let mut pin_groups = [(0u64, 0u64); 3];
+    let mut free_only = (0u64, 0u64);
+    for (_, (bytes, groups)) in shadow_pins {
+        for (i, group) in pin_groups.iter_mut().enumerate() {
+            if groups & (1 << i) != 0 {
+                group.0 += 1;
+                group.1 += bytes;
+            }
+        }
+        if groups == 4 {
+            free_only.0 += 1;
+            free_only.1 += bytes;
+        }
+    }
+    tracing::info!(
+        title_slots = shadow_pin_slots[0], title_unique = pin_groups[0].0,
+        title_mb = format_args!("{:.1}", pin_groups[0].1 as f64 / 1e6),
+        active_dynamic_slots = shadow_pin_slots[1], active_dynamic_unique = pin_groups[1].0,
+        active_dynamic_mb = format_args!("{:.1}", pin_groups[1].1 as f64 / 1e6),
+        free_dynamic_slots = shadow_pin_slots[2], free_dynamic_unique = pin_groups[2].0,
+        free_dynamic_mb = format_args!("{:.1}", pin_groups[2].1 as f64 / 1e6),
+        free_dynamic_only_unique = free_only.0,
+        free_dynamic_only_mb = format_args!("{:.1}", free_only.1 as f64 / 1e6),
+        "descriptor-held title-memory copies by slot ownership (unique groups may overlap)"
+    );
+    host::log_used_null();
+}
+
 /// Every shader-visible view heap's slots viewing one of the host textures
 /// `textures` (raw pointers) are left null, made again when read
 /// (`crate::resource::evict` gives those textures up).
@@ -272,6 +462,25 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
         let heap = unsafe { &*(at as *const Heap) };
         if let (Some(Some(host)), VIEWS_KIND) = (heap.host.get(), heap.desc.kind) {
             host.evict(textures);
+        }
+    }
+}
+
+/// Every shader-visible view heap's slots viewing one of the host buffers
+/// `buffers` (raw pointers) are left null. The copy was given up
+/// ([`crate::shadow::reap_free`]); the next time the title writes the
+/// slot, it is made again.
+#[cfg(windows)]
+pub(crate) fn evict_buffers(buffers: &std::collections::HashSet<usize>) {
+    if buffers.is_empty() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), VIEWS_KIND) = (heap.host.get(), heap.desc.kind) {
+            host.evict_buffers(buffers);
         }
     }
 }
@@ -544,6 +753,7 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
 
 /// For each record (tag, index, generation): whether it names a view that
 /// is current, as [`view_at`] would find it (one lock for them all).
+#[cfg(all(windows, feature = "diagnostics"))]
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     records

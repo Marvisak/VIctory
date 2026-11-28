@@ -33,7 +33,7 @@
 //! world), and loads that waited on it stalled every worker for as long.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
@@ -287,8 +287,14 @@ pub(crate) fn pipeline(
     let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        l.added += 1;
+    match unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) } {
+        Ok(()) => l.added += 1,
+        Err(e) => {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(error = %e, "host pipeline library refused StorePipeline; the early key list still saves");
+            }
+        }
     }
     Ok(pso)
 }
@@ -306,7 +312,7 @@ thread_local! {
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -314,9 +320,24 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    // The driver may accept a pipeline library but refuse both StorePipeline
+    // and Serialize. Keep the title's first-use keys independently so its
+    // pipelines can still start during loading on the next run.
+    if USED_CHANGED.swap(false, Ordering::Relaxed) {
+        let used = used().as_ref().map(Used::list).unwrap_or_default();
+        let saved = write_early(dir, &used);
+        match saved {
+            Ok(()) => tracing::info!(early = used.len(), "host early pipeline list saved"),
+            Err(e) => {
+                USED_CHANGED.store(true, Ordering::Relaxed);
+                tracing::warn!(error = %e, "host early pipeline list not saved");
+            }
+        }
+    }
+    let Some(library) = library() else { return };
     let (blob, prebuilt) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        if l.added == 0 && !l.prebuilt_changed {
             return;
         }
         // SAFETY: a plain size query on a live library.
@@ -338,7 +359,7 @@ pub(crate) fn save(now: bool) {
                 (bytes, prebuilt)
             }
             Err(e) => {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
+                tracing::warn!(error = %e, bytes = size, added = l.added, "host pipeline library not serialised");
                 return;
             }
         }
@@ -368,6 +389,11 @@ pub(crate) fn save(now: bool) {
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
+}
+
+fn write_early(dir: &Path, keys: &[String]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    write_atomically(&dir.join(EARLY_FILE), keys.join("\n").as_bytes())
 }
 
 /// `n` zero bytes, or `None` when the host has no memory for them. The
@@ -485,6 +511,18 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn early_keys_survive_without_a_serialized_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = vec!["first title pipeline".to_owned(), "second title pipeline".to_owned()];
+        write_early(dir.path(), &keys).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(EARLY_FILE)).unwrap(),
+            keys.join("\n")
+        );
+        assert!(!dir.path().join(LIBRARY_FILE).exists());
+    }
 
     /// A size the host cannot give is refused, not fatal; others are zeros.
     #[test]
@@ -658,13 +696,13 @@ mod tests {
                     ..Default::default()
                 }
             }
-            fn store(&self, i: usize, code: &[u8]) {
+            fn store(&self, i: usize, code: &[u8]) -> windows::core::Result<()> {
                 let name = HSTRING::from(format!("p{i}"));
                 // SAFETY: the description points at live data.
                 unsafe {
                     let pso: ID3D12PipelineState =
-                        self.0.CreateComputePipelineState(&self.desc(code)).unwrap();
-                    self.2.StorePipeline(&name, &pso).unwrap();
+                        self.0.CreateComputePipelineState(&self.desc(code))?;
+                    self.2.StorePipeline(&name, &pso)
                 }
             }
             fn load(&self, i: usize, code: &[u8]) -> windows::core::Result<ID3D12PipelineState> {
@@ -684,7 +722,11 @@ mod tests {
         }
         let first = open(&device, Vec::new()).expect("an empty library");
         let made = Shared(device.clone(), root.clone(), first.library.clone());
-        (0..N).for_each(|i| made.store(i, &codes[i]));
+        if let Err(e) = made.store(0, &codes[0]) {
+            eprintln!("pipeline library StorePipeline unavailable on this adapter: {e}; skipped");
+            return;
+        }
+        (1..N).for_each(|i| made.store(i, &codes[i]).unwrap());
         let again = open(&device, made.serialized()).expect("the library again");
         let shared = Shared(device, root, again.library.clone());
         let stores = Mutex::new(());
@@ -700,7 +742,7 @@ mod tests {
                         );
                         assert!(shared.load(N + i, &codes[N + i]).is_err(), "not stored yet");
                         let _one = stores.lock().unwrap();
-                        shared.store(N + i, &codes[N + i]);
+                        shared.store(N + i, &codes[N + i]).unwrap();
                         shared.serialized();
                     }
                 });
@@ -771,8 +813,8 @@ mod tests {
         // SAFETY: D3D12 objects are free-threaded.
         unsafe impl Sync for Made {}
         impl Made {
-            fn get(&self, made: bool) -> windows::core::Result<ID3D12PipelineState> {
-                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            fn desc(&self) -> D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     // SAFETY: a borrowed pointer the description never releases.
                     pRootSignature: unsafe { std::mem::transmute_copy(&self.1) },
                     CS: D3D12_SHADER_BYTECODE {
@@ -780,7 +822,10 @@ mod tests {
                         BytecodeLength: self.2.len(),
                     },
                     ..Default::default()
-                };
+                }
+            }
+            fn get(&self, made: bool) -> windows::core::Result<ID3D12PipelineState> {
+                let desc = self.desc();
                 pipeline(
                     "test: a pipeline loads while a save holds the library",
                     // SAFETY: the description points at live data.
@@ -795,6 +840,15 @@ mod tests {
         }
         let made = Made(device, root, code);
         made.get(true).expect("made and stored");
+        let name = HSTRING::from("test: a pipeline loads while a save holds the library");
+        // SAFETY: the pipeline description borrows the live root signature
+        // and bytecode owned by `made` for the duration of this load call.
+        if unsafe {
+            library.loads.LoadComputePipeline::<_, ID3D12PipelineState>(&name, &made.desc())
+        }.is_err() {
+            eprintln!("pipeline library StorePipeline unavailable on this adapter; skipped");
+            return;
+        }
         let saving = library.state.lock().unwrap_or_else(|e| e.into_inner());
         let (done, loaded) = std::sync::mpsc::channel();
         std::thread::scope(|s| {

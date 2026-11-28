@@ -726,19 +726,60 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     for &page in &others {
         mark_changed(g, page, page + 1, save);
     }
-    open_guarded(g, first, last);
-    for page in others {
-        open_guarded(g, page, page + 1);
-    }
+    // Open the direct pages and their aliases together. A large runtime
+    // write may span many guarded 64 KiB pages; opening each with a separate
+    // VirtualProtect call held the global guard lock for the whole series.
+    let mut open: Vec<usize> = g.protected.range(first..last).copied().collect();
+    open.extend(others.into_iter().filter(|page| g.protected.contains(page)));
+    open.sort_unstable();
+    open.dedup();
+    open_guarded(g, &open);
     guarded
 }
 
-/// Gives write access back to the pages of `[first, last)` we guarded.
-fn open_guarded(g: &mut Guards, first: usize, last: usize) {
-    let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for page in guarded {
-        open(g, page);
+/// Applies one page-protection change to each contiguous run. A run may
+/// cross a newly unmapped page, in which case it is retried page by page as
+/// before. `set` takes page numbers and an exclusive end.
+fn open_runs(pages: &[usize], mut set: impl FnMut(usize, usize) -> bool) {
+    let mut i = 0;
+    while i < pages.len() {
+        let first = i;
+        while i + 1 < pages.len() && pages[i + 1] == pages[i] + 1 {
+            i += 1;
+        }
+        let run = &pages[first..=i];
+        i += 1;
+        if !set(run[0], run[run.len() - 1] + 1) {
+            for &page in run {
+                set(page, page + 1);
+            }
+        }
     }
+}
+
+/// Gives write access back to the guarded pages, with all their old bytes
+/// already marked/saved by `changed`. Failed protections still leave the
+/// tracking set, matching the former per-page `open` behavior.
+fn open_guarded(g: &mut Guards, pages: &[usize]) {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    open_runs(pages, |first, last| {
+        let mut old = 0;
+        // SAFETY: these are consecutive pages we made read-only. A range
+        // that contains a page remapped since then falls back per page.
+        unsafe {
+            VirtualProtect(
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                PAGE_READWRITE,
+                &mut old,
+            ) != 0
+        }
+    });
+    for &page in pages {
+        g.protected.remove(&page);
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::OpenPages, pages.len() as u64);
 }
 
 /// Marks `[first, last)` changed in the trackers holding its pages. With
@@ -978,6 +1019,44 @@ pub(crate) mod tests {
     pub(crate) fn free(p: usize) {
         // SAFETY: an allocation of ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn opening_guarded_runs_batches_and_retries_failed_ranges() {
+        let pages = [1, 2, 3, 8, 9];
+        let mut calls = Vec::new();
+        open_runs(&pages, |a, b| {
+            calls.push((a, b));
+            (a, b) != (1, 4)
+        });
+        assert_eq!(calls, [(1, 4), (1, 2), (2, 3), (3, 4), (8, 10)]);
+        calls.clear();
+        open_runs(&pages, |a, b| {
+            calls.push((a, b));
+            true
+        });
+        assert_eq!(calls, [(1, 4), (8, 10)]);
+    }
+
+    #[test]
+    fn runtime_write_opens_a_contiguous_guarded_range() {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        let p = pool(4);
+        let tracked = track(p, 4 * PAGE, true).expect("pool memory is tracked");
+        assert_eq!(tracked.take(p, p + 4 * PAGE), [(p, p + 4 * PAGE)]);
+        let writing = writing(p + 1, 4 * PAGE - 2);
+        for page in 0..4 {
+            // SAFETY: a mapped page of the test's own allocation.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: `p` owns four mapped pages, so each queried address
+            // lies within that allocation; `info` is a writable output.
+            unsafe { VirtualQuery((p + page * PAGE) as *const _, &mut info, size_of_val(&info)) };
+            assert_eq!(info.Protect, PAGE_READWRITE, "page {page} opened");
+        }
+        drop(writing);
+        assert_eq!(tracked.take(p, p + 4 * PAGE), [(p, p + 4 * PAGE)]);
+        drop(tracked);
+        free(p);
     }
 
     /// Everything is changed at first; after taking, only what is written

@@ -693,7 +693,9 @@ dependencies = [
  "anyhow",
  "blake3",
  "miniz_oxide",
+ "serde",
  "tempfile",
+ "toml",
  "tracing",
  "victory-formats",
  "victory-pipeline",
@@ -730,6 +732,17 @@ dependencies = [
  "tracing",
  "victory-core",
  "victory-pe",
+ "windows-sys",
+]
+
+[[package]]
+name = "victory-native-runtime"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
+ "victory-gpu",
+ "victory-hle",
  "windows-sys",
 ]
 

@@ -3,6 +3,8 @@
 //! (IUnknown, the object methods, then each interface's methods).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::sync::Mutex;
+
 use crate::object::{
     self, ADAPTER, DXGI_DEVICE, E_INVALIDARG, FACTORY, HRESULT, Iid, MORE_DATA, NOT_FOUND, OUTPUT,
     Object, S_OK, Table, This, guid,
@@ -227,7 +229,55 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// The console's mode list: one 4K mode at 60 Hz (Grand Theft Auto VI looks
+static REQUESTED: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+/// Ask the console's output list to report this size. Refuses anything
+/// outside 640–7680 by 360–4320. A launch sets this before the title asks;
+/// otherwise the list is Series X 3840x2160, Series S 1920x1080, or
+/// `VICTORY_OUTPUT_SIZE` when that parses.
+pub fn request_output_size(width: u32, height: u32) -> bool {
+    let Some(size) = accepted_size(width, height) else {
+        return false;
+    };
+    *REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(size);
+    true
+}
+
+fn accepted_size(width: u32, height: u32) -> Option<(u32, u32)> {
+    ((640..=7680).contains(&width) && (360..=4320).contains(&height)).then_some((width, height))
+}
+
+fn parse_output_size(value: &str) -> Option<(u32, u32)> {
+    let value = value.trim();
+    let (width, height) = match value.to_ascii_lowercase().as_str() {
+        "720" | "720p" => (1280, 720),
+        "1080" | "1080p" => (1920, 1080),
+        _ => {
+            let (width, height) = value.split_once(['x', 'X'])?;
+            (width.trim().parse().ok()?, height.trim().parse().ok()?)
+        }
+    };
+    accepted_size(width, height)
+}
+
+fn advertised_size() -> (u32, u32) {
+    if let Some(size) = *REQUESTED.lock().unwrap_or_else(|e| e.into_inner()) {
+        return size;
+    }
+    if let Some(size) = std::env::var("VICTORY_OUTPUT_SIZE")
+        .ok()
+        .as_deref()
+        .and_then(parse_output_size)
+    {
+        return size;
+    }
+    match crate::console::current() {
+        crate::console::Console::SeriesS => (1920, 1080),
+        crate::console::Console::SeriesX => (3840, 2160),
+    }
+}
+
+/// The console's mode list: one mode at 60 Hz (Grand Theft Auto VI looks
 /// for a 120 Hz one to allow 120 Hz frame intervals).
 /// shortcut: fixed mode, not the host display's; report the host's rates if
 /// a title paces by them.
@@ -250,9 +300,10 @@ extern "system" fn modes(
         return MORE_DATA;
     }
     *count = 1;
+    let (width, height) = advertised_size();
     let mode = Mode {
-        width: 3840,
-        height: 2160,
+        width,
+        height,
         refresh: [60, 1],
         format: 0,
         scanlines: 1, // progressive
@@ -277,6 +328,17 @@ static OUTPUT_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::{E_NOINTERFACE, slot};
+
+    #[test]
+    fn a_bad_output_size_is_refused() {
+        assert!(!request_output_size(10, 10));
+        assert!(!request_output_size(1920, 0));
+        if std::env::var_os("VICTORY_OUTPUT_SIZE").is_none()
+            && crate::console::current() == crate::console::Console::SeriesX
+        {
+            assert_eq!(advertised_size(), (3840, 2160));
+        }
+    }
 
     type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
     type Get = extern "system" fn(This, *mut This) -> HRESULT;

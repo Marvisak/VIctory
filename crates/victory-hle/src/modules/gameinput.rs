@@ -111,8 +111,7 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
-    /// Scripted diagnostic keys (`VICTORY_KEYS`), independent of focus.
-    #[cfg(any(test, feature = "diagnostics"))]
+    /// Optional local scripted keys (`VICTORY_KEYS`), independent of focus.
     fn scripted_keys(&mut self) -> Vec<KeyState> {
         Vec::new()
     }
@@ -143,7 +142,6 @@ fn fallback(keys: &[KeyState]) -> PadState {
 }
 
 /// Combines `extra` (from `VICTORY_KEYS`) onto `base` (a physical host pad).
-#[cfg(any(test, feature = "diagnostics"))]
 fn merge_pad(base: PadState, extra: PadState) -> PadState {
     PadState {
         buttons: base.buttons | extra.buttons,
@@ -158,7 +156,6 @@ fn merge_pad(base: PadState, extra: PadState) -> PadState {
 
 /// Applies `scripted` keys to the first connected host pad, so `VICTORY_KEYS`
 /// works even when an XInput or virtual controller disables `FALLBACK`.
-#[cfg(any(test, feature = "diagnostics"))]
 fn merge_scripted(pads: &mut [Option<PadState>; PADS], scripted: &[KeyState]) {
     if scripted.is_empty() {
         return;
@@ -439,10 +436,7 @@ impl Hub {
         let (pads, keys, scripted) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            #[cfg(any(test, feature = "diagnostics"))]
             let scripted = source.scripted_keys();
-            #[cfg(not(any(test, feature = "diagnostics")))]
-            let scripted: [KeyState; 0] = [];
             (pads, source.keys(), scripted)
         };
         let events = self.state().poll(&self.devices, pads, keys, &scripted);
@@ -506,17 +500,13 @@ impl State {
             }
             self.seen_input[slot].then_some(pad)
         });
-        #[cfg(any(test, feature = "diagnostics"))]
         merge_scripted(&mut pads, scripted);
-        #[cfg(not(any(test, feature = "diagnostics")))]
-        let _ = (&mut pads, scripted);
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
         let fallback = (!any_pad).then(|| {
             let base = fallback(&keys);
-            #[cfg(any(test, feature = "diagnostics"))]
             if !scripted.is_empty() {
                 return Value::Pad(merge_pad(base, fallback(scripted)));
             }
@@ -1231,10 +1221,7 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1248,16 +1235,8 @@ mod host {
             down.into_iter().map(key_state).collect()
         }
 
-        #[cfg(any(test, feature = "diagnostics"))]
         fn scripted_keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
-            {
-                scripted().into_iter().map(key_state).collect()
-            }
-            #[cfg(not(feature = "diagnostics"))]
-            {
-                Vec::new()
-            }
+            scripted().into_iter().map(key_state).collect()
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1270,16 +1249,17 @@ mod host {
         }
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
+    /// Local input script: `VICTORY_KEYS=<seconds>:<key>[:<hold_seconds>],...`.
+    /// The default hold is 0.2 s. Keys work with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        type KeyWindow = (Duration, Duration, u8);
+        static SCRIPT: LazyLock<(Instant, Vec<KeyWindow>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
+                let (key, hold) = key.split_once(':').map_or((key, "0.2"), |(key, hold)| (key, hold));
                 let vk = match key.trim() {
                     "Enter" => 0x0D,
                     "Esc" => 0x1B,
@@ -1294,18 +1274,22 @@ mod host {
                     }
                     _ => return None,
                 };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
+                let at = Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?;
+                let hold = Duration::try_from_secs_f64(hold.trim().parse().ok()?).ok()?;
+                (hold > Duration::ZERO && hold <= Duration::from_secs(30))
+                    .then_some((at, hold, vk))
             });
-            (Instant::now(), keys.collect())
+            let keys: Vec<_> = keys.collect();
+            if !keys.is_empty() {
+                tracing::info!(count = keys.len(), "local scripted key presses armed");
+            }
+            (Instant::now(), keys)
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
+            .filter(|&&(at, hold, _)| now >= at && now < at + hold)
+            .map(|&(_, _, vk)| vk)
             .collect()
     }
 

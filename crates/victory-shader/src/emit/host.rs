@@ -64,6 +64,53 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// The debug layer, when `VICTORY_D3D12_DEBUG=1`. Must run before the device
+/// exists. Pipeline creation then names the binding it rejected.
+fn enable_debug_layer() {
+    if std::env::var("VICTORY_D3D12_DEBUG").ok().as_deref() != Some("1") {
+        return;
+    }
+    // SAFETY: the debug interface is optional and process-wide.
+    unsafe {
+        let mut layer: Option<ID3D12Debug> = None;
+        if D3D12GetDebugInterface(&mut layer).is_ok()
+            && let Some(layer) = layer
+        {
+            layer.EnableDebugLayer();
+        }
+    }
+}
+
+/// Stored debug-layer errors, emptied so the next failure is its own.
+fn debug_text(device: &ID3D12Device) -> String {
+    let Ok(queue) = device.cast::<ID3D12InfoQueue>() else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    // SAFETY: each message is read into a buffer of the size the queue reports.
+    unsafe {
+        for i in 0..queue.GetNumStoredMessages() {
+            let mut size = 0;
+            if queue.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                continue;
+            }
+            let mut buffer = vec![0u64; size.div_ceil(8)];
+            let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+            if queue.GetMessage(i, Some(message), &mut size).is_ok() {
+                let m = &*message;
+                let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                let text = String::from_utf8_lossy(text);
+                let text = text.trim_end_matches('\0').trim();
+                if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && !text.is_empty() {
+                    lines.push(format!(" [{:?}] {text}", m.ID));
+                }
+            }
+        }
+        queue.ClearStoredMessages();
+    }
+    lines.join(";")
+}
+
 /// A D3D12 device kept alive for the process so concurrent callers do not
 /// race creating and tearing down the same singleton adapter device.
 struct SharedDevice(ID3D12Device);
@@ -75,6 +122,7 @@ unsafe impl Send for SharedDevice {}
 unsafe impl Sync for SharedDevice {}
 
 fn create_device(warp: bool) -> Result<ID3D12Device, String> {
+    enable_debug_layer();
     // SAFETY: plain D3D12/DXGI calls with valid out pointers.
     unsafe {
         let mut device: Option<ID3D12Device> = None;
@@ -245,7 +293,19 @@ impl Host {
         views.dedup();
         let mut views: Vec<(u32, u32, u8)> = views
             .into_iter()
-            .map(|(slot, kind)| (u32::from(slot), super::ROOT_CBV_SPACE, kind))
+            .map(|(slot, kind)| {
+                // Only the two sentinel slots are space 3. A title root
+                // view can itself be numbered 255, and that binding stays
+                // in the root-view space at that register.
+                let fallback = slot == super::MESH_FALLBACK_SLOT
+                    || slot == super::MESH_FALLBACK_SLOT.wrapping_add(1);
+                let (space, register) = if fallback {
+                    (super::FALLBACK_SPACE, u32::from(slot - super::MESH_FALLBACK_SLOT))
+                } else {
+                    (super::ROOT_CBV_SPACE, u32::from(slot))
+                };
+                (register, space, kind)
+            })
             .collect();
         if stages.iter().any(|(s, _)| s.memory) {
             views.push((0, super::MEMORY_SPACE, 1));
@@ -373,7 +433,10 @@ impl Host {
         };
         let _guard = self.lock_warp();
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err)
+        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| {
+            let note = debug_text(&self.device);
+            if note.is_empty() { err(e) } else { format!("{};{note}", err(e)) }
+        })
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or

@@ -4,6 +4,7 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod graphics;
 mod inspect;
 mod prebuild;
 mod run;
@@ -120,6 +121,34 @@ enum Command {
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
         title_args: Vec<String>,
+        /// Output size written into the title's settings and advertised as
+        /// the console mode: `720p`, `1080p`, or `WIDTHxHEIGHT`.
+        #[arg(long)]
+        resolution: Option<String>,
+        /// Graphics quality written into the title's settings.
+        #[arg(long, value_enum)]
+        quality: Option<graphics::Quality>,
+        /// Anti-aliasing written into the title's settings (`mapMSAA`).
+        #[arg(long, value_enum)]
+        aa: Option<graphics::Aa>,
+        /// Anisotropic filtering written into the title's settings: 0, 2, 4, 8, or 16.
+        #[arg(long)]
+        anisotropic: Option<u32>,
+    },
+    /// Show or edit the saved graphics profile and existing settings files.
+    Graphics {
+        /// Output size: `720p`, `1080p`, or `WIDTHxHEIGHT`.
+        #[arg(long)]
+        resolution: Option<String>,
+        /// Graphics quality.
+        #[arg(long, value_enum)]
+        quality: Option<graphics::Quality>,
+        /// Anti-aliasing (`mapMSAA`).
+        #[arg(long, value_enum)]
+        aa: Option<graphics::Aa>,
+        /// Anisotropic filtering: 0, 2, 4, 8, or 16.
+        #[arg(long)]
+        anisotropic: Option<u32>,
     },
     /// Show the resolved configuration and check it.
     Config,
@@ -196,16 +225,49 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
+            resolution,
+            quality,
+            aa,
+            anisotropic,
         } => {
-            let code = run::run(&exe, unimplemented, strict, execute, console)?;
+            let code = run::run(
+                &exe,
+                unimplemented,
+                strict,
+                execute,
+                console,
+                graphics::Selection {
+                    resolution,
+                    quality,
+                    aa,
+                    anisotropic,
+                },
+            )?;
             if code != 0 {
                 // Preserve all 32 bits of the Windows process status.
                 std::process::exit(code as i32);
             }
             Ok(())
         }
+        Command::Graphics {
+            resolution,
+            quality,
+            aa,
+            anisotropic,
+        } => graphics_command(graphics::Selection {
+            resolution,
+            quality,
+            aa,
+            anisotropic,
+        }),
         Command::Config => show_config(),
     }
+}
+
+fn graphics_command(selection: graphics::Selection) -> Result<()> {
+    let cfg = victory_core::Config::load()?;
+    println!("{}", graphics::edit(&cfg.data_dir, &selection)?);
+    Ok(())
 }
 
 fn show_config() -> Result<()> {

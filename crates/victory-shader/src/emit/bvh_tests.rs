@@ -516,6 +516,21 @@ fn program(wide: bool) -> Vec<u32> {
     w
 }
 
+#[test]
+fn ray_classifier_finds_both_native_bvh_instructions() {
+    for wide in [false, true] {
+        let code: Vec<u8> = program(wide).iter().flat_map(|word| word.to_le_bytes()).collect();
+        let instructions = crate::gfx10::decode(&code).expect("decode synthetic BVH shader");
+        assert!(instructions.iter().any(|instruction| {
+            instruction.name().is_some_and(|name| name.starts_with("image_bvh"))
+        }));
+    }
+    let ordinary = 0xBF81_0000u32.to_le_bytes();
+    assert!(!crate::gfx10::decode(&ordinary).unwrap().iter().any(|instruction| {
+        instruction.name().is_some_and(|name| name.starts_with("image_bvh"))
+    }));
+}
+
 fn build(wide: bool, memory: bool) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,

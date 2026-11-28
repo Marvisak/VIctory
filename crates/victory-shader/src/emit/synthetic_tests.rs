@@ -1003,7 +1003,10 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
         vec![pos_sig("SV_Target", 16, 0)],
     );
 
-    let host = Host::new(true).expect("WARP host");
+    let host = Host::new(true).or_else(|error| {
+        eprintln!("WARP cannot run this shader ({error}); testing the hardware host");
+        Host::new(false)
+    }).expect("SM 6.6 host");
     let (root, pso) = host.pipeline(&vs, &ps).expect("pipeline");
     let pixels = host
         .draw(

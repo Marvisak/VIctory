@@ -357,6 +357,49 @@ fn make_stand_in(
 /// Destroys a stand-in (posted when the title's window goes).
 const DESTROY_STAND_IN: u32 = wm::WM_APP + 0x7649;
 
+/// The two close paths are otherwise indistinguishable in the shutdown log.
+/// Record the delivery mode and local stack once so a posted user/system
+/// message can be separated from a synchronous title SendMessage call.
+#[cfg(feature = "diagnostics")]
+fn log_close_message(window: &'static str, hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+    if count > 8 && !count.is_power_of_two() {
+        return;
+    }
+    // SAFETY: InSendMessageEx requires its reserved pointer to be null.
+    let sent = unsafe { wm::InSendMessageEx(std::ptr::null_mut()) };
+    // SAFETY: GetForegroundWindow is a Win32 query with no input pointers.
+    let foreground = unsafe { wm::GetForegroundWindow() };
+    tracing::warn!(
+        window,
+        hwnd = format_args!("{:#x}", hwnd as usize),
+        message = format_args!("{message:#x}"),
+        wparam = format_args!("{wparam:#x}"),
+        lparam = format_args!("{lparam:#x}"),
+        sent_flags = format_args!("{sent:#x}"),
+        foreground = format_args!("{:#x}", foreground as usize),
+        thread = ?std::thread::current().id(),
+        stack = %std::backtrace::Backtrace::force_capture(),
+        "window close message received"
+    );
+}
+
+/// Opt-in for bounded unattended diagnostics. The test harness still owns
+/// process shutdown; a stray close button or taskbar command cannot abort
+/// the world capture before it reaches the configured time/RAM limit.
+fn ignore_window_close() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static IGNORE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *IGNORE.get_or_init(|| std::env::var("VICTORY_IGNORE_WINDOW_CLOSE").is_ok_and(|v| v == "1"))
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        false
+    }
+}
+
 extern "system" fn stand_in_proc(
     hwnd: HWND,
     message: u32,
@@ -366,7 +409,13 @@ extern "system" fn stand_in_proc(
     match message {
         // A user close (close button, Alt+F4, window or taskbar menu).
         wm::WM_CLOSE => {
-            end_title("window closed", Box::new(|| {}));
+            #[cfg(feature = "diagnostics")]
+            log_close_message("stand-in", hwnd, message, wparam, lparam);
+            if ignore_window_close() {
+                tracing::warn!("stand-in WM_CLOSE ignored by bounded diagnostic run");
+                return 0;
+            }
+            end_title("stand-in WM_CLOSE", Box::new(|| {}));
             return 0;
         }
         // No window menu from the keyboard (see `window_proc`): here it
@@ -436,7 +485,13 @@ extern "system" fn window_proc(
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
-        end_title("window closed", Box::new(|| {}));
+        #[cfg(feature = "diagnostics")]
+        log_close_message("title", hwnd, message, wparam, lparam);
+        if ignore_window_close() {
+            tracing::warn!("title SC_CLOSE ignored by bounded diagnostic run");
+            return 0;
+        }
+        end_title("title WM_SYSCOMMAND SC_CLOSE", Box::new(|| {}));
         return 0;
     }
     // Alt or F10 puts a window into menu mode: the system runs a modal menu

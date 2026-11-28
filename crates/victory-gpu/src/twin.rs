@@ -640,7 +640,9 @@ mod tests {
         run.extend(recorded);
         let key = |t: &HostTexture| t.texture.as_raw() as usize;
         let mut states = std::collections::HashMap::from([(key(&depth), DEPTH_WRITE), (key(&twin.planes[0]), 0)]);
-        replay(&run, &mut states).unwrap();
+        replay(&run, &mut states).unwrap_or_else(|error| {
+            panic!("{error}; transitions: {run:?}")
+        });
         // What the list left is what the next prelude starts from.
         assert_eq!(states[&key(&depth)], depth.state.load(Relaxed));
         assert_eq!(states[&key(&twin.planes[0])], twin.planes[0].state.load(Relaxed));

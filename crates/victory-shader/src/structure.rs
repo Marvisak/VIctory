@@ -1114,8 +1114,14 @@ impl<'a> Lanes<'a> {
             "cselect" => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
                 let scc = inst.read(Reg::Scc)?;
-                let born = self.born(scc);
-                let u = self.b.atom(Atom::Uniform(scc), born);
+                // A mask operation's SCC is represented by the lanes in
+                // its result, just as a branch on that SCC is. Keep that
+                // representation when the select itself builds a mask;
+                // the scalar SCC value is not materialized by the emitter.
+                let u = self.scc_lane.get(&scc).copied().unwrap_or_else(|| {
+                    let born = self.born(scc);
+                    self.b.atom(Atom::Uniform(scc), born)
+                });
                 (self.b.ite(u, a, c), None)
             }
             _ => {

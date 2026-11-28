@@ -11,11 +11,14 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 const MAX_FILE_SIZE: usize = 512 * 1024;
+const MAX_SHADER_LOWER_SIZE: usize = 640 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh", "py", "c",
 ];
+/// The launcher's locally authored settings schema, checked as text below.
+const ALLOWED_PATHS: &[&str] = &["apps/victory/src/settings_template.xml"];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
     ".gitattributes",
@@ -148,15 +151,23 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     let allowed = ALLOWED_NAMES.contains(&name)
+        || ALLOWED_PATHS.contains(&path)
         || ext
             .as_deref()
             .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
     if !allowed {
         problems.push("file type not on the allowlist".to_owned());
     }
-    if content.len() > MAX_FILE_SIZE {
+    // The shader lowerer remains source text under every content check; its
+    // accumulated conversion rules now exceed the general 512 KiB ceiling.
+    let size_limit = if path == "crates/victory-shader/src/emit/lower.rs" {
+        MAX_SHADER_LOWER_SIZE
+    } else {
+        MAX_FILE_SIZE
+    };
+    if content.len() > size_limit {
         problems.push(format!(
-            "{} bytes exceeds the {MAX_FILE_SIZE}-byte limit",
+            "{} bytes exceeds the {size_limit}-byte limit",
             content.len()
         ));
     }
@@ -235,6 +246,11 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+        assert!(check("scripts/cook-textures.py", b"print('hello')\n").is_empty());
+        assert!(check("scripts/victory-first-run.c", b"int main(void) { return 0; }\n").is_empty());
+        assert!(check("apps/victory/src/settings_template.xml", b"<settings/>\n").is_empty());
+        assert!(!check("assets/settings.xml", b"<settings/>\n").is_empty());
+        assert!(check("crates/victory-shader/src/emit/lower.rs", "fn a() {}\n".repeat(54_000).as_bytes()).is_empty());
     }
 
     #[test]

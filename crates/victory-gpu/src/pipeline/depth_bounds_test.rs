@@ -1,5 +1,6 @@
 //! Synthetic shaders, depth target and readback for a pipeline stream and
-//! draws that go through the title entry points.
+//! depth-bounds commands that go through the title entry point, with a
+//! directly bound host DSV and pipeline for the depth readback.
 
 use super::*;
 use crate::object::{S_OK, slot};
@@ -94,7 +95,7 @@ fn made(pso: This) -> &'static host::HostPipeline {
 }
 
 #[test]
-fn depth_bounds_control_a_title_draw() {
+fn depth_bounds_command_controls_a_depth_draw() {
     let Some(host) = crate::host::host() else {
         eprintln!("skipped depth bounds render: no host D3D12 device");
         return;
@@ -165,7 +166,7 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     let newer = crate::list::has_newer_table(list);
     let bounds = slot::<extern "system" fn(This, f32, f32)>(list, if newer { 0x230 } else { 0x220 });
     let scissors = slot::<extern "system" fn(This, u32, *const RECT)>(list, 0xb0);
-    let draw = slot::<extern "system" fn(This, u32, u32, u32, u32)>(list, 0x60);
+    let host_pso = made(pso);
     let draw_pixel = |x| {
         scissors(list, 1, &RECT { left: x, top: 0, right: x + 1, bottom: 1 });
         if mesh {
@@ -174,7 +175,10 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
             );
             dispatch(list, 1, 1, 1);
         } else {
-            draw(list, 3, 1, 0, 0);
+            // The test DSV is a host-only resource. A title draw would
+            // select the depthless PSO because no title DSV was recorded.
+            // SAFETY: the host DSV and depth-enabled PSO are bound below.
+            unsafe { l.DrawInstanced(3, 1, 0, 0) };
         }
     };
     let depth_desc = D3D12_RESOURCE_DESC {
@@ -214,7 +218,11 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     let bind = || {
         // SAFETY: an open list and the live depth buffer's descriptor.
         unsafe { l.OMSetRenderTargets(0, None, false, Some(&dsv)) };
-        slot::<extern "system" fn(This, This)>(list, 0xc8)(list, pso);
+        // SAFETY: this test owns the translated host pipeline and list.
+        unsafe {
+            l.SetGraphicsRootSignature(&host_pso.root);
+            l.SetPipelineState(&host_pso.pso);
+        }
         if !mesh {
             slot::<extern "system" fn(This, u32)>(list, 0xa0)(list, 4); // triangle list
         }
