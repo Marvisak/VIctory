@@ -2432,8 +2432,12 @@ impl<'a> Lower<'a> {
     /// minimum of the three instead (the host's minimum skips NaNs, so that
     /// is the smallest number among them).
     fn med3(&mut self, a: V, b: V, third: V) -> V {
-        let c = self.cur;
         let (a, b, third) = (self.ftz(a), self.ftz(b), self.ftz(third));
+        self.med3_flushed(a, b, third)
+    }
+
+    fn med3_flushed(&mut self, a: V, b: V, third: V) -> V {
+        let c = self.cur;
         let lo = self.max_min_flushed(false, a, b);
         let hi = self.max_min_flushed(true, a, b);
         let t = self.max_min_flushed(false, hi, third);
@@ -7001,8 +7005,9 @@ impl<'a> Lower<'a> {
                 "v_sub_f16" => self.s.m.bin(c, Bin::Sub, a, b),
                 "v_subrev_f16" => self.s.m.bin(c, Bin::Sub, b, a),
                 "v_mul_f16" => self.s.m.bin(c, Bin::Mul, a, b),
-                "v_max_f16" => self.max_min(true, a, b),
-                _ => self.max_min(false, a, b),
+                // Even a widened f16 subnormal is normal in f32.
+                "v_max_f16" => self.max_min_flushed(true, a, b),
+                _ => self.max_min_flushed(false, a, b),
             };
             return float_result(self, r);
         }
@@ -7038,15 +7043,12 @@ impl<'a> Lower<'a> {
                 // shortcut: fused f16 multiply-adds as FMad in f32 (the
                 // product is exact; the sum rounds twice).
                 "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
-                "v_max3_f16" => {
-                    let t = self.max_min(true, a, b);
-                    self.max_min(true, t, acc)
+                "v_max3_f16" | "v_min3_f16" => {
+                    let max = name == "v_max3_f16";
+                    let t = self.max_min_flushed(max, a, b);
+                    self.max_min_flushed(max, t, acc)
                 }
-                "v_min3_f16" => {
-                    let t = self.max_min(false, a, b);
-                    self.max_min(false, t, acc)
-                }
-                _ => self.med3(a, b, acc),
+                _ => self.med3_flushed(a, b, acc),
             };
             return float_result(self, r);
         }
