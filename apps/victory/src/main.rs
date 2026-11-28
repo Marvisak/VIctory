@@ -83,12 +83,23 @@ enum Command {
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader. With
-        /// `--cache`: then make every pipeline of the title's shader pack
-        /// into the host pipeline library `run` reads (on this GPU and
+        /// Also create a host D3D12 pipeline for each emitted shader
+        /// (translated for this host's wave sizes unless --host-lanes says).
+        /// With `--cache`: then make every pipeline of the title's shader
+        /// pack into the host pipeline library `run` reads (on this GPU and
         /// driver; a second time only what is not there yet).
         #[arg(long)]
         pipelines: bool,
+        /// Translate for a host whose waves are MIN-MAX lanes (32-32 for
+        /// NVIDIA, 32-64 for AMD RDNA): shaders that need another wave size
+        /// are listed as failures. Default: any wave size.
+        #[arg(long, value_name = "MIN-MAX", value_parser = parse_lanes)]
+        host_lanes: Option<(u32, u32)>,
+        /// Translate without pair meetings (what `VICTORY_BVH_HALVES=0`
+        /// does at run time): wave64 programs whose groups hold several
+        /// console waves are refused on hosts without 64-lane waves.
+        #[arg(long, conflicts_with = "cache")]
+        no_pair_meetings: bool,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
@@ -97,8 +108,9 @@ enum Command {
         jobs: Option<NonZeroUsize>,
         /// Only translate into the shader cache `run` reads (the warm-up):
         /// every container found, once, nothing else checked or listed
-        /// (with `--pipelines`, then the shader pack's pipelines).
-        #[arg(long, conflicts_with_all = ["validate", "list"])]
+        /// (with `--pipelines`, then the shader pack's pipelines), for this
+        /// host's wave sizes as `run` translates.
+        #[arg(long, conflicts_with_all = ["validate", "list", "host_lanes"])]
         cache: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
@@ -182,12 +194,16 @@ fn main() -> Result<()> {
             list,
             jobs,
             cache: false,
+            host_lanes,
+            no_pair_meetings,
         } => translate::run(
             paths,
             validate,
             pipelines,
             list,
             jobs.map(NonZeroUsize::get),
+            host_lanes,
+            !no_pair_meetings,
         ),
         Command::Run {
             exe,
@@ -206,6 +222,23 @@ fn main() -> Result<()> {
         }
         Command::Config => show_config(),
     }
+}
+
+/// `MIN-MAX` lanes per wave, or one size `N`.
+fn parse_lanes(s: &str) -> Result<(u32, u32), String> {
+    let (a, b) = s.split_once('-').unwrap_or((s, s));
+    let n = |x: &str| {
+        x.trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| n.is_power_of_two() && (4..=128).contains(n))
+            .ok_or_else(|| format!("{x:?} is not a wave size (4 to 128, a power of two)"))
+    };
+    let (a, b) = (n(a)?, n(b)?);
+    if a > b {
+        return Err(format!("{a} is more than {b}"));
+    }
+    Ok((a, b))
 }
 
 fn show_config() -> Result<()> {
