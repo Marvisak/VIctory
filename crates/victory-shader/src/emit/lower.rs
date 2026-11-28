@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1407,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -7562,14 +7567,13 @@ impl<'a> Lower<'a> {
                 } else {
                     m31(self, sh)
                 };
-                let k32 = k(self, 32);
                 let lo = self.s.m.bin(c, Bin::LShr, b, sh);
-                let left = self.s.m.bin(c, Bin::Sub, k32, sh);
-                let left = m31(self, left);
-                let hi = self.s.m.bin(c, Bin::Shl, a, left);
-                let zero = k(self, 0);
-                let none = self.s.m.cmp(c, pred::EQ, sh, zero);
-                let hi = self.s.m.select(c, none, zero, hi);
+                // Split a << (32 - sh) into two bounded shifts. At sh=0
+                // they shift out every bit without ever shifting by 32.
+                let (one, k31) = (k(self, 1), k(self, 31));
+                let hi = self.s.m.bin(c, Bin::Shl, a, one);
+                let left = self.s.m.bin(c, Bin::Sub, k31, sh);
+                let hi = self.s.m.bin(c, Bin::Shl, hi, left);
                 self.s.m.bin(c, Bin::Or, lo, hi)
             }
             "v_bfrev_b32" => {
@@ -11089,6 +11093,23 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn align_instructions_use_bounded_shifts() {
+        // All three sources are dynamic root constants copied to VGPRs;
+        // v0 is stored to a live UAV. Count the written DXIL, not source ops.
+        let counts: Vec<_> = [0x14Eu32, 0x14F]
+            .into_iter()
+            .map(|op| {
+                let lowered =
+                    lower_valu(&[0xD400_0000 | op << 16, 0x101 | 0x102 << 9 | 0x103 << 18])
+                        .expect("align lowers");
+                eprintln!("align {op:#x}: {} DXIL instructions", lowered.instructions);
+                lowered.instructions
+            })
+            .collect();
+        assert_eq!(counts, [24, 25]);
     }
 
     #[test]

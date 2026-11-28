@@ -2034,6 +2034,90 @@ fn integers_match_the_hardware() {
     assert_clean(check(&integer_probes()));
 }
 
+/// Both align forms take the low word of a shifted 64-bit concatenation.
+/// Check every effective shift, ignored shift bits, one-bit sources,
+/// overlapping destinations, and preservation of inactive lanes.
+#[test]
+fn align_matches_concatenation_with_overlapping_destinations_and_exec() {
+    let values = [
+        0,
+        1,
+        u32::MAX,
+        0x8000_0000,
+        0x7FFF_FFFF,
+        0x5555_5555,
+        0xAAAA_AAAA,
+        0x1234_5678,
+    ];
+    let mut inputs = Vec::new();
+    for shift in 0..64u32 {
+        for a in values {
+            for b in values {
+                inputs.extend([[a, b, shift, OLD], [a, b, shift | 0xFFFF_FFC0, OLD]]);
+            }
+        }
+        for bit in 0..32 {
+            let one = 1u32 << bit;
+            inputs.extend([
+                [one, 0, shift, OLD],
+                [0, one, shift, OLD],
+                [!one, 0, shift, OLD],
+                [0, !one, shift, OLD],
+            ]);
+        }
+    }
+    let mut random = 0x7812_9345u32;
+    for _ in 0..2048 {
+        let mut input = [0; 4];
+        for x in &mut input[..3] {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            *x = random;
+        }
+        input[3] = OLD;
+        inputs.push(input);
+    }
+    let mut probes = Vec::new();
+    for op in [0x14E, 0x14F] {
+        for dst in [5, 1, 2, 3] {
+            for guarded in [false, true] {
+                let mut body = Vec::new();
+                if guarded {
+                    body.push(vopc(0xC4, v(2), 3)); // v_cmp_gt_u32 vcc, v2, v3
+                    body.push(sop1(0x3C, 20, VCC)); // s_and_saveexec_b32 s20, vcc
+                }
+                body.extend(vop3(op, dst, [v(1), v(2), v(3)], NONE));
+                if guarded {
+                    body.push(sop1(0x03, 126, s(20))); // restore EXEC
+                }
+                if dst != 5 {
+                    body.push(vop1(0x01, 5, v(dst)));
+                }
+                probes.push(probe(body, inputs.clone(), INT, move |i| {
+                    if guarded && i[1] <= i[2] {
+                        return vec![if dst == 5 {
+                            OLD
+                        } else {
+                            i[usize::from(dst - 1)]
+                        }];
+                    }
+                    // A wide concatenation, independent of the lowering's
+                    // word-sized shifts and zero-shift handling.
+                    let shift = if op == 0x14E {
+                        i[2] & 31
+                    } else {
+                        (i[2] & 3) * 8
+                    };
+                    let pair = u64::from(i[0]) << 32 | u64::from(i[1]);
+                    vec![(pair >> shift) as u32]
+                }));
+            }
+        }
+    }
+    assert_clean(check(&probes));
+}
+
 /// Carries as lane masks: `v_add_co_u32` into VCC, `v_add_co_ci_u32`
 /// taking and giving VCC, the last carry read back by `v_cndmask_b32`.
 #[test]
