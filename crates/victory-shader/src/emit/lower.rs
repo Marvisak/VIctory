@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod gather;
 
 type Why = &'static str;
 
@@ -8972,6 +8973,20 @@ impl<'a> Lower<'a> {
                             let t = self.s.m.bin(c, Bin::Shl, w, left);
                             let k26 = self.s.m.i32(26);
                             os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
+                        }
+                    }
+                    if kind != 5 {
+                        // Hosts resolve a coordinate near a texel's edge
+                        // differently: take the console's footprint.
+                        let i32t = self.s.t.i32;
+                        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                        let z = self.s.m.i32(0);
+                        let d = self
+                            .s
+                            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, z]);
+                        for k in 0..spatial.min(2) {
+                            let n = self.s.m.extract(c, d, k as u32);
+                            args[2 + k] = self.gather_console_coordinate(cs[k], n);
                         }
                     }
                     args.extend(&os[..2]);
