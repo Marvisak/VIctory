@@ -163,6 +163,12 @@ default worker count.
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+On a host without 64-lane waves (NVIDIA), a console wave64 compute program
+whose thread group holds several console waves runs in the console flow with
+pair meetings: the two 32-lane halves of each console wave meet on their own
+before shared-memory accesses and wave-wide operations. `VICTORY_BVH_HALVES=0`
+(or `translate --no-pair-meetings`) refuses these programs as before.
+
 ### Windows shader-test validator
 
 The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.

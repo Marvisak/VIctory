@@ -105,3 +105,12 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+
+On a 32-lane host, eligible wave64 compute programs run in two 32-lane
+halves. In a single-wave thread group, the console's control flow uses
+group barriers for cross-half exchanges and shared LDS accesses.
+Whole-wave reductions in a partial group combine the halves that contain
+threads. `ds_permute_b32` still prevents splitting. `ds_bpermute_b32`
+gathers within each 32-lane half.
+Translation refuses programs by name if their required wave size falls
+outside the host's range.

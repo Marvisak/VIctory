@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, Target, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -79,17 +79,63 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// The translation of a console shader container, from the cache when
-/// there is one, and whether it came from there.
-pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+/// The wave sizes a run translates for: the host device's, any without one.
+/// The warm-up asks here too, so its entries are the ones a run looks up.
+pub fn host_target() -> Target {
+    crate::host::host().map_or(Target::ANY, |h| h.target())
+}
+
+/// Whether programs translate with pair meetings
+/// ([`victory_shader::emit::Options::pair_meetings`]): yes, unless
+/// `VICTORY_BVH_HALVES=0` (for A/B runs; logged once). Off, console wave64
+/// programs with several console waves to a group are refused on hosts of
+/// 32-lane waves, as before (among them five of the BVH builder's stages).
+pub fn pair_meetings() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let off = std::env::var_os("VICTORY_BVH_HALVES").is_some_and(|v| v == "0");
+        if off {
+            tracing::info!("programs translate without pair meetings (VICTORY_BVH_HALVES=0)");
+        }
+        !off
+    });
+    *ON
+}
+
+/// The translation of a console shader container for a host that runs
+/// `target`'s wave sizes, from the cache when there is one, and whether it
+/// came from there.
+pub fn host_shader(container: &[u8], target: Target) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true };
+    let pair_meetings = pair_meetings();
+    let options = victory_shader::emit::Options {
+        view_marks: true,
+        target,
+        pair_meetings,
+    };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(
+            cache,
+            &host_key(build(), target, pair_meetings),
+            container,
+            translate,
+        ),
         None => (translate(container), false),
     }
+}
+
+/// The part of an entry's key before the container: the build, and the
+/// host's wave sizes (a translation for one host's waves is not another's),
+/// and pair meetings when asked for (keys without them stay as they were).
+fn host_key(build: &[u8; 32], target: Target, pair_meetings: bool) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(&target.key());
+    if pair_meetings {
+        h.update(b"pair meetings");
+    }
+    *h.finalize().as_bytes()
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -498,6 +544,36 @@ mod tests {
             std::str::from_utf8(ENCODING)
                 .unwrap()
                 .contains("fn encode(translation: &Result<HostShader, String>)")
+        );
+    }
+
+    #[test]
+    fn keys_tell_hosts_wave_sizes_apart() {
+        let build = [7u8; 32];
+        let nvidia = Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        };
+        let rdna = Target {
+            lanes_min: 32,
+            lanes_max: 64,
+        };
+        assert_eq!(
+            host_key(&build, nvidia, false),
+            host_key(&build, nvidia, false)
+        );
+        assert_ne!(
+            host_key(&build, nvidia, false),
+            host_key(&build, rdna, false)
+        );
+        assert_ne!(
+            host_key(&build, nvidia, false),
+            host_key(&[8; 32], nvidia, false)
+        );
+        // Pair meetings change the translation of the builder's programs.
+        assert_ne!(
+            host_key(&build, nvidia, false),
+            host_key(&build, nvidia, true)
         );
     }
 
