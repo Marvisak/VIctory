@@ -2,6 +2,8 @@
 //! plays, 48 kHz stereo 16-bit, through process loopback: our own process
 //! tree only, never the rest of the host's mix. Stretches where nothing was
 //! played are written as silence, so the file keeps real time.
+//! The first packet log carries the WAV start as Unix time in 100 ns units
+//! when the packet has a usable timestamp.
 //!
 //! The recorder runs in a child copy of this executable: an audio client
 //! in the title's process raises that process's timer resolution, which
@@ -12,8 +14,10 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Media::Audio::{
-    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
     AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
@@ -23,7 +27,8 @@ use windows::Win32::Media::Audio::{
     VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVE_FORMAT_PCM, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-use windows::Win32::Foundation::WAIT_OBJECT_0;
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_SYNCHRONIZE, Sleep, WaitForSingleObject,
 };
@@ -115,6 +120,52 @@ fn header(frames: u64) -> [u8; 44] {
     h
 }
 
+/// Convert the packet's WASAPI QPC timestamp to Unix time in 100 ns units.
+fn packet_unix_100ns(qpc: u64, before: u64, after: u64, filetime: u64) -> Option<u64> {
+    const UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+    let sample_span = after.checked_sub(before)?;
+    let packet_age = (before + sample_span / 2).checked_sub(qpc)?;
+    filetime.checked_sub(UNIX_EPOCH)?.checked_sub(packet_age)
+}
+
+fn log_first_packet(qpc: u64, flags: u32) {
+    if flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0 {
+        tracing::info!("audio capture: first packet has no reliable timestamp");
+        return;
+    }
+    match sample_packet_time(qpc) {
+        Ok(Some((unix_100ns, sample_span))) => tracing::info!(
+            wav_start_unix_100ns = unix_100ns,
+            clock_sample_100ns = sample_span,
+            "audio capture: first packet"
+        ),
+        Ok(None) => tracing::info!("audio capture: first packet has no reliable timestamp"),
+        Err(error) => tracing::debug!(%error, "audio capture: first packet clock sample failed"),
+    }
+}
+
+fn sample_packet_time(qpc: u64) -> windows::core::Result<Option<(u64, u64)>> {
+    const TICKS_PER_SECOND: i128 = 10_000_000;
+    let (mut frequency, mut before, mut after) = (0i64, 0i64, 0i64);
+    // Bracket the wall-clock read to estimate its QPC and log the sample span.
+    // SAFETY: QPC functions write one value to each valid out pointer.
+    let time = unsafe {
+        QueryPerformanceFrequency(&mut frequency)?;
+        QueryPerformanceCounter(&mut before)?;
+        let time = GetSystemTimePreciseAsFileTime();
+        QueryPerformanceCounter(&mut after)?;
+        time
+    };
+    if frequency <= 0 || before < 0 || after < before {
+        return Ok(None);
+    }
+    let to_ticks =
+        |counter| (i128::from(counter) * TICKS_PER_SECOND / i128::from(frequency)) as u64;
+    let (before, after) = (to_ticks(before), to_ticks(after));
+    let filetime = (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    Ok(packet_unix_100ns(qpc, before, after, filetime).map(|unix| (unix, after - before)))
+}
+
 fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: COM calls with parameters built here; buffers are used only
     // between `GetBuffer` and `ReleaseBuffer`.
@@ -191,6 +242,10 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             while capture.GetNextPacketSize()? > 0 {
                 let (mut data, mut frames, mut flags, mut qpc) = (std::ptr::null_mut(), 0, 0, 0);
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
+                if frames == 0 {
+                    break;
+                }
+                let first_packet = written == 0;
                 // Where this packet belongs, from its time stamp (100 ns).
                 let at = (qpc - *first.get_or_insert(qpc)) * u64::from(RATE) / 10_000_000;
                 if at > written + u64::from(RATE / 500) {
@@ -213,6 +268,9 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 written += u64::from(frames);
                 capture.ReleaseBuffer(frames)?;
+                if first_packet {
+                    log_first_packet(qpc, flags);
+                }
             }
             if ended || patched.elapsed() >= Duration::from_secs(1) {
                 // Valid sizes at any time: runs end by being killed.
@@ -225,5 +283,24 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::packet_unix_100ns;
+
+    #[test]
+    fn converts_audio_packet_qpc_to_unix_ticks() {
+        let filetime = 116_444_736_000_001_000;
+        assert_eq!(packet_unix_100ns(90, 100, 104, filetime), Some(988));
+    }
+
+    #[test]
+    fn rejects_inconsistent_clock_samples() {
+        let filetime = 116_444_736_000_000_100;
+        assert_eq!(packet_unix_100ns(110, 100, 104, filetime), None);
+        assert_eq!(packet_unix_100ns(90, 104, 100, filetime), None);
+        assert_eq!(packet_unix_100ns(0, 1000, 1004, filetime), None);
     }
 }
