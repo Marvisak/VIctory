@@ -2814,6 +2814,46 @@ fn scalar_alu_matches_the_hardware() {
     assert_clean(check(&passing(scalar_probes())));
 }
 
+/// All packed scalar offsets and seven-bit widths, including ignored
+/// control bits, checked with a field model and SCC on both host adapters.
+#[test]
+fn scalar_bitfield_extract_all_widths_and_offsets() {
+    let mut inputs = Vec::new();
+    for a in [0, u32::MAX, 0x8000_0000, 0xD2F9_0159] {
+        for offset in 0..32 {
+            for width in 0..128 {
+                for ignored in [0, 0xFF80_FFE0] {
+                    inputs.push([a, offset | width << 16 | ignored, 0, OLD]);
+                }
+            }
+        }
+    }
+    let probes: Vec<_> = [(0x27, false), (0x28, true)]
+        .into_iter()
+        .map(|(op, signed)| {
+            scalar_out(sop2(op, 20, s(16), s(17)), inputs.clone(), move |i| {
+                let offset = i[1] & 31;
+                let bits = (i[1] >> 16 & 127).min(32 - offset);
+                let result = if bits == 0 {
+                    0
+                } else {
+                    // Extract in u64, then interpret the field as a signed
+                    // integer when requested. No shift by the word width.
+                    let modulus = 1u64 << bits;
+                    let field = (u64::from(i[0]) >> offset) & (modulus - 1);
+                    if signed && field & (modulus >> 1) != 0 {
+                        (field as i64 - modulus as i64) as u32
+                    } else {
+                        field as u32
+                    }
+                };
+                (result, Some(result != 0))
+            })
+        })
+        .collect();
+    assert_clean(check(&probes));
+}
+
 // ---- lanes ----
 
 /// Masked lanes keep their registers: `s_and_saveexec_b32` narrowing to the

@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1405,6 +1408,8 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
             #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
+            #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
@@ -2426,6 +2431,26 @@ impl<'a> Lower<'a> {
         let is0 = self.s.m.cmp(c, pred::EQ, w, zero);
         let keep = self.s.m.bin(c, Bin::Or, full, is0);
         self.s.m.select(c, keep, r, t)
+    }
+
+    /// Scalar BFE has a seven-bit width; DXIL Ibfe/Ubfe mask it to five.
+    /// For widths of 32 or more, keep the scalar instruction's shifted word.
+    fn scalar_bfe(&mut self, a: V, off: V, width: V, signed: bool) -> V {
+        let c = self.cur;
+        let (k31, k32) = (self.s.m.i32(31), self.s.m.i32(32));
+        let off = self.s.m.bin(c, Bin::And, off, k31);
+        let shift = if signed { Bin::AShr } else { Bin::LShr };
+        let shifted = self.s.m.bin(c, shift, a, off);
+        let full = self.s.m.cmp(c, pred::IUGE, width, k32);
+        let field = self.s.op(
+            c,
+            "tertiary.i32",
+            Attr::ReadNone,
+            self.s.t.i32,
+            if signed { 51 } else { 52 }, // Ibfe / Ubfe
+            &[width, off, a],
+        );
+        self.s.m.select(c, full, shifted, field)
     }
 
     /// The median of three. With a NaN among them the hardware gives the
@@ -3936,7 +3961,7 @@ impl<'a> Lower<'a> {
                 let (k16, k127) = (self.s.m.i32(16), self.s.m.i32(0x7F));
                 let w = self.s.m.bin(c, Bin::LShr, b, k16);
                 let w = self.s.m.bin(c, Bin::And, w, k127);
-                (self.bfe(a, b, w, name == "s_bfe_i32"), None)
+                (self.scalar_bfe(a, b, w, name == "s_bfe_i32"), None)
             }
             "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_andn2_b32" | "s_orn2_b32"
             | "s_nand_b32" | "s_nor_b32" | "s_xnor_b32" => {
@@ -11089,6 +11114,18 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn scalar_bitfield_extract_instruction_count() {
+        // SOP2 s_bfe_{u32,i32} s16, s0, s1; v_mov_b32 v0, s16.
+        // Both operands are runtime root constants; the result reaches a UAV.
+        let counts = [0x27u32, 0x28].map(|op| {
+            let words = [0x8010_0100 | op << 23, 0x7E00_0210];
+            lower_valu(&words).expect("scalar BFE").instructions
+        });
+        eprintln!("s_bfe_u32/i32 written instructions: {counts:?}");
+        assert_eq!(counts, [23, 23]);
     }
 
     #[test]
