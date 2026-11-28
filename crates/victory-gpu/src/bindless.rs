@@ -112,6 +112,14 @@ impl Inner {
                             self.hulls.remove(&(key.0, key.3));
                         }
                     }
+                    // A heap views a range of the copy as unordered access:
+                    // the bytes its shaders write stay only in the copy
+                    // (`refresh`'s shortcut below) and made again from title
+                    // memory it would lose them, so it is never evicted
+                    // (`Shadow::note_heap_uav`).
+                    if key.3 && now > 0 {
+                        shadow.note_heap_uav();
+                    }
                 }
             }
             Seen::Texture(r) => {
@@ -310,6 +318,10 @@ impl Uploads {
 /// there. Copying back the whole unordered ranges after every submission
 /// (about 1 GB of them in the world) cost seconds per frame; the upgrade
 /// is shaders marking the pages they write (as `crate::memory` does).
+///
+/// Such a copy is therefore never evicted (`Shadow::note_heap_uav`):
+/// made again from title memory after a budget pass gave it up, it would
+/// hold the title's bytes where the shaders' were.
 ///
 /// Copies the title has not written since they took it are passed by: a
 /// world submission's heaps reach ~9,000 copies, a few of them written.

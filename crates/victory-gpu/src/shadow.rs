@@ -90,7 +90,22 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    /// Monotonic use stamp for opt-in LRU eviction (`VICTORY_SHADOW_BUDGET_MB`).
+    last_used: std::sync::atomic::AtomicU64,
+    /// Set once a heap view can let shaders write the copy as unordered
+    /// access (`crate::bindless`, `descriptor::host`): what they write stays
+    /// only in the copy and never goes back to title memory (bindless,
+    /// "shortcut" on [`crate::bindless::refresh`]), so the copy is never
+    /// evicted: made again from title memory, it would silently lose those
+    /// bytes. Permanent: the bytes do not return when the view goes.
+    heap_uav: std::sync::atomic::AtomicBool,
+    /// Held (cloned) by every descriptor slot that views the copy, owned or
+    /// not ([`Shadow::slot_token`]): the eviction pass sees a live slot by
+    /// its count.
+    slots: Arc<()>,
 }
+
+static USE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
@@ -264,6 +279,11 @@ impl Shadow {
             marks,
             base: slice.map_or(0, |s| s.offset),
             slice,
+            last_used: std::sync::atomic::AtomicU64::new(
+                USE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ),
+            heap_uav: std::sync::atomic::AtomicBool::new(false),
+            slots: Arc::new(()),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -285,6 +305,28 @@ impl Shadow {
     /// Whether writes through views of this copy are marked.
     pub(crate) fn marked(&self) -> bool {
         self.marks.is_some()
+    }
+
+    /// A heap view may let shaders write it as unordered access: from now on
+    /// it is never evicted (see the field).
+    pub(crate) fn note_heap_uav(&self) {
+        self.heap_uav.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a heap view ever could write it as unordered access.
+    pub(crate) fn heap_uav(&self) -> bool {
+        self.heap_uav.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A token a descriptor slot holds while it views the copy, even one it
+    /// does not own (the eviction pass does not evict while any is alive).
+    pub(crate) fn slot_token(&self) -> Arc<()> {
+        self.slots.clone()
+    }
+
+    /// Whether any descriptor slot holds a [`Shadow::slot_token`].
+    fn slot_held(&self) -> bool {
+        Arc::strong_count(&self.slots) != 1
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -1047,7 +1089,137 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
         changed();
     }
+    if let Some(s) = &entry.shadow {
+        s.last_used.store(
+            USE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     entry.shadow.clone()
+}
+
+fn shadow_budget_bytes_for(val: Option<&str>) -> Option<u64> {
+    let val = val?;
+    let Ok(mb) = val.trim().parse::<u64>() else {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                value = val,
+                "VICTORY_SHADOW_BUDGET_MB is not a whole number of MiB: shadow budget off (logged once)"
+            )
+        });
+        return None;
+    };
+    (mb > 0).then(|| mb.saturating_mul(1 << 20))
+}
+
+fn shadow_budget_bytes() -> Option<u64> {
+    static CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        if cfg!(test) {
+            return None;
+        }
+        shadow_budget_bytes_for(std::env::var("VICTORY_SHADOW_BUDGET_MB").ok().as_deref())
+    })
+}
+
+/// Evicts least-recently-used unreferenced `Shadow` buffer copies from
+/// [`BUFFERS`] until total live shadow bytes are at or below `budget`.
+/// Only copies with `Arc::strong_count == 1`, no pending GPU writebacks and
+/// no descriptor slot viewing them ([`Shadow::slot_token`]) and no heap view
+/// of them with unordered access ([`Shadow::note_heap_uav`], permanent) are
+/// eligible, so no active command list or descriptor slot is affected and
+/// no bytes only the GPU wrote are lost.
+///
+/// Bytes of copies it cannot evict (held by page tables, `crate::memory`
+/// layouts, heaps or command lists; written through heap unordered access)
+/// stay in the total. When they alone are past the budget it is unreachable:
+/// the pass is skipped (evicting every evictable copy each frame and making
+/// it again churns) and warned once. A zero budget (only tests pass one; the
+/// knob treats it as off) still runs.
+fn evict_unused_with_budget(budget: u64) -> (usize, u64) {
+    let mut evicted: Vec<Arc<Shadow>> = Vec::new();
+    let mut freed_bytes = 0u64;
+    {
+        let mut map = buffers();
+        let mut total: u64 = map
+            .values()
+            .filter_map(|e| e.shadow.as_ref())
+            .map(|s| s.len)
+            .sum();
+        if total <= budget {
+            return (0, 0);
+        }
+        let mut candidates: Vec<(u64, (u64, usize), u64)> = map
+            .iter()
+            .filter_map(|(&key, entry)| {
+                let s = entry.shadow.as_ref()?;
+                if Arc::strong_count(s) != 1 || s.slot_held() || s.heap_uav() {
+                    return None;
+                }
+                if !s.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                    return None;
+                }
+                if !s.before.lock().unwrap_or_else(|e| e.into_inner()).0.is_empty() {
+                    return None;
+                }
+                Some((
+                    s.last_used.load(std::sync::atomic::Ordering::Relaxed),
+                    key,
+                    s.len,
+                ))
+            })
+            .collect();
+        let evictable: u64 = candidates.iter().map(|&(_, _, len)| len).sum();
+        if budget > 0 && total - evictable > budget {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    budget,
+                    held = total - evictable,
+                    "shadow copies that cannot be evicted alone are past VICTORY_SHADOW_BUDGET_MB: eviction skipped (logged once)"
+                )
+            });
+            return (0, 0);
+        }
+        candidates.sort_unstable_by_key(|&(stamp, _, _)| stamp);
+        for (_, key, len) in candidates {
+            if total <= budget {
+                break;
+            }
+            if let Some(entry) = map.get_mut(&key)
+                && entry
+                    .shadow
+                    .as_ref()
+                    .is_some_and(|s| Arc::strong_count(s) == 1 && !s.slot_held() && !s.heap_uav())
+                && let Some(shadow) = entry.shadow.take()
+            {
+                total = total.saturating_sub(len);
+                freed_bytes = freed_bytes.saturating_add(len);
+                evicted.push(shadow);
+            }
+        }
+        if !evicted.is_empty() {
+            changed();
+        }
+    }
+    let count = evicted.len();
+    drop(evicted);
+    (count, freed_bytes)
+}
+
+/// Once per presented frame, when `VICTORY_SHADOW_BUDGET_MB` is set, evicts
+/// least-recently-used unreferenced shadow buffer copies past the budget.
+pub(crate) fn evict_unused() {
+    let Some(budget) = shadow_budget_bytes() else {
+        return;
+    };
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let frame = crate::queue::presented();
+    if LAST.swap(frame, std::sync::atomic::Ordering::Relaxed) == frame {
+        return;
+    }
+    let _ = evict_unused_with_budget(budget);
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -1656,5 +1828,108 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// The budget tests evict from the shared [`BUFFERS`]: serialized so one
+    /// does not take the copy the other is about to check.
+    static BUDGET_TESTS: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn shadow_budget_evicts_lru_unreferenced_copies_and_keeps_held_ones() {
+        let _serial = BUDGET_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(shadow_budget_bytes_for(None), None);
+        assert_eq!(shadow_budget_bytes_for(Some("0")), None);
+        assert_eq!(shadow_budget_bytes_for(Some("512")), Some(512 << 20));
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let a = crate::watch::tests::pool(2);
+        let b = crate::watch::tests::pool(2);
+        let len = (2 * PAGE) as u64;
+        register(a, a as u64, len);
+        register(b, b as u64, len);
+        let sa = find(a as u64, len).expect("shadow a");
+        let sb = find(b as u64, len).expect("shadow b");
+        // Drop external ref to `a` so it becomes evictable; keep `sb` held.
+        drop(sa);
+        let (evicted, freed) = evict_unused_with_budget(0);
+        assert!(evicted >= 1 && freed >= len, "unreferenced shadow a evicted");
+        // `b` is still held externally (strong_count > 1) and must remain in BUFFERS.
+        assert!(
+            buffers()
+                .get(&(b as u64, b))
+                .is_some_and(|e| e.shadow.is_some()),
+            "externally held shadow b must not be evicted"
+        );
+        assert!(
+            buffers()
+                .get(&(a as u64, a))
+                .is_some_and(|e| e.shadow.is_none()),
+            "evicted shadow a slot cleared"
+        );
+        drop(sb);
+        unregister(a, a as u64);
+        unregister(b, b as u64);
+    }
+
+    /// A copy a descriptor slot views (even one it does not own) is not
+    /// eligible while the slot's token lives; once dropped, it is.
+    #[test]
+    fn shadow_budget_keeps_copies_with_a_live_slot_token() {
+        let _serial = BUDGET_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let a = crate::watch::tests::pool(2);
+        let len = (2 * PAGE) as u64;
+        register(a, a as u64, len);
+        let sa = find(a as u64, len).expect("shadow a");
+        let token = sa.slot_token();
+        drop(sa);
+        let (evicted, _) = evict_unused_with_budget(0);
+        assert_eq!(evicted, 0, "a copy with a live slot is kept");
+        assert!(buffers().get(&(a as u64, a)).is_some_and(|e| e.shadow.is_some()));
+        drop(token);
+        let (evicted, freed) = evict_unused_with_budget(0);
+        assert!(evicted >= 1 && freed >= len, "evictable once the slot is gone");
+        assert!(buffers().get(&(a as u64, a)).is_some_and(|e| e.shadow.is_none()));
+        unregister(a, a as u64);
+    }
+
+    /// A copy a heap ever viewed with unordered access may hold bytes only
+    /// the GPU wrote: it is never evicted, whatever else is released.
+    #[test]
+    fn shadow_budget_never_evicts_copies_marked_heap_uav() {
+        let _serial = BUDGET_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let a = crate::watch::tests::pool(2);
+        let b = crate::watch::tests::pool(2);
+        let len = (2 * PAGE) as u64;
+        register(a, a as u64, len);
+        register(b, b as u64, len);
+        let sa = find(a as u64, len).expect("shadow a");
+        let sb = find(b as u64, len).expect("shadow b");
+        sa.note_heap_uav();
+        drop(sa.slot_token()); // a token that came and went changes nothing
+        drop((sa, sb));
+        for _ in 0..2 {
+            let (evicted, _) = evict_unused_with_budget(0);
+            let _ = evicted;
+            let map = buffers();
+            let s = map
+                .get(&(a as u64, a))
+                .and_then(|e| e.shadow.as_ref())
+                .expect("a copy heaps write with unordered access is kept");
+            assert_eq!(Arc::strong_count(s), 1, "no other holder");
+            assert!(s.heap_uav());
+            assert!(
+                map.get(&(b as u64, b)).is_some_and(|e| e.shadow.is_none()),
+                "the unmarked copy went"
+            );
+        }
+        unregister(a, a as u64);
+        unregister(b, b as u64);
     }
 }

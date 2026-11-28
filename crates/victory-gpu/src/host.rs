@@ -1162,9 +1162,11 @@ impl Host {
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        // Host textures the title has not used for a while (or past the
-        // card's budget) are given up first: the last submission has run.
+        // Host textures and opt-in shadow buffer copies the title has not used
+        // for a while (or past budget) are given up first: the last submission
+        // has run.
         crate::resource::evict_unused();
+        crate::shadow::evict_unused();
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
