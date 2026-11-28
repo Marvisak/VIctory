@@ -62,7 +62,11 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
-    container: Vec<u8>,
+    /// The container's length, kept for logs after the bytes are gone.
+    size: usize,
+    /// The container, until it is translated (or never, if it never is).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    container: Mutex<Option<Vec<u8>>>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -92,7 +96,8 @@ impl Shader {
         Shader {
             stage,
             hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
-            container: bytes.to_vec(),
+            size: bytes.len(),
+            container: Mutex::new(Some(bytes.to_vec())),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }
@@ -100,9 +105,16 @@ impl Shader {
 
     #[cfg(all(test, windows))]
     pub(crate) fn for_test(stage: &'static str, translated: Translated) -> Arc<Shader> {
-        let shader = Shader::new(stage, b"");
+        let mut shader = Shader::new(stage, b"");
+        shader.size = 0;
         let _ = shader.translated.set(Some(translated));
         Arc::new(shader)
+    }
+
+    /// The container's bytes, if not yet released.
+    #[cfg(test)]
+    pub(crate) fn container_bytes(&self) -> Option<Vec<u8>> {
+        self.container.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -121,7 +133,10 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let (done, cached) = translate(&self.container);
+                // The bytes are not needed once translated: release them
+                // instead of holding every container for the session.
+                let container = self.container.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+                let (done, cached) = translate(&container);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
@@ -241,7 +256,7 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.size, hash = %shader.hash, "first bind");
     }
 }
 
@@ -743,8 +758,21 @@ mod tests {
         pipeline(p)
             .shaders
             .iter()
-            .map(|s| (s.stage, s.container.clone()))
+            .map(|s| (s.stage, s.container_bytes().unwrap_or_default()))
             .collect()
+    }
+
+    /// Translating releases the container's bytes; its size and the
+    /// translation stay.
+    #[cfg(windows)]
+    #[test]
+    fn translating_drops_the_container() {
+        let shader = Shader::new("vertex", &[9u8; 13]);
+        assert_eq!(shader.container_bytes().as_deref(), Some(&[9u8; 13][..]));
+        let first = shader.translated().map(|t| t as *const Translated);
+        assert!(shader.container_bytes().is_none());
+        assert_eq!(shader.size, 13);
+        assert_eq!(shader.translated().map(|t| t as *const Translated), first);
     }
 
     #[test]

@@ -413,7 +413,8 @@ mod tests {
         let shader = Arc::new(Shader {
             stage: "compute",
             hash: "0123456789abcdef".into(),
-            container: Vec::new(),
+            size: 0,
+            container: std::sync::Mutex::new(None),
             translated: OnceLock::new(),
         });
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));

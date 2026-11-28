@@ -115,6 +115,8 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     let mesh = shader.stage == "mesh";
     eprintln!("{} depth bounds on {}: {supported}", shader.stage, name.trim_end_matches('\0'));
 
+    let shader_bytes = shader.container_bytes().unwrap_or_default();
+    let ps_bytes = ps.as_ref().map(|ps| ps.container_bytes().unwrap_or_default());
     #[repr(C)]
     struct Stream {
         shader_kind: u64,
@@ -127,11 +129,11 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
     }
     let stream = Stream {
         shader_kind: if mesh { 24 } else { 1 },
-        shader: Bytecode { code: shader.container.as_ptr(), size: shader.container.len() },
+        shader: Bytecode { code: shader_bytes.as_ptr(), size: shader_bytes.len() },
         ps_kind: 2,
-        ps: ps.as_ref().map_or(
+        ps: ps_bytes.as_ref().map_or(
             Bytecode { code: std::ptr::null(), size: 0 },
-            |ps| Bytecode { code: ps.container.as_ptr(), size: ps.container.len() },
+            |ps| Bytecode { code: ps.as_ptr(), size: ps.len() },
         ),
         depth: Depth1(21, D3D12_DEPTH_STENCIL_DESC1 {
             DepthEnable: true.into(),
