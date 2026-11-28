@@ -12,6 +12,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at, views_current};
 use crate::host::host;
+use crate::resource::integer_format;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -1040,16 +1041,6 @@ fn view_kind(view: &View) -> u32 {
         Some(true) => VIEW_INTEGER | VIEW_SIGNED,
         Some(false) => VIEW_INTEGER,
         None => 0,
-    }
-}
-
-/// Whether a DXGI format is an integer one, and if so whether signed:
-/// `Some(false)` for `UINT`, `Some(true)` for `SINT`, `None` otherwise.
-fn integer_format(format: u32) -> Option<bool> {
-    match format {
-        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => Some(false),
-        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => Some(true),
-        _ => None,
     }
 }
 

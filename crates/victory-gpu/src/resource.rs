@@ -112,6 +112,16 @@ const _: () = assert!(size_of::<ResourceDesc>() == 56);
 const BUFFER: u32 = 1;
 const TEXTURE_3D: u32 = 4;
 
+/// Whether a typed DXGI color format is integer, and if so whether signed:
+/// `Some(false)` for `UINT`, `Some(true)` for `SINT`, `None` otherwise.
+pub(crate) fn integer_format(format: u32) -> Option<bool> {
+    match format {
+        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => Some(false),
+        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => Some(true),
+        _ => None,
+    }
+}
+
 /// Bytes per element and the element's width in texels (4 for block
 /// compression), by DXGI format number. `None` for 1-bit and video
 /// formats. The console adds 116/117 (10-bit float color), 118-120 (16-bit

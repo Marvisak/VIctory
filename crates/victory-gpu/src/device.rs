@@ -312,10 +312,13 @@ extern "system" fn check_feature_support(
         FORMAT_SUPPORT => {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<[u32; 3]>() };
-            // shortcut: every use of every format; answer from the host
-            // device once there is one.
+            // Shortcut: fixed capability masks pending console format measurements.
             q[1] = 0x7fff_ffff;
             q[2] = 0xffff;
+            if resource::integer_format(q[0]).is_some() {
+                const BLENDABLE: u32 = 0x8000;
+                q[1] &= !BLENDABLE;
+            }
             S_OK
         }
         MULTISAMPLE => {
@@ -448,6 +451,31 @@ static FUNCTIONS: Table<160> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn integer_color_formats_do_not_advertise_blending() {
+        const BLENDABLE: u32 = 0x8000;
+        const RENDER_TARGET: u32 = 0x4000;
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let query = |format| {
+            let mut info = [format, 0, 0];
+            assert_eq!(check(device, 3, info.as_mut_ptr().cast(), 12), S_OK);
+            assert_eq!(info[0], format);
+            info[1]
+        };
+        for format in [
+            3, 4, 7, 8, 12, 14, 17, 18, 25, 30, 32, 36, 38, 42, 43, 50, 52, 57, 59, 62, 64,
+        ] {
+            assert_eq!(query(format) & BLENDABLE, 0, "integer format {format}");
+        }
+        // R32_UINT keeps its RT bit. RGBA8, packed UNORM, and float can blend.
+        assert_ne!(query(42) & RENDER_TARGET, 0);
+        for format in [10, 24, 28, 29, 41, 56] {
+            assert_eq!(query(format) & BLENDABLE, BLENDABLE);
+        }
+    }
 
     fn create_as(iid: &Iid) -> (HRESULT, This) {
         let version = CHECKED_VERSION;
