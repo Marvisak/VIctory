@@ -111,16 +111,21 @@ impl Named {
     fn name_from_registers(&mut self, want: &mut Wanted, pack: &Pack) {
         let mut tried = HashSet::new();
         for g in pack.graphics() {
+            let depth_wanted = want.depth.contains(&g.depth_stencil_hash);
+            let blend_wanted = want.blend.contains(&g.blend_hash);
+            if !depth_wanted && !blend_wanted {
+                continue;
+            }
             let (Some(regs), Some(formats)) = (registers(g.packet), g.target_formats()) else {
                 continue;
             };
             if !tried.insert((g.depth_stencil_hash, g.blend_hash, formats, regs)) {
                 continue;
             }
-            if want.depth.contains(&g.depth_stencil_hash) {
+            if depth_wanted {
                 depth_from_registers(&regs, |b| self.try_depth(want, &b));
             }
-            if want.blend.contains(&g.blend_hash) {
+            if blend_wanted {
                 blend_from_registers(&regs, &formats, |b| self.try_blend(want, &b));
             }
         }
