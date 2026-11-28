@@ -3537,8 +3537,17 @@ impl Host {
     }
 }
 
-/// A visible top-level window of this process: the one the title made, if
-/// it made one.
+/// The class of the stand-in `victory_hle` shows for a title's top-level
+/// window (`make_stand_in` in `victory_hle::modules::lifecycle`).
+const STAND_IN_CLASS: &str = "VIctory.title";
+
+/// A visible top-level window of this process: the stand-in for the one the
+/// title made, if it made one; else the first, in z-order, with a client
+/// area. Not simply the first visible one: started by Windows Terminal (as
+/// the first process of its console), this process owns the terminal's
+/// `PseudoConsoleWindow`, which the terminal shows, with no client area,
+/// and keeps above the title's window whenever the terminal is above it. A
+/// swap chain made for that one left the title's window white.
 fn title_window() -> Option<HWND> {
     extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
         let mut process = 0;
@@ -3548,16 +3557,187 @@ fn title_window() -> Option<HWND> {
             if process == windows::Win32::System::Threading::GetCurrentProcessId()
                 && IsWindowVisible(hwnd).as_bool()
             {
-                *(found.0 as *mut Option<HWND>) = Some(hwnd);
-                return false.into();
+                (*(found.0 as *mut Vec<HWND>)).push(hwnd);
             }
         }
         true.into()
     }
-    let mut found: Option<HWND> = None;
-    // SAFETY: the callback only writes `found`, which outlives the call.
+    let mut found: Vec<HWND> = Vec::new();
+    // SAFETY: the callback only adds to `found`, which outlives the call.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
+    let stand_in = |&hwnd: &HWND| {
+        let mut class = [0u16; 64];
+        // SAFETY: a window of this process; the buffer holds 64 characters.
+        let n = unsafe { GetClassNameW(hwnd, &mut class) };
+        String::from_utf16_lossy(&class[..n.max(0) as usize]) == STAND_IN_CLASS
+    };
+    let sized = |&hwnd: &HWND| {
+        let mut area = RECT::default();
+        // SAFETY: a plain query.
+        unsafe { GetClientRect(hwnd, &mut area) }.is_ok()
+            && area.right > area.left
+            && area.bottom > area.top
+    };
     found
+        .iter()
+        .find(|h| stand_in(h))
+        .or_else(|| found.iter().find(|h| sized(h)))
+        .copied()
+}
+
+/// Serializes tests that expose their windows to the presenter.
+#[cfg(test)]
+static TEST_WINDOWS: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+mod title_window_tests {
+    use super::{TEST_WINDOWS, title_window};
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    use windows::core::{PCWSTR, w};
+
+    /// Queries the HWND of a swap chain created through the presenter.
+    fn bound_window() -> Option<HWND> {
+        let Some(host) = super::host() else {
+            eprintln!("skipping swap-chain binding: no D3D12 device");
+            return None;
+        };
+        let presenter = host
+            .presenter(64, 64, super::DXGI_FORMAT_R8G8B8A8_UNORM)
+            .expect("swap chain on the selected window");
+        // SAFETY: the presenter owns the live swap chain.
+        Some(unsafe { presenter.swap_chain.GetHwnd() }.unwrap())
+    }
+
+    /// A visible top-level window of class `class` on this thread, `width`
+    /// by `height` (its client area too: no border).
+    fn popup(class: PCWSTR, width: i32, height: i32) -> HWND {
+        // SAFETY: a plain window, destroyed by the test that made it.
+        unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                class,
+                w!("title_window test"),
+                WS_POPUP | WS_VISIBLE,
+                0,
+                0,
+                width,
+                height,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap()
+    }
+
+    /// Puts `hwnd` above the other windows, without activating it.
+    fn raise(hwnd: HWND) {
+        // SAFETY: a window of this thread.
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        }
+        .unwrap();
+    }
+
+    /// The visible top-level windows of this process, topmost first.
+    fn visible_in_z_order() -> Vec<HWND> {
+        extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
+            let mut process = 0;
+            // SAFETY: a window handle from the enumeration; `found` is ours.
+            unsafe {
+                GetWindowThreadProcessId(hwnd, Some(&mut process));
+                if process == windows::Win32::System::Threading::GetCurrentProcessId()
+                    && IsWindowVisible(hwnd).as_bool()
+                {
+                    (*(found.0 as *mut Vec<HWND>)).push(hwnd);
+                }
+            }
+            true.into()
+        }
+        let mut found = Vec::new();
+        // SAFETY: the callback only adds to `found`, which outlives the call.
+        let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
+        found
+    }
+
+    fn before(order: &[HWND], above: HWND, below: HWND) -> bool {
+        let at = |h| order.iter().position(|&o| o == h);
+        matches!((at(above), at(below)), (Some(a), Some(b)) if a < b)
+    }
+
+    /// Started from Windows Terminal, the process owns the terminal's
+    /// `PseudoConsoleWindow`: visible, with no client area, and above the
+    /// title's window whenever the terminal is.
+    #[test]
+    fn an_empty_window_above_the_titles_is_passed_over() {
+        let _one = TEST_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+        let empty = popup(w!("Static"), 0, 0);
+        let title = popup(w!("Static"), 64, 64);
+        raise(title);
+        raise(empty);
+        assert!(
+            before(&visible_in_z_order(), empty, title),
+            "the empty window is the first visible one"
+        );
+        let found = title_window();
+        let bound = bound_window();
+        // SAFETY: windows of this thread.
+        unsafe {
+            let _ = DestroyWindow(title);
+            let _ = DestroyWindow(empty);
+        }
+        if let Some(bound) = bound {
+            assert_eq!(bound, title, "swap-chain window");
+        }
+        assert_eq!(found, Some(title));
+    }
+
+    /// The stand-in `victory_hle` shows for the title's window is the one
+    /// frames go to, wherever it is in z-order.
+    #[test]
+    fn the_stand_in_wins_over_other_windows_above_it() {
+        let _one = TEST_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: registers a class (again is harmless) of the stand-in's name.
+        unsafe {
+            let class = WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(super::window_proc),
+                hInstance: GetModuleHandleW(None).unwrap().into(),
+                lpszClassName: w!("VIctory.title"),
+                ..Default::default()
+            };
+            RegisterClassExW(&class);
+        }
+        let stand_in = popup(w!("VIctory.title"), 64, 64);
+        let other = popup(w!("Static"), 64, 64);
+        raise(other);
+        assert!(
+            before(&visible_in_z_order(), other, stand_in),
+            "the other window is above the stand-in"
+        );
+        let found = title_window();
+        let bound = bound_window();
+        // SAFETY: windows of this thread.
+        unsafe {
+            let _ = DestroyWindow(other);
+            let _ = DestroyWindow(stand_in);
+        }
+        if let Some(bound) = bound {
+            assert_eq!(bound, stand_in, "swap-chain window");
+        }
+        assert_eq!(found, Some(stand_in));
+    }
 }
 
 /// `state` without the bits the host texture's flags forbid: the console
@@ -4024,6 +4204,7 @@ mod present_plane_tests {
 
     #[test]
     fn compositor_failure_presents_primary_in_the_same_frame() {
+        let _one = TEST_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(host) = host() else {
             eprintln!("skipping PresentX recovery: no D3D12 device");
             return;
