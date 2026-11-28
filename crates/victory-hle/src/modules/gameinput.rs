@@ -120,6 +120,22 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
+impl PadState {
+    /// Detect the first intentional input on a newly connected pad. Use
+    /// XInput's stick deadzones and trigger threshold in normalized units.
+    fn has_initial_input(&self) -> bool {
+        const LEFT_RADIUS: f32 = 7_849.0 / 32_767.0;
+        const RIGHT_RADIUS: f32 = 8_689.0 / 32_767.0;
+        const TRIGGER_THRESHOLD: f32 = 30.0 / 255.0;
+        let outside = |x: f32, y: f32, radius: f32| x * x + y * y > radius * radius;
+        self.buttons != 0
+            || self.left_trigger > TRIGGER_THRESHOLD
+            || self.right_trigger > TRIGGER_THRESHOLD
+            || outside(self.left_x, self.left_y, LEFT_RADIUS)
+            || outside(self.right_x, self.right_y, RIGHT_RADIUS)
+    }
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
@@ -494,14 +510,14 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        // A wireless receiver answers for a switched-off pad with an all-zero
-        // report; ignore a slot until its current connection reports input.
+        // A receiver can report an idle pad, and resting analog controls
+        // can send small values. Keep the stand-in until a pad is used.
         let mut pads: [Option<PadState>; PADS] = std::array::from_fn(|slot| {
             let Some(pad) = pads[slot] else {
                 self.seen_input[slot] = false;
                 return None;
             };
-            if pad != PadState::default() {
+            if !self.seen_input[slot] && pad.has_initial_input() {
                 self.seen_input[slot] = true;
             }
             self.seen_input[slot].then_some(pad)
@@ -1885,4 +1901,72 @@ mod tests {
         assert_eq!(pad(back).buttons, A);
         release(back);
     }
+
+    #[test]
+    fn idle_analog_input_keeps_the_keyboard_stand_in() {
+        let (hub, host) = fake();
+        let resting = PadState {
+            left_x: -0.01,
+            left_y: 0.02,
+            right_y: 0.015,
+            left_trigger: 30.0 / 255.0,
+            ..Default::default()
+        };
+        let keep_keyboard = || {
+            assert!(
+                matches!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED)),
+                "idle analog input took over the real pad slot"
+            );
+            let keyboard = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+            assert_eq!(pad(keyboard).left_y, 1.0);
+            release(keyboard);
+        };
+        {
+            let mut h = host.lock().unwrap();
+            h.pads[0] = Some(resting);
+            h.keys = vec![key(b'W')];
+        }
+        hub.poll();
+        keep_keyboard();
+
+        // Both coordinates are inside the radius alone, but the diagonal
+        // reaches outside the right stick's circular deadzone.
+        let active = PadState {
+            right_x: 0.20,
+            right_y: -0.20,
+            ..resting
+        };
+        host.lock().unwrap().pads[0] = Some(active);
+        hub.poll();
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
+        let first = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(first), active);
+        release(first);
+
+        host.lock().unwrap().pads[0] = Some(resting);
+        hub.poll();
+        let next = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(next), resting);
+        release(next);
+
+        host.lock().unwrap().pads[0] = None;
+        hub.poll();
+        host.lock().unwrap().pads[0] = Some(resting);
+        hub.poll();
+        keep_keyboard();
+
+        let trigger = PadState {
+            right_trigger: 31.0 / 255.0,
+            ..resting
+        };
+        host.lock().unwrap().pads[0] = Some(trigger);
+        hub.poll();
+        let pressed = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(pressed), trigger);
+        release(pressed);
+    }
+
 }
