@@ -653,16 +653,31 @@ impl Lane {
     }
 }
 
-/// Staging bytes a request holds while it runs: what it buffers between
-/// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console).
+/// Staging bytes a request holds while it runs: every buffer a worker
+/// allocates for it besides the destination itself. That is the file
+/// source (memory sources need none, as on the console), the zlib output
+/// that feeds BCPack (`intermediate_size`) and the page-list bounce buffer
+/// (`data`). Raw reads straight to their destination hold nothing.
 fn staging_bytes(request: &Request) -> u64 {
-    let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
-    if buffered && request.options & MEMORY_SOURCE == 0 {
-        u64::from(request.source_size)
-    } else {
-        0
+    let options = request.options;
+    let file_source = options & MEMORY_SOURCE == 0;
+    let compressed = options & (ZLIB | BCPACK) != 0;
+    let mut bytes = 0u64;
+    if file_source && (compressed || options & PAGE_DESTINATION != 0) {
+        bytes += u64::from(request.source_size);
     }
+    if options & ZLIB != 0 && options & BCPACK != 0 {
+        bytes += u64::from(request.intermediate_size);
+    }
+    if options & PAGE_DESTINATION != 0 {
+        // `into_destination` may bounce through a buffer of the output size.
+        bytes += u64::from(if compressed {
+            request.destination_size
+        } else {
+            request.source_size
+        });
+    }
+    bytes
 }
 
 /// Ends a queue: what was not started is dropped, and this waits for the
@@ -1392,6 +1407,15 @@ mod tests {
         lane.unsubmitted.push(Command::Read(r));
     }
 
+    fn lanes_push(lanes: &mut Lanes, r: Request) {
+        lanes
+            .lanes
+            .get_mut(&0)
+            .unwrap()
+            .unsubmitted
+            .push(Command::Read(r));
+    }
+
     #[test]
     fn priorities_share_by_bytes_about_tenfold() {
         let mut l = lanes(STAGING);
@@ -1435,6 +1459,62 @@ mod tests {
         l.submit(0);
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
+        assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn staging_counts_source_and_buffers_and_returns_them_on_error() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let both = ZLIB | BCPACK;
+        let mut r = request(both, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
+        (r.source_size, r.intermediate_size, r.destination_size) = (10, 20, 40);
+        assert_eq!(staging_bytes(&r), 30, "source + zlib output");
+        r.options |= MEMORY_SOURCE;
+        assert_eq!(staging_bytes(&r), 20, "memory source: no source copy");
+        r.options |= PAGE_DESTINATION;
+        assert_eq!(staging_bytes(&r), 60, "plus the page bounce buffer");
+        r.options = ZLIB;
+        assert_eq!(staging_bytes(&r), 10, "plain zlib: source only");
+
+        let r = request(
+            ZLIB | BCPACK,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            0,
+            0,
+        );
+        let mut r = r;
+        (r.source_size, r.intermediate_size, r.destination_size) = (10, 20, 40);
+        lanes_push(&mut l, r);
+        l.submit(0);
+        let job = l.start().unwrap();
+        assert_eq!((job.staging, l.staged), (30, 30));
+        l.finish(&job, Err(INVALID_DATA));
+        assert_eq!(l.staged, 0, "an error returns exactly what was held");
+    }
+
+    #[test]
+    fn one_request_over_the_staging_limit_runs_alone() {
+        let mut l = lanes(100);
+        l.lanes.insert(0, Lane::new(0, 64));
+        let mut big = request(
+            ZLIB | BCPACK,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            0,
+            0,
+        );
+        (big.source_size, big.intermediate_size, big.destination_size) = (80, 80, 80);
+        lanes_push(&mut l, big);
+        read(&mut l, 0, ZLIB, 10);
+        l.submit(0);
+        let job = l.start().expect("nothing in flight: it must run");
+        assert_eq!(job.staging, 160);
+        assert!(l.start().is_none(), "others wait while it holds the buffer");
+        l.finish(&job, Ok(()));
         assert!(l.start().is_some());
     }
 
