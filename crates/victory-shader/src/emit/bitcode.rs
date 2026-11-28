@@ -601,6 +601,32 @@ impl Module {
             .count()
     }
 
+    /// Integer-constant arguments (or `None` for non-constant / undef) of
+    /// live calls to `name` that [`Module::write`] writes.
+    #[cfg(test)]
+    pub fn written_call_args(&self, name: &str) -> Vec<Vec<Option<i64>>> {
+        let plan = self.plan();
+        plan.layout
+            .iter()
+            .flat_map(|&b| &self.blocks[b].body)
+            .filter(|&&i| plan.live[i as usize])
+            .filter_map(|&i| match &self.insts[i as usize].op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == name => Some(
+                    args.iter()
+                        .map(|&v| match v {
+                            V::Const(c) => match self.consts[c as usize] {
+                                Const::Int(x) => Some(x),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The globals and functions [`Module::write`] declares, each kept
     /// one's new index and their number: functions declared and not called,
     /// and constant globals nothing reads, are left out (the validator
