@@ -38,6 +38,73 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::dirty_ranges::DirtyRanges;
+
+static SNAPSHOT_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SPANNED: [AtomicU64; 2] = [AtomicU64::new(u64::MAX), AtomicU64::new(0)];
+static PAGE_WRITTEN: Mutex<DirtyRanges<{ 1 << 15 }>> = Mutex::new(DirtyRanges::new());
+static REMAPPED: Mutex<DirtyRanges<{ 1 << 15 }>> = Mutex::new(DirtyRanges::new());
+
+pub(crate) fn snapshot_generation() -> u64 {
+    SNAPSHOT_GENERATION.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+pub(crate) fn bump_snapshot_generation_for_test() {
+    SNAPSHOT_GENERATION.fetch_add(1, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn note_invalidated_for_test(at: usize, len: usize) {
+    note_invalidated(at, len, snapshot_generation(), &PAGE_WRITTEN);
+}
+
+fn note_invalidated(at: usize, len: usize, generation: u64, ranges: &Mutex<DirtyRanges<{ 1 << 15 }>>) {
+    let (start, end) = (at as u64, at.saturating_add(len) as u64);
+    if end <= SPANNED[0].load(Ordering::Relaxed) || start >= SPANNED[1].load(Ordering::Relaxed) {
+        return;
+    }
+    let mut ranges = ranges.lock().unwrap_or_else(|e| e.into_inner());
+    ranges.insert(start, end, generation);
+}
+
+#[cfg(test)]
+pub(crate) fn invalidated(from: usize, to: usize) -> bool {
+    if from >= to {
+        return false;
+    }
+    let (from, to) = (from as u64, to as u64);
+    PAGE_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .overlaps(from, to)
+        || REMAPPED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .overlaps(from, to)
+}
+
+pub(crate) fn invalidation_generation_since(from: usize, to: usize, generation: u64) -> Option<u64> {
+    if from >= to {
+        return None;
+    }
+    let (from, to) = (from as u64, to as u64);
+    let written = PAGE_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .newest_since(from, to, generation);
+    let remapped = REMAPPED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .newest_since(from, to, generation);
+    written.max(remapped)
+}
+
+pub(crate) fn invalidations_done() {
+    let _ = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+    let _ = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
 /// made the checks of the world's big buffers cost more than the copies
 /// they saved.
@@ -337,6 +404,8 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     if pages.is_empty() {
         return None;
     }
+    SPANNED[0].fetch_min(start as u64, Ordering::Relaxed);
+    SPANNED[1].fetch_max(end as u64, Ordering::Relaxed);
     install();
     // The rest of the range, as byte runs.
     let mut untracked: Vec<(usize, usize)> = Vec::new();
@@ -566,6 +635,27 @@ impl Tracked {
         clean_bit(self.changed.2)
     }
 
+    /// Marks the tracked pages of `[from, to)` changed again. Used when a
+    /// refresh took them but its upload was discarded (a concurrent remap):
+    /// the next refresh must see them.
+    pub(crate) fn remark(&self, from: usize, to: usize) {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to {
+            return;
+        }
+        let (first, last) = (from / PAGE, to.div_ceil(PAGE));
+        let mut g = guards();
+        mark_changed(&mut g, first, last, false);
+        let others: Vec<usize> = g
+            .alias_of
+            .range(first..last)
+            .flat_map(|(_, o)| o.iter().copied())
+            .collect();
+        for page in others {
+            mark_changed(&mut g, page, page + 1, false);
+        }
+    }
+
     /// The tracker's bit for [`clean_bit`], for callers that ask about
     /// many trackers at once without touching each (none: never clean).
     pub(crate) fn bit(&self) -> Option<u32> {
@@ -790,6 +880,10 @@ impl Drop for Writing {
             g.busy.swap_remove(i);
         }
         changed(&mut g, self.first, self.last, false);
+        drop(g);
+        let (start, end) = (self.first * PAGE, self.last.saturating_mul(PAGE));
+        SNAPSHOT_GENERATION.fetch_add(1, Ordering::Release);
+        note_invalidated(start, end.saturating_sub(start), snapshot_generation(), &PAGE_WRITTEN);
     }
 }
 
@@ -800,6 +894,8 @@ impl Drop for Writing {
 /// `kernel_will_write`) around the title's kernel reads into its own
 /// memory and DirectStorage's writes to addresses.
 pub fn writing(at: usize, len: usize) -> Writing {
+    SNAPSHOT_GENERATION.fetch_add(1, Ordering::Release);
+    note_invalidated(at, len, snapshot_generation(), &PAGE_WRITTEN);
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
@@ -811,6 +907,8 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    SNAPSHOT_GENERATION.fetch_add(1, Ordering::Release);
+    note_invalidated(at, len, snapshot_generation(), &REMAPPED);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.

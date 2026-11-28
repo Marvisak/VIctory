@@ -267,7 +267,13 @@ pub(crate) fn uploads(
     let mut recorded = false;
     // The textures copied into stay alive in `work` until recorded.
     let mut readable = Vec::new();
-    for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
+    let frame = if cfg!(test) { 0 } else { crate::frame::current() };
+    let stage = crate::texture::stage_slice(frame);
+    let deadline = Some(match &stage {
+        Some(stage) => stage.deadline(),
+        None => std::time::Instant::now(),
+    });
+    for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work, deadline)) {
         if let Some(upload) = upload {
             readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
             recorded = true;

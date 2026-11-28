@@ -19,12 +19,101 @@
 //! not.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
 use windows::core::Interface;
+
+const BLOCK_BYTES: usize = 64 << 10;
+const PAGE_BYTES: usize = 4096;
+const MAX_BATCH: usize = 256;
+type WorkingPage = windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION;
+
+#[allow(clippy::undocumented_unsafe_blocks)]
+fn query_pages(entries: &mut [WorkingPage]) -> bool {
+    use windows_sys::Win32::System::{ProcessStatus::K32QueryWorkingSetEx, Threading::GetCurrentProcess};
+    unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), entries.as_mut_ptr().cast(), std::mem::size_of_val(entries) as u32) != 0 }
+}
+
+#[allow(clippy::undocumented_unsafe_blocks)]
+fn sample_readable(entry: &WorkingPage, asked: bool, address: usize) -> bool {
+    let resident = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+    resident || crate::host::read_into(address as *const u8, &mut [0u8; 1])
+}
+
+#[allow(clippy::undocumented_unsafe_blocks)]
+fn probe_blocks(addresses: &[usize], present: &mut [bool]) {
+    let mut info: [WorkingPage; MAX_BATCH] = unsafe { std::mem::zeroed() };
+    let entries = &mut info[..addresses.len()];
+    for (entry, &address) in entries.iter_mut().zip(addresses) {
+        entry.VirtualAddress = address as *mut _;
+    }
+    let asked = query_pages(entries);
+    for ((value, entry), &address) in present.iter_mut().zip(entries).zip(addresses) {
+        *value = sample_readable(entry, asked, address);
+    }
+}
+
+fn batched_residency() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BATCHED_RESIDENCY").is_none_or(|v| v != "0"))
+}
+
+fn mapped_blocks(
+    start: usize,
+    end: usize,
+    mut probe: impl FnMut(&[usize], &mut [bool]),
+) -> Vec<(usize, usize)> {
+    if start >= end {
+        return Vec::new();
+    }
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut addresses = [0usize; MAX_BATCH];
+    let mut present = [false; MAX_BATCH];
+    let mut block = start & !(BLOCK_BYTES - 1);
+    while block < end {
+        let mut count = 0;
+        while count < MAX_BATCH && block < end {
+            addresses[count] = block.max(start) & !(PAGE_BYTES - 1);
+            count += 1;
+            block = block.saturating_add(BLOCK_BYTES);
+        }
+        present[..count].fill(false);
+        probe(&addresses[..count], &mut present[..count]);
+        for i in 0..count {
+            let base = addresses[i] & !(BLOCK_BYTES - 1);
+            let (from, to) = (base.max(start), base.saturating_add(BLOCK_BYTES).min(end));
+            if from >= to {
+                continue;
+            }
+            if present[i] {
+                match out.last_mut() {
+                    Some((_, last)) if *last == from => *last = to,
+                    _ => out.push((from, to)),
+                }
+                continue;
+            }
+            let mut page = from & !(PAGE_BYTES - 1);
+            while page < to {
+                let page_end = page.saturating_add(PAGE_BYTES).min(to);
+                let mut page_ok = [false];
+                probe(&[page], &mut page_ok);
+                if page_ok[0] {
+                    let (pf, pt) = (page.max(from), page_end);
+                    match out.last_mut() {
+                        Some((_, last)) if *last == pf => *last = pt,
+                        _ => out.push((pf, pt)),
+                    }
+                }
+                page = page.saturating_add(PAGE_BYTES);
+            }
+        }
+    }
+    out
+}
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -59,6 +148,7 @@ pub(crate) struct Staging {
     /// copied.
     uploads: std::sync::atomic::AtomicU64,
     copied: std::sync::atomic::AtomicU64,
+    refreshed: std::sync::atomic::AtomicU64,
 }
 
 /// What was last detiled: the hash of the memory (not tracked), or of each
@@ -67,6 +157,25 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     hashes: Vec<Option<blake3::Hash>>,
+    published: bool,
+    deferred: bool,
+    asked: u64,
+}
+
+impl Last {
+    fn defer_remap(&mut self) -> bool {
+        if !self.published || self.deferred {
+            return false;
+        }
+        self.deferred = true;
+        self.asked = 0;
+        true
+    }
+
+    fn discard_snapshot(&mut self) {
+        self.hash = None;
+        self.hashes.fill(None);
+    }
 }
 
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
@@ -513,15 +622,107 @@ pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
     });
 }
 
+fn no_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
+}
+
+pub(crate) static REMAP_CONFLICTS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+struct StageConfig {
+    shared: bool,
+    span: Duration,
+}
+
+impl StageConfig {
+    fn from_env() -> Self {
+        let shared = std::env::var_os("VICTORY_TEXTURE_STAGE_PER_FRAME").is_none_or(|v| v != "0");
+        let var = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let span = var("VICTORY_TEXTURE_STAGE_US")
+            .map(Duration::from_micros)
+            .unwrap_or_else(|| {
+                Duration::from_millis(var("VICTORY_TEXTURE_STAGE_MS").unwrap_or(if shared { 6 } else { 250 }))
+            });
+        Self { shared, span }
+    }
+
+    fn slice(&self, frame: u64, used: (u64, Duration)) -> Option<Duration> {
+        if !self.shared {
+            return Some(self.span);
+        }
+        if used.0 > frame {
+            return None;
+        }
+        let base = if used.0 == frame { used.1 } else { Duration::ZERO };
+        let remaining = self.span.saturating_sub(base);
+        (!remaining.is_zero()).then_some(remaining)
+    }
+}
+
+static STAGE_CONFIG: std::sync::OnceLock<StageConfig> = std::sync::OnceLock::new();
+static STAGE_SPENT: Mutex<(u64, Duration)> = Mutex::new((0, Duration::ZERO));
+
+pub(crate) struct StageSlice {
+    guard: std::sync::MutexGuard<'static, (u64, Duration)>,
+    frame: u64,
+    charged: Duration,
+    began: Instant,
+    shared: bool,
+}
+
+impl StageSlice {
+    pub(crate) fn deadline(&self) -> Instant {
+        self.began + self.charged.saturating_sub(self.began.elapsed())
+    }
+}
+
+impl Drop for StageSlice {
+    fn drop(&mut self) {
+        if !self.shared {
+            return;
+        }
+        let base = if self.guard.0 == self.frame { self.guard.1 } else { Duration::ZERO };
+        self.guard.0 = self.frame;
+        self.guard.1 = base.saturating_sub(self.charged).saturating_add(self.began.elapsed());
+    }
+}
+
+pub(crate) fn stage_slice(frame: u64) -> Option<StageSlice> {
+    let config = STAGE_CONFIG.get_or_init(StageConfig::from_env);
+    let shared = config.shared && frame != 0;
+    let mut used = STAGE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+    let base = if used.0 == frame { used.1 } else { Duration::ZERO };
+    let remaining = if shared {
+        config.slice(frame, (frame, base))?
+    } else {
+        config.span
+    };
+    *used = (frame, if shared { base + remaining } else { Duration::ZERO });
+    Some(StageSlice {
+        guard: used,
+        frame,
+        charged: remaining,
+        began: Instant::now(),
+        shared,
+    })
+}
+
 /// [`Staging::refresh`] of each of `work`, those whose memory may have
 /// changed on several threads at once (reading title memory and detiling
 /// cost ~6 ms of frame a MB on one thread in a new shot, run evict5).
-pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)]) -> Vec<Option<Upload>> {
+pub(crate) fn refresh_all(
+    work: &[(Arc<Staging>, Arc<crate::resource::HostTexture>)],
+    deadline: Option<Instant>,
+) -> Vec<Option<Upload>> {
     // Most find nothing changed (their trackers' clean bits say so): those
     // are not handed to threads.
     let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.maybe_changed()).collect();
     let results: Vec<Mutex<Option<Upload>>> = changed.iter().map(|_| Mutex::new(None)).collect();
     in_parallel(changed.len(), |k| {
+        if deadline.is_some_and(|at| Instant::now() >= at) {
+            return;
+        }
         *results[k].lock().unwrap_or_else(|e| e.into_inner()) = work[changed[k]].0.refresh();
     });
     let mut out: Vec<Option<Upload>> = vec![None; work.len()];
@@ -535,7 +736,12 @@ impl Staging {
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {
-        self.tracked.as_ref().is_none_or(|t| !t.clean())
+        let from = self.memory as usize;
+        let to = from.saturating_add(self.layout.size as usize);
+        if self.tracked.as_ref().is_none_or(|t| !t.clean()) {
+            return true;
+        }
+        crate::watch::invalidation_generation_since(from, to, self.refreshed.load(std::sync::atomic::Ordering::Relaxed)).is_some()
     }
 
     /// A staging buffer with the texture memory detiled into it if it
@@ -543,30 +749,73 @@ impl Staging {
     /// subresources that changed (only those are detiled and to be copied).
     pub(crate) fn refresh(&self) -> Option<Upload> {
         use std::sync::atomic::Ordering::Relaxed;
-        let started = std::time::Instant::now();
-        let (read, buffer) = self.refresh_now();
-        let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        preparing[3].fetch_add(read as u64, Relaxed);
-        buffer
+        let started = Instant::now();
+        let wait = !no_wait();
+        let mut retries = 0;
+        loop {
+            let generation = crate::watch::snapshot_generation();
+            self.last.lock().unwrap_or_else(|e| e.into_inner()).asked += 1;
+            let (read, buffer) = self.refresh_now(generation);
+            if crate::watch::snapshot_generation() == generation {
+                let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+                if buffer.is_some() {
+                    last.published = true;
+                }
+                last.deferred = false;
+                drop(last);
+                let preparing = &crate::host::PREPARING;
+                preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+                preparing[3].fetch_add(read as u64, Relaxed);
+                return buffer;
+            }
+            let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+            last.discard_snapshot();
+            if let Some(t) = &self.tracked {
+                t.remark(self.memory as usize, (self.memory as usize).saturating_add(self.layout.size as usize));
+            }
+            if !wait && last.defer_remap() {
+                REMAP_CONFLICTS[1].fetch_add(1, Relaxed);
+                return None;
+            }
+            REMAP_CONFLICTS[0].fetch_add(1, Relaxed);
+            drop(last);
+            retries += 1;
+            if retries >= 8 {
+                return None;
+            }
+            std::thread::yield_now();
+        }
     }
 
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
-    fn refresh_now(&self) -> (usize, Option<Upload>) {
+    fn refresh_now(&self, generation: u64) -> (usize, Option<Upload>) {
+        use std::sync::atomic::Ordering::Relaxed;
         let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
+        let refreshed = self.refreshed.load(Relaxed);
+        let seen = crate::watch::invalidation_generation_since(start, start + size, refreshed);
+        let settle = |epoch: Option<u64>| {
+            let epoch = epoch.unwrap_or(generation).max(refreshed);
+            self.refreshed.store(epoch, Relaxed);
+        };
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some(t) = &self.tracked {
             // Most refreshes find nothing: the tracker's dense bit says so
             // without its lock (123,000 refreshes a frame, run evict3).
-            if t.clean() {
+            if t.clean() && seen.is_none() {
+                settle(seen);
                 return (0, None);
             }
-            let ranges = t.take(start, start + size);
+            let mut ranges = t.take(start, start + size);
+            if ranges.is_empty() && seen.is_some() {
+                t.remark(start, start + size);
+                ranges = t.take(start, start + size);
+            }
             if ranges.is_empty() {
+                settle(seen);
                 return (0, None);
             }
             // Only the subresources in the pages that changed (streamed
@@ -588,13 +837,38 @@ impl Staging {
             let read = &mut scratch.0[..size];
             let mut bytes = 0;
             let mut done: Vec<(usize, usize)> = Vec::new();
+            let batched = batched_residency();
             for &i in &touched {
                 let (a, b) = span(i);
-                if !done.contains(&(a, b)) {
-                    // SAFETY: inside the buffer of the texture's size.
-                    crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
-                    (bytes, _) = (bytes + b - a, done.push((a, b)));
+                if done.contains(&(a, b)) {
+                    continue;
                 }
+                if batched {
+                    read[a..b].fill(0);
+                    for (from, to) in mapped_blocks(start + a, start + b, probe_blocks) {
+                        let (lo, hi) = (from - start, to - start);
+                        // SAFETY: inside the buffer of the texture's size.
+                        unsafe {
+                            crate::host::copy_mapped(read.as_mut_ptr().add(lo), self.memory.wrapping_add(lo), hi - lo, false);
+                        }
+                        bytes += hi - lo;
+                    }
+                } else {
+                    read[a..b].fill(0);
+                    for (from, to) in mapped_blocks(start + a, start + b, |addresses, present| {
+                        for (address, value) in addresses.iter().zip(present.iter_mut()) {
+                            *value = committed(*address as *const u8, PAGE_BYTES.min((start + b).saturating_sub(*address)));
+                        }
+                    }) {
+                        let (lo, hi) = (from - start, to - start);
+                        // SAFETY: inside the buffer of the texture's size.
+                        unsafe {
+                            crate::host::copy_mapped(read.as_mut_ptr().add(lo), self.memory.wrapping_add(lo), hi - lo, false);
+                        }
+                        bytes += hi - lo;
+                    }
+                }
+                done.push((a, b));
             }
             // A changed page that holds only the subresource's bytes says it
             // changed. Pages it shares with other data the title writes
@@ -617,6 +891,7 @@ impl Staging {
                 .map(|i| i as u32)
                 .collect();
             if fresh.is_empty() {
+                settle(seen);
                 return (bytes, None);
             }
             let buffer = self.detile(read, &fresh);
@@ -624,6 +899,8 @@ impl Staging {
                 for &i in &fresh {
                     last.hashes[i as usize] = None;
                 }
+            } else {
+                settle(seen);
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
@@ -836,6 +1113,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         last: Mutex::default(),
         uploads: Default::default(),
         copied: Default::default(),
+        refreshed: Default::default(),
     });
     *held = Some(s.clone());
     Some(s)
@@ -877,5 +1155,278 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn batched_residency_batches_256_blocks_and_keeps_holes() {
+        let start = BLOCK_BYTES + 3 * PAGE_BYTES + 19;
+        let end = (MAX_BATCH + 7) * BLOCK_BYTES + 71;
+        let mut batches = Vec::new();
+        let choose = |block: usize| block % 5 != 2;
+        let ranges = mapped_blocks(start, end, |addresses, present| {
+            batches.push(addresses.len());
+            for (&address, value) in addresses.iter().zip(present) {
+                let block = address / BLOCK_BYTES;
+                *value = if addresses.len() == 1 { false } else { choose(block) };
+            }
+        });
+        let first = start / BLOCK_BYTES;
+        let last = (end - 1) / BLOCK_BYTES;
+        let mut expected: Vec<(usize, usize)> = Vec::new();
+        for block in (first..=last).filter(|&block| choose(block)) {
+            let (from, to) = (start.max(block * BLOCK_BYTES), end.min((block + 1) * BLOCK_BYTES));
+            match expected.last_mut() {
+                Some((_, previous)) if *previous == from => *previous = to,
+                _ => expected.push((from, to)),
+            }
+        }
+        assert_eq!(ranges, expected);
+        assert_eq!(batches[0], MAX_BATCH);
+        assert!(batches.iter().skip(1).all(|&n| n == 1 || n == last - first + 1 - MAX_BATCH));
+        assert!(mapped_blocks(start, start, |_, _| panic!("empty range")).is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::undocumented_unsafe_blocks)]
+    fn probe_blocks_takes_the_safe_read_path_when_the_query_says_nothing() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let page = unsafe { VirtualAlloc(std::ptr::null(), PAGE_BYTES, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        let hole = unsafe { VirtualAlloc(std::ptr::null(), PAGE_BYTES, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!page.is_null() && !hole.is_null());
+        let unknown: WorkingPage = unsafe { std::mem::zeroed() };
+        assert!(sample_readable(&unknown, false, page as usize));
+        assert!(!sample_readable(&unknown, false, hole as usize));
+        unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+        unsafe { VirtualFree(hole, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn conflicting_refresh_retains_only_a_published_image_and_retries_once() {
+        let mut last = Last::default();
+        assert!(!last.defer_remap(), "a first publication must wait");
+        last.published = true;
+        last.asked = 42;
+        assert!(last.defer_remap());
+        assert_eq!(last.asked, 0);
+        assert!(!last.defer_remap(), "a continuous remap cannot starve the texture");
+    }
+
+    #[test]
+    fn per_frame_stage_budget_slices_a_shared_six_ms_budget() {
+        let shared = StageConfig {
+            shared: true,
+            span: Duration::from_millis(6),
+        };
+        assert_eq!(shared.slice(4, (3, Duration::from_millis(2))), Some(Duration::from_millis(6)));
+        assert_eq!(shared.slice(4, (4, Duration::from_millis(2))), Some(Duration::from_millis(4)));
+        assert_eq!(shared.slice(4, (4, Duration::from_millis(6))), None);
+        assert_eq!(shared.slice(5, (4, Duration::from_millis(6))), Some(Duration::from_millis(6)));
+        let per_pass = StageConfig {
+            shared: false,
+            span: Duration::from_millis(250),
+        };
+        assert_eq!(per_pass.slice(4, (4, Duration::from_secs(10))), Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn stage_slice_budget_resets_on_frame_advance() {
+        // Use high frame numbers to avoid colliding with other tests.
+        let frame = 1_000_000u64;
+        {
+            let mut used = STAGE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+            *used = (frame, Duration::from_millis(7));
+        }
+        // Same frame: exhausted.
+        assert!(stage_slice(frame).is_none());
+        // Next frame: budget resets.
+        let slice = stage_slice(frame + 1).expect("budget should reset on frame advance");
+        assert!(slice.charged <= Duration::from_millis(250));
+        assert!(slice.charged > Duration::ZERO);
+        drop(slice);
+        let mut used = STAGE_SPENT.lock().unwrap_or_else(|e| e.into_inner());
+        if used.0 == frame + 1 {
+            *used = (0, Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn mapped_blocks_preserves_committed_pages_in_partially_committed_block() {
+        let start = 0usize;
+        let end = BLOCK_BYTES;
+        let committed_page = 2 * PAGE_BYTES;
+        let ranges = mapped_blocks(start, end, |addresses, present| {
+            for (&address, value) in addresses.iter().zip(present.iter_mut()) {
+                let off = address % BLOCK_BYTES;
+                *value = if addresses.len() == 1 { off == committed_page } else { off == 0 };
+            }
+        });
+        assert_eq!(ranges, vec![(committed_page, committed_page + PAGE_BYTES)]);
+    }
+
+    #[test]
+    fn conflicting_refresh_clears_deferred_on_success_path() {
+        let mut last = Last { published: true, ..Default::default() };
+        assert!(last.defer_remap());
+        assert!(last.deferred);
+        last.deferred = false;
+        assert!(last.defer_remap());
+    }
+
+    #[test]
+    fn concurrent_snapshot_generation_bump_does_not_lose_texture_updates() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let p = crate::watch::tests::pool(1);
+        let desc = Desc {
+            dimension: Dimension::Tex2d,
+            width: 4,
+            height: 4,
+            depth: 1,
+            mips: 1,
+            block: 1,
+            swizzle: Swizzle::LINEAR,
+            element_bytes: 4,
+            samples: 1,
+        };
+        let layout = Layout::new(&desc).expect("layout");
+        let size = layout.size as usize;
+        let staging = Staging {
+            size: size as u64,
+            footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default()],
+            rows: vec![4],
+            layout: layout.clone(),
+            mips: 1,
+            memory: p as *const u8,
+            tracked: crate::watch::track(p, size, true),
+            spans: spans(&layout, 1, 1),
+            last: Mutex::default(),
+            uploads: Default::default(),
+            copied: Default::default(),
+            refreshed: Default::default(),
+        };
+        let _ = staging.refresh_now(crate::watch::snapshot_generation());
+        let t = staging.tracked.as_ref().expect("tracked");
+        assert!(t.clean());
+        // Mark dirty and force a generation bump as if a concurrent remap happened.
+        t.remark(p, p + size);
+        crate::watch::note_invalidated_for_test(p, size);
+        crate::watch::bump_snapshot_generation_for_test();
+        // Should not permanently lose the dirty state.
+        let _ = staging.refresh();
+        assert!(!t.clean() || crate::watch::invalidated(p, p + size));
+        crate::watch::tests::free(p);
+    }
+
+    fn linear_staging(side: u32) -> (Staging, usize) {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+        let p = crate::watch::tests::pool(1);
+        let size = side as usize * side as usize * 4;
+        let desc = Desc {
+            dimension: Dimension::Tex2d,
+            width: side,
+            height: side,
+            depth: 1,
+            mips: 1,
+            block: 1,
+            swizzle: Swizzle::LINEAR,
+            element_bytes: 4,
+            samples: 1,
+        };
+        let layout = Layout::new(&desc).expect("layout");
+        assert_eq!(layout.size as usize, size);
+        let spans = spans(&layout, 1, 1);
+        let staging = Staging {
+            size: size as u64,
+            footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    Width: side,
+                    Height: side,
+                    Depth: 1,
+                    RowPitch: side * 4,
+                },
+            }],
+            rows: vec![side],
+            layout,
+            mips: 1,
+            memory: p as *const u8,
+            tracked: crate::watch::track(p, size, true),
+            spans,
+            last: Mutex::default(),
+            uploads: Default::default(),
+            copied: Default::default(),
+            refreshed: Default::default(),
+        };
+        (staging, p)
+    }
+
+    #[test]
+    #[allow(clippy::undocumented_unsafe_blocks)]
+    fn same_frame_submissions_settle_invalidations_without_redundant_uploads() {
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        for (side, remap) in [(128, false), (64, true)] {
+            let (staging, p) = linear_staging(side);
+            let size = staging.layout.size as usize;
+            let t = staging.tracked.as_ref().expect("tracked");
+            assert!(staging.refresh().is_some(), "side {side}: first upload");
+            assert!(t.clean(), "side {side}: clean after refresh");
+            if remap {
+                crate::watch::title_memory_remapped(p, size);
+            } else {
+                let _writing = crate::watch::writing(p, size);
+                unsafe { std::ptr::write_bytes(p as *mut u8, 0x5a, size) };
+            }
+            assert!(staging.maybe_changed(), "side {side}: invalidation seen");
+            let expected = usize::from(!remap);
+            let mut uploads = 0;
+            for submission in 0..4 {
+                if staging.maybe_changed() && staging.refresh().is_some() {
+                    uploads += 1;
+                }
+                assert!(uploads <= expected, "side {side}: submission {submission} uploaded redundantly");
+            }
+            assert_eq!(uploads, expected, "side {side}: one upload per genuine change");
+            assert!(!staging.maybe_changed(), "side {side}: invalidation settled");
+            crate::watch::tests::free(p);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::undocumented_unsafe_blocks)]
+    fn one_remap_uploads_once_across_six_same_frame_submissions() {
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let (staging, p) = linear_staging(128);
+        let size = staging.layout.size as usize;
+        assert!(staging.refresh().is_some(), "first upload");
+        crate::watch::title_memory_remapped(p, size);
+        // The remap opens the guarded pages: its bytes change once, with no
+        // further write invalidation in this frame.
+        unsafe { std::ptr::write_bytes(p as *mut u8, 0xa5, size) };
+        assert!(staging.maybe_changed(), "remap seen");
+        let mut uploads = 0;
+        for _ in 0..6 {
+            if staging.maybe_changed() && staging.refresh().is_some() {
+                uploads += 1;
+            }
+        }
+        assert_eq!(uploads, 1, "six same-frame submissions: redundant upload");
+        // A present clears the frame's invalidations; a later frame advances
+        // the snapshot generation without writing the texture again.
+        crate::watch::invalidations_done();
+        crate::watch::bump_snapshot_generation_for_test();
+        for _ in 0..2 {
+            if staging.maybe_changed() && staging.refresh().is_some() {
+                uploads += 1;
+            }
+        }
+        assert_eq!(uploads, 1, "next frame: extra upload");
+        crate::watch::tests::free(p);
     }
 }

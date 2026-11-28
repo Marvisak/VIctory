@@ -25,6 +25,7 @@ pub mod console;
 mod copystat;
 pub mod descriptor;
 pub mod device;
+mod dirty_ranges;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
