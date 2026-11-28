@@ -3080,7 +3080,8 @@ impl<'a> Lower<'a> {
     /// the first pass and leaves; what a helper lane computes only feeds
     /// derivatives, and its stores are dropped.
     fn helper_reads_own(&mut self, own: V, first: V) -> V {
-        if !self.s.pixel {
+        // Shader model 6.7: the wave operations include helper lanes.
+        if !self.s.pixel || super::helper_lane_waves() {
             return first;
         }
         let c = self.cur;
