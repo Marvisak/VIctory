@@ -3333,7 +3333,7 @@ fn choose(uses: &[(u64, u64, u64)], held: &[bool], frame: u64, now: u64, over: u
     for i in idle_at {
         let bytes = uses[i].2;
         if !gone.is_empty() && bytes > room {
-            break;
+            continue;
         }
         room = room.saturating_sub(bytes);
         over = over.saturating_sub(bytes);
@@ -3348,7 +3348,7 @@ fn choose(uses: &[(u64, u64, u64)], held: &[bool], frame: u64, now: u64, over: u
     for i in rest {
         let bytes = uses[i].2;
         if !gone.is_empty() && bytes > room {
-            break;
+            continue;
         }
         room = room.saturating_sub(bytes);
         over = over.saturating_sub(bytes);
@@ -4953,6 +4953,17 @@ mod tests {
         let cold = (frame - SOON_FRAMES - 1, now - 5_000, 40);
         let uses = [oldest, cold];
         assert_eq!(choose(&uses, &[false, false], frame, now, 100, 30), vec![0], "the burst does not reach past the step");
+    }
+
+    #[test]
+    fn eviction_skips_an_oversized_candidate_and_reclaims_later_fitting_ranges() {
+        let (frame, now) = (1_000, 1_000_000);
+        let idle = |age_ms, bytes| (frame - IDLE_FRAMES, now - IDLE_MS - age_ms, bytes);
+        let uses = [idle(30_000, 30), idle(20_000, 50), idle(10_000, 10)];
+        assert_eq!(choose(&uses, &[false; 3], frame, now, 0, 40), vec![0, 2]);
+        let cold = |age_ms, bytes| (frame - SOON_FRAMES - 1, now - age_ms, bytes);
+        let uses = [cold(30_000, 30), cold(20_000, 50), cold(10_000, 10)];
+        assert_eq!(choose(&uses, &[false; 3], frame, now, 100, 40), vec![0, 2]);
     }
 
     /// Title textures of one memory share a key in any format of the same

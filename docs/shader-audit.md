@@ -1877,6 +1877,15 @@ and fragmentation problem under the safe combined cap, not a shader-format
 or placed-resource API failure. Raising the cap without reclaiming other
 memory remains unsafe given the earlier device-removal result.
 
+The subsequent eviction review found a bounded-reclaim edge case: after
+selecting one old texture, `choose` stopped at the first candidate larger
+than the remaining per-frame allowance. Smaller older candidates later in
+the list were never considered, even when their ranges could be reused.
+It now skips an oversized candidate and continues through the sorted list,
+still honoring the same byte allowance and recent/held protections. Unit
+tests cover both idle and budget-driven selection. Its effect on the RX
+5700 XT's closed-cap missing views is not yet measured in a world run.
+
 ### 2026-11-28: `uiOverlay` A/B for the secondary 4K path
 
 The paired offline `rx5700-ui-overlay-ab-20261128-145503Z` test changed
