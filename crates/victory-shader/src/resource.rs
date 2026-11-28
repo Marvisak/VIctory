@@ -2825,6 +2825,7 @@ pub(crate) mod tests {
         let res = track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let empty = crate::Container {
+            size: 0x20,
             digest: [0; 16],
             version: (1, 0),
             parts: Vec::new(),

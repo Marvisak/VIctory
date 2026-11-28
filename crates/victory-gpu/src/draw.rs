@@ -3390,6 +3390,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let io = io::raise(&p, &native).unwrap();
         let host_shader = emit_with(
             &Container {
+                size: 0x20,
                 digest: [0; 16],
                 version: (1, 0),
                 parts: Vec::new(),

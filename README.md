@@ -151,6 +151,7 @@ victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm] [--effects]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+                  [--shader-hash HASH[,HASH...]]
 victory translate [paths...] --cache [--pipelines] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
@@ -159,6 +160,10 @@ victory config
 
 `translate --jobs N` requires a positive worker count. Omit it to use the
 default worker count.
+
+Pass a 16-digit runtime shader hash to `translate --shader-hash HASH --list`
+to see its file, offset and translation result. Repeat the option or separate
+hashes with commas. Missing hashes are reported after the matches.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).

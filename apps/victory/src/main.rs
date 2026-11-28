@@ -92,13 +92,16 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
+        /// Translate only these 16-digit runtime shader hashes (comma-separated or repeated).
+        #[arg(long, value_delimiter = ',', value_parser = translate::parse_hash)]
+        shader_hash: Vec<u64>,
         /// Positive worker thread count (default: every logical core).
         #[arg(long)]
         jobs: Option<NonZeroUsize>,
         /// Only translate into the shader cache `run` reads (the warm-up):
         /// every container found, once, nothing else checked or listed
         /// (with `--pipelines`, then the shader pack's pipelines).
-        #[arg(long, conflicts_with_all = ["validate", "list"])]
+        #[arg(long, conflicts_with_all = ["validate", "list", "shader_hash"])]
         cache: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
@@ -182,12 +185,14 @@ fn main() -> Result<()> {
             list,
             jobs,
             cache: false,
+            shader_hash,
         } => translate::run(
             paths,
             validate,
             pipelines,
             list,
             jobs.map(NonZeroUsize::get),
+            shader_hash,
         ),
         Command::Run {
             exe,
