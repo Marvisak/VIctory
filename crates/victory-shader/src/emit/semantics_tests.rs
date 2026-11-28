@@ -3181,3 +3181,117 @@ fn lds_out_of_bounds_reads_zero_and_drops_writes() {
         probe(masked, inputs, INT, |i| vec![if i[0] > i[1] { 0 } else { OLD }]),
     ]));
 }
+
+/// SAD sums unsigned byte/half/dword distances into a wrapping dword.
+/// Model each field through Rust's byte arrays and a wide accumulator.
+#[test]
+fn sad_fields_and_wrapping_accumulators_match_the_reference() {
+    let edges = [
+        0,
+        1,
+        0xFF,
+        0x100,
+        0xFFFF,
+        0x1_0000,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        u32::MAX,
+        0xFF00_FF00,
+        0x00FF_00FF,
+        0x1234_5678,
+        0xFEDC_BA98,
+    ];
+    let mut inputs = triples(&edges, &edges, &[0, 1, 0xFFFF, 0x8000_0000, u32::MAX]);
+    // Every pair of byte values, replicated to exercise every field.
+    for a in 0..=255u32 {
+        for b in 0..=255u32 {
+            inputs.push([a * 0x0101_0101, b * 0x0101_0101, u32::MAX, OLD]);
+        }
+    }
+    // Individual field positions, in both orders, with carry and wrap.
+    for shift in [0, 8, 16, 24] {
+        for a in [0, 1, 127, 128, 254, 255] {
+            for b in [0, 1, 127, 128, 254, 255] {
+                for acc in [0, u32::MAX] {
+                    inputs.push([a << shift, b << shift, acc, OLD]);
+                }
+            }
+        }
+    }
+    // All MSAD mask-byte combinations; src0 zeroes are not masks.
+    for mask in 0..16 {
+        let b = (0..4).fold(0, |b, n| {
+            b | (if mask & (1 << n) != 0 { 0xFF } else { 0 }) << (8 * n)
+        });
+        for a in [0, 0x1234_5678, u32::MAX] {
+            for acc in [0, u32::MAX] {
+                inputs.push([a, b, acc, OLD]);
+            }
+        }
+    }
+    let mut seed = 0x7182_9345u32;
+    for _ in 0..4096 {
+        let mut input = [0; 4];
+        for x in &mut input[..3] {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            *x = seed;
+        }
+        input[3] = OLD;
+        inputs.push(input);
+    }
+    let mut probes = Vec::new();
+    for op in [0x15a, 0x15b, 0x15c, 0x15d, 0x171] {
+        for guarded in [false, true] {
+            let mut body = Vec::new();
+            if guarded {
+                body.push(vopc(0xC4, v(1), 2)); // v_cmp_gt_u32 vcc, v1, v2
+                body.push(sop1(0x3C, 20, VCC)); // s_and_saveexec_b32 s20, vcc
+            }
+            body.extend(vop3(op, 5, [v(1), v(2), v(3)], NONE));
+            if guarded {
+                body.push(sop1(0x03, 126, s(20))); // restore EXEC
+            }
+            probes.push(probe(body, inputs.clone(), INT, move |i| {
+                if guarded && i[0] <= i[1] {
+                    return vec![OLD];
+                }
+                let a = i[0].to_le_bytes();
+                let b = i[1].to_le_bytes();
+                let distance = match op {
+                    0x15a | 0x15b => a
+                        .iter()
+                        .zip(b)
+                        .map(|(&a, b)| u64::from(a.abs_diff(b)))
+                        .sum(),
+                    0x171 => a
+                        .iter()
+                        .zip(b)
+                        .filter(|(_, b)| *b != 0)
+                        .map(|(&a, b)| u64::from(a.abs_diff(b)))
+                        .sum(),
+                    0x15c => a
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .zip(b.as_chunks::<2>().0)
+                        .map(|(a, b)| {
+                            let a = u16::from_le_bytes(*a);
+                            let b = u16::from_le_bytes(*b);
+                            u64::from(a.abs_diff(b))
+                        })
+                        .sum(),
+                    _ => u64::from(i[0].abs_diff(i[1])),
+                };
+                let distance = if op == 0x15b {
+                    distance << 16
+                } else {
+                    distance
+                };
+                vec![(distance + u64::from(i[2])) as u32]
+            }));
+        }
+    }
+    assert_clean(check(&probes));
+}
