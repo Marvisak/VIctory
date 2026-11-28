@@ -492,6 +492,10 @@ pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
 /// fewer than two.
 pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    if n <= 1 {
+        (0..n).for_each(f);
+        return;
+    }
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(1, 4).min(n);
     if threads < 2 {
         (0..n).for_each(f);
@@ -520,11 +524,19 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
     // Most find nothing changed (their trackers' clean bits say so): those
     // are not handed to threads.
     let changed: Vec<usize> = (0..work.len()).filter(|&i| work[i].0.maybe_changed()).collect();
+    let mut out: Vec<Option<Upload>> = vec![None; work.len()];
+    match changed.as_slice() {
+        [] => return out,
+        &[i] => {
+            out[i] = work[i].0.refresh();
+            return out;
+        }
+        _ => {}
+    }
     let results: Vec<Mutex<Option<Upload>>> = changed.iter().map(|_| Mutex::new(None)).collect();
     in_parallel(changed.len(), |k| {
         *results[k].lock().unwrap_or_else(|e| e.into_inner()) = work[changed[k]].0.refresh();
     });
-    let mut out: Vec<Option<Upload>> = vec![None; work.len()];
     for (k, r) in results.into_iter().enumerate() {
         out[changed[k]] = r.into_inner().unwrap_or_else(|e| e.into_inner());
     }
