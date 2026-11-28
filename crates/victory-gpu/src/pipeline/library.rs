@@ -47,6 +47,11 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// The pipeline cache folder, if configured.
+pub(crate) fn folder() -> Option<&'static std::path::Path> {
+    DIR.get().map(PathBuf::as_path)
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
@@ -84,7 +89,7 @@ unsafe impl Sync for Shared {}
 
 /// Names one thread at a time holds.
 struct Names {
-    held: Mutex<Option<HashSet<String>>>,
+    held: Mutex<Option<std::collections::HashMap<String, std::thread::ThreadId>>>,
     released: Condvar,
 }
 
@@ -105,23 +110,42 @@ impl Names {
     /// Holds `name`, once no other thread does.
     fn hold<'a>(&'a self, name: &'a str) -> Held<'a> {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
-        while held.as_ref().is_some_and(|h| h.contains(name)) {
+        while held.as_ref().is_some_and(|h| h.contains_key(name)) {
             held = self.released.wait(held).unwrap_or_else(|e| e.into_inner());
         }
-        held.get_or_insert_default().insert(name.to_owned());
+        held.get_or_insert_default()
+            .insert(name.to_owned(), std::thread::current().id());
         Held { names: self, name }
+    }
+
+    /// Releases any name held by `thread` (for a worker parked after a crash).
+    fn release_by(&self, thread: std::thread::ThreadId) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = held.as_mut() {
+            h.retain(|_, owner| *owner != thread);
+        }
+        drop(held);
+        self.released.notify_all();
     }
 }
 
 impl Drop for Held<'_> {
     fn drop(&mut self) {
+        let me = std::thread::current().id();
         let mut held = self.names.held.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(h) = held.as_mut() {
+        if let Some(h) = held.as_mut()
+            && h.get(self.name) == Some(&me)
+        {
             h.remove(self.name);
         }
         drop(held);
         self.names.released.notify_all();
     }
+}
+
+/// Releases any pipeline name held by `thread` if it parked in the compiler guard.
+pub(crate) fn release_held_by(thread: std::thread::ThreadId) {
+    NAMES.release_by(thread);
 }
 
 /// Pipelines being loaded, or made and stored.
