@@ -19,12 +19,13 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ShaderError;
-use crate::gfx10::{Fields, Operand};
+use crate::gfx10::{Fields, Instruction, Operand};
 use crate::ir::{self, EXEC, Inst, M0, Program, Reg, Value};
 use crate::structure::{self, Atom, LaneExit, Structured};
 
-/// [`ir::build`] and [`structure::structure`], built again with the register
-/// ranges of relative moves bounded where their index is.
+/// An IR build and [`structure::structure`], rebuilding the IR from the same
+/// decoded instructions with the register ranges of relative moves bounded
+/// where their index is.
 ///
 /// A move can write the registers its own index comes from (the full range
 /// of a `v_movreld` covers a loop's counter and limit), so the bounds are
@@ -38,7 +39,30 @@ pub fn build(
     wave64: bool,
     vgprs: u16,
 ) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
-    let p = ir::build(code, wave64, vgprs)?;
+    let list = ir::decode(code)?;
+    if !list.iter().any(|i| i.name().is_some_and(relative_name)) {
+        let p = ir::build_bounded_owned(code, list, wave64, vgprs, &HashMap::new())?;
+        let st = structure::structure(&p);
+        return Ok((p, st));
+    }
+    build_decoded(code, &list, wave64, vgprs)
+}
+
+/// Rebuild a decoded program with the M0 bounds of relative moves refined.
+fn build_decoded(
+    code: &[u8],
+    list: &[Instruction],
+    wave64: bool,
+    vgprs: u16,
+) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
+    build_with(|m0_max| ir::build_bounded_decoded(code, list, wave64, vgprs, m0_max))
+}
+
+/// The induction over M0 bounds, parameterized by how the IR is rebuilt.
+fn build_with(
+    make: impl Fn(&HashMap<usize, u8>) -> Result<Program, ShaderError>,
+) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
+    let p = make(&HashMap::new())?;
     let st = structure::structure(&p);
     let mut assumed: HashMap<usize, u8> = p
         .blocks
@@ -55,7 +79,7 @@ pub fn build(
         if assumed.is_empty() {
             break;
         }
-        let q = ir::build_bounded(code, wave64, vgprs, &assumed)?;
+        let q = make(&assumed)?;
         let Ok(s) = structure::structure(&q) else {
             break;
         };
@@ -68,7 +92,7 @@ pub fn build(
             if proven == assumed {
                 return Ok((q, Ok(s)));
             }
-            let q = ir::build_bounded(code, wave64, vgprs, &proven)?;
+            let q = make(&proven)?;
             let s = structure::structure(&q);
             return Ok((q, s));
         }
@@ -81,8 +105,12 @@ pub fn build(
 }
 
 fn relative(inst: &Inst) -> bool {
+    relative_name(inst.name())
+}
+
+fn relative_name(name: &str) -> bool {
     matches!(
-        inst.name(),
+        name,
         "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" | "v_movrelsd_2_b32" | "v_swaprel_b32"
     )
 }
@@ -324,6 +352,46 @@ fn dst(inst: &Inst) -> Option<Reg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_m0_bounded_loop_decodes_once_and_keeps_its_ir_and_structure() {
+        let words = [
+            vop1(0x01, 7, 128),   // v_mov_b32 v7, 0
+            vop1(0x02, 0, V + 7), // v_readfirstlane_b32 s0, v7
+            M0_S0,
+            vop1(0x42, 2, V),                        // v_movreld_b32 v2, v0
+            vop2(0x25, 7, 129, 7),                   // v_add_nc_u32 v7, 1, v7
+            0x7C00_0000 | 0xC4 << 17 | 7 << 9 | 132, // v_cmp_gt_u32 vcc, 4, v7
+            0xBF87_FFFA,                             // s_cbranch_vccnz to the readfirstlane
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        let list = ir::decode(&code).unwrap();
+        let cached = build_decoded(&code, &list, false, 16).unwrap();
+        let built = build(&code, false, 16).unwrap();
+        let legacy_decodes = std::cell::Cell::new(0);
+        let uncached = build_with(|m0_max| {
+            legacy_decodes.set(legacy_decodes.get() + 1);
+            ir::build_bounded(&code, false, 16, m0_max)
+        })
+        .unwrap();
+
+        assert!(legacy_decodes.get() > 1);
+        assert_eq!(cached.0, built.0);
+        assert!(built.1.is_ok());
+        assert_eq!(cached.0, uncached.0);
+        let (cached, uncached) = (cached.1.unwrap(), uncached.1.unwrap());
+        assert_eq!(cached.exits, uncached.exits);
+        assert_eq!(cached.guards, uncached.guards);
+        assert_eq!(cached.reach, uncached.reach);
+        assert_eq!(cached.masks, uncached.masks);
+        assert_eq!(cached.other, uncached.other);
+        assert_eq!(cached.highs, uncached.highs);
+        assert_eq!(cached.active, uncached.active);
+        assert_eq!(cached.restored, uncached.restored);
+        assert_eq!(cached.discards, uncached.discards);
+    }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
     const V: u32 = 256;

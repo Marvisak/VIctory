@@ -139,6 +139,33 @@ pub fn build_bounded(
     m0_max: &HashMap<usize, u8>,
 ) -> Result<Program, ShaderError> {
     let list = gfx10::decode(code)?;
+    build_bounded_owned(code, list, wave64, vgprs, m0_max)
+}
+
+/// Decode a program once, so callers rebuilding it with different M0 bounds
+/// can reuse the same instructions instead of decoding each time.
+pub(crate) fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
+    gfx10::decode(code)
+}
+
+/// [`build_bounded`], from instructions already decoded by [`decode`].
+pub(crate) fn build_bounded_decoded(
+    code: &[u8],
+    list: &[Instruction],
+    wave64: bool,
+    vgprs: u16,
+    m0_max: &HashMap<usize, u8>,
+) -> Result<Program, ShaderError> {
+    build_bounded_owned(code, list.to_vec(), wave64, vgprs, m0_max)
+}
+
+pub(crate) fn build_bounded_owned(
+    code: &[u8],
+    list: Vec<Instruction>,
+    wave64: bool,
+    vgprs: u16,
+    m0_max: &HashMap<usize, u8>,
+) -> Result<Program, ShaderError> {
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
 
