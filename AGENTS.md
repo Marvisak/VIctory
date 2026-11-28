@@ -3,18 +3,16 @@
 Read this file before changing code, opening issues, creating pull requests, reviewing changes, or merging branches.
 
 
-## 0. Autonomous agent operation
+## 0. Single-operator autonomous development
 
-The project is operated by its coordinating agents. Routine implementation, research, issue triage, code review, pull-request management, integration into `dev`, and qualified `dev` → `main` promotion do not require case-by-case project-owner approval. Agents are expected to coordinate with one another and maintain the repository without waiting for a human supervisor.
+The project is currently maintained directly by the project owner and one coordinating development agent. The previous multi-agent swarm review process is optional and is not a mandatory merge gate unless the project owner explicitly re-enables it.
 
-This autonomy is bounded by the technical and security gates in this file and by the actual GitHub repository permissions and rules:
-
-- Agents may independently claim work, create or update temporary branches, open and revise PRs, request reviews, run permitted checks, merge qualifying PRs, close genuinely superseded work, and clean up merged temporary branches.
-- Every implementation change must pass independent review. The author cannot review or approve their own work. Reviewers must challenge the implementation, not merely confirm the author's explanation.
-- Agents must keep the coordination desk and upstream index accurate, resolve duplicate tasks, and hand work between implementation, review, and integration roles.
-- When a required independent reviewer, check, permission, or piece of evidence is unavailable, the agent must leave the change open and clearly blocked. Autonomy never means inventing evidence, weakening a gate, or bypassing repository protections.
-- No agent may change these governance rules, branch protections, required checks, secrets, or permission boundaries as a way to make its own pending change mergeable. Governance changes themselves require the same independent review and validation discipline.
-- The project owner may coordinate priorities and provide direction, but routine operational decisions within these rules belong to the agents.
+- The coordinating agent may implement, inspect its own changes, run available validation, write a documented self-review, update PRs, merge qualifying PRs into `dev`, and promote a validated `dev` snapshot to `main` without requesting artificial or ceremonial independent reviews.
+- A self-review is valid as an engineering self-audit in this operating mode. It must be honest about scope, tests actually run, untested paths, and residual risks. It must never be labelled as an independent review.
+- Peer/agent reviews are welcome when genuinely available and useful, but their absence alone does not block work.
+- The project owner's direct instructions define priorities and may explicitly authorize changes to this governance policy. Routine implementation and integration decisions are delegated to the coordinating agent.
+- Technical validation, exact-SHA checks, security boundaries, branch protections, and truthful reporting remain mandatory. Owner authorization does not justify fabricated CI results, false test claims, secret exposure, or bypassing GitHub protections.
+- If an actual GitHub rule or permission prevents an authorized operation, report that concrete restriction. Do not claim that conversational authorization changed the repository's technical permissions.
 
 ## 1. Coordination is mandatory
 
@@ -30,7 +28,7 @@ Before starting work:
 3. Claim exactly one existing `TASK-ID` in #50. Include your agent identifier, precise scope, files/functions, and expected output.
 4. If no canonical issue exists, create one focused issue only after checking for duplicates; then add its `TASK-ID` to #50.
 5. Do not begin overlapping implementation while another active claim owns that scope. Coordinate a handoff first.
-6. Review tasks are first-class work. An agent may claim an independent review of another agent's PR without claiming implementation ownership.
+6. Optional peer-review tasks may be claimed when another agent is genuinely available; they are not required in single-operator mode.
 
 Use these status words consistently:
 
@@ -41,7 +39,7 @@ Use these status words consistently:
 - `done`: the promised output is complete; link the canonical result.
 - `release`: the claim is relinquished without completion.
 
-A completed research task does not mean its implementation PR is merged. Track implementation, review, and integration separately.
+A completed research task does not mean its implementation PR is merged. Track implementation, self-audit, validation, and integration separately.
 
 ## 2. Keep the repository and issue tracker clean
 
@@ -53,7 +51,7 @@ A completed research task does not mean its implementation PR is merged. Track i
 - Separate confirmed facts, reproductions, hypotheses, and recommendations.
 - Close an issue only when its tracked result is integrated or explicitly abandoned. A green upstream CI run is not proof that the fork has integrated the change.
 - Do not claim that a task is complete while a required test, review, rebase, or integration step remains.
-- Review comments must identify concrete code paths, invariants, failure modes, and evidence. Generic approvals such as "looks good" are not meaningful review.
+- Self-audit notes and any optional review comments must identify concrete code paths, invariants, failure modes, and evidence. Generic approvals such as "looks good" are not meaningful review.
 
 ## 3. Branch and pull-request policy
 
@@ -72,18 +70,25 @@ All feature, fix, experiment, and upstream-import branches are temporary.
 - When two PRs touch the same file, subsystem, or invariant, serialize their integration: merge/rebase one, then re-review the second against the new combined tree.
 - After merge, delete the temporary branch when permissions and tooling allow. Do not delete a branch before confirming its PR is merged and no other work depends on it.
 - Agents ARE AUTHORIZED to merge qualifying PRs into `dev` and to promote `dev` into `main`, but only after satisfying the gates in sections 4 and 5. Do not interpret the previous human-only merge restriction as active; it is superseded by this policy.
-- The PR author/implementer may perform the final merge after independent reviewers have completed their work. The author may never count their own review as an independent review.
+- In single-operator mode, the PR author/implementer may perform the final merge after completing and documenting a critical self-audit and satisfying all applicable validation gates. Do not invent independent reviewers or claim that a self-review is independent.
 - Use GitHub's PR merge operation and supply the exact reviewed head SHA as the expected head. Never force-push a permanent branch or bypass branch protection, required checks, required reviews, or repository rules.
 - If the agent lacks write permission or GitHub protection rejects the merge, do not work around the restriction. Report the exact blocker and hand off to an authorized agent/maintainer.
 
-## 4. AI review and integration gates
+## 4. Self-audit and integration gates
 
-The goal is not to collect superficial approvals. Every implementation PR must survive independent inspection and an explicit attempt to find defects.
+The goal is to catch defects through careful inspection and reproducible validation, not to collect ceremonial approvals.
 
-### 4.1 Independent reviewers
+### 4.1 Required self-audit
 
-Before merging any implementation PR into `dev`:
+Before merging an implementation PR into `dev`, the coordinating agent must:
+1. Inspect the complete diff at the exact current head SHA, not only the PR description or its own summary.
+2. Trace changed functions through relevant call sites, ownership/lifetime rules, error paths, concurrency behavior, and compatibility boundaries.
+3. Actively search for counterexamples, boundary cases, races, resource exhaustion, malformed input, and tests that could pass while the implementation remains incorrect.
+4. Check whether equivalent fixes or regressions already exist in upstream or other fork PRs.
+5. Record the exact head SHA, files/functions inspected, commands actually run, findings, test gaps, and residual risks in the PR.
+6. Fix blocking findings and repeat the affected inspection and validation after every change.
 
+Optional peer reviews may add confidence, but are not mandatory in the current single-operator mode. Never fabricate reviewer identities, separate agent instances, or approvals.
 1. Obtain at least **two independent AI reviews** of the exact PR head:
    - **Correctness reviewer:** checks semantics, architecture, API/ABI compatibility, ownership/lifetimes, concurrency, error paths, and regressions.
    - **Adversarial reviewer:** assumes the implementation is wrong and actively searches for counterexamples, boundary cases, races, resource exhaustion, malformed input, and tests that would pass while the implementation is still incorrect.
@@ -107,8 +112,6 @@ The #50 claim is the auditable record of a separate review context. Multiple rev
 9. If two reviewers disagree, a third independent reviewer adjudicates. Do not resolve a technical disagreement by majority vote without evidence.
 10. If separate reviewers are unavailable, do not fabricate reviewer identities or claim a multi-agent review occurred. Keep the PR open and request review.
 
-GitHub formal review approvals should be used when the reviewer has permission to submit them. If the repository requires a formal approval that the available agents cannot provide, the PR remains blocked until an authorized reviewer supplies it. PR comments are useful evidence but must never be misrepresented as GitHub APPROVE reviews.
-
 ### 4.2 Required validation for every PR
 
 A PR is merge-ready only when all of the following are true:
@@ -119,7 +122,7 @@ A PR is merge-ready only when all of the following are true:
 - Formatting is a required exact-head check: run `cargo fmt --all -- --check` after the final commit. If the current CI workflow does not run it, execute it separately and record the exact SHA, command, and result in the PR. Clippy is not a substitute for rustfmt.
 - Required unit, integration, regression, policy, formatting, static-analysis, and platform-specific checks have been run. A skipped check is not evidence that the underlying behavior works.
 - Tests cover the reported failure, normal behavior, negative cases, boundaries, and relevant failure/recovery paths.
-- The two independent reviews in section 4.1 are complete, all blocking findings are resolved, and the final head has been re-reviewed after fixes.
+- The self-audit in section 4.1 is complete, all blocking findings are resolved, and the final head has been re-inspected after fixes.
 - The PR has no unresolved review threads or unexplained failing/pending checks.
 - The mergeability state and exact base/head SHAs have been rechecked immediately before merging.
 
@@ -159,23 +162,19 @@ This is explicit authorization for agents to merge into `dev`. Do not ask the ow
 
 ## 5. Release gate: promoting dev into main
 
-Merging into `main` is permitted for AI agents, but it is a release operation and has a higher bar than normal integration.
+Promotion to `main` remains a deliberate release operation, but it does not require a multi-agent review ceremony in single-operator mode.
 
 - The only normal promotion path is a focused PR from the current `dev` into the current `main`. Do not merge an individual feature branch directly into `main`.
-- Promote a reviewed snapshot of `dev`; do not combine unrelated, unfinished work merely to make a release.
-- At least **three independent AI review passes** are required for the `dev` → `main` PR:
-  1. release-diff auditor: checks every commit and file included since the exact current `main` SHA, including main-only commits and accidental scope expansion;
-  2. correctness/security auditor: rechecks critical invariants, unsafe code, resource lifetime, concurrency, data integrity, and failure handling;
-  3. adversarial release auditor: searches for regressions, missing tests, incompatible interactions, incomplete features, and evidence gaps.
-- At least two of the three reviewers must not have implemented the changes under review. The reviewer roles must be performed by distinct agent instances; do not count repeated passes by one agent.
-- All P0/P1 findings must be resolved. P2/P3 residual risks must be explicitly documented and accepted in the PR with a reason and follow-up issue where appropriate.
-- The complete Windows CI suite must pass on the exact release candidate/merge candidate. Re-run after any rebase, new commit, conflict resolution, or change to the candidate tree.
-- All hardware-dependent changes included in the release must have the required real-hardware evidence. WARP or synthetic tests alone do not prove vendor hardware behavior.
-- Verify that `dev` contains no accidental proprietary data, forbidden assets, debug dumps, local credentials, secrets, or unreviewed workflow/security changes.
-- Review the full `main...dev` change set and commit graph. Identify main-only commits and explain how they are preserved. Do not overwrite or discard changes that exist only on `main`.
-- Confirm the release notes or PR body accurately describe included changes, known limitations, and validation evidence.
+- Promote a validated snapshot of `dev`; do not combine unrelated, unfinished work merely to make a release.
+- The coordinating agent must perform and document a release self-audit of the complete `main...dev` diff and commit graph, including main-only commits, accidental scope expansion, critical invariants, unsafe code, resource lifetime, concurrency, data integrity, and failure handling.
+- All P0/P1 findings must be resolved. P2/P3 residual risks must be explicitly documented with rationale and follow-up issue where appropriate.
+- The complete applicable CI suite must pass on the exact release candidate. Re-run after any rebase, new commit, conflict resolution, or candidate-tree change.
+- All hardware-dependent changes included in the release must have required real-hardware evidence. WARP or synthetic tests alone do not prove vendor hardware behavior.
+- Verify that `dev` contains no accidental proprietary data, forbidden assets, debug dumps, local credentials, secrets, or unsafe workflow/security changes.
+- Identify main-only commits and preserve them. Do not overwrite or discard changes that exist only on `main`.
+- Confirm release notes accurately describe included changes, known limitations, and validation evidence.
 
-An AI agent MAY merge the `dev` → `main` PR without routine human approval when every release requirement above and all GitHub repository protections are satisfied. If any requirement cannot be verified, the release is blocked; do not lower the bar to force a merge.
+The coordinating agent may merge the `dev` → `main` PR without routine human approval when this release self-audit, applicable validation, and actual GitHub repository protections are satisfied.
 
 After promotion, verify the new `main` SHA and its CI. If the release checks fail, stop further promotion and prepare a narrow corrective PR or revert. Do not silently leave `main` red.
 
@@ -201,10 +200,10 @@ Do not cherry-pick a large integration PR merely because it makes a title reach 
 - Never execute upstream PR/build/test code in a job that has repository write permissions, secrets, or a token capable of mutating refs/issues/PRs.
 - Keep CI and scheduled triage read-only: fetch metadata and Git objects, compute merge trees/patch IDs, run candidate tests in isolated jobs without write credentials, and publish reports only where safe.
 - Candidate-controlled code must not receive repository secrets, privileged tokens, or write access. Do not use `pull_request_target` to check out and execute untrusted PR code with elevated permissions.
-- Merge authorization in this file applies to an agent acting after it has independently verified completed evidence. It does NOT authorize a candidate-controlled workflow to merge itself, approve itself, change branch protections, publish secrets, or bypass required checks.
+- Merge authorization in this file applies to the coordinating agent acting after it has completed and documented its self-audit and verified available evidence. It does NOT authorize candidate-controlled workflows to merge themselves, change branch protections, publish secrets, or bypass required checks.
 - If a separate publisher or merge service is introduced, isolate it from candidate execution and independently verify pinned candidate heads, artifacts, and expected refs. Do not trust reports or bundles produced in a candidate-controlled workspace without validation.
 - Never use force-push, admin bypass, disabling branch protection, fabricated reviews, or manually forged green statuses to get a merge through.
-- Human review is welcome and may be required by actual GitHub repository settings, but it is NOT a blanket policy requirement in this file. Qualified AI agents are explicitly authorized to make merge decisions under the gates above.
+- Human or peer review is welcome and may be required by actual GitHub repository settings, but it is NOT a blanket policy requirement in this file. The coordinating agent is explicitly authorized to make merge decisions under the self-audit and validation gates above.
 - If repository rules require a human or a permission unavailable to agents, obey the rule and report the blocker. This policy does not grant GitHub permissions or override repository configuration.
 
 ## 8. Correctness rules for low-level changes
@@ -233,8 +232,8 @@ Every completed task must leave a concise comment in its canonical issue contain
 - fork `main`/`dev` status and relevant file/function comparison;
 - changed files and behavior reviewed;
 - tests with exact command, platform/GPU/WARP, and counts;
-- independent reviewers, exact reviewed head SHA, their verdicts, and links to findings;
-- unresolved review objections, risks, and dependencies;
+- self-audit summary, exact audited head SHA, validation evidence, and links to findings;
+- unresolved findings, risks, and dependencies;
 - verdict: `ready to port`, `needs changes`, `blocked`, `merged to dev`, or `released to main`;
 - link to the fork PR and the resulting merge commit SHA when merged.
 
