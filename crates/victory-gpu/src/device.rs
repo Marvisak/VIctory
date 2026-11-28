@@ -315,6 +315,12 @@ extern "system" fn check_feature_support(
             // shortcut: every use of every format; answer from the host
             // device once there is one.
             q[1] = 0x7fff_ffff;
+            // D32_FLOAT_S8X24_UINT, D32_FLOAT, D24_UNORM_S8_UINT, D16_UNORM.
+            if matches!(q[0], 20 | 40 | 45 | 55) {
+                // Typed depth/stencil formats have no color render-target or blend support.
+                const COLOR_TARGET_FLAGS: u32 = 0x4000 | 0x8000;
+                q[1] &= !COLOR_TARGET_FLAGS;
+            }
             q[2] = 0xffff;
             S_OK
         }
@@ -448,6 +454,29 @@ static FUNCTIONS: Table<160> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn typed_depth_formats_do_not_advertise_color_target_support() {
+        const COLOR_TARGET_FLAGS: u32 = 0x4000 | 0x8000;
+        const DEPTH_STENCIL: u32 = 0x1_0000;
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let query = |format| {
+            let mut info = [format, 0, 0];
+            assert_eq!(check(device, 3, info.as_mut_ptr().cast(), 12), S_OK);
+            assert_eq!(info[0], format);
+            info[1]
+        };
+        for format in [20, 40, 45, 55] {
+            let support = query(format);
+            assert_eq!(support & (COLOR_TARGET_FLAGS | DEPTH_STENCIL), DEPTH_STENCIL);
+        }
+        // RGBA8 and the color formats of the R32 and R16 families.
+        for format in [28, 41, 56] {
+            assert_eq!(query(format) & COLOR_TARGET_FLAGS, COLOR_TARGET_FLAGS);
+        }
+    }
 
     fn create_as(iid: &Iid) -> (HRESULT, This) {
         let version = CHECKED_VERSION;
