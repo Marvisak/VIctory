@@ -409,6 +409,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn swap_chain_resize_retries_are_independent_by_format() {
+        let mut resize = super::SwapChainResizeRetries::default();
+        let start = Instant::now();
+        let rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let bgra = DXGI_FORMAT_B8G8R8A8_UNORM;
+        let rgb10 = DXGI_FORMAT_R10G10B10A2_UNORM;
+        let at = |ms| start + Duration::from_millis(ms);
+        let rgba_error = || Err::<(), _>("RGBA resize failed");
+        let rgb10_error = || Err::<(), _>("RGB10 resize failed");
+        let success = || Ok::<_, &str>(());
+
+        assert_eq!(resize.for_format(rgba).attempt(at(0), rgba_error), Some(Err("RGBA resize failed")));
+        assert_eq!(resize.for_format(rgba).attempt(at(100), rgba_error), None);
+        assert_eq!(
+            resize.for_format(bgra).attempt(at(100), success),
+            Some(Ok(())),
+            "BGRA must run during RGBA cooldown"
+        );
+        assert_eq!(
+            resize.for_format(rgb10).attempt(at(200), rgb10_error),
+            Some(Err("RGB10 resize failed"))
+        );
+        assert_eq!(resize.for_format(rgba).attempt(at(999), rgba_error), None);
+        assert_eq!(resize.for_format(rgba).attempt(at(1_000), success), Some(Ok(())));
+        assert_eq!(resize.for_format(rgb10).attempt(at(1_199), rgb10_error), None);
+        assert_eq!(resize.for_format(rgb10).attempt(at(1_200), success), Some(Ok(())));
+    }
+
+    #[test]
     fn swap_chain_failures_retry_once_per_second_and_success_clears_the_wait() {
         use super::{Duration, Instant, SwapChainRetry};
 
@@ -2973,6 +3002,7 @@ impl Compositor {
 struct Presentation {
     presenter: Option<Presenter>,
     retry: SwapChainRetry,
+    resize_retries: SwapChainResizeRetries,
 }
 
 #[derive(Default)]
@@ -2998,6 +3028,18 @@ impl SwapChainRetry {
         let result = operation();
         self.next_attempt = result.is_err().then(|| now + Duration::from_secs(1));
         Some(result)
+    }
+}
+
+#[derive(Default)]
+struct SwapChainResizeRetries {
+    // Only the four output formats accepted by swap_format are used here.
+    by_format: std::collections::BTreeMap<i32, SwapChainRetry>,
+}
+
+impl SwapChainResizeRetries {
+    fn for_format(&mut self, format: DXGI_FORMAT) -> &mut SwapChainRetry {
+        self.by_format.entry(format.0).or_default()
     }
 }
 
@@ -3211,7 +3253,11 @@ impl Host {
             return None;
         };
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
-        let Presentation { presenter, retry } = &mut *presentation;
+        let Presentation {
+            presenter,
+            retry,
+            resize_retries,
+        } = &mut *presentation;
         if presenter.is_none() && !retry.ready(Instant::now()) {
             return None;
         }
@@ -3257,6 +3303,7 @@ impl Host {
             p.compositor = Some(c);
         }
         if (p.width, p.height, p.format) != (width, height, format) {
+            let retry = resize_retries.for_format(format);
             let resized = retry.attempt(Instant::now(), || {
                 // SAFETY: no back buffer is held; every submission was waited for.
                 unsafe {
