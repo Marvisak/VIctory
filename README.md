@@ -118,7 +118,10 @@ it with the PC build on your GPU instead of the console build, get the
 and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
 `Kits/FidelityFX/signedbin` folder, which holds
 `amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
-upscaler for your GPU (the log says so), the title's own DLLs run.
+upscaler for your GPU, the title's own DLLs run. In Series S mode, that path
+can leave the 3D view blank while the HUD still renders. Look for the
+`FidelityFX: the host's upscaler serves the title's` line to confirm that the
+PC upscaler is in use.
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived

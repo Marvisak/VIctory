@@ -61,6 +61,11 @@ pub fn run(
     // Before the import registry is first used: it holds the module only
     // when the host's FidelityFX serves.
     victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
+    if execute && matches!(console, Console::SeriesS) && cfg.fidelityfx_dir.is_none() {
+        tracing::warn!(
+            "No host FidelityFX directory configured for Series S. If the 3D view is blank with the HUD visible, set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir"
+        );
+    }
     let prepared = victory_loader::prepare(
         &std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?,
     )?;
