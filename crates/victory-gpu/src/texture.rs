@@ -693,6 +693,18 @@ impl Staging {
             // keeping the slice strictly inside the mapped staging buffer even when
             // GetCopyableFootprints does not pad the final row of the last subresource.
             let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
+            if contiguous_copy(ContiguousCopy {
+                layout: &self.layout,
+                tiled,
+                linear,
+                mip,
+                slice,
+                pitch,
+                rows,
+                depth: f.Depth,
+            }) {
+                continue;
+            }
             if let Err(e) =
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
@@ -745,6 +757,66 @@ fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64)
         .saturating_mul(depth as usize);
     let remaining = usize::try_from(total.saturating_sub(offset)).unwrap_or(usize::MAX);
     padded.min(remaining)
+}
+
+struct ContiguousCopy<'a> {
+    layout: &'a victory_formats::texture::Layout,
+    tiled: &'a [u8],
+    linear: &'a mut [u8],
+    mip: u32,
+    slice: u32,
+    pitch: usize,
+    rows: u32,
+    depth: u32,
+}
+
+fn contiguous_copy(copy: ContiguousCopy<'_>) -> bool {
+    let ContiguousCopy {
+        layout,
+        tiled,
+        linear,
+        mip,
+        slice,
+        pitch,
+        rows,
+        depth,
+    } = copy;
+    use victory_formats::texture::Swizzle;
+    if layout.desc.swizzle != Swizzle::LINEAR {
+        return false;
+    }
+    let Some(m) = layout.mips.get(mip as usize) else {
+        return false;
+    };
+    let bytes = (m.width as usize).saturating_mul(layout.desc.element_bytes as usize);
+    let native = (m.pitch as usize).saturating_mul(layout.desc.element_bytes as usize);
+    if native != pitch
+        || pitch != bytes
+        || rows != m.height
+        || depth != m.depth.max(1)
+        || bytes == 0
+    {
+        return false;
+    }
+    let Some(len) = bytes
+        .checked_mul(rows as usize)
+        .and_then(|len| len.checked_mul(depth as usize))
+    else {
+        return false;
+    };
+    let Some(at) = (m.offset as usize)
+        .checked_add((slice as usize).saturating_mul(layout.slice_size as usize))
+    else {
+        return false;
+    };
+    let Some(end) = at.checked_add(len) else {
+        return false;
+    };
+    if end > tiled.len() || len > linear.len() {
+        return false;
+    }
+    linear[..len].copy_from_slice(&tiled[at..][..len]);
+    true
 }
 
 /// Whether `[at, at + len)` is committed, readable memory (streamed textures
@@ -852,6 +924,83 @@ mod tests {
         assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
         assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
         assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+    }
+
+    #[test]
+    fn contiguous_subresources_take_the_one_copy_path() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let desc = Desc {
+            dimension: Dimension::Tex2d,
+            width: 64,
+            height: 4,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        };
+        let layout = Layout::new(&desc).unwrap();
+        let tiled: Vec<u8> = (0..layout.size as usize).map(|i| i as u8).collect();
+        let mut linear = vec![0u8; tiled.len()];
+        assert!(contiguous_copy(ContiguousCopy {
+            layout: &layout,
+            tiled: &tiled,
+            linear: &mut linear,
+            mip: 0,
+            slice: 0,
+            pitch: 256,
+            rows: 4,
+            depth: 1,
+        }));
+        assert_eq!(linear, tiled);
+    }
+
+    #[test]
+    fn padded_and_tiled_subresources_do_not_take_the_contiguous_path() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let desc = Desc {
+            dimension: Dimension::Tex2d,
+            width: 64,
+            height: 4,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        };
+        let layout = Layout::new(&desc).unwrap();
+        let tiled: Vec<u8> = (0..layout.size as usize).map(|i| i as u8).collect();
+        let mut padded = vec![0u8; tiled.len()];
+        assert!(!contiguous_copy(ContiguousCopy {
+            layout: &layout,
+            tiled: &tiled,
+            linear: &mut padded,
+            mip: 0,
+            slice: 0,
+            pitch: 320,
+            rows: 4,
+            depth: 1,
+        }));
+        assert!(padded.iter().all(|&b| b == 0));
+
+        let tiled_desc = Desc {
+            swizzle: Swizzle::SW_256B_S,
+            ..desc
+        };
+        let tiled_layout = Layout::new(&tiled_desc).unwrap();
+        let mut linear = vec![0u8; tiled_layout.size as usize];
+        assert!(!contiguous_copy(ContiguousCopy {
+            layout: &tiled_layout,
+            tiled: &tiled,
+            linear: &mut linear,
+            mip: 0,
+            slice: 0,
+            pitch: 256,
+            rows: 4,
+            depth: 1,
+        }));
     }
 
     #[test]

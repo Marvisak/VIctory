@@ -590,6 +590,28 @@ impl Module {
         }
     }
 
+    /// The arguments of the calls of functions named `name`.
+    #[cfg(test)]
+    pub fn call_args(&self, name: &str) -> Vec<Vec<V>> {
+        self.insts
+            .iter()
+            .filter_map(|i| match &i.op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == name => Some(args.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The fields of a constant aggregate.
+    #[cfg(test)]
+    pub fn aggregate_fields(&self, v: V) -> Option<Vec<V>> {
+        let V::Const(i) = v else { return None };
+        match &self.consts[i as usize].1 {
+            Const::Aggregate(ids) => Some(ids.iter().map(|&i| V::Const(i)).collect()),
+            _ => None,
+        }
+    }
+
     /// Calls of functions named `name` that [`Module::write`] writes.
     #[cfg(test)]
     pub fn written_calls(&self, name: &str) -> usize {
