@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1407,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -3744,9 +3749,8 @@ impl<'a> Lower<'a> {
                         .s
                         .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[b]);
                     let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
-                    let fb32 = self.s.m.bin(c, Bin::Add, fb, k32);
-                    let none = self.s.m.cmp(c, pred::EQ, b, z);
-                    let fb = self.s.m.select(c, none, fb, fb32);
+                    // A position 0..31 becomes 32..63; the -1 sentinel stays -1.
+                    let fb = self.s.m.bin(c, Bin::Or, fb, k32);
                     let low = self.s.m.cmp(c, pred::NE, a, z);
                     let r = self.s.m.select(c, low, fa, fb);
                     self.set(lo, Val::I32(r));
@@ -11089,6 +11093,14 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn scalar_first_set_bit_64_instruction_count() {
+        // Dynamic s[0:1], s2 = first set bit, v0 = s2, then a live UAV store.
+        let lowered = lower_valu(&[0xBE82_1400, 0x7E00_0202]).expect("s_ff1_i32_b64 lowers");
+        eprintln!("s_ff1_i32_b64: {} DXIL instructions", lowered.instructions);
+        assert_eq!(lowered.instructions, 21);
     }
 
     #[test]

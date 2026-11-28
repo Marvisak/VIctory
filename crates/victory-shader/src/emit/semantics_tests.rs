@@ -2814,6 +2814,54 @@ fn scalar_alu_matches_the_hardware() {
     assert_clean(check(&passing(scalar_probes())));
 }
 
+/// The high half's scan adds 32 without changing the no-bit sentinel.
+/// Check every possible first-bit position in both halves, overlapping
+/// destinations, and preservation of both values of SCC.
+#[test]
+fn scalar_first_set_bit_64_matches_the_reference() {
+    let mut values = vec![0, u64::MAX, 0xAAAA_AAAA_5555_5555];
+    for bit in 0..64 {
+        values.extend([1u64 << bit, !(1u64 << bit), u64::MAX << bit]);
+    }
+    for low in 0..32 {
+        for high in 0..32 {
+            values.push((1u64 << low) | (1u64 << (32 + high)));
+        }
+    }
+    let mut random = 0xD2F9_0159_5A1C_E773u64;
+    for _ in 0..2048 {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        values.extend([random, random & 0xFFFF_FFFF, random & 0xFFFF_FFFF_0000_0000]);
+    }
+    values.sort_unstable();
+    values.dedup();
+    let inputs: Vec<_> = values
+        .into_iter()
+        .flat_map(|x| [0, 1].map(|scc| [x as u32, (x >> 32) as u32, scc, OLD]))
+        .collect();
+    // The prologue reads v1/v2/v3 into s16/s17/s18 for each input.
+    let mut body = vec![sopc(0x07, s(18), int(0))]; // s_cmp_lg_u32
+    for (dst, out) in [(20, 5), (16, 6), (17, 7)] {
+        body.extend([
+            vop1(0x02, 16, v(1)), // restore both source halves
+            vop1(0x02, 17, v(2)),
+            sop1(0x14, dst, s(16)),
+            vop1(0x01, out, s(dst)),
+        ]);
+    }
+    body.push(vop1(0x01, 8, SRC_SCC));
+    assert_clean(check(&[scalar(body, inputs, |i| {
+        let bits = u64::from(i[0]) | u64::from(i[1]) << 32;
+        // Independent per-bit search, including the all-zero sentinel.
+        let result = (0..64)
+            .find(|&bit| bits & (1u64 << bit) != 0)
+            .unwrap_or(u32::MAX);
+        vec![result, result, result, i[2]]
+    })]));
+}
+
 // ---- lanes ----
 
 /// Masked lanes keep their registers: `s_and_saveexec_b32` narrowing to the
