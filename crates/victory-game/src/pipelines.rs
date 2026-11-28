@@ -109,18 +109,23 @@ impl Named {
     /// not keep every field (factors of a target that does not blend, the
     /// depth func with depth off): those are enumerated.
     fn name_from_registers(&mut self, want: &mut Wanted, pack: &Pack) {
-        let mut tried = HashSet::new();
+        let mut tried_depth = HashSet::new();
+        let mut tried_blend = HashSet::new();
         for g in pack.graphics() {
             let (Some(regs), Some(formats)) = (registers(g.packet), g.target_formats()) else {
                 continue;
             };
-            if !tried.insert((g.depth_stencil_hash, g.blend_hash, formats, regs)) {
-                continue;
-            }
-            if want.depth.contains(&g.depth_stencil_hash) {
+            // Each search only depends on the registers for its own state kind.
+            let [control, stencil, mask, _, _, blend_regs @ ..] = regs;
+            let depth_regs = [control, stencil, mask];
+            if want.depth.contains(&g.depth_stencil_hash)
+                && tried_depth.insert((g.depth_stencil_hash, depth_regs))
+            {
                 depth_from_registers(&regs, |b| self.try_depth(want, &b));
             }
-            if want.blend.contains(&g.blend_hash) {
+            if want.blend.contains(&g.blend_hash)
+                && tried_blend.insert((g.blend_hash, formats, blend_regs))
+            {
                 blend_from_registers(&regs, &formats, |b| self.try_blend(want, &b));
             }
         }
