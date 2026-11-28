@@ -63,13 +63,13 @@ impl ValueWait {
 }
 
 /// What a queue holds, in its order.
-pub(crate) enum Item<S> {
+pub(crate) enum Item<S, F = usize> {
     /// A list segment and the waits at its start.
     Segment(S, Vec<ValueWait>),
     /// A fence Signal: the fence and its value.
-    Signal(usize, u64),
+    Signal(F, u64),
     /// A fence Wait: until the fence reaches the value.
-    FenceWait(usize, u64),
+    FenceWait(F, u64),
 }
 
 /// What a pump did, for the frame's accounting.
@@ -83,46 +83,48 @@ pub(crate) struct Pumped {
     pub(crate) waited: Vec<(usize, Duration)>,
     /// Waits with a comparison we do not know (taken as holding).
     pub(crate) unknown: u32,
+    /// Whether any queue still has work waiting after this pump.
+    pub(crate) blocked: bool,
 }
 
 /// Every queue's held work.
-pub(crate) struct Held<S> {
-    queues: Vec<(usize, Fifo<S>)>,
+pub(crate) struct Held<S, F = usize> {
+    queues: Vec<(usize, Fifo<S, F>)>,
 }
 
 /// A queue's items, each with when it was pushed and whether it is fresh
 /// (not yet found waiting).
-type Fifo<S> = VecDeque<(Item<S>, Instant, bool)>;
+type Fifo<S, F> = VecDeque<(Item<S, F>, Instant, bool)>;
 
-impl<S> Default for Held<S> {
+impl<S, F> Default for Held<S, F> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<S> Held<S> {
+impl<S, F> Held<S, F> {
     pub(crate) const fn new() -> Self {
         Held { queues: Vec::new() }
     }
 }
 
 /// What the pump needs from the outside world.
-pub(crate) struct World<'a, S> {
+pub(crate) struct World<'a, S, F = usize> {
     /// A memory value (address, bytes).
     pub(crate) read: &'a dyn Fn(u64, u8) -> Option<u64>,
     /// A fence's value.
-    pub(crate) fence: &'a dyn Fn(usize) -> u64,
+    pub(crate) fence: &'a dyn Fn(&F) -> u64,
     /// Runs a piece (a queue, its segments in order) to completion, the
     /// bottom-of-pipe writes included.
     pub(crate) run: &'a mut dyn FnMut(usize, Vec<S>),
     /// Signals a fence.
-    pub(crate) signal: &'a mut dyn FnMut(usize, u64),
+    pub(crate) signal: &'a mut dyn FnMut(F, u64),
 }
 
-impl<S> Held<S> {
+impl<S, F> Held<S, F> {
     /// Appends `item` to `queue`'s FIFO, marked fresh: whether it waited is
     /// decided by its first test.
-    pub(crate) fn push(&mut self, queue: usize, item: Item<S>) {
+    pub(crate) fn push(&mut self, queue: usize, item: Item<S, F>) {
         let now = Instant::now();
         match self.queues.iter_mut().find(|(q, _)| *q == queue) {
             Some((_, items)) => items.push_back((item, now, true)),
@@ -131,7 +133,30 @@ impl<S> Held<S> {
     }
 
     /// Runs every queue's heads that may run, until none can.
-    pub(crate) fn pump(&mut self, w: &mut World<S>) -> Pumped {
+    ///
+    /// Each memory word is read at most once between executions in this
+    /// pump. Running a piece may write wait words, so execution invalidates
+    /// the cache before any queue is tested again.
+    pub(crate) fn pump(&mut self, w: &mut World<S, F>) -> Pumped {
+        let World {
+            read,
+            fence,
+            run,
+            signal,
+        } = w;
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read = |address: u64, bytes: u8| {
+            let mut cache = reads.borrow_mut();
+            if let Some((_, _, value)) = cache
+                .iter()
+                .find(|(a, b, _)| *a == address && *b == bytes)
+            {
+                return *value;
+            }
+            let value = read(address, bytes);
+            cache.push((address, bytes, value));
+            value
+        };
         let mut done = Pumped::default();
         loop {
             let mut moved = false;
@@ -143,7 +168,7 @@ impl<S> Held<S> {
                         Some((Item::Segment(_, waits), since, fresh)) => {
                             let mut ok = true;
                             for wait in waits.iter() {
-                                match wait.holds(w.read) {
+                                match wait.holds(&read) {
                                     Some(true) => {}
                                     Some(false) => ok = false,
                                     None => done.unknown += 1,
@@ -160,13 +185,14 @@ impl<S> Held<S> {
                         // it runs first.
                         Some((Item::Signal(..), ..)) => {
                             if !piece.is_empty() {
-                                (w.run)(*queue, std::mem::take(&mut piece));
+                                run(*queue, std::mem::take(&mut piece));
+                                reads.borrow_mut().clear();
                                 done.pieces += 1;
                             }
                             true
                         }
-                        Some((Item::FenceWait(fence, value), _, fresh)) => {
-                            let ok = (w.fence)(*fence) >= *value;
+                        Some((Item::FenceWait(f, value), _, fresh)) => {
+                            let ok = fence(f) >= *value;
                             if !ok {
                                 *fresh = false;
                             }
@@ -182,12 +208,22 @@ impl<S> Held<S> {
                             piece.push(s);
                             done.segments += 1;
                         }
-                        Some(Item::Signal(fence, value)) => (w.signal)(fence, value),
-                        Some(Item::FenceWait(..)) | None => {}
+                        Some(Item::Signal(fence, value)) => {
+                            signal(fence, value);
+                            reads.borrow_mut().clear();
+                        },
+                        Some(Item::FenceWait(fence, _)) => {
+                            drop(fence);
+                            // A completed fence is a synchronization boundary: work
+                            // signaled outside this pump may have changed a cached wait word.
+                            reads.borrow_mut().clear();
+                        }
+                        None => {}
                     }
                 }
                 if !piece.is_empty() {
-                    (w.run)(*queue, piece);
+                    run(*queue, piece);
+                    reads.borrow_mut().clear();
                     done.pieces += 1;
                 }
             }
@@ -196,6 +232,10 @@ impl<S> Held<S> {
             }
         }
         self.queues.retain(|(_, items)| !items.is_empty());
+        // Derive this from the final queue state, not from an observation
+        // made during an earlier pass: later queues may have released a
+        // previously blocked head. FenceWait heads also keep the timer alive.
+        done.blocked = !self.queues.is_empty();
         done
     }
 
@@ -265,7 +305,7 @@ mod tests {
 
     fn pump(held: &mut Held<&'static str>, fake: &RefCell<Fake>) -> Pumped {
         let read = |a: u64, _| Some(*fake.borrow().memory.get(&a).unwrap_or(&0));
-        let fence = |f: usize| *fake.borrow().fences.get(&f).unwrap_or(&0);
+        let fence = |f: &usize| *fake.borrow().fences.get(f).unwrap_or(&0);
         let mut run = |q: usize, segments: Vec<&'static str>| {
             let mut f = fake.borrow_mut();
             for s in &segments {
@@ -327,6 +367,122 @@ mod tests {
         let p = pump(&mut held, &fake);
         assert_eq!(fake.borrow().log, ["q2: a b"], "one piece");
         assert_eq!((p.pieces, p.waited.len()), (1, 0));
+    }
+
+    #[test]
+    fn a_pump_reads_each_address_and_width_once_until_work_runs() {
+        use std::cell::Cell;
+
+        let reads = Cell::new(0);
+        let read = |address: u64, _bytes: u8| {
+            reads.set(reads.get() + 1);
+            Some(u64::from(address == 0x200))
+        };
+        let fence = |_: &usize| 0;
+        let mut run = |_: usize, _: Vec<&'static str>| {};
+        let mut signal = |_: usize, _: u64| {};
+        let mut held = Held::default();
+        held.push(
+            1,
+            Item::Segment("same-word", vec![ge(0x100, 1), ge(0x100, 2)]),
+        );
+        let narrow = ValueWait {
+            address: 0x100,
+            bytes: 4,
+            comparison: GREATER_EQUAL,
+            reference: 1,
+            mask: 0xffff_ffff,
+        };
+        held.push(2, Item::Segment("different-width", vec![narrow]));
+
+        let pumped = held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        });
+
+        assert!(pumped.blocked);
+        assert_eq!(
+            reads.get(),
+            2,
+            "same address at 8 and 4 bytes is two cache keys"
+        );
+    }
+
+    /// A completed external fence may publish memory writes while this pump
+    /// still holds a cached pre-fence value for the same wait word.
+    #[test]
+    fn a_satisfied_fence_wait_invalidates_the_wait_word_cache() {
+        use std::cell::Cell;
+
+        let memory = RefCell::new(HashMap::from([(0x100, 0)]));
+        let reads = Cell::new(0);
+        let read = |address: u64, _bytes: u8| {
+            reads.set(reads.get() + 1);
+            Some(*memory.borrow().get(&address).unwrap_or(&0))
+        };
+        let fence = |value: &usize| {
+            if *value == 5 {
+                // Model work completed before the fence was signaled.
+                memory.borrow_mut().insert(0x100, 1);
+                5
+            } else {
+                0
+            }
+        };
+        let ran = RefCell::new(Vec::new());
+        let mut run = |queue: usize, segments: Vec<&'static str>| {
+            ran.borrow_mut().push((queue, segments));
+        };
+        let mut signal = |_: usize, _: u64| {};
+        let mut held = Held::default();
+        // Queue 1 seeds the cache with X=0 and blocks.
+        held.push(1, Item::Segment("queue-a", vec![ge(0x100, 1)]));
+        // Queue 2 observes the completed fence, which makes X=1 visible.
+        held.push(2, Item::FenceWait(5, 5));
+        held.push(2, Item::Segment("after-fence", vec![ge(0x100, 1)]));
+
+        let pumped = held.pump(&mut World {
+            read: &read,
+            fence: &fence,
+            run: &mut run,
+            signal: &mut signal,
+        });
+        assert_eq!(*ran.borrow(), vec![(2, vec!["after-fence"]), (1, vec!["queue-a"])]);
+        assert_eq!(reads.get(), 3, "the post-fence read must not reuse X=0");
+        assert!(!pumped.blocked);
+        assert!(held.is_empty());
+    }
+    #[test]
+    fn a_queue_unblocked_by_later_work_does_not_remain_blocked() {
+        let fake = RefCell::new(Fake::default());
+        fake.borrow_mut().writes.insert("release", vec![(0x100, 1)]);
+        let mut held = Held::default();
+        // Queue 1 is tested before queue 2, so it blocks on the first pass.
+        held.push(1, Item::Segment("waiting", vec![ge(0x100, 1)]));
+        held.push(2, Item::Segment("release", vec![]));
+
+        let p = pump(&mut held, &fake);
+
+        assert_eq!(
+            fake.borrow().log,
+            ["q2: release", "q1: waiting"]
+        );
+        assert!(!p.blocked, "all queues drained during the later pump pass");
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn a_pending_fence_wait_keeps_the_pump_blocked() {
+        let fake = RefCell::new(Fake::default());
+        let mut held = Held::default();
+        held.push(2, Item::FenceWait(5, 2));
+
+        let p = pump(&mut held, &fake);
+
+        assert!(p.blocked, "FenceWait must keep the timer polling active");
+        assert!(held.holds_work(2));
     }
 
     /// A list's second segment waits for a value the other queue writes
@@ -438,5 +594,72 @@ mod tests {
         assert_eq!(forced, [(2, vec![ge(0x100, 1)])]);
         pump(&mut held, &fake);
         assert_eq!(fake.borrow().log, ["q2: stuck"]);
+    }
+
+    #[test]
+    fn fence_tokens_are_dropped_once_on_completion_and_on_held_drop() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct Token(usize, Rc<Cell<usize>>);
+        impl Drop for Token {
+            fn drop(&mut self) {
+                self.1.set(self.1.get() + 1);
+            }
+        }
+
+        let live = Rc::new(Cell::new(0));
+        let dropped = Rc::new(Cell::new(0));
+        let make = |id: usize| {
+            live.set(live.get() + 1);
+            Token(id, dropped.clone())
+        };
+
+        let values = RefCell::new(HashMap::<usize, u64>::new());
+        let log = RefCell::new(Vec::<String>::new());
+        let mut held = Held::<&'static str, Token>::default();
+        held.push(2, Item::FenceWait(make(5), 1));
+        held.push(2, Item::Segment("after", vec![]));
+
+        let run_pump = |held: &mut Held<&'static str, Token>| {
+            let read = |_, _| Some(0);
+            let fence = |t: &Token| *values.borrow().get(&t.0).unwrap_or(&0);
+            let mut run = |q: usize, segments: Vec<&'static str>| {
+                log.borrow_mut()
+                    .push(format!("q{q}: {}", segments.join(" ")));
+            };
+            let mut signal = |t: Token, value: u64| {
+                values.borrow_mut().insert(t.0, value);
+                log.borrow_mut().push(format!("signal {} {value}", t.0));
+                drop(t);
+            };
+            held.pump(&mut World {
+                read: &read,
+                fence: &fence,
+                run: &mut run,
+                signal: &mut signal,
+            });
+        };
+
+        // Blocked polls must keep the FenceWait token alive.
+        run_pump(&mut held);
+        run_pump(&mut held);
+        assert_eq!(dropped.get(), 0);
+        assert!(log.borrow().is_empty());
+
+        // Delivering Signal drops Signal's token, then FenceWait sees value 1,
+        // drops its token once, and runs the queued segment.
+        held.push(1, Item::Signal(make(5), 1));
+        run_pump(&mut held);
+        assert_eq!(*log.borrow(), ["signal 5 1", "q2: after"]);
+        assert_eq!(dropped.get(), 2);
+
+        // Dropping a non-empty Held drops every pending Signal and FenceWait token.
+        held.push(3, Item::FenceWait(make(9), 2));
+        held.push(3, Item::Signal(make(10), 1));
+        assert_eq!(dropped.get(), 2);
+        drop(held);
+        assert_eq!(dropped.get(), live.get());
+        assert_eq!(dropped.get(), 4);
     }
 }
