@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1407,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -3988,9 +3993,12 @@ impl<'a> Lower<'a> {
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
                 let z = self.s.m.i32(0);
-                let neg = self.s.m.cmp(c, pred::SLT, a, z);
                 let n = self.s.m.bin(c, Bin::Sub, z, a);
-                (self.s.m.select(c, neg, n, a), None)
+                // IMax(a, -a) also preserves INT_MIN: its negation wraps.
+                let r = self
+                    .s
+                    .op(c, "binary.i32", Attr::ReadNone, self.s.t.i32, 37, &[a, n]);
+                (r, None)
             }
             "s_bitset0_b32" | "s_bitset1_b32" => {
                 // Sets (clears) bit src[4:0] of the destination it reads.
@@ -11089,6 +11097,17 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn scalar_abs_uses_two_operations() {
+        // A dynamic scalar root constant, followed by a live UAV store.
+        let lowered = lower_valu(&[0xBE82_3400, 0x7E00_0202]).expect("s_abs_i32 lowers");
+        eprintln!(
+            "s_abs_i32: {} written DXIL instructions",
+            lowered.instructions
+        );
+        assert_eq!(lowered.instructions, 16);
     }
 
     #[test]

@@ -2814,6 +2814,51 @@ fn scalar_alu_matches_the_hardware() {
     assert_clean(check(&passing(scalar_probes())));
 }
 
+/// Signed absolute value wraps at INT_MIN; SCC tests the result for
+/// nonzero. Check both incoming SCC values and an overlapping destination.
+#[test]
+fn scalar_abs_matches_wide_magnitudes_and_scc() {
+    let mut values = Vec::new();
+    for offset in 0..4096u32 {
+        values.extend([
+            (offset as i32 - 2048) as u32,
+            0x8000_0000 + offset,
+            0x7FFF_FFFF - offset,
+        ]);
+    }
+    for bit in 0..32 {
+        values.extend([1u32 << bit, !(1u32 << bit)]);
+    }
+    let mut random = 0xD2F9_0159u32;
+    for _ in 0..4096 {
+        random ^= random << 13;
+        random ^= random >> 17;
+        random ^= random << 5;
+        values.push(random);
+    }
+    values.sort_unstable();
+    values.dedup();
+    let inputs = values
+        .into_iter()
+        .flat_map(|x| [0, 1].map(|scc| [x, 0, scc, OLD]))
+        .collect();
+    let mut body = Vec::new();
+    for (dst, result, flag) in [(20, 5, 6), (16, 7, 8)] {
+        body.extend([
+            sopc(0x07, s(18), int(0)), // initialize SCC from the input
+            sop1(0x34, dst, s(16)),    // s_abs_i32
+            vop1(0x01, result, s(dst)),
+            vop1(0x01, flag, SRC_SCC),
+        ]);
+    }
+    assert_clean(check(&[scalar(body, inputs, |i| {
+        // A wider signed magnitude, independent of the lowering's max.
+        let magnitude = i64::from(i[0] as i32).unsigned_abs() as u32;
+        let scc = u32::from(magnitude != 0);
+        vec![magnitude, scc, magnitude, scc]
+    })]));
+}
+
 // ---- lanes ----
 
 /// Masked lanes keep their registers: `s_and_saveexec_b32` narrowing to the
