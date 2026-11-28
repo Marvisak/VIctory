@@ -1876,3 +1876,20 @@ allocated heaps, with only 2.2 MB free across 14 ranges. This is a capacity
 and fragmentation problem under the safe combined cap, not a shader-format
 or placed-resource API failure. Raising the cap without reclaiming other
 memory remains unsafe given the earlier device-removal result.
+
+### 2026-11-28: `uiOverlay` A/B for the secondary 4K path
+
+The paired offline `rx5700-ui-overlay-ab-20261128-145503Z` test changed
+only the saved `<uiOverlay>` value from `true` to `false` between two
+two-minute 720p launches. Both arms saw the main title dimensions become
+1920×1080, the secondary dimensions become 3840×2160, and the secondary
+flag become one. Both first PresentX calls listed 1920×1080 and
+3840×2160 planes, and each arm logged 17 title-created 4K textures in its
+startup window. The loader binary hash matched across arms, the settings
+were not rewritten during either arm, and the original settings bytes were
+restored with a matching SHA-256. The WFP preflight passed and 22 network
+samples per arm saw zero TCP and UDP endpoints. Neither arm reached the
+world, so this is evidence about the 4K setup path, not an FPS comparison.
+Disabling `uiOverlay` alone does not turn off the secondary 4K path. The
+writer of the secondary dimensions/flag remains to be identified before a
+safe title-facing resolution change is attempted.
