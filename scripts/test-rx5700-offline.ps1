@@ -71,7 +71,8 @@ param(
     [switch] $TraceLitWritersOnly,
     [switch] $CheckpointLitWriters,
     [switch] $TraceLitStages,
-    [switch] $TraceExit
+    [switch] $TraceExit,
+    [string] $DebuggerCommands = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -98,6 +99,16 @@ function Assert-FixedLocalPath([string] $Path, [string] $Label) {
 $Title = Assert-FixedLocalPath $Title 'Title'
 $FidelityFX = Assert-FixedLocalPath $FidelityFX 'FidelityFX directory'
 $Loader = Assert-FixedLocalPath $Loader 'Loader'
+if ($DebuggerCommands -and -not $TraceExit) {
+    throw 'DebuggerCommands requires TraceExit.'
+}
+$debuggerCommandPath = ''
+if ($DebuggerCommands) {
+    $debuggerCommandPath = Assert-FixedLocalPath $DebuggerCommands 'Debugger commands'
+    if (-not (Test-Path -LiteralPath $debuggerCommandPath -PathType Leaf)) {
+        throw "Debugger commands file does not exist: $debuggerCommandPath"
+    }
+}
 if ($DumpLightingBC -and -not $BoundPriorityMips) {
     throw 'DumpLightingBC requires BoundPriorityMips to select the four shader-bound sources.'
 }
@@ -555,7 +566,7 @@ if ($TraceExit) {
     if (-not (Test-Path -LiteralPath $debuggerPath -PathType Leaf)) {
         throw "Windows debugger is missing: $debuggerPath"
     }
-    $debuggerCommands = Join-Path $PSScriptRoot 'exit-debugger.txt'
+    $debuggerCommands = if ($debuggerCommandPath) { $debuggerCommandPath } else { Join-Path $PSScriptRoot 'exit-debugger.txt' }
     $debuggerLog = Join-Path $outPath 'debugger.log'
     # Local symbols only. The debugged title still uses the verified exact-path
     # WFP and firewall blocks installed above.

@@ -1893,3 +1893,26 @@ world, so this is evidence about the 4K setup path, not an FPS comparison.
 Disabling `uiOverlay` alone does not turn off the secondary 4K path. The
 writer of the secondary dimensions/flag remains to be identified before a
 safe title-facing resolution change is attempted.
+
+### 2026-11-28: secondary 4K state write watchpoint
+
+The offline CDB run `rx5700-offline-20261128-150644Z` installed a hardware
+write watchpoint on the relocated prepared title image's
+`+0xa9438f4` before title initialization. The first write was zero during
+CRT initialization. The next write made the flag one while the title was
+copying a 0x1e8-byte display-state structure with `VCRUNTIME140!memmove`.
+The test harness now accepts a local `-DebuggerCommands` file alongside
+`-TraceExit` for focused CDB watchpoints while retaining the exact-loader
+offline firewall preflight and bounded run timer.
+At that instant, the destination at `+0xa9438ec` held 3840, the next
+dword held 2160, and the flag held one. The title call site returning at
+`+0x19f4e15` copies from an object passed by `+0x5804379` into globals
+starting at `+0xa9437b8`; the higher callers were `+0x43a490c` and
+`+0x2240706`. This explains why a scan for direct RIP-relative writes to
+the individual globals did not find the setter. The copy is an observer
+of state assembled earlier in the object, so the original source of the
+4K dimensions is still unproven. Changing the global flag after this copy
+would leave the object's source state and other 4K render targets intact.
+The debugger quit at the watched write, before gameplay. WFP preflight
+passed and the monitor recorded no TCP or UDP endpoints. This run is not
+an FPS or picture-quality test.
