@@ -193,6 +193,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 
 | Variable | Effect |
 |----------|--------|
+| `VICTORY_GLYPH_FILE=<package-relative file>` and `VICTORY_GLYPH_DIR=<external directory>` | On each DirectStorage open of that file, tries compatible artwork in `<dir>\<active profile>\<filename>` (xbox, playstation, nintendo or steam), falling back to the package file. Available in release builds. |
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |

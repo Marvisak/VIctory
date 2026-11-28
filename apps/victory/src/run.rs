@@ -107,6 +107,18 @@ pub fn run(
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
     victory_hle::modules::files::mount_at('G', title_dir);
+    let glyph_file = std::env::var_os("VICTORY_GLYPH_FILE").filter(|v| !v.is_empty());
+    let glyph_dir = std::env::var_os("VICTORY_GLYPH_DIR").filter(|v| !v.is_empty());
+    match (glyph_file, glyph_dir) {
+        (Some(file), Some(dir)) => {
+            victory_core::ensure_outside_repo(Path::new(&dir))?;
+            victory_hle::modules::files::use_controller_diagram(Path::new(&file), dir.into())?;
+        }
+        (None, None) => {}
+        _ => anyhow::bail!(
+            "set both VICTORY_GLYPH_FILE and VICTORY_GLYPH_DIR for a controller diagram"
+        ),
+    }
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });

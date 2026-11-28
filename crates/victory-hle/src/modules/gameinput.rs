@@ -1,5 +1,5 @@
-//! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! `gameinput.dll`: input devices from the host. Gamepads come from SDL3
+//! or XInput (host slots 0-3); while none is connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
@@ -93,6 +93,18 @@ struct PadState {
     right_y: f32,
 }
 
+/// A physical pad's state and its identity on the selected backend. SDL
+/// instance IDs follow the device when enumeration changes its slot.
+#[derive(Clone, Copy)]
+struct HostPad {
+    state: PadState,
+    id: u32,
+    profile: &'static str,
+}
+
+mod glyphs;
+use glyphs::Glyphs;
+
 /// One key held down: scan code (0xE0xx when extended), character, key.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -108,7 +120,7 @@ const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
-    fn pad(&mut self, slot: usize) -> Option<PadState>;
+    fn pad(&mut self, slot: usize) -> Option<HostPad>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
     /// Scripted diagnostic keys (`VICTORY_KEYS`), independent of focus.
@@ -116,8 +128,8 @@ trait Source: Send {
     fn scripted_keys(&mut self) -> Vec<KeyState> {
         Vec::new()
     }
-    /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Motor levels: low frequency, high frequency, then the two triggers.
+    fn rumble(&mut self, slot: usize, levels: [f32; 4]);
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -354,6 +366,7 @@ struct State {
     slots: [Slot; DEVICES],
     /// Host slots that have reported non-rest input on their current connection.
     seen_input: [bool; PADS],
+    glyphs: Glyphs,
     callbacks: Vec<Registration>,
     /// Asynchronous enumerations, delivered by the next poll.
     pending: Vec<Event>,
@@ -401,6 +414,7 @@ impl Hub {
             state: Mutex::new(State {
                 slots: Default::default(),
                 seen_input: [false; PADS],
+                glyphs: Glyphs::default(),
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
@@ -488,16 +502,17 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        pads: [Option<PadState>; PADS],
+        pads: [Option<HostPad>; PADS],
         keys: Vec<KeyState>,
         scripted: &[KeyState],
     ) -> Vec<Event> {
+        self.glyphs.poll(&pads);
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         // A wireless receiver answers for a switched-off pad with an all-zero
         // report; ignore a slot until its current connection reports input.
         let mut pads: [Option<PadState>; PADS] = std::array::from_fn(|slot| {
-            let Some(pad) = pads[slot] else {
+            let Some(pad) = pads[slot].map(|p| p.state) else {
                 self.seen_input[slot] = false;
                 return None;
             };
@@ -575,25 +590,32 @@ impl State {
 
 #[cfg(windows)]
 fn host() -> Box<dyn Source> {
-    Box::new(host::Host::default())
+    host::source()
 }
 
 #[cfg(not(windows))]
 fn host() -> Box<dyn Source> {
     struct Nothing;
     impl Source for Nothing {
-        fn pad(&mut self, _: usize) -> Option<PadState> {
+        fn pad(&mut self, _: usize) -> Option<HostPad> {
             None
         }
         fn keys(&mut self) -> Vec<KeyState> {
             Vec::new()
         }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        fn rumble(&mut self, _: usize, _: [f32; 4]) {}
     }
     Box::new(Nothing)
 }
 
-static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));
+static HUB: OnceLock<&'static Hub> = OnceLock::new();
+
+/// Pack directory of the most recently used physical controller. A file
+/// lookup before the title creates GameInput must not start input polling.
+#[cfg(windows)]
+pub(crate) fn active_glyph_profile() -> &'static str {
+    HUB.get().map_or("xbox", |hub| hub.state().glyphs.profile())
+}
 
 type This = *const Object;
 type Out = *mut *const c_void;
@@ -605,7 +627,7 @@ pub extern "system" fn GameInputCreate(out: *mut This) -> HRESULT {
         return E_INVALIDARG;
     }
     // SAFETY: checked non-null; the title passes room for a pointer.
-    unsafe { out.write(&HUB.object) };
+    unsafe { out.write(&HUB.get_or_init(|| Hub::start(host())).object) };
     S_OK
 }
 
@@ -890,7 +912,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -980,24 +1005,22 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+// The last two levels are the trigger motors (slot 0x50); SDL3 drives them,
+// XInput has none. The body motors are left and right on XInput, low and high
+// frequency on SDL3.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let levels = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
         unsafe { *params }
     };
-    let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    lock(&device.hub().source).rumble(device.index, levels);
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -1216,7 +1239,7 @@ mod host {
     }
 
     impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+        fn pad(&mut self, slot: usize) -> Option<HostPad> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1227,47 +1250,361 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
+            Some(HostPad {
+                state: convert(&state.Gamepad),
+                id: slot as u32,
+                profile: "xbox",
+            })
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
-            let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
-            if focused() {
-                // Left/right modifier keys only, as devices report them; no
-                // mouse buttons (below 0x08).
-                let held: Vec<u8> = (0x08..=0xFE_u8)
-                    .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
-                    // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
-                    .collect();
-                down.extend(held);
-            }
-            down.into_iter().map(key_state).collect()
+            keys()
         }
 
-        #[cfg(any(test, feature = "diagnostics"))]
+        #[cfg(feature = "diagnostics")]
         fn scripted_keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
-            {
-                scripted().into_iter().map(key_state).collect()
-            }
-            #[cfg(not(feature = "diagnostics"))]
-            {
-                Vec::new()
-            }
+            scripted().into_iter().map(key_state).collect()
         }
 
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+        fn rumble(&mut self, slot: usize, levels: [f32; 4]) {
+            // XInput has the two body motors only.
+            let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
             let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
+                wLeftMotorSpeed: speed(levels[0]),
+                wRightMotorSpeed: speed(levels[1]),
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
+    }
+
+    /// Keys held down, shared by the host backends.
+    pub(super) fn keys() -> Vec<KeyState> {
+        #[cfg(feature = "diagnostics")]
+        let mut down = scripted();
+        #[cfg(not(feature = "diagnostics"))]
+        let mut down = Vec::new();
+        if focused() {
+            // Left/right modifier keys only, as devices report them; no
+            // mouse buttons (below 0x08).
+            let held: Vec<u8> = (0x08..=0xFE_u8)
+                .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
+                // SAFETY: plain queries.
+                .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                .collect();
+            down.extend(held);
+        }
+        down.into_iter().map(key_state).collect()
+    }
+
+    /// Gamepads from SDL3 (`SDL3.dll`), loaded at run time so the runtime
+    /// still starts without it. The profile follows the controller type reported by SDL.
+    mod sdl {
+        use std::ffi::{CString, c_void};
+        use std::time::{Duration, Instant};
+
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+
+        use super::*;
+
+        const SDL_INIT_GAMEPAD: u32 = 0x0000_2000;
+        /// How often the pad list is looked at again (hotplug).
+        const SCAN: Duration = Duration::from_secs(1);
+        /// Rumble is armed this far ahead; zero levels stop it at once.
+        const RUMBLE_MS: u32 = 60_000;
+
+        // SDL_GamepadButton
+        const SOUTH: i32 = 0;
+        const EAST: i32 = 1;
+        const WEST: i32 = 2;
+        const NORTH: i32 = 3;
+        const BACK: i32 = 4;
+        const START: i32 = 6;
+        const LEFT_STICK_BUTTON: i32 = 7;
+        const RIGHT_STICK_BUTTON: i32 = 8;
+        const LEFT_SHOULDER_BUTTON: i32 = 9;
+        const RIGHT_SHOULDER_BUTTON: i32 = 10;
+        const DPAD_UP: i32 = 11;
+        const DPAD_DOWN: i32 = 12;
+        const DPAD_LEFT: i32 = 13;
+        const DPAD_RIGHT: i32 = 14;
+
+        // SDL_GamepadAxis
+        const LEFT_X: i32 = 0;
+        const LEFT_Y: i32 = 1;
+        const RIGHT_X: i32 = 2;
+        const RIGHT_Y: i32 = 3;
+        const LEFT_TRIGGER: i32 = 4;
+        const RIGHT_TRIGGER: i32 = 5;
+
+        type Init = unsafe extern "C" fn(u32) -> bool;
+        type GetGamepads = unsafe extern "C" fn(*mut i32) -> *mut u32;
+        type OpenGamepad = unsafe extern "C" fn(u32) -> *mut c_void;
+        type CloseGamepad = unsafe extern "C" fn(*mut c_void);
+        type UpdateGamepads = unsafe extern "C" fn();
+        type GamepadType = unsafe extern "C" fn(*mut c_void) -> i32;
+        type DeviceIdPart = unsafe extern "C" fn(*mut c_void) -> u16;
+        type Button = unsafe extern "C" fn(*mut c_void, i32) -> bool;
+        type Axis = unsafe extern "C" fn(*mut c_void, i32) -> i16;
+        type Rumble = unsafe extern "C" fn(*mut c_void, u16, u16, u32) -> bool;
+        type RumbleTriggers = unsafe extern "C" fn(*mut c_void, u16, u16, u32) -> bool;
+        type Free = unsafe extern "C" fn(*mut c_void);
+        type Quit = unsafe extern "C" fn();
+
+        struct Api {
+            init: Init,
+            get_gamepads: GetGamepads,
+            open: OpenGamepad,
+            close_pad: CloseGamepad,
+            update: UpdateGamepads,
+            gamepad_type: GamepadType,
+            vendor: DeviceIdPart,
+            product: DeviceIdPart,
+            button: Button,
+            axis: Axis,
+            rumble: Rumble,
+            rumble_triggers: RumbleTriggers,
+            free: Free,
+            quit: Quit,
+        }
+
+        impl Api {
+            fn load() -> Option<Api> {
+                let name: Vec<u16> = "SDL3.dll\0".encode_utf16().collect();
+                // SAFETY: a NUL-terminated UTF-16 file name.
+                let module = unsafe { LoadLibraryW(name.as_ptr()) };
+                if module.is_null() {
+                    return None;
+                }
+                let sym = |name: &str| -> Option<usize> {
+                    let c = CString::new(name).ok()?;
+                    // SAFETY: a loaded module and a C string.
+                    let f = unsafe { GetProcAddress(module, c.as_ptr().cast()) }?;
+                    Some(f as usize)
+                };
+                macro_rules! get {
+                    ($ty:ty, $name:literal) => {
+                        // SAFETY: the type is SDL's declaration of this symbol.
+                        unsafe { std::mem::transmute::<usize, $ty>(sym($name)?) }
+                    };
+                }
+                Some(Api {
+                    init: get!(Init, "SDL_Init"),
+                    get_gamepads: get!(GetGamepads, "SDL_GetGamepads"),
+                    open: get!(OpenGamepad, "SDL_OpenGamepad"),
+                    close_pad: get!(CloseGamepad, "SDL_CloseGamepad"),
+                    update: get!(UpdateGamepads, "SDL_UpdateGamepads"),
+                    gamepad_type: get!(GamepadType, "SDL_GetGamepadType"),
+                    vendor: get!(DeviceIdPart, "SDL_GetGamepadVendor"),
+                    product: get!(DeviceIdPart, "SDL_GetGamepadProduct"),
+                    button: get!(Button, "SDL_GetGamepadButton"),
+                    axis: get!(Axis, "SDL_GetGamepadAxis"),
+                    rumble: get!(Rumble, "SDL_RumbleGamepad"),
+                    rumble_triggers: get!(RumbleTriggers, "SDL_RumbleGamepadTriggers"),
+                    free: get!(Free, "SDL_free"),
+                    quit: get!(Quit, "SDL_Quit"),
+                })
+            }
+        }
+
+        pub(super) struct Sdl {
+            api: Api,
+            ids: [Option<u32>; PADS],
+            pads: [Option<*mut c_void>; PADS],
+            profiles: [&'static str; PADS],
+            scanned: Instant,
+        }
+
+        // SAFETY: every SDL call is made through the hub's mutex, one thread
+        // at a time.
+        unsafe impl Send for Sdl {}
+
+        impl Sdl {
+            pub(super) fn new() -> Option<Self> {
+                let api = Api::load()?;
+                // SAFETY: SDL initialization from this thread.
+                if !unsafe { (api.init)(SDL_INIT_GAMEPAD) } {
+                    return None;
+                }
+                let mut s = Sdl {
+                    api,
+                    ids: [None; PADS],
+                    pads: [None; PADS],
+                    profiles: ["xbox"; PADS],
+                    scanned: Instant::now(),
+                };
+                s.scan();
+                Some(s)
+            }
+
+            /// The first `PADS` gamepads SDL lists, in SDL's order.
+            fn scan(&mut self) {
+                self.scanned = Instant::now();
+                let mut n = 0;
+                // SAFETY: SDL writes the count and returns a temporary array
+                // of joystick ids, freed with SDL_free.
+                let ids = unsafe { (self.api.get_gamepads)(&mut n) };
+                let mut wanted: [Option<u32>; PADS] = [None; PADS];
+                if !ids.is_null() {
+                    for (slot, want) in wanted.iter_mut().enumerate() {
+                        if slot < n.max(0) as usize {
+                            // SAFETY: `n` ids were written.
+                            *want = Some(unsafe { *ids.add(slot) });
+                        }
+                    }
+                    // SAFETY: SDL allocated this array.
+                    unsafe { (self.api.free)(ids.cast()) };
+                }
+                let opened = wanted
+                    .iter()
+                    .zip(&self.pads)
+                    .all(|(want, pad)| want.is_none() || pad.is_some());
+                if wanted == self.ids && opened {
+                    return;
+                }
+                self.close();
+                self.ids = wanted;
+                for slot in 0..PADS {
+                    if let Some(id) = self.ids[slot] {
+                        // SAFETY: an id from SDL's list.
+                        let pad = unsafe { (self.api.open)(id) };
+                        if !pad.is_null() {
+                            self.pads[slot] = Some(pad);
+                            // SAFETY: the gamepad was just opened.
+                            self.profiles[slot] = unsafe {
+                                glyphs::sdl_profile(
+                                    (self.api.gamepad_type)(pad),
+                                    (self.api.vendor)(pad),
+                                    (self.api.product)(pad),
+                                )
+                            };
+                        }
+                    }
+                }
+            }
+
+            fn close(&mut self) {
+                for pad in &mut self.pads {
+                    if let Some(pad) = pad.take() {
+                        // SAFETY: an open gamepad.
+                        unsafe { (self.api.close_pad)(pad) };
+                    }
+                }
+                self.ids = [None; PADS];
+            }
+        }
+
+        impl Source for Sdl {
+            fn pad(&mut self, slot: usize) -> Option<HostPad> {
+                if slot == 0 && self.scanned.elapsed() >= SCAN {
+                    self.scan();
+                }
+                let pad = self.pads.get(slot).copied().flatten()?;
+                // SAFETY: an open gamepad.
+                unsafe { (self.api.update)() };
+                let button = |b: i32| -> bool {
+                    // SAFETY: an open gamepad and a button number.
+                    unsafe { (self.api.button)(pad, b) }
+                };
+                let axis = |a: i32| -> i16 {
+                    // SAFETY: an open gamepad and an axis number.
+                    unsafe { (self.api.axis)(pad, a) }
+                };
+                let mut buttons = 0;
+                for (b, bit) in [
+                    (SOUTH, A),
+                    (EAST, B),
+                    (WEST, X),
+                    (NORTH, Y),
+                    (BACK, VIEW),
+                    (START, MENU),
+                    (LEFT_STICK_BUTTON, LEFT_STICK),
+                    (RIGHT_STICK_BUTTON, RIGHT_STICK),
+                    (LEFT_SHOULDER_BUTTON, LEFT_SHOULDER),
+                    (RIGHT_SHOULDER_BUTTON, RIGHT_SHOULDER),
+                    (DPAD_UP, UP),
+                    (DPAD_DOWN, DOWN),
+                    (DPAD_LEFT, LEFT),
+                    (DPAD_RIGHT, RIGHT),
+                ] {
+                    if button(b) {
+                        buttons |= bit;
+                    }
+                }
+                let stick = |v: i16| (f32::from(v) / 32767.0).clamp(-1.0, 1.0);
+                // SDL's Y axis grows down; XInput's and the console's grows up.
+                let stick_up = |v: i16| (-f32::from(v) / 32767.0).clamp(-1.0, 1.0);
+                let trigger = |v: i16| (f32::from(v) / 32767.0).clamp(0.0, 1.0);
+                let state = PadState {
+                    buttons,
+                    left_trigger: trigger(axis(LEFT_TRIGGER)),
+                    right_trigger: trigger(axis(RIGHT_TRIGGER)),
+                    left_x: stick(axis(LEFT_X)),
+                    left_y: stick_up(axis(LEFT_Y)),
+                    right_x: stick(axis(RIGHT_X)),
+                    right_y: stick_up(axis(RIGHT_Y)),
+                };
+                Some(HostPad {
+                    state,
+                    id: self.ids[slot]?,
+                    profile: self.profiles[slot],
+                })
+            }
+
+            fn keys(&mut self) -> Vec<KeyState> {
+                super::keys()
+            }
+
+            #[cfg(feature = "diagnostics")]
+            fn scripted_keys(&mut self) -> Vec<KeyState> {
+                scripted().into_iter().map(key_state).collect()
+            }
+
+            fn rumble(&mut self, slot: usize, levels: [f32; 4]) {
+                let Some(pad) = self.pads.get(slot).copied().flatten() else {
+                    return;
+                };
+                let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
+                let ms = if levels.iter().any(|&level| level > 0.0) {
+                    RUMBLE_MS
+                } else {
+                    0
+                };
+                // SAFETY: an open gamepad; zero milliseconds stops the motors.
+                unsafe {
+                    (self.api.rumble)(pad, speed(levels[0]), speed(levels[1]), ms);
+                    (self.api.rumble_triggers)(pad, speed(levels[2]), speed(levels[3]), ms);
+                }
+            }
+        }
+
+        impl Drop for Sdl {
+            fn drop(&mut self) {
+                self.close();
+                // SAFETY: SDL was initialized by `new`.
+                unsafe { (self.api.quit)() };
+            }
+        }
+    }
+
+    /// The backend for this run: SDL3 when its DLL and gamepad subsystem
+    /// start, XInput otherwise. `VICTORY_INPUT=xinput|sdl3` forces one.
+    pub(super) fn source() -> Box<dyn Source> {
+        let forced = std::env::var("VICTORY_INPUT")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if forced == "xinput" {
+            return Box::new(Host::default());
+        }
+        if let Some(sdl) = sdl::Sdl::new() {
+            tracing::info!("gamepads from SDL3");
+            return Box::new(sdl);
+        }
+        if forced == "sdl3" {
+            tracing::warn!("SDL3.dll or its gamepad subsystem is missing; using XInput");
+        }
+        Box::new(Host::default())
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
@@ -1355,16 +1692,23 @@ mod tests {
     #[derive(Default)]
     struct FakeHost {
         pads: [Option<PadState>; PADS],
+        profiles: [Option<(u32, &'static str)>; PADS],
         keys: Vec<KeyState>,
         scripted: Vec<KeyState>,
-        rumble: Vec<(usize, u16, u16)>,
+        rumble: Vec<(usize, [f32; 4])>,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
 
     impl Source for Fake {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
-            self.0.lock().unwrap().pads[slot]
+        fn pad(&mut self, slot: usize) -> Option<HostPad> {
+            let host = self.0.lock().unwrap();
+            let (id, profile) = host.profiles[slot].unwrap_or((slot as u32, "xbox"));
+            Some(HostPad {
+                state: host.pads[slot]?,
+                id,
+                profile,
+            })
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
@@ -1372,8 +1716,8 @@ mod tests {
         fn scripted_keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().scripted.clone()
         }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
+        fn rumble(&mut self, slot: usize, levels: [f32; 4]) {
+            self.0.lock().unwrap().rumble.push((slot, levels));
         }
     }
 
@@ -1382,6 +1726,53 @@ mod tests {
         let hub = Hub::new(Box::new(Fake(Arc::clone(&host))));
         hub.poll();
         (hub, host)
+    }
+
+    #[test]
+    fn active_profile_follows_deliberate_input_across_slot_changes() {
+        let (hub, host) = fake();
+        let profile = || hub.state().glyphs.profile();
+        let sample = |slot: usize, pad| {
+            lock(&host).pads[slot] = pad;
+            hub.poll();
+        };
+        let idle = PadState::default();
+        let stick = |left_x| Some(PadState { left_x, ..idle });
+        {
+            let mut h = lock(&host);
+            h.profiles[0] = Some((41, "playstation"));
+            h.profiles[1] = Some((87, "nintendo"));
+            h.pads[0] = Some(idle);
+            h.pads[1] = Some(idle);
+        }
+        hub.poll();
+        assert_eq!(profile(), "playstation");
+        sample(1, stick(0.12));
+        assert_eq!(profile(), "playstation");
+        sample(1, stick(0.7));
+        assert_eq!(profile(), "nintendo");
+        // Scripted diagnostic input goes to slot 0, even when another pad is active.
+        lock(&host).scripted = vec![key(0x0D)];
+        hub.poll();
+        assert_eq!(profile(), "nintendo");
+        lock(&host).scripted.clear();
+        sample(0, Some(PadState { buttons: A, ..idle }));
+        sample(1, stick(0.49));
+        sample(1, stick(0.51));
+        assert_eq!(profile(), "playstation");
+        // SDL may move a still-connected pad to a different slot on a rescan.
+        {
+            let mut h = lock(&host);
+            h.profiles.swap(0, 1);
+            h.pads.swap(0, 1);
+        }
+        hub.poll();
+        assert_eq!(profile(), "playstation");
+        sample(1, None);
+        assert_eq!(profile(), "nintendo");
+        lock(&host).keys = vec![key(b'X')];
+        sample(0, None);
+        assert_eq!(profile(), "xbox");
     }
 
     fn key(virtual_key: u8) -> KeyState {
@@ -1708,7 +2099,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState {
@@ -1720,7 +2120,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
+        assert!(
+            !unregister(&hub.object, token, 5000),
+            "times out while it runs"
+        );
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);
@@ -1757,7 +2160,10 @@ mod tests {
         rumble(device, &[0.5, 1.0, 1.0, 1.0]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        assert_eq!(
+            host.lock().unwrap().rumble,
+            [(2, [0.5, 1.0, 1.0, 1.0]), (2, [0.0; 4])]
+        );
     }
 
     #[test]
