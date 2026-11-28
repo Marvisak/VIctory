@@ -118,6 +118,8 @@ fn weak(s: &[u8], i: usize, a: u64, b: u64) -> (u64, u64) {
     (a.wrapping_add(z), b.wrapping_add(c))
 }
 
+// The pipeline-state caller knows the compact description's length.
+#[inline]
 pub fn city64(s: &[u8]) -> u64 {
     let n = s.len();
     match n {
