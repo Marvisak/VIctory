@@ -48,6 +48,16 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
         fourth.copy_from_slice(v(a));
         for &(offset, format) in elements {
             let at = offset as usize;
+            if format == 24 {
+                // The packed color shares one word across all four channels.
+                if stride.saturating_sub(at) >= 4 {
+                    let field = at..at + 4;
+                    let color = |i| u32::from_le_bytes(v(i)[field.clone()].try_into().unwrap());
+                    let corner = packed_unorm_corner(color(a), color(b), color(right));
+                    fourth[field].copy_from_slice(&corner.to_le_bytes());
+                }
+                continue;
+            }
             let Some((n, kind)) = components(format) else {
                 continue;
             };
@@ -61,6 +71,17 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
             }
         }
     }
+}
+
+/// R10G10B10A2_UNORM: interpolate in integer channel units, then clamp per field.
+fn packed_unorm_corner(a: u32, b: u32, right: u32) -> u32 {
+    let mut corner = 0;
+    for (shift, mask) in [(0, 1023), (10, 1023), (20, 1023), (30, 3)] {
+        let channel = |color: u32| (color >> shift) & mask;
+        let value = (channel(a) + channel(b)).saturating_sub(channel(right));
+        corner |= value.min(mask) << shift;
+    }
+    corner
 }
 
 #[derive(Clone, Copy)]
@@ -239,6 +260,40 @@ mod tests {
         let src = [vertex(0.0, 0.0), vertex(3.0, 1.0), vertex(1.0, 0.0)].concat();
         expand_rects(&src, &mut dst, 8, &[(0, 16)]);
         assert!(turn(&dst, 0) * turn(&dst, 3) > 0.0, "same winding");
+    }
+
+    #[test]
+    fn packed_unorm_uses_the_position_corner_in_each_vertex_order() {
+        let pack = |r: u32, g: u32, b: u32, a: u32| r | g << 10 | b << 20 | a << 30;
+        let vertices = [
+            ([0.0f32, 0.0], pack(60, 150, 300, 0)),
+            ([2.0, 0.0], pack(960, 220, 16, 1)),
+            ([0.0, 1.0], pack(300, 200, 75, 3)),
+        ];
+        let stride = 12;
+        let expected_position = [2.0f32, 1.0].map(f32::to_le_bytes).concat();
+        let expected_color = pack(1023, 270, 0, 3).to_le_bytes();
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [2, 0, 1],
+            [1, 2, 0],
+            [2, 1, 0],
+        ] {
+            let mut source = Vec::new();
+            for index in order {
+                let (position, color) = vertices[index];
+                source.extend(position.map(f32::to_le_bytes).concat());
+                source.extend(color.to_le_bytes());
+            }
+
+            let mut expanded = [0; 6 * 12];
+            expand_rects(&source, &mut expanded, stride, &[(0, 16), (8, 24)]);
+            let fourth = &expanded[5 * stride..];
+            assert_eq!(&fourth[..8], expected_position, "order {order:?}");
+            assert_eq!(&fourth[8..], expected_color, "order {order:?}");
+        }
     }
 
     /// A rounding that carries out of the mantissa raises the exponent
