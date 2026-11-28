@@ -2973,6 +2973,7 @@ impl Compositor {
 struct Presentation {
     presenter: Option<Presenter>,
     retry: SwapChainRetry,
+    compositor_failures: std::collections::HashMap<i32, Instant>,
 }
 
 #[derive(Default)]
@@ -3211,7 +3212,7 @@ impl Host {
             return None;
         };
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
-        let Presentation { presenter, retry } = &mut *presentation;
+        let Presentation { presenter, retry, compositor_failures } = &mut *presentation;
         if presenter.is_none() && !retry.ready(Instant::now()) {
             return None;
         }
@@ -3220,13 +3221,22 @@ impl Host {
             .and_then(|p| p.compositor.as_ref())
             .map(|c| c.format);
         let mut new_compositor = None;
-        let planes = if planes.len() > 1 && cached_format != Some(format) {
+        let needs_compositor = planes.len() > 1 && cached_format != Some(format);
+        let planes = if needs_compositor
+            && compositor_failures.get(&format.0).is_some_and(|&next| Instant::now() < next)
+        {
+            &planes[..1]
+        } else if needs_compositor {
             match create_compositor(&self.device, format) {
                 Ok(c) => {
+                    compositor_failures.remove(&format.0);
                     new_compositor = Some(c);
                     planes
                 }
                 Err(e) => {
+                    // Keep showing the primary while a failing compositor
+                    // would otherwise rebuild its pipelines every frame.
+                    compositor_failures.insert(format.0, Instant::now() + Duration::from_secs(1));
                     tracing::warn!(error = %e, "presenting the primary plane after compositor initialization failed");
                     &planes[..1]
                 }
@@ -4023,7 +4033,7 @@ mod present_plane_tests {
     use super::*;
 
     #[test]
-    fn compositor_failure_presents_primary_in_the_same_frame() {
+    fn compositor_failure_presents_primary_during_retry_cooldown() {
         let Some(host) = host() else {
             eprintln!("skipping PresentX recovery: no D3D12 device");
             return;
@@ -4111,16 +4121,37 @@ mod present_plane_tests {
             "the primary plane must still be shown in this frame"
         );
         assert_eq!(fallback, Some((32, 32, [255, 0, 0, 255])));
-        let presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
-        let swap_chain = presentation.presenter.as_ref().unwrap();
-        assert_eq!((swap_chain.width, swap_chain.height), (32, 32));
-        drop(presentation);
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM.0;
+        {
+            let mut presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
+            let swap_chain = presentation.presenter.as_ref().unwrap();
+            assert_eq!((swap_chain.width, swap_chain.height), (32, 32));
+            let next = presentation.compositor_failures.get_mut(&format).expect("failed format is cooling down");
+            // Simulate the next frame without depending on the test's elapsed time.
+            *next = Instant::now() + Duration::from_secs(60);
+        }
+
+        let mut during_cooldown = None;
+        assert!(
+            host.present_with_compositor(
+                &[(&scene, state), (&overlay, state)],
+                3,
+                |_, _| panic!("must not recreate the compositor during cooldown"),
+                |buffer, footprint| during_cooldown = Some(first_pixel(buffer, footprint)),
+            )
+            .is_some()
+        );
+        assert_eq!(during_cooldown, fallback);
+        {
+            let mut presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
+            *presentation.compositor_failures.get_mut(&format).unwrap() = Instant::now();
+        }
 
         let mut composite = None;
         assert!(
             host.present_with_compositor(
                 &[(&scene, state), (&overlay, state)],
-                3,
+                4,
                 Compositor::new,
                 |buffer, footprint| composite = Some(first_pixel(buffer, footprint)),
             )
@@ -4129,5 +4160,7 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+        let presentation = host.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!presentation.compositor_failures.contains_key(&format));
     }
 }
