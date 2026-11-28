@@ -485,8 +485,12 @@ impl Shader {
     }
 
     /// The handle of immediate sampler `n` (a comparison sampler when its
-    /// bit in `cmp_samplers` is set).
+    /// bit in `cmp_samplers` is set). The register is bounded by the root
+    /// signature's sampler slots, not by the number of samplers recorded so
+    /// far: lowering emits handles before `self.samplers` is set, and
+    /// distinct slots must stay distinct (notably comparison samplers).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
+        let n = n.min(HEAP_SAMPLERS - 1);
         let bind = [
             self.m.i32(n),
             self.m.i32(n),
@@ -503,7 +507,7 @@ impl Shader {
             217,
             &[bind, i, f],
         );
-        let cmp = if self.cmp_samplers >> n & 1 != 0 {
+        let cmp = if self.cmp_samplers.checked_shr(n).unwrap_or(0) & 1 != 0 {
             0x8000
         } else {
             0
@@ -1062,6 +1066,43 @@ mod tests {
         s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, or, zero, iu, iu, one]);
         s.m.terminate(b, Term::Ret);
         s.finish()
+    }
+
+    #[test]
+    fn sampler_handle_clamps_out_of_range_indices() {
+        let mut clamped = Shader::new(false);
+        clamped.samplers = 2;
+        let b = clamped.entry;
+        let _ = clamped.sampler_handle(b, HEAP_SAMPLERS + 5);
+        clamped.m.terminate(b, Term::Ret);
+        let clamped_dxil = clamped.finish();
+
+        let mut in_range = Shader::new(false);
+        in_range.samplers = 2;
+        let b = in_range.entry;
+        let _ = in_range.sampler_handle(b, HEAP_SAMPLERS - 1);
+        in_range.m.terminate(b, Term::Ret);
+        let in_range_dxil = in_range.finish();
+
+        assert_eq!(clamped_dxil, in_range_dxil);
+    }
+
+    #[test]
+    fn sampler_handle_keeps_comparison_slot_before_count_is_set() {
+        let mut validator = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        let mut s = Shader::new(true);
+        s.cmp_samplers = 1 << 1;
+        let b = s.entry;
+        let _ = s.sampler_handle(b, 1);
+        s.samplers = 2;
+        s.m.terminate(b, Term::Ret);
+        let mut dxil = s.finish();
+        if let Some(v) = validator.as_mut() {
+            v.validate(&mut dxil).unwrap();
+        }
     }
 
     /// A vertex program writing a declared UAV declares UAVs at every stage

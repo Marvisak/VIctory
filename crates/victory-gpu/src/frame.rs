@@ -219,6 +219,7 @@ mod tests {
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
+        let _guard = crate::memory::tests::gpu_test_lock();
         let null = std::ptr::null();
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
@@ -280,6 +281,7 @@ mod tests {
     /// none. The old code marked the tick after the sleep, so both got it.
     #[test]
     fn waits_begun_together_take_different_ticks() {
+        let _guard = crate::memory::tests::gpu_test_lock();
         const VBLANK: u32 = 1;
         let long = Duration::from_secs(1);
         let (first, _) = next_tick(VBLANK, long);

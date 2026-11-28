@@ -542,7 +542,12 @@ impl HostPipeline {
                     });
                 }
             }
-            for (n, s) in t.static_samplers.iter().enumerate() {
+            for (n, s) in t
+                .static_samplers
+                .iter()
+                .take(victory_shader::emit::HEAP_SAMPLERS as usize)
+                .enumerate()
+            {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
                     Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
                     AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),

@@ -713,7 +713,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Writes of lists using title memory are held back from a frame with a
@@ -829,7 +829,7 @@ mod tests {
         assert!(has_missed(&marks, &l));
     }
 
-    fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
