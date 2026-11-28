@@ -39,4 +39,40 @@ impl Lower<'_> {
         let base = self.s.m.select(self.cur, upper, k32, z);
         self.s.m.bin(self.cur, Bin::Add, lane, base)
     }
+
+    /// `v_readfirstlane`: `x` of the first active lane. With masks split
+    /// by halves (see [`Lower::host_half`]), the first active lane of this
+    /// lane's half: a 64-lane host wave holds two console waves, and
+    /// `waveReadLaneFirst` over the whole host wave gave lanes 32-63 a value
+    /// from lanes 0-31.
+    pub(super) fn read_first_lane(&mut self, x: V) -> V {
+        self.s.flags |= flags::WAVE_OPS;
+        let i32t = self.s.t.i32;
+        let Some(upper) = self.host_half() else {
+            let c = self.cur;
+            return self
+                .s
+                .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
+        };
+        let c = self.cur;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let on = self.s.m.bool(true);
+        let ballot = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+        let (lo, hi) = (
+            self.s.m.extract(c, ballot, 0),
+            self.s.m.extract(c, ballot, 1),
+        );
+        let half = self.s.m.select(c, upper, hi, lo);
+        // FirstbitLo of a dword holding this lane's own bit (a helper lane,
+        // left out of the ballot before 6.7, reads its own: helper_reads_own).
+        let first = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[half]);
+        let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
+        let base = self.s.m.select(c, upper, k32, z);
+        let lane = self.s.m.bin(c, Bin::Add, first, base);
+        self.read_lane(x, lane)
+    }
 }
