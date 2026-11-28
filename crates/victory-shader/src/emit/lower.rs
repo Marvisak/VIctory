@@ -7340,8 +7340,9 @@ impl<'a> Lower<'a> {
                 let mut f = match op {
                     "add_f16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
                     "mul_f16" => self.s.m.bin(c, Bin::Mul, xs[0], xs[1]),
-                    "min_f16" => self.max_min(false, xs[0], xs[1]),
-                    "max_f16" => self.max_min(true, xs[0], xs[1]),
+                    // Widened f16 operands have no f32 subnormals.
+                    "min_f16" => self.max_min_flushed(false, xs[0], xs[1]),
+                    "max_f16" => self.max_min_flushed(true, xs[0], xs[1]),
                     // shortcut: FMad in f32, as v_fma_f16.
                     _ => self.fmad(xs[0], xs[1], xs[2]),
                 };
