@@ -330,6 +330,10 @@ impl Shadow {
             .insert((address, address + len));
         if marked && let Some(t) = &self.tracked {
             t.arm(address, address + len);
+            // `VICTORY_OWNER`: a page this copy holds stays in it, so the
+            // bytes a title write's fault keeps are the copy's now, not
+            // title memory's older ones.
+            crate::watch::arm_keeping(self.start as usize, self.data as usize, address, len, t.id());
             return;
         }
         let (from, to) = self.inside(address, len);
@@ -400,8 +404,10 @@ impl Shadow {
 
     /// After the submission ran: what its shaders wrote in the range stays
     /// in the copy and does not go into title memory (they computed it
-    /// from memory with no copy, `crate::memory`).
+    /// from memory with no copy, `crate::memory`). A page of it that stayed
+    /// in the copy earlier (`VICTORY_OWNER`) keeps title memory's bytes now.
     pub(crate) fn keep_writes(&self, address: usize, len: usize) {
+        self.withhold(address, len);
         self.copy_back_or_not(address, len, false);
     }
 
@@ -485,6 +491,15 @@ impl Shadow {
     /// since the copy took it, else what the page held when the title first
     /// wrote it ([`crate::watch::Tracked::saved`], if the page was armed).
     /// Returns the bytes written.
+    ///
+    /// With `VICTORY_OWNER=1` a whole page nothing touched need not go back
+    /// at all: it stays in the copy (`crate::watch::lazify`) until the title
+    /// or our host touches it, and a page its shaders mark again before then
+    /// is never written in between (`crate::watch::owning`). A page that
+    /// cannot stay there is written through the runtime's own mapping of its
+    /// section (`crate::watch::put_back`), so its title mapping is never
+    /// opened, and a title write during the copy faults into the handler,
+    /// which waits for it.
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
@@ -497,8 +512,21 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        let whole = from == page && to == page + PAGE;
+        // SAFETY: inside the mapping; only the submitting thread writes it.
+        let src = unsafe { self.data.add(from - start) } as usize;
         // Our own write below must not save the page for this copy again.
         t.unarm(page / PAGE);
+        // Owned by this copy (`VICTORY_OWNER`): its shaders wrote it again
+        // before anyone touched it. What goes back at the first touch is in
+        // the copy already.
+        if whole && crate::watch::owning(page / PAGE, src, t.id()) {
+            // Other holders count changed whether or not the shaders changed
+            // anything: their next read is given the copy's bytes, and this
+            // copy's bytes are the newest (title memory's are older still).
+            crate::watch::again(page / PAGE, t.id());
+            return 0;
+        }
         let saved = t.saved(page / PAGE);
         if saved.is_none() && t.changed(page / PAGE) {
             #[cfg(feature = "diagnostics")]
@@ -521,15 +549,58 @@ impl Shadow {
                 merge_writeback(&mut title, host, before).then_some(title.as_ptr())
             }
         };
+        let mut back = 0;
         if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
+            // A whole page goes back through our own mapping of its section,
+            // or stays in the copy (`VICTORY_OWNER`); otherwise as before.
+            let alias = (whole && crate::watch::owner())
+                .then(|| crate::watch::writable_alias(page / PAGE))
+                .flatten();
+            let kept = alias.is_some_and(|alias| {
+                crate::watch::lazify(page / PAGE, src, Some(alias), t.id())
+                    || crate::watch::put_back(page / PAGE, bytes as usize, alias, t.id())
+            });
+            if !kept {
+                let _writing = crate::watch::writing(from, n);
+                crate::host::write_mapped(from as *mut u8, bytes, n);
+                back = n;
+            }
         }
         // Equal to title memory now: taken, unless it holds the page in part.
-        if from == page && to == page + PAGE {
+        if whole {
             t.taken(&[page / PAGE]);
         }
-        written.map_or(0, |_| n)
+        back
+    }
+
+    /// Shaders' writes to `[address, address + len)` stay out of title
+    /// memory (`crate::memory`'s withholdings), and a page this copy kept
+    /// earlier must not carry them back (`VICTORY_OWNER`): when the shaders
+    /// wrote it this submission, the bytes kept at arming go back instead (the
+    /// page's bytes before them); a page they did not write keeps its older,
+    /// valid bytes and goes back.
+    pub(crate) fn withhold(&self, address: usize, len: usize) {
+        let Some(t) = &self.tracked else {
+            return;
+        };
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        for page in crate::watch::held_pages(from / PAGE, to.div_ceil(PAGE), t.id()) {
+            match t.peek_saved(page) {
+                Some(before) => {
+                    crate::watch::put_kept(page, &before, t.id());
+                }
+                None => crate::watch::resolve_page(page),
+            }
+        }
+    }
+
+    /// Its lazy pages get the copy's bytes back now (the title is about to
+    /// let its memory go; `VICTORY_OWNER`).
+    pub(crate) fn resolve_owned(&self) {
+        if let Some(t) = &self.tracked {
+            t.resolve_all();
+        }
     }
 
     /// Whether the title wrote none of the copy's memory since the copy took
@@ -693,6 +764,11 @@ impl Shadow {
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // Pages it holds for the title get their bytes back while its mapping
+        // is still alive (`VICTORY_OWNER`).
+        if let Some(t) = &self.tracked {
+            t.resolve_all();
+        }
         if let Some(slice) = self.slice {
             arena().give_back(slice);
         }
@@ -932,10 +1008,13 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             (copy, page)
         })
     };
-    // Held back: dropped from the copies (`crate::memory::drop_withheld`).
+    // Held back: dropped from the copies (`crate::memory::drop_withheld`),
+    // after the page a copy kept gives its older bytes back if it has them
+    // (`VICTORY_OWNER`).
     if !held.is_empty() {
         let m = marks();
-        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+        for (copy, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+            copy.withhold(page, PAGE);
             crate::memory::drop_withheld(page, PAGE);
         }
     }
@@ -1002,8 +1081,15 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
-        changed();
+    if let Some(entry) = buffers().remove(&(start, resource)) {
+        if let Some(shadow) = &entry.shadow {
+            // Pages it holds for the title go back before the memory can be
+            // given out again (`VICTORY_OWNER`).
+            shadow.resolve_owned();
+        }
+        if entry.shadow.is_some() {
+            changed();
+        }
     }
 }
 
@@ -1640,6 +1726,205 @@ pub(crate) mod tests {
         assert_eq!([read(PAGE + 10), read(PAGE + 20)], [0xbb, 0x77]);
         copy.copy_back(p, PAGE + 16);
         unregister(p, p as u64);
+    }
+
+    /// The addresses [`crate::watch::writable_alias`] gives the wiring tests'
+    /// pages: a second view of the same section that the guards do not know.
+    static OWNER_ALIASES: std::sync::Mutex<std::collections::BTreeMap<usize, usize>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    fn owner_alias(page: usize) -> Option<usize> {
+        OWNER_ALIASES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&page)
+            .copied()
+    }
+
+    /// Restores the switch when the test ends, panic or not.
+    struct OwnerOn;
+
+    impl Drop for OwnerOn {
+        fn drop(&mut self) {
+            crate::watch::set_owner(false);
+        }
+    }
+
+    /// A one-page section mapped twice: the title's view and the runtime's
+    /// own writable view of it; `None` without a host GPU. The switch is on
+    /// while the returned guard lives.
+    fn owned_page() -> Option<(usize, usize, OwnerOn)> {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE,
+        };
+        host()?;
+        // SAFETY: a pagefile section of two pages mapped read-write twice; both
+        // views live until the test's process does.
+        let (title, ours) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * PAGE) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            (
+                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE).Value as usize,
+                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE).Value as usize,
+            )
+        };
+        assert!(title != 0 && ours != 0);
+        {
+            let mut aliases = OWNER_ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+            for k in 0..2 {
+                aliases.insert(title / PAGE + k, ours + k * PAGE);
+            }
+        }
+        crate::watch::set_writable_alias(owner_alias);
+        crate::watch::set_owner(true);
+        Some((title, ours, OwnerOn))
+    }
+
+    /// The copy of the page at `title`, or `None` without a host GPU.
+    fn page_copy(title: usize) -> Option<std::sync::Arc<Shadow>> {
+        register(title + 1, title as u64, PAGE as u64);
+        let copy = find(title as u64, PAGE as u64);
+        if copy.is_none() {
+            unregister(title + 1, title as u64);
+        }
+        copy
+    }
+
+    /// With `VICTORY_OWNER=1`, `copy_back_marked` keeps a whole page in the
+    /// copy (title memory shows nothing of the shaders' writes), and a
+    /// submission in which the title writes the page too goes back by the
+    /// merge of both, not by the copy's page.
+    #[test]
+    fn marked_pages_stay_in_the_copy_and_merge_a_title_write() {
+        let Some((title, ours, _on)) = owned_page() else {
+            return; // no host GPU here
+        };
+        let Some(copy) = page_copy(title) else { return };
+        let title_byte = |at: usize| {
+            // SAFETY: a byte of our view; a held page faults into the handler.
+            unsafe { ((title + at) as *const u8).read_volatile() }
+        };
+        let raw_byte = |at: usize| {
+            // SAFETY: a byte of the other view, which has no guard.
+            unsafe { ((ours + at) as *const u8).read_volatile() }
+        };
+        // Title memory holds zeros; a submission's shaders write 0x44 at +32.
+        copy.update(title, PAGE);
+        copy.writing(title, PAGE, true);
+        copy.write_host(title as u64 + 32, &[0x44]);
+        assert_eq!(copy.copy_back_marked(title), 0, "kept in the copy");
+        assert_eq!(raw_byte(32), 0x00, "nothing went back");
+        assert_eq!(title_byte(32), 0x44, "a title read gets the copy's bytes");
+        // Next submission: the title writes +48 (faults first), the shaders
+        // write +32 again, and both go back.
+        copy.writing(title, PAGE, true);
+        // SAFETY: a byte of the page, guarded: the handler resolves it first.
+        unsafe { ((title + 48) as *mut u8).write_volatile(0x99) };
+        copy.write_host(title as u64 + 32, &[0x66]);
+        copy.copy_back_marked(title);
+        assert_eq!(
+            (title_byte(32), title_byte(48)),
+            (0x66, 0x99),
+            "the merge holds both"
+        );
+        unregister(title + 1, title as u64);
+    }
+
+    /// A held page its shaders write again, with no title touch in between,
+    /// goes through `again` in `copy_back_marked`: it stays in the copy, and
+    /// the other copy holding it is marked changed so its next read takes the
+    /// new bytes.
+    #[test]
+    fn a_held_page_written_again_marks_the_other_copy() {
+        let Some((title, _ours, _on)) = owned_page() else {
+            return; // no host GPU here
+        };
+        let Some(outer) = page_copy(title) else {
+            return;
+        };
+        // A second copy over bytes at the page's end and the next page's
+        // start: it holds the page too, and is another holder of it.
+        register(title + 2, (title + PAGE - 16) as u64, 32);
+        let Some(inner) = find((title + PAGE - 16) as u64, 32) else {
+            unregister(title + 2, (title + PAGE - 16) as u64);
+            unregister(title + 1, title as u64);
+            return;
+        };
+        let inner_changed = || {
+            inner
+                .tracked
+                .as_ref()
+                .expect("tracked")
+                .changed(title / PAGE)
+        };
+        outer.update(title, PAGE);
+        outer.writing(title, PAGE, true);
+        outer.write_host(title as u64 + 32, &[0x44]);
+        assert_eq!(outer.copy_back_marked(title), 0, "kept in the copy");
+        // The second copy refreshes: served the copy's bytes, and clean.
+        inner.update(title + PAGE - 16, 32);
+        assert!(!inner_changed(), "taken at its refresh");
+        // The shaders write the page again; nothing touches the title.
+        outer.writing(title, PAGE, true);
+        outer.write_host(title as u64 + 32, &[0x55]);
+        assert_eq!(outer.copy_back_marked(title), 0, "still kept");
+        assert!(inner_changed(), "the other copy reads the new bytes next");
+        assert_eq!(
+            crate::watch::held_pages(
+                title / PAGE,
+                title / PAGE + 1,
+                outer.tracked.as_ref().expect("tracked").id()
+            ),
+            [title / PAGE],
+            "still held"
+        );
+        unregister(title + 2, (title + PAGE - 16) as u64);
+        unregister(title + 1, title as u64);
+    }
+
+    /// A held page in a withheld range gives back the bytes it held before the
+    /// submission's writes (`Shadow::withhold`, which the withheld paths call),
+    /// not the withheld ones.
+    #[test]
+    fn a_withheld_held_page_gives_back_the_bytes_kept_at_arming() {
+        let Some((title, ours, _on)) = owned_page() else {
+            return; // no host GPU here
+        };
+        let Some(copy) = page_copy(title) else { return };
+        copy.update(title, PAGE);
+        copy.writing(title, PAGE, true);
+        copy.write_host(title as u64 + 32, &[0x44]);
+        assert_eq!(copy.copy_back_marked(title), 0, "kept in the copy");
+        // Next submission writes +32 again; its range is withheld.
+        copy.writing(title, PAGE, true);
+        copy.write_host(title as u64 + 32, &[0x77]);
+        copy.keep_writes(title, PAGE);
+        // SAFETY: bytes of the other view (no guard) and of the title's.
+        let (kept, shown) = unsafe {
+            (
+                ((ours + 32) as *const u8).read_volatile(),
+                ((title + 32) as *const u8).read_volatile(),
+            )
+        };
+        assert_eq!(shown, 0x44, "the bytes the page held before the writes");
+        assert_eq!(kept, 0x44, "and not the withheld ones");
+        assert!(
+            crate::watch::held_pages(
+                title / PAGE,
+                title / PAGE + 1,
+                copy.tracked.as_ref().expect("tracked").id()
+            )
+            .is_empty(),
+            "the held record is gone"
+        );
+        unregister(title + 1, title as u64);
     }
 
     /// Mark bits are handed out in runs and come back joined.

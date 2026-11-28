@@ -1271,6 +1271,10 @@ impl Host {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+            // From here its lists may write the copies (`VICTORY_OWNER`: a
+            // page kept in the copy-back is only kept while no later
+            // submission runs).
+            crate::watch::submission_started(*submitted);
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -1393,6 +1397,9 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
+        // What this copy-back keeps in the copies is this submission's: a
+        // withholding drops those bytes, and older ones go back.
+        crate::watch::copy_back_started(*submitted);
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
@@ -2496,7 +2503,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let _writing = title_dst.then(|| crate::watch::writing(dst as usize, len));
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    // Pages shaders wrote that have not gone back are read from the copy
+    // that wrote them (`VICTORY_OWNER`).
+    let whole = crate::watch::serve(src as usize, dst, len, &mut |s, d, n| {
+        read(s as *const u8, d, n)
+    });
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -2514,12 +2525,15 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FallbackUs);
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
+    let piece = |at: usize, to: *mut u8, n: usize| {
+        crate::watch::serve(at, to, n, &mut |s, d, n| read(s as *const u8, d, n))
+    };
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+        if !piece(at, to, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
+                if !piece(at, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     // SAFETY: inside the destination, which is mapped.
@@ -2531,8 +2545,18 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
-/// readable.
+/// readable. Pages shaders wrote that have not gone back are read from the
+/// copy that wrote them (`crate::watch::serve`, `VICTORY_OWNER`).
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    crate::watch::serve(src as usize, dst.as_mut_ptr(), dst.len(), &mut |s, d, n| {
+        read(s as *const u8, d, n)
+    })
+}
+
+/// [`read_into`] with no look at pages that have not gone back (a lazy page
+/// has no access, and the read fails): for holders of the guard lock, which
+/// that look takes.
+pub(crate) fn read_raw(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 

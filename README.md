@@ -214,6 +214,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
 | `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
+| `VICTORY_OWNER=1` | a whole 64 KiB page a buffer copy's shaders wrote stays in the copy instead of going back into title memory at the submission's end, until the title (a fault) or our host touches it: a page nothing reads, or the shaders write again first, is never copied. Its bytes go back through our own writable view of the page's section, so the title's mapping is never opened. Off by default; needs physical-page views (sections) for the page to qualify |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |

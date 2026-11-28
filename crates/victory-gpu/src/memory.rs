@@ -333,6 +333,8 @@ static DROPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// garbage BVH nodes over meshlet buffers, run shards20), else from the
 /// frame's end ([`retake_dropped`]).
 pub(crate) fn drop_withheld(address: usize, len: usize) {
+    // A page a copy kept gives its older bytes back first, where the caller
+    // can name the copy (`crate::shadow::Shadow::withhold`).
     if SUBMISSION_MISSED.load(std::sync::atomic::Ordering::Relaxed) {
         crate::watch::retake(address, len);
     } else {
@@ -681,7 +683,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // nor while any list using title memory misses ([`withholding`]).
         let withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
         if withheld > 0 {
-            for &(_, at) in &writes {
+            for &(k, at) in &writes {
+                // A page that copy kept earlier: its older bytes go back, and
+                // these withheld ones are dropped (`VICTORY_OWNER`).
+                copies[k].withhold(at as usize, 1 << 16);
                 drop_withheld(at as usize, 1 << 16);
             }
         }

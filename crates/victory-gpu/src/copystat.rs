@@ -305,6 +305,27 @@ pub(crate) fn log(frames: f64) {
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
     );
+    let owner = crate::watch::owner_counts();
+    if owner.iter().any(|&n| n != 0) {
+        let n = |i: usize| owner[i] as f64 / frames;
+        tracing::info!(
+            "  owned pages per frame: {:.0} kept in their copy ({:.1} MB not written), {:.0} their \
+             copy's shaders wrote again, {:.0} given back by a title read, {:.0} by a title write, \
+             {:.0} by our host, {:.0} reads served from the copy ({:.1} MB), {:.0} written through \
+             our mapping, {:.0} withheld, {:.0} offers refused",
+            n(0),
+            n(1) / 1e6,
+            n(2),
+            n(3),
+            n(4),
+            n(5),
+            n(6),
+            n(7) / 1e6,
+            n(8),
+            n(9),
+            n(10),
+        );
+    }
     let held: Vec<String> = crate::watch::held_times()
         .iter()
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))

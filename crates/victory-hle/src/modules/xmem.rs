@@ -363,18 +363,62 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section, and our own writable view of all of it once asked for
+/// ([`writable_alias`]).
+struct Section(HANDLE, std::sync::OnceLock<usize>);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
 // SAFETY: as above.
 unsafe impl Sync for Section {}
 
+impl Section {
+    /// Our writable view of the whole section (0 if it cannot be mapped),
+    /// mapped on first use.
+    fn whole(&self) -> usize {
+        *self.1.get_or_init(|| {
+            use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+            // SAFETY: our section, mapped whole (length 0) at an address of
+            // the system's choice; unmapped when the section goes.
+            unsafe { MapViewOfFile(self.0, FILE_MAP_WRITE, 0, 0, 0) }.Value as usize
+        })
+    }
+}
+
 impl Drop for Section {
     fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        if let Some(&at) = self.1.get()
+            && at != 0
+        {
+            // SAFETY: our own view of the section.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: at as *mut c_void,
+                })
+            };
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
+}
+
+/// Where the GPU side may write title page `at` (an address in a view of
+/// physical pages) without its guards: the same page in our own writable
+/// view of its section, which no tracker holds and the title does not see
+/// (`victory_gpu::set_writable_alias`; copy-back of what shaders wrote, and
+/// the bytes of pages kept in a copy). `None` for memory that is no
+/// section's. Takes the page table's lock: never called with the GPU side's
+/// guard lock held.
+fn writable_alias(at: usize) -> Option<usize> {
+    let physical = physical();
+    let (base, (_, slice)) = physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| at < *base + size)?;
+    let whole = slice.section.whole();
+    (whole != 0).then(|| whole + (slice.index + (at - base) / PAGE) * PAGE + at % PAGE)
 }
 
 /// Where a page lives, or what a view starts with: a section and a page
@@ -441,6 +485,19 @@ fn shown_at(pages: &[usize]) -> Vec<usize> {
         .flatten()
         .copied()
         .collect()
+}
+
+/// Before bytes land in physical pages through our own views: what the
+/// title's mappings show there gets a held page's bytes first
+/// (`VICTORY_OWNER`), so these bytes land on them instead of being
+/// overwritten when the page is touched (a report after the write is too
+/// late for that).
+fn will_write(pages: &[usize]) {
+    for &page in &shown_at(pages) {
+        #[cfg(test)]
+        REPORTED.with(|r| r.borrow_mut().push(page));
+        drop(victory_gpu::kernel_will_write(page, PAGE));
+    }
 }
 
 /// Reports writes into physical pages through our own views at every title
@@ -515,7 +572,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section(handle, std::sync::OnceLock::new()));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -636,6 +693,13 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
+    // The pages' bytes go first (`VICTORY_OWNER`): a page a copy holds is
+    // not put back over what this writes.
+    will_write(
+        pages
+            .get(offset / PAGE..(offset + data.len()).div_ceil(PAGE))
+            .unwrap_or(&[]),
+    );
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -689,6 +753,13 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    // As in `write_physical`: the bytes land on a held page's own bytes, not
+    // under them (`VICTORY_OWNER`).
+    will_write(
+        pages
+            .get(offset / PAGE..(offset + len).div_ceil(PAGE))
+            .unwrap_or(&[]),
+    );
     Some(PageWindow {
         view: View::map(slice, *n)?,
         within: offset % PAGE,
@@ -845,6 +916,10 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         shown.push(base + k * PAGE);
     }
     physical.views.insert(base, (len, slice));
+    // Copy-back of what shaders wrote goes through our own views of these
+    // pages from now on (`victory_gpu::set_writable_alias`).
+    static ALIAS: std::sync::Once = std::sync::Once::new();
+    ALIAS.call_once(|| victory_gpu::set_writable_alias(writable_alias));
     true
 }
 
@@ -1436,13 +1511,21 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
         window.bytes().fill(3);
         drop(window);
-        assert_eq!(REPORTED.with(|r| r.borrow().clone()), [b as usize]);
+        // Resolved where the page showed when the bytes were about to land,
+        // then marked at the address showing it when they had.
+        assert_eq!(
+            REPORTED.with(|r| r.borrow().clone()),
+            [a as usize, b as usize]
+        );
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { b.cast::<u8>().read() }, 3);
-        // `write_physical` the same way.
+        // `write_physical` the same way (resolved before, marked after).
         REPORTED.with(|r| r.borrow_mut().clear());
         assert!(write_physical(&pages, 0, &[4]));
-        assert_eq!(REPORTED.with(|r| r.borrow().clone()), [b as usize]);
+        assert_eq!(
+            REPORTED.with(|r| r.borrow().clone()),
+            [b as usize, b as usize]
+        );
         assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
         assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
