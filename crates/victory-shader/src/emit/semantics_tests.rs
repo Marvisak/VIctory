@@ -2814,6 +2814,94 @@ fn scalar_alu_matches_the_hardware() {
     assert_clean(check(&passing(scalar_probes())));
 }
 
+/// Every byte value at every position with dirty neighbouring bytes,
+/// both encodings, output modifiers, overlaps, and partial EXEC.
+#[test]
+fn byte_float_conversion_matches_selected_byte() {
+    let mut values = Vec::new();
+    for byte in 0..=255u32 {
+        for position in 0..4 {
+            let shift = 8 * position;
+            let outside = !(255 << shift);
+            for neighbours in [
+                0,
+                u32::MAX,
+                0x8000_0000,
+                0x7FFF_FFFF,
+                0x5555_5555,
+                0xAAAA_AAAA,
+            ] {
+                values.push((neighbours & outside) | (byte << shift));
+            }
+        }
+    }
+    let mut random = 0x19C6_EA43u32;
+    for _ in 0..4096 {
+        random ^= random << 13;
+        random ^= random >> 17;
+        random ^= random << 5;
+        values.push(random);
+    }
+    values.sort_unstable();
+    values.dedup();
+    let inputs: Vec<_> = values
+        .into_iter()
+        .flat_map(|x| [0, 1].map(|active| [x, active, 0, OLD]))
+        .collect();
+    let mut probes = Vec::new();
+    for position in 0..4u8 {
+        // VOP1 has no output modifiers; VOP3 carries clamp and omod.
+        for (vop3_form, omod, clamp) in [(false, 0, false)]
+            .into_iter()
+            .chain((0..4).flat_map(|omod| [false, true].map(move |clamp| (true, omod, clamp))))
+        {
+            for dst in [5, 1] {
+                for guarded in [false, true] {
+                    let mut body = Vec::new();
+                    if guarded {
+                        body.push(vopc(0xC4, v(2), 3)); // v_cmp_gt_u32 vcc, v2, v3
+                        body.push(sop1(0x3C, 20, VCC)); // s_and_saveexec_b32 s20, vcc
+                    }
+                    let op = 0x11 + u16::from(position);
+                    if vop3_form {
+                        body.extend(vop3(
+                            0x180 + op,
+                            dst,
+                            [v(1), 0, 0],
+                            M {
+                                omod,
+                                clamp,
+                                ..NONE
+                            },
+                        ));
+                    } else {
+                        body.push(vop1(op, dst, v(1)));
+                    }
+                    if guarded {
+                        body.push(sop1(0x03, 126, s(20))); // restore EXEC
+                    }
+                    if dst != 5 {
+                        body.push(vop1(0x01, 5, v(dst)));
+                    }
+                    probes.push(probe(body, inputs.clone(), INT, move |i| {
+                        if guarded && i[1] == 0 {
+                            return vec![if dst == 5 { OLD } else { i[0] }];
+                        }
+                        // A byte-array reference independent of bitfield
+                        // extraction. All outputs are exactly representable.
+                        let byte = i[0].to_le_bytes()[usize::from(position)];
+                        let mut result = f32::from(byte) * [1.0, 2.0, 4.0, 0.5][usize::from(omod)];
+                        if clamp {
+                            result = result.clamp(0.0, 1.0);
+                        }
+                        vec![result.to_bits()]
+                    }));
+                }
+            }
+        }
+    }
+    assert_clean(check(&probes));
+}
 // ---- lanes ----
 
 /// Masked lanes keep their registers: `s_and_saveexec_b32` narrowing to the

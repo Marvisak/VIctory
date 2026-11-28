@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1407,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -6396,9 +6401,15 @@ impl<'a> Lower<'a> {
                 let mut a = s(self, 0)?;
                 if let Some(n) = name.strip_prefix("v_cvt_f32_ubyte") {
                     let sh = self.s.m.i32(8 * u32::from(n.as_bytes()[0] - b'0'));
-                    let ff = self.s.m.i32(0xff);
-                    a = self.s.m.bin(c, Bin::LShr, a, sh);
-                    a = self.s.m.bin(c, Bin::And, a, ff);
+                    let width = self.s.m.i32(8);
+                    a = self.s.op(
+                        c,
+                        "tertiary.i32",
+                        Attr::ReadNone,
+                        self.s.t.i32,
+                        52, // Ubfe
+                        &[width, sh, a],
+                    );
                 }
                 let op = if name == "v_cvt_f32_i32" {
                     Cast::SiToFp
@@ -11089,6 +11100,26 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn byte_float_conversion_uses_one_extract() {
+        // Same conversion and store, but without byte extraction.
+        let control = lower_valu(&[0x7E00_0B01]).unwrap().instructions; // v_cvt_f32_i32
+        let mut counts = Vec::new();
+        for op in 0x11..=0x14u32 {
+            // Dynamic source and live UAV store in both encodings.
+            for body in [
+                vec![0x7E00_0000 | op << 9 | 0x101],
+                vec![0xD400_0000 | (0x180 + op) << 16, 0x101],
+            ] {
+                counts.push(lower_valu(&body).unwrap().instructions);
+            }
+        }
+        eprintln!(
+            "byte-to-float VOP1/VOP3: {counts:?} written DXIL instructions; control {control}"
+        );
+        assert_eq!(counts, [control + 1; 8]);
     }
 
     #[test]
