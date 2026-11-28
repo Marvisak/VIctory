@@ -1044,6 +1044,8 @@ impl State {
         float: bool,
         rects: &[RECT],
     ) {
+        // Writes buffers: no indirect draw after it joins a window before.
+        crate::indirect::end_window(list);
         let Some(view) = crate::descriptor::view(cpu) else {
             once!("an unordered access clear of a slot without a view");
             return;
@@ -1094,6 +1096,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1199,6 +1202,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
@@ -1560,6 +1564,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         // Rectangles: completed by the pipeline's geometry shader, else
@@ -1664,6 +1669,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        crate::indirect::end_window(list);
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -1764,12 +1770,60 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
+        // An execution may be clamped in a window with the indirect
+        // executions next to it, an indirect dispatch or one whose shaders
+        // may store included: with the switch on and a host pipeline to run,
+        // nothing else decides (`crate::indirect`, `crate::indirect::Run`).
+        let host_pipeline = crate::pipeline::host_pipeline(self.pipeline as This);
+        let windows = crate::indirect::windows_on() && host_pipeline.is_some();
+        // The window's pass needs to know whether this execution may store
+        // (`crate::indirect::Run`); with the switch off nothing asks.
+        let stores = windows && host_pipeline.is_some_and(may_store);
+        let window = windows
+            .then(|| {
+                let (start, _) = args.range();
+                crate::indirect::windowed(
+                    list,
+                    args.gpu(start),
+                    arguments - start,
+                    (kind, stride, max),
+                    stores,
+                )
+            })
+            .flatten();
+        let windowed = window.is_some();
+        #[cfg(feature = "diagnostics")]
+        match (windowed, stores) {
+            (true, true) => crate::copystat::add(
+                if kind == DISPATCH {
+                    crate::copystat::C::ClampWindowDispatches
+                } else {
+                    crate::copystat::C::ClampWindowStores
+                },
+                1,
+            ),
+            // Windows off, or this execution the window refused.
+            (false, true) => crate::copystat::add(crate::copystat::C::ClampStoring, 1),
+            _ => {}
+        }
+        let (clamped, at) = match window {
+            Some((out, at, opened)) => {
+                if opened {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
+                (out, at)
+            }
+            None => {
+                let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
+                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                    return false;
+                };
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+                (clamped, 0)
+            }
         };
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
         let ran = match kind {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || self.completes_rectangles() || {
@@ -1785,7 +1839,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &clamped);
+            if !windowed {
+                crate::indirect::done(list, &clamped);
+            }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1812,7 +1868,7 @@ impl State {
                 &signature,
                 max,
                 &clamped,
-                0,
+                at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
@@ -1826,10 +1882,13 @@ impl State {
             if always || crate::capture::dump_on() {
                 let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let name = crate::pipeline::shaders_of(pipeline);
-                crate::capture::read_indirect(list, (&clamped, 0), count, (kind, stride, max), name, always);
+                crate::capture::read_indirect(list, (&clamped, at), count, (kind, stride, max), name, always);
             }
         }
-        crate::indirect::done(list, &clamped);
+        // A window's buffer stays readable as arguments until it ends.
+        if !windowed {
+            crate::indirect::done(list, &clamped);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1837,6 +1896,25 @@ impl State {
         }
         true
     }
+}
+
+/// Whether a pipeline's shaders may store to memory (buffers among it):
+/// unordered views, in tables, roots or the heap, marked view writes, or
+/// title memory through the page table. Such an execution joins a window
+/// of clamped indirect executions only if nothing comes between it and the
+/// next (`crate::indirect::Run`), and is clamped on its own otherwise.
+fn may_store(p: &crate::pipeline::host::HostPipeline) -> bool {
+    p.marks.is_some()
+        || p.stages.iter().any(|s| {
+            let t = s.translated();
+            !s.root_uavs.is_empty()
+                || s.memory_dirty.is_some()
+                || t.host.heap_writes
+                || t.host.view_marks
+                || t.host.memory_writes
+                || !t.host.root_uavs.is_empty()
+                || t.used.iter().any(|u| u.kind == ResourceType::Uav)
+        })
 }
 
 /// The host command signature for one argument of `kind` with records
