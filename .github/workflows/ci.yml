@@ -34,6 +34,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Forced WARP selection must fail closed if the software adapter or debug layer cannot initialize.
       - name: D3D12 WARP OOM recovery regressions
         run: |
           cargo test -p victory-gpu --features diagnostics --lib --locked resource::tests::oom_backoff_reuses_host_texture_from_another_resource_with_same_memory_key -- --nocapture
