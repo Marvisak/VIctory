@@ -450,6 +450,8 @@ impl Scheduler {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    // A helper (`VICTORY_CCD_SPLIT`).
+    victory_gpu::processors::keep_helper_apart("dstorage worker");
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {

@@ -46,6 +46,8 @@ pub mod pipeline;
 mod placement;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+pub mod processors;
 pub mod query;
 pub mod queue;
 pub mod resource;

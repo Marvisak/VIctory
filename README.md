@@ -131,6 +131,13 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
+Two experimental switches change where threads run; both are off by
+default. `VICTORY_TITLE_AFFINITY=ignore` remembers where the title asks
+for its threads to run and never gives it to Windows, which then places
+them. `VICTORY_CCD_SPLIT=1`, on a processor with two level 3 caches (a
+Ryzen with two chiplets), asks for the disk and release threads of
+VIctory's own to run on the second one.
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 

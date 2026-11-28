@@ -3703,7 +3703,11 @@ fn release_later(what: Box<dyn std::any::Any + Send>) {
         // Without the thread the receiver is gone: sends fail and drop here.
         let _ = std::thread::Builder::new()
             .name("victory-release".into())
-            .spawn(move || rx.into_iter().for_each(drop));
+            .spawn(move || {
+                // A helper (`VICTORY_CCD_SPLIT`).
+                crate::processors::keep_helper_apart("victory-release");
+                rx.into_iter().for_each(drop)
+            });
         tx
     });
     let _ = release.send(what);

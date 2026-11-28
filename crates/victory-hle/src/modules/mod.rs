@@ -9,6 +9,8 @@
 //! `xaudio2`, `xstore` stubs.
 
 #[cfg(windows)]
+mod affinity;
+#[cfg(windows)]
 pub mod apu;
 pub mod audio;
 pub mod d3d12x;
@@ -74,6 +76,11 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    // Only when asked: unset, these imports stay the host's.
+    #[cfg(windows)]
+    if affinity::serving() {
+        all.push(affinity::module());
+    }
     #[cfg(windows)]
     if fidelityfx::serving() {
         all.push(fidelityfx::module());
