@@ -16,7 +16,7 @@ use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
 use crate::{
     DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, ImportResolver, PreparedImage, Provenance, Resolution,
-    prepare,
+    prepare_owned,
 };
 
 /// A title image mapped into this process. A clone names the same mapping
@@ -152,7 +152,8 @@ fn map_dll(
         return Ok(());
     }
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
+    let prepared =
+        prepare_owned(original).with_context(|| format!("preparing {}", path.display()))?;
     let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
     loaded.push((name, image));

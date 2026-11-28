@@ -42,8 +42,15 @@ impl PreparedImage {
 ///   its base relocation is made a no-op so the 0 survives a rebase;
 /// * `FORCE_INTEGRITY` cleared, checksum zeroed: the copy is unsigned.
 pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
-    let info = ImageInfo::parse(original)?;
-    let mut bytes = original.to_vec();
+    prepare_owned(original.to_vec())
+}
+
+/// Same preparation, taking the buffer by value so callers that already own
+/// the image do not pay for a second copy.
+pub fn prepare_owned(original: Vec<u8>) -> Result<PreparedImage, PrepareError> {
+    let info = ImageInfo::parse(&original)?;
+    let original_hash = blake3::hash(&original);
+    let mut bytes = original;
 
     let fh = layout::file_header_offset(&bytes).ok_or(PrepareError::Patch("no file header"))?;
     let opt =
@@ -109,7 +116,7 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
     Ok(PreparedImage {
         info,
         bytes,
-        original_hash: blake3::hash(original),
+        original_hash,
     })
 }
 
@@ -279,5 +286,16 @@ mod tests {
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());
+    }
+
+    #[test]
+    fn owned_buffer_matches_borrowed_preparation() {
+        let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let borrowed = prepare(&original).unwrap();
+        let owned = prepare_owned(original).unwrap();
+        assert_eq!(owned.bytes, borrowed.bytes);
+        assert_eq!(owned.info.import_count(), borrowed.info.import_count());
+        assert_eq!(owned.original_hash, borrowed.original_hash);
+        assert_eq!(owned.file_name(), borrowed.file_name());
     }
 }
