@@ -7872,46 +7872,36 @@ impl<'a> Lower<'a> {
                 };
                 let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (exp_sh, sign_sh, exp_mask, mant_mask, quiet_bit) = if f16 {
-                    (10, 15, 0x1F, 0x03FF, 0x0200)
+                let (sign, min_normal, infinity, quiet_shift) = if f16 {
+                    (0x8000, 0x0400, 0x7C00, 9)
                 } else {
-                    (23, 31, 0xFF, 0x7F_FFFF, 0x40_0000)
+                    (0x8000_0000, 0x0080_0000, 0x7F80_0000, 22)
                 };
-                let (k_exp, k_sign, k_emax, mant, quiet) = (
-                    k(self, exp_sh),
-                    k(self, sign_sh),
-                    k(self, exp_mask),
-                    k(self, mant_mask),
-                    k(self, quiet_bit),
-                );
-                let e = self.s.m.bin(c, Bin::LShr, x, k_exp);
-                let e = self.s.m.bin(c, Bin::And, e, k_emax);
-                let m = self.s.m.bin(c, Bin::And, x, mant);
-                let neg = self.s.m.bin(c, Bin::LShr, x, k_sign);
-                let zero = k(self, 0);
-                let (e0, emax) = (
-                    self.s.m.cmp(c, pred::EQ, e, zero),
-                    self.s.m.cmp(c, pred::EQ, e, k_emax),
-                );
-                let m0 = self.s.m.cmp(c, pred::EQ, m, zero);
-                let q = self.s.m.bin(c, Bin::And, x, quiet);
-                let q = self.s.m.cmp(c, pred::NE, q, zero);
+                let (sign_bit, mag_mask) = (k(self, sign), k(self, sign - 1));
+                let (min_normal, infinity) = (k(self, min_normal), k(self, infinity));
+                let (zero, one) = (k(self, 0), k(self, 1));
+                let mag = self.s.m.bin(c, Bin::And, x, mag_mask);
+                let is_zero = self.s.m.cmp(c, pred::EQ, mag, zero);
+                let is_normal_or_higher = self.s.m.cmp(c, pred::IUGE, mag, min_normal);
+                let is_inf_or_nan = self.s.m.cmp(c, pred::IUGE, mag, infinity);
+                let is_nan = self.s.m.cmp(c, pred::IUGT, mag, infinity);
+                let is_neg = self.s.m.cmp(c, pred::IUGE, x, sign_bit);
+
                 // Positive classes 6-9; negative ones are 11 minus those.
-                let (normal, inf, zero_c, denorm) =
-                    (k(self, 8), k(self, 9), k(self, 6), k(self, 7));
-                let t = self.s.m.select(c, m0, zero_c, denorm);
-                let t = self.s.m.select(c, e0, t, normal);
-                let t = self.s.m.select(c, emax, inf, t);
+                let (zero_c, denorm, normal, inf) =
+                    (k(self, 6), k(self, 7), k(self, 8), k(self, 9));
+                let t = self.s.m.select(c, is_zero, zero_c, denorm);
+                let t = self.s.m.select(c, is_normal_or_higher, normal, t);
+                let t = self.s.m.select(c, is_inf_or_nan, inf, t);
                 let eleven = k(self, 11);
                 let mirrored = self.s.m.bin(c, Bin::Sub, eleven, t);
-                let is_neg = self.s.m.cmp(c, pred::NE, neg, zero);
                 let t = self.s.m.select(c, is_neg, mirrored, t);
-                let (one, snan) = (k(self, 1), k(self, 0));
-                let nan_class = self.s.m.select(c, q, one, snan);
-                let yes = self.s.m.bool(true);
-                let nan = self.s.m.bin(c, Bin::Xor, m0, yes);
-                let nan = self.s.m.bin(c, Bin::And, nan, emax);
-                let t = self.s.m.select(c, nan, nan_class, t);
+
+                // The quiet bit is the class index for a NaN of either sign.
+                let quiet_shift = k(self, quiet_shift);
+                let q = self.s.m.bin(c, Bin::LShr, x, quiet_shift);
+                let nan_class = self.s.m.bin(c, Bin::And, q, one);
+                let t = self.s.m.select(c, is_nan, nan_class, t);
                 let bit = self.s.m.bin(c, Bin::LShr, mask, t);
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 self.s.m.cmp(c, pred::NE, bit, zero)
