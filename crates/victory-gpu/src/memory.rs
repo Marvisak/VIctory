@@ -33,6 +33,7 @@
 //! past that, the smallest copies read as missing (logged once).
 
 use std::collections::{HashMap, HashSet};
+use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -61,6 +62,8 @@ const BITMAP_WORDS: usize = BITMAP_BITS / 32;
 const BITMAP_BYTES: u64 = (BITMAP_BITS / 8).next_multiple_of(256) as u64;
 /// Maximum number of dirty-page bitmaps kept in [`BITMAP_POOL`].
 const BITMAP_POOL_CAP: usize = 64;
+/// Maximum number of idle page tables kept in [`TABLE_POOL`] (16 MiB each).
+const TABLE_POOL_CAP: usize = 1;
 /// The key of our own view heap ([`heap`]) among the title's.
 pub(crate) const OURS: usize = usize::MAX;
 
@@ -204,7 +207,8 @@ struct Shared {
     /// The host heap it was made for (a heap made later at a released one's
     /// address is another).
     host: usize,
-    table: ID3D12Resource,
+    /// Taken out in `Drop`, which pools it or releases it.
+    table: ManuallyDrop<ID3D12Resource>,
     data: usize,
     gpu: u64,
     /// The pair of null views entries without a copy name.
@@ -219,6 +223,59 @@ struct Shared {
 // SAFETY: `data` is the persistent mapping of `table`, written only under
 // the lock; D3D12 resources are free-threaded.
 unsafe impl Send for Shared {}
+
+/// A page table buffer kept while no heap has it: its resource and mapping.
+struct IdleTable {
+    table: ID3D12Resource,
+    data: usize,
+}
+
+// SAFETY: `data` is the persistent mapping of `table`, owned by whoever holds
+// the `IdleTable`; D3D12 resources are free-threaded.
+unsafe impl Send for IdleTable {}
+
+/// Page table buffers of released heaps, for the next heap's: up to
+/// [`TABLE_POOL_CAP`], each the only holder of its buffer when pooled.
+static TABLE_POOL: Mutex<Vec<IdleTable>> = Mutex::new(Vec::new());
+
+/// Whether `table` has no holder but the caller's (a list holds the table of
+/// a heap it used until its run is over and the list resets, so a table
+/// still held may be read by the GPU).
+fn sole_holder(table: &ID3D12Resource) -> bool {
+    use windows::core::Interface;
+    let raw = table.as_raw();
+    let unknown: &windows::core::IUnknown = table.into();
+    // SAFETY: `raw` is a live COM object; the added reference is given back.
+    unsafe {
+        let vtable = Interface::vtable(unknown);
+        let count = (vtable.AddRef)(raw);
+        (vtable.Release)(raw);
+        count == 2
+    }
+}
+
+/// Pools `idle` unless the pool is full; what does not fit is returned.
+fn pool_table<T>(pool: &mut Vec<T>, idle: T) -> Option<T> {
+    if pool.len() < TABLE_POOL_CAP {
+        pool.push(idle);
+        None
+    } else {
+        Some(idle)
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // SAFETY: `table` is not used after this.
+        let table = unsafe { ManuallyDrop::take(&mut self.table) };
+        if !sole_holder(&table) {
+            return;
+        }
+        let idle = IdleTable { table, data: self.data };
+        let overflow = pool_table(&mut TABLE_POOL.lock().unwrap_or_else(|e| e.into_inner()), idle);
+        drop(overflow);
+    }
+}
 
 /// Page tables by view heap (the title heap's address, or [`OURS`]).
 static SHARED: Mutex<Vec<(usize, Shared)>> = Mutex::new(Vec::new());
@@ -481,15 +538,27 @@ impl Shared {
     /// submission that uses it).
     fn new(heap: &HostHeap) -> Option<Shared> {
         let bytes = TABLE_DWORDS as u64 * 4;
-        let (table, data) = crate::host::host()?.upload_buffer(bytes)?;
-        crate::host::name(&table, || "title memory page table".into());
+        let idle = TABLE_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let (table, data) = match idle {
+            Some(IdleTable { table, data }) => {
+                // SAFETY: the pooled buffer's persistent mapping holds
+                // `TABLE_DWORDS` dwords and nothing else holds the buffer.
+                unsafe { std::ptr::write_bytes(data as *mut u32, 0, TABLE_DWORDS) };
+                (table, data as *mut u8)
+            }
+            None => {
+                let (table, data) = crate::host::host()?.upload_buffer(bytes)?;
+                crate::host::name(&table, || "title memory page table".into());
+                (table, data)
+            }
+        };
         let null = heap.pair()?;
         heap.raw_pair_at(null, None, 0);
         // SAFETY: a live buffer.
         let gpu = unsafe { table.GetGPUVirtualAddress() };
         Some(Shared {
             host: std::ptr::from_ref(heap) as usize,
-            table,
+            table: ManuallyDrop::new(table),
             data: data as usize,
             gpu,
             null,
@@ -616,13 +685,13 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
         if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host) {
-            list.keep(&s.table);
+            list.keep(&*s.table);
             return Some(s.gpu);
         }
         // A released heap's table goes with it (lists that name it hold it).
         shared.retain(|(k, _)| *k != key);
         let s = Shared::new(heap)?;
-        list.keep(&s.table);
+        list.keep(&*s.table);
         let gpu = s.gpu;
         shared.push((key, s));
         Some(gpu)
@@ -714,6 +783,16 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_tables_are_capped() {
+        let mut pool = Vec::new();
+        for n in 0..TABLE_POOL_CAP {
+            assert_eq!(pool_table(&mut pool, n), None);
+        }
+        assert_eq!(pool_table(&mut pool, 99), Some(99), "past the cap it is released");
+        assert_eq!(pool.len(), TABLE_POOL_CAP);
+    }
+
     use super::*;
 
     /// Writes of lists using title memory are held back from a frame with a
