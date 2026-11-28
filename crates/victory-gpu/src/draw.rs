@@ -548,31 +548,26 @@ impl State {
         }
         let l = &list.list;
         // Vertex buffers the input layout reads.
-        let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
-        let mut count = 0;
-        for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
-            if p.slots & 1 << slot == 0 {
-                continue;
+        if p.slots != 0 {
+            let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
+            let count = vertex_slot_count(p.slots);
+            for slot in active_slots(p.slots) {
+                let v = self.vertex[slot];
+                if v.address == 0 || v.size == 0 {
+                    continue;
+                }
+                let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
+                    continue;
+                };
+                shadow.refresh(list, v.address, u64::from(v.size));
+                views[slot] = D3D12_VERTEX_BUFFER_VIEW {
+                    BufferLocation: shadow.gpu(v.address),
+                    SizeInBytes: v.size,
+                    StrideInBytes: v.stride,
+                };
             }
-            count = slot + 1;
-            if v.address == 0 || v.size == 0 {
-                continue;
-            }
-            let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
-                continue;
-            };
-            shadow.refresh(list, v.address, u64::from(v.size));
-            *view = D3D12_VERTEX_BUFFER_VIEW {
-                BufferLocation: shadow.gpu(v.address),
-                SizeInBytes: v.size,
-                StrideInBytes: v.stride,
-            };
-        }
-        // SAFETY: an open list; the views name live host buffers.
-        unsafe {
-            if count > 0 {
-                l.IASetVertexBuffers(0, Some(&views[..count]));
-            }
+            // SAFETY: an open list; the views name live host buffers.
+            unsafe { l.IASetVertexBuffers(0, Some(&views[..count])) };
         }
         if indexed {
             let v = self.index;
@@ -1607,17 +1602,17 @@ impl State {
             return false;
         };
         let rects = u64::from(count / 3);
-        for slot in 0..32 {
+        for slot in active_slots(p.slots) {
             let elements: Vec<(u32, u32)> = p
                 .inputs
                 .iter()
-                .filter(|e| e.slot == slot && !e.per_instance)
+                .filter(|e| e.slot as usize == slot && !e.per_instance)
                 .map(|e| (e.offset, e.format))
                 .collect();
             if elements.is_empty() {
                 continue;
             }
-            let v = self.vertex[slot as usize];
+            let v = self.vertex[slot];
             let stride = u64::from(v.stride);
             let from = v.address + u64::from(first) * stride;
             if v.address == 0
@@ -1650,7 +1645,7 @@ impl State {
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
-            unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+            unsafe { list.list.IASetVertexBuffers(slot as u32, Some(&[view])) };
         }
         true
     }
@@ -2025,9 +2020,40 @@ const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
+/// The vertex buffer slots set in `mask`, lowest first.
+fn active_slots(mask: u32) -> impl Iterator<Item = usize> {
+    let mut rest = mask;
+    std::iter::from_fn(move || {
+        (rest != 0).then(|| {
+            let slot = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            slot
+        })
+    })
+}
+
+/// How many vertex buffer views cover every slot set in `mask`.
+fn vertex_slot_count(mask: u32) -> usize {
+    (32 - mask.leading_zeros()) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vertex_slots_are_walked_by_their_set_bits() {
+        assert_eq!(active_slots(0).count(), 0);
+        assert_eq!(vertex_slot_count(0), 0);
+        assert_eq!(active_slots(0b1).collect::<Vec<_>>(), [0]);
+        assert_eq!(vertex_slot_count(0b1), 1);
+        assert_eq!(active_slots(0b1010_0001).collect::<Vec<_>>(), [0, 5, 7]);
+        assert_eq!(vertex_slot_count(0b1010_0001), 8);
+        assert_eq!(active_slots(u32::MAX).count(), 32);
+        assert_eq!(vertex_slot_count(u32::MAX), 32);
+        assert_eq!(active_slots(1 << 31).collect::<Vec<_>>(), [31]);
+        assert_eq!(vertex_slot_count(1 << 31), 32);
+    }
 
     /// A root signature that indexes the heaps directly needs one of each
     /// kind bound before it is set: our sampler heap stands in for a title
