@@ -401,7 +401,25 @@ impl Module {
 
     pub fn bin(&mut self, block: usize, op: Bin, a: V, b: V) -> V {
         let ty = self.type_of(a);
+        if op == Bin::And
+            && self.types[ty.0 as usize] == TypeDef::Int(32)
+            && let Some((V::Inst(i), mask)) = self.constant_mask(a, b)
+            && let Op::Bin(Bin::And, x, y) = self.insts[i as usize].op
+            && let Some((value, earlier)) = self.constant_mask(x, y)
+        {
+            // Keep the earlier instruction available to any other users.
+            let combined = self.int_const(ty, mask & earlier);
+            return self.push(block, ty, Op::Bin(op, value, combined));
+        }
         self.push(block, ty, Op::Bin(op, a, b))
+    }
+
+    fn constant_mask(&self, a: V, b: V) -> Option<(V, i64)> {
+        match (a, b) {
+            (V::Const(_), value) => self.int_value(a).map(|mask| (value, mask)),
+            (value, V::Const(_)) => self.int_value(b).map(|mask| (value, mask)),
+            _ => None,
+        }
     }
     pub fn cast(&mut self, block: usize, op: Cast, v: V, to: Ty) -> V {
         self.push(block, to, Op::Cast(op, v))
@@ -1558,6 +1576,44 @@ mod tests {
         // atomic's operand list, kept as its body entry.
         let store = m.blocks[entry].body.iter().any(|&i| matches!(m.insts[i as usize].op, Op::Store(..)) && live[i as usize]);
         assert!(store);
+        let _ = m.write();
+    }
+
+    #[test]
+    fn consecutive_constant_and_masks_share_the_original_value() {
+        let (mut m, b, sink) = module(1);
+        let block = b[0];
+        let i32t = m.int(32);
+        let input_ty = m.func_ty(i32t, vec![]);
+        let input = m.function("input", input_ty, Some(Attr::ReadOnly), false);
+        let input = m.call(block, input, vec![]);
+        let (low, alternating, endpoints) = (m.i32(0xFFFF), m.i32(0x5555_5555), m.i32(0xF00F));
+        let first = m.bin(block, Bin::And, input, low);
+        let second = m.bin(block, Bin::And, alternating, first);
+        let third = m.bin(block, Bin::And, second, endpoints);
+        let V::Inst(third_id) = third else {
+            unreachable!()
+        };
+        let Op::Bin(Bin::And, value, mask) = m.insts[third_id as usize].op else {
+            panic!("expected a single AND");
+        };
+        assert_eq!(value, input);
+        assert_eq!(m.int_value(mask), Some(0x5005));
+
+        let keep = m.call(block, sink, vec![third]);
+        m.terminate(block, Term::Ret);
+        let inst = |v| {
+            if let V::Inst(i) = v {
+                i as usize
+            } else {
+                unreachable!()
+            }
+        };
+        let live = m.live();
+        assert!(live[inst(keep)] && !live[inst(first)] && !live[inst(second)]);
+        m.call(block, sink, vec![first]);
+        let live = m.live();
+        assert!(live[inst(first)] && !live[inst(second)]);
         let _ = m.write();
     }
 
