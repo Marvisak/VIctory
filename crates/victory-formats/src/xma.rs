@@ -546,38 +546,26 @@ impl Channel {
     }
 }
 
-/// Decodes the frames of one mono or stereo stream.
-#[derive(Clone)]
-pub struct Decoder {
-    channels: usize,
+/// Immutable scale-factor band boundaries and cross-block mappings for one sample rate.
+struct ScaleBands {
     num_sfb: [usize; BLOCK_SIZES],
     sfb_offsets: [[usize; MAX_BANDS + 1]; BLOCK_SIZES],
     sf_offsets: [[[usize; MAX_BANDS]; BLOCK_SIZES]; BLOCK_SIZES],
-    ch: [Channel; 2],
-    // Per subframe.
-    subframe_len: usize,
-    channels_for_cur_subframe: usize,
-    channel_indexes: [usize; 2],
-    num_bands: usize,
-    table_idx: usize,
-    esc_len: u32,
-    transmit_num_vec_coeffs: bool,
-    transform: bool,
-    transform_band: [bool; MAX_BANDS],
-    parsed_all_subframes: bool,
 }
 
-/// What the decoder needs from the stream format: the channel count and
-/// the sample rate, which sets the scale factor band layout.
-impl Decoder {
-    pub fn new(channels: usize, sample_rate: u32) -> Decoder {
-        let channels = channels.clamp(1, 2);
-        let rate = match sample_rate {
-            r if r > 44_100 => 48_000,
-            r if r > 32_000 => 44_100,
-            r if r > 24_000 => 32_000,
-            _ => 24_000,
+impl ScaleBands {
+    fn for_sample_rate(sample_rate: u32) -> &'static Self {
+        static BY_RATE: [OnceLock<ScaleBands>; 4] = [const { OnceLock::new() }; 4];
+        let (index, rate) = match sample_rate {
+            r if r > 44_100 => (3, 48_000),
+            r if r > 32_000 => (2, 44_100),
+            r if r > 24_000 => (1, 32_000),
+            _ => (0, 24_000),
         };
+        BY_RATE[index].get_or_init(|| Self::new(rate))
+    }
+
+    fn new(rate: usize) -> Self {
         let mut sfb_offsets = [[0usize; MAX_BANDS + 1]; BLOCK_SIZES];
         let mut num_sfb = [0usize; BLOCK_SIZES];
         for i in 0..BLOCK_SIZES {
@@ -613,11 +601,41 @@ impl Decoder {
                 }
             }
         }
-        Decoder {
-            channels,
+        Self {
             num_sfb,
             sfb_offsets,
             sf_offsets,
+        }
+    }
+}
+
+/// Decodes the frames of one mono or stereo stream.
+#[derive(Clone)]
+pub struct Decoder {
+    channels: usize,
+    bands: &'static ScaleBands,
+    ch: [Channel; 2],
+    // Per subframe.
+    subframe_len: usize,
+    channels_for_cur_subframe: usize,
+    channel_indexes: [usize; 2],
+    num_bands: usize,
+    table_idx: usize,
+    esc_len: u32,
+    transmit_num_vec_coeffs: bool,
+    transform: bool,
+    transform_band: [bool; MAX_BANDS],
+    parsed_all_subframes: bool,
+}
+
+/// What the decoder needs from the stream format: the channel count and
+/// the sample rate, which sets the scale factor band layout.
+impl Decoder {
+    pub fn new(channels: usize, sample_rate: u32) -> Decoder {
+        let channels = channels.clamp(1, 2);
+        Decoder {
+            channels,
+            bands: ScaleBands::for_sample_rate(sample_rate),
             ch: [Channel::new(), Channel::new()],
             subframe_len: FRAME_SAMPLES,
             channels_for_cur_subframe: 0,
@@ -908,7 +926,7 @@ impl Decoder {
         let codes = codes();
         for i in 0..self.channels_for_cur_subframe {
             let c = self.channel_indexes[i];
-            let sf_offsets = self.sf_offsets[self.table_idx][self.ch[c].table_idx];
+            let sf_offsets = self.bands.sf_offsets[self.table_idx][self.ch[c].table_idx];
             let ch = &mut self.ch[c];
             let target = 1 - ch.scale_factor_idx;
             ch.scale_factors = target;
@@ -992,7 +1010,7 @@ impl Decoder {
             self.parsed_all_subframes = true;
         }
         self.table_idx = log2(FRAME_SAMPLES / subframe_len) as usize;
-        self.num_bands = self.num_sfb[self.table_idx];
+        self.num_bands = self.bands.num_sfb[self.table_idx];
         self.subframe_len = subframe_len;
         self.esc_len = log2(subframe_len - 1) + 1;
 
@@ -1083,7 +1101,7 @@ impl Decoder {
             self.inverse_channel_transform();
             // Output in [-1, 1] for 16-bit streams.
             let scale = 2.0 / subframe_len as f32 / 32768.0;
-            let sfb = self.sfb_offsets[self.table_idx];
+            let sfb = self.bands.sfb_offsets[self.table_idx];
             let mut tmp = [0f32; FRAME_SAMPLES];
             for i in 0..self.channels_for_cur_subframe {
                 let ch = &mut self.ch[self.channel_indexes[i]];
@@ -1134,7 +1152,7 @@ impl Decoder {
         if !self.transform || self.channels_for_cur_subframe != 2 {
             return;
         }
-        let sfb = self.sfb_offsets[self.table_idx];
+        let sfb = self.bands.sfb_offsets[self.table_idx];
         let [a, b] = &mut self.ch;
         for band in 0..self.num_bands {
             let range = sfb[band]..sfb[band + 1].min(self.subframe_len);
@@ -1180,6 +1198,30 @@ fn to_i16(v: f32) -> i16 {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn decoders_share_the_layout_for_their_normalized_sample_rate() {
+        let mut previous = None;
+        for (rates, canonical) in [
+            ([0, 24_000], 24_000),
+            ([24_001, 32_000], 32_000),
+            ([32_001, 44_100], 44_100),
+            ([44_101, u32::MAX], 48_000),
+        ] {
+            let [mono_rate, stereo_rate] = rates;
+            let mono = Decoder::new(1, mono_rate);
+            let stereo = Decoder::new(2, stereo_rate);
+            let expected = ScaleBands::new(canonical);
+            assert!(std::ptr::eq(mono.bands, stereo.bands));
+            assert_eq!(mono.bands.num_sfb, expected.num_sfb);
+            assert_eq!(mono.bands.sfb_offsets, expected.sfb_offsets);
+            assert_eq!(mono.bands.sf_offsets, expected.sf_offsets);
+            if let Some(previous) = previous {
+                assert!(!std::ptr::eq(mono.bands, previous));
+            }
+            previous = Some(mono.bands);
+        }
+    }
     /// Writes `value` as `n` bits, MSB first, at bit `pos`.
     fn put_bits(data: &mut [u8], pos: usize, n: u32, value: u32) {
         for i in 0..n as usize {
