@@ -2878,7 +2878,7 @@ mod tests {
         // the creation the failure is injected in.
         const D32_FLOAT: u32 = 40;
         let clear = [D32_FLOAT, 1.0f32.to_bits(), 0, 0, 0];
-        let desc = ResourceDesc { flags: DEPTH, ..texture(64, 64, D32_FLOAT, 1) };
+        let desc = ResourceDesc {\n            flags: DEPTH,\n            ..texture(64, 64, D32_FLOAT, 1)\n        };
         let wait = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
         // `host_copy` with the next creation failing: whether it was asked
         // for (the failure taken), and what it gave.
@@ -2980,10 +2980,8 @@ mod tests {
         // WARP/D3D12 allocation could otherwise expire it and let the test
         // pass through the ordinary shared-cache path.
         let forced_deadline = now_ms().saturating_add(30_000);
-        a.refused_until.store(
-            forced_deadline,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        a.refused_until
+            .store(forced_deadline, std::sync::atomic::Ordering::Relaxed);
 
         let shared = host_copy(succeeds).expect("second Resource creates the shared texture");
         assert!(
