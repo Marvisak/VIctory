@@ -69,6 +69,25 @@ pub(crate) mod flags {
     pub const ATOMIC64_HEAP: u64 = 1 << 32;
 }
 
+/// Renderer port 5 (`VICTORY_PORT_CBV=1`; off by default): read a root
+/// constant buffer as a raw root SRV, so its title bytes need no 256-byte
+/// copy at submission. The host binds the same address as a root SRV, and
+/// the shader cache keys on the switch.
+pub fn constants_raw() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CONSTANTS_RAW_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`constants_raw`], for the calling test alone: off unless a test opts in.
+    pub(crate) static CONSTANTS_RAW_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(Some(false)) };
+}
+
 pub(crate) struct Types {
     pub void: Ty,
     pub i1: Ty,
@@ -1087,5 +1106,24 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod raw_cbv_tests {
+    use super::*;
+
+    #[test]
+    fn constants_raw_is_opt_in() {
+        CONSTANTS_RAW_HERE.set(Some(false));
+        assert!(!constants_raw());
+        CONSTANTS_RAW_HERE.set(Some(true));
+        assert!(constants_raw());
+        CONSTANTS_RAW_HERE.set(None);
+        assert_eq!(
+            constants_raw(),
+            std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "1")
+        );
+        CONSTANTS_RAW_HERE.set(Some(false));
     }
 }

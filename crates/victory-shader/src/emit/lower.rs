@@ -24,6 +24,15 @@ mod bvh;
 
 type Why = &'static str;
 
+/// Renderer port 5's lowering guard: only a known root constant buffer may
+/// become a raw root SRV. A descriptor of unknown kind, a table and a view
+/// picked from the heap keep their existing (bounded) paths.
+fn raw_root_cbv(kind: Option<&UsedResource>, root: RootType) -> bool {
+    super::shader::constants_raw()
+        && root == RootType::Descriptor
+        && matches!(kind, Some(u) if u.kind == ResourceType::Cbv)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -4173,7 +4182,13 @@ impl<'a> Lower<'a> {
         // of it, so tables need no copies of their own per draw.
         let table_constants =
             matches!(kind, Some(u) if u.kind == ResourceType::Cbv && u.root == RootType::Table);
+        // Renderer port 5: a root constant buffer read as a raw root SRV.
+        // The guard keeps the default path (a 256-byte CBV copy) intact and
+        // never applies to a descriptor built any other way.
+        let root_constants = raw_root_cbv(kind, RootType::Descriptor)
+            && matches!(kind, Some(u) if u.root == RootType::Descriptor);
         let srv = heap_constants
+            || root_constants
             || table_constants
             || matches!(kind, Some(u) if u.kind == ResourceType::Srv);
         // A root UAV is read as title memory in a program that uses it.
@@ -5440,6 +5455,11 @@ impl<'a> Lower<'a> {
                 match (rp.root, kind, props.0) {
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(rp.slot))
+                    }
+                    (RootType::Descriptor, Some(ResourceType::Cbv), 11)
+                        if super::shader::constants_raw() =>
+                    {
+                        Ok(self.s.root_srv_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) if !self.root_memory => {
                         Ok(self.root_view(address.param, false))
@@ -10927,6 +10947,31 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    fn cbv(root: RootType) -> UsedResource {
+        UsedResource {
+            kind: ResourceType::Cbv,
+            root,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }
+    }
+
+    #[test]
+    fn raw_root_cbv_needs_the_switch_and_a_root_descriptor() {
+        let here = &crate::emit::shader::CONSTANTS_RAW_HERE;
+        here.set(Some(false));
+        assert!(!super::raw_root_cbv(Some(&cbv(RootType::Descriptor)), RootType::Descriptor));
+        here.set(Some(true));
+        assert!(super::raw_root_cbv(Some(&cbv(RootType::Descriptor)), RootType::Descriptor));
+        assert!(!super::raw_root_cbv(Some(&cbv(RootType::Table)), RootType::Table));
+        assert!(!super::raw_root_cbv(None, RootType::Descriptor));
+        here.set(Some(false));
+    }
 
     /// A program's constant table starts after its instructions, unless a
     /// load at a fixed offset reads below that.

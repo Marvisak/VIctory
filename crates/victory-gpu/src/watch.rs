@@ -35,8 +35,8 @@
 //! and allocated again while a tracker holds it is not seen.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// The unit tracked and copied: 64 KiB, the console's page. Finer units
 /// made the checks of the world's big buffers cost more than the copies
@@ -85,6 +85,39 @@ fn set_dirty(bit: Option<u32>, dirty: bool) {
 /// [`Tracked::clean`]).
 pub(crate) fn clean_bit(bit: Option<u32>) -> bool {
     bit.is_some_and(|bit| DIRTY[bit as usize / 64].load(Ordering::Acquire) & 1 << (bit % 64) == 0)
+}
+
+/// Renderer port 7 (`VICTORY_PORT_JOURNAL=1`; off by default): a page already
+/// marked in this generation needs no second mark before it is taken.
+pub(crate) fn port_journal() -> bool {
+    #[cfg(test)]
+    if let Some(on) = PORT_JOURNAL_IN_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_JOURNAL").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Renderer port 6 (`VICTORY_PORT_GUARD=1`; off by default): faults,
+/// refreshes and publishes take the guards' lock shared. A per-page atomic
+/// claim ([`BUSY`]) serializes the threads changing the same block, so only
+/// mapping changes, kernel writes and frees need the lock alone. Independent
+/// of [`port_journal`]: either switch works on its own.
+pub(crate) fn port_guard() -> bool {
+    #[cfg(test)]
+    if let Some(on) = PORT_GUARD_IN_TEST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_GUARD").is_ok_and(|v| v.trim() == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`port_journal`], for the calling test alone: off unless a test opts in.
+    pub(crate) static PORT_JOURNAL_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(Some(false)) };
+    /// [`port_guard`], for the calling test alone: off unless a test opts in.
+    pub(crate) static PORT_GUARD_IN_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(Some(false)) };
 }
 
 impl Drop for Changed {
@@ -185,8 +218,10 @@ pub(crate) struct Tracked {
 }
 
 struct Guards {
-    /// Blocks (pages) we made read-only.
-    protected: BTreeSet<usize>,
+    /// Blocks (pages) we made read-only. Its own lock lets a fault or a
+    /// refresh change one block while other threads hold the guards shared
+    /// ([`port_guard`]); a block's change is serialized by [`BUSY`].
+    protected: Blocks,
     /// The trackers holding each page.
     holders: BTreeMap<usize, Vec<Arc<Changed>>>,
     /// Pages `[first, last)` of writes the guards do not see that are under
@@ -199,25 +234,192 @@ struct Guards {
     alias_of: BTreeMap<usize, Vec<usize>>,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
-    written: BTreeSet<usize>,
+    written: Blocks,
     #[cfg(feature = "diagnostics")]
-    written_before: BTreeSet<usize>,
+    written_before: Blocks,
 }
 
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
-    protected: BTreeSet::new(),
+/// A set of pages whose entries can be changed through a shared guards lock:
+/// each change is brief and, with [`port_guard`], made under that page's
+/// [`BUSY`] claim.
+struct Blocks(Mutex<BTreeSet<usize>>);
+
+impl Blocks {
+    const fn new() -> Self {
+        Self(Mutex::new(BTreeSet::new()))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<usize>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn contains(&self, page: usize) -> bool {
+        self.lock().contains(&page)
+    }
+
+    fn insert(&self, page: usize) {
+        self.lock().insert(page);
+    }
+
+    fn remove(&self, page: usize) -> bool {
+        self.lock().remove(&page)
+    }
+
+    fn extend(&self, pages: impl IntoIterator<Item = usize>) {
+        self.lock().extend(pages);
+    }
+
+    fn in_range(&self, first: usize, last: usize) -> Vec<usize> {
+        self.lock().range(first..last).copied().collect()
+    }
+
+    fn any_in(&self, first: usize, last: usize) -> bool {
+        self.lock().range(first..last).next().is_some()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn snapshot(&self) -> BTreeSet<usize> {
+        self.lock().clone()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn replace(&self, pages: BTreeSet<usize>) -> BTreeSet<usize> {
+        std::mem::replace(&mut *self.lock(), pages)
+    }
+}
+
+static GUARDS: RwLock<Guards> = RwLock::new(Guards {
+    protected: Blocks::new(),
     holders: BTreeMap::new(),
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
     #[cfg(feature = "diagnostics")]
-    written: BTreeSet::new(),
+    written: Blocks::new(),
     #[cfg(feature = "diagnostics")]
-    written_before: BTreeSet::new(),
+    written_before: Blocks::new(),
 });
 
 #[cfg(not(feature = "diagnostics"))]
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
+    GUARDS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Read-only access to the guards: faults, refreshes and publishes hold this
+/// while they change a block under its [`BUSY`] claim.
+fn guards_shared() -> std::sync::RwLockReadGuard<'static, Guards> {
+    GUARDS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+fn try_guards_shared() -> Option<std::sync::RwLockReadGuard<'static, Guards>> {
+    GUARDS.try_read().ok()
+}
+
+/// Atomic bits made in pieces when first needed and never freed: one bit per
+/// page, for the [`BUSY`] claims. A piece is 64 KiB of bits (4 million pages).
+struct Bits([AtomicPtr<[AtomicU64; Bits::WORDS]>; Bits::PIECES]);
+
+impl Bits {
+    const WORDS: usize = 1 << 13;
+    const PIECES: usize = 1 << 13;
+
+    const fn new() -> Self {
+        Self([const { AtomicPtr::new(std::ptr::null_mut()) }; Self::PIECES])
+    }
+
+    fn word(&self, page: usize) -> Option<&AtomicU64> {
+        let word = page / 64;
+        let piece = self.0.get(word / Self::WORDS)?.load(Ordering::Acquire);
+        if piece.is_null() {
+            return None;
+        }
+        // SAFETY: a piece made by `try_set`, never freed while the process
+        // lives.
+        Some(&(unsafe { &*piece })[word % Self::WORDS])
+    }
+
+    /// Sets the bit if it was clear.
+    fn try_set(&self, page: usize) -> bool {
+        let word = page / 64;
+        let Some(place) = self.0.get(word / Self::WORDS) else {
+            return false;
+        };
+        if place.load(Ordering::Acquire).is_null() {
+            let piece = Box::into_raw(Box::new([const { AtomicU64::new(0) }; Self::WORDS]));
+            if place.compare_exchange(std::ptr::null_mut(), piece, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                // SAFETY: another thread's piece won; ours was never shared.
+                unsafe { drop(Box::from_raw(piece)) };
+            }
+        }
+        // SAFETY: a piece is there: loaded above, or put by our successful
+        // compare exchange; pieces are never freed.
+        let piece = unsafe { &*place.load(Ordering::Acquire) };
+        let bit = 1u64 << (page % 64);
+        piece[word % Self::WORDS].fetch_or(bit, Ordering::AcqRel) & bit == 0
+    }
+
+    fn clear(&self, page: usize) {
+        if let Some(word) = self.word(page) {
+            word.fetch_and(!(1u64 << (page % 64)), Ordering::Release);
+        }
+    }
+}
+
+/// The pages whose protection a thread holding the guards shared is changing
+/// ([`port_guard`]): one claim each, let go when dropped.
+static BUSY: Bits = Bits::new();
+
+/// Claims of [`BUSY`] pages, released together on drop.
+struct Claims(Vec<usize>);
+
+impl Claims {
+    /// The claims of sorted, distinct `pages`, waited for one at a time: a
+    /// waiter holds no claim, so two threads cannot wait for each other.
+    fn wait_for(pages: &[usize]) -> Self {
+        debug_assert!(pages.windows(2).all(|w| w[0] < w[1]));
+        let mut claims = Self(Vec::with_capacity(pages.len()));
+        for &page in pages {
+            let mut tries = 0u32;
+            while !BUSY.try_set(page) {
+                tries += 1;
+                if tries < 64 {
+                    std::hint::spin_loop();
+                } else {
+                    // Another thread's `VirtualProtect` of the page.
+                    std::thread::yield_now();
+                }
+            }
+            claims.0.push(page);
+        }
+        claims
+    }
+
+    /// The claim of `page` if it is free; never waits. A refresh leaves a
+    /// page it cannot claim as it is (changed, to be taken again).
+    fn try_one(&mut self, page: usize) -> bool {
+        if BUSY.try_set(page) {
+            self.0.push(page);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn none() -> Self {
+        Self(Vec::new())
+    }
+
+    fn holds(&self, page: usize) -> bool {
+        self.0.contains(&page)
+    }
+}
+
+impl Drop for Claims {
+    fn drop(&mut self) {
+        for &page in &self.0 {
+            BUSY.clear(page);
+        }
+    }
 }
 
 /// The guard lock, timed while held by the line that took it
@@ -226,12 +428,12 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 #[track_caller]
 fn guards() -> Held {
     let line = std::panic::Location::caller().line();
-    let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = GUARDS.write().unwrap_or_else(|e| e.into_inner());
     Held(Some(guard), std::time::Instant::now(), line)
 }
 
 #[cfg(feature = "diagnostics")]
-struct Held(Option<std::sync::MutexGuard<'static, Guards>>, std::time::Instant, u32);
+struct Held(Option<std::sync::RwLockWriteGuard<'static, Guards>>, std::time::Instant, u32);
 
 #[cfg(feature = "diagnostics")]
 impl std::ops::Deref for Held {
@@ -245,6 +447,29 @@ impl std::ops::Deref for Held {
 impl std::ops::DerefMut for Held {
     fn deref_mut(&mut self) -> &mut Guards {
         self.0.as_mut().expect("held until dropped")
+    }
+}
+
+#[cfg(not(feature = "diagnostics"))]
+type WriteGuards = std::sync::RwLockWriteGuard<'static, Guards>;
+#[cfg(feature = "diagnostics")]
+type WriteGuards = Held;
+
+/// The guards, shared for the read-mostly paths when [`port_guard`] is on,
+/// alone otherwise. Chosen at each call site so the diagnostic timer still
+/// records the line that took the exclusive lock.
+enum GuardsLock {
+    Shared(std::sync::RwLockReadGuard<'static, Guards>),
+    Exclusive(WriteGuards),
+}
+
+impl std::ops::Deref for GuardsLock {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        match self {
+            Self::Shared(g) => g,
+            Self::Exclusive(g) => g,
+        }
     }
 }
 
@@ -296,12 +521,12 @@ fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
 
 /// Guards the other mappings of taken pages, returning those that still
 /// have an unguarded mapping (cannot be taken yet).
-fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
+fn guard_aliases(g: &Guards, pairs: &[(usize, usize)], claims: Option<&mut Claims>) -> BTreeSet<usize> {
     if pairs.is_empty() {
         return BTreeSet::new();
     }
     let others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
-    let guarded: BTreeSet<usize> = protect(g, &others).into_iter().collect();
+    let guarded: BTreeSet<usize> = protect(g, &others, claims).into_iter().collect();
     pairs
         .iter()
         .filter(|(_, a)| !guarded.contains(a))
@@ -433,16 +658,17 @@ impl Drop for Tracked {
         for page in free {
             let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
             if !watched_elsewhere {
-                open(&mut g, page);
+                open(&g, page);
             }
         }
     }
 }
 
-/// Gives write access back to page `page` if we guarded it.
-fn open(g: &mut Guards, page: usize) -> bool {
+/// Gives write access back to page `page` if we guarded it. The caller holds
+/// the guards (shared with [`port_guard`]) and the page's [`BUSY`] claim.
+fn open(g: &Guards, page: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    if !g.protected.remove(&page) {
+    if !g.protected.remove(page) {
         return false;
     }
     let mut old = 0;
@@ -500,23 +726,32 @@ impl Tracked {
         // between marks them changed again; the copy, made after, has it.
         #[cfg(feature = "diagnostics")]
         let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
-        let mut g = guards();
+        let (g, shared) = if port_guard() {
+            (GuardsLock::Shared(guards_shared()), true)
+        } else {
+            (GuardsLock::Exclusive(guards()), false)
+        };
+        let mut claims = shared.then(Claims::none);
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "diagnostics")]
         drop(waited);
         #[cfg(feature = "diagnostics")]
         let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
         let others = aliases(&g, &whole);
-        let unguarded = guard_aliases(&mut g, &others);
+        let unguarded = guard_aliases(&g, &others, claims.as_mut());
         #[cfg(feature = "diagnostics")]
         drop(asked);
         whole.retain(|p| !unguarded.contains(p));
         let mut unmapped = Vec::new();
-        for page in protect_noting(&mut g, &whole, &mut unmapped) {
+        for page in protect_noting(&g, &whole, &mut unmapped, claims.as_mut()) {
             changed.remove(&page);
             self.changed.taken(page);
         }
+        crate::port_journal::advance();
         set_dirty(self.changed.2, !changed.is_empty());
+        // A fault on a page just guarded waits for its claim, and sees the
+        // page taken as soon as this is dropped.
+        drop(claims);
         drop(changed);
         drop(g);
         let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
@@ -543,20 +778,27 @@ impl Tracked {
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
     pub(crate) fn taken(&self, pages: &[usize]) {
-        let mut g = guards();
+        let (g, shared) = if port_guard() {
+            (GuardsLock::Shared(guards_shared()), true)
+        } else {
+            (GuardsLock::Exclusive(guards()), false)
+        };
+        let mut claims = shared.then(Claims::none);
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         let others = aliases(&g, pages);
-        let unguarded = guard_aliases(&mut g, &others);
+        let unguarded = guard_aliases(&g, &others, claims.as_mut());
         let pages: Vec<usize> = pages
             .iter()
             .copied()
             .filter(|p| !unguarded.contains(p))
             .collect();
-        for page in protect(&mut g, &pages) {
+        for page in protect(&g, &pages, claims.as_mut()) {
             changed.remove(&page);
             self.changed.taken(page);
         }
+        crate::port_journal::advance();
         set_dirty(self.changed.2, !changed.is_empty());
+        drop(claims);
     }
 
     /// Whether no page changed since it was taken: then [`Tracked::take`]
@@ -640,14 +882,20 @@ impl Tracked {
 
 /// Makes `pages` read-only where not already (in runs), and returns those
 /// now guarded or with nothing mapped (taken either way); a page that is
-/// mapped but cannot be guarded is left out (it stays changed).
-fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
-    protect_noting(g, pages, &mut Vec::new())
+/// mapped but cannot be guarded is left out (it stays changed). With the
+/// guards held shared, `claims` holds each page changed here.
+fn protect(g: &Guards, pages: &[usize], claims: Option<&mut Claims>) -> Vec<usize> {
+    protect_noting(g, pages, &mut Vec::new(), claims)
 }
 
 /// [`protect`], also listing in `unmapped` the pages taken because nothing
 /// is mapped there.
-fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usize>) -> Vec<usize> {
+fn protect_noting(
+    g: &Guards,
+    pages: &[usize],
+    unmapped_pages: &mut Vec<usize>,
+    mut claims: Option<&mut Claims>,
+) -> Vec<usize> {
     #[cfg(feature = "diagnostics")]
     let counted = |calls: u64, pages: u64| {
         crate::copystat::add(crate::copystat::C::ProtectCalls, calls);
@@ -672,29 +920,44 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
     };
     let mut taken = Vec::with_capacity(pages.len());
     let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
+    // Busy pages are left open (and changed) until the kernel write ends.
     let pages: Vec<usize> = pages.iter().copied().filter(|&p| !busy(p)).collect();
     let mut i = 0;
     while i < pages.len() {
-        if g.protected.contains(&pages[i]) {
+        if let Some(claims) = claims.as_deref_mut() {
+            // Another thread is opening this page: leave it changed, so a
+            // refresh takes it again after that write.
+            if !claims.holds(pages[i]) && !claims.try_one(pages[i]) {
+                i += 1;
+                continue;
+            }
+        }
+        if g.protected.contains(pages[i]) {
             taken.push(pages[i]);
             i += 1;
             continue;
         }
-        // A run of consecutive pages not guarded yet.
+        // A run of consecutive pages not guarded yet, all claimed here.
         let first = i;
-        while i + 1 < pages.len() && pages[i + 1] == pages[i] + 1 && !g.protected.contains(&pages[i + 1]) {
+        while i + 1 < pages.len() && pages[i + 1] == pages[i] + 1 && !g.protected.contains(pages[i + 1]) {
+            if let Some(claims) = claims.as_deref_mut()
+                && !claims.holds(pages[i + 1])
+                && !claims.try_one(pages[i + 1])
+            {
+                break;
+            }
             i += 1;
         }
-        let run = &pages[first..=i];
+        let run: Vec<usize> = pages[first..=i].to_vec();
         i += 1;
         #[cfg(feature = "diagnostics")]
         counted(1, run.len() as u64);
         if set(run[0], run[run.len() - 1] + 1) {
-            g.protected.extend(run);
-            taken.extend(run);
+            g.protected.extend(run.iter().copied());
+            taken.extend(run.iter().copied());
             continue;
         }
-        for &page in run {
+        for &page in &run {
             if set(page, page + 1) {
                 g.protected.insert(page);
                 taken.push(page);
@@ -711,32 +974,53 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
 /// elsewhere: gives write access back where we guarded them and marks them
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
-fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
-    let guarded = g.protected.range(first..last).next().is_some();
+fn changed(g: &Guards, first: usize, last: usize, save: bool) -> bool {
+    let guarded = g.protected.any_in(first, last);
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    mark_and_open(g, first, last, &others, save);
+    guarded
+}
+
+/// [`changed`] with the guards held shared ([`port_guard`]): the fault's page
+/// and every view of it are claimed in page order before their state is
+/// looked at or changed, so no take or other fault can open one meanwhile.
+fn changed_shared(g: &Guards, first: usize, last: usize, save: bool) -> bool {
+    let mut pages: Vec<usize> = (first..last).collect();
+    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    pages.extend(others.iter().copied());
+    pages.sort_unstable();
+    pages.dedup();
+    let claims = Claims::wait_for(&pages);
+    let guarded = g.protected.any_in(first, last);
+    mark_and_open(g, first, last, &others, save);
+    drop(claims);
+    guarded
+}
+
+/// Notes the write in every tracker holding the page or one of its aliases,
+/// then gives write access back where we guarded them. Every page's bytes
+/// are saved before any is opened: once a page is open, a write by another
+/// thread lands without a fault, and a save after it would keep that write
+/// as the page's old bytes.
+fn mark_and_open(g: &Guards, first: usize, last: usize, others: &[usize], save: bool) {
     #[cfg(feature = "diagnostics")]
     {
         let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
         crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
     }
-    // Every page's bytes are saved before any is opened: once a page is
-    // open, a write by another thread lands without a fault, and a save
-    // after it would keep that write as the page's old bytes.
     mark_changed(g, first, last, save);
-    for &page in &others {
+    for &page in others {
         mark_changed(g, page, page + 1, save);
     }
     open_guarded(g, first, last);
-    for page in others {
+    for &page in others {
         open_guarded(g, page, page + 1);
     }
-    guarded
 }
 
 /// Gives write access back to the pages of `[first, last)` we guarded.
-fn open_guarded(g: &mut Guards, first: usize, last: usize) {
-    let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for page in guarded {
+fn open_guarded(g: &Guards, first: usize, last: usize) {
+    for page in g.protected.in_range(first, last) {
         open(g, page);
     }
 }
@@ -744,7 +1028,7 @@ fn open_guarded(g: &mut Guards, first: usize, last: usize) {
 /// Marks `[first, last)` changed in the trackers holding its pages. With
 /// `save`, before the write lands: trackers armed for a page they had taken
 /// keep its bytes.
-fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
+fn mark_changed(g: &Guards, first: usize, last: usize, save: bool) {
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             let first_write = {
@@ -765,12 +1049,16 @@ fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
 /// in it, and those written the frame before too.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn frame_done() {
-    let mut g = guards();
-    let written = std::mem::take(&mut g.written);
-    let again = written.intersection(&g.written_before).count();
+    let g = if port_guard() {
+        GuardsLock::Shared(guards_shared())
+    } else {
+        GuardsLock::Exclusive(guards())
+    };
+    let written = g.written.replace(BTreeSet::new());
+    let again = written.intersection(&g.written_before.snapshot()).count();
     crate::copystat::add(crate::copystat::C::WrittenPages, written.len() as u64);
     crate::copystat::add(crate::copystat::C::WrittenAgain, again as u64);
-    g.written_before = written;
+    g.written_before.replace(written);
 }
 
 /// A write into title memory the guards do not see, under way: its pages
@@ -789,7 +1077,7 @@ impl Drop for Writing {
         if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
             g.busy.swap_remove(i);
         }
-        changed(&mut g, self.first, self.last, false);
+        changed(&g, self.first, self.last, false);
     }
 }
 
@@ -804,7 +1092,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     g.busy.push((first, last));
-    changed(&mut g, first, last, true);
+    changed(&g, first, last, true);
     Writing { first, last }
 }
 
@@ -814,7 +1102,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
-    changed(&mut g, first, last, false);
+    changed(&g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -839,12 +1127,39 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// were uploaded again for nothing: 19 % of the uploads, run evict3).
 pub(crate) fn retake(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
-    let g = guards();
-    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    // The journal narrows which pages are marked; the guard switch alone
+    // decides whether the mark is made under the shared lock.
+    let narrowed = crate::port_journal::on().then(|| crate::port_journal::claim(first, last));
+    if narrowed.as_ref().is_some_and(Vec::is_empty) {
+        return;
+    }
+    let g = if port_guard() {
+        GuardsLock::Shared(guards_shared())
+    } else {
+        GuardsLock::Exclusive(guards())
+    };
+    if let Some(pages) = narrowed {
+        mark_pages(&g, &pages);
+        return;
+    }
     mark(&g, first, last);
-    for page in others {
+    for page in alias_pages(&g, &(first..last).collect::<Vec<_>>()) {
         mark(&g, page, page + 1);
     }
+}
+
+/// Marks the pages the journal still has to mark, with their aliases.
+fn mark_pages(g: &Guards, pages: &[usize]) {
+    for page in alias_pages(g, pages) {
+        mark(g, page, page + 1);
+    }
+    for &page in pages {
+        mark(g, page, page + 1);
+    }
+}
+
+fn alias_pages(g: &Guards, pages: &[usize]) -> Vec<usize> {
+    aliases(g, pages).into_iter().map(|(_, other)| other).collect()
 }
 
 /// Pages `[first, last)` count as changed in every host buffer copy's
@@ -877,10 +1192,10 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     // If the new mapping cannot be guarded (a write the guards do not see is
     // under way through it), the page is changed; its bytes now may hold that
     // write already, so nothing is saved of them.
-    if others.iter().any(|&o| g.protected.contains(&(o / PAGE)))
-        && protect(&mut g, &[page]).is_empty()
+    if others.iter().any(|&o| g.protected.contains(o / PAGE))
+        && protect(&g, &[page], None).is_empty()
     {
-        changed(&mut g, page, page + 1, false);
+        changed(&g, page, page + 1, false);
     }
 }
 
@@ -907,9 +1222,20 @@ fn install() {
         let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
-        // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
-        if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
+        // (then it is ours again, not read-only for some other reason). With
+        // [`port_guard`] this is shared: the block's claim ([`BUSY`]) makes
+        // the check and the opening one change, not the whole guard set.
+        let (g, shared) = if port_guard() {
+            (GuardsLock::Shared(guards_shared()), true)
+        } else {
+            (GuardsLock::Exclusive(guards()), false)
+        };
+        let opened = if shared {
+            changed_shared(&g, at / PAGE, at / PAGE + 1, true)
+        } else {
+            changed(&g, at / PAGE, at / PAGE + 1, true)
+        };
+        if opened {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -958,6 +1284,102 @@ pub(crate) mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     pub(crate) const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn test_flags_are_thread_local() {
+        PORT_JOURNAL_IN_TEST.set(Some(true));
+        PORT_GUARD_IN_TEST.set(Some(true));
+        assert!(port_journal());
+        assert!(port_guard());
+        PORT_JOURNAL_IN_TEST.set(Some(false));
+        PORT_GUARD_IN_TEST.set(Some(false));
+        assert!(!port_journal());
+        assert!(!port_guard());
+        PORT_JOURNAL_IN_TEST.set(None);
+        PORT_GUARD_IN_TEST.set(None);
+        assert_eq!(
+            port_journal(),
+            std::env::var("VICTORY_PORT_JOURNAL").is_ok_and(|v| v.trim() == "1")
+        );
+        assert_eq!(
+            port_guard(),
+            std::env::var("VICTORY_PORT_GUARD").is_ok_and(|v| v.trim() == "1")
+        );
+        PORT_JOURNAL_IN_TEST.set(Some(false));
+        PORT_GUARD_IN_TEST.set(Some(false));
+    }
+
+    #[test]
+    fn shared_guards_yield_to_a_writer() {
+        drop(guards_shared());
+        let write = GUARDS.write().unwrap_or_else(|e| e.into_inner());
+        assert!(try_guards_shared().is_none(), "a writer excludes readers");
+        drop(write);
+        drop(guards_shared());
+    }
+
+    /// Renderer port 6: faults, refreshes and publishes take the same lock
+    /// shared, while a claim serializes only the threads changing one page.
+    #[test]
+    fn port_guard_shares_the_lock_and_serializes_one_page() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        PORT_GUARD_IN_TEST.set(Some(true));
+        // A read guard permits other readers: the fault, refresh and publish
+        // paths all take this one instead of waiting behind other writes.
+        for path in ["fault", "refresh", "publish"] {
+            let g = if port_guard() {
+                GuardsLock::Shared(guards_shared())
+            } else {
+                GuardsLock::Exclusive(guards())
+            };
+            assert!(matches!(&g, GuardsLock::Shared(_)), "{path} takes the guards shared");
+            drop(g);
+        }
+
+        let (page, other) = (7usize, 8usize);
+        let held = Claims::wait_for(&[page]);
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut retry = Claims::none();
+            tx.send(retry.try_one(page)).expect("the claim is reported");
+            while !retry.try_one(page) {
+                std::thread::yield_now();
+            }
+            tx.send(true).expect("the claim is reported");
+            assert!(retry.try_one(other), "another page is free");
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(false), "same page is claimed");
+        let mut elsewhere = Claims::none();
+        assert!(elsewhere.try_one(other), "a different page can be claimed");
+        drop(elsewhere);
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err(), "the claim waits");
+        drop(held);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true), "the claim is released");
+        worker.join().expect("the worker finishes");
+        PORT_GUARD_IN_TEST.set(Some(false));
+    }
+
+    /// With the switch on, a fault and a refresh still see each other's
+    /// writes: the shared lock and its claims change no tracking decisions.
+    #[test]
+    fn port_guard_faults_refreshes_and_publishes() {
+        PORT_GUARD_IN_TEST.set(Some(true));
+        let p = pool(2);
+        let t = track_copy(p, 2 * PAGE, true).expect("pool memory is tracked");
+        assert_eq!(t.take(p, p + 2 * PAGE), [(p, p + 2 * PAGE)]);
+        // SAFETY: committed memory of ours, read-only after the take: this
+        // write faults into the handler, which opens it under the shared lock.
+        unsafe { ((p + 8) as *mut u8).write_volatile(1) };
+        assert!(t.changed(p / PAGE));
+        assert_eq!(t.take(p, p + 2 * PAGE), [(p, p + PAGE)]);
+        retake(p, PAGE);
+        assert!(t.changed(p / PAGE), "a publish marks the page again");
+        drop(t);
+        free(p);
+        PORT_GUARD_IN_TEST.set(Some(false));
+    }
 
     /// A write-watched allocation of `pages` pages (as the runtime's pools),
     /// on a 64 KiB boundary (the allocation granularity).

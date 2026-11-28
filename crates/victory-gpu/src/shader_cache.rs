@@ -76,6 +76,10 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    // Renderer port 5: only when on, so entries made without it keep their key.
+    if crate::port_cbv::on() {
+        h.update(b"VICTORY_PORT_CBV=1");
+    }
     *h.finalize().as_bytes()
 }
 

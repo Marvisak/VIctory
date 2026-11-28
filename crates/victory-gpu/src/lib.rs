@@ -44,6 +44,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod placement;
+mod port_cbv;
+mod port_journal;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
