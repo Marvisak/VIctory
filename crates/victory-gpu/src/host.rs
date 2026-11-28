@@ -102,16 +102,19 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
-/// Ends the run on a host GPU failure: what failed, the removal reason and
-/// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
-/// diagnostics build names the command).
+/// Ends the run on a host GPU failure: what failed, the removal reason,
+/// DRED data and the debug layer's first error, if any
+/// (`VICTORY_D3D12_DEBUG=1` in a diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
+    fail_after(what, &[])
+}
+
+fn fail_after(what: std::fmt::Arguments, runs: &[&HostList]) -> ! {
     let mut text = what.to_string();
     if let Some(host) = host() {
         // SAFETY: a plain query.
-        if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
-            text.push_str(&format!("; device removed: {e}"));
-        }
+        let removed = unsafe { host.device.GetDeviceRemovedReason() };
+        text = failure_text(text, removed, || host.removal_data(runs));
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
             None if host.messages.is_none() => text.push_str(
@@ -125,6 +128,18 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         Some(report) => report(&text),
         None => std::process::abort(),
     }
+}
+
+fn failure_text(
+    mut text: String,
+    removed: windows::core::Result<()>,
+    removal_data: impl FnOnce() -> String,
+) -> String {
+    if let Err(e) = removed {
+        text.push_str(&format!("; device removed: {e}"));
+        text.push_str(&removal_data());
+    }
+    text
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
@@ -381,6 +396,26 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn failure_text_keeps_removal_data_once() {
+        let reason = windows::core::Error::from_hresult(super::DXGI_ERROR_DEVICE_REMOVED);
+        let data = "; page fault at 0x1000; inside [allocation]; breadcrumbs [0/1]";
+        let expected = format!("host list did not close; device removed: {reason}{data}");
+        let text = super::failure_text("host list did not close".into(), Err(reason), || {
+            data.into()
+        });
+        assert_eq!(text, expected);
+        assert_eq!(text.matches(data).count(), 1);
+    }
+
+    #[test]
+    fn failure_text_skips_removal_data_on_a_live_device() {
+        let text = super::failure_text("host list did not reset".into(), Ok(()), || {
+            panic!("a live device has no removal data")
+        });
+        assert_eq!(text, "host list did not reset");
+    }
+
     thread_local! {
         /// Every transition barrier built on this thread (resource, before,
         /// after), in order.
@@ -1323,13 +1358,15 @@ impl Host {
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-            fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}{}",
-                runs.len(),
-                self.removal_data(runs),
-                last_notes(runs),
-                removed_during(runs, removed_in)
-            ));
+            fail_after(
+                format_args!(
+                    "host GPU device removed after a submission of {} lists{}{}",
+                    runs.len(),
+                    last_notes(runs),
+                    removed_during(runs, removed_in)
+                ),
+                runs,
+            );
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
