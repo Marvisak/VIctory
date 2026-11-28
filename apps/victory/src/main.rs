@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod agility_probe;
 mod census;
 mod inspect;
 mod prebuild;
@@ -123,6 +124,9 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Verify the D3D12 Agility SDK opt-in without running a title.
+    #[command(name = "agility-probe", hide = true)]
+    AgilityProbe,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -144,6 +148,8 @@ static ALLOC: victory_gpu::CountingAlloc = victory_gpu::CountingAlloc;
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    #[cfg(victory_agility)]
+    agility::check_runtime();
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
@@ -205,6 +211,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Config => show_config(),
+        Command::AgilityProbe => agility_probe::run(),
     }
 }
 
@@ -265,6 +272,62 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+/// Opt in to the Agility SDK runtime, when this build was configured for one.
+///
+/// The host loader reads the `D3D12SDKVersion` and `D3D12SDKPath` exports
+/// when `d3d12.dll` is loaded into the process, so they must be part of the
+/// image itself; `build.rs` emits the `/EXPORT` arguments only when a runtime
+/// sits next to the output binary, and this module is compiled only then.
+#[cfg(victory_agility)]
+mod agility {
+    /// Agility SDK version read from the staged `D3D12Core.dll` at build time.
+    const SDK_VERSION: u32 = match u32::from_str_radix(env!("VICTORY_AGILITY_SDK_VERSION"), 10) {
+        Ok(version) => version,
+        Err(_) => panic!("invalid VICTORY_AGILITY_SDK_VERSION"),
+    };
+
+    #[allow(non_upper_case_globals)]
+    #[unsafe(no_mangle)]
+    #[used]
+    pub static D3D12SDKVersion: u32 = SDK_VERSION;
+
+    /// Path the loader appends to the executable's directory.
+    const SDK_PATH: &[u8] = b".\\D3D12\\\0";
+
+    /// A `static` may not hold a raw pointer directly (it is not `Sync`), but
+    /// the loader wants the export's contents to be one, so wrap it.
+    #[repr(transparent)]
+    pub struct SdkPath(*const u8);
+
+    // SAFETY: the pointer targets immutable static bytes and is never written.
+    unsafe impl Sync for SdkPath {}
+
+    /// The loader reads this export as a `const char*`: a pointer to a
+    /// NUL-terminated path relative to the executable.
+    #[allow(non_upper_case_globals)]
+    #[unsafe(no_mangle)]
+    #[used]
+    pub static D3D12SDKPath: SdkPath = SdkPath(SDK_PATH.as_ptr());
+
+    /// Point a missing runtime out before a device-creation failure does.
+    pub fn check_runtime() {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let Some(dir) = exe.parent() else {
+            return;
+        };
+        let runtime = dir.join("D3D12").join("D3D12Core.dll");
+        if !runtime.is_file() {
+            eprintln!(
+                "victory: this build opted into the D3D12 Agility SDK runtime {SDK_VERSION}, but {} is \
+                 missing; copy the matching D3D12Core.dll into that directory",
+                runtime.display()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
