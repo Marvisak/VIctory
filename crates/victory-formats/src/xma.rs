@@ -438,20 +438,31 @@ impl Rotations {
     /// (`exp(-2πi nk/N)`) on points already in bit-reversed order.
     fn butterflies(&self, re: &mut [f64], im: &mut [f64]) {
         let m = re.len().min(im.len());
-        let mut len = 2;
+        let (re, im) = (&mut re[..m], &mut im[..m]);
+        // The first two stages run the most blocks. Their fixed widths let
+        // the compiler unroll the small butterflies and their chunk walks.
+        if m >= 2 {
+            self.butterfly_stage(re, im, 2);
+        }
+        if m >= 4 {
+            self.butterfly_stage(re, im, 4);
+        }
+        let mut len = 8;
         while len <= m {
-            let half = len / 2;
-            let wr = &self.twiddle_re[half - 1..][..half];
-            let wi = &self.twiddle_im[half - 1..][..half];
-            let blocks = re[..m]
-                .chunks_exact_mut(len)
-                .zip(im[..m].chunks_exact_mut(len));
-            for (re, im) in blocks {
-                let (are, bre) = re.split_at_mut(half);
-                let (aim, bim) = im.split_at_mut(half);
-                butterfly_block(are, aim, bre, bim, wr, wi);
-            }
+            self.butterfly_stage(re, im, len);
             len <<= 1;
+        }
+    }
+
+    #[inline(always)]
+    fn butterfly_stage(&self, re: &mut [f64], im: &mut [f64], len: usize) {
+        let half = len / 2;
+        let wr = &self.twiddle_re[half - 1..][..half];
+        let wi = &self.twiddle_im[half - 1..][..half];
+        for (re, im) in re.chunks_exact_mut(len).zip(im.chunks_exact_mut(len)) {
+            let (are, bre) = re.split_at_mut(half);
+            let (aim, bim) = im.split_at_mut(half);
+            butterfly_block(are, aim, bre, bim, wr, wi);
         }
     }
 }
