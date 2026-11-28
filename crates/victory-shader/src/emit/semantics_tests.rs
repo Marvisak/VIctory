@@ -2814,6 +2814,92 @@ fn scalar_alu_matches_the_hardware() {
     assert_clean(check(&passing(scalar_probes())));
 }
 
+/// All low nibbles with dirty upper bits, both encodings, output
+/// modifiers, source/destination overlap, and inactive-lane preservation.
+#[test]
+fn nibble_offset_matches_signed_fractions() {
+    let mut values = Vec::new();
+    for nibble in 0..16u32 {
+        for upper in [
+            0,
+            0xFFFF_FFF0,
+            0x8000_0000,
+            0x7FFF_FFF0,
+            0x5555_5550,
+            0xAAAA_AAA0,
+        ] {
+            values.push(upper | nibble);
+        }
+        for bit in 4..32 {
+            values.extend([(1 << bit) | nibble, (!(1 << bit) & !15) | nibble]);
+        }
+    }
+    let mut random = 0xE19B_460Du32;
+    for _ in 0..4096 {
+        random ^= random << 13;
+        random ^= random >> 17;
+        random ^= random << 5;
+        values.push(random);
+    }
+    values.sort_unstable();
+    values.dedup();
+    let inputs: Vec<_> = values
+        .into_iter()
+        .flat_map(|x| [0, 1].map(|active| [x, active, 0, OLD]))
+        .collect();
+    let mut probes = Vec::new();
+    // VOP1 has no output modifiers; VOP3 carries clamp and omod.
+    for (vop3_form, omod, clamp) in [(false, 0, false)]
+        .into_iter()
+        .chain((0..4).flat_map(|omod| [false, true].map(move |clamp| (true, omod, clamp))))
+    {
+        for dst in [5, 1] {
+            for guarded in [false, true] {
+                let mut body = Vec::new();
+                if guarded {
+                    body.push(vopc(0xC4, v(2), 3)); // v_cmp_gt_u32 vcc, v2, v3
+                    body.push(sop1(0x3C, 20, VCC)); // s_and_saveexec_b32 s20, vcc
+                }
+                if vop3_form {
+                    body.extend(vop3(
+                        0x18E,
+                        dst,
+                        [v(1), 0, 0],
+                        M {
+                            omod,
+                            clamp,
+                            ..NONE
+                        },
+                    ));
+                } else {
+                    body.push(vop1(0x0E, dst, v(1)));
+                }
+                if guarded {
+                    body.push(sop1(0x03, 126, s(20))); // restore EXEC
+                }
+                if dst != 5 {
+                    body.push(vop1(0x01, 5, v(dst)));
+                }
+                probes.push(probe(body, inputs.clone(), INT, move |i| {
+                    if guarded && i[1] == 0 {
+                        return vec![if dst == 5 { OLD } else { i[0] }];
+                    }
+                    // Arithmetic in a wider type, independent of Ibfe or
+                    // sign-extension shifts. Every resulting f32 is exact.
+                    let low = (i[0] % 16) as i64;
+                    let signed = if low < 8 { low } else { low - 16 };
+                    let mut fraction = signed as f32 / 16.0;
+                    fraction *= [1.0, 2.0, 4.0, 0.5][usize::from(omod)];
+                    if clamp {
+                        fraction = fraction.clamp(0.0, 1.0);
+                    }
+                    vec![fraction.to_bits()]
+                }));
+            }
+        }
+    }
+    assert_clean(check(&probes));
+}
 // ---- lanes ----
 
 /// Masked lanes keep their registers: `s_and_saveexec_b32` narrowing to the

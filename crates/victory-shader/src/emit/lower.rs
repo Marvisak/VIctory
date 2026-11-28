@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1407,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -6411,9 +6416,15 @@ impl<'a> Lower<'a> {
             "v_cvt_off_f32_i4" => {
                 // The low nibble as a signed 4-bit integer, over 16.
                 let a = s(self, 0)?;
-                let k28 = self.s.m.i32(28);
-                let a = self.s.m.bin(c, Bin::Shl, a, k28);
-                let a = self.s.m.bin(c, Bin::AShr, a, k28);
+                let (width, offset) = (self.s.m.i32(4), self.s.m.i32(0));
+                let a = self.s.op(
+                    c,
+                    "tertiary.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    51, // Ibfe
+                    &[width, offset, a],
+                );
                 let f = self.s.m.cast(c, Cast::SiToFp, a, self.s.t.f32);
                 let k = self.s.m.f32(0.0625f32.to_bits());
                 let r = self.s.m.bin(c, Bin::Mul, f, k);
@@ -11089,6 +11100,19 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn nibble_offset_uses_one_signed_extract() {
+        // A run-time operand and live UAV store, in both encodings.
+        let bodies: [&[u32]; 2] = [&[0x7E00_1D01], &[0xD58E_0000, 0x101]];
+        let counts = bodies.map(|body| {
+            lower_valu(body)
+                .expect("v_cvt_off_f32_i4 lowers")
+                .instructions
+        });
+        eprintln!("nibble offset VOP1/VOP3: {counts:?} written DXIL instructions");
+        assert_eq!(counts, [18, 18]);
     }
 
     #[test]
