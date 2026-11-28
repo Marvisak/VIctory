@@ -43,6 +43,56 @@ use std::sync::{Arc, Mutex};
 /// they saved.
 pub(crate) const PAGE: usize = 64 << 10;
 
+/// Idle first-write snapshots kept for reuse: at most 4 MiB. Live snapshots
+/// remain owned by their tracker or the copy-back consuming them.
+const SAVED_PAGES_KEPT: usize = 64;
+static SAVED_PAGES: Mutex<Vec<Box<[u8]>>> = Mutex::new(Vec::new());
+
+/// A page's pre-write bytes, returned only after their last consumer is done.
+pub(crate) struct SavedPage(Option<Box<[u8]>>);
+
+impl SavedPage {
+    fn new() -> Self {
+        let pooled = SAVED_PAGES.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        Self(Some(
+            pooled.unwrap_or_else(|| vec![0u8; PAGE].into_boxed_slice()),
+        ))
+    }
+}
+
+impl std::ops::Deref for SavedPage {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.0
+            .as_deref()
+            .expect("a saved page owns its bytes until dropped")
+    }
+}
+
+impl std::ops::DerefMut for SavedPage {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.0
+            .as_deref_mut()
+            .expect("a saved page owns its bytes until dropped")
+    }
+}
+
+impl Drop for SavedPage {
+    fn drop(&mut self) {
+        let Some(bytes) = self.0.take() else {
+            return;
+        };
+        let mut pool = SAVED_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() < SAVED_PAGES_KEPT {
+            pool.push(bytes);
+            return;
+        }
+        // Release excess idle memory outside the pool lock.
+        drop(pool);
+    }
+}
+
 /// The pages a tracker has not taken since they changed, what it saves of
 /// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
 /// whether it is a host buffer copy's (the only trackers [`retake`] marks).
@@ -112,7 +162,7 @@ struct Saved {
     armed: Vec<(usize, usize)>,
     /// Pages of those runs that are not armed any more.
     unarmed: BTreeSet<usize>,
-    bytes: std::collections::HashMap<usize, Box<[u8]>>,
+    bytes: std::collections::HashMap<usize, SavedPage>,
 }
 
 impl Saved {
@@ -162,7 +212,7 @@ impl Changed {
         if !saved.armed(page) || saved.bytes.contains_key(&page) {
             return;
         }
-        let mut bytes = vec![0u8; PAGE].into_boxed_slice();
+        let mut bytes = SavedPage::new();
         if crate::host::read_into((page * PAGE) as *const u8, &mut bytes) {
             saved.bytes.insert(page, bytes);
             #[cfg(feature = "diagnostics")]
@@ -612,7 +662,7 @@ impl Tracked {
     /// The bytes page `page` (a page number) held when it was first written
     /// since it was taken, if it was armed then (and so changed), with what
     /// the copy took of it since: the copy's bytes before the submission.
-    pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
+    pub(crate) fn saved(&self, page: usize) -> Option<SavedPage> {
         self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
     }
 
@@ -1445,5 +1495,141 @@ pub(crate) mod tests {
         let top = usize::MAX - 16;
         drop(writing(top, PAGE));
         title_memory_remapped(top, usize::MAX);
+    }
+
+    #[test]
+    fn detached_saved_pages_keep_their_bytes_after_tracker_cleanup() {
+        let p = pool(2);
+        // SAFETY: this test owns both writable pages.
+        unsafe { std::slice::from_raw_parts_mut(p as *mut u8, 2 * PAGE) }.fill(0x11);
+        let first = track_copy(p, 2 * PAGE, true).expect("pool memory is tracked");
+        let second = track_copy(p, 2 * PAGE, true).expect("pool memory is tracked");
+        first.take(p, p + 2 * PAGE);
+        second.take(p, p + 2 * PAGE);
+        first.arm(p, p + 2 * PAGE);
+        second.arm(p, p + 2 * PAGE);
+        // SAFETY: guarded bytes of our pages; each real fault saves both trackers first.
+        unsafe {
+            (p as *mut u8).add(8).write_volatile(0x22);
+            (p as *mut u8).add(PAGE + 8).write_volatile(0x33);
+        }
+        let detached = first.saved(p / PAGE).expect("first snapshot");
+        first.taken(&[p / PAGE, p / PAGE + 1]);
+        first.disarm();
+        drop(first);
+        second.refreshed(p + PAGE - 2, &[0xA1, 0xA2, 0xB1, 0xB2]);
+        let refreshed_first = second.saved(p / PAGE).expect("other tracker's first page");
+        let refreshed_second = second
+            .saved(p / PAGE + 1)
+            .expect("other tracker's second page");
+        second.disarm();
+        drop(second);
+        free(p);
+        let mut another = SavedPage::new();
+        assert_ne!(another.as_ptr(), detached.as_ptr());
+        assert_ne!(another.as_ptr(), refreshed_first.as_ptr());
+        assert_ne!(another.as_ptr(), refreshed_second.as_ptr());
+        another.fill(0xCC);
+        assert!(detached.iter().all(|&byte| byte == 0x11));
+        assert!(refreshed_first[..PAGE - 2].iter().all(|&byte| byte == 0x11));
+        assert_eq!(&refreshed_first[PAGE - 2..], &[0xA1, 0xA2]);
+        assert_eq!(&refreshed_second[..2], &[0xB1, 0xB2]);
+        assert!(refreshed_second[2..].iter().all(|&byte| byte == 0x11));
+    }
+
+    #[test]
+    fn failed_saved_page_reads_publish_nothing() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        let mut recycled = SavedPage::new();
+        recycled.fill(0x99);
+        drop(recycled);
+        // SAFETY: a reservation this test owns, with only its first 4 KiB committed.
+        let p =
+            unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        assert_eq!(
+            // SAFETY: commit inside that reservation.
+            unsafe { VirtualAlloc(p as *const _, 4096, MEM_COMMIT, PAGE_READWRITE) } as usize,
+            p
+        );
+        // SAFETY: the first 4 KiB was committed writable above.
+        unsafe { std::slice::from_raw_parts_mut(p as *mut u8, 4096) }.fill(0x42);
+        let failed = Changed(Mutex::default(), Mutex::default(), None, false);
+        failed.1.lock().unwrap().arm(p / PAGE, p / PAGE + 1);
+        failed.save(p / PAGE);
+        assert!(
+            failed.1.lock().unwrap().bytes.is_empty(),
+            "a partial read published a snapshot"
+        );
+        drop(failed);
+        free(p);
+        let good = pool(1);
+        // SAFETY: a separate fully committed writable page owned by the test.
+        unsafe { std::slice::from_raw_parts_mut(good as *mut u8, PAGE) }.fill(0x55);
+        let complete = Changed(Mutex::default(), Mutex::default(), None, false);
+        complete.1.lock().unwrap().arm(good / PAGE, good / PAGE + 1);
+        complete.save(good / PAGE);
+        let bytes = complete
+            .1
+            .lock()
+            .unwrap()
+            .bytes
+            .remove(&(good / PAGE))
+            .expect("complete snapshot");
+        assert!(bytes.iter().all(|&byte| byte == 0x55));
+        drop(complete);
+        free(good);
+    }
+
+    #[test]
+    fn saved_page_pool_bounds_idle_memory() {
+        let pages: Vec<_> = (0..2 * SAVED_PAGES_KEPT + 1)
+            .map(|_| SavedPage::new())
+            .collect();
+        let addresses: BTreeSet<_> = pages.iter().map(|page| page.as_ptr() as usize).collect();
+        assert_eq!(addresses.len(), pages.len(), "live owners share a buffer");
+        drop(pages);
+        let retained = SAVED_PAGES.lock().unwrap().len();
+        assert!(
+            retained <= SAVED_PAGES_KEPT,
+            "{retained} idle pages retained"
+        );
+    }
+
+    #[test]
+    fn concurrent_saved_page_reuse_keeps_each_prewrite_image() {
+        std::thread::scope(|scope| {
+            for seed in 0x10u8..0x14 {
+                scope.spawn(move || {
+                    let p = pool(2);
+                    // SAFETY: two writable pages owned only by this thread.
+                    unsafe { std::slice::from_raw_parts_mut(p as *mut u8, 2 * PAGE) }.fill(seed);
+                    let tracker = track_copy(p, 2 * PAGE, true).expect("pool memory is tracked");
+                    let mut previous = seed;
+                    for round in 0..32u8 {
+                        tracker.take(p, p + 2 * PAGE);
+                        tracker.arm(p, p + 2 * PAGE);
+                        let value = seed + round + 1;
+                        // SAFETY: real guarded writes to our own pages.
+                        unsafe {
+                            (p as *mut u8).write_volatile(value);
+                            (p as *mut u8).add(PAGE).write_volatile(value);
+                        }
+                        let first = tracker.saved(p / PAGE).expect("first snapshot");
+                        let second = tracker.saved(p / PAGE + 1).expect("second snapshot");
+                        tracker.disarm();
+                        let mut other = SavedPage::new();
+                        other.fill(0xCC);
+                        assert_eq!((first[0], second[0]), (previous, previous));
+                        assert_eq!((first[PAGE - 1], second[PAGE - 1]), (seed, seed));
+                        previous = value;
+                    }
+                    drop(tracker);
+                    free(p);
+                });
+            }
+        });
     }
 }
