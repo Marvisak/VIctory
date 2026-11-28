@@ -3212,6 +3212,14 @@ impl Host {
         };
         let mut presentation = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let Presentation { presenter, retry } = &mut *presentation;
+        // The title can replace the window while the host keeps presenting.
+        if presenter.as_ref().is_some_and(|p| {
+            // SAFETY: this only queries the handle previously selected by us.
+            !unsafe { IsWindow(Some(p.hwnd)) }.as_bool()
+        }) {
+            *presenter = None;
+            *retry = SwapChainRetry::default();
+        }
         if presenter.is_none() && !retry.ready(Instant::now()) {
             return None;
         }
@@ -3559,6 +3567,10 @@ fn title_window() -> Option<HWND> {
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
     found
 }
+
+/// Serializes tests that expose their windows to the presenter.
+#[cfg(test)]
+static TEST_WINDOWS: Mutex<()> = Mutex::new(());
 
 /// `state` without the bits the host texture's flags forbid: the console
 /// lets the title name states its own resources allow (unordered access on
@@ -4018,55 +4030,64 @@ mod withholding {
     }
 }
 
-#[cfg(all(test, feature = "diagnostics"))]
+#[cfg(test)]
 mod present_plane_tests {
     use super::*;
 
+    fn plane(
+        host: &Host,
+        list: &HostList,
+        width: u64,
+        height: u32,
+        color: &[f32; 4],
+    ) -> ID3D12Resource {
+        let mut texture = None;
+        // SAFETY: live device, valid render target description, and an open list.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: width,
+                        Height: height,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut texture,
+                )
+                .unwrap();
+            let texture = texture.unwrap();
+            list.list
+                .ClearRenderTargetView(host.rtv(&texture, None), color, None);
+            texture
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn compositor_failure_presents_primary_in_the_same_frame() {
+        let _one = TEST_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(host) = host() else {
             eprintln!("skipping PresentX recovery: no D3D12 device");
             return;
         };
         let list = host.new_list().unwrap();
-        let make_plane = |width, height, color: &[f32; 4]| {
-            let mut texture = None;
-            // SAFETY: live device, valid render target description, and an open list.
-            unsafe {
-                host.device
-                    .CreateCommittedResource(
-                        &D3D12_HEAP_PROPERTIES {
-                            Type: D3D12_HEAP_TYPE_DEFAULT,
-                            ..Default::default()
-                        },
-                        D3D12_HEAP_FLAG_NONE,
-                        &D3D12_RESOURCE_DESC {
-                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                            Width: width,
-                            Height: height,
-                            DepthOrArraySize: 1,
-                            MipLevels: 1,
-                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                            SampleDesc: DXGI_SAMPLE_DESC {
-                                Count: 1,
-                                Quality: 0,
-                            },
-                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                            ..Default::default()
-                        },
-                        D3D12_RESOURCE_STATE_RENDER_TARGET,
-                        None,
-                        &mut texture,
-                    )
-                    .unwrap();
-                let texture = texture.unwrap();
-                list.list
-                    .ClearRenderTargetView(host.rtv(&texture, None), color, None);
-                texture
-            }
-        };
-        let scene = make_plane(32, 32, &[1.0, 0.0, 0.0, 1.0]);
-        let overlay = make_plane(64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let scene = plane(host, &list, 32, 32, &[1.0, 0.0, 0.0, 1.0]);
+        let overlay = plane(host, &list, 64, 64, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
         list.close();
         host.execute(&[&list]);
         let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
@@ -4129,5 +4150,79 @@ mod present_plane_tests {
         );
         // Premultiplied half-blue over opaque red.
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
+    }
+
+    struct TestWindow(HWND);
+
+    impl TestWindow {
+        fn new() -> Self {
+            // SAFETY: create an off-screen window owned by this test thread.
+            Self(unsafe {
+                CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                    w!("STATIC"),
+                    w!("PresentX window test"),
+                    WS_POPUP | WS_VISIBLE,
+                    -32000,
+                    -32000,
+                    32,
+                    32,
+                    None,
+                    None,
+                    Some(GetModuleHandleW(None).unwrap().into()),
+                    None,
+                )
+                .unwrap()
+            })
+        }
+    }
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            // SAFETY: this test thread owns the window.
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    #[test]
+    fn presenter_rebinds_after_its_window_is_destroyed() {
+        let _one = TEST_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = host() else {
+            eprintln!("skipping PresentX window replacement: no D3D12 device");
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let scene = plane(host, &list, 32, 32, &[1.0, 0.0, 0.0, 1.0]);
+        list.close();
+        host.execute(&[&list]);
+        let sources = [(&scene, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32)];
+        let first = TestWindow::new();
+        assert_eq!(title_window(), Some(first.0));
+        let previous = std::mem::take(&mut *host.presenter.lock().unwrap());
+        let bound_window = || {
+            let presentation = host.presenter.lock().unwrap();
+            let p = presentation.presenter.as_ref().unwrap();
+            // SAFETY: this is an HWND swap chain owned by the presenter.
+            unsafe { p.swap_chain.GetHwnd().unwrap() }
+        };
+        let _ = host.present(&sources, 1);
+        assert_eq!(bound_window(), first.0);
+        let replacement = TestWindow::new();
+        assert_ne!(replacement.0, first.0);
+        let _ = host.present(&sources, 2);
+        assert_eq!(bound_window(), first.0, "the live presenter is reused");
+
+        // An earlier resize failure must not delay a new window's swap chain.
+        host.presenter.lock().unwrap().retry.next_attempt =
+            Some(Instant::now() + Duration::from_secs(60));
+        drop(first);
+        assert_eq!(title_window(), Some(replacement.0));
+        let _ = host.present(&sources, 3);
+        let bound = bound_window();
+        *host.presenter.lock().unwrap() = previous;
+        assert_eq!(
+            bound, replacement.0,
+            "the replacement window gets the swap chain"
+        );
     }
 }
