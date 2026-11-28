@@ -678,8 +678,18 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
-        55..=59 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
-        60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
+        55..=57 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
+        58 => (2, Box::new(move |b| {
+            let value = f32::from(u16_at(b, 0) as i16);
+            [(value / f32::from(i16::MAX)).max(-1.0); 3]
+        })),
+        59 => (2, Box::new(move |b| [f32::from(u16_at(b, 0) as i16); 3])),
+        60..=62 | 65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
+        63 => (1, Box::new(move |b| {
+            let value = f32::from(b[0] as i8);
+            [(value / f32::from(i8::MAX)).max(-1.0); 3]
+        })),
+        64 => (1, Box::new(move |b| [f32::from(b[0] as i8); 3])),
         _ => return None,
     };
     let values: Vec<[f32; 3]> = (0..h)
@@ -947,6 +957,39 @@ mod tests {
                 "format {format}"
             );
         }
+    }
+
+    #[test]
+    fn signed_grayscale_targets_keep_the_order_across_zero() {
+        let bytes = [-2i8, 0, 2, 99, -2, 0, 2, 99].map(|v| v as u8);
+        let words = [-2i16, 0, 2, 99, -2, 0, 2, 99].map(i16::to_le_bytes).concat();
+        let expected_row = [0, 0, 0, 255, 127, 127, 127, 255, 255, 255, 255, 255];
+
+        for (format, pitch, rows) in [
+            (58, 8, words.as_slice()),
+            (59, 8, words.as_slice()),
+            (63, 4, bytes.as_slice()),
+            (64, 4, bytes.as_slice()),
+        ] {
+            assert_eq!(
+                super::to_rgba(format, 3, 2, pitch, rows),
+                Some(expected_row.repeat(2)),
+                "format {format}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_normalized_targets_alias_the_two_negative_endpoints() {
+        let bytes = [i8::MIN as u8, (-i8::MAX) as u8];
+        let words = [i16::MIN, -i16::MAX].map(i16::to_le_bytes).concat();
+        let black = Some(vec![0, 0, 0, 255, 0, 0, 0, 255]);
+        let ramp = Some(vec![0, 0, 0, 255, 255, 255, 255, 255]);
+
+        assert_eq!(super::to_rgba(58, 2, 1, 4, &words), black);
+        assert_eq!(super::to_rgba(63, 2, 1, 2, &bytes), black);
+        assert_eq!(super::to_rgba(59, 2, 1, 4, &words), ramp);
+        assert_eq!(super::to_rgba(64, 2, 1, 2, &bytes), ramp);
     }
 
     #[test]
