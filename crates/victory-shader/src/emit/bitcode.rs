@@ -308,6 +308,27 @@ impl Module {
         }
     }
 
+    /// A float literal, including the raw integer bitcast used for a source.
+    pub fn f32_literal_bits(&self, v: V) -> Option<u32> {
+        if let V::Const(i) = v {
+            return match self.consts[i as usize].1 {
+                Const::Float(bits) => Some(bits),
+                _ => None,
+            };
+        }
+        let V::Inst(i) = v else { return None };
+        let inst = &self.insts[i as usize];
+        let Op::Cast(Cast::Bitcast, input) = inst.op else {
+            return None;
+        };
+        if self.types[inst.ty.0 as usize] != TypeDef::Float
+            || self.types[self.type_of(input).0 as usize] != TypeDef::Int(32)
+        {
+            return None;
+        }
+        self.int_value(input).map(|bits| bits as u32)
+    }
+
     #[cfg(test)]
     pub fn has_function(&self, name: &str) -> bool {
         self.func_ids.contains_key(name)
@@ -1559,6 +1580,21 @@ mod tests {
         let store = m.blocks[entry].body.iter().any(|&i| matches!(m.insts[i as usize].op, Op::Store(..)) && live[i as usize]);
         assert!(store);
         let _ = m.write();
+    }
+
+    #[test]
+    fn f32_literal_bits_require_a_float_or_i32_bitcast() {
+        let (mut m, blocks, _) = module(1);
+        let b = blocks[0];
+        let float = m.f32(0xFFC0_0001);
+        let f32t = m.type_of(float);
+        let bits = m.i32(0x8000_0000);
+        let cast = m.cast(b, Cast::Bitcast, bits, f32t);
+        let convert = m.cast(b, Cast::UiToFp, bits, f32t);
+        assert_eq!(m.f32_literal_bits(float), Some(0xFFC0_0001));
+        assert_eq!(m.f32_literal_bits(cast), Some(0x8000_0000));
+        assert_eq!(m.f32_literal_bits(convert), None);
+        assert_eq!(m.f32_literal_bits(bits), None);
     }
 
     /// A constant global only dropped values read is not declared; one a
