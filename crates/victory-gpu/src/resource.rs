@@ -1449,7 +1449,10 @@ fn cached_shared_texture(address: u64, desc: &ResourceDesc) -> Option<std::sync:
         // The live texture's own description: d may ask for uses its
         // format does not take on this host. SAFETY: plain queries on a live
         // resource, retained by live while the allocation info is queried.
-        let info = unsafe { host.device.GetResourceAllocationInfo(0, &[live.texture.GetDesc()]) };
+        let info = unsafe {
+            host.device
+                .GetResourceAllocationInfo(0, &[live.texture.GetDesc()])
+        };
         SAVED.fetch_add(info.SizeInBytes, std::sync::atomic::Ordering::Relaxed);
     }
     Some(live)
