@@ -63,6 +63,9 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    /// The one allocator every state prelude records into, with the closed
+    /// lists kept to record them (`Preludes`).
+    preludes: Mutex<Preludes>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -247,6 +250,8 @@ fn create() -> windows::core::Result<Host> {
             ),
             Err(e) => tracing::debug!(error = %e, "multiply-add fusing not checked"),
         }
+        // The one allocator every state prelude records into (`Preludes`).
+        let preludes = Mutex::new(Preludes::new(&device)?);
         Ok(Host {
             device,
             depth_bounds_supported,
@@ -265,6 +270,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
+            preludes,
         })
     }
 }
@@ -641,6 +647,110 @@ pub(crate) mod tests {
         list.close();
     }
 
+    /// The state preludes of a submission share one allocator, and it is
+    /// reset only between submissions. `Host::execute` resets it once,
+    /// records every prelude of the submission from it (one list recording
+    /// at a time), submits them and waits for them before it returns, so the
+    /// next reset is the next `execute`'s, when nothing records or is in
+    /// flight. This test holds the mechanics of that invariant: a
+    /// submission's preludes take closed lists from one allocator with one
+    /// reset, and the next submission's reset reuses those lists instead of
+    /// making one per prelude.
+    #[test]
+    fn the_prelude_allocator_resets_between_submissions_only() {
+        use windows::core::Interface;
+        let Some(host) = host() else { return };
+        let mut preludes = Preludes::new(&host.device).expect("a prelude allocator");
+        // A submission with two preludes: each list is recorded and closed
+        // before the next is taken (one recording list per allocator at a
+        // time), with one allocator reset for both.
+        preludes.begin().expect("an empty allocator resets");
+        let first = preludes.list(&host.device).expect("a first prelude list");
+        // SAFETY: a closed list of ours.
+        unsafe { first.Close().expect("a closed recorded list") };
+        let second = preludes.list(&host.device).expect("a second prelude list");
+        assert_ne!(first.as_raw(), second.as_raw(), "one list per prelude");
+        assert_eq!(
+            preludes.resets, 1,
+            "the allocator resets once per submission, not once per prelude"
+        );
+        // The submission is waited for; the next one starts with the reset
+        // (safe because the lists are closed and their submission ran) and
+        // reuses both lists: the pool does not grow one list per prelude,
+        // nor one allocator per list.
+        // SAFETY: a closed list of ours.
+        unsafe { second.Close().expect("a closed recorded list") };
+        let resets = preludes.resets;
+        preludes.begin().expect("closed lists of a submission that was waited for");
+        assert_eq!(
+            preludes.resets,
+            resets + 1,
+            "one reset, at the start of the submission"
+        );
+        let again = preludes.list(&host.device).expect("the pool's first list");
+        assert_eq!(again.as_raw(), first.as_raw(), "the first list is reused");
+        // SAFETY: a closed list of ours.
+        unsafe { again.Close().expect("a closed recorded list") };
+        let again = preludes.list(&host.device).expect("the pool's second list");
+        assert_eq!(again.as_raw(), second.as_raw(), "the second list is reused");
+        assert_eq!(preludes.lists.len(), 2, "two preludes, two lists, however many submissions");
+        // SAFETY: a closed list of ours.
+        unsafe { again.Close().expect("a closed recorded list") };
+        // And the real path: one submission whose two lists each need a
+        // state prelude, recorded and submitted together from the host's
+        // shared allocator (a list recording another, or the allocator being
+        // reset while one is in flight, ends the run).
+        let mut copies = Vec::new();
+        let mut lists = Vec::new();
+        for _ in 0..2 {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 4096,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation with valid descriptions; our out pointer.
+            unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+            }
+            .unwrap();
+            let copy = std::sync::Arc::new(crate::resource::HostTexture::new(
+                buffer.unwrap(),
+                D3D12_RESOURCE_STATE_COMMON.0 as u32,
+                Vec::new(),
+            ));
+            let list = host.new_list().unwrap();
+            assert!(
+                list.move_texture(&copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32).is_none(),
+                "a first use records no barrier in the list: its prelude moves it"
+            );
+            list.close();
+            copies.push(copy);
+            lists.push(list);
+        }
+        host.execute(&[&lists[0], &lists[1]]);
+        for copy in &copies {
+            assert_eq!(
+                copy.state.load(Ordering::Relaxed),
+                D3D12_RESOURCE_STATE_COPY_DEST.0 as u32,
+                "each list's prelude ran, from the one shared allocator"
+            );
+        }
+    }
+
     #[test]
     fn present_compositor_builds_both_pipeline_states() {
         let Some(host) = host() else {
@@ -782,7 +892,111 @@ pub(crate) mod tests {
     }
 }
 
-/// A host command list and its allocator, always used together.
+/// The state preludes of a submission: one command allocator shared by
+/// every prelude list, reset once per submission, and the closed lists kept
+/// to record them, one per list of the submission that needs a prelude (a
+/// submission records its preludes one after another, then submits them
+/// all).
+///
+/// D3D12 lets command lists share an allocator as long as only one of them
+/// is recording at a time and the allocator is not reset while a list made
+/// from it is recording or in flight. [`Host::execute`] holds
+/// `Host::submitted` while it records the preludes of one submission,
+/// submits them on the one direct queue and waits for the fence it signals
+/// after them, so by the next submission nothing that recorded into this
+/// allocator is still recording or in flight: [`Preludes::begin`] may reset
+/// it there, and only there. The reset frees every prelude list's command
+/// memory at once; the lists are closed by then and are recorded again from
+/// scratch when reused.
+///
+/// Only prelude lists use this allocator. Each [`HostList`] keeps its own
+/// and resets it for its own recording (`HostList::reset`), including the
+/// ones a queue still holds or the idle pool keeps (`crate::hold`,
+/// `crate::list::restart`, `crate::list::recycle`): retaining a list never
+/// delays a reset of this one.
+struct Preludes {
+    allocator: ID3D12CommandAllocator,
+    /// Closed prelude lists; a submission takes as many as it needs a
+    /// prelude for, and the next submissions reuse them.
+    lists: Vec<ID3D12GraphicsCommandList>,
+    /// How many of `lists` this submission has taken.
+    used: usize,
+    /// Allocator resets, counted by the test that holds the invariant
+    /// (`Preludes::begin` is only called between submissions).
+    #[cfg(test)]
+    resets: u64,
+}
+
+impl Preludes {
+    /// The host's one prelude allocator (made with the host).
+    fn new(device: &ID3D12Device) -> windows::core::Result<Self> {
+        // SAFETY: plain object creation.
+        let allocator: ID3D12CommandAllocator = unsafe {
+            device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?
+        };
+        Ok(Self {
+            allocator,
+            lists: Vec::new(),
+            used: 0,
+            #[cfg(test)]
+            resets: 0,
+        })
+    }
+
+    /// Starts a submission's preludes: frees what the last submission
+    /// recorded.
+    ///
+    /// Only between submissions: the caller ([`Host::execute`]) waited for
+    /// the last submission's lists before returning, so none of this
+    /// allocator's lists is recording (they are closed) or in flight.
+    fn begin(&mut self) -> windows::core::Result<()> {
+        // SAFETY: see above.
+        unsafe { self.allocator.Reset()? };
+        self.used = 0;
+        #[cfg(test)]
+        {
+            self.resets += 1;
+        }
+        Ok(())
+    }
+
+    /// The next prelude list, wiped and ready to record: one the pool
+    /// kept, or a new one when this submission needs more preludes than any
+    /// earlier one did.
+    fn list(&mut self, device: &ID3D12Device) -> windows::core::Result<ID3D12GraphicsCommandList> {
+        let list = match self.lists.get(self.used) {
+            Some(list) => list.clone(),
+            None => {
+                // SAFETY: plain creation from our allocator, none of whose
+                // lists is recording (all are closed).
+                let list: ID3D12GraphicsCommandList = unsafe {
+                    device.CreateCommandList(
+                        0,
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        &self.allocator,
+                        None,
+                    )?
+                };
+                // Created open, and closed at once: `Reset` below starts the
+                // recording, and nothing here leaves a list open.
+                // SAFETY: a list just created from our allocator.
+                unsafe { list.Close()? };
+                self.lists.push(list.clone());
+                list
+            }
+        };
+        // SAFETY: a closed list, and an allocator no list is recording into
+        // (`begin` reset it, and the pool holds the lists recorded since,
+        // each one closed before the next was taken).
+        unsafe { list.Reset(&self.allocator, None)? };
+        self.used += 1;
+        Ok(list)
+    }
+}
+
+/// A host command list and its allocator, always used together. Its state
+/// preludes are not its own: they record into the host's one prelude
+/// allocator (`Preludes`).
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
@@ -812,8 +1026,6 @@ pub(crate) struct HostList {
     /// The draw or dispatch being recorded runs a program using title
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
-    /// The list that runs those transitions just before this one.
-    prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// Which list this is, for the name that tells it apart in device-removed
@@ -1114,16 +1326,6 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude_allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let prelude: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &prelude_allocator,
-                None,
-            )?;
-            prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
             Ok(HostList {
@@ -1137,7 +1339,6 @@ impl Host {
                 rebind: false.into(),
                 ours: false.into(),
                 memory_writer: false.into(),
-                prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
@@ -1238,17 +1439,29 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        // This submission's state preludes share one allocator, reset here:
+        // the previous submission was waited for under this lock (every
+        // submission is, before `execute` returns), so nothing that recorded
+        // into it is recording or in flight (`Preludes`). It is reset once,
+        // before the first prelude, not between them: D3D12 lets every list
+        // of a submission share it as long as they record one at a time.
+        let mut preludes = self.preludes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = preludes.begin() {
+            drop(preludes);
+            fail(format_args!("the shared prelude allocator did not reset ({e})"));
+        }
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(&mut preludes, &self.device) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        drop(preludes);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1918,8 +2131,10 @@ impl HostList {
 
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
-    /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// states become those the list ends with. Records into the
+    /// submission's shared prelude allocator, reset once by `execute`
+    /// before this submission's first prelude (`Preludes`).
+    fn prelude(&self, preludes: &mut Preludes, device: &ID3D12Device) -> Option<ID3D12CommandList> {
         // Depth textures and their twins first, from their real states and
         // back: the side each first use needs, made newer.
         let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
@@ -1948,39 +2163,40 @@ impl HostList {
             left();
             return None;
         }
-        let (allocator, list) = &self.prelude;
+        let list = match preludes.list(device) {
+            Ok(list) => list,
+            Err(e) => fail(format_args!("a host state prelude list was not made ({e})")),
+        };
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // for, and the shared allocator was reset before this submission's
+        // first prelude); the textures are live.
         let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
-                for (depth, to_depth) in &copies {
-                    let Some(Some(twin)) = depth.twin.get() else { continue };
-                    // From each texture's real state to the copy's and back.
-                    let mut back = Vec::new();
-                    twin.copy(list, depth, *to_depth, &mut |t, wanted| {
-                        let real = t.state.load(Ordering::Relaxed);
-                        let wanted = legal_state(&t.texture, wanted);
-                        (real != wanted).then(|| {
-                            let there = transition(&t.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(wanted as i32));
-                            back.push(transition(
-                                &t.texture,
-                                D3D12_RESOURCE_STATES(wanted as i32),
-                                D3D12_RESOURCE_STATES(real as i32),
-                            ));
-                            there
-                        })
-                    });
-                    if !back.is_empty() {
-                        list.ResourceBarrier(&back);
-                    }
+            for (depth, to_depth) in &copies {
+                let Some(Some(twin)) = depth.twin.get() else { continue };
+                // From each texture's real state to the copy's and back.
+                let mut back = Vec::new();
+                twin.copy(&list, depth, *to_depth, &mut |t, wanted| {
+                    let real = t.state.load(Ordering::Relaxed);
+                    let wanted = legal_state(&t.texture, wanted);
+                    (real != wanted).then(|| {
+                        let there = transition(&t.texture, D3D12_RESOURCE_STATES(real as i32), D3D12_RESOURCE_STATES(wanted as i32));
+                        back.push(transition(
+                            &t.texture,
+                            D3D12_RESOURCE_STATES(wanted as i32),
+                            D3D12_RESOURCE_STATES(real as i32),
+                        ));
+                        there
+                    })
+                });
+                if !back.is_empty() {
+                    list.ResourceBarrier(&back);
                 }
-                let barriers = moves();
-                if !barriers.is_empty() {
-                    list.ResourceBarrier(&barriers);
-                }
-                list.Close()
-            })
+            }
+            let barriers = moves();
+            if !barriers.is_empty() {
+                list.ResourceBarrier(&barriers);
+            }
+            list.Close()
         };
         left();
         if let Err(e) = recorded {
