@@ -346,11 +346,30 @@ fn log_gpu_times(frames: f64) {
         wall / frames,
         sum / frames
     );
-    let mut by: Vec<_> = by.into_iter().collect();
-    by.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
-    for (key, (ms, n)) in by.iter().take(25) {
-        tracing::info!("  GPU {:.2} ms/frame in {:.1} commands/frame: {key}", ms / frames, *n as f64 / frames);
+    for (key, (ms, n)) in slowest_gpu_pipelines(by) {
+        tracing::info!(
+            "  GPU {:.2} ms/frame in {:.1} commands/frame: {key}",
+            ms / frames,
+            n as f64 / frames
+        );
     }
+}
+
+#[cfg(feature = "diagnostics")]
+fn slowest_gpu_pipelines(
+    by: std::collections::HashMap<String, (f64, u64)>,
+) -> Vec<(String, (f64, u64))> {
+    const LIMIT: usize = 25;
+    let mut by: Vec<_> = by.into_iter().collect();
+    let rank = |a: &(String, (f64, u64)), b: &(String, (f64, u64))| {
+        b.1.0.total_cmp(&a.1.0).then(a.0.cmp(&b.0))
+    };
+    if by.len() > LIMIT {
+        by.select_nth_unstable_by(LIMIT, rank);
+        by.truncate(LIMIT);
+    }
+    by.sort_unstable_by(rank);
+    by
 }
 
 /// Diagnostics: the host device's video memory use and budget, in MB, local
@@ -381,6 +400,20 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn slowest_gpu_pipelines_keep_the_sort_order_at_the_report_limit() {
+        for count in [0, 1, 24, 25, 26, 256] {
+            let by: std::collections::HashMap<_, _> = (0..count)
+                .map(|i| (format!("pipeline {i:03}"), (f64::from(i % 7), i as u64)))
+                .collect();
+            let mut expected: Vec<_> = by.clone().into_iter().collect();
+            expected.sort_by(|a, b| b.1.0.total_cmp(&a.1.0).then(a.0.cmp(&b.0)));
+            expected.truncate(25);
+            assert_eq!(super::slowest_gpu_pipelines(by), expected);
+        }
+    }
+
     thread_local! {
         /// Every transition barrier built on this thread (resource, before,
         /// after), in order.
