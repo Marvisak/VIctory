@@ -63,6 +63,12 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    /// Indirect arguments (`crate::indirect`): buffers borrowed by the lists
+    /// for their largest clamp, given back when they are reset.
+    arguments: Mutex<ArgumentsPool>,
+    /// The lists' indirect-work budget words, few per shared buffer
+    /// ([`BudgetPool`]).
+    budgets: Mutex<BudgetPool>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -265,6 +271,8 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
+            arguments: Mutex::new(ArgumentsPool::default()),
+            budgets: Mutex::new(BudgetPool::default()),
         })
     }
 }
@@ -641,6 +649,99 @@ pub(crate) mod tests {
         list.close();
     }
 
+    /// A reset list gives its indirect budget slot and its argument buffer
+    /// back to the host's pools: idle lists hold neither, and the next list
+    /// takes the buffer again instead of making one.
+    #[test]
+    fn list_indirect_buffers_go_back_on_reset() {
+        let Some(host) = host() else { return };
+        let one = host.new_list().unwrap();
+        let two = host.new_list().unwrap();
+        let (a, b) = (one.budget().unwrap(), two.budget().unwrap());
+        assert_ne!(a, b, "each list's budget word is its own");
+        assert!(one.arguments(8 << 20).is_some());
+        assert!(two.arguments(1 << 16).is_some());
+        // A list is closed and run before it is reset (its allocator cannot
+        // be reset while it records).
+        one.close();
+        host.execute(&[&one]);
+        one.reset();
+        assert!(one.budget.lock().unwrap().is_none(), "the budget word goes back");
+        assert!(one.arguments.lock().unwrap().is_none(), "the argument buffer goes back");
+        assert!(two.budget.lock().unwrap().is_some(), "another list keeps its word");
+        assert!(two.arguments.lock().unwrap().is_some(), "another list keeps its arguments");
+        // Its next use takes them again. Which buffer comes back is not
+        // asserted: the pool is shared with tests running in parallel.
+        assert!(one.budget().is_some());
+        let again = one.arguments(8 << 20).unwrap();
+        // SAFETY: a plain query on a live buffer.
+        assert!(unsafe { again.GetDesc() }.Width >= 8 << 20);
+        one.close();
+        two.close();
+    }
+
+    /// Two lists share one budget block, each with its own slot: one list
+    /// spending part of its budget and having a batch rejected leaves the
+    /// other's word as it was, and after its reset and next submission the
+    /// first starts again from a full budget (a zeroed word).
+    #[test]
+    fn a_lists_spent_budget_does_not_touch_its_neighbour_and_resets_in_full() {
+        let Some(host) = host() else { return };
+        let (a, b) = (host.new_list().unwrap(), host.new_list().unwrap());
+        assert!(a.budget().is_some() && b.budget().is_some());
+        // The word of a list: its slot's address, as the shader's clamp
+        // reads and writes it (the host writes it here in the shader's stead).
+        let word = |list: &HostList| {
+            let held = list.budget.lock().unwrap();
+            let held = held.as_ref().expect("the list holds a budget word");
+            (held.buffer.as_raw(), held.mapped, held.gpu)
+        };
+        let read = |at: usize| {
+            // SAFETY: a slot's word in a live, mapped budget block.
+            unsafe { (at as *const u32).read_volatile() }
+        };
+        let write = |at: usize, value: u32| {
+            // SAFETY: as above; no submission runs this slot meanwhile.
+            unsafe { (at as *mut u32).write_volatile(value) }
+        };
+        let ((block_a, at_a, gpu_a), (block_b, at_b, gpu_b)) = (word(&a), word(&b));
+        assert_eq!(block_a, block_b, "both lists take their slot of one block");
+        assert_ne!(at_a, at_b, "each list's slot is its own");
+        assert_eq!(at_a.abs_diff(at_b) % BUDGET_SLOT, 0, "slots are whole strides apart");
+        assert_eq!(at_a.abs_diff(at_b) as u64, gpu_a.abs_diff(gpu_b), "host and device addresses agree");
+        // B has spent some of its budget.
+        write(at_b, 0xb0b);
+        // A is submitted (its word starts at zero), spends part of its
+        // budget, then has a batch rejected (which takes all that is left).
+        write(at_a, 0xdead);
+        a.close();
+        host.execute(&[&a]);
+        assert_eq!(read(at_a), 0, "a list's word is zeroed at its submission");
+        assert_eq!(read(at_b), 0xb0b, "B's word is not A's to zero");
+        write(at_a, 0x1234);
+        assert_eq!(read(at_b), 0xb0b, "A spending part of its budget leaves B's");
+        write(at_a, u32::MAX);
+        assert_eq!(read(at_b), 0xb0b, "A's rejected batch leaves B's");
+        // A is reset: it gives its slot back, B keeps its own untouched.
+        a.reset();
+        assert!(a.budget.lock().unwrap().is_none(), "A's slot goes back");
+        assert_eq!(read(at_b), 0xb0b, "A's reset leaves B's word");
+        assert_eq!(word(&b).1, at_b, "B still holds the same slot");
+        // A's next use takes a slot again (not necessarily the same one:
+        // the pool is shared with tests running in parallel), stale from
+        // the spent budget, and its next submission zeroes it: a full budget.
+        assert!(a.budget().is_some());
+        let (_, again, _) = word(&a);
+        assert_ne!(again, at_b, "A does not take B's slot");
+        write(again, u32::MAX);
+        a.close();
+        host.execute(&[&a]);
+        assert_eq!(read(again), 0, "A starts again from its full budget");
+        assert_eq!(read(at_b), 0xb0b, "B is unaffected by A's whole cycle");
+        a.reset();
+        b.close();
+    }
+
     #[test]
     fn present_compositor_builds_both_pipeline_states() {
         let Some(host) = host() else {
@@ -819,11 +920,12 @@ pub(crate) struct HostList {
     /// Which list this is, for the name that tells it apart in device-removed
     /// data (see [`HostList::is_node`]).
     id: u64,
-    /// The work its indirect executions may still do (`indirect`): a
-    /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// The work its indirect executions may still do (`indirect`): a word of
+    /// the host's shared ones, sent back when the list is reset.
+    budget: Mutex<Option<BudgetWord>>,
     /// Clamped indirect arguments (`crate::indirect`), reused by each
-    /// execution in turn; replaced by a bigger one when too small.
+    /// execution in turn, from the host's shared buffer; a reset list gives
+    /// its hold back.
     arguments: Mutex<Option<ID3D12Resource>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
@@ -845,6 +947,31 @@ pub(crate) struct HostList {
 unsafe impl Send for HostList {}
 // SAFETY: as above.
 unsafe impl Sync for HostList {}
+
+impl Drop for HostList {
+    fn drop(&mut self) {
+        // A list dropped without a reset (a title list let go) gives its
+        // budget word and argument buffer back here.
+        if let Some(buffer) = self
+            .arguments
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            && let Some(host) = host()
+        {
+            host.release_arguments(buffer);
+        }
+        if let Some(word) = self
+            .budget
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            && let Some(host) = host()
+        {
+            host.release_budget(word);
+        }
+    }
+}
 
 pub(crate) fn warn_depth_bounds() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -964,6 +1091,53 @@ struct ScratchChunk {
     gpu: u64,
     capacity: u64,
 }
+
+/// The lists' indirect-work budget words (`crate::indirect`): one slot of a
+/// shared buffer each, handed to a list at its first indirect execution and
+/// back when it is reset. Before, each list made its own 256-byte buffer,
+/// 64 KiB committed each, and kept it for the list's life.
+#[derive(Default)]
+struct BudgetPool {
+    blocks: Vec<BudgetBlock>,
+}
+
+struct BudgetBlock {
+    buffer: ID3D12Resource,
+    mapped: usize,
+    gpu: u64,
+    /// Slot indices not handed out.
+    free: Vec<usize>,
+    /// Slots handed out now: none, the block goes.
+    taken: usize,
+}
+
+/// Bytes between budget slots (aligned for a root unordered-access view; the
+/// word is 4 bytes at the start of its slot).
+const BUDGET_SLOT: usize = 256;
+
+/// Slots of one budget buffer: 64 KiB committed, shared by this many lists.
+const BUDGET_SLOTS: usize = 256;
+
+/// A list's slot of a budget block, kept by the list until it is reset.
+struct BudgetWord {
+    buffer: ID3D12Resource,
+    mapped: usize,
+    gpu: u64,
+    slot: usize,
+}
+
+/// Indirect argument buffers kept between lists (`crate::indirect`): a list
+/// borrows the smallest one its largest clamp fits and gives it back when it
+/// is reset, so no list holds one while it is idle (each list's clamp writes
+/// only its own buffer just before its execution).
+#[derive(Default)]
+struct ArgumentsPool {
+    free: Vec<ID3D12Resource>,
+}
+
+/// Bytes of argument buffers the pool keeps between lists: a frame's peak of
+/// the clamps' classes (64 KiB and its powers), not a spike's.
+const ARGUMENTS_IDLE_BYTES: u64 = 16 << 20;
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -1140,7 +1314,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 id,
-                budget: OnceLock::new(),
+                budget: Mutex::new(None),
                 arguments: Mutex::new(None),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -1150,6 +1324,105 @@ impl Host {
                 stamps: OnceLock::new(),
             })
         }
+    }
+
+    /// A budget word for a list, from a free slot of the blocks or a new
+    /// block (`crate::indirect`).
+    fn budget_word(&self) -> Option<BudgetWord> {
+        let mut pool = self.budgets.lock().unwrap_or_else(|e| e.into_inner());
+        let found = pool.blocks.iter().position(|b| !b.free.is_empty());
+        let block = match found {
+            Some(i) => &mut pool.blocks[i],
+            None => {
+                let (buffer, data) = self.shared_buffer((BUDGET_SLOT * BUDGET_SLOTS) as u64)?;
+                name(&buffer, || "indirect budgets".into());
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                pool.blocks.push(BudgetBlock {
+                    buffer,
+                    mapped: data as usize,
+                    gpu,
+                    free: (0..BUDGET_SLOTS).rev().collect(),
+                    taken: 0,
+                });
+                pool.blocks.last_mut()?
+            }
+        };
+        let slot = block.free.pop()?;
+        block.taken += 1;
+        Some(BudgetWord {
+            buffer: block.buffer.clone(),
+            mapped: block.mapped + slot * BUDGET_SLOT,
+            gpu: block.gpu + (slot * BUDGET_SLOT) as u64,
+            slot,
+        })
+    }
+
+    /// A reset or dropped list's budget word goes back; a block with none
+    /// out is released.
+    fn release_budget(&self, word: BudgetWord) {
+        let mut pool = self.budgets.lock().unwrap_or_else(|e| e.into_inner());
+        let key = word.buffer.as_raw();
+        let Some(i) = pool.blocks.iter().position(|b| b.buffer.as_raw() == key) else {
+            return;
+        };
+        let block = &mut pool.blocks[i];
+        block.free.push(word.slot);
+        block.taken -= 1;
+        // The last block stays, so lists that all reset each frame do not
+        // destroy and recreate its buffer every time.
+        if block.taken == 0 && pool.blocks.len() > 1 {
+            pool.blocks.swap_remove(i);
+        }
+    }
+
+    /// An argument buffer for a list (`crate::indirect`), at least `bytes`
+    /// long: the smallest the pool keeps that fits, or a new one. The list
+    /// holds it until it is reset.
+    fn arguments(&self, bytes: u64) -> Option<ID3D12Resource> {
+        let bytes = bytes.next_power_of_two().max(1 << 16);
+        let mut pool = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+        let width = |b: &ID3D12Resource| {
+            // SAFETY: a plain query on a live buffer.
+            unsafe { b.GetDesc() }.Width
+        };
+        let fit = pool
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| width(b) >= bytes)
+            .min_by_key(|(_, b)| width(b))
+            .map(|(i, _)| i);
+        if let Some(i) = fit {
+            return Some(pool.free.swap_remove(i));
+        }
+        let (made, _) = self.shared_buffer(bytes)?;
+        name(&made, || "indirect arguments".into());
+        Some(made)
+    }
+
+    /// A reset or dropped list's argument buffer goes back; the pool keeps
+    /// the largest ones up to [`ARGUMENTS_IDLE_BYTES`].
+    fn release_arguments(&self, buffer: ID3D12Resource) {
+        let width = |b: &ID3D12Resource| {
+            // SAFETY: a plain query on a live buffer.
+            unsafe { b.GetDesc() }.Width
+        };
+        let mut pool = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+        pool.free.push(buffer);
+        pool.free.sort_by_key(|b| std::cmp::Reverse(width(b)));
+        let mut total = 0;
+        pool.free.retain(|b| {
+            // Only kept buffers count, so one that does not fit cannot
+            // push out the smaller ones behind it.
+            let w = width(b);
+            if total + w <= ARGUMENTS_IDLE_BYTES {
+                total += w;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Runs closed lists and waits for them.
@@ -1793,6 +2066,19 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
+        // The indirect buffers come from the host's pools (a budget word is
+        // a slot, the argument buffer one borrowed until reset): a reset
+        // list gives them back and takes them again on its next use.
+        if let Some(buffer) = self.arguments.lock().unwrap_or_else(|e| e.into_inner()).take()
+            && let Some(host) = host()
+        {
+            host.release_arguments(buffer);
+        }
+        if let Some(word) = self.budget.lock().unwrap_or_else(|e| e.into_inner()).take()
+            && let Some(host) = host()
+        {
+            host.release_budget(word);
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -2219,38 +2505,37 @@ impl HostList {
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
+    /// submission of the list from the first use after a reset on. The word
+    /// is the list's slot of the host's shared blocks until it is reset.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
-            .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
-            .as_ref()?;
+        let (gpu, mapped) = {
+            let mut held = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+            if held.is_none() {
+                *held = host()?.budget_word();
+            }
+            let word = held.as_ref()?;
+            (word.gpu, word.mapped)
+        };
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
+            // SAFETY: the list's own word (its slot), written before it runs.
             deferred
                 .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+                .push(Step::Host(Box::new(move || unsafe { (mapped as *mut u32).write_volatile(0) })));
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some(gpu)
     }
 
     /// The list's argument buffer, at least `bytes` long, common between
-    /// its uses (`crate::indirect`).
+    /// its uses (`crate::indirect`), borrowed from the host's pool.
     pub(crate) fn arguments(&self, bytes: u64) -> Option<ID3D12Resource> {
         let mut arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a plain query on a live buffer.
         if let Some(b) = arguments.as_ref().filter(|b| unsafe { b.GetDesc() }.Width >= bytes) {
             return Some(b.clone());
         }
-        let (made, _) = host()?.shared_buffer(bytes.next_power_of_two().max(1 << 16))?;
-        name(&made, || "indirect arguments".into());
+        let made = host()?.arguments(bytes)?;
         // Commands recorded earlier may still name the smaller one.
         if let Some(old) = arguments.replace(made.clone()) {
             self.keep(&old);
