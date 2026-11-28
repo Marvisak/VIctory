@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod bench;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -17,6 +18,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Compare Windows title runs with time and memory limits.
+    Bench(bench::Args),
     /// Enforce the asset policy: the repository holds only small text files
     /// we wrote. Checks tracked and untracked-but-not-ignored files.
     Policy {
@@ -31,6 +34,7 @@ enum Cmd {
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
+        Cmd::Bench(args) => bench::run(args),
         Cmd::Policy { staged } => policy::run(&root, staged),
         Cmd::InstallHooks => {
             let status = Command::new("git")

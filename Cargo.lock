@@ -912,5 +912,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "victory-core",
  "walkdir",
+ "windows-sys",
 ]
