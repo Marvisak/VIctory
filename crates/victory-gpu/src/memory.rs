@@ -145,13 +145,26 @@ impl Bitmap {
 /// or `Drop`, ensuring it is zeroed before returning to [`BITMAP_POOL`].
 struct PooledBitmap {
     bitmap: Option<Bitmap>,
+    /// True once `defer_after` has verified/cleared all active words and no
+    /// subsequent run has touched the bitmap; lets `Drop` return it to
+    /// [`BITMAP_POOL`] without re-scanning all 256 KiB.
+    clean: std::sync::atomic::AtomicBool,
 }
 
 impl PooledBitmap {
     fn new(bitmap: Bitmap) -> Self {
         Self {
             bitmap: Some(bitmap),
+            clean: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn mark_clean(&self) {
+        self.clean.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn mark_dirty(&self) {
+        self.clean.store(false, std::sync::atomic::Ordering::Release);
     }
 
     fn gpu(&self) -> u64 {
@@ -166,24 +179,34 @@ impl PooledBitmap {
     }
 }
 
+/// Zeroes any non-zero words in `marks`, skipping all-zero 4-word chunks.
+fn clear_nonzero_words(marks: &mut [u32]) {
+    let (chunks, rem) = marks.as_chunks_mut::<4>();
+    for chunk in chunks {
+        if (chunk[0] | chunk[1] | chunk[2] | chunk[3]) != 0 {
+            *chunk = [0; 4];
+        }
+    }
+    for word in rem {
+        if *word != 0 {
+            *word = 0;
+        }
+    }
+}
+
 impl Drop for PooledBitmap {
     fn drop(&mut self) {
         let Some(bitmap) = self.bitmap.take() else {
             return;
         };
-        // SAFETY: `PooledBitmap` drops only when `HostList::reset` or `Drop`
-        // releases its deferred closures after any GPU submission has finished;
-        // `bitmap.data` is mapped for `BITMAP_WORDS` dwords.
-        let marks =
-            unsafe { std::slice::from_raw_parts_mut(bitmap.data as *mut u32, BITMAP_WORDS) };
-        // `defer_after` clears non-zero words after execution and un-executed
-        // lists start clean; verify and clear any stray non-zero words before pooling.
-        if let Some(first) = marks.iter().position(|&m| m != 0) {
-            for mark in &mut marks[first..] {
-                if *mark != 0 {
-                    *mark = 0;
-                }
-            }
+        if !self.clean.load(std::sync::atomic::Ordering::Acquire) {
+            // SAFETY: `PooledBitmap` drops only when `HostList::reset` or `Drop`
+            // releases its deferred closures after any GPU submission has finished;
+            // `bitmap.data` is mapped for `BITMAP_WORDS` dwords.
+            let marks =
+                unsafe { std::slice::from_raw_parts_mut(bitmap.data as *mut u32, BITMAP_WORDS) };
+            // Clear any stray non-zero words before returning to the pool.
+            clear_nonzero_words(marks);
         }
         let overflow = {
             let mut pool = BITMAP_POOL.lock().unwrap_or_else(|e| e.into_inner());
@@ -214,6 +237,8 @@ struct Shared {
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
     layout: Arc<Layout>,
+    /// Largest bitmap prefix addressable by any layout written to this table.
+    bitmap_words: usize,
 }
 
 // SAFETY: `data` is the persistent mapping of `table`, written only under
@@ -496,6 +521,7 @@ impl Shared {
             pairs: HashMap::new(),
             generation: u64::MAX,
             layout: Arc::default(),
+            bitmap_words: BLOCK / 32,
         })
     }
 
@@ -545,19 +571,20 @@ impl Shared {
             blocks,
             owner,
         });
+        self.bitmap_words = self.bitmap_words.max(active_words(&self.layout));
         self.generation = now;
         stats(|s| s.tables += 1);
     }
 }
 
-/// The page table of view heap `key`, as the last submission using it
-/// left it.
-fn layout(key: usize) -> Arc<Layout> {
+/// Decode against the table the list actually bound. If its heap was released,
+/// every mark is a miss and its former size is no longer in the registry.
+fn bitmap_layout(key: usize, table: u64) -> (Arc<Layout>, usize) {
     shared()
         .iter()
-        .find(|(k, _)| *k == key)
-        .map(|(_, s)| s.layout.clone())
-        .unwrap_or_default()
+        .find(|(k, s)| *k == key && s.gpu == table)
+        .map(|(_, s)| (s.layout.clone(), s.bitmap_words))
+        .unwrap_or_else(|| (Arc::default(), BITMAP_WORDS))
 }
 
 /// At submission, for a list using title memory with view heap `key`
@@ -588,10 +615,17 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     }
 }
 
-/// Whether any marked page in `marks` fell outside a valid copy in `l`.
-fn has_missed(marks: &[u32], l: &Layout) -> bool {
-    for (w, &mark) in marks.iter().enumerate() {
-        let mut bits = mark;
+/// Number of 32-bit bitmap words covering every block the page table can index
+/// (block 0 for missing 256 MiB regions plus active level-2 blocks `1..blocks.len()`).
+/// A shader using this particular layout can only mark words inside this prefix.
+fn active_words(l: &Layout) -> usize {
+    l.blocks.len().max(1).saturating_mul(BLOCK / 32).min(BITMAP_WORDS)
+}
+
+/// Scans `marks` for misses against `l`, returning `(has_missed, any_nonzero)`.
+fn scan_missed(marks: &[u32], l: &Layout) -> (bool, bool) {
+    let mut any_nonzero = false;
+    let check_word = |w: usize, mut bits: u32| -> bool {
         while bits != 0 {
             let entry = w * 32 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
@@ -603,9 +637,42 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
                 return true;
             }
         }
+        false
+    };
+    let (chunks, rem) = marks.as_chunks::<4>();
+    let rem_base = chunks.len() * 4;
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        if (chunk[0] | chunk[1] | chunk[2] | chunk[3]) == 0 {
+            continue;
+        }
+        any_nonzero = true;
+        for (off, &mark) in chunk.iter().enumerate() {
+            if mark != 0 && check_word(chunk_idx * 4 + off, mark) {
+                return (true, true);
+            }
+        }
     }
-    false
+    for (off, &mark) in rem.iter().enumerate() {
+        if mark != 0 {
+            any_nonzero = true;
+            if check_word(rem_base + off, mark) {
+                return (true, true);
+            }
+        }
+    }
+    (false, any_nonzero)
 }
+
+/// Whether any marked page in `marks` fell outside a valid copy in `l`.
+#[cfg(test)]
+fn has_missed(marks: &[u32], l: &Layout) -> bool {
+    scan_missed(marks, l).0
+}
+
+/// Handoff state between `defer_missed` and `defer_after` on a list's bitmap.
+const SCAN_UNKNOWN: u8 = 0;
+const SCAN_ALL_ZERO: u8 = 1;
+const SCAN_HAS_MARKS: u8 = 2;
 
 /// `list` uses title memory with view heap `key` bound: the heap's page
 /// table (made on first use) and a page bitmap of the list's, the table
@@ -634,47 +701,73 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
     let missed_bitmap = Arc::clone(&pooled);
+    let scan_state = Arc::new(std::sync::atomic::AtomicU8::new(SCAN_UNKNOWN));
+    let missed_state = Arc::clone(&scan_state);
     list.defer_missed(move || {
-        let l = layout(key);
-        // SAFETY: the bitmap is mapped and the list's run is over.
+        let (l, words) = bitmap_layout(key, table);
+        missed_bitmap.mark_dirty();
+        // SAFETY: the bitmap is mapped for `BITMAP_WORDS` dwords (`words <= BITMAP_WORDS`)
+        // and the list's run is over.
         let marks =
-            unsafe { std::slice::from_raw_parts(missed_bitmap.data() as *const u32, BITMAP_WORDS) };
-        has_missed(marks, &l)
+            unsafe { std::slice::from_raw_parts(missed_bitmap.data() as *const u32, words) };
+        let (missed, any_nonzero) = scan_missed(marks, &l);
+        missed_state.store(
+            if any_nonzero { SCAN_HAS_MARKS } else { SCAN_ALL_ZERO },
+            std::sync::atomic::Ordering::Release,
+        );
+        missed
     });
     list.defer_after(move || {
-        let Layout { copies, blocks, owner, .. } = &*layout(key);
+        // A miss in an earlier binding can short-circuit this check on the
+        // next execution. Only consume an all-zero result from this run.
+        if scan_state.swap(SCAN_UNKNOWN, std::sync::atomic::Ordering::AcqRel) == SCAN_ALL_ZERO {
+            pooled.mark_clean();
+            return;
+        }
+        let (l, words) = bitmap_layout(key, table);
+        let Layout { copies, blocks, owner, .. } = &*l;
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the bitmap is mapped and the list's run is over.
+        // SAFETY: the bitmap is mapped for `BITMAP_WORDS` dwords (`words <= BITMAP_WORDS`)
+        // and the list's run is over.
         let marks =
-            unsafe { std::slice::from_raw_parts_mut(pooled.data() as *mut u32, BITMAP_WORDS) };
+            unsafe { std::slice::from_raw_parts_mut(pooled.data() as *mut u32, words) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let mut writes = Vec::new();
-        for (w, mark) in marks.iter_mut().enumerate() {
-            if *mark == 0 {
+        debug_assert_eq!(words % 4, 0);
+        let (chunks, _) = marks.as_chunks_mut::<4>();
+        for (chunk_idx, chunk) in chunks.iter_mut().enumerate() {
+            if (chunk[0] | chunk[1] | chunk[2] | chunk[3]) == 0 {
                 continue;
             }
-            let mut bits = std::mem::take(mark);
-            while bits != 0 {
-                let entry = w * 32 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let (block, page) = (entry / BLOCK, entry % BLOCK);
-                // Block 0's bits are 256 MiB regions with no block.
-                let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
-                    regions += 1;
-                    missed.push((entry as u64) << 28);
+            for (off, mark) in chunk.iter_mut().enumerate() {
+                if *mark == 0 {
                     continue;
-                };
-                let at = (l1 << 28 | page << 16) as u64;
-                match owner.get(entry) {
-                    Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
-                    Some(&k) if k != NO_OWNER => writes.push((k as usize, at)),
-                    _ => {
-                        pages += 1;
-                        missed.push(at);
+                }
+                let w = chunk_idx * 4 + off;
+                let mut bits = std::mem::take(mark);
+                while bits != 0 {
+                    let entry = w * 32 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let (block, page) = (entry / BLOCK, entry % BLOCK);
+                    // Block 0's bits are 256 MiB regions with no block.
+                    let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
+                        regions += 1;
+                        missed.push((entry as u64) << 28);
+                        continue;
+                    };
+                    let at = (l1 << 28 | page << 16) as u64;
+                    match owner.get(entry) {
+                        Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
+                        Some(&k) if k != NO_OWNER => writes.push((k as usize, at)),
+                        _ => {
+                            pages += 1;
+                            missed.push(at);
+                        }
                     }
                 }
             }
         }
+        pooled.mark_clean();
         // What shaders computed from memory with no copy (read as zeros) is
         // not the console's: it does not go into title memory, where it broke
         // the title's own data (garbage pointers in title threads, run c1),
@@ -696,14 +789,16 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             );
             written += 1;
         }
-        stats(|s| {
-            s.written += written;
-            s.withheld += withheld;
-            s.missed_pages += pages;
-            s.missed_regions += regions;
-            let room = 4usize.saturating_sub(s.first_missed.len());
-            s.first_missed.extend(missed.into_iter().take(room));
-        });
+        if written > 0 || withheld > 0 || pages > 0 || regions > 0 {
+            stats(|s| {
+                s.written += written;
+                s.withheld += withheld;
+                s.missed_pages += pages;
+                s.missed_regions += regions;
+                let room = 4usize.saturating_sub(s.first_missed.len());
+                s.first_missed.extend(missed.into_iter().take(room));
+            });
+        }
     });
     Some(Map {
         table,
@@ -827,6 +922,249 @@ mod tests {
         let oob = 2 * BLOCK + 1;
         marks[oob / 32] = 1 << (oob % 32);
         assert!(has_missed(&marks, &l));
+    }
+
+    #[test]
+    fn active_words_scan_missed_and_clear_nonzero_words() {
+        let empty = Layout::default();
+        assert_eq!(active_words(&empty), BLOCK / 32);
+        let small = Layout {
+            blocks: vec![usize::MAX, 0, 1, 2],
+            owner: vec![NO_OWNER; 4 * BLOCK],
+            ..Default::default()
+        };
+        assert_eq!(active_words(&small), 4 * (BLOCK / 32));
+        let full = Layout {
+            blocks: vec![0; CAPACITY + 2],
+            ..Default::default()
+        };
+        assert_eq!(active_words(&full), BITMAP_WORDS);
+
+        let mut owner = vec![NO_OWNER; 2 * BLOCK];
+        owner[BLOCK + 9] = 0;
+        let l = Layout {
+            blocks: vec![usize::MAX, 0],
+            owner,
+            ..Default::default()
+        };
+        let mut marks = vec![0u32; active_words(&l)];
+        assert_eq!(scan_missed(&marks, &l), (false, false));
+        let owned = BLOCK + 9;
+        marks[owned / 32] = 1 << (owned % 32);
+        assert_eq!(scan_missed(&marks, &l), (false, true));
+        marks[0] = 1;
+        assert_eq!(scan_missed(&marks, &l), (true, true));
+
+        // Non-4-aligned slice tail clearing.
+        let mut tail = vec![0u32, 0, 0, 0, 0, 0x55, 0];
+        clear_nonzero_words(&mut tail);
+        assert!(tail.iter().all(|&w| w == 0));
+    }
+
+    /// Executing a bound title-memory list with no shader writes takes the
+    /// all-zero fast handoff and returns a clean bitmap to the pool; re-executing
+    /// a writing list without reset still processes new marks on each run.
+    #[test]
+    fn clean_handoff_and_repeat_submission_preserve_bitmap_state() {
+        let _guard = gpu_test_lock();
+        let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
+            return;
+        };
+        // Earlier tests (e.g. `a_submission_that_missed_leaves_the_copies_at_once`)
+        // leave `MISSED_IN` set for the current frame, which withholds copy-backs.
+        let prev_missed = MISSED_IN.swap(MISS_NEVER, std::sync::atomic::Ordering::Relaxed);
+        let list = host.new_list().unwrap();
+        let _map = bind(&list, OURS).expect("bitmap for list");
+        list.close();
+        // Run with no GPU shader writes: defer_missed -> defer_after all-zero fast path.
+        host.execute(&[&list]);
+        list.reset();
+
+        // Next acquire reuses a zeroed bitmap.
+        let reused = Bitmap::acquire().unwrap();
+        // SAFETY: mapped for `BITMAP_WORDS` dwords.
+        let words = unsafe { std::slice::from_raw_parts(reused.data as *const u32, BITMAP_WORDS) };
+        assert!(words.iter().all(|&w| w == 0), "bitmap remains zeroed after fast-path drop");
+        drop(PooledBitmap::new(reused));
+
+        // Also execute a real writing shader twice on the same list without resetting it.
+        with_recorded_page_write(&list, views, OURS, |at, _| {
+            list.close();
+            // First execution writes 0x77 back to title memory and clears the bitmap.
+            host.execute(&[&list]);
+            // SAFETY: our pool.
+            assert_eq!(unsafe { (at as *const u32).read_volatile() }, 0x77);
+            // Overwrite title memory, then re-execute the SAME list without reset:
+            // defer_missed must still re-scan and defer_after must still copy 0x77 back.
+            // SAFETY: our pool.
+            unsafe { (at as *mut u32).write_volatile(0x22) };
+            host.execute(&[&list]);
+            // SAFETY: our pool.
+            assert_eq!(unsafe { (at as *const u32).read_volatile() }, 0x77);
+            list.reset();
+        });
+        MISSED_IN.store(prev_missed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Keep the shader, its registered title page and the shadow alive through submission.
+    fn with_recorded_page_write(
+        list: &HostList,
+        views: &HostHeap,
+        key: usize,
+        run: impl FnOnce(usize, &Map),
+    ) {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let p = (0..256u64)
+            .map(|k| 0x60_0000_0000 + (k << 28))
+            // SAFETY: fresh write-watched allocation below 2^40.
+            .map(|hint| unsafe {
+                VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE)
+            } as usize)
+            .find(|&p| p != 0)
+            .expect("memory below 2^40");
+        let at = p + 16;
+        // SAFETY: our pool.
+        unsafe { (at as *mut u32).write_volatile(0x10) };
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        let (write_root, writer) = pipeline(WRITE);
+        let map = bind(list, key).expect("page table");
+        let constants = [at as u32, (at >> 32) as u32, 0x77, 0, 0];
+        // SAFETY: open list, live objects.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+            list.list.SetComputeRootSignature(&write_root);
+            list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+            list.list.SetComputeRootShaderResourceView(1, map.table);
+            list.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+            list.list.SetComputeRoot32BitConstants(3, constants.len() as u32, constants.as_ptr().cast(), 0);
+            list.list.SetPipelineState(&writer);
+            list.list.Dispatch(1, 1, 1);
+        }
+        run(at, &map);
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    fn new_view_heap() -> crate::object::This {
+        use crate::object::S_OK;
+        let desc = [0u32, 8, 1, 0, 0, 0, 0, 0]; // shader-visible view heap, no placement
+        let mut heap = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(), desc.as_ptr().cast(), &crate::resource::PAGEABLE_IIDS[0], &mut heap,
+            ),
+            S_OK
+        );
+        crate::descriptor::heap(heap).host().expect("host view heap");
+        heap
+    }
+
+    #[test]
+    fn released_table_still_reports_and_clears_its_shader_marks() {
+        use crate::object::{This, slot};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _guard = gpu_test_lock();
+        let Some(host) = crate::host::host() else { return };
+        let heap = new_view_heap();
+        let key = heap as usize;
+        let views = crate::descriptor::heap(heap).host().unwrap();
+        let list = host.new_list().unwrap();
+        // Remove only the registry entry after the GPU finishes. The recorded
+        // list keeps its table, and this test holds the descriptor heap.
+        let released = AtomicBool::new(false);
+        list.defer_missed(move || {
+            if !released.swap(true, Ordering::Relaxed) {
+                release(key);
+            }
+            false
+        });
+        with_recorded_page_write(&list, views, key, |_, map| {
+            let reached = Arc::new(AtomicBool::new(false));
+            let witness = reached.clone();
+            list.defer_missed(move || {
+                witness.store(true, Ordering::Relaxed);
+                false
+            });
+            list.close();
+            host.execute(&[&list]);
+            // A detected miss short-circuits the next check on this list.
+            let missed = !reached.load(Ordering::Relaxed);
+
+            // Replay the old list with a new page table registered under the same
+            // key. Even when the replacement names the same page, it cannot own
+            // the old table's marks.
+            let replacement = host.new_list().unwrap();
+            let next = bind(&replacement, key).unwrap();
+            assert_ne!(next.table, map.table);
+            replacement.close();
+            reached.store(false, Ordering::Relaxed);
+            host.execute(&[&list]);
+            let missed_on_replay = !reached.load(Ordering::Relaxed);
+            list.reset();
+            let bitmap = Bitmap::acquire().unwrap();
+            assert_eq!(bitmap.gpu, map.dirty);
+            // SAFETY: this mapped bitmap is exclusively ours after reset.
+            let words = unsafe { std::slice::from_raw_parts(bitmap.data as *const u32, BITMAP_WORDS) };
+            let clean = words.iter().all(|&word| word == 0);
+            assert!(missed, "a mark from the released table must be reported");
+            assert!(missed_on_replay, "a different table recorded under the same key must not claim the mark");
+            assert!(clean, "the recycled bitmap must be clear");
+        });
+        slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap);
+    }
+
+    #[test]
+    fn repeated_list_clears_second_bitmap_when_first_heap_misses() {
+        use crate::object::{This, slot};
+        let _guard = gpu_test_lock();
+        let (Some(host), Some(_)) = (crate::host::host(), heap()) else {
+            return;
+        };
+        let heap = new_view_heap();
+        let list = host.new_list().unwrap();
+        let first = bind(&list, OURS).unwrap();
+        let second = bind(&list, heap as usize).unwrap();
+        let (out, cpu) = host.shared_buffer(256).unwrap();
+        // A mark in block zero signals a miss. The shader returns the word
+        // it found in the second heap's bitmap before setting its own bit.
+        let (root, writer) = pipeline(r#"
+RWByteAddressBuffer first : register(u0);
+RWByteAddressBuffer second : register(u1);
+RWByteAddressBuffer result : register(u2);
+[RootSignature("UAV(u0), UAV(u1), UAV(u2)")]
+[numthreads(1, 1, 1)]
+void main() {
+    uint previous;
+    first.InterlockedOr(0, 1);
+    second.InterlockedOr(0, 2, previous);
+    result.Store(0, previous);
+}
+"#);
+        // SAFETY: open list and live UAV buffers for all three root descriptors.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootUnorderedAccessView(0, first.dirty);
+            list.list.SetComputeRootUnorderedAccessView(1, second.dirty);
+            list.list.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
+            list.list.SetPipelineState(&writer);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        let mut previous = [0; 3];
+        for word in &mut previous {
+            // SAFETY: the shared output is mapped, and execute waits for completion.
+            unsafe { cpu.cast::<u32>().write_volatile(u32::MAX) };
+            host.execute(&[&list]);
+            // SAFETY: the dispatch has completed.
+            *word = unsafe { cpu.cast::<u32>().read_volatile() };
+        }
+        list.reset();
+        slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap);
+        assert_eq!(previous, [0; 3], "each submission must see a clean second bitmap");
     }
 
     fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {

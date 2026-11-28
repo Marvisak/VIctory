@@ -1023,6 +1023,12 @@ struct Deferred {
     waits: Vec<crate::hold::ValueWait>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// Whether `copies` contains any `Step::Heap`, `Step::Texture`, or
+    /// `Step::GpuWrite` steps, letting `Host::execute` skip scanning `copies`
+    /// for lists that have none.
+    has_heaps: bool,
+    has_textures: bool,
+    has_gpu_writes: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
@@ -1172,35 +1178,27 @@ impl Host {
         crate::descriptor::sync_heaps();
         #[cfg(feature = "diagnostics")]
         drop(syncing);
-        // Textures heap-indexing shaders may read, uploaded first by a list
-        // of ours where their title memory changed.
-        let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
-            .iter()
-            .flat_map(|l| {
-                l.deferred()
-                    .copies
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Heap(v) => Some(v.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        // And textures read through tables, uploaded by the same list.
-        let textures: Vec<_> = runs
-            .iter()
-            .flat_map(|l| {
-                l.deferred()
-                    .copies
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Texture(staging, copy) => Some((staging.clone(), copy.clone())),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        // Textures heap-indexing shaders may read, and textures read through
+        // tables, uploaded first by a list of ours where their title memory
+        // changed.
+        let mut heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = Vec::new();
+        let mut textures: Vec<(
+            std::sync::Arc<crate::texture::Staging>,
+            std::sync::Arc<crate::resource::HostTexture>,
+        )> = Vec::new();
+        for list in runs {
+            let deferred = list.deferred();
+            if !deferred.has_heaps && !deferred.has_textures {
+                continue;
+            }
+            for step in &deferred.copies {
+                match step {
+                    Step::Heap(v) => heaps.push(v.clone()),
+                    Step::Texture(staging, copy) => textures.push((staging.clone(), copy.clone())),
+                    _ => {}
+                }
+            }
+        }
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         let uploads = (!heaps.is_empty() || !textures.is_empty())
@@ -1358,6 +1356,9 @@ impl Host {
         let withholding = crate::memory::withholding();
         for (list, &missed) in runs.iter().zip(&missed) {
             let deferred = list.deferred();
+            if !deferred.has_gpu_writes {
+                continue;
+            }
             let missed = missed || withholding && !deferred.missed.is_empty();
             for step in &deferred.copies {
                 if let Step::GpuWrite(shadow, address, len, _, memory) = step {
@@ -2095,7 +2096,9 @@ impl HostList {
         marked: bool,
     ) {
         let memory = self.memory_writer.load(Ordering::Relaxed);
-        self.deferred()
+        let mut deferred = self.deferred();
+        deferred.has_gpu_writes = true;
+        deferred
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len, marked, memory));
     }
@@ -2107,6 +2110,7 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(viewed) as usize, usize::MAX, 0);
         if deferred.refreshed.insert(key) {
+            deferred.has_heaps = true;
             deferred.copies.push(Step::Heap(viewed.clone()));
         }
     }
@@ -2291,7 +2295,9 @@ impl HostList {
         staging: std::sync::Arc<crate::texture::Staging>,
         copy: std::sync::Arc<crate::resource::HostTexture>,
     ) {
-        self.deferred().copies.push(Step::Texture(staging, copy));
+        let mut deferred = self.deferred();
+        deferred.has_textures = true;
+        deferred.copies.push(Step::Texture(staging, copy));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -2368,11 +2374,15 @@ impl HostList {
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
                 Step::Heap(viewed) => {
-                    crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    if batch.need_heap(viewed) {
+                        crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    }
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    if batch.need_memory(heap) {
+                        crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    }
                     continue;
                 }
             };
@@ -2404,9 +2414,41 @@ struct Batch {
     /// The range of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Bindless heaps (`(viewed_ptr, hull_generation)`) already refreshed
+    /// since the last title write.
+    heaps_seen: Vec<(usize, u64)>,
+    /// Title-memory page tables (`(heap_key, shadow_generation)`) already
+    /// prepared since the last title write.
+    memories_seen: Vec<(usize, u64)>,
 }
 
 impl Batch {
+    fn need_heap(&mut self, viewed: &crate::bindless::Viewed) -> bool {
+        let key = (std::ptr::from_ref(viewed) as usize, viewed.hull_generation());
+        if self.heaps_seen.contains(&key) {
+            return false;
+        }
+        if let Some(entry) = self.heaps_seen.iter_mut().find(|(p, _)| *p == key.0) {
+            entry.1 = key.1;
+        } else {
+            self.heaps_seen.push(key);
+        }
+        true
+    }
+
+    fn need_memory(&mut self, heap: usize) -> bool {
+        let key = (heap, crate::shadow::generation());
+        if self.memories_seen.contains(&key) {
+            return false;
+        }
+        if let Some(entry) = self.memories_seen.iter_mut().find(|(h, _)| *h == heap) {
+            entry.1 = key.1;
+        } else {
+            self.memories_seen.push(key);
+        }
+        true
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
@@ -2434,6 +2476,8 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.current.clear();
+        self.heaps_seen.clear();
+        self.memories_seen.clear();
     }
 
     /// Does the refreshes; returns the bytes copied.
@@ -4015,6 +4059,93 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+
+    /// `Batch` deduplicates repeat `Step::Heap` and `Step::Memory` walks across
+    /// lists in a submission while nothing changed, and re-runs them after a
+    /// `Step::Copy` title write or a hull/shadow generation change.
+    #[test]
+    fn batch_deduplicates_heap_and_memory_steps_until_title_write() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let p_src = crate::watch::tests::pool(1);
+        let p_dst = crate::watch::tests::pool(1);
+        let page = crate::watch::PAGE;
+
+        // Unit check on Batch::need_heap / need_memory / title_written.
+        let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
+        let mut batch = super::Batch::default();
+        assert!(batch.need_heap(&viewed));
+        assert!(!batch.need_heap(&viewed), "repeat in same batch skipped");
+        assert!(batch.need_memory(0x1000));
+        assert!(!batch.need_memory(0x1000), "repeat memory heap skipped");
+        batch.title_written();
+        assert!(batch.need_heap(&viewed), "re-checked after title write");
+        assert!(batch.need_memory(0x1000), "re-checked after title write");
+
+        // End-to-end check: list 0 has Step::Heap then Step::Copy into p_dst;
+        // list 1 has Step::Heap and must pick up the post-Copy bytes in dst_copy.
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let buf_desc: [u32; 14] = [1, 0, 0, 0, page as u32, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let res_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut buf_obj = null;
+        assert_eq!(
+            crate::resource::create_at_address(
+                null,
+                p_dst as u64,
+                buf_desc.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &res_iid,
+                &mut buf_obj
+            ),
+            0
+        );
+        let srv: [u32; 10] = [39, 1, 0x1688, 0, 0, 0, 16, 0, 1, 0];
+        crate::descriptor::create_srv(null, buf_obj, &srv, title_heap.start);
+        let heap_host = title_heap.host().expect("host view heap");
+        let _ = heap_host.mirror(0, title_heap.start, false);
+        let dst_copy = crate::shadow::find(p_dst as u64, page as u64).expect("host copy of p_dst");
+
+        // SAFETY: our pool allocations.
+        unsafe {
+            (p_src as *mut u32).write_volatile(0xCAFE_BABE);
+            (p_dst as *mut u32).write_volatile(0x1111_2222);
+        }
+        let l0 = host.new_list().unwrap();
+        let l1 = host.new_list().unwrap();
+        l0.defer_heap(&heap_host.viewed);
+        l0.defer_copy(p_dst as *mut u8, p_src as *const u8, 16);
+        l1.defer_heap(&heap_host.viewed);
+        l0.close();
+        l1.close();
+        host.execute(&[&l0, &l1]);
+        assert_eq!(
+            dst_copy.read_host(p_dst as u64, 1)[0],
+            0xCAFE_BABE,
+            "second list's Step::Heap refreshes bytes written by first list's Step::Copy"
+        );
+
+        drop(dst_copy);
+        crate::shadow::unregister(buf_obj as usize, p_dst as u64);
+        crate::watch::tests::free(p_src);
+        crate::watch::tests::free(p_dst);
     }
 }
 
