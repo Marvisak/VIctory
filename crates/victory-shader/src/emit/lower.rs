@@ -570,6 +570,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -6658,6 +6659,62 @@ impl<'a> Lower<'a> {
                 }
                 let r = self.read_lane(a, lane);
                 int(self, r)
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Each lane reads lane `nib(l & 15)` of its row (or of the
+                // other row of its pair): nibble i of {src2, src1} picks for
+                // lane i. opsel bit 0 is fetch-inactive, bit 1 bound-control.
+                let x = s(self, 0)?;
+                let (s1, s2) = (s(self, 1)?, s(self, 2)?);
+                let (fi, bc) = (v.opsel & 1 != 0, v.opsel & 2 != 0);
+                self.cross_lane(false)?;
+                let lane = self.lane_index();
+                let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+                let (low, seven, eight) = (k(self, 15), k(self, 7), k(self, 8));
+                let p = self.s.m.bin(c, Bin::And, lane, low);
+                let lo_half = self.s.m.cmp(c, pred::IULT, p, eight);
+                let sel = self.s.m.select(c, lo_half, s1, s2);
+                let p7 = self.s.m.bin(c, Bin::And, p, seven);
+                let two = k(self, 2);
+                let sh = self.s.m.bin(c, Bin::Shl, p7, two);
+                let pick = self.s.m.bin(c, Bin::LShr, sel, sh);
+                let pick = self.s.m.bin(c, Bin::And, pick, low);
+                let src = if name == "v_permlanex16_b32" {
+                    let (not31, sixteen) = (k(self, !31), k(self, 16));
+                    let base = self.s.m.bin(c, Bin::And, lane, not31);
+                    let bit = self.s.m.bin(c, Bin::And, lane, sixteen);
+                    let flip = self.s.m.bin(c, Bin::Xor, bit, sixteen);
+                    let base = self.s.m.bin(c, Bin::Or, base, flip);
+                    self.s.m.bin(c, Bin::Or, base, pick)
+                } else {
+                    let not15 = k(self, !15);
+                    let base = self.s.m.bin(c, Bin::And, lane, not15);
+                    self.s.m.bin(c, Bin::Or, base, pick)
+                };
+                if fi {
+                    let r = self.read_lane(x, src);
+                    return int(self, r);
+                }
+                let valid = self.src_lane_active(src, guard, false);
+                let safe = match valid {
+                    Some(ok) => self.s.m.select(c, ok, src, lane),
+                    None => src,
+                };
+                let mut r = self.read_lane(x, safe);
+                let mut guard = guard;
+                if let Some(ok) = valid {
+                    if bc {
+                        let z = k(self, 0);
+                        r = self.s.m.select(c, ok, r, z);
+                    } else {
+                        // An inactive source leaves the old destination.
+                        guard = Some(match guard {
+                            Some(g) => self.s.m.bin(c, Bin::And, g, ok),
+                            None => ok,
+                        });
+                    }
+                }
+                self.write_i(inst, r, guard)
             }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.

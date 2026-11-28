@@ -463,6 +463,109 @@ fn permutes_mask_high_address_bits_and_divergent_branches() {
     run_permute_cs(false, &body, &want);
 }
 
+/// `v_permlane16_b32` / `v_permlanex16_b32 v3, v2, <s1>, <s2>` (VOP3, `opsel`
+/// bit 0 = fetch-inactive, bit 1 = bound-control) run by lanes below `live`
+/// (all lanes when 32 or more); `v2` holds 0x4000 + lane and `v3` keeps
+/// 0xcafe0000 + lane where nothing is written. Returns the program body.
+fn permlane_body(x16: bool, opsel: u32, (s1, s2): (u32, u32), narrow: bool) -> Vec<u32> {
+    let op = if x16 { 0x378 } else { 0x377 };
+    let mut b = vec![
+        0x4A04_00FF,
+        0x0000_4000, // v_add_nc_u32 v2, 0x4000, v0
+        0x4A06_00FF,
+        0xCAFE_0000, // v_add_nc_u32 v3, 0xcafe0000, v0
+        0xBE86_03FF,
+        0x3C5A_1E07, // s_mov_b32 s6, 0x3c5a1e07
+        0xBE87_03FF,
+        0x8765_4321, // s_mov_b32 s7, 0x87654321
+    ];
+    if narrow {
+        b.extend([
+            0x7D88_0098, // v_cmp_gt_u32 vcc_lo, 24, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+        ]);
+    }
+    b.extend([
+        0xD400_0003 | op << 16 | opsel << 11,
+        258 | s1 << 9 | s2 << 18,
+    ]);
+    if narrow {
+        b.push(0xBEFE_0314); // s_mov_b32 exec_lo, s20
+    }
+    b
+}
+
+/// The lane `l` reads, given the selector dwords.
+fn permlane_src(x16: bool, l: u32, s1: u32, s2: u32) -> u32 {
+    let p = l & 15;
+    let nib = ((if p < 8 { s1 } else { s2 }) >> (4 * (p & 7))) & 15;
+    if x16 {
+        (l & !31) | ((l & 16) ^ 16) | nib
+    } else {
+        (l & !15) | nib
+    }
+}
+
+#[test]
+fn permlanes_pick_lanes_by_nibble_with_fetch_and_bound_control() {
+    // Selectors: inline constants (33 = code 161, -1 = code 193), SGPRs
+    // (s6, s7) and one of each. Lanes below 24 run the permute; a source lane
+    // at 24 or above is inactive.
+    const S6: u32 = 0x3C5A_1E07;
+    const S7: u32 = 0x8765_4321;
+    for x16 in [true, false] {
+        for (codes, vals) in [
+            ((161, 193), (33, 0xFFFF_FFFF)),
+            ((6, 7), (S6, S7)),
+            ((6, 193), (S6, 0xFFFF_FFFF)),
+        ] {
+            for opsel in 0..4u32 {
+                let (fi, bc) = (opsel & 1 != 0, opsel & 2 != 0);
+                let body = permlane_body(x16, opsel, codes, true);
+                let want: Vec<u32> = (0..32)
+                    .map(|l| {
+                        let old = 0xCAFE_0000 + l;
+                        if l >= 24 {
+                            return old;
+                        }
+                        let src = permlane_src(x16, l, vals.0, vals.1);
+                        if fi || src < 24 {
+                            0x4000 + src
+                        } else if bc {
+                            0
+                        } else {
+                            old
+                        }
+                    })
+                    .collect();
+                run_permute_cs(false, &body, &want);
+            }
+        }
+    }
+}
+
+#[test]
+fn permlanes_with_every_lane_live_read_across_rows() {
+    for x16 in [true, false] {
+        for opsel in 0..4u32 {
+            let body = permlane_body(x16, opsel, (6, 7), false);
+            let want: Vec<u32> = (0..32)
+                .map(|l| 0x4000 + permlane_src(x16, l, 0x3C5A_1E07, 0x8765_4321))
+                .collect();
+            run_permute_cs(false, &body, &want);
+        }
+    }
+}
+
+#[test]
+fn wave64_permlanex16_stays_within_each_32_lane_half() {
+    let body = permlane_body(true, 0, (6, 7), false);
+    let want: Vec<u32> = (0..64)
+        .map(|l| 0x4000 + permlane_src(true, l, 0x3C5A_1E07, 0x8765_4321))
+        .collect();
+    run_permute_cs(true, &body, &want);
+}
+
 #[test]
 fn wave64_permutes_stay_within_each_32_lane_half() {
     // RDNA 2 ISA §10.4.4: wave64 permutes lanes 0..31 and 32..63 independently.
