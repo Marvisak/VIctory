@@ -2180,8 +2180,22 @@ impl<'a> Lower<'a> {
     /// -0 ordered below +0 (RDNA2 ISA, `v_max_f32`), where the compare and
     /// select DXIL specifies gives either zero.
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
-        let (a, b) = (self.ftz(a), self.ftz(b));
+        let (a, a_nonzero) = self.max_min_operand(a);
+        let (b, b_nonzero) = self.max_min_operand(b);
+        if a_nonzero || b_nonzero {
+            return self.binary(if max { 35 } else { 36 }, a, b);
+        }
         self.max_min_flushed(max, a, b)
+    }
+
+    fn max_min_operand(&mut self, value: V) -> (V, bool) {
+        if let Some(bits) = self.s.m.f32_literal_bits(value) {
+            let nonzero = bits & 0x7F80_0000 != 0;
+            let flushed = if nonzero { bits } else { bits & 0x8000_0000 };
+            (self.s.m.f32(flushed), nonzero)
+        } else {
+            (self.ftz(value), false)
+        }
     }
 
     /// [`Self::max_min`] of operands without denormals.
