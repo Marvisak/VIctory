@@ -372,6 +372,7 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        victory_gpu::title_memory_section_gone(self.0 as usize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -515,6 +516,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
+    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
@@ -838,6 +840,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
+    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
     for k in 0..len / PAGE {
         let shown = physical.shown.entry(slice.key(k)).or_default();
         // Pages shown elsewhere already: guarded here too if they are there.
@@ -975,6 +978,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
+        victory_gpu::title_memory_freeing(at, size);
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
