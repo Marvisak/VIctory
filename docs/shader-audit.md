@@ -1810,3 +1810,69 @@ reversible settings test, not a known fix. If the flag still becomes one,
 an early debugger write watchpoint on the relocated title image's
 `+0xa9438ec`, `+0xa9438f0`, and `+0xa9438f4` will identify the actual
 writer before an opt-in patch is designed.
+
+### 2026-11-28: shader-used missing texture identities
+
+The strict offline RX 5700 XT run `rx5700-offline-20261128-142321Z` reached
+world frame 8,877 and completed a two-minute world window. Its exact loader
+WFP inbound/outbound IPv4/IPv6 blocks were verified; 0 TCP and 0 UDP
+endpoints were observed; the GPU was not reported removed. All 1,771 bound
+shader paths translated. The 15 world FPS reports had a 1.7 fps median, so
+this is not a performance acceptance result. The diagnostic gate failed:
+7,554 shader-used Budget-null buffer events and 1,395 shader-used null
+texture events were observed in 14 classified intervals. One final FPS row
+was emitted after the last drop and descriptor report, so this run's exact
+drop and texture coverage is marked incomplete. The strict harness now waits
+for reports through its latest FPS timestamp, including the texture-use
+report when coverage is enabled.
+
+The new bounded identity census recorded at most 366 distinct missing
+textures in any five-second interval, with no identity overflow in this run.
+The missing texture views were almost entirely `host copy unavailable`, not
+shader translation or format-compatibility failures. A sampled 1x1 format-41
+texture at title address `0x9bda40000` was used 184 times in one interval;
+four 16x8–16x13 format-10 table textures were each used 4–8 times in nearby
+intervals. Their host copies were explicitly deferred while local plus
+nonlocal DXGI use exceeded the 9,000 MB stream cap. During the first world
+minute, the already allocated regular texture heaps often had no reusable
+range, despite their untouched tails being reserved. Later evictions exposed
+reusable ranges and admitted more sampled textures without making a new
+heap. The next instrumented run separates unplaceable descriptions,
+missing reusable ranges and driver rejection before changing the cap or
+admission policy; an earlier 9,500 MB cap test removed the GPU.
+
+The first follow-up with placement-failure counters
+(`rx5700-offline-20261128-143702Z`) reached world frame 6,093 but ended
+before the memory cap shut. It had zero missing texture views and no GPU
+removal in its one classified world interval; it cannot test the intended
+placement question. The title's previously identified watchdog wrote to
+null at image RVA `0x23cf683` roughly 31 seconds after the first heavy
+frame, and the process exited with `0xc0000005`. The proximate stalled
+operation was not established. The title attempted a Breakpad upload to
+`submit.backtrace.io`; the HLE network layer blocked it and the WFP-backed
+monitor saw zero TCP and UDP endpoints. A repeat without full descriptor
+coverage is needed to distinguish a repeatable rendering stall from
+instrumentation overhead.
+
+That repeat, `rx5700-offline-20261128-144255Z`, omitted the full view and
+pipeline coverage census while keeping the same 720p, 9,000 MB combined cap,
+85% local limit, 512-pixel streamed edge, and offline WFP rules. It reached
+world frame 6,217 and completed a 90-second world window without GPU removal
+or the watchdog abort. All 1,724 bound shader paths translated. Ten of ten
+world intervals had exact drop and used-null classifications. The median was
+1.55 fps, with 477 shader-used Budget-null buffer events and 61 valid
+shader-used texture-null events. WFP verified the loader process's blocks and
+60 network samples observed zero TCP and UDP endpoints. Different world
+frames and the coverage switch mean the two runs do not isolate the cause of
+the first abort or the difference in texture misses.
+
+The placement-failure counters do isolate this run's closed-cap texture
+failure mode: 1,078 reuse-only texture attempts, 897 admitted and 181
+deferred. Across the small-alignment attempt and its ordinary-alignment
+fallback, 189 placement attempts found no eligible range; zero descriptions
+were unplaceable and zero placed-resource creations were rejected by D3D12.
+At the busiest interval the regular pool held 467.6 of its 469.8 MB of
+allocated heaps, with only 2.2 MB free across 14 ranges. This is a capacity
+and fragmentation problem under the safe combined cap, not a shader-format
+or placed-resource API failure. Raising the cap without reclaiming other
+memory remains unsafe given the earlier device-removal result.

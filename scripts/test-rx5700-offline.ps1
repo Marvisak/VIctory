@@ -666,22 +666,39 @@ try {
                     break
                 }
                 # A strict run must include the reporting interval that spans
-                # the deadline. Otherwise its last few uses are unaccounted.
+                # the deadline and its last FPS row. Otherwise the final row
+                # can be left unclassified when the process is stopped between
+                # the FPS log and its drop/descriptor reports.
                 $deadline = $worldObservedAt.ToUniversalTime().AddSeconds($WorldSeconds)
-                $reported = $true
+                $lastFps = Select-String -LiteralPath $stderr -Pattern ' fps, .* draws/frame' |
+                    Select-Object -Last 1
+                $reported = $lastFps -and
+                    $lastFps.Line -match '^(\S+)\s+INFO .* fps, .* draws/frame'
+                $reportThrough = $deadline
+                if ($reported) {
+                    $lastFpsTime = [datetimeoffset]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+                    if ($lastFpsTime -gt $reportThrough) { $reportThrough = $lastFpsTime }
+                }
                 if ($RequireNoUnexpectedDrops) {
                     $lastAccounting = Select-String -LiteralPath $stderr -Pattern 'drop accounting:' |
                         Select-Object -Last 1
                     $reported = $reported -and $lastAccounting -and
                         $lastAccounting.Line -match '^(\S+)\s+INFO .*drop accounting:' -and
-                        [datetimeoffset]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture).UtcDateTime -ge $deadline
+                        [datetimeoffset]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture).UtcDateTime -ge $reportThrough
                 }
                 if ($RequireNoUsedBudgetNulls) {
                     $lastNullUse = Select-String -LiteralPath $stderr -Pattern 'actual shader-use sites with null host buffer descriptors' |
                         Select-Object -Last 1
                     $reported = $reported -and $lastNullUse -and
                         $lastNullUse.Line -match '^(\S+)\s+(?:INFO|WARN) .*actual shader-use sites with null host buffer descriptors' -and
-                        [datetimeoffset]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture).UtcDateTime -ge $deadline
+                        [datetimeoffset]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture).UtcDateTime -ge $reportThrough
+                }
+                if ($Coverage) {
+                    $lastTextureUse = Select-String -LiteralPath $stderr -Pattern 'shader-used texture slots with null host views' |
+                        Select-Object -Last 1
+                    $reported = $reported -and $lastTextureUse -and
+                        $lastTextureUse.Line -match '^(\S+)\s+(?:INFO|WARN) .*shader-used texture slots with null host views' -and
+                        [datetimeoffset]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture).UtcDateTime -ge $reportThrough
                 }
                 if ($reported) {
                     $stopReason = 'world timing window complete'

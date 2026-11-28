@@ -2204,6 +2204,11 @@ static RECYCLED_STREAM: [std::sync::atomic::AtomicU64; 3] =
 #[cfg(all(windows, feature = "diagnostics"))]
 static RECYCLED_STREAM_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Failed host placement attempts while the streaming cap is shut: descriptor
+/// cannot be placed, no previously used heap range, or D3D12 rejected it.
+#[cfg(all(windows, feature = "diagnostics"))]
+static RECYCLED_PLACEMENT_FAILURE: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 #[cfg(windows)]
 fn note_priority_stream_denial(address: u64, reason: &'static str, original: &ResourceDesc, host: &ResourceDesc) {
@@ -2846,14 +2851,20 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void, recycled_onl
     // SAFETY: the description has the host layout (checked size).
     let plain = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
     let mut placement = None;
-    if clear_value.is_none()
-        && crate::placement::fits(&host.device, &plain)
-        && let Some((heap, p)) = if recycled_only {
+    let placeable = clear_value.is_none() && crate::placement::fits(&host.device, &plain);
+    let chosen = if placeable {
+        if recycled_only {
             crate::placement::place_existing(&host.device, &plain, stream_pristine_limit_bytes())
         } else {
             crate::placement::place(&host.device, &plain)
         }
-    {
+    } else { None };
+    #[cfg(feature = "diagnostics")]
+    if recycled_only && chosen.is_none() {
+        let reason = if placeable { 1 } else { 0 };
+        RECYCLED_PLACEMENT_FAILURE[reason].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some((heap, p)) = chosen {
         let formats: Vec<DXGI_FORMAT> = castable_formats.iter().map(|&f| DXGI_FORMAT(f as i32)).collect();
         let made = match host.device.cast::<ID3D12Device10>() {
             Ok(device) if !formats.is_empty() => {
@@ -2882,6 +2893,10 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void, recycled_onl
                 placement = Some(p);
             }
             Err(e) => {
+                #[cfg(feature = "diagnostics")]
+                if recycled_only {
+                    RECYCLED_PLACEMENT_FAILURE[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| tracing::warn!(error = %e, desc = ?d, "a texture not placed in a heap: committed"));
                 crate::placement::unplace(p);
@@ -3849,7 +3864,10 @@ pub(crate) fn log_allocation_pressure() {
     use std::sync::atomic::Ordering::Relaxed;
     let [attempted, admitted, deferred] = std::array::from_fn(|i| RECYCLED_STREAM[i].swap(0, Relaxed));
     let bytes = RECYCLED_STREAM_BYTES.swap(0, Relaxed);
+    let [unplaceable, no_existing_range, driver_rejected] =
+        std::array::from_fn(|i| RECYCLED_PLACEMENT_FAILURE[i].swap(0, Relaxed));
     tracing::info!(attempted, admitted, deferred, admitted_mb = bytes as f64 / 1e6,
+        unplaceable, no_existing_range, driver_rejected,
         "sampled textures reused existing host heap under combined-memory cap");
     let counts: [u64; 3] = std::array::from_fn(|i| HOST_KIND_COUNT[i].load(Relaxed));
     let bytes: [u64; 3] = std::array::from_fn(|i| HOST_KIND_BYTES[i].load(Relaxed));

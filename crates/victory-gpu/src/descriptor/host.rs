@@ -217,6 +217,70 @@ static USED_NULL_TEXTURE: [std::sync::atomic::AtomicU64; 10] =
 #[cfg(feature = "diagnostics")]
 static USED_NULL_TEXTURE_WARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Bounded, shader-use-weighted missing texture identities per report. The
+/// descriptor attempt census cannot tell which missing textures were used.
+#[cfg(feature = "diagnostics")]
+const USED_TEXTURE_IDENTITY_CAP: usize = 4096;
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct UsedTextureKey {
+    source: UsedNullSource,
+    address: u64,
+    width: u64,
+    height: u32,
+    format: u32,
+}
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy, Debug)]
+struct UsedTextureStat {
+    uses: u64,
+    kind: &'static str,
+    reason: &'static str,
+    example_pipeline: usize,
+    example_root_slot: u8,
+    example_index: u32,
+}
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct UsedTextureIdentities {
+    entries: std::collections::HashMap<UsedTextureKey, UsedTextureStat>,
+    total_uses: u64,
+    overflow_uses: u64,
+}
+#[cfg(feature = "diagnostics")]
+struct UsedTextureReport {
+    total_uses: u64,
+    tracked_distinct: usize,
+    overflow_uses: u64,
+    top: Vec<(UsedTextureKey, UsedTextureStat)>,
+}
+#[cfg(feature = "diagnostics")]
+impl UsedTextureIdentities {
+    fn record(&mut self, key: UsedTextureKey, stat: UsedTextureStat, cap: usize) {
+        self.total_uses = self.total_uses.saturating_add(1);
+        if let Some(found) = self.entries.get_mut(&key) {
+            found.uses = found.uses.saturating_add(1);
+        } else if self.entries.len() < cap {
+            self.entries.insert(key, stat);
+        } else {
+            self.overflow_uses = self.overflow_uses.saturating_add(1);
+        }
+    }
+
+    fn drain_top(&mut self, limit: usize) -> UsedTextureReport {
+        let state = std::mem::take(self);
+        let distinct = state.entries.len();
+        let mut top: Vec<_> = state.entries.into_iter().collect();
+        top.sort_unstable_by(|(a_key, a), (b_key, b)|
+            b.uses.cmp(&a.uses).then_with(|| a_key.address.cmp(&b_key.address)));
+        top.truncate(limit);
+        UsedTextureReport { total_uses: state.total_uses,
+            tracked_distinct: distinct, overflow_uses: state.overflow_uses, top }
+    }
+}
+#[cfg(feature = "diagnostics")]
+static USED_TEXTURE_IDENTITIES: std::sync::OnceLock<Mutex<UsedTextureIdentities>> = std::sync::OnceLock::new();
+
 // A statically named table buffer is needed by a draw even when the ordinary
 // loose-copy budget is closed. Keep this reserve separate from vertex/index
 // admission: at most 64 MiB of cached copies, and 256 new attempts in one
@@ -420,6 +484,22 @@ pub(crate) fn log_used_null() {
             observed_heap_format_incompatible = 0, observed_heap_other = 0,
             observed_heap_invalid_or_empty = 0,
             "shader-used texture slots with null host views (events, not unique slots)");
+    }
+    if let Some(tallies) = USED_TEXTURE_IDENTITIES.get() {
+        let report = tallies.lock().unwrap_or_else(|e| e.into_inner()).drain_top(16);
+        if report.total_uses > 0 {
+            let top: Vec<String> = report.top.iter().map(|(key, stat)| {
+                format!("{:?} kind={} address={:#x} {}x{} format={} uses={} reason={} example_pipeline={:#x} example_root_slot={} example_index={}",
+                    key.source, stat.kind, key.address, key.width, key.height,
+                    key.format, stat.uses, stat.reason, stat.example_pipeline,
+                    stat.example_root_slot, stat.example_index)
+            }).collect();
+            tracing::warn!(used_events = report.total_uses,
+                tracked_distinct_identities = report.tracked_distinct,
+                overflow_events = report.overflow_uses,
+                distinct_complete = report.overflow_uses == 0, ?top,
+                "shader-used missing texture identities (top 16 per interval)");
+        }
     }
     let [attempted, denied_copy, denied_cap, admitted, reused] =
         std::array::from_fn(|i| TABLE_PRIORITY_STATS[i].swap(0, Relaxed));
@@ -1752,6 +1832,12 @@ impl HostHeap {
         let (reason_at, reason) = used_texture_null_reason(address, attempted_reason);
         let source_at = match source { UsedNullSource::Table => 0, UsedNullSource::ObservedHeap => 1 };
         USED_NULL_TEXTURE[source_at * 5 + reason_at].fetch_add(1, Relaxed);
+        USED_TEXTURE_IDENTITIES.get_or_init(|| Mutex::new(UsedTextureIdentities::default()))
+            .lock().unwrap_or_else(|e| e.into_inner())
+            .record(UsedTextureKey { source, address, width, height, format },
+                UsedTextureStat { uses: 1, kind, reason, example_pipeline: pipeline,
+                    example_root_slot: root_slot, example_index: index },
+                USED_TEXTURE_IDENTITY_CAP);
         let seen = USED_NULL_TEXTURE_WARNED.fetch_add(1, Relaxed) + 1;
         if seen <= 8 || seen.is_power_of_two() {
             tracing::warn!(seen, ?source, reason, kind, index, root_slot,
@@ -2959,6 +3045,30 @@ mod tests {
         let empty = ranges.drain_top(16);
         assert_eq!((empty.total_uses, empty.tracked_distinct_ranges, empty.overflow_uses),
             (0, 0, 0));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn shader_used_texture_identities_count_uses_without_losing_overflow() {
+        let mut identities = UsedTextureIdentities::default();
+        let a = UsedTextureKey { source: UsedNullSource::Table, address: 0x1000,
+            width: 1024, height: 1024, format: 71 };
+        let b = UsedTextureKey { source: UsedNullSource::ObservedHeap, address: 0x2000,
+            width: 512, height: 512, format: 98 };
+        let c = UsedTextureKey { source: UsedNullSource::Table, address: 0x3000,
+            width: 256, height: 256, format: 41 };
+        let stat = UsedTextureStat { uses: 1, kind: "srv", reason: "host copy unavailable",
+            example_pipeline: 0x1234, example_root_slot: 2, example_index: 7 };
+        identities.record(a, stat, 2);
+        identities.record(b, stat, 2);
+        identities.record(a, UsedTextureStat { example_pipeline: 0x9999, ..stat }, 2);
+        identities.record(c, stat, 2);
+        let report = identities.drain_top(2);
+        assert_eq!((report.total_uses, report.tracked_distinct, report.overflow_uses), (4, 2, 1));
+        assert_eq!(report.top[0].0, a);
+        assert_eq!(report.top[0].1.uses, 2);
+        assert_eq!(report.top[0].1.example_pipeline, 0x1234);
+        assert_eq!(identities.drain_top(2).total_uses, 0);
     }
 
     #[cfg(feature = "diagnostics")]
