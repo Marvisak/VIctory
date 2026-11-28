@@ -55,6 +55,11 @@ pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// Disable math refactoring: keep an `fmul` and the `fsub` that follows
+    /// it separate. Without it the host contracts the watertight triangle
+    /// test's cross products into FMAs, whose extra precision turns an
+    /// exact edge or vertex cancellation into a signed residue.
+    pub const NO_MATH_REFACTOR: u64 = 1 << 1;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -245,12 +250,15 @@ impl Shader {
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
+        let r = self.m.call(block, f, all.clone());
+        if ret == self.t.void {
+            return r;
+        }
         let choice = self
             .sampler_choices
             .iter()
             .copied()
             .find(|&(a, _, _)| args.contains(&a));
-        let r = self.m.call(block, f, all.clone());
         let Some((a, b, cond)) = choice else {
             return r;
         };

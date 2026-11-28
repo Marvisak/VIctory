@@ -130,6 +130,22 @@ pub struct Resources {
     /// within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
+    /// Every `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`: where
+    /// its nodes are.
+    pub bvh: Vec<(Site, BvhNodes)>,
+}
+
+/// Where a ray-tracing node test ([`crate::bvh`]) reads its nodes. Its
+/// descriptor operand names a range of memory, not a texture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BvhNodes {
+    /// A buffer of the host: the descriptor is loaded from a table (it is
+    /// among [`Resources::descriptors`]), and node pointers count from the
+    /// buffer's start.
+    Resource,
+    /// Title memory by address: the code makes the descriptor from numbers.
+    /// Dwords 1 and 3, which hold its flags.
+    Memory { word1: u32, word3: u32 },
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -207,12 +223,51 @@ pub fn track(
             };
             match &inst.fields {
                 Fields::Image { rsrc, .. } if inst.name().starts_with("image_bvh") => {
-                    if let Some(source) = t.bvh_descriptor(inst, rsrc).map_err(fail)? {
-                        out.descriptors.push(Descriptor {
-                            site,
-                            role: Role::Resource,
-                            source,
-                        });
+                    // The ray and node test names no texture. A descriptor
+                    // whose flag dwords the code sets as numbers and whose
+                    // type is a ray-tracing structure is a range of title
+                    // memory; any other descriptor must be a resource of the
+                    // host.
+                    let word = |k: u8| match *rsrc {
+                        Operand::Scalar { code, dwords } if k < dwords => {
+                            inst.read(Reg::S(code + k)).map(|v| t.origin(v))
+                        }
+                        _ => None,
+                    };
+                    match (word(1), word(3)) {
+                        (Some(w1), Some(Term::Const(word3)))
+                            if word3 >> 28 == crate::bvh::DESCRIPTOR_TYPE =>
+                        {
+                            // Dword 1's low byte may be a computed high
+                            // address (`s_lshr_b64`) with its flags set by
+                            // `s_or_b32`: take the constant flag bits; the
+                            // lowering still reads the address from SGPRs.
+                            let (mut word1, mut term, mut flags_set) = (0, w1, false);
+                            loop {
+                                match term {
+                                    Term::Const(c) => {
+                                        word1 |= c;
+                                        break;
+                                    }
+                                    Term::Value(v) => match t.set_bits(v) {
+                                        Some((x, bits)) => {
+                                            (word1, term, flags_set) = (word1 | bits, x, true);
+                                        }
+                                        None => break,
+                                    },
+                                }
+                            }
+                            if matches!(w1, Term::Const(_)) || flags_set {
+                                out.bvh.push((site, BvhNodes::Memory { word1, word3 }));
+                            } else {
+                                descriptor(rsrc, Role::Resource)?;
+                                out.bvh.push((site, BvhNodes::Resource));
+                            }
+                        }
+                        _ => {
+                            descriptor(rsrc, Role::Resource)?;
+                            out.bvh.push((site, BvhNodes::Resource));
+                        }
                     }
                 }
                 Fields::Image { rsrc, sampler, .. } => {
@@ -1335,77 +1390,6 @@ impl<'a> Tracer<'a> {
             dword(src.get(1)?)?
         };
         Some((inst.read(Reg::Scc)?, set, clear))
-    }
-
-    /// The descriptor of `image_bvh*_intersect_ray`: no view, but the BVH's
-    /// address over 256 (dword 0 and the low byte of dword 1) and flags (see
-    /// `emit`'s BVH lowering). Only the flags it emulates pass: box sorting,
-    /// no box growth, no node bound, triangles returning barycentrics. The
-    /// address is a [`Source::Built`] around a root parameter's when the code
-    /// shifted one into place (`s_lshr_b64 ..., 8`), else `None`: the nodes
-    /// are then at a raw GPU address.
-    fn bvh_descriptor(&self, inst: &Inst, op: &Operand) -> Result<Option<Source>, &'static str> {
-        const WHY: &str = "a BVH descriptor with other flags";
-        let Operand::Scalar { code, dwords: 4 } = *op else {
-            return Err("a descriptor not in SGPRs");
-        };
-        let word = |k| {
-            inst.read(Reg::S(code + k))
-                .map(|v| self.origin(v))
-                .ok_or("a descriptor not in SGPRs")
-        };
-        let (Term::Const(w2), Term::Const(w3)) = (word(2)?, word(3)?) else {
-            return Err(WHY);
-        };
-        // Dword 1 holds address bits 32-39 under the flags: a constant, or
-        // the high half of the shift with the flags set.
-        let (high, flags) = match word(1)? {
-            Term::Const(c) => (None, c & !0xFF),
-            Term::Value(v) => match self.set_bits(v) {
-                Some((Term::Value(x), bits)) => (Some(x), bits),
-                _ => return Err(WHY),
-            },
-        };
-        // Bit 123 (dword 3 bit 27) is a page-size hint.
-        if flags != 0x8000_0000 || w2 != u32::MAX || w3 & !(1 << 27) != 0x8100_03FF {
-            return Err(WHY);
-        }
-        let shifted = match word(0)? {
-            Term::Value(lo) => self
-                .def(lo)
-                .filter(|s| s.name() == "s_lshr_b64" && s.writes.first().map(|w| w.1) == Some(lo)),
-            Term::Const(_) => None,
-        };
-        let Some(shift) = shifted else {
-            return if high.is_none() { Ok(None) } else { Err(WHY) };
-        };
-        let Fields::Sop { src, .. } = &shift.fields else {
-            return Err(WHY);
-        };
-        let pair = match (src.first(), src.get(1).and_then(|s| self.term(shift, s))) {
-            (Some(&Operand::Scalar { code, .. }), Some(Term::Const(8))) if code != NULL => {
-                let half = |k| shift.read(Reg::S(code + k)).map(|v| self.origin(v));
-                half(0).zip(half(1))
-            }
-            _ => None,
-        };
-        let (Some((lo, hi)), true) = (pair, high == shift.writes.get(1).map(|w| w.1)) else {
-            return Err(WHY);
-        };
-        let at = Sum {
-            base: None,
-            offset: 0,
-            dynamic: None,
-        };
-        // A computed base (title memory) is read from the operand.
-        match self.address(lo, hi, at) {
-            Ok(address) if address.param != MEMORY => Ok(Some(Source::Built {
-                address,
-                bits: flags,
-                words: [w2, w3],
-            })),
-            _ => Ok(None),
-        }
     }
 
     /// `v` as some other dword with constant bits set.

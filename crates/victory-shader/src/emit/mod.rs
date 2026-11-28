@@ -199,7 +199,7 @@ mod bitcode;
 #[cfg(test)]
 mod census_tests;
 #[cfg(all(test, windows))]
-mod bvh_tests;
+mod intersect_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod crosslane_tests;
@@ -404,7 +404,8 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
         })?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
-    let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let (mut p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    crate::spill::user_data(&mut p, &native);
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;

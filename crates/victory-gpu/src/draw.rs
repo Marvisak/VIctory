@@ -667,7 +667,8 @@ impl State {
             };
             // Shaders using title memory mark in a bitmap of their own, held
             // back while their results are (`crate::memory::withholding`).
-            let memory = p.stages.iter().any(|s| s.memory.is_some());
+            let memory = p.stages.iter().any(|s| s.memory.is_some())
+                && !crate::pipeline::builder_quarantined(self.pipeline as This);
             let (Some(table), Some(bitmap)) = (heap.and_then(|h| h.marks()), crate::shadow::view_writes(memory)) else {
                 once!("a shader marking its writes without a view heap: dropped");
                 not_run("write marks without a view heap");
@@ -1097,6 +1098,14 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            dropped(list, self.pipeline, "dispatch");
+            return;
+        }
+        if crate::pipeline::walk_held(self.pipeline as This)
+            || crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs()
+        {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
         }
@@ -1724,6 +1733,14 @@ impl State {
         };
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        if crate::pipeline::walk_held(self.pipeline as This) {
+            why("a walk of ray-tracing structures that are not built");
+            return false;
+        }
+        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            why("a stage of the ray-tracing structure builder, which is off");
+            return false;
+        }
         // A call with no host pipeline cannot run, and that is the common
         // case while the world builds its pipelines: #400 measures 1 400-1 750
         // indirect calls a frame dropped this way. Drop it here, before the

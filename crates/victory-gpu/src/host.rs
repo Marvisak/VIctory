@@ -3073,12 +3073,14 @@ impl Meter {
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
+            let held = crate::pipeline::WALKS_HELD.swap(0, Ordering::Relaxed) as f64 / report_frames;
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
-                 dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
+                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
+                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; \
+                  {held:.1} walks held/frame",
                 making = crate::pipeline::making()
             );
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();

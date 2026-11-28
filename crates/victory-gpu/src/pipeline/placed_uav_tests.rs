@@ -83,6 +83,7 @@ fn store_shader() -> Arc<Shader> {
             host,
             used: native.used,
         })),
+        walks: OnceLock::new(),
     })
 }
 

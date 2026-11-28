@@ -65,6 +65,8 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    walks: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -95,6 +97,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            walks: OnceLock::new(),
         }
     }
 
@@ -206,6 +210,147 @@ fn with_resources(
     Ok(Translated { host, used })
 }
 
+#[cfg(windows)]
+struct Builder {
+    pipelines: Vec<Arc<make::Pending>>,
+    whole: bool,
+    off: bool,
+    /// Pipelines already checked: ones added after `whole` latches still
+    /// need their host pipeline before the builder runs.
+    checked: usize,
+}
+
+#[cfg(windows)]
+static BUILDER: Mutex<Builder> = Mutex::new(Builder {
+    pipelines: Vec::new(),
+    whole: false,
+    off: false,
+    checked: 0,
+});
+
+#[cfg(windows)]
+fn of_builder(shaders: &[Arc<Shader>]) -> bool {
+    use victory_shader::{Container, FourCC};
+    let [shader] = shaders else {
+        return false;
+    };
+    if shader.stage != "compute" {
+        return false;
+    }
+    let Ok(c) = Container::parse(&shader.container) else {
+        return false;
+    };
+    c.part(FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
+}
+
+#[cfg(windows)]
+pub(crate) fn builder_quarantined(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    is_builder(this)
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(windows)]
+impl Shader {
+    fn walks(&self) -> bool {
+        *self.walks.get_or_init(|| container_walks(&self.container))
+    }
+}
+
+#[cfg(windows)]
+fn container_walks(container: &[u8]) -> bool {
+    use victory_shader::{Container, FourCC};
+    let Ok(c) = Container::parse(container) else {
+        return false;
+    };
+    c.part(FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(|p| code_walks(&p.code)))
+}
+
+#[cfg(windows)]
+fn code_walks(code: &[u8]) -> bool {
+    victory_shader::gfx10::decode(code)
+        .is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
+}
+
+#[cfg(windows)]
+pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+pub(crate) fn walk_held(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if this.is_null() || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    let p = pipeline(this);
+    if !p.shaders.iter().any(|s| s.stage == "compute" && s.walks()) {
+        return false;
+    }
+    if BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole {
+        return false;
+    }
+    if WALKS_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(
+                shaders = ?p.shaders,
+                "a dispatch of a program that walks ray-tracing structures is held back (VICTORY_BVH_HOLD=1)"
+            );
+        });
+    }
+    true
+}
+
+#[cfg(windows)]
+pub(crate) fn is_builder(this: This) -> bool {
+    !this.is_null() && pipeline(this).builder
+}
+
+#[cfg(windows)]
+pub(crate) fn builder_runs() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    if b.off {
+        return false;
+    }
+    if b.whole && b.checked == b.pipelines.len() {
+        return true;
+    }
+    // Check the pipelines added since the last time, even if the earlier
+    // ones were all made and `whole` is already latched.
+    let start = b.checked;
+    let missing = b.pipelines[start..]
+        .iter()
+        .filter(|p| !make::now(p))
+        .count();
+    if missing > 0 {
+        b.off = true;
+        for p in b.pipelines[start..].iter().filter(|p| !make::now(p)) {
+            tracing::warn!(shaders = ?make::shaders(p), "a builder pipeline with no host pipeline");
+        }
+        tracing::warn!(
+            missing,
+            of = b.pipelines.len() - start,
+            "the ray-tracing structure builder stays off"
+        );
+        return false;
+    }
+    tracing::info!(
+        pipelines = b.pipelines.len(),
+        "the ray-tracing structure builder runs"
+    );
+    b.checked = b.pipelines.len();
+    b.whole = true;
+    true
+}
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
@@ -214,6 +359,8 @@ struct Pipeline {
     shaders: Vec<Arc<Shader>>,
     /// Whether a list has bound it yet (its shaders are logged then).
     bound: std::sync::atomic::AtomicBool,
+    #[cfg(windows)]
+    builder: bool,
     /// What its host pipeline is made from, and the host pipeline once made
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
@@ -379,6 +526,8 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
+    let builder = of_builder(&shaders);
+    #[cfg(windows)]
     let host = Arc::new(make::Pending::new(
         shaders.clone(),
         graphics,
@@ -386,12 +535,22 @@ fn hand_out(
         skip_hashes(),
     ));
     #[cfg(windows)]
+    if builder {
+        BUILDER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pipelines
+            .push(host.clone());
+    }
+    #[cfg(windows)]
     make::early(&host);
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        builder,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

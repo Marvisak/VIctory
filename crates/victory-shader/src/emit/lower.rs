@@ -20,7 +20,10 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER_DATA};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
-mod bvh;
+/// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
+/// it shares the emitter's state.
+#[path = "intersect.rs"]
+pub(super) mod intersect;
 
 type Why = &'static str;
 
@@ -3544,6 +3547,15 @@ impl<'a> Lower<'a> {
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
             Fields::Valu(_) => self.valu(inst, b, i),
             Fields::Vintrp { .. } => self.interp(inst, (b, i)),
+            // The ray and node test. A failure is a refusal at once: an
+            // instruction without a side effect otherwise only stops the
+            // program where its results are needed, and two trace programs
+            // came out without their test that way.
+            Fields::Image { .. } if name.starts_with("image_bvh") => {
+                return self
+                    .bvh(inst, b, i)
+                    .map_err(|why| unsupported(offset, why));
+            }
             Fields::Image { .. } => self.image(inst, b, i),
             Fields::Buffer { .. } => self.buffer(inst, b, i),
             Fields::Exp { .. } => self.export(b, i),

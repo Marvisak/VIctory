@@ -106,6 +106,15 @@ impl Pending {
     }
 }
 
+pub(crate) fn shaders(p: &Pending) -> &[Arc<Shader>] {
+    &p.shaders
+}
+
+pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    p.make();
+    p.made.get().is_some_and(Option::is_some)
+}
+
 /// What identifies a title pipeline across runs: its shader containers
 /// and graphics state.
 pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
@@ -415,6 +424,7 @@ mod tests {
             hash: "0123456789abcdef".into(),
             container: Vec::new(),
             translated: OnceLock::new(),
+            walks: OnceLock::new(),
         });
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
         let warm = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
