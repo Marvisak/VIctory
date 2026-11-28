@@ -478,10 +478,12 @@ fn table(
 
 impl Shared {
     /// A page table for `heap`, named nothing yet (written at the first
-    /// submission that uses it).
+    /// submission that uses it). Written whole by the CPU and read by
+    /// shaders only: it lives in video memory where the device takes GPU
+    /// upload heaps (`VICTORY_GPU_UPLOAD`, [`crate::host::Host::upload_buffer_write_only`]).
     fn new(heap: &HostHeap) -> Option<Shared> {
         let bytes = TABLE_DWORDS as u64 * 4;
-        let (table, data) = crate::host::host()?.upload_buffer(bytes)?;
+        let (table, data) = crate::host::host()?.upload_buffer_write_only(bytes)?;
         crate::host::name(&table, || "title memory page table".into());
         let null = heap.pair()?;
         heap.raw_pair_at(null, None, 0);

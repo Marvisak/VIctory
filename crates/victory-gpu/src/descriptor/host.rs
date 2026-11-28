@@ -122,14 +122,16 @@ impl HostHeap {
         // Every slot a shader can index (title slots, also past a capped
         // heap, and dynamic ones): shaders read the table as a root view,
         // which has no bounds, at indices clamped below `HEAP_VIEWS`.
+        // The CPU only writes these tables and shaders read them: in video
+        // memory where the device takes GPU upload heaps (`VICTORY_GPU_UPLOAD`).
         let strides = (!sampler)
-            .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
+            .then(|| host.upload_buffer_write_only(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
             .flatten()
             .map(|(buffer, data)| (buffer, data as usize));
         let marks = (!sampler)
             .then(|| {
                 let bytes = u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 8;
-                let (buffer, data) = host.upload_buffer(bytes)?;
+                let (buffer, data) = host.upload_buffer_write_only(bytes)?;
                 crate::host::name(&buffer, || "view marks".into());
                 // Every slot unmarked (all ones) until a view is made there.
                 // SAFETY: our mapped buffer of `bytes` bytes.
@@ -571,7 +573,7 @@ impl HostHeap {
             // made afresh on a host whose heap is smaller than the title's
             // read past the title slots' entries: whatever followed the
             // buffer, or a GPU fault).
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.address_slots()) * 16)?;
+            let (buffer, data) = host()?.upload_buffer_write_only(u64::from(self.address_slots()) * 16)?;
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -607,7 +609,8 @@ impl HostHeap {
     }
 
     /// The view address entered for slot `index`; none for a slot past the
-    /// view addresses' buffer (tests).
+    /// view addresses' buffer (tests). The buffer may be a GPU upload heap
+    /// (video memory over the bus): this read is slow, and only tests do it.
     #[cfg(test)]
     fn address_at(&self, index: u32) -> Option<u64> {
         let (buffer, data, _) = self.addresses.get()?.as_ref()?;

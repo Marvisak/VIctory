@@ -409,6 +409,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn gpu_upload_defaults_on_and_zero_turns_it_off() {
+        use super::gpu_upload_on_for;
+        assert!(gpu_upload_on_for(None), "unset: on");
+        assert!(!gpu_upload_on_for(Some("0")), "0: off");
+        for on in ["1", "true", ""] {
+            assert!(gpu_upload_on_for(Some(on)), "{on:?}");
+        }
+    }
+
+    /// Buffers the CPU only writes go to a GPU upload heap (video memory)
+    /// where the device takes them; host copies, which the CPU reads back,
+    /// stay in write-back system memory.
+    #[test]
+    fn write_only_buffers_are_video_memory_and_copies_write_back() {
+        use super::{gpu_upload_on, host};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_CUSTOM,
+            D3D12_HEAP_TYPE_GPU_UPLOAD, D3D12_HEAP_TYPE_UPLOAD, D3D12_MEMORY_POOL_L0,
+            ID3D12Resource,
+        };
+        let Some(host) = host() else { return }; // no host GPU here
+        let heap_of = |resource: &ID3D12Resource| {
+            let mut heap = D3D12_HEAP_PROPERTIES::default();
+            // SAFETY: a live resource; the query writes `heap`.
+            unsafe { resource.GetHeapProperties(Some(&mut heap), None) }.unwrap();
+            heap
+        };
+        let (written, _data) = host.upload_buffer_write_only(1 << 16).expect("a write-only buffer");
+        let heap = heap_of(&written);
+        if host.gpu_upload_supported() && gpu_upload_on() {
+            assert_eq!(heap.Type, D3D12_HEAP_TYPE_GPU_UPLOAD, "the CPU only writes it");
+        } else {
+            assert_eq!(heap.Type, D3D12_HEAP_TYPE_UPLOAD, "upload memory, as before");
+        }
+        let (copy, _data) = host.shared_buffer(1 << 16).expect("a shared buffer");
+        let heap = heap_of(&copy);
+        assert_eq!(heap.Type, D3D12_HEAP_TYPE_CUSTOM);
+        assert_eq!(heap.CPUPageProperty, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, "the CPU reads it back");
+        assert_eq!(heap.MemoryPoolPreference, D3D12_MEMORY_POOL_L0);
+    }
+
+    #[test]
     fn swap_chain_failures_retry_once_per_second_and_success_clears_the_wait() {
         use super::{Duration, Instant, SwapChainRetry};
 
@@ -3584,19 +3626,27 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+/// `VICTORY_GPU_UPLOAD` (default on, `0` off): buffers the CPU only writes
+/// and the GPU reads (page tables, the heaps' view tables) in video memory
+/// where the device takes GPU upload heaps ([`Host::upload_buffer_write_only`]).
+fn gpu_upload_on_for(val: Option<&str>) -> bool {
+    val.is_none_or(|v| v.trim() != "0")
+}
+
+fn gpu_upload_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| gpu_upload_on_for(std::env::var("VICTORY_GPU_UPLOAD").ok().as_deref()))
+}
+
 impl Host {
-    /// Diagnostics, `VICTORY_COPIES_IN_VIDEO_MEMORY`: [`Host::shared_buffer`]s
-    /// (host copies of title memory among them) in video memory the CPU maps
-    /// (a GPU upload heap, where the host has one), to measure how much of
-    /// the GPU's time is shaders reading the copies over the bus. CPU reads
-    /// of them (snapshots, copy-backs) become slow: for that measurement only.
-    #[cfg(feature = "diagnostics")]
-    fn copies_in_video_memory(&self) -> bool {
+    /// Whether the device takes `D3D12_HEAP_TYPE_GPU_UPLOAD` resources: video
+    /// memory the CPU maps (write-combining), so the CPU's writes go there
+    /// over the bus and the GPU reads them at local speeds. Per
+    /// `GPUUploadHeapSupported` (`D3D12_FEATURE_D3D12_OPTIONS16`); on discrete
+    /// adapters it needs all of video memory CPU-visible (Resizable BAR).
+    fn gpu_upload_supported(&self) -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| {
-            if !crate::switch::on("VICTORY_COPIES_IN_VIDEO_MEMORY") {
-                return false;
-            }
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
             // SAFETY: the query writes its own structure of the given size.
             let ok = unsafe {
@@ -3608,8 +3658,24 @@ impl Host {
             }
             .is_ok()
                 && options.GPUUploadHeapSupported.as_bool();
-            tracing::warn!(on = ok, "host copies of title memory in video memory (diagnostics)");
+            tracing::debug!(on = ok, "GPU upload heaps");
             ok
+        })
+    }
+
+    /// Diagnostics, `VICTORY_COPIES_IN_VIDEO_MEMORY`: [`Host::shared_buffer`]s
+    /// (host copies of title memory among them) in video memory the CPU maps
+    /// (a GPU upload heap, where the host has one), to measure how much of
+    /// the GPU's time is shaders reading the copies over the bus. CPU reads
+    /// of them (snapshots, copy-backs) become slow: for that measurement only.
+    #[cfg(feature = "diagnostics")]
+    fn copies_in_video_memory(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = crate::switch::on("VICTORY_COPIES_IN_VIDEO_MEMORY")
+                && self.gpu_upload_supported();
+            tracing::warn!(on, "host copies of title memory in video memory (diagnostics)");
+            on
         })
     }
 
@@ -3617,6 +3683,10 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    ///
+    /// The CPU reads these (snapshots of what shaders write, copy-backs), so
+    /// they are not GPU upload heaps even where the device takes them:
+    /// [`Host::upload_buffer_write_only`] is for buffers it never reads.
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
@@ -3666,6 +3736,78 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                None
+            }
+        }
+    }
+
+    /// `size` bytes of memory the CPU only writes and the GPU reads (the
+    /// CPU never reads it back): video memory itself
+    /// (`D3D12_HEAP_TYPE_GPU_UPLOAD`) where `VICTORY_GPU_UPLOAD` is on
+    /// (default) and the device takes such heaps, else upload memory as
+    /// before. Page tables and the heaps' view tables are its users: shaders
+    /// read them again and again, and the CPU only fills them.
+    ///
+    /// The mapping is write-combining in either heap: write whole ranges
+    /// (`memcpy`-like), not scattered dwords, or each store takes the bus
+    /// alone. Reads there are slow (VRAM over the bus): the CPU must not.
+    pub(crate) fn upload_buffer_write_only(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if gpu_upload_on() && self.gpu_upload_supported() {
+            match self.gpu_upload_buffer(size) {
+                Some(made) => return Some(made),
+                None => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(size, "no GPU upload buffer: upload memory instead")
+                    });
+                }
+            }
+        }
+        self.upload_buffer(size)
+    }
+
+    /// A mapped `D3D12_HEAP_TYPE_GPU_UPLOAD` buffer of `size` bytes, in the
+    /// common state (a buffer moves to what a root view needs implicitly).
+    fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a CPU-visible buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no GPU upload buffer");
                 None
             }
         }
