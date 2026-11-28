@@ -2486,6 +2486,26 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, exact, zero, r)
     }
 
+    /// A multiply reads only the low 24 bits of each multiplicand.
+    fn extend_mul24(&mut self, value: V, signed: bool) -> V {
+        let c = self.cur;
+        if signed {
+            let width = self.s.m.i32(24);
+            let offset = self.s.m.i32(0);
+            return self.s.op(
+                c,
+                "tertiary.i32",
+                Attr::ReadNone,
+                self.s.t.i32,
+                51,
+                &[width, offset, value],
+            );
+        }
+        let shift = self.s.m.i32(8);
+        let value = self.s.m.bin(c, Bin::Shl, value, shift);
+        self.s.m.bin(c, Bin::LShr, value, shift)
+    }
+
     /// The high dword of a 32 × 32-bit product.
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
@@ -7497,18 +7517,9 @@ impl<'a> Lower<'a> {
             }
             "v_mul_u32_u24" | "v_mul_i32_i24" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let (sh, op) = (
-                    k(self, 8),
-                    if name == "v_mul_i32_i24" {
-                        Bin::AShr
-                    } else {
-                        Bin::LShr
-                    },
-                );
-                let a = self.s.m.bin(c, Bin::Shl, a, sh);
-                let a = self.s.m.bin(c, op, a, sh);
-                let b = self.s.m.bin(c, Bin::Shl, b, sh);
-                let b = self.s.m.bin(c, op, b, sh);
+                let signed = name == "v_mul_i32_i24";
+                let a = self.extend_mul24(a, signed);
+                let b = self.extend_mul24(b, signed);
                 self.s.m.bin(c, Bin::Mul, a, b)
             }
             "v_mul_hi_u32_u24" | "v_mul_hi_i32_i24" => {
@@ -7516,11 +7527,8 @@ impl<'a> Lower<'a> {
                 // of each operand, zero- or sign-extended, multiplied.
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let signed = name == "v_mul_hi_i32_i24";
-                let (sh, op) = (k(self, 8), if signed { Bin::AShr } else { Bin::LShr });
-                let a = self.s.m.bin(c, Bin::Shl, a, sh);
-                let a = self.s.m.bin(c, op, a, sh);
-                let b = self.s.m.bin(c, Bin::Shl, b, sh);
-                let b = self.s.m.bin(c, op, b, sh);
+                let a = self.extend_mul24(a, signed);
+                let b = self.extend_mul24(b, signed);
                 self.mul_hi(a, b, signed)
             }
             "v_bfe_u32" | "v_bfe_i32" => {
@@ -7586,18 +7594,9 @@ impl<'a> Lower<'a> {
             }
             "v_mad_u32_u24" | "v_mad_i32_i24" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let (sh, op) = (
-                    k(self, 8),
-                    if name == "v_mad_i32_i24" {
-                        Bin::AShr
-                    } else {
-                        Bin::LShr
-                    },
-                );
-                let a = self.s.m.bin(c, Bin::Shl, a, sh);
-                let a = self.s.m.bin(c, op, a, sh);
-                let b = self.s.m.bin(c, Bin::Shl, b, sh);
-                let b = self.s.m.bin(c, op, b, sh);
+                let signed = name == "v_mad_i32_i24";
+                let a = self.extend_mul24(a, signed);
+                let b = self.extend_mul24(b, signed);
                 let m = self.s.m.bin(c, Bin::Mul, a, b);
                 self.s.m.bin(c, Bin::Add, m, d)
             }
