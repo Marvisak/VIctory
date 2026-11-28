@@ -9463,7 +9463,12 @@ impl<'a> Lower<'a> {
         }
         // A descriptor built around a root view has the stride the code puts
         // in dword 1 (bits 16-29) and no record limit (dword 2 is -1): an
-        // index is a byte offset into the raw root view.
+        // index is a byte offset into the raw root view. With OOB_SELECT
+        // (dword 3 bits 28-29) 0 or 1 the console checks the index against
+        // the record count: a lane whose index is not below it (-1 here)
+        // reads 0, stores nothing and does no atomic (which returns 0).
+        // shortcut: mode 0's other check (offset >= stride) is left out.
+        let mut inside = None;
         let index = match (src, index) {
             (Source::Built { address, bits, words }, Some(ix))
                 if address.param < self.x.native.layout.len() && !typed =>
@@ -9474,9 +9479,28 @@ impl<'a> Lower<'a> {
                 let stride = self.s.m.i32(bits >> 16 & 0x3FFF);
                 let byte = self.s.m.bin(c, Bin::Mul, ix, stride);
                 off = self.s.m.bin(c, Bin::Add, off, byte);
+                if words[1] >> 28 & 3 <= 1
+                    && self.s.m.int_value(ix).is_none_or(|x| x as u32 >= words[0])
+                {
+                    let records = self.s.m.i32(words[0]);
+                    inside = Some(self.s.m.cmp(c, pred::IULT, ix, records));
+                }
                 None
             }
             (_, ix) => ix,
+        };
+        // The lanes that access memory: the guard's, less those out of range.
+        let access = match (guard, inside) {
+            (Some(g), Some(k)) => Some(self.s.m.bin(c, Bin::And, g, k)),
+            (g, k) => g.or(k),
+        };
+        // A loaded dword, 0 in lanes out of range.
+        let ranged = |l: &mut Self, x: V| match inside {
+            Some(k) => {
+                let zero = l.s.m.i32(0);
+                l.s.m.select(l.cur, k, x, zero)
+            }
+            None => x,
         };
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
@@ -9496,7 +9520,7 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = *data else {
                     return Err("a buffer result");
                 };
-                let (h, byte) = self.raw_view(site, src, byte, 4 * count, (11, 0), false, guard)?;
+                let (h, byte) = self.raw_view(site, src, byte, 4 * count, (11, 0), false, access)?;
                 for k in 0..count {
                     let four = self.s.m.i32(4 * k);
                     let a = self.s.m.bin(c, Bin::Add, byte, four);
@@ -9505,6 +9529,7 @@ impl<'a> Lower<'a> {
                     let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, a, u, mask, al]);
                     let x = self.s.m.extract(c, r, 0);
                     let x = self.as_int(x);
+                    let x = ranged(self, x);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
                 }
                 return Ok(());
@@ -9517,6 +9542,7 @@ impl<'a> Lower<'a> {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
                 let x = self.cbuffer_dword(h, a);
+                let x = ranged(self, x);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -9552,7 +9578,7 @@ impl<'a> Lower<'a> {
                     (h, [index, off, iu], byte)
                 }
                 None => {
-                    let (h, off) = self.raw_view(site, src, off, 4, (11 | u, 0), true, guard)?;
+                    let (h, off) = self.raw_view(site, src, off, 4, (11 | u, 0), true, access)?;
                     (h, [off, iu, iu], off)
                 }
             };
@@ -9564,7 +9590,16 @@ impl<'a> Lower<'a> {
                 Some(v) if returns => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
-            let at = self.begin_guarded(guard);
+            // Lanes out of range return 0; lanes outside the guard keep it.
+            let old = match (inside, guard) {
+                (Some(_), None) => self.s.m.i32(0),
+                (Some(_), Some(g)) if returns => {
+                    let zero = self.s.m.i32(0);
+                    self.s.m.select(self.cur, g, zero, old)
+                }
+                _ => old,
+            };
+            let at = self.begin_guarded(access);
             let i32t = self.s.t.i32;
             let r = if op == u32::MAX {
                 // cmpswap: data is (new, compare).
@@ -9612,8 +9647,8 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.bin(c, Bin::Shl, field, sh);
             let all = self.s.m.i32(u32::MAX);
             let keep = self.s.m.bin(c, Bin::Xor, mask, all);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
-            let begin = self.begin_guarded(guard);
+            let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, access)?;
+            let begin = self.begin_guarded(access);
             let i32t = self.s.t.i32;
             for (op, v) in [(1, keep), (2, x)] {
                 let args = [h, self.s.m.i32(op), at, iu, iu, v];
@@ -9707,7 +9742,7 @@ impl<'a> Lower<'a> {
                     None => {
                         let n = 4 * count;
                         let (h, off) =
-                            self.raw_view(site, src, off, n, (11 | u, 0), true, guard)?;
+                            self.raw_view(site, src, off, n, (11 | u, 0), true, access)?;
                         args.extend([h, off, iu]);
                         (byte, bytes) = (off, n);
                     }
@@ -9720,7 +9755,7 @@ impl<'a> Lower<'a> {
             if !typed {
                 args.push(self.s.m.i32(4));
             }
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(access);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.mark_view_write(args[0], byte, bytes, None);
@@ -9731,7 +9766,7 @@ impl<'a> Lower<'a> {
             if index.is_some() {
                 return Err("a typed-format load by index");
             }
-            let (h, off) = self.raw_view(site, src, off, 4 * count, (11 | u, 0), false, guard)?;
+            let (h, off) = self.raw_view(site, src, off, 4 * count, (11 | u, 0), false, access)?;
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
@@ -9740,6 +9775,7 @@ impl<'a> Lower<'a> {
                 xs = self.d16_channels(f, xs)?;
             }
             for (k, x) in xs.into_iter().enumerate() {
+                let x = ranged(self, x);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -9752,7 +9788,7 @@ impl<'a> Lower<'a> {
             }
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, guard)?;
+            let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, access)?;
             let c = self.cur;
             let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
             let r = self.s.op(
@@ -9777,6 +9813,7 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
+            let x = ranged(self, x);
             self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
@@ -9821,7 +9858,7 @@ impl<'a> Lower<'a> {
                 None => {
                     let bytes = 4 * count;
                     let (h, off) =
-                        self.raw_view(site, src, off, bytes, (11 | u, 0), false, guard)?;
+                        self.raw_view(site, src, off, bytes, (11 | u, 0), false, access)?;
                     self.s.op(
                         self.cur,
                         "rawBufferLoad.f32",
@@ -9871,13 +9908,15 @@ impl<'a> Lower<'a> {
                         None => h,
                     });
                 }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                let x = ranged(self, x.expect("a channel"));
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
             let x = self.as_int(x);
+            let x = ranged(self, x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())

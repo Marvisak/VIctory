@@ -487,6 +487,256 @@ fn root_views_read_their_copy_and_zeros_past_it() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+/// The program of [`root_views_by_index_drop_lanes_out_of_range`]; with
+/// `memory` it also reads a dword through a pointer in root constants
+/// (s[0:1]), so it uses title memory and its root UAV is title memory.
+fn root_index_program(memory: bool) -> HostShader {
+    const fn vop2(op: u32, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+        op << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | src0 as u32
+    }
+    /// MUBUF `op` of `vdata` at `vaddr` plus `byte_off` through
+    /// `s[srsrc:srsrc+3]`, `bits` its `idxen`, `offen` and `glc` bits.
+    const fn mubuf(op: u32, vdata: u8, vaddr: u8, srsrc: u8, bits: u32, byte_off: u32) -> [u32; 2] {
+        [
+            0x38 << 26 | op << 18 | bits | byte_off,
+            0x80 << 24 | (srsrc as u32 >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32,
+        ]
+    }
+    const V_LSHLREV_B32: u32 = 0x1A;
+    const V_ADD_NC_U32: u32 = 0x25;
+    const BUFFER_LOAD_DWORD: u32 = 0x0C;
+    const BUFFER_STORE_DWORD: u32 = 0x1C;
+    const BUFFER_ATOMIC_ADD: u32 = 0x32;
+    const OFFEN: u32 = 1 << 12;
+    const IDXEN: u32 = 1 << 13;
+    const GLC: u32 = 1 << 14;
+    let mut w = vec![s_mov_b32(5, ZERO as u8)]; // s[4:5]: the table at s4
+    if memory {
+        w.extend(s_load(0, 26, 0, 0)); // s26 = the dword at the pointer
+    }
+    // s[12:15], s[16:19] and s[20:23]: the root UAV's buffer descriptor,
+    // stride 16, records -1, with OOB_SELECT 1 (the console's word 3), 0
+    // and 3.
+    let modes = [(12u8, 0x1101_4FAC), (16, 0x0101_4FAC), (20, 0x3101_4FAC)];
+    for (sdst, word3) in modes {
+        w.push(s_mov_b32(sdst, 6));
+        // s_or_b32 s[sdst + 1], s7, stride 16
+        w.extend([0x8800_FF07 | u32::from(sdst + 1) << 16, 0x0010_0000]);
+        w.push(s_mov_b32(sdst + 2, 0xC1));
+        w.extend([s_mov_b32(sdst + 3, 0xFF), word3]);
+    }
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
+    w.push(vop2(V_ADD_NC_U32, 1, 128 + 65, 0)); // v1 = lane - 1, the index
+    w.extend([vop2(V_ADD_NC_U32, 2, 255, 0), 0x100]); // v2 = 0x100 + lane
+    w.push(v_mov_b32(3, 129)); // v3 = 1
+    w.extend([v_mov_b32(4, 255), 0xDEAD]); // v4 = 0xdead
+    w.extend(mubuf(BUFFER_STORE_DWORD, 2, 1, 12, IDXEN, 0));
+    w.push(0x7D8A_0082); // v_cmp_ne_u32 vcc_lo, 2, v0
+    w.push(0xBE98_3C6A); // s_and_saveexec_b32 s24, vcc_lo
+    w.extend(mubuf(BUFFER_ATOMIC_ADD, 3, 1, 12, IDXEN | GLC, 4));
+    w.push(s_mov_b32(126, 24)); // s_mov_b32 exec_lo, s24
+    w.extend(mubuf(BUFFER_LOAD_DWORD, 4, 1, 12, IDXEN, 8));
+    w.extend(mubuf(BUFFER_STORE_DWORD, 2, 1, 16, IDXEN, 12));
+    if !memory {
+        // Not checked: lane 0's store wraps to the record before the root.
+        w.extend(mubuf(BUFFER_STORE_DWORD, 2, 1, 20, IDXEN, 8));
+    }
+    w.push(vop2(V_LSHLREV_B32, 5, 128 + 3, 0)); // v5 = lane << 3
+    w.push(S_WAITCNT_ALL);
+    w.extend(mubuf(BUFFER_STORE_DWORD, 3, 5, 8, OFFEN, 0));
+    w.extend(mubuf(BUFFER_STORE_DWORD, 4, 5, 8, OFFEN, 4));
+    if memory {
+        w.push(v_mov_b32(6, 26));
+        w.extend(buffer_store_dword(6, 8, 256));
+    }
+    w.push(S_ENDPGM);
+    let param = |root, user_data, sgprs, slot| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let mut layout = vec![param(RootType::Table, 4, 1, 1), param(RootType::Descriptor, 6, 2, 2)];
+    if memory {
+        layout.insert(0, param(RootType::Constants, 0, 2, 0));
+    }
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 7,
+        layout,
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 16,
+                dwords: 4,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 8 << 1,
+            threads: [32, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+    })
+    .expect("lower");
+    assert!(l.root_uavs.is_empty() && !l.view_addresses, "no root descriptor");
+    assert_eq!(l.memory && l.memory_writes, memory, "title memory");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
+    }
+    shader
+}
+
+/// A root UAV's buffer descriptor read by index (`idxen`, stride 16, no
+/// record limit) checks the index as the console does with OOB_SELECT 0
+/// and 1: a lane at index -1 (the ray-tracing builder's, #3486) stores
+/// nothing, adds nothing (its atomic returns 0) and loads 0, where index
+/// times stride would wrap to the record before the root address (in
+/// title memory 16 bytes short of 4 GiB past it, which would mark its
+/// region missed). Lanes at indices 0-30 store, add and load their
+/// records; lane 2, outside the atomic's guard, keeps its register. With
+/// OOB_SELECT 3 the index is not checked. Both through the host's view of
+/// a root UAV's copy and as title memory.
+#[test]
+fn root_views_by_index_drop_lanes_out_of_range() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let copy: Vec<u32> = (0..256).map(|k| 0x1000 + k).collect();
+    let mut ran = 0;
+    for memory in [false, true] {
+        let shader = root_index_program(memory);
+        // The root address 64 bytes into the copy: record i at dword
+        // 16 + 4i, record -1 at dword 12.
+        let mut want_copy = copy.clone();
+        let mut want = vec![0u32; 65];
+        for lane in 1..32u32 {
+            let d = (16 + 4 * (lane - 1)) as usize;
+            want_copy[d] = 0x100 + lane;
+            want_copy[d + 3] = 0x100 + lane;
+            if !memory {
+                want_copy[d + 2] = 0x100 + lane;
+            }
+            let at = 2 * lane as usize;
+            if lane == 2 {
+                want[at] = 1;
+            } else {
+                want[at] = copy[d + 1];
+                want_copy[d + 1] += 1;
+            }
+            want[at + 1] = copy[d + 2];
+        }
+        if memory {
+            want[64] = copy[0];
+        } else {
+            want_copy[14] = 0x100;
+        }
+        let root_uav = TITLE + 64;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match u.root {
+                    RootType::Constants => (TITLE >> (32 * u.dword)) as u32,
+                    // In title memory the root address, else the copy's UAV
+                    // at heap index 2 and the root address 64 bytes into it.
+                    RootType::Descriptor if memory => (root_uav >> (32 * u.dword)) as u32,
+                    RootType::Descriptor => [2, 64][(u.index - 6) as usize],
+                    _ => 0,
+                };
+            }
+            let d = if memory {
+                Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: page_table(1, 3) }),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[View::RawUav(65), View::Memory(&copy), View::Pair, View::NullPair, View::Pair],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                }
+            } else {
+                Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(65), View::Memory(&copy), View::Pair],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                }
+            };
+            let out = host
+                .dispatch(&root, &pso, &d)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let label = format!("{label}, title memory {memory}");
+            assert_eq!(out[0], want, "{label}: atomic returns and loads");
+            assert_eq!(out[1], want_copy, "{label}: the copy");
+            if memory {
+                // The page written; no region missed.
+                let entry = 4096 + (TITLE as u32 >> 16 & 0xFFF) as usize;
+                let marked: Vec<usize> = (0..out[2].len() * 32)
+                    .filter(|&b| out[2][b / 32] >> (b % 32) & 1 != 0)
+                    .collect();
+                assert_eq!(marked, [entry], "{label}: pages");
+            }
+            ran += 1;
+        }
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
 /// Writes through unordered buffer views mark their pages (`emit`, "Write
 /// marks"): a dword store and a 16-byte store through view 0 (base bit 100,
 /// its first byte 16 bytes before a 64 KiB page ends, so the second store
