@@ -351,6 +351,15 @@ fn log_gpu_times(frames: f64) {
     for (key, (ms, n)) in by.iter().take(25) {
         tracing::info!("  GPU {:.2} ms/frame in {:.1} commands/frame: {key}", ms / frames, *n as f64 / frames);
     }
+    // A traced pipeline can fall out of the top 25 as soon as a fix makes
+    // it faster. Report its measured total and count even when it does.
+    if !traced_shaders().is_empty() {
+        for (key, (ms, n)) in &by {
+            if !key.starts_with("DROPPED ") && is_traced(key) {
+                tracing::info!(command = %key, commands = *n, total_ms = *ms, frames, "traced GPU timing");
+            }
+        }
+    }
 }
 
 /// Diagnostics: the host device's video memory use and budget, in MB, local
