@@ -4031,14 +4031,14 @@ void main(uint3 id : SV_DispatchThreadID) {
                 "#define RS \"DescriptorTable(UAV(u0))\"\n{put}\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) {{ put(id.xy); }}"
             ));
             let list = host.new_list().unwrap();
-            let copies = crate::texture::ALIAS_COPIES.load(Ordering::Relaxed);
+            let copies = crate::texture::test_alias_copies();
             readable(&list, &used(ResourceType::Uav), &unordered, false);
             run(&list, &slots, &write, 0, None, (size / 8, size / 8));
             readable(&list, &used(ResourceType::Srv), &view, false);
             run(&list, &slots, &read, 1, Some(&out), (read_size / 8, read_size / 8));
             list.close();
             host.execute(&[&list]);
-            let copied = crate::texture::ALIAS_COPIES.load(Ordering::Relaxed) > copies;
+            let copied = crate::texture::test_alias_copies() > copies;
             assert_eq!(copied, !shared, "round {round}: a copy only where not shared");
             let n = read_size as usize;
             for i in [0usize, 7, n * 9 + 33, n * n - 1] {

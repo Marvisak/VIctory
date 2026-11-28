@@ -271,6 +271,16 @@ pub(crate) fn retained_subresources_recorded(copy: &Arc<crate::resource::HostTex
 /// Copies [`alias_copy`] recorded since the last frame-rate line.
 pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_ALIAS_COPIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_alias_copies() -> u64 {
+    TEST_ALIAS_COPIES.with(std::cell::Cell::get)
+}
+
 /// Records, once per list, the copy of `from`'s host texture into `to`'s:
 /// two title textures at one memory that cannot share a host texture
 /// (`resource::alias_source`: block-compressed against plain formats of
@@ -363,6 +373,8 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         }
     }
     ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    TEST_ALIAS_COPIES.with(|copies| copies.set(copies.get() + 1));
     static LOGGED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
     let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
     if logged.len() < 64 && !logged.contains(&(from as usize, to as usize)) {
