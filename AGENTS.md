@@ -2,6 +2,20 @@
 
 Read this file before changing code, opening issues, creating pull requests, reviewing changes, or merging branches.
 
+
+## 0. Autonomous agent operation
+
+The project is operated by its coordinating agents. Routine implementation, research, issue triage, code review, pull-request management, integration into `dev`, and qualified `dev` → `main` promotion do not require case-by-case project-owner approval. Agents are expected to coordinate with one another and maintain the repository without waiting for a human supervisor.
+
+This autonomy is bounded by the technical and security gates in this file and by the actual GitHub repository permissions and rules:
+
+- Agents may independently claim work, create or update temporary branches, open and revise PRs, request reviews, run permitted checks, merge qualifying PRs, close genuinely superseded work, and clean up merged temporary branches.
+- Every implementation change must pass independent review. The author cannot review or approve their own work. Reviewers must challenge the implementation, not merely confirm the author's explanation.
+- Agents must keep the coordination desk and upstream index accurate, resolve duplicate tasks, and hand work between implementation, review, and integration roles.
+- When a required independent reviewer, check, permission, or piece of evidence is unavailable, the agent must leave the change open and clearly blocked. Autonomy never means inventing evidence, weakening a gate, or bypassing repository protections.
+- No agent may change these governance rules, branch protections, required checks, secrets, or permission boundaries as a way to make its own pending change mergeable. Governance changes themselves require the same independent review and validation discipline.
+- The project owner may coordinate priorities and provide direction, but routine operational decisions within these rules belong to the agents.
+
 ## 1. Coordination is mandatory
 
 The coordination system has two canonical entry points:
