@@ -7586,20 +7586,22 @@ impl<'a> Lower<'a> {
             }
             "v_mad_u32_u24" | "v_mad_i32_i24" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let (sh, op) = (
-                    k(self, 8),
-                    if name == "v_mad_i32_i24" {
-                        Bin::AShr
-                    } else {
-                        Bin::LShr
-                    },
-                );
+                let signed = name == "v_mad_i32_i24";
+                let (sh, op) = (k(self, 8), if signed { Bin::AShr } else { Bin::LShr });
                 let a = self.s.m.bin(c, Bin::Shl, a, sh);
                 let a = self.s.m.bin(c, op, a, sh);
                 let b = self.s.m.bin(c, Bin::Shl, b, sh);
                 let b = self.s.m.bin(c, op, b, sh);
-                let m = self.s.m.bin(c, Bin::Mul, a, b);
-                self.s.m.bin(c, Bin::Add, m, d)
+                // The addend and the wrapping result use all 32 bits.
+                let mad = if signed { 48 } else { 49 };
+                self.s.op(
+                    c,
+                    "tertiary.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    mad,
+                    &[a, b, d],
+                )
             }
             "v_sad_u8" | "v_sad_hi_u8" | "v_sad_u16" | "v_sad_u32" | "v_msad_u8" => {
                 // src2 plus the sum of the unsigned differences |a - b| of
