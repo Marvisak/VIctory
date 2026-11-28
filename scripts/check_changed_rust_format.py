@@ -99,9 +99,16 @@ def main() -> int:
             b=formatted,
             autojunk=False,
         )
-        for tag, i1, i2, _j1, _j2 in matcher.get_opcodes():
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag != "equal" and overlaps_changed_lines(i1, i2, ranges):
                 failures.append(path)
+                print(
+                    f"rustfmt overlap in {path}: original lines {i1 + 1}-{i2}, "
+                    f"changed ranges {ranges}",
+                    file=sys.stderr,
+                )
+                print(f"  before: {''.join(original[i1:i2])!r}", file=sys.stderr)
+                print(f"  after:  {''.join(formatted[j1:j2])!r}", file=sys.stderr)
                 break
 
     if failures:
