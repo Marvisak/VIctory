@@ -41,6 +41,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
+static LIBRARY: OnceLock<Option<Shared>> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
@@ -134,7 +135,6 @@ const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 const EARLY_MAX: usize = 8192;
 
 fn library() -> Option<&'static Shared> {
-    static LIBRARY: OnceLock<Option<Shared>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
@@ -301,19 +301,38 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Saves new pipelines or early-start keys at most every 20 seconds unless
+/// requested immediately. The early list can be saved without a native library.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
+    let (Some(dir), library) = (DIR.get(), library()) else {
+        return;
+    };
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        return;
     }
+    let Some(library) = library else {
+        if USED_CHANGED.swap(false, Ordering::Relaxed) {
+            *last = Some(std::time::Instant::now());
+            // Keep the save lock through the early-only write so a later
+            // snapshot cannot be replaced by an older one.
+            let used = used().as_ref().map(Used::list).unwrap_or_default();
+            let written = std::fs::create_dir_all(dir)
+                .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+            match written {
+                Ok(()) => tracing::info!(early = used.len(), "early pipeline list saved"),
+                Err(e) => {
+                    USED_CHANGED.store(true, Ordering::Relaxed);
+                    tracing::warn!(error = %e, "early pipeline list not saved");
+                }
+            }
+        }
+        return;
+    };
+    *last = Some(std::time::Instant::now());
+    drop(last);
     let (blob, prebuilt) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
@@ -491,6 +510,64 @@ mod tests {
     fn a_save_buffer_the_host_cannot_give_is_refused() {
         assert!(zeroed(usize::MAX / 2).is_none());
         assert_eq!(zeroed(100).as_deref(), Some(&[0u8; 100][..]));
+    }
+
+    #[test]
+    fn early_list_persists_without_a_host_library() {
+        const CACHE: &str = "VICTORY_TEST_EARLY_ONLY_CACHE";
+        const PHASE: &str = "VICTORY_TEST_EARLY_ONLY_PHASE";
+        if let Some(path) = std::env::var_os(CACHE) {
+            let dir = PathBuf::from(path);
+            use_pipeline_cache(dir.clone());
+            assert!(LIBRARY.set(None).is_ok());
+            let early = dir.join(EARLY_FILE);
+            if std::env::var(PHASE).unwrap() == "save" {
+                save(true);
+                assert!(!early.exists());
+
+                // An ordinary I/O failure leaves the recorded key pending.
+                std::fs::create_dir(&early).unwrap();
+                note_used("first");
+                save(true);
+                assert!(early.is_dir());
+                std::fs::remove_dir(&early).unwrap();
+                save(true);
+                let recovered =
+                    std::fs::read_to_string(&early).expect("retry writes the early list");
+                assert_eq!(recovered, "first");
+
+                note_used("second");
+                save(true);
+                assert!(!dir.join(LIBRARY_FILE).exists());
+                assert!(!dir.join(PREBUILT_FILE).exists());
+            } else {
+                assert!(wanted_early("first"));
+                assert!(wanted_early("second"));
+                assert!(!wanted_early("unused"));
+            }
+            return;
+        }
+
+        // Cache configuration and the read-once list belong to one process.
+        let dir = tempfile::tempdir().unwrap();
+        for phase in ["save", "load"] {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pipeline::library::tests::early_list_persists_without_a_host_library",
+                ])
+                .env(CACHE, dir.path())
+                .env(PHASE, phase)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success()
+                    && String::from_utf8_lossy(&result.stdout).contains("1 passed; 0 failed"),
+                "{phase}: {}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
     }
 
     #[test]
