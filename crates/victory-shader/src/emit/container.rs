@@ -64,38 +64,16 @@ impl SigElement {
 }
 
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
-/// Gives the elements of a row whose interpolation mode nothing decided
-/// (float elements, unless `read` and read) the mode the row's other
-/// elements agree on: DXIL wants one mode per row, and the console's
-/// signature, packed by the source's modes, had one (an int or a system
-/// value beside a float means the float was `nointerpolation`).
-pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
-    let free = |e: &SigElement| e.kind == 0 && e.comp == 9 && !(read && e.usage != 0);
-    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
-    rows.sort_unstable();
-    rows.dedup();
-    for row in rows {
-        let decided = |e: &&SigElement| e.row == Some(row) && !free(e) && e.interp != 0;
-        let mut modes = elements.iter().filter(decided).map(|e| e.interp);
-        let Some(mode) = modes.next() else { continue };
-        if modes.any(|m| m != mode) {
-            continue;
-        }
-        let undecided = |e: &&mut SigElement| e.row == Some(row) && free(e);
-        for e in elements.iter_mut().filter(undecided) {
-            e.interp = mode;
-        }
-    }
-}
-
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend((elements.len() as u32).to_le_bytes());
     out.extend(8u32.to_le_bytes());
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
-    // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the semantic's string, which is one static string per system value).
+    // Rows are grouped stably by register (unallocated last), preserving the
+    // console's intra-row element order so interleaved signatures like
+    // `[0, 1, 0]` emit contiguously.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -375,22 +353,70 @@ pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
 fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
     const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
     const K: [u32; 64] = [
-        0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee,
-        0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501,
-        0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be,
-        0x6b90_1122, 0xfd98_7193, 0xa679_438e, 0x49b4_0821,
-        0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa,
-        0xd62f_105d, 0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8,
-        0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed,
-        0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a,
-        0xfffa_3942, 0x8771_f681, 0x6d9d_6122, 0xfde5_380c,
-        0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70,
-        0x289b_7ec6, 0xeaa1_27fa, 0xd4ef_3085, 0x0488_1d05,
-        0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665,
-        0xf429_2244, 0x432a_ff97, 0xab94_23a7, 0xfc93_a039,
-        0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1,
-        0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1,
-        0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb, 0xeb86_d391,
+        0xd76a_a478,
+        0xe8c7_b756,
+        0x2420_70db,
+        0xc1bd_ceee,
+        0xf57c_0faf,
+        0x4787_c62a,
+        0xa830_4613,
+        0xfd46_9501,
+        0x6980_98d8,
+        0x8b44_f7af,
+        0xffff_5bb1,
+        0x895c_d7be,
+        0x6b90_1122,
+        0xfd98_7193,
+        0xa679_438e,
+        0x49b4_0821,
+        0xf61e_2562,
+        0xc040_b340,
+        0x265e_5a51,
+        0xe9b6_c7aa,
+        0xd62f_105d,
+        0x0244_1453,
+        0xd8a1_e681,
+        0xe7d3_fbc8,
+        0x21e1_cde6,
+        0xc337_07d6,
+        0xf4d5_0d87,
+        0x455a_14ed,
+        0xa9e3_e905,
+        0xfcef_a3f8,
+        0x676f_02d9,
+        0x8d2a_4c8a,
+        0xfffa_3942,
+        0x8771_f681,
+        0x6d9d_6122,
+        0xfde5_380c,
+        0xa4be_ea44,
+        0x4bde_cfa9,
+        0xf6bb_4b60,
+        0xbebf_bc70,
+        0x289b_7ec6,
+        0xeaa1_27fa,
+        0xd4ef_3085,
+        0x0488_1d05,
+        0xd9d4_d039,
+        0xe6db_99e5,
+        0x1fa2_7cf8,
+        0xc4ac_5665,
+        0xf429_2244,
+        0x432a_ff97,
+        0xab94_23a7,
+        0xfc93_a039,
+        0x655b_59c3,
+        0x8f0c_cc92,
+        0xffef_f47d,
+        0x8584_5dd1,
+        0x6fa8_7e4f,
+        0xfe2c_e6e0,
+        0xa301_4314,
+        0x4e08_11a1,
+        0xf753_7e82,
+        0xbd3a_f235,
+        0x2ad7_d2bb,
+        0xeb86_d391,
     ];
     let x: [u32; 16] = std::array::from_fn(|i| {
         u32::from_le_bytes([
@@ -439,5 +465,40 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn signature_groups_rows_stably_and_keeps_intra_row_order() {
+        // Interleaved rows `[0, 1, 0]`: rows are grouped contiguously, while
+        // intra-row element order is preserved.
+        let el = |name: &str, row, col| SigElement {
+            name: name.into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 1,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage: 1 << col,
+            half: false,
+        };
+        let part = signature(&[el("A", 0, 0), el("B", 1, 0), el("C", 0, 2)], true);
+        let row_at = |i: usize| {
+            let at = 8 + 32 * i;
+            u32::from_le_bytes(part[at + 20..at + 24].try_into().unwrap())
+        };
+        let name_at = |i: usize| {
+            let at = 8 + 32 * i;
+            let offset = u32::from_le_bytes(part[at + 4..at + 8].try_into().unwrap()) as usize;
+            let end = part[offset..].iter().position(|&b| b == 0).unwrap();
+            std::str::from_utf8(&part[offset..offset + end]).unwrap()
+        };
+        assert_eq!(row_at(0), 0);
+        assert_eq!(name_at(0), "A");
+        assert_eq!(row_at(1), 0);
+        assert_eq!(name_at(1), "C");
+        assert_eq!(row_at(2), 1);
+        assert_eq!(name_at(2), "B");
     }
 }

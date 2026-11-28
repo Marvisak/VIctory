@@ -249,7 +249,7 @@ impl Shader {
             .sampler_choices
             .iter()
             .copied()
-            .find(|&(a, _, _)| args.contains(&a));
+            .find(|&(a, _, _)| all.contains(&a));
         let r = self.m.call(block, f, all.clone());
         let Some((a, b, cond)) = choice else {
             return r;
@@ -511,6 +511,9 @@ impl Shader {
         self.annotate(block, h, 14 | cmp, 0)
     }
 
+    /// Static samplers are emitted as individual descriptors; no multi-
+    /// descriptor static sampler range handles. Keep a helper absent so new
+    /// code cannot reintroduce indexed static-sampler bindings.
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
@@ -542,7 +545,9 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self
+            .m
+            .i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
@@ -581,7 +586,11 @@ impl Shader {
             (flags::WAVE_OPS, uses.wave),
             (flags::INT64, uses.int64),
         ] {
-            self.flags = if used { self.flags | flag } else { self.flags & !flag };
+            self.flags = if used {
+                self.flags | flag
+            } else {
+                self.flags & !flag
+            };
         }
         // UAVs outside pixel and compute programs (the write and read marks
         // of vertex, geometry and mesh programs), as DXC counts them: UAV
@@ -786,6 +795,15 @@ impl Shader {
         }
 
         let graphics = self.threads.is_none() || self.mesh.is_some();
+        // DXIL requires every signature element packed into the same row to
+        // share one interpolation mode. Integer / SV_IsFrontFace elements must
+        // stay constant (1); otherwise a read element's mode wins over unread
+        // siblings in the same row.
+        if self.pixel {
+            reconcile_row_interp(&mut self.inputs);
+        } else if graphics {
+            reconcile_row_interp(&mut self.outputs);
+        }
         if graphics {
             // shortcut: every output is declared to depend on every input; the
             // exact sets need a dependence pass. Drivers read this state.
@@ -824,11 +842,6 @@ impl Shader {
             self.m.named_md("dx.viewIdState", vec![view_node]);
         }
 
-        if self.pixel {
-            container::same_mode_per_row(&mut self.inputs, true);
-        } else {
-            container::same_mode_per_row(&mut self.outputs, false);
-        }
         let sigs = if graphics {
             let ins = self.signature_md(self.inputs.clone());
             let outs = self.signature_md(self.outputs.clone());
@@ -1038,6 +1051,56 @@ impl Shader {
     }
 }
 
+/// Ensures elements sharing a signature row declare one DXIL interpolation
+/// mode. Integer / system values or `interp = 0` (constant) integer system
+/// values force the row to `constant` (`1`); otherwise, a used element's mode
+/// wins, and conflicting float interpolation modes fall back to `constant`.
+fn reconcile_row_interp(elems: &mut [SigElement]) {
+    let mut row_mode: std::collections::HashMap<u32, (bool, Option<u8>, bool)> =
+        std::collections::HashMap::new();
+    for e in elems.iter() {
+        let Some(row) = e.row else { continue };
+        let entry = row_mode.entry(row).or_insert((false, None, false));
+        let is_integer_or_sv = e.kind != 0 || e.comp != 9;
+        if e.interp == 0 {
+            if is_integer_or_sv {
+                entry.0 = true;
+            }
+            continue;
+        }
+        if is_integer_or_sv || e.interp == 1 {
+            entry.0 = true;
+        } else if e.usage != 0 {
+            // Only a used element decides the row's mode. An unread sibling
+            // must not introduce a competing mode that would force the row
+            // to constant before the used element is seen.
+            match entry.1 {
+                None => entry.1 = Some(e.interp),
+                Some(m) if m != e.interp => entry.2 = true,
+                _ => {}
+            }
+        }
+    }
+    for e in elems.iter_mut() {
+        let Some(row) = e.row else { continue };
+        if e.interp == 0 {
+            if row_mode.get(&row).is_some_and(|m| m.0) {
+                e.interp = 1;
+            }
+            continue;
+        }
+        if let Some(&(force_const, used_mode, conflict)) = row_mode.get(&row) {
+            if force_const || conflict {
+                e.interp = 1;
+            } else if e.usage == 0
+                && let Some(m) = used_mode
+            {
+                e.interp = m;
+            }
+        }
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::super::bitcode::Term;
@@ -1059,7 +1122,14 @@ mod tests {
         let (or, zero, one) = (s.m.i32(2), s.m.i32(0), s.m.i32(1));
         let iu = s.m.undef(s.t.i32);
         let i32t = s.t.i32;
-        s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, or, zero, iu, iu, one]);
+        s.op(
+            b,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            78,
+            &[h, or, zero, iu, iu, one],
+        );
         s.m.terminate(b, Term::Ret);
         s.finish()
     }
@@ -1086,6 +1156,69 @@ mod tests {
                 v.validate(&mut dxil)
                     .unwrap_or_else(|e| panic!("{name}: {e}"));
             }
+        }
+    }
+
+    fn elem(
+        name: &str,
+        kind: u8,
+        comp: u8,
+        interp: u8,
+        row: u32,
+        col: u8,
+        usage: u8,
+    ) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn reconcile_row_interp_matches_constant_and_used_siblings() {
+        let mut elems = vec![
+            elem("TEXCOORD", 0, 9, 2, 7, 0, 0),
+            elem("SV_IsFrontFace", 13, 5, 1, 7, 1, 1),
+            elem("TEXCOORD", 0, 9, 2, 8, 0, 0),
+            elem("TEXCOORD", 0, 9, 3, 8, 1, 1),
+            elem("SV_PrimitiveID", 8, 4, 0, 9, 0, 1),
+            elem("TEXCOORD", 0, 9, 2, 9, 1, 1),
+            elem("TEXCOORD", 0, 9, 2, 10, 0, 1),
+            elem("TEXCOORD", 0, 9, 3, 10, 1, 1),
+        ];
+        reconcile_row_interp(&mut elems);
+        assert_eq!(elems[0].interp, 1);
+        assert_eq!(elems[1].interp, 1);
+        assert_eq!(elems[2].interp, 3);
+        assert_eq!(elems[3].interp, 3);
+        // interp==0 integer system value shares row with float: force constant.
+        assert_eq!(elems[4].interp, 1);
+        assert_eq!(elems[5].interp, 1);
+        // conflicting float modes in same row: fall back to constant.
+        assert_eq!(elems[6].interp, 1);
+        assert_eq!(elems[7].interp, 1);
+    }
+
+    #[test]
+    fn static_sampler_handles_are_not_multi_descriptor_ranges() {
+        let mut s = Shader::new(false);
+        s.samplers = 2;
+        s.cmp_samplers = 0b11;
+        let _ = s.sampler_handle(s.entry, 0);
+        let _ = s.sampler_handle(s.entry, 1);
+        for call in s.m.call_args("dx.op.createHandleFromBinding") {
+            let bind = s.m.aggregate_fields(call[1]).unwrap();
+            let lo = s.m.int_value(bind[0]).unwrap();
+            let hi = s.m.int_value(bind[1]).unwrap();
+            assert_eq!(lo, hi, "static samplers must be individual descriptors");
         }
     }
 }
