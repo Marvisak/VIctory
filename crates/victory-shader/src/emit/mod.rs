@@ -196,10 +196,10 @@
 //!   console never exports them).
 
 mod bitcode;
-#[cfg(test)]
-mod census_tests;
 #[cfg(all(test, windows))]
 mod bvh_tests;
+#[cfg(test)]
+mod census_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod crosslane_tests;
@@ -214,6 +214,8 @@ mod rect;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
 mod memory_tests;
+#[cfg(all(test, windows))]
+mod packed_tests;
 mod sampler;
 #[cfg(all(test, windows))]
 mod semantics_tests;
@@ -236,10 +238,12 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS,
-    VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    FALLBACK_SPACE, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, MESH_FALLBACK_SLOT, NULL_BUFFER_VIEW,
+    ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS,
+    VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
 };
+mod mesh_fallback;
+pub use mesh_fallback::{MeshFallbackLayout, mesh_fallback_vertex};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -375,6 +379,18 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// Encode an opaque R9G9B9E5 pixel shader's RGB output as one packed
+    /// uint at SV_Target0 for an R32_UINT render target.
+    pub packed_shared_exp_target0: bool,
+    /// Diagnostic variant: use explicit LOD 0 for implicit compute samples.
+    /// The caller must scope this to the exact shader under investigation.
+    pub force_compute_sample_lod_zero: bool,
+    /// Diagnostic variant: replace one image sample's result with zero.
+    /// This is a native byte offset, scoped by the caller to one shader.
+    pub zero_sample_offset: Option<usize>,
+    /// Diagnostic variant for 348e: replace samples from its two packed
+    /// sky-LUT inputs with 0.25, preserving a nonblack sky contribution.
+    pub constant_348e_packed_luts: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -411,6 +427,75 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
     emit_with(&c, &native, &p, &st, &io, &res, options)
 }
 
+/// The compute producer for a mesh shader. Raw UAVs `u0` and `u1` in
+/// [`FALLBACK_SPACE`] receive generated indices and vertices. One indexed
+/// draw consumes every group through [`mesh_fallback_vertex`].
+///
+/// Per-primitive outputs other than the primitive id and the cull flag are
+/// refused. The producer is a compute shader: the host draws it where the
+/// GPU has no mesh stage.
+pub fn translate_mesh_compute(
+    container: &[u8],
+) -> Result<(HostShader, MeshFallbackLayout), ShaderError> {
+    let c = Container::parse(container)?;
+    let part = c
+        .part(FourCC::DXIL)
+        .or(c.part(FourCC::ACCC))
+        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(part.data)?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Ms)
+        .ok_or(ShaderError::Malformed("no mesh program"))?;
+    let crate::native::StageIo::Ms(mesh) = &native.io else {
+        return Err(ShaderError::Malformed("mesh I/O missing"));
+    };
+    if mesh.max_vertices == 0 || mesh.max_primitives == 0 {
+        return Err(ShaderError::Malformed(
+            "mesh fallback needs nonzero vertex and primitive limits",
+        ));
+    }
+    if let Some(prims) = c.part(FourCC::PSG1) {
+        let mut prims = signature(prims.data)?;
+        // The console never exports a primitive id or a cull flag the
+        // vertex fallback can see; anything else is a real per-primitive
+        // output.
+        prims.retain(|e| !matches!(e.kind, 10 | 30));
+        if !prims.is_empty() {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "per-primitive mesh outputs in the compute fallback",
+            });
+        }
+    }
+    let outputs = signature(
+        c.part(FourCC::OSG1)
+            .ok_or(ShaderError::Malformed("mesh output signature missing"))?
+            .data,
+    )?;
+    let layout = MeshFallbackLayout::new(&outputs, mesh.max_vertices, mesh.max_primitives)
+        .ok_or(ShaderError::Malformed("mesh output layout is too large"))?;
+    let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io = io::raise(&p, &native)?;
+    let st = st?;
+    let mut shader = emit_inner(
+        &c,
+        &native,
+        &p,
+        &st,
+        &io,
+        &res,
+        EmitConfig {
+            options: Options::default(),
+            mesh_out: Some(layout),
+        },
+    )?;
+    shader.stage = HwStage::Cs;
+    shader.root_uavs.push(MESH_FALLBACK_SLOT);
+    shader.root_uavs.push(MESH_FALLBACK_SLOT + 1);
+    Ok((shader, layout))
+}
+
 /// Emits a program whose earlier stages already ran, without write marks.
 pub fn emit(
     c: &Container,
@@ -433,6 +518,25 @@ pub fn emit_with(
     res: &resource::Resources,
     options: Options,
 ) -> Result<HostShader, ShaderError> {
+    emit_inner(c, native, p, st, io, res, EmitConfig { options, mesh_out: None })
+}
+
+/// Settings shared by ordinary emission and the mesh-to-compute variant.
+struct EmitConfig {
+    options: Options,
+    mesh_out: Option<MeshFallbackLayout>,
+}
+
+fn emit_inner(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    config: EmitConfig,
+) -> Result<HostShader, ShaderError> {
+    let EmitConfig { options, mesh_out } = config;
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -442,6 +546,37 @@ pub fn emit_with(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
+    if options.packed_shared_exp_target0 {
+        let target = outputs
+            .iter()
+            .filter(|o| o.kind == 16 && o.row == Some(0))
+            .collect::<Vec<_>>();
+        let color = io
+            .exports
+            .iter()
+            .filter(|e| e.target == io::Target::Color(0))
+            .collect::<Vec<_>>();
+        if !pixel
+            || target.len() != 1
+            || target[0].comp != 9
+            || target[0].col != 0
+            || target[0].cols < 3
+            || target[0].half
+            || color.len() != 1
+            || color[0].compressed
+            || !color[0].done
+            || color[0].values[..3].iter().any(Option::is_none)
+            || io
+                .exports
+                .iter()
+                .any(|e| matches!(e.target, io::Target::Color(n) if n != 0))
+        {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "an R9G9B9E5 pixel output without one full RGB export",
+            });
+        }
+    }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
@@ -500,14 +635,28 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let l = match lower::lower_with_packed(
+        &parts(st, res),
+        mesh_out,
+        options.packed_shared_exp_target0,
+        options.force_compute_sample_lod_zero,
+        options.zero_sample_offset,
+        options.constant_348e_packed_luts,
+    ) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower(&parts(&st, &res))?
+            lower::lower_with_packed(
+                &parts(&st, &res),
+                mesh_out,
+                options.packed_shared_exp_target0,
+                options.force_compute_sample_lod_zero,
+                options.zero_sample_offset,
+                options.constant_348e_packed_luts,
+            )?
         }
         l => l?,
     };

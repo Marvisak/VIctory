@@ -1,0 +1,9 @@
+bu kernelbase!CtrlRoutine ".echo === console control event ===; r rcx; k; g"
+bu kernelbase!TerminateProcess ".echo === KernelBase TerminateProcess caller ===; r rcx; r rdx; k; g"
+bu kernel32!ExitProcess ".echo === Kernel32 ExitProcess caller ===; r rcx; k; g"
+bu ntdll!RtlExitUserProcess ".echo === RtlExitUserProcess caller ===; r rcx; k; g"
+bu ntdll!NtTerminateProcess ".echo === NtTerminateProcess caller ===; r rcx; r rdx; k; g"
+sxe -c ".echo === process exit event ===; r; q" epr
+sxd -c2 ".echo === unhandled access violation ===; .exr -1; k; q" av
+sxi ld
+g

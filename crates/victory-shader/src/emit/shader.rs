@@ -27,6 +27,14 @@ pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
+/// Where a mesh fallback's own buffers are bound, off the title's spaces:
+/// the producer writes indices at `u0` and vertices at `u1`; the vertex
+/// shader reads vertices at `t0`.
+pub const FALLBACK_SPACE: u32 = 3;
+/// Title root-parameter index that means [`FALLBACK_SPACE`] register 0
+/// (`u0` or `t0`). 251 is register 1 (`u1`). Not a title slot: root
+/// parameters stop far below this.
+pub const MESH_FALLBACK_SLOT: u8 = 250;
 /// Heap indices are clamped below these (views, samplers): the host's heaps
 /// are at least this large, the slots past their own null (`emit`, "Heap
 /// indices").
@@ -119,6 +127,10 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Mesh-fallback index (`u0`) and vertex (`u1`) UAVs in [`FALLBACK_SPACE`].
+    pub fallback_uavs: Vec<(u8, V)>,
+    /// Mesh-fallback vertex SRV (`t0`) in [`FALLBACK_SPACE`].
+    pub fallback_srv: Option<V>,
     /// The title-memory page table's handle, once read.
     pub memory: Option<V>,
     /// The written-pages bitmap's handle, once title memory is written.
@@ -138,6 +150,9 @@ pub(crate) struct Shader {
     pub texture_index: std::collections::HashMap<V, V>,
     pub texture_reads: Vec<V>,
     pub flags: u64,
+    /// Compute uses an implicit-derivative texture sample. DXIL 1.6 can
+    /// encode it, but validation needs validator version 1.8.
+    pub compute_implicit_sample: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -195,6 +210,8 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            fallback_uavs: Vec::new(),
+            fallback_srv: None,
             memory: None,
             memory_dirty: None,
             view_addresses: None,
@@ -204,6 +221,7 @@ impl Shader {
             texture_index: std::collections::HashMap::new(),
             texture_reads: Vec::new(),
             flags: 0,
+            compute_implicit_sample: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
@@ -361,6 +379,54 @@ impl Shader {
         let h = self.annotate(block, h, 11 | 0x1000, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
+        h
+    }
+
+    /// `u<register>` in [`FALLBACK_SPACE`]: a mesh producer's index or vertex buffer.
+    pub fn fallback_uav(&mut self, register: u8) -> V {
+        if let Some(&(_, h)) = self.fallback_uavs.iter().find(|r| r.0 == register) {
+            return h;
+        }
+        let r = self.m.i32(u32::from(register));
+        let bind = [r, r, self.m.i32(FALLBACK_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.fallback_uavs.push((register, h));
+        h
+    }
+
+    /// `t0` in [`FALLBACK_SPACE`]: the vertex shader's view of generated vertices.
+    pub fn fallback_srv(&mut self) -> V {
+        if let Some(h) = self.fallback_srv {
+            return h;
+        }
+        let r = self.m.i32(0);
+        let bind = [r, r, self.m.i32(FALLBACK_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.fallback_srv = Some(h);
         h
     }
 
@@ -587,8 +653,10 @@ impl Shader {
         // of vertex, geometry and mesh programs), as DXC counts them: UAV
         // ranges declared below, not UAVs indexed from the heap.
         let compute = self.threads.is_some() && self.mesh.is_none() && self.gs.is_none();
-        let declared_uavs =
-            !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some();
+        let declared_uavs = !self.root_uavs.is_empty()
+            || !self.fallback_uavs.is_empty()
+            || self.memory_dirty.is_some()
+            || self.view_writes.is_some();
         if declared_uavs && !self.pixel && !compute {
             self.flags |= flags::UAVS_EVERY_STAGE;
         }
@@ -608,6 +676,8 @@ impl Shader {
             || self.view_addresses.is_some()
             || self.view_marks.is_some()
             || self.view_writes.is_some()
+            || self.fallback_srv.is_some()
+            || !self.fallback_uavs.is_empty()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -666,6 +736,7 @@ impl Shader {
                 || self.memory.is_some()
                 || self.view_addresses.is_some()
                 || self.view_marks.is_some()
+                || self.fallback_srv.is_some()
             {
                 let ty = self
                     .m
@@ -680,6 +751,7 @@ impl Shader {
                     .chain(self.memory.map(|_| (MEMORY_SPACE, 0)))
                     .chain(self.view_addresses.map(|_| (MEMORY_SPACE, 1)))
                     .chain(self.view_marks.map(|_| (MEMORY_SPACE, VIEW_MARKS)))
+                    .chain(self.fallback_srv.map(|_| (FALLBACK_SPACE, 0)))
                     .collect();
                 for (n, (space, slot)) in all.into_iter().enumerate() {
                     let ops = vec![
@@ -719,6 +791,7 @@ impl Shader {
                     .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
                     .chain(self.memory_dirty.map(|_| (MEMORY_SPACE, 0)))
                     .chain(self.view_writes.map(|_| (MEMORY_SPACE, VIEW_WRITES)))
+                    .chain(self.fallback_uavs.iter().map(|&(slot, _)| (FALLBACK_SPACE, u32::from(slot))))
                     .collect();
                 for (n, (space, slot)) in all.into_iter().enumerate() {
                     let ops = vec![
@@ -902,7 +975,13 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        let validator_version = if self.compute_implicit_sample {
+            let eight = i32c(&mut self, 8);
+            self.m.md_node(vec![Some(one), Some(eight)])
+        } else {
+            version
+        };
+        self.m.named_md("dx.valver", vec![validator_version]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
@@ -976,6 +1055,7 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
+            validator_1_8: self.compute_implicit_sample,
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);

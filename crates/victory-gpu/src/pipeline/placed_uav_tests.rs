@@ -83,6 +83,12 @@ fn store_shader() -> Arc<Shader> {
             host,
             used: native.used,
         })),
+        packed_shared_exp: OnceLock::new(),
+        ray_traversal: OnceLock::new(),
+        synthetic: true,
+        resolves_light: false,
+        ends_reflections: false,
+        draws_sky: false,
     })
 }
 

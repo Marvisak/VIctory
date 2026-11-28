@@ -65,6 +65,19 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    packed_shared_exp: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    ray_traversal: OnceLock<bool>,
+    /// Port-generated DXIL has no title native program to classify.
+    #[cfg(windows)]
+    synthetic: bool,
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
+    #[cfg(windows)]
+    pub(crate) ends_reflections: bool,
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -89,12 +102,27 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 
 impl Shader {
     fn new(stage: &'static str, bytes: &[u8]) -> Shader {
+        let hash = blake3::hash(bytes).to_hex()[..16].to_owned();
+        #[cfg(feature = "diagnostics")]
+        crate::capture::dump_shader_source(&hash, bytes);
         Shader {
             stage,
-            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
+            hash,
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            packed_shared_exp: OnceLock::new(),
+            #[cfg(windows)]
+            ray_traversal: OnceLock::new(),
+            #[cfg(windows)]
+            synthetic: false,
+            #[cfg(windows)]
+            resolves_light: bytes.windows(crate::ambient::PROGRAM.len()).any(|w| w == crate::ambient::PROGRAM),
+            #[cfg(windows)]
+            ends_reflections: bytes.windows(crate::ambient::REFLECTED.len()).any(|w| w == crate::ambient::REFLECTED),
+            #[cfg(windows)]
+            draws_sky: bytes.windows(crate::ambient::SKY.len()).any(|w| w == crate::ambient::SKY),
         }
     }
 
@@ -103,6 +131,33 @@ impl Shader {
         let shader = Shader::new(stage, b"");
         let _ = shader.translated.set(Some(translated));
         Arc::new(shader)
+    }
+
+    /// The title container bytes.
+    pub(crate) fn container(&self) -> &[u8] {
+        &self.container
+    }
+
+    /// Classify the native program once, including for a cached translation.
+    #[cfg(windows)]
+    pub(crate) fn uses_ray_traversal(&self) -> bool {
+        *self.ray_traversal.get_or_init(|| {
+            if self.synthetic || self.container.is_empty() {
+                return false;
+            }
+            match victory_shader::uses_ray_traversal(&self.container) {
+                Ok(uses_rays) => {
+                    if uses_rays {
+                        tracing::info!(stage = self.stage, hash = %self.hash, "native shader uses BVH ray traversal");
+                    }
+                    uses_rays
+                }
+                Err(error) => {
+                    tracing::warn!(stage = self.stage, hash = %self.hash, %error, "could not classify native ray operations");
+                    false
+                }
+            }
+        })
     }
 }
 
@@ -121,7 +176,21 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
-                let (done, cached) = translate(&self.container);
+                let eligible_348e = diagnostic_348e(
+                    self.stage,
+                    &self.hash,
+                    cfg!(feature = "diagnostics"),
+                );
+                let force_lod_zero = (eligible_348e
+                    && std::env::var("VICTORY_348E_FORCE_LOD0").is_ok_and(|v| v == "1"))
+                    || (cfg!(feature = "diagnostics") && self.stage == "compute"
+                        && self.hash == "577248728544d74b"
+                        && std::env::var("VICTORY_577_FORCE_LOD0").is_ok_and(|v| v == "1"));
+                let zero_bc1 = eligible_348e && !force_lod_zero
+                    && std::env::var("VICTORY_348E_ZERO_BC1").is_ok_and(|v| v == "1");
+                let constant_luts = eligible_348e && !force_lod_zero && !zero_bc1
+                    && std::env::var("VICTORY_348E_CONSTANT_LUTS").is_ok_and(|v| v == "1");
+                let (done, cached) = translate(&self.container, force_lod_zero, zero_bc1, constant_luts);
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
@@ -131,6 +200,9 @@ impl Shader {
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
                         cached,
+                        force_lod_zero,
+                        zero_bc1,
+                        constant_luts,
                         ms,
                         user_ms,
                         kernel_ms,
@@ -141,6 +213,9 @@ impl Shader {
                         hash = %self.hash,
                         error = %e,
                         cached,
+                        force_lod_zero,
+                        zero_bc1,
+                        constant_luts,
                         ms,
                         user_ms,
                         kernel_ms,
@@ -151,6 +226,50 @@ impl Shader {
             })
             .as_ref()
     }
+
+    /// A distinct translation of a compatible pixel shader with its
+    /// R9G9B9E5 output packed into a uint render target.
+    pub(crate) fn packed_shared_exp(&self) -> Option<&Translated> {
+        self.packed_shared_exp
+            .get_or_init(|| {
+                let (started, cpu) = (std::time::Instant::now(), thread_cpu());
+                let (done, cached) = translate_packed_shared_exp(&self.container);
+                let (user_ms, kernel_ms) = thread_cpu_since(cpu);
+                match &done {
+                    Ok(_) => tracing::info!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        cached,
+                        ms = started.elapsed().as_millis() as u64,
+                        user_ms,
+                        kernel_ms,
+                        "packed R9G9B9E5 pixel shader translated"
+                    ),
+                    Err(e) => tracing::warn!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        error = %e,
+                        "packed R9G9B9E5 pixel shader unavailable"
+                    ),
+                }
+                done.ok()
+            })
+            .as_ref()
+    }
+
+    /// A shader whose translation is already known. Used for the mesh
+    /// fallback's compute producer and vertex consumer, which are not the
+    /// cached translation of a title container.
+    pub(crate) fn from_translation(
+        stage: &'static str,
+        host: victory_shader::emit::HostShader,
+        used: Vec<victory_shader::UsedResource>,
+    ) -> Arc<Shader> {
+        let mut shader = Shader::new(stage, &host.dxil);
+        shader.synthetic = true;
+        let _ = shader.translated.set(Some(Translated { host, used }));
+        Arc::new(shader)
+    }
 }
 
 /// This thread's processor time so far, user and kernel, in 100 ns units.
@@ -158,7 +277,10 @@ impl Shader {
 fn thread_cpu() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-    let mut t = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+    let mut t = [FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    }; 4];
     let [created, exited, kernel, user] = &mut t;
     // SAFETY: four times of our own thread into our own variables.
     unsafe { GetThreadTimes(GetCurrentThread(), created, exited, kernel, user) };
@@ -177,9 +299,33 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
-fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
-    let (host, cached) = crate::shader_cache::host_shader(container);
-    (host.and_then(|host| with_resources(container, host)), cached)
+fn translate(container: &[u8], force_lod_zero: bool, zero_bc1: bool, constant_luts: bool) -> (Result<Translated, String>, bool) {
+    let (host, cached) = if constant_luts {
+        crate::shader_cache::host_shader_348e_constant_luts(container)
+    } else if zero_bc1 {
+        crate::shader_cache::host_shader_348e_zero_bc1(container)
+    } else if force_lod_zero {
+        crate::shader_cache::host_shader_348e_lod_zero(container)
+    } else {
+        crate::shader_cache::host_shader(container)
+    };
+    (
+        host.and_then(|host| with_resources(container, host)),
+        cached,
+    )
+}
+
+fn diagnostic_348e(stage: &str, hash: &str, enabled: bool) -> bool {
+    enabled && stage == "compute" && hash == "348e1e8c414c7eca"
+}
+
+#[cfg(windows)]
+fn translate_packed_shared_exp(container: &[u8]) -> (Result<Translated, String>, bool) {
+    let (host, cached) = crate::shader_cache::host_shader_packed_shared_exp(container);
+    (
+        host.and_then(|host| with_resources(container, host)),
+        cached,
+    )
 }
 
 #[cfg(windows)]
@@ -256,6 +402,24 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// Select a PSO whose DSV format matches the render targets currently bound
+/// to the command list. A null DSV requires a color-only PSO on D3D12.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for_targets<'a>(
+    this: This,
+    has_depth: bool,
+) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let pending = &pipeline(this).host;
+    if has_depth {
+        make::ready(pending)
+    } else {
+        make::ready_without_depth(pending)
+    }
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -322,6 +486,35 @@ pub(crate) fn shaders_of(this: This) -> String {
     format!("{:?}", pipeline(this).shaders)
 }
 
+/// The title graphics state of a pipeline, including its blend and target
+/// formats, for a bounded unsupported-render-target diagnostic.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn graphics_state_of(this: This) -> Option<String> {
+    if this.is_null() {
+        return None;
+    }
+    pipeline(this)
+        .host
+        .graphics
+        .as_deref()
+        .map(host::GraphicsState::describe)
+}
+
+/// True only after a strict opaque format-67 pipeline has a host PSO with
+/// a uint SV_Target0 and R32_UINT RTV slot 0.
+#[cfg(windows)]
+pub(crate) fn packed_shared_exp_rtv(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let p = pipeline(this);
+    p.host
+        .graphics
+        .as_deref()
+        .is_some_and(|g| host::packed_shared_exp_eligible(&p.shaders, g))
+        && host_pipeline(this).is_some()
+}
+
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
 /// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -345,7 +538,10 @@ pub(crate) fn note_drop(this: This) {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_why(why: String) {
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
@@ -551,7 +747,13 @@ fn read_stream(
         if let Some(stage) = stage {
             // SAFETY: a shader subobject has its bytecode at +8, which the
             // slice does not promise to be aligned.
-            let code = unsafe { stream.as_ptr().add(at + 8).cast::<Bytecode>().read_unaligned() };
+            let code = unsafe {
+                stream
+                    .as_ptr()
+                    .add(at + 8)
+                    .cast::<Bytecode>()
+                    .read_unaligned()
+            };
             shaders.extend(shader(stage, &code));
         }
         #[cfg(windows)]
@@ -652,7 +854,11 @@ impl Prebuild {
 
     /// Its shaders and state as a diagnostics build logs them.
     pub fn describe(&self) -> String {
-        let state = self.graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
+        let state = self
+            .graphics
+            .as_ref()
+            .map(|g| g.describe())
+            .unwrap_or_default();
         format!("{:?}\t{state}", self.shaders)
     }
 
@@ -677,10 +883,12 @@ impl Prebuild {
         library::save(false);
         match made {
             Some(_) => Ok(()),
-            None => Err(match self.shaders.iter().find(|s| s.translated().is_none()) {
-                Some(s) => format!("{} shader does not translate", s.stage),
-                None => "the host refuses it".into(),
-            }),
+            None => Err(
+                match self.shaders.iter().find(|s| s.translated().is_none()) {
+                    Some(s) => format!("{} shader does not translate", s.stage),
+                    None => "the host refuses it".into(),
+                },
+            ),
         }
     }
 }
@@ -707,6 +915,15 @@ pub fn wanted_early(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostics_match_only_the_lighting_compute_hash() {
+        use super::diagnostic_348e;
+        assert!(diagnostic_348e("compute", "348e1e8c414c7eca", true));
+        assert!(!diagnostic_348e("compute", "348e1e8c414c7eca", false));
+        assert!(!diagnostic_348e("pixel", "348e1e8c414c7eca", true));
+        assert!(!diagnostic_348e("compute", "348e1e8c414c7ecb", true));
+    }
+
     #[cfg(feature = "diagnostics")]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
@@ -726,14 +943,16 @@ mod tests {
     fn a_stream_of_any_alignment_is_read() {
         let mut backing = [0u64; 5];
         // SAFETY: the 40 bytes of `backing`, one off its (aligned) start.
-        let stream = unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 32) };
+        let stream =
+            unsafe { std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 32) };
         stream[..4].copy_from_slice(&1u32.to_le_bytes()); // vertex shader
         stream[8..16].copy_from_slice(&0x1000usize.to_le_bytes());
         stream[16..24].copy_from_slice(&7usize.to_le_bytes());
         assert_ne!(stream.as_ptr() as usize % 8, 0);
         let seen = std::cell::RefCell::new(Vec::new());
         read_stream(stream, |stage, code| {
-            seen.borrow_mut().push((stage, code.code as usize, code.size));
+            seen.borrow_mut()
+                .push((stage, code.code as usize, code.size));
             None
         });
         assert_eq!(*seen.borrow(), [("vertex", 0x1000, 7)]);
@@ -857,10 +1076,16 @@ mod tests {
             element[8 + 4 * i..12 + 4 * i].copy_from_slice(&w.to_le_bytes());
         }
         let mut stream = vec![0u8; 0x2b0];
-        let put = |s: &mut Vec<u8>, at: usize, v: u64| {
-            s[at..at + 8].copy_from_slice(&v.to_le_bytes())
-        };
-        let kinds = [(0x10, 1), (0x28, 2), (0x40, 3), (0x58, 4), (0x70, 5), (0x88, 8)];
+        let put =
+            |s: &mut Vec<u8>, at: usize, v: u64| s[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        let kinds = [
+            (0x10, 1),
+            (0x28, 2),
+            (0x40, 3),
+            (0x58, 4),
+            (0x70, 5),
+            (0x88, 8),
+        ];
         for (at, kind) in kinds.into_iter().chain([(0x210, 21), (0x250, 17)]) {
             put(&mut stream, at, kind);
         }
@@ -884,7 +1109,10 @@ mod tests {
             stream: stream.as_ptr(),
         };
         let mut p = std::ptr::null();
-        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert_eq!(
+            create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+            S_OK
+        );
         // SAFETY: the stream points at live code and elements.
         let pre = unsafe { Prebuild::graphics(&stream) };
         let title = pipeline(p);

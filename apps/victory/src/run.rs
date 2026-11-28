@@ -42,6 +42,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    graphics: crate::graphics::Selection,
 ) -> Result<u32> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -109,12 +110,21 @@ pub fn run(
     victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
-    victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
+    victory_hle::runtime::set_title(victory_hle::runtime::Title {
+        storage: storage.clone(),
+        ..title
+    });
     victory_hle::console::set(match console {
         Console::SeriesX => victory_hle::console::Console::SeriesX,
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
-    println!("console        {}", victory_hle::console::current().name());
+    let console_name = victory_hle::console::current().name();
+    println!("console        {console_name}");
+    if (execute || graphics.any())
+        && let Some(line) = crate::graphics::launch(&cfg.data_dir, &storage, console_name, &graphics)?
+    {
+        println!("graphics       {line}");
+    }
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
@@ -192,6 +202,8 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    let command = victory_hle::modules::files::install_title_command_line(exe);
+    println!("command        {command}");
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
@@ -553,6 +565,13 @@ mod cpu_check_tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<u32> {
+pub fn run(
+    _: &Path,
+    _: Unimplemented,
+    _: bool,
+    _: bool,
+    _: Console,
+    _: crate::graphics::Selection,
+) -> Result<u32> {
     anyhow::bail!("running titles requires Windows")
 }

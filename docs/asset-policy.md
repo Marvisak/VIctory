@@ -45,9 +45,12 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
 1. `.gitignore` keeps common data types out of `git status`.
 2. `cargo xtask policy` (run by the pre-commit hook; install with
    `cargo xtask install-hooks`) is an allowlist: files must have an allowed
-   type, be under 512 KiB, contain no binary data or known binary
+   type, generally be under 512 KiB, contain no binary data or known binary
    signatures, and hold no long hex/base64 runs. Exceptions need an entry
    with a reason in `xtask/src/policy.rs`.
+   Python/C source is allowed. The locally authored launcher settings XML is
+   allowed at its exact path. The shader lowerer has a 640 KiB text ceiling;
+   it still receives all binary-signature and embedded-data checks.
 3. At runtime, everything that writes derived data calls
    `victory_core::ensure_outside_repo`.
 4. Tests that need real files take their paths from environment variables

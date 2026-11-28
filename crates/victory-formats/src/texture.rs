@@ -1034,6 +1034,148 @@ mod tests {
         assert_eq!(l.offset(0, 0, 16, 0), Ok(8192));
     }
 
+    /// The world-lighting BC sources use 4 KiB standard-swizzled tiles. Build
+    /// their tiled bytes from an independent address oracle, then detile them:
+    /// a tile/detile round trip would share the same addressing mistake.
+    #[test]
+    fn world_lighting_bc_detile_matches_4kb_s_reference() {
+        struct Case {
+            width: u32,
+            format: u32,
+            mips: u32,
+            size: usize,
+            // Mip bases, largest first, before the 4 KiB mip-tail tile.
+            standard: &'static [usize],
+            // Element coordinates in the tail tile, largest tail mip first.
+            tail: &'static [(u32, u32)],
+        }
+        let cases = [
+            Case {
+                width: 2048,
+                format: 71, // BC1: 8 bytes per 4x4 texels
+                mips: 12,
+                size: 2_797_568,
+                standard: &[700_416, 176_128, 45_056, 12_288, 4_096],
+                tail: &[(16, 0), (8, 8), (0, 12), (0, 8), (8, 4), (8, 0), (0, 4)],
+            },
+            Case {
+                width: 1024,
+                format: 77, // BC3: 16 bytes per 4x4 texels
+                mips: 11,
+                size: 1_400_832,
+                standard: &[352_256, 90_112, 24_576, 8_192, 4_096],
+                tail: &[(8, 0), (4, 8), (0, 12), (0, 8), (4, 4), (4, 0)],
+            },
+            Case {
+                width: 512,
+                format: 77,
+                mips: 10,
+                size: 352_256,
+                standard: &[90_112, 24_576, 8_192, 4_096],
+                tail: &[(8, 0), (4, 8), (0, 12), (0, 8), (4, 4), (4, 0)],
+            },
+            Case {
+                width: 256,
+                format: 71,
+                mips: 1,
+                size: 32_768,
+                standard: &[0],
+                tail: &[],
+            },
+        ];
+
+        // GFX10 SW_4KB_S bit positions from AMD addrlib's RB+ pattern for
+        // 64-bit and 128-bit elements. This deliberately does not use the
+        // layout's pattern, offset, tile, or detile code to place source bytes.
+        let within_tile = |x: u32, y: u32, bytes: usize| -> usize {
+            let bit = |value: u32, from: u32, to: u32| (((value >> from) & 1) << to) as usize;
+            match bytes {
+                8 => bit(x, 0, 3)
+                    | bit(y, 0, 4)
+                    | bit(y, 1, 5)
+                    | bit(x, 1, 6)
+                    | bit(x, 2, 7)
+                    | bit(y, 2, 8)
+                    | bit(x, 3, 9)
+                    | bit(y, 3, 10)
+                    | bit(x, 4, 11),
+                16 => bit(y, 0, 4)
+                    | bit(y, 1, 5)
+                    | bit(x, 0, 6)
+                    | bit(x, 1, 7)
+                    | bit(y, 2, 8)
+                    | bit(x, 2, 9)
+                    | bit(y, 3, 10)
+                    | bit(x, 3, 11),
+                _ => unreachable!(),
+            }
+        };
+
+        for case in cases {
+            let desc = TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: case.width,
+                height: case.width,
+                depth_or_array: 1,
+                mips: case.mips,
+                format: case.format,
+                samples: 1,
+                swizzle: Swizzle::SW_4KB_S,
+            };
+            let layout = &Texture::new(&desc).unwrap().planes[0].layout;
+            let bytes = if case.format == 71 { 8 } else { 16 };
+            let tile_width = if bytes == 8 { 32 } else { 16 };
+            assert_eq!(layout.size as usize, case.size, "{desc:?}");
+            assert_eq!(layout.first_tail_mip as usize, case.standard.len(), "{desc:?}");
+            assert_eq!(case.standard.len() + case.tail.len(), case.mips as usize);
+            let mut tiled = vec![0u8; case.size];
+            let mut used = vec![false; case.size / bytes];
+            let mut expected_mips = Vec::new();
+            for mip in 0..case.mips {
+                let blocks = (case.width >> mip).max(1).div_ceil(4);
+                let row_pitch = blocks as usize * bytes;
+                let mut expected = vec![0u8; row_pitch * blocks as usize];
+                for y in 0..blocks {
+                    for x in 0..blocks {
+                        let offset = if (mip as usize) < case.standard.len() {
+                            let tiles_per_row = blocks / tile_width;
+                            let tile = (y / 16) * tiles_per_row + x / tile_width;
+                            case.standard[mip as usize]
+                                + tile as usize * 4096
+                                + within_tile(x % tile_width, y % 16, bytes)
+                        } else {
+                            let (start_x, start_y) = case.tail[mip as usize - case.standard.len()];
+                            within_tile(start_x + x, start_y + y, bytes)
+                        };
+                        assert!(offset + bytes <= tiled.len(), "{desc:?} mip={mip} ({x},{y})");
+                        assert!(offset.is_multiple_of(bytes));
+                        assert!(!used[offset / bytes], "oracle overlaps {desc:?} mip={mip} ({x},{y})");
+                        used[offset / bytes] = true;
+                        let value = (x as u16).to_le_bytes();
+                        let row = y as usize * row_pitch + x as usize * bytes;
+                        expected[row..row + 2].copy_from_slice(&value);
+                        expected[row + 2..row + 4].copy_from_slice(&(y as u16).to_le_bytes());
+                        expected[row + 4..row + 6].copy_from_slice(&(mip as u16).to_le_bytes());
+                        expected[row + 6..row + 8]
+                            .copy_from_slice(&((x ^ y.rotate_left(5) ^ mip) as u16).to_le_bytes());
+                        if bytes == 16 {
+                            expected[row + 8..row + 16]
+                                .copy_from_slice(&(!(u64::from(x) | (u64::from(y) << 16) | (u64::from(mip) << 32))).to_le_bytes());
+                        }
+                        tiled[offset..offset + bytes].copy_from_slice(&expected[row..row + bytes]);
+                        assert_eq!(layout.offset(mip, x, y, 0), Ok(offset as u64));
+                    }
+                }
+                expected_mips.push((expected, row_pitch));
+            }
+            for (mip, (expected, pitch)) in expected_mips.iter().enumerate() {
+                let mut actual = vec![0u8; expected.len()];
+                layout.detile(&tiled, mip as u32, 0, &mut actual, *pitch, 0).unwrap();
+                assert_eq!(actual, *expected, "{desc:?} mip={mip}");
+            }
+        }
+    }
+
     #[test]
     fn layouts_share_identical_swizzle_tables() {
         for (swizzle, kind, dimension, block_log2) in [

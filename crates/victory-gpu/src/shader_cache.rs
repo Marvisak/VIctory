@@ -68,6 +68,53 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// A packed-output translation changes the pixel output signature and DXIL,
+/// so it must never read the ordinary translation's cache entry.
+fn packed_build() -> &'static [u8; 32] {
+    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
+    BUILD.get_or_init(|| {
+        let mut h = blake3::Hasher::new();
+        h.update(build());
+        h.update(b"R9G9B9E5 packed SV_Target0 to R32_UINT v1");
+        *h.finalize().as_bytes()
+    })
+}
+
+/// Diagnostic compute sampling changes the DXIL, so its entry is distinct
+/// from both the ordinary and packed-output translations.
+fn lod_zero_build() -> &'static [u8; 32] {
+    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
+    BUILD.get_or_init(|| {
+        let mut h = blake3::Hasher::new();
+        h.update(build());
+        h.update(b"348e implicit compute samples to SampleLevel LOD0 v1");
+        *h.finalize().as_bytes()
+    })
+}
+
+/// A distinct diagnostic translation for the first BC1 sample in 348e.
+fn zero_bc1_build() -> &'static [u8; 32] {
+    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
+    BUILD.get_or_init(|| {
+        let mut h = blake3::Hasher::new();
+        h.update(build());
+        h.update(b"348e BC1 sample at native 0xbcc replaced with zero v1");
+        *h.finalize().as_bytes()
+    })
+}
+
+/// A separate diagnostic translation with the packed sky-LUT samples
+/// replaced by nonzero constants.
+fn constant_348e_luts_build() -> &'static [u8; 32] {
+    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
+    BUILD.get_or_init(|| {
+        let mut h = blake3::Hasher::new();
+        h.update(build());
+        h.update(b"348e packed LUT samples at 0x744..0x824 replaced with 0.25 v1");
+        *h.finalize().as_bytes()
+    })
+}
+
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
@@ -82,12 +129,51 @@ fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+    host_shader_variant(container, false, false, None, false)
+}
+
+/// The exact 348e compute shader with implicit samples forced to LOD 0.
+/// The caller verifies its stage and container hash before selecting this.
+pub(crate) fn host_shader_348e_lod_zero(container: &[u8]) -> (Result<HostShader, String>, bool) {
+    host_shader_variant(container, false, true, None, false)
+}
+
+/// The exact 348e compute shader with its BC1 result at 0xbcc zeroed.
+pub(crate) fn host_shader_348e_zero_bc1(container: &[u8]) -> (Result<HostShader, String>, bool) {
+    host_shader_variant(container, false, false, Some(0xbcc), false)
+}
+
+/// The exact 348e compute shader with constant packed sky-LUT samples.
+pub(crate) fn host_shader_348e_constant_luts(container: &[u8]) -> (Result<HostShader, String>, bool) {
+    host_shader_variant(container, false, false, None, true)
+}
+
+/// The same title pixel shader with its RGB output encoded into one uint.
+pub(crate) fn host_shader_packed_shared_exp(
+    container: &[u8],
+) -> (Result<HostShader, String>, bool) {
+    host_shader_variant(container, true, false, None, false)
+}
+
+fn host_shader_variant(container: &[u8], packed: bool, lod_zero: bool, zero_sample_offset: Option<usize>, constant_348e_packed_luts: bool) -> (Result<HostShader, String>, bool) {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
-    let options = victory_shader::emit::Options { view_marks: true };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let options = victory_shader::emit::Options {
+        view_marks: true,
+        packed_shared_exp_target0: packed,
+        force_compute_sample_lod_zero: lod_zero,
+        zero_sample_offset,
+        constant_348e_packed_luts,
+    };
+    let translate =
+        |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(
+            cache,
+            if packed { packed_build() } else if lod_zero { lod_zero_build() } else if zero_sample_offset.is_some() { zero_bc1_build() } else if constant_348e_packed_luts { constant_348e_luts_build() } else { build() },
+            container,
+            translate,
+        ),
         None => (translate(container), false),
     }
 }

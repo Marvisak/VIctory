@@ -26,6 +26,14 @@ use crate::host::{HostList, host};
 use crate::object::This;
 use windows::core::Interface;
 
+mod cooked;
+mod profile;
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn audit_zero_sources(frame: u64) {
+    cooked::audit_zero_sources(frame);
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -47,6 +55,12 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Mips per array slice.
     mips: u32,
+    /// Title mips before the first one this copy keeps ([`crate::resource`]
+    /// shrinks a large streamed texture). Detile and the watched spans read
+    /// that far into the title's chain.
+    dropped: u32,
+    title_format: u32,
+    host_format: u32,
     memory: *const u8,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
@@ -72,13 +86,18 @@ struct Last {
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
 /// are its mips), the bytes of the texture's memory it lies in, rounded out
 /// to the layout's blocks; empty if the layout cannot say.
-fn spans(layout: &victory_formats::texture::Layout, count: u32, mips: u32) -> Vec<(usize, usize)> {
+fn spans(
+    layout: &victory_formats::texture::Layout,
+    count: u32,
+    mips: u32,
+    dropped: u32,
+) -> Vec<(usize, usize)> {
     use victory_formats::texture::Dimension;
     let d = &layout.desc;
     let block = layout.alignment.max(256);
     (0..count)
         .map(|i| {
-            let (mip, slice) = (i % mips, i / mips);
+            let (mip, slice) = (i % mips + dropped, i / mips);
             let m = layout.mips.get(mip as usize)?;
             let (z0, z1) = if d.dimension == Dimension::Tex3d { (0, m.depth.max(1) - 1) } else { (slice, slice) };
             let first = layout.offset(mip, 0, 0, z0).ok()?;
@@ -239,6 +258,16 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
     unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
 }
 
+/// How many retained subresource uploads from title memory were recorded for
+/// this host copy. Recording does not establish GPU completion or nonzero
+/// texels; it distinguishes an upload path from a texture with none yet.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn retained_subresources_recorded(copy: &Arc<crate::resource::HostTexture>) -> u64 {
+    copy.staging.lock().unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, |staging| staging.copied.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Copies [`alias_copy`] recorded since the last frame-rate line.
 pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -284,7 +313,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         }
         (f, rows, total)
     };
-    let (fa, ra, total) = footprints(&da, count(&da));
+    let (fa, ra, total_a) = footprints(&da, count(&da));
     let (fb, rb, _) = footprints(&db, count(&db));
     // Subresources in order while both have the same bytes there (mips of
     // a block-compressed texture past its last whole block do not).
@@ -298,6 +327,9 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
         return;
     }
+    // `GetCopyableFootprints` drops the last row's pitch padding. The copy
+    // still reads every row at `RowPitch`; a tight buffer removes the device.
+    let total = footprint_bytes(total_a, &fa[..n as usize], &ra[..n as usize]);
     let Some(buffer) = host.default_buffer(total) else { return };
     list.keep(&buffer);
     crate::texture::host_writes(list, to);
@@ -337,6 +369,84 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         logged.push((from as usize, to as usize));
         tracing::info!(from = ?from, to = ?to, a = da.Format.0, b = db.Format.0, w = da.Width, h = da.Height, subresources = n, "aliased texture copied");
     }
+}
+
+/// Repack a bounded R32_UINT UAV through a row-major buffer into
+/// its R9G9B9E5 read resource. Two placed textures can have equal allocation
+/// sizes but the host GPU lays their texels out differently: a raw readback
+/// of the writer filled 192 columns, while its R9 alias read all zero in
+/// columns 128..192. The buffer copy transfers logical rows across both
+/// texture layouts before the lighting shader samples the alias.
+pub(crate) fn repack_shared_exp_alias(list: &HostList, resource: This) -> bool {
+    let (Some(copy), Some(host)) = (crate::resource::host_copy(resource), host()) else {
+        return false;
+    };
+    let Some(alias) = copy.shared_exp_resource() else { return false };
+    let primary = &copy.texture;
+    // SAFETY: both host resources stay live while `copy` is held.
+    let (a, b) = unsafe { (primary.GetDesc(), alias.GetDesc()) };
+    let bounded_shape = copy.shared_exp_separate()
+        && crate::resource::separate_shared_exp_shape(a.Width, a.Height);
+    if a.Format.0 != 42 || b.Format.0 != 67 || !bounded_shape
+        || a.Width != b.Width || a.Height != b.Height || a.MipLevels != 1 || b.MipLevels != 1
+        || a.SampleDesc.Count != 1 || b.SampleDesc.Count != 1
+    {
+        return false;
+    }
+    if !list.first_use(std::sync::Arc::as_ptr(&copy) as usize | 2) {
+        return true;
+    }
+    let mut fa = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 1];
+    let mut fb = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 1];
+    let mut ra = [0u32; 1];
+    let mut rb = [0u32; 1];
+    let (mut ta, mut tb) = (0u64, 0u64);
+    // SAFETY: outputs contain one subresource footprint each.
+    unsafe {
+        host.device.GetCopyableFootprints(&a, 0, 1, 0, Some(fa.as_mut_ptr()), Some(ra.as_mut_ptr()), None, Some(&mut ta));
+        host.device.GetCopyableFootprints(&b, 0, 1, 0, Some(fb.as_mut_ptr()), Some(rb.as_mut_ptr()), None, Some(&mut tb));
+    }
+    if fa[0].Footprint.RowPitch != fb[0].Footprint.RowPitch || ra != rb
+        || fa[0].Footprint.Width != fb[0].Footprint.Width
+        || fa[0].Footprint.Height != fb[0].Footprint.Height
+        || fa[0].Footprint.Depth != fb[0].Footprint.Depth
+    {
+        tracing::warn!(?a, ?b, "packed alias footprints differ; repack skipped");
+        return false;
+    }
+    let bytes = footprint_bytes(ta.max(tb), &fa, &ra);
+    let Some(buffer) = host.default_buffer(bytes) else { return false };
+    list.keep(&buffer);
+    let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: borrowed resource is held by this list until completion.
+        pResource: unsafe { std::mem::transmute_copy(r) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+    };
+    let sub = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(r) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+    };
+    crate::list::ensure_state(list, resource, 0x800); // COPY_SOURCE on R32
+    // SAFETY: the primary is in COPY_SOURCE and the new buffer in COPY_DEST.
+    unsafe {
+        list.list.CopyTextureRegion(&place(&buffer, fa[0]), 0, 0, 0, &sub(primary), None);
+        list.list.ResourceBarrier(&[crate::host::transition(
+            &buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+    }
+    if !list.use_shared_exp_state(&copy, 0x400) { return false } // COPY_DEST on R9
+    // SAFETY: the buffer now reads and the active R9 alias is in COPY_DEST.
+    unsafe { list.list.CopyTextureRegion(&sub(&alias), 0, 0, 0, &place(&buffer, fb[0]), None) };
+    let _ = list.use_shared_exp_state(&copy, 0x40 | 0x80); // shader resource
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if count <= 8 || count.is_power_of_two() {
+        tracing::info!(count, bytes, width = a.Width, height = a.Height, ?resource, "packed R32 to R9 repacked through buffer");
+    }
+    true
 }
 
 /// Has `resource`'s host copy brought up to date at the submission that
@@ -384,7 +494,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 pub(crate) fn record_upload(
     list: &HostList,
     copy: &Arc<crate::resource::HostTexture>,
-    staging: &Staging,
+    staging: &Arc<Staging>,
     (buffer, at, subresources): &Upload,
 ) -> Option<D3D12_RESOURCE_BARRIER> {
     const COPY_DEST: u32 = 0x400;
@@ -393,11 +503,150 @@ pub(crate) fn record_upload(
         // SAFETY: an open list; the barrier names a live texture.
         unsafe { list.list.ResourceBarrier(&[b]) };
     }
-    copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
+    let recorded = copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
+    #[cfg(feature = "diagnostics")]
+    verify_priority_lighting_bc_gpu(list, copy, staging, subresources);
     list.keep(buffer);
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    staging.copied.fetch_add(recorded as u64, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    if let Some(index) = crate::resource::priority_bound_source(staging.memory as u64) {
+        static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<u64>>> = std::sync::OnceLock::new();
+        if SEEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).insert(staging.memory as u64) {
+            // SAFETY: a live host texture named by this copy operation.
+            let d = unsafe { copy.texture.GetDesc() };
+            tracing::info!(index, address = format_args!("{:#x}", staging.memory as u64), requested = subresources.len(), recorded, host_width = d.Width, host_height = d.Height, host_mips = d.MipLevels, dropped_mips = staging.dropped, "bound full-mip lighting texture upload recorded");
+        }
+    }
     list.move_texture(copy, SHADER_RESOURCE)
+}
+
+/// Read back every uploaded mip of each bounded lighting BC source. The
+/// upload list runs before its consumers, so this observes the bytes they
+/// will sample, after `CopyTextureRegion` and before any later writes.
+#[cfg(feature = "diagnostics")]
+fn verify_priority_lighting_bc_gpu(
+    list: &HostList,
+    copy: &Arc<crate::resource::HostTexture>,
+    staging: &Staging,
+    subresources: &[u32],
+) {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| {
+        std::env::var_os("VICTORY_DUMP_LIGHTING_BC_DIR")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+    }).as_ref() else { return };
+    if staging.dropped != 0 || !subresources.contains(&0) || staging.layout.desc.swizzle.0 != 5 {
+        return;
+    }
+    let Some(index) = crate::resource::priority_bound_source(staging.memory as u64) else { return };
+    let Some((width, bytes, mips, kind)) = [
+        (2048, 8, 12, "bc1"), (1024, 16, 11, "bc3"),
+        (512, 16, 10, "bc3"), (256, 8, 1, "bc1"),
+    ].get(index).copied() else { return };
+    let d = &staging.layout.desc;
+    if d.width != width || d.height != width || d.element_bytes != bytes || d.block != 4 || d.mips != mips {
+        return;
+    }
+    // Only one complete-chain readback per source and process. A failed
+    // allocation may be retried at a later upload.
+    static SEEN: Mutex<[bool; 4]> = Mutex::new([false; 4]);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen[index] { return; }
+    let Some(host) = host() else { return };
+    // Mips with implicit sample LOD matter here. `read_back`'s ordinary
+    // target helper covers only mip 0, so pack every mip of this exact BC
+    // chain into one mapped readback buffer, including its tiny tail.
+    // SAFETY: the live host texture is retained by `copy`; GetDesc writes no caller memory.
+    let desc = unsafe { copy.texture.GetDesc() };
+    if desc.MipLevels != mips as u16 || !(0..mips).all(|mip| subresources.contains(&mip)) {
+        return;
+    }
+    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); mips as usize];
+    let mut rows = vec![0u32; mips as usize];
+    let mut total = 0;
+    // SAFETY: the device and descriptor are live; the output arrays each have
+    // `mips` elements, and all pointers remain valid for the duration of the call.
+    unsafe {
+        host.device.GetCopyableFootprints(
+            &desc, 0, mips, 0,
+            Some(footprints.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total),
+        );
+    }
+    let total = footprint_bytes(total, &footprints, &rows);
+    let Some((buffer, mapped)) = list.readback(host, total) else { return };
+    // The upload just left the host texture in COPY_DEST. Return it there
+    // before `record_upload` asks the list to leave it shader-readable.
+    // SAFETY: the command list, texture and readback buffer stay alive until
+    // execution completes. `footprint_bytes` reserves every row pitch, and
+    // each footprint/subresource index comes from GetCopyableFootprints.
+    unsafe {
+        list.list.ResourceBarrier(&[crate::host::transition(
+            &copy.texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+        for (mip, footprint) in footprints.iter().enumerate() {
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&buffer),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&copy.texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: mip as u32 },
+            };
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        }
+        list.list.ResourceBarrier(&[crate::host::transition(
+            &copy.texture, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST,
+        )]);
+    }
+    seen[index] = true;
+    drop(seen);
+
+    let dir = dir.clone();
+    let mapped = mapped as usize;
+    list.defer_after(move || {
+        // SAFETY: the upload list's fence completed before `defer_after`,
+        // and `HostList::readback` retains the mapped buffer until reset.
+        for (mip, (footprint, &row_count)) in footprints.iter().zip(&rows).enumerate() {
+            let edge = (width as usize >> mip).max(1);
+            let row_bytes = edge.div_ceil(4) * bytes as usize;
+            let row_count = row_count as usize;
+            let f = footprint.Footprint;
+            if (f.RowPitch as usize) < row_bytes || row_count != edge.div_ceil(4) {
+                tracing::warn!(index, mip, pitch = f.RowPitch, row_count, "lighting BC GPU readback footprint differs from expected mip");
+                continue;
+            }
+            let mut gpu = vec![0u8; row_bytes * row_count];
+            for row in 0..row_count {
+                // SAFETY: `readback` retains the mapped allocation until list
+                // reset; this callback runs after its fence. The checked row
+                // pitch and `footprint_bytes` keep this row inside that buffer.
+                let src = unsafe { std::slice::from_raw_parts(
+                    (mapped as *const u8).add(footprint.Offset as usize + row * f.RowPitch as usize),
+                    row_bytes,
+                ) };
+                gpu[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(src);
+            }
+            let stem = format!("lighting-bc-{index}-{width}x{width}-{kind}-mip{mip}");
+            let path = dir.join(format!("{stem}-gpu.bc"));
+            let reference = dir.join(format!("{stem}-linear.bc"));
+            match (std::fs::write(&path, &gpu), std::fs::read(&reference)) {
+                (Ok(()), Ok(expected)) if expected.len() == gpu.len() => {
+                    let mismatch = gpu.iter().zip(&expected).filter(|(a, b)| a != b).count();
+                    tracing::info!(index, mip, bytes = gpu.len(), mismatch, path = %path.display(), "lighting BC GPU readback compared with staged bytes");
+                }
+                (Ok(()), Ok(expected)) => tracing::warn!(index, mip, gpu = gpu.len(), staged = expected.len(), "lighting BC GPU readback size differs"),
+                (Ok(()), Err(error)) => tracing::warn!(index, mip, %error, "lighting BC staged reference unavailable"),
+                (Err(error), _) => tracing::warn!(index, mip, %error, "lighting BC GPU readback write failed"),
+            }
+        }
+    });
 }
 
 /// The uploads [`record_upload`] recorded into `resource`'s host texture
@@ -424,19 +673,20 @@ pub(crate) fn copied(resource: This) -> u64 {
 fn copies(
     list: &HostList,
     texture: &ID3D12Resource,
-    staging: &Staging,
+    staging: &Arc<Staging>,
     (buffer, at): (&ID3D12Resource, u64),
     subresources: &[u32],
     name: impl Fn() -> String,
-) {
+) -> usize {
+    let mut recorded = 0;
     for &i in subresources {
         let i = i as usize;
         let mut footprint = staging.footprints[i];
         footprint.Offset += at;
         let footprint = &footprint;
+        let f = footprint.Footprint;
         #[cfg(feature = "diagnostics")]
         {
-            let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
@@ -462,6 +712,21 @@ fn copies(
                 (gpu + footprint.Offset, len),
             );
         }
+        // A chunk is far larger than one texture, but a buffer sized to the
+        // tight footprint total is not. Reading the pitched last row past
+        // that buffer removes the device, so skip the subresource.
+        // SAFETY: a live upload buffer.
+        let width = unsafe { buffer.GetDesc() }.Width;
+        let pitched = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth.max(1));
+        if footprint.Offset.saturating_add(pitched) > width {
+            once!(
+                offset = footprint.Offset,
+                pitched,
+                width,
+                "texture upload skipped: the staging buffer does not cover the row pitch"
+            );
+            continue;
+        }
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
             pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -480,7 +745,11 @@ fn copies(
         };
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        #[cfg(feature = "diagnostics")]
+        cooked::copy_recorded(staging, staging.memory as u64, i as u32);
+        recorded += 1;
     }
+    recorded
 }
 
 /// What a refresh gives: a staging buffer, where its space starts in it,
@@ -668,7 +937,13 @@ impl Staging {
     /// staging buffer (`None` if none could be had or a subresource could
     /// not be read).
     fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
-        let (buffer, at, data) = staging_space(self.size)?;
+        #[cfg(feature = "diagnostics")]
+        cooked::clear_pending(self as *const Staging as usize);
+        let Some((buffer, at, data)) = staging_space(self.size) else {
+            #[cfg(feature = "diagnostics")]
+            self.note_priority_detile(tiled, subresources, false);
+            return None;
+        };
         #[cfg(feature = "diagnostics")]
         // Scanned only when its message is wanted: a pass over every
         // texture read, in timing runs too.
@@ -683,9 +958,10 @@ impl Staging {
                 tracing::debug!(memory = ?self.memory, desc = ?self.layout.desc, "a sampled texture detiled");
             }
         }
+        let mut succeeded = true;
         for &i in subresources {
             let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
-            let (mip, slice) = (i % self.mips, i / self.mips);
+            let (mip, slice) = (i % self.mips + self.dropped, i / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
@@ -698,10 +974,221 @@ impl Staging {
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return None;
+                succeeded = false;
+                break;
+            }
+            #[cfg(feature = "diagnostics")]
+            cooked::trace(
+                self as *const Staging as usize, i,
+                self.memory as u64,
+                self.layout.desc.width, self.layout.desc.height, self.layout.desc.mips,
+                self.title_format, self.dropped, self.mips, self.host_format,
+                mip, slice, f.Width, f.Height, self.layout.desc.element_bytes,
+                pitch, rows, linear,
+            );
+            if !profile::replace(
+                self.memory as u64,
+                self.layout.desc.width, self.layout.desc.height, self.layout.desc.mips,
+                self.title_format, self.dropped, self.mips, self.host_format, mip,
+                f.Width, f.Height, pitch, rows, linear,
+            ) {
+                cooked::replace(
+                    cooked::ReplaceSource {
+                        address: self.memory as u64,
+                        width: self.layout.desc.width,
+                        height: self.layout.desc.height,
+                        mips: self.layout.desc.mips,
+                        format: self.title_format,
+                    },
+                    cooked::ReplaceMip {
+                        dropped: self.dropped,
+                        host_mips: self.mips,
+                        host_format: self.host_format,
+                        source_mip: mip,
+                        width: f.Width,
+                        height: f.Height,
+                        pitch,
+                        rows,
+                    },
+                    linear,
+                );
             }
         }
-        Some((buffer, at))
+        #[cfg(feature = "diagnostics")]
+        if succeeded {
+            self.dump_priority_lighting_bc(tiled, data, subresources);
+        }
+        #[cfg(feature = "diagnostics")]
+        self.note_priority_detile(tiled, subresources, succeeded);
+        succeeded.then_some((buffer, at))
+    }
+
+    /// One local, opt-in pair of raw BC mip-0 dumps per selected lighting
+    /// source: original console tile order and the bytes staged for upload.
+    /// Lower mips are also saved in linear order. The exact four shapes keep
+    /// output bounded. The readback beside `record_upload` verifies each mip.
+    #[cfg(feature = "diagnostics")]
+    fn dump_priority_lighting_bc(&self, tiled: &[u8], data: *mut u8, subresources: &[u32]) {
+        use std::path::PathBuf;
+        use std::sync::OnceLock;
+
+        static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+        let Some(dir) = DIR
+            .get_or_init(|| {
+                std::env::var_os("VICTORY_DUMP_LIGHTING_BC_DIR")
+                    .map(PathBuf::from)
+                    .filter(|path| !path.as_os_str().is_empty())
+            })
+            .as_ref()
+        else {
+            return;
+        };
+        if !subresources.contains(&0) || self.dropped != 0 || self.layout.desc.swizzle.0 != 5 {
+            return;
+        }
+        let Some(index) = crate::resource::priority_bound_source(self.memory as u64) else {
+            return;
+        };
+        let d = &self.layout.desc;
+        let Some((width, bytes, mips)) = [(2048, 8, 12), (1024, 16, 11), (512, 16, 10), (256, 8, 1)].get(index).copied() else {
+            return;
+        };
+        if d.width != width || d.height != width || d.element_bytes != bytes || d.block != 4 || d.mips != mips {
+            return;
+        }
+        let row_bytes = width as usize / 4 * bytes as usize;
+        let rows = width as usize / 4;
+        let Some(mip_bytes) = row_bytes.checked_mul(rows).filter(|&n| n <= 2 << 20) else {
+            return;
+        };
+        let Some(mip) = self.layout.mips.first() else { return };
+        let Some(source) = tiled.get(mip.offset as usize..mip.offset as usize + mip_bytes) else {
+            tracing::warn!(index, "lighting BC source mip 0 is outside the tiled snapshot");
+            return;
+        };
+        let Some(footprint) = self.footprints.first() else { return };
+        let pitch = footprint.Footprint.RowPitch as usize;
+        let Some(end) = footprint.Offset.checked_add(((rows - 1) * pitch + row_bytes) as u64) else { return };
+        if pitch < row_bytes || end > self.size {
+            tracing::warn!(index, pitch, row_bytes, "lighting BC mip 0 is outside the staging footprint");
+            return;
+        }
+
+        static WRITTEN: Mutex<[bool; 4]> = Mutex::new([false; 4]);
+        let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        if written[index] {
+            return;
+        }
+        let mut linear = vec![0u8; mip_bytes];
+        for row in 0..rows {
+            // SAFETY: `end <= self.size` and `pitch >= row_bytes`, so every
+            // row is inside the mapped staging space supplied to `detile`.
+            let from = unsafe { std::slice::from_raw_parts(data.add(footprint.Offset as usize + row * pitch), row_bytes) };
+            linear[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(from);
+        }
+        let name = format!("lighting-bc-{index}-{width}x{width}-{}-mip0", if bytes == 8 { "bc1" } else { "bc3" });
+        let source_path = dir.join(format!("{name}-tiled.bc"));
+        let linear_path = dir.join(format!("{name}-linear.bc"));
+        let manifest_path = dir.join(format!("{name}.txt"));
+        let manifest = format!(
+            "index={index}\naddress={:#x}\nwidth={width}\nheight={width}\nformat={}\nswizzle=SW_4KB_S\nsource_mip0_offset={}\nsource_bytes={}\nlinear_row_bytes={}\nhost_row_pitch={}\n",
+            self.memory as u64,
+            if bytes == 8 { "BC1" } else { "BC3" },
+            mip.offset,
+            mip_bytes,
+            row_bytes,
+            pitch,
+        );
+        let result = std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(&source_path, source))
+            .and_then(|()| std::fs::write(&linear_path, &linear))
+            .and_then(|()| std::fs::write(&manifest_path, manifest));
+        match result {
+            Ok(()) => {
+                let mut lower = 0usize;
+                for mip in 1..mips as usize {
+                    if !subresources.contains(&(mip as u32)) { continue; }
+                    let edge = (width as usize >> mip).max(1);
+                    let row_bytes = edge.div_ceil(4) * bytes as usize;
+                    let rows = edge.div_ceil(4);
+                    let Some(footprint) = self.footprints.get(mip) else { break };
+                    let pitch = footprint.Footprint.RowPitch as usize;
+                    let Some(end) = footprint.Offset.checked_add(((rows - 1) * pitch + row_bytes) as u64) else { break };
+                    if pitch < row_bytes || self.rows.get(mip).copied() != Some(rows as u32) || end > self.size {
+                        tracing::warn!(index, mip, pitch, rows, "lighting BC lower mip lies outside staging footprint");
+                        break;
+                    }
+                    let mut linear = vec![0u8; row_bytes * rows];
+                    for row in 0..rows {
+                        // SAFETY: this row is inside the mapped staging
+                        // space by the footprint and end checks above.
+                        let from = unsafe { std::slice::from_raw_parts(data.add(footprint.Offset as usize + row * pitch), row_bytes) };
+                        linear[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(from);
+                    }
+                    let path = dir.join(format!("lighting-bc-{index}-{width}x{width}-{}-mip{mip}-linear.bc", if bytes == 8 { "bc1" } else { "bc3" }));
+                    if let Err(error) = std::fs::write(&path, linear) {
+                        tracing::warn!(index, mip, %error, "lighting BC lower mip write failed");
+                        break;
+                    }
+                    lower += 1;
+                }
+                written[index] = true;
+                tracing::info!(index, width, bytes = mip_bytes, lower_mips = lower, tiled = %source_path.display(), linear = %linear_path.display(), "lighting BC source and staged mip chain dumped locally");
+            }
+            Err(error) => tracing::warn!(index, %error, directory = %dir.display(), "lighting BC diagnostic dump failed"),
+        }
+    }
+
+    /// Two bounded observations of each selected world-lighting source.
+    /// The page probe is read-only and diagnostic: it reports pages that
+    /// `ReadProcessMemory` cannot read, plus pages zero in the snapshot sent
+    /// to the detiler. A zero page can also be valid texture data.
+    #[cfg(feature = "diagnostics")]
+    fn note_priority_detile(&self, tiled: &[u8], subresources: &[u32], succeeded: bool) {
+        let address = self.memory as u64;
+        let Some(index) = crate::resource::priority_bound_source(address) else { return };
+        static SEEN: std::sync::OnceLock<Mutex<std::collections::HashMap<u64, u8>>> = std::sync::OnceLock::new();
+        let seen = SEEN.get_or_init(Default::default);
+        let attempt = {
+            let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+            let count = seen.entry(address).or_default();
+            if *count >= 2 {
+                return;
+            }
+            *count += 1;
+            *count
+        };
+        const PAGE: usize = 4096;
+        let size = self.layout.size as usize;
+        let mut pages = vec![false; size.div_ceil(PAGE)];
+        for &subresource in subresources {
+            let (from, to) = self.spans.get(subresource as usize).copied().unwrap_or((0, size));
+            for selected in pages.iter_mut().take(to.min(size).div_ceil(PAGE)).skip(from / PAGE) {
+                *selected = true;
+            }
+        }
+        let mut probed = [0u8; PAGE];
+        let mut tile_bytes = 0usize;
+        let mut zero_pages = 0usize;
+        let mut unreadable_pages = 0usize;
+        let mut page_count = 0usize;
+        for (page, &selected) in pages.iter().enumerate() {
+            if !selected {
+                continue;
+            }
+            let from = page * PAGE;
+            let to = (from + PAGE).min(size);
+            let len = to - from;
+            tile_bytes += len;
+            page_count += 1;
+            if tiled.get(from..to).is_some_and(|bytes| bytes.iter().all(|&byte| byte == 0)) {
+                zero_pages += 1;
+            }
+            if !crate::host::read_into(self.memory.wrapping_add(from), &mut probed[..len]) {
+                unreadable_pages += 1;
+            }
+        }
+        tracing::info!(index, address = format_args!("{address:#x}"), attempt, original_width = self.layout.desc.width, original_height = self.layout.desc.height, original_mips = self.layout.desc.mips, host_mips = self.mips, dropped_mips = self.dropped, swizzle = self.layout.desc.swizzle.0, subresources = subresources.len(), tile_bytes, page_count, zero_pages, unreadable_pages, detile_succeeded = succeeded, "bound full-mip lighting texture detile probe");
     }
 }
 
@@ -735,10 +1222,30 @@ impl Drop for Scratch {
     }
 }
 
+/// Bytes a host buffer must cover for these footprints.
+///
+/// [`ID3D12Device::GetCopyableFootprints`] omits the row-pitch padding on
+/// the last row of the last subresource. [`ID3D12GraphicsCommandList::CopyTextureRegion`]
+/// still addresses every row at `RowPitch`, including that one. A buffer
+/// sized to the tight total (a 2×1 `R32_FLOAT` mip is 8 bytes at pitch 256)
+/// removes the device with `DXGI_ERROR_INVALID_CALL` on AMD.
+fn footprint_bytes(
+    total: u64,
+    footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+    rows: &[u32],
+) -> u64 {
+    footprints.iter().zip(rows).fold(total, |total, (f, &n)| {
+        let pitched = u64::from(f.Footprint.RowPitch)
+            .saturating_mul(u64::from(n))
+            .saturating_mul(u64::from(f.Footprint.Depth.max(1)));
+        total.max(f.Offset.saturating_add(pitched))
+    })
+}
+
 /// Bytes available in the staging buffer for a subresource at `offset`.
 /// D3D12's `GetCopyableFootprints` omits trailing row-pitch padding on the
 /// final row of the final subresource, so `pitch * rows * depth` can exceed
-/// `total - offset`.
+/// `total - offset` unless the caller used [`footprint_bytes`].
 fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64) -> usize {
     let padded = pitch
         .saturating_mul(rows as usize)
@@ -821,15 +1328,20 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
             Some(&mut total),
         );
     }
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    let total = footprint_bytes(total, &footprints, &rows);
+    let dropped = copy.dropped;
+    tracing::debug!(?desc, total, dropped, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
-    let spans = spans(&layout, count, u32::from(d.MipLevels));
+    let spans = spans(&layout, count, u32::from(d.MipLevels), dropped);
     let s = Arc::new(Staging {
         size: total,
         footprints,
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        dropped,
+        title_format: crate::resource::title_format(resource).unwrap_or(0),
+        host_format: d.Format.0 as u32,
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         spans,
@@ -844,6 +1356,28 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn footprint_bytes_covers_the_last_rows_pitch() {
+        // The 128×72 R32_FLOAT chain that removed the device: last mip
+        // 2×1 at offset 0xd600, pitch 256, tight total 0xd608 (8 texels).
+        let last = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0xd600,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Width: 2,
+                Height: 1,
+                Depth: 1,
+                RowPitch: 256,
+                ..Default::default()
+            },
+        };
+        assert_eq!(footprint_bytes(0xd608, &[last], &[1]), 0xd700);
+        let mut full = last;
+        full.Offset = 0;
+        full.Footprint.RowPitch = 512;
+        full.Footprint.Height = 72;
+        assert_eq!(footprint_bytes(512 * 72, &[full], &[72]), 512 * 72);
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {

@@ -1669,6 +1669,16 @@ fn bfe_signed_and_unsigned_match_rdna2() {
 /// tables at s4 and s6 (slots 1 and 2); `used` lists (table user SGPR,
 /// kind, table offset in dwords, descriptor dwords).
 fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: bool) -> HostShader {
+    lower_cs32_with_diagnostics(words, used, validate, false, None)
+}
+
+fn lower_cs32_with_diagnostics(
+    words: &[u32],
+    used: &[(u8, ResourceType, u32, u8)],
+    validate: bool,
+    force_lod_zero: bool,
+    zero_sample_offset: Option<usize>,
+) -> HostShader {
     let param = |root, user_data, slot| RootParam {
         root,
         table_offset_dwords: 0,
@@ -1711,7 +1721,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
+    let lowered = lower::lower_with_packed(&lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -1722,7 +1732,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
-    })
+    }, None, false, force_lod_zero, zero_sample_offset, false)
     .expect("lower");
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -1797,6 +1807,39 @@ fn image_addresses_of_16_bits_and_clamps() {
         (6, ResourceType::Sampler, 0, 4),
     ];
 
+    // The diagnostic form changes only an implicit compute Sample to
+    // SampleLevel(0); both variants must still validate as SM 6.6 compute.
+    let mut implicit = prefix.clone();
+    implicit.extend([vop1(0x001, 1, 255), 0x3F00_0000]);
+    implicit.extend([vop1(0x001, 2, 255), 0x3F00_0000]);
+    let sample_offset = implicit.len() * 4;
+    implicit.extend([0xF080_0F08, 1 | 5 << 8 | 2 << 16 | 4 << 21]);
+    implicit.extend(buffer_store_dword(5, 20, 0));
+    implicit.push(S_ENDPGM);
+    let normal = lower_cs32(&implicit, &used, true);
+    let lod_zero = lower_cs32_with_diagnostics(&implicit, &used, true, true, None);
+    let zero_sample = lower_cs32_with_diagnostics(&implicit, &used, true, false, Some(sample_offset));
+    assert_ne!(normal.dxil, lod_zero.dxil);
+    assert_ne!(normal.dxil, zero_sample.dxil);
+    if let Some(dxc) = validator::Validator::default_path().map(|p| p.with_file_name("dxc.exe"))
+        && dxc.exists()
+    {
+        let path = std::env::temp_dir().join(format!("victory-lod-zero-{}.dxil", std::process::id()));
+        let dump = |dxil: &[u8]| {
+            std::fs::write(&path, dxil).expect("write DXIL test file");
+            let output = std::process::Command::new(&dxc).arg("-dumpbin").arg(&path).output().expect("dxc dumpbin");
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        let ordinary = dump(&normal.dxil);
+        let diagnostic = dump(&lod_zero.dxil);
+        let _ = std::fs::remove_file(&path);
+        assert!(ordinary.contains("@dx.op.sample.f32("));
+        assert!(!ordinary.contains("@dx.op.sampleLevel.f32("));
+        assert!(diagnostic.contains("@dx.op.sampleLevel.f32("));
+        assert!(!diagnostic.contains("@dx.op.sample.f32("));
+    }
+
     // A 2x2 quad per four lanes: u = (4 + (l & 1)) / 16, v = (4 + (l >> 1 & 1)) / 16.
     let mut biased = prefix.clone();
     biased.push(0x1B << 25 | 3 << 17 | (v0 as u32 & 0xFF) << 9 | 129); // v_and_b32 v3, 1, v0
@@ -1819,9 +1862,9 @@ fn image_addresses_of_16_bits_and_clamps() {
     biased.extend([0xF094_0F08, 1 | 5 << 8 | 2 << 16 | 4 << 21 | 1 << 30]);
     biased.extend(buffer_store_dword(5, 20, 0));
     biased.push(S_ENDPGM);
-    // The 1.6 validator refuses implicit derivatives in compute (1.8 takes
-    // them); the host runs them.
-    let biased = lower_cs32(&biased, &used, false);
+    // Implicit derivatives in compute require validator 1.8, which the
+    // emitter selects while keeping the shader and DXIL versions at 6.6/1.6.
+    let biased = lower_cs32(&biased, &used, true);
 
     let mut gathers = prefix;
     // Offset (1, 0); coordinates (0.375, 0.625) as f16 in v2 and as f32 in

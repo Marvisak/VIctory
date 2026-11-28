@@ -241,6 +241,29 @@ pub(crate) fn has_table(key: usize) -> bool {
     shared().iter().any(|(k, _)| *k == key)
 }
 
+/// Page tables name every host copy. After copies were given up
+/// ([`crate::shadow::reap_free`]), rewrite so the tables drop them before
+/// the next submission reads the old views. No submission is running.
+pub(crate) fn drop_gone() {
+    let now = crate::shadow::generation();
+    let keys: Vec<usize> = shared()
+        .iter()
+        .filter(|(_, s)| s.generation != now)
+        .map(|(k, _)| *k)
+        .collect();
+    for key in keys {
+        let _ = with_heap(key, |heap| {
+            let mut tables = shared();
+            let host = std::ptr::from_ref(heap) as usize;
+            if let Some((_, table)) = tables.iter_mut().find(|(k, s)| *k == key && s.host == host)
+                && table.generation != now
+            {
+                table.rewrite(heap, now);
+            }
+        });
+    }
+}
+
 /// Runs `f` on the host heap behind view heap `key` while it cannot go
 /// away; None if it is gone or has no host heap.
 fn with_heap<R>(key: usize, f: impl FnOnce(&HostHeap) -> R) -> Option<R> {

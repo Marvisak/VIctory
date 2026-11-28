@@ -36,6 +36,9 @@ pub(crate) struct Pending {
     now: AtomicBool,
     taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    /// Created only when a draw has no usable depth view. This variant is
+    /// compiled on the same workers as ordinary pipelines.
+    without_depth: OnceLock<Arc<Pending>>,
     #[cfg(feature = "diagnostics")]
     pub(super) skipped_shader: Option<String>,
     /// What identifies it across runs (shader containers and state), and
@@ -65,6 +68,18 @@ impl Pending {
         #[cfg(feature = "diagnostics")]
         let skipped_shader = super::skipped_shader(&shaders, skip_hashes).map(str::to_owned);
         let made = OnceLock::new();
+        if shaders.iter().any(|shader| shader.hash == "731a39171b568298")
+            && crate::switch::on("VICTORY_DISABLE_731_COMPOSITE")
+        {
+            // Use the same pipeline-creation omission as the diagnostic
+            // shader skip. A dispatch-only skip leaves a different title
+            // state and produced a near-black FFX input in live testing.
+            let _ = made.set(None);
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::warn!("world composite 731 pipeline omitted for visual fallback");
+            }
+        }
         // Publish the completed result before the pipeline can be queued.
         #[cfg(feature = "diagnostics")]
         if skipped_shader.is_some() {
@@ -78,6 +93,7 @@ impl Pending {
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             made,
+            without_depth: OnceLock::new(),
             #[cfg(feature = "diagnostics")]
             skipped_shader,
             used: AtomicBool::new(false),
@@ -114,7 +130,12 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
         key.update(s.stage.as_bytes());
         key.update(s.hash.as_bytes());
     }
-    key.update(graphics.map(|g| g.describe()).unwrap_or_default().as_bytes());
+    key.update(
+        graphics
+            .map(|g| g.describe())
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     key.finalize().to_hex()[..32].to_owned()
 }
 
@@ -146,7 +167,9 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log_built(key: &str) {
     if let Some((name, loaded)) = super::library::LAST.take() {
-        log("built", key, || format!("{name}\t{}", if loaded { "loaded" } else { "made" }));
+        log("built", key, || {
+            format!("{name}\t{}", if loaded { "loaded" } else { "made" })
+        });
     }
 }
 
@@ -166,9 +189,13 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
     };
     let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
     if log.is_none() {
-        *log = std::fs::File::create(path).ok().map(|f| (f, HashSet::new()));
+        *log = std::fs::File::create(path)
+            .ok()
+            .map(|f| (f, HashSet::new()));
     }
-    let Some((file, seen)) = log.as_mut() else { return };
+    let Some((file, seen)) = log.as_mut() else {
+        return;
+    };
     if seen.insert(format!("{what} {key}")) {
         let _ = writeln!(file, "{what}\t{key}\t{}", rest());
     }
@@ -205,6 +232,35 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
+/// The color-only PSO used when the title's depth view is absent or too
+/// small for its color targets. D3D12 requires UNKNOWN DSVFormat with a null
+/// DSV; merely disabling depth tests on the original PSO still fails draw
+/// validation. The variant is queued once and shares the normal wait budget.
+pub(crate) fn ready_without_depth(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    let ordinary = ready(p)?;
+    let Some(graphics) = p.graphics.as_deref() else { return Some(ordinary) };
+    if !graphics.expects_depth_view() {
+        return Some(ordinary);
+    }
+    let variant = p.without_depth.get_or_init(|| {
+        #[cfg(feature = "diagnostics")]
+        {
+            static VARIANTS: AtomicU64 = AtomicU64::new(0);
+            let count = VARIANTS.fetch_add(1, Ordering::Relaxed) + 1;
+            if count <= 8 || count.is_power_of_two() {
+                tracing::info!(count, shaders = ?p.shaders, "compiling color-only pipeline for null depth view");
+            }
+        }
+        Arc::new(Pending::new(
+            p.shaders.clone(),
+            Some(Box::new(graphics.without_depth())),
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ))
+    });
+    ready(variant)
+}
+
 /// Queues `p` for the workers: once, and once more ahead of the early
 /// starts if a draw waits for it (`now`) while it is still queued.
 fn start(p: &Arc<Pending>, now: bool) {
@@ -217,7 +273,10 @@ fn start(p: &Arc<Pending>, now: bool) {
 fn enqueue(p: &Pending, now: bool) -> Option<bool> {
     let first = !p.queued.swap(true, Ordering::Relaxed);
     if first {
-        PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+        PEAK.fetch_max(
+            WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+            Ordering::Relaxed,
+        );
     }
     let ahead = now && !p.now.swap(true, Ordering::Relaxed);
     (first || ahead && !p.taken.load(Ordering::Relaxed)).then_some(ahead)
@@ -249,15 +308,20 @@ fn wait(p: &Pending, frame: u64) {
         if rest.is_zero() {
             break;
         }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        held = done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 /// Pipelines for the workers: those draws wait for, then those started
 /// early.
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
-    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
+static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) = (
+    Mutex::new([VecDeque::new(), VecDeque::new()]),
+    Condvar::new(),
+);
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
@@ -415,6 +479,12 @@ mod tests {
             hash: "0123456789abcdef".into(),
             container: Vec::new(),
             translated: OnceLock::new(),
+            packed_shared_exp: OnceLock::new(),
+            ray_traversal: OnceLock::new(),
+            synthetic: true,
+            resolves_light: false,
+            ends_reflections: false,
+            draws_sky: false,
         });
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
         let warm = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));

@@ -592,6 +592,19 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     0
 }
 
+/// Samples the R9G9B9E5 alias of `resource`'s host texture. Without an
+/// alias, moves the primary to a shader-resource state instead.
+#[cfg(windows)]
+pub(crate) fn ensure_shared_exp(list: &crate::host::HostList, resource: This) {
+    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    let Some(copy) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    if !list.use_shared_exp(&copy) {
+        ensure_state(list, resource, SHADER_RESOURCE);
+    }
+}
+
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
@@ -642,6 +655,22 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+/// Brings a copy source texture up to date from a GPU-written alias of the
+/// same title memory, then from title memory when it has no host writer.
+#[cfg(windows)]
+fn sync_copy_source(
+    list: &crate::host::HostList,
+    src: This,
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) {
+    if let Some(alias) = crate::resource::alias_source(src) {
+        crate::texture::alias_copy(list, alias, src);
+    }
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src, texture);
+    }
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -652,9 +681,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if crate::texture::title_written(&from) {
-                crate::texture::upload(list, src, &from);
-            }
+            sync_copy_source(list, src, &from);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_writes(list, dst);
@@ -662,6 +689,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(&to, &from) };
+            #[cfg(feature = "diagnostics")]
+            crate::capture::after_lit_path_copy(list, dst, src);
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -685,6 +714,262 @@ pub(crate) struct CopyLocation {
     resource: This,
     kind: u32,
     footprint: crate::resource::PlacedFootprint,
+}
+
+/// A title-side description for diagnosing a copy omitted by the host's
+/// shortened streamed mip chain. A buffer endpoint has no texture shape.
+#[cfg(all(windows, feature = "diagnostics"))]
+#[derive(Clone, Copy, Debug)]
+struct CopyTextureShape {
+    address: u64,
+    dimension: u32,
+    width: u64,
+    height: u32,
+    depth_or_array: u32,
+    mips: u32,
+    format: u32,
+    flags: u32,
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn copy_texture_shape(resource: This) -> Option<CopyTextureShape> {
+    let (address, _) = crate::resource::texture_memory(resource)?;
+    let words = crate::resource::texture_desc(resource)?;
+    let width = u64::from(words[4]) | u64::from(words[5]) << 32;
+    let height = words[6];
+    let depth_or_array = words[7] & 0xffff;
+    let mips = words[7] >> 16;
+    let mips = if mips == 0 {
+        64 - width.max(u64::from(height)).max(1).leading_zeros()
+    } else {
+        mips
+    };
+    Some(CopyTextureShape {
+        address: address as u64,
+        dimension: words[0],
+        width,
+        height,
+        depth_or_array,
+        mips,
+        format: words[8],
+        flags: words[12],
+    })
+}
+
+/// Every skipped copy is counted; only 12 distinct examples are printed in
+/// each five-second interval. The weak watch does not keep a texture alive.
+#[cfg(all(windows, feature = "diagnostics"))]
+struct SkippedCopyWatch {
+    texture: std::sync::Weak<crate::resource::HostTexture>,
+    address: u64,
+    skipped: u64,
+    retained_copies_recorded: u64,
+    first_read_seen: bool,
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+#[derive(Default)]
+struct SkippedCopyTrace {
+    examples: std::collections::HashSet<(u8, u64, u64, u32, u32)>,
+    watched: std::collections::HashMap<usize, SkippedCopyWatch>,
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+static SKIPPED_COPY_TRACE: std::sync::LazyLock<std::sync::Mutex<SkippedCopyTrace>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(SkippedCopyTrace::default()));
+#[cfg(all(windows, feature = "diagnostics"))]
+static SKIPPED_COPY_COUNTS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn copy_extent(src: &CopyLocation, shape: Option<CopyTextureShape>, copy_box: Option<[u32; 6]>) -> Option<[u32; 3]> {
+    if let Some([left, top, front, right, bottom, back]) = copy_box {
+        return Some([right.saturating_sub(left), bottom.saturating_sub(top), back.saturating_sub(front)]);
+    }
+    if src.kind == 1 {
+        return Some([src.footprint.width, src.footprint.height, src.footprint.depth]);
+    }
+    let shape = shape?;
+    let mip = (src.footprint.offset as u32) % shape.mips.max(1);
+    Some([
+        u32::try_from(shape.width.checked_shr(mip)?).ok()?.max(1),
+        shape.height.checked_shr(mip)?.max(1),
+        if shape.dimension == 4 { shape.depth_or_array.checked_shr(mip)?.max(1) } else { 1 },
+    ])
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+struct SkippedCopyHost<'a> {
+    dropped: u32,
+    mips: u32,
+    destination: Option<&'a std::sync::Arc<crate::resource::HostTexture>>,
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn copy_host_mips(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u32 {
+    // SAFETY: the host texture is live for this recorded copy and GetDesc
+    // reads no caller-provided memory.
+    u32::from(unsafe { texture.GetDesc() }.MipLevels)
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn note_skipped_streamed_copy(
+    side: u8,
+    dst: &CopyLocation,
+    src: &CopyLocation,
+    at: [u32; 3],
+    source_box: *const [u32; 6],
+    host: SkippedCopyHost<'_>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let SkippedCopyHost { dropped, mips: host_mips, destination } = host;
+    SKIPPED_COPY_COUNTS[side as usize].fetch_add(1, Relaxed);
+    let dst_shape = copy_texture_shape(dst.resource);
+    let src_shape = copy_texture_shape(src.resource);
+    let dst_address = dst_shape.map_or_else(|| crate::resource::buffer_bytes(dst.resource).map_or(0, |(p, _)| p as u64), |d| d.address);
+    let src_address = src_shape.map_or_else(|| crate::resource::buffer_bytes(src.resource).map_or(0, |(p, _)| p as u64), |d| d.address);
+    let dst_subresource = (dst.kind == 0).then_some(dst.footprint.offset as u32);
+    let src_subresource = (src.kind == 0).then_some(src.footprint.offset as u32);
+    let dropped_subresource = if side == 0 { dst_subresource } else { src_subresource };
+    let mut trace = SKIPPED_COPY_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(copy) = destination {
+        let key = std::sync::Arc::as_ptr(copy) as usize;
+        if let Some(watch) = trace.watched.get_mut(&key) {
+            watch.skipped += 1;
+        } else if trace.watched.len() < 256 {
+            trace.watched.insert(key, SkippedCopyWatch {
+                texture: std::sync::Arc::downgrade(copy),
+                address: dst_address,
+                skipped: 1,
+                retained_copies_recorded: 0,
+                first_read_seen: false,
+            });
+        } else {
+            SKIPPED_COPY_COUNTS[3].fetch_add(1, Relaxed);
+        }
+    }
+    let example = (side, dst_address, src_address, dst_subresource.unwrap_or(u32::MAX), src_subresource.unwrap_or(u32::MAX));
+    let print = trace.examples.len() < 12 && trace.examples.insert(example);
+    drop(trace);
+    if print {
+        let copy_box = (!source_box.is_null()
+            && crate::texture::committed(source_box.cast::<u8>(), std::mem::size_of::<[u32; 6]>() ))
+            .then(|| {
+                // SAFETY: `source_box` is nonnull and `committed` verified
+                // that all six u32s reside in mapped readable memory.
+                unsafe { source_box.read_unaligned() }
+            });
+        let extent = copy_extent(src, src_shape, copy_box);
+        let side = match side { 0 => "destination", 1 => "source", _ => "source-readback" };
+        tracing::warn!(side, dst_address = format_args!("{dst_address:#x}"), src_address = format_args!("{src_address:#x}"),
+            dst_dimension = ?dst_shape.map(|d| d.dimension),
+            dst_original_width = ?dst_shape.map(|d| d.width), dst_original_height = ?dst_shape.map(|d| d.height),
+            dst_original_depth_or_array = ?dst_shape.map(|d| d.depth_or_array),
+            dst_original_mips = ?dst_shape.map(|d| d.mips), dst_format = ?dst_shape.map(|d| d.format),
+            dst_flags = ?dst_shape.map(|d| d.flags),
+            src_dimension = ?src_shape.map(|d| d.dimension),
+            src_original_width = ?src_shape.map(|d| d.width), src_original_height = ?src_shape.map(|d| d.height),
+            src_original_depth_or_array = ?src_shape.map(|d| d.depth_or_array),
+            src_original_mips = ?src_shape.map(|d| d.mips), src_format = ?src_shape.map(|d| d.format),
+            src_flags = ?src_shape.map(|d| d.flags), dst_kind = dst.kind, src_kind = src.kind,
+            ?dst_subresource, ?src_subresource, ?dropped_subresource, dropped, host_mips,
+            destination_offset = ?at, ?copy_box, ?extent,
+            "CopyTextureRegion skipped because a streamed top mip was removed");
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn note_retained_streamed_copy(destination: &std::sync::Arc<crate::resource::HostTexture>) {
+    let key = std::sync::Arc::as_ptr(destination) as usize;
+    let mut trace = SKIPPED_COPY_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(watch) = trace.watched.get_mut(&key) {
+        watch.retained_copies_recorded += 1;
+    }
+}
+
+/// Report skipped copies and observed reads without holding their textures.
+/// A recorded copy is not proof of nonzero texels or GPU execution; the
+/// first-read probe also reports subresources uploaded from title memory.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn log_skipped_streamed_copies() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let counts: [u64; 4] = std::array::from_fn(|i| SKIPPED_COPY_COUNTS[i].swap(0, Relaxed));
+    let mut trace = SKIPPED_COPY_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    let examples = trace.examples.len();
+    trace.examples.clear();
+    let expired_unread = trace.watched.values()
+        .filter(|watch| watch.texture.strong_count() == 0 && !watch.first_read_seen).count();
+    trace.watched.retain(|_, watch| watch.texture.strong_count() > 0);
+    let watched = trace.watched.len();
+    let unread = trace.watched.values().filter(|watch| !watch.first_read_seen).count();
+    drop(trace);
+    tracing::info!(skipped_destination = counts[0], skipped_source = counts[1],
+        skipped_source_readback = counts[2], watch_cap_omitted = counts[3],
+        distinct_examples = examples, watched_destinations = watched,
+        awaiting_observed_read = unread, expired_unread,
+        "streamed top-mip CopyTextureRegion skips in this interval");
+}
+
+/// The first observed shader-heap read of a watched copy destination.
+/// Direct table reads are also reported through mirror_used_table.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_skipped_copy_shader_read(resource: This, source: &'static str) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(copy) = crate::resource::made_copy(resource) else { return };
+    let key = std::sync::Arc::as_ptr(&copy) as usize;
+    let mut trace = SKIPPED_COPY_TRACE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(watch) = trace.watched.get_mut(&key) else { return };
+    if watch.first_read_seen {
+        return;
+    }
+    watch.first_read_seen = true;
+    let (address, skipped, retained_copies_recorded) = (watch.address, watch.skipped, watch.retained_copies_recorded);
+    drop(trace);
+    let retained_subresources_recorded = crate::texture::retained_subresources_recorded(&copy);
+    let host_written = copy.host_written.load(Relaxed);
+    tracing::warn!(source, address = format_args!("{address:#x}"), skipped,
+        retained_copies_recorded, retained_subresources_recorded, host_written,
+        retained_path_seen = retained_copies_recorded > 0 || retained_subresources_recorded > 0 || host_written,
+        "first shader read after a skipped streamed top-mip copy");
+}
+
+/// The title indexes its full mip chain; a streamed host copy starts after
+/// `dropped` leading mips. Keep the array slice while shifting its mip.
+/// A copy of a mip we did not allocate on the host cannot be recorded.
+fn streamed_subresource(index: u32, host_mips: u32, dropped: u32) -> Option<u32> {
+    if dropped == 0 {
+        return Some(index);
+    }
+    let title_mips = host_mips.checked_add(dropped)?;
+    if host_mips == 0 {
+        return None;
+    }
+    let (slice, mip) = (index / title_mips, index % title_mips);
+    if mip < dropped {
+        return None;
+    }
+    slice.checked_mul(host_mips)?.checked_add(mip - dropped)
+}
+
+#[cfg(windows)]
+fn copy_location_on_host(location: &mut CopyLocation, copy: &crate::resource::HostTexture) -> bool {
+    const SUBRESOURCE: u32 = 0;
+    if location.kind != SUBRESOURCE || copy.dropped == 0 {
+        return true;
+    }
+    // SAFETY: `copy` owns a live host texture. A subresource index occupies
+    // the low dword of the location union's footprint offset.
+    let host_mips = u32::from(unsafe { copy.texture.GetDesc() }.MipLevels);
+    let title_index = location.footprint.offset as u32;
+    let Some(host_index) = streamed_subresource(title_index, host_mips, copy.dropped) else {
+        static SKIPPED: std::sync::Once = std::sync::Once::new();
+        SKIPPED.call_once(|| {
+            tracing::info!(title_index, host_mips, dropped = copy.dropped, "copy to or from a streamed texture's dropped mip skipped");
+        });
+        return false;
+    };
+    location.footprint.offset = u64::from(host_index);
+    true
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -712,24 +997,64 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
-        let Some(to) = crate::resource::host_resource(dst.resource) else {
+        // A title copy into a leading mip is evidence that this particular
+        // destination needs its full chain. Mark it before `host_copy` lazily
+        // creates the host texture; copying the 1024x1024 BC3 top mip into a
+        // reduced 512x512 mip would overflow or crop, not downsample it.
+        let source_exists = match src.kind {
+            0 => crate::resource::copy_source_subresource_exists(src.resource, src.footprint.offset as u32),
+            FOOTPRINT => src.footprint.bytes().is_some() && crate::resource::buffer_bytes(src.resource).is_some(),
+            _ => false,
+        };
+        let preserved_mip = (dst.kind == 0 && source_exists)
+            .then(|| crate::resource::preserve_copied_top_mip(dst.resource, dst.footprint.offset as u32))
+            .flatten();
+        #[cfg(feature = "diagnostics")]
+        let prior_host_dropped = preserved_mip
+            .and_then(|_| crate::resource::made_copy(dst.resource).map(|copy| copy.dropped));
+        let Some(to_copy) = crate::resource::host_copy(dst.resource) else {
             if dst.kind == FOOTPRINT && src.kind != FOOTPRINT {
                 read_back(list, &dst, [x, y, z], &src, source_box);
             }
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        if let Some(policy_dropped) = preserved_mip {
+            static REPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let count = REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if count <= 16 || count.is_power_of_two() {
+                tracing::info!(count, policy_dropped, ?prior_host_dropped,
+                    host_dropped = to_copy.dropped,
+                    destination = ?dst.resource,
+                    "top-mip copy destination host creation checked");
+            }
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = preserved_mip;
+        let to = &to_copy.texture;
+        let mut to_location = dst;
+        if !copy_location_on_host(&mut to_location, &to_copy) {
+            #[cfg(feature = "diagnostics")]
+            note_skipped_streamed_copy(0, &dst, &src, [x, y, z], source_box,
+                SkippedCopyHost { dropped: to_copy.dropped, mips: copy_host_mips(to), destination: Some(&to_copy) });
+            return;
+        }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
+        let _source_copy;
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
             };
+            // The title buffer is the tight span. The host buffer covers the
+            // pitched rows (`PlacedFootprint::host_buffer_bytes`).
+            let host_bytes = src.footprint.host_buffer_bytes().unwrap_or(bytes);
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
+            let Some((buffer, staging)) = list.upload(host, host_bytes) else {
                 return;
             };
             // The list owns this mapped D3D12 upload buffer. Wine can report
@@ -740,22 +1065,28 @@ extern "system" fn copy_texture_region(
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, host_bytes));
             }
             _upload = buffer;
+            _source_copy = None;
         } else {
-            let Some(texture) = crate::resource::host_resource(src.resource) else {
+            let Some(copy) = crate::resource::host_copy(src.resource) else {
                 return;
             };
-            if crate::texture::title_written(&texture) {
-                crate::texture::upload(list, src.resource, &texture);
+            if !copy_location_on_host(&mut from, &copy) {
+                #[cfg(feature = "diagnostics")]
+                note_skipped_streamed_copy(1, &dst, &src, [x, y, z], source_box,
+                    SkippedCopyHost { dropped: copy.dropped, mips: copy_host_mips(&copy.texture), destination: Some(&to_copy) });
+                return;
             }
+            let texture = &copy.texture;
+            sync_copy_source(list, src.resource, texture);
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
+            _source_copy = Some(copy);
         }
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_writes(list, dst.resource);
-        let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
@@ -794,6 +1125,10 @@ extern "system" fn copy_texture_region(
                 host_box,
             )
         };
+        #[cfg(feature = "diagnostics")]
+        note_retained_streamed_copy(&to_copy);
+        #[cfg(feature = "diagnostics")]
+        crate::capture::after_lit_path_copy(list, dst.resource, src.resource);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
@@ -825,22 +1160,31 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
             return;
         }};
     }
-    let (Some(host), Some(texture)) = (crate::host::host(), crate::resource::host_resource(src.resource)) else {
+    let (Some(host), Some(copy)) = (crate::host::host(), crate::resource::host_copy(src.resource)) else {
         refused!("no host texture");
     };
+    let texture = &copy.texture;
+    let mut from = *src;
+    if !copy_location_on_host(&mut from, &copy) {
+        #[cfg(feature = "diagnostics")]
+        note_skipped_streamed_copy(2, dst, src, at, source_box,
+            SkippedCopyHost { dropped: copy.dropped, mips: copy_host_mips(texture), destination: None });
+        return;
+    }
     // SAFETY: the title's box (same layout as the host's) or null; a live texture.
     let (b, desc) = unsafe { (source_box.cast::<D3D12_BOX>().as_ref(), texture.GetDesc()) };
     let size = match b {
         Some(b) => [b.right.saturating_sub(b.left), b.bottom.saturating_sub(b.top), b.back.saturating_sub(b.front)],
         None => {
             // A subresource index shares the footprint's first dword.
-            let mip = src.footprint.offset as u32 % u32::from(desc.MipLevels.max(1));
+            let mip = from.footprint.offset as u32 % u32::from(desc.MipLevels.max(1));
             let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { u32::from(desc.DepthOrArraySize) } else { 1 };
             [((desc.Width >> mip) as u32).max(1), (desc.Height >> mip).max(1), (depth >> mip).max(1)]
         }
     };
     // The host takes footprints of 256-byte pitches only (as the console).
-    if !dst.footprint.row_pitch.is_multiple_of(256) {
+    // A pitch of 0 is a multiple of 256 and is not a footprint.
+    if dst.footprint.row_pitch == 0 || !dst.footprint.row_pitch.is_multiple_of(256) {
         refused!("a row pitch not a multiple of 256");
     }
     // shortcut: depth and stencil planes copy out in typeless formats of
@@ -850,17 +1194,22 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     }
     // The host copies into a footprint only within a buffer that holds all
     // of it, so readback memory spans the footprint, not just the region.
+    // The title's buffer is the tight span; the host buffer covers every
+    // pitched row, or a one-row readback runs past it and AMD removes the
+    // device.
     let (Some(rows), Some(len)) = (dst.footprint.rows(at, size), dst.footprint.bytes()) else {
         refused!("a region outside its footprint");
     };
-    let (Some(title), Some((buffer, data))) = (buffer_range(dst.resource, dst.footprint.offset, len), list.readback(host, len)) else {
+    let host_len = dst.footprint.host_buffer_bytes().unwrap_or(len);
+    let (Some(title), Some((buffer, data))) = (
+        buffer_range(dst.resource, dst.footprint.offset, len),
+        list.readback(host, host_len),
+    ) else {
         return;
     };
-    if crate::texture::title_written(&texture) {
-        crate::texture::upload(list, src.resource, &texture);
-    }
+    sync_copy_source(list, src.resource, texture);
     ensure_state(list, src.resource, COPY_SOURCE);
-    let (mut to, mut from) = (*dst, *src);
+    let mut to = *dst;
     to.resource = buffer.as_raw().cast_const().cast();
     to.footprint.offset = 0;
     from.resource = texture.as_raw().cast_const().cast();
@@ -1013,6 +1362,20 @@ extern "system" fn clear_rtv(
         ) else {
             return;
         };
+        let desc = record.desc();
+        if crate::draw::unsupported_rtv(record.resource, desc.as_ref()) {
+            #[cfg(feature = "diagnostics")]
+            {
+                static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let skipped = SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if skipped <= 8 || skipped.is_power_of_two() {
+                    // SAFETY: the title passes four floats for a clear (null is tolerated).
+                    let clear_color = unsafe { color.as_ref() };
+                    tracing::warn!(skipped, resource = ?record.resource, clear_color = ?clear_color, rect_count = count, "skipping R9G9B9E5 render-target clear unsupported by the host");
+                }
+            }
+            return;
+        }
         // SAFETY: the title passes four floats (null is tolerated).
         let Some(color) = (unsafe { color.as_ref() }) else {
             return;
@@ -1022,7 +1385,7 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
-        let rtv = host.rtv(&texture, record.desc().as_ref());
+        let rtv = host.rtv(&texture, desc.as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
@@ -1108,9 +1471,28 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
+/// `DispatchX(x, y, z, flags)`: the title's ray-tracing builder dispatches
+/// this way. Keep the builder off unless RT was explicitly enabled.
+pub(crate) fn ray_tracing_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if crate::switch::on("VICTORY_DISABLE_SHADOWS") {
+            return false;
+        }
+        std::env::var("VICTORY_RAY_TRACING")
+            .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true"))
+    })
+}
+
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+    if !ray_tracing_enabled() {
+        static SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if count == 1 || count.is_power_of_two() {
+            tracing::info!(count, "ray-tracing builder DispatchX calls suppressed");
+        }
+        return;
+    }
     #[cfg(windows)]
     state::dispatch(this, x, y, z);
     #[cfg(not(windows))]
@@ -1873,6 +2255,47 @@ mod tests {
     };
     use tracing::{Event, Metadata, Subscriber, span};
 
+    #[test]
+    fn streamed_copy_indices_skip_dropped_mips_and_keep_array_slices() {
+        // A title's 1024-square BC3 chain has 11 mips. The 512-edge host
+        // copy keeps 10; title mip 0 is absent and mip 10 becomes host 9.
+        assert_eq!(streamed_subresource(0, 10, 1), None);
+        assert_eq!(streamed_subresource(1, 10, 1), Some(0));
+        assert_eq!(streamed_subresource(10, 10, 1), Some(9));
+        assert_eq!(streamed_subresource(11, 10, 1), None);
+        assert_eq!(streamed_subresource(12, 10, 1), Some(10));
+        assert_eq!(streamed_subresource(21, 10, 1), Some(19));
+        assert_eq!(streamed_subresource(3, 9, 2), Some(1));
+        assert_eq!(streamed_subresource(10, 9, 2), Some(8));
+        assert_eq!(streamed_subresource(10, 11, 0), Some(10));
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn skipped_copy_diagnostic_reports_the_original_copy_extent() {
+        let shape = CopyTextureShape {
+            address: 0x5c3050000,
+            dimension: 3,
+            width: 1024,
+            height: 1024,
+            depth_or_array: 1,
+            mips: 11,
+            format: 77,
+            flags: 0,
+        };
+        let location = |kind, offset| CopyLocation {
+            resource: std::ptr::null(),
+            kind,
+            footprint: crate::resource::PlacedFootprint {
+                offset, format: 77, width: 128, height: 64, depth: 1, row_pitch: 512,
+            },
+        };
+        assert_eq!(copy_extent(&location(0, 1), Some(shape), None), Some([512, 512, 1]));
+        assert_eq!(copy_extent(&location(1, 0), None, None), Some([128, 64, 1]));
+        assert_eq!(copy_extent(&location(0, 0), Some(shape), Some([4, 8, 0, 260, 136, 1])),
+            Some([256, 128, 1]));
+    }
+
     struct PipelineBinds(Arc<AtomicUsize>);
 
     impl Subscriber for PipelineBinds {
@@ -2043,6 +2466,346 @@ mod tests {
         resolve_queries(list, null, 0, 0, 2, buffer, u64::MAX - 8);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [buffer, list, allocator] {
+            assert_eq!(release(object), 0);
+        }
+    }
+    /// Copy commands (`CopyResource`, texture-to-texture `CopyTextureRegion`,
+    /// and texture-to-buffer read-back) reading a texture whose memory is
+    /// written on the GPU through an incompatible alias (e.g. a render target
+    /// aliased as BC3) must sync from the alias's host texture rather than
+    /// copying stale title memory.
+    #[cfg(windows)]
+    #[test]
+    fn copy_commands_sync_aliased_texture_sources() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct HeapProps {
+            kind: u32,
+            cpu_pages: u32,
+            pool: u32,
+            creation_nodes: u32,
+            visible_nodes: u32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct HeapDesc {
+            size: u64,
+            properties: HeapProps,
+            alignment: u64,
+            flags: u32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct ResDesc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_count: u32,
+            sample_quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        const _: () = assert!(size_of::<HeapDesc>() == size_of::<crate::resource::HeapDesc>());
+        const _: () = assert!(size_of::<ResDesc>() == size_of::<crate::resource::ResourceDesc>());
+
+        const PROPS: HeapProps = HeapProps {
+            kind: 1,
+            cpu_pages: 0,
+            pool: 0,
+            creation_nodes: 0,
+            visible_nodes: 0,
+        };
+        const RENDER_TARGET: u32 = 1;
+        const R32G32B32A32_FLOAT: u32 = 2;
+        const BC3_UNORM: u32 = 77;
+        let tex_desc = |width, height, format, flags| ResDesc {
+            dimension: 3,
+            alignment: 0,
+            width,
+            height,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0x105,
+            flags,
+        };
+        let buf_desc = |width| ResDesc {
+            dimension: 1,
+            alignment: 0,
+            width,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 0,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 1,
+            flags: 0,
+        };
+        let null = std::ptr::null();
+        let heap_iid = crate::object::guid(
+            0x6b3b2502,
+            0x6e51,
+            0x45b3,
+            [0x90, 0xee, 0x98, 0x84, 0x26, 0x5e, 0x8d, 0xf3],
+        );
+        let res_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let queue_iid = crate::object::guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let (mut queue, mut allocator) = (null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let execute = slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50);
+        let close = |l: This| {
+            assert_eq!(
+                slot::<extern "system" fn(This) -> HRESULT>(l, 0x48)(l),
+                S_OK
+            )
+        };
+        let bc_footprint = crate::resource::PlacedFootprint {
+            offset: 0,
+            format: BC3_UNORM,
+            width: 16,
+            height: 16,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let sub = |resource| CopyLocation {
+            resource,
+            kind: 0,
+            footprint: crate::resource::PlacedFootprint {
+                offset: 0,
+                format: 0,
+                width: 0,
+                height: 0,
+                depth: 0,
+                row_pitch: 0,
+            },
+        };
+        let fp = |resource| CopyLocation {
+            resource,
+            kind: 1,
+            footprint: bc_footprint,
+        };
+        let expected_row = |color: [f32; 4]| {
+            let mut row = Vec::with_capacity(64);
+            for _ in 0..4 {
+                for f in color {
+                    row.extend_from_slice(&f.to_le_bytes());
+                }
+            }
+            row
+        };
+
+        let make_pair = || {
+            let mut heap = null;
+            let hdesc = HeapDesc {
+                size: 1 << 20,
+                properties: PROPS,
+                alignment: 0,
+                flags: 0,
+            };
+            assert_eq!(
+                crate::resource::create_heap(
+                    null,
+                    std::ptr::from_ref(&hdesc).cast(),
+                    &heap_iid,
+                    &mut heap,
+                ),
+                S_OK
+            );
+            let (mut writer, mut alias, mut dst_tex, mut out_buf, mut list) =
+                (null, null, null, null, null);
+            let writer_desc = tex_desc(4, 4, R32G32B32A32_FLOAT, RENDER_TARGET);
+            let alias_desc = tex_desc(16, 16, BC3_UNORM, 0);
+            let out_desc = buf_desc(4096);
+            assert_eq!(
+                crate::resource::create_placed(
+                    null,
+                    heap,
+                    0,
+                    std::ptr::from_ref(&writer_desc).cast(),
+                    0,
+                    null.cast(),
+                    &res_iid,
+                    &mut writer,
+                ),
+                S_OK
+            );
+            assert_eq!(
+                crate::resource::create_placed(
+                    null,
+                    heap,
+                    0,
+                    std::ptr::from_ref(&alias_desc).cast(),
+                    0,
+                    null.cast(),
+                    &res_iid,
+                    &mut alias,
+                ),
+                S_OK
+            );
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    std::ptr::from_ref(&PROPS).cast(),
+                    0,
+                    std::ptr::from_ref(&alias_desc).cast(),
+                    0,
+                    null.cast(),
+                    &res_iid,
+                    &mut dst_tex,
+                ),
+                S_OK
+            );
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    std::ptr::from_ref(&PROPS).cast(),
+                    0,
+                    std::ptr::from_ref(&out_desc).cast(),
+                    0,
+                    null.cast(),
+                    &res_iid,
+                    &mut out_buf,
+                ),
+                S_OK
+            );
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            (heap, writer, alias, dst_tex, out_buf, list)
+        };
+
+        // Run each copy path against its own independent aliased pair so none
+        // can mask another via `alias_copy`'s per-list `first_use` guard.
+        for (mode, color) in [
+            ("copy_resource", [1.0f32, 2.0, 3.0, 4.0]),
+            ("copy_texture_region", [5.0f32, 6.0, 7.0, 8.0]),
+            ("read_back", [9.0f32, 10.0, 11.0, 12.0]),
+        ] {
+            let (heap, writer, alias, dst_tex, out_buf, list) = make_pair();
+            let (out_ptr, _) = crate::resource::buffer_bytes(out_buf).unwrap();
+            // SAFETY: `out_buf` holds 4096 bytes.
+            unsafe { std::ptr::write_bytes(out_ptr, 0xEE, 4096) };
+
+            let mut rtv_mem = [0u64; 16];
+            let rtv = rtv_mem.as_mut_ptr() as u64;
+            crate::descriptor::create_rtv(null, writer, null.cast(), rtv);
+            clear_rtv(list, rtv, &color, 0, null.cast());
+
+            match mode {
+                "copy_resource" => {
+                    copy_resource(list, dst_tex, alias);
+                    copy_texture_region(list, &fp(out_buf), 0, 0, 0, &sub(dst_tex), null.cast());
+                }
+                "copy_texture_region" => {
+                    copy_texture_region(list, &sub(dst_tex), 0, 0, 0, &sub(alias), null.cast());
+                    copy_texture_region(list, &fp(out_buf), 0, 0, 0, &sub(dst_tex), null.cast());
+                }
+                "read_back" => {
+                    copy_texture_region(list, &fp(out_buf), 0, 0, 0, &sub(alias), null.cast());
+                }
+                _ => unreachable!(),
+            }
+            close(list);
+            execute(queue, 1, &list);
+            assert_eq!(crate::resource::alias_source(alias), Some(writer));
+
+            // SAFETY: `out_buf` holds 4096 bytes and the submission has completed.
+            let got = unsafe { std::slice::from_raw_parts(out_ptr, 4096) };
+            let want = expected_row(color);
+            for row in 0..4 {
+                let at = row * 256;
+                assert_eq!(
+                    &got[at..at + 64],
+                    want.as_slice(),
+                    "{mode}: row {row} must match GPU-written alias source"
+                );
+            }
+
+            for object in [list, out_buf, dst_tex, alias, writer, heap] {
+                assert_eq!(release(object), 0);
+            }
+        }
+
+        // Cross-submission sync: submission 1 writes `writer`, submission 2
+        // reads back `alias`, and submission 3 updates `writer` again and
+        // copies `alias` through `copy_resource`.
+        let (heap, writer, alias, dst_tex, out_buf, list) = make_pair();
+        let (out_ptr, _) = crate::resource::buffer_bytes(out_buf).unwrap();
+        let mut rtv_mem = [0u64; 16];
+        let rtv = rtv_mem.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(null, writer, null.cast(), rtv);
+
+        // Submission 1: write `writer` only.
+        let first = [1.5f32, 2.5, 3.5, 4.5];
+        clear_rtv(list, rtv, &first, 0, null.cast());
+        close(list);
+        execute(queue, 1, &list);
+
+        // Submission 2: read back `alias` in a new submission.
+        // SAFETY: `out_buf` holds 4096 bytes.
+        unsafe { std::ptr::write_bytes(out_ptr, 0xEE, 4096) };
+        assert_eq!(reset(list, allocator, null), S_OK);
+        copy_texture_region(list, &fp(out_buf), 0, 0, 0, &sub(alias), null.cast());
+        close(list);
+        execute(queue, 1, &list);
+        // SAFETY: `out_buf` holds 4096 bytes and submission 2 has completed.
+        let got = unsafe { std::slice::from_raw_parts(out_ptr, 4096) };
+        let want = expected_row(first);
+        for row in 0..4 {
+            assert_eq!(&got[row * 256..row * 256 + 64], want.as_slice());
+        }
+
+        // Submission 3: overwrite `writer` and copy via `alias` again.
+        let second = [13.0f32, 14.0, 15.0, 16.0];
+        // SAFETY: `out_buf` holds 4096 bytes.
+        unsafe { std::ptr::write_bytes(out_ptr, 0xEE, 4096) };
+        assert_eq!(reset(list, allocator, null), S_OK);
+        clear_rtv(list, rtv, &second, 0, null.cast());
+        copy_resource(list, dst_tex, alias);
+        copy_texture_region(list, &fp(out_buf), 0, 0, 0, &sub(dst_tex), null.cast());
+        close(list);
+        execute(queue, 1, &list);
+        // SAFETY: `out_buf` holds 4096 bytes and submission 3 has completed.
+        let got = unsafe { std::slice::from_raw_parts(out_ptr, 4096) };
+        let want = expected_row(second);
+        for row in 0..4 {
+            assert_eq!(&got[row * 256..row * 256 + 64], want.as_slice());
+        }
+
+        for object in [
+            list, out_buf, dst_tex, alias, writer, heap, allocator, queue,
+        ] {
             assert_eq!(release(object), 0);
         }
     }

@@ -166,9 +166,11 @@ pub(crate) struct Psv<'a> {
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
+    /// Validator 1.8 needs PSV runtime-info v3 and the entry-point name.
+    pub validator_1_8: bool,
 }
 
-/// `PSV0` with runtime info version 2 (validator 1.6).
+/// `PSV0` with runtime info version 2 or 3 (validator 1.6 or 1.8).
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -184,8 +186,9 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[48]);
-    let mut info = [0u8; 48];
+    let runtime_info_size = if p.validator_1_8 { 52usize } else { 48usize };
+    u32s(&mut out, &[runtime_info_size as u32]);
+    let mut info = vec![0u8; runtime_info_size];
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
         // PSInfo.SampleFrequency: an input interpolated per sample, or the
@@ -202,6 +205,11 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     info[24] = p.stage;
     for (k, n) in p.threads.into_iter().enumerate() {
         info[36 + 4 * k..40 + 4 * k].copy_from_slice(&n.to_le_bytes());
+    }
+    if p.validator_1_8 {
+        // PSVRuntimeInfo3::EntryFunctionName, an offset into the string
+        // table. The leading NUL occupies offset 0.
+        info[48..52].copy_from_slice(&1u32.to_le_bytes());
     }
     info[28] = p.inputs.len() as u8;
     info[29] = p.outputs.len() as u8;
@@ -236,7 +244,11 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     // Names of arbitrary semantics (system values use ""), then indices.
-    let mut strings = vec![0u8];
+    let mut strings = if p.validator_1_8 {
+        b"\0main\0".to_vec()
+    } else {
+        vec![0u8]
+    };
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
