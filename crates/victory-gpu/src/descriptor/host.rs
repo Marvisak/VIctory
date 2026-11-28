@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, view_at, views_current};
+use super::{VIEW_TAG, View, view_at, view_gens};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
@@ -694,21 +694,27 @@ impl HostHeap {
     /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
     pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
         let at = |i: u32| start + u64::from(i) * step;
-        // SAFETY: records in title heap memory the caller found mapped.
-        let records: Vec<[u32; 3]> =
-            (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
-        let current = views_current(&records);
         let stale: Vec<u32> = {
+            // Lock order: `self.made` -> `VIEWS` -> `VIEW_GENS` (never take
+            // `VIEW_GENS` before `self.made` or a concurrent `made -> VIEWS` and
+            // `VIEWS -> VIEW_GENS` writer will deadlock).
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            (first..last)
-                .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
+            let gens = view_gens();
+            let mut stale = Vec::new();
+            for i in first..last {
+                // SAFETY: records in title heap memory the caller found mapped.
+                let [tag, view, generation] = unsafe { (at(i) as *const [u32; 3]).read_unaligned() };
+                let current = tag == VIEW_TAG && gens.get(view as usize) == Some(&generation);
+                let is_stale = match made.get(i as usize) {
                     Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
                     Some(&m) => m != 0,
                     None => true,
-                })
-                .map(|(i, _)| i)
-                .collect()
+                };
+                if is_stale {
+                    stale.push(i);
+                }
+            }
+            stale
         };
         for i in stale {
             self.mirror(i, at(i), false);

@@ -495,6 +495,7 @@ fn record(handle: u64, view: View) {
                 }
                 None => {
                     views.list.push((view.clone(), 1));
+                    VIEW_GENS.write().unwrap_or_else(|e| e.into_inner()).push(1);
                     views.list.len() as u32 - 1
                 }
             };
@@ -527,7 +528,9 @@ pub(crate) fn forget(resource: usize) {
             continue;
         }
         views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+        let next = generation.wrapping_add(1).max(1);
+        views.list[i as usize].1 = next;
+        VIEW_GENS.write().unwrap_or_else(|e| e.into_inner())[i as usize] = next;
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
@@ -542,16 +545,15 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     (*current == generation).then(|| view.clone())
 }
 
-/// For each record (tag, index, generation): whether it names a view that
-/// is current, as [`view_at`] would find it (one lock for them all).
-fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    records
-        .iter()
-        .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
-        })
-        .collect()
+/// Each entry's generation, kept equal to `Views::list`'s (written under the
+/// `VIEWS` lock): a record is current if its generation is the one here, as
+/// [`view_at`] would find it, without taking the `VIEWS` lock.
+static VIEW_GENS: std::sync::RwLock<Vec<u32>> = std::sync::RwLock::new(Vec::new());
+
+/// The generations of every entry, for many slot checks under one read lock.
+#[cfg(any(windows, test))]
+fn view_gens() -> std::sync::RwLockReadGuard<'static, Vec<u32>> {
+    VIEW_GENS.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -1054,5 +1056,43 @@ pub(crate) mod tests {
             release(h);
             assert!(queued, "the descriptor write reached the heap at the reused address");
         }
+    }
+
+    #[test]
+    fn view_gens_matches_views_across_record_forget_and_reuse() {
+        let mut res1 = 0u64;
+        let mut res2 = 0u64;
+        let mut slot1 = [0u32; 4];
+        let mut slot2 = [0u32; 4];
+        let r1 = std::ptr::from_mut(&mut res1) as usize;
+        let r2 = std::ptr::from_mut(&mut res2) as usize;
+        let h1 = slot1.as_mut_ptr() as u64;
+        let h2 = slot2.as_mut_ptr() as u64;
+
+        record(h1, View::Shader(r1, None));
+        let [tag1, i1, gen1] = [slot1[0], slot1[1], slot1[2]];
+        assert_eq!(tag1, VIEW_TAG);
+        assert_eq!(view_gens().get(i1 as usize).copied(), Some(gen1));
+
+        forget(r1);
+        {
+            let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            let gens = view_gens();
+            assert_eq!(gens.len(), views.list.len());
+            assert_ne!(gens[i1 as usize], gen1);
+            assert_eq!(gens[i1 as usize], views.list[i1 as usize].1);
+        }
+
+        record(h2, View::Shader(r2, None));
+        let [tag2, i2, gen2] = [slot2[0], slot2[1], slot2[2]];
+        assert_eq!(tag2, VIEW_TAG);
+        {
+            let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            let gens = view_gens();
+            assert_eq!(gens.len(), views.list.len());
+            assert_eq!(gens[i2 as usize], gen2);
+            assert_eq!(gens[i2 as usize], views.list[i2 as usize].1);
+        }
+        forget(r2);
     }
 }
