@@ -1210,8 +1210,8 @@ impl Host {
         drop(uploading);
         let runs: Vec<&HostList> = uploads
             .as_ref()
-            .map(|u| u.list())
             .into_iter()
+            .flat_map(|u| u.lists())
             .chain(runs.iter().copied())
             .collect();
         let runs = &runs[..];

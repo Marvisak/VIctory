@@ -416,6 +416,34 @@ impl HostHeap {
         self.note_address(index, Some(view));
     }
 
+    /// A shader reads a constant through an `SRV` table range: make a raw
+    /// `R32_TYPELESS` buffer view of the host copy instead of a CBV.
+    /// `raw_view_at` keeps the buffer alive with the slot.
+    pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, first: u64, size: u32) {
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        // `raw_view_at` takes a byte offset, but callers may pass the absolute
+        // host address of the constant (as a CBV's `BufferLocation` does).
+        let first = if first >= gpu { first - gpu } else { first };
+        self.raw_view_at(index, Some(buffer), first, u64::from(size), false);
+    }
+
+    fn raw_srv(first: u64, elements: u32) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+        D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: first,
+                    NumElements: elements,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        }
+    }
+
     /// Makes slot `index` (a dynamic one) a raw view, shader resource or
     /// unordered access (`uav`), of `bytes` of `buffer` from byte `first`
     /// (both multiples of 4), which it holds; a null one for no buffer, or
@@ -451,19 +479,7 @@ impl HostHeap {
                 host.device
                     .CreateUnorderedAccessView(buffer, None, Some(&desc), self.cpu(index));
             } else {
-                let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                    Format: DXGI_FORMAT_R32_TYPELESS,
-                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Buffer: D3D12_BUFFER_SRV {
-                            FirstElement: first,
-                            NumElements: elements,
-                            StructureByteStride: 0,
-                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                        },
-                    },
-                };
+                let desc = Self::raw_srv(first, elements);
                 host.device
                     .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index));
             }
@@ -2211,6 +2227,94 @@ mod tests {
         assert_eq!(unsafe { past.read_unaligned() }, mark);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A constant named by an `SRV` table is a raw buffer SRV, and the host
+    /// copy it reads is held by the slot.
+    #[test]
+    fn direct_constants_are_raw_srvs_and_retain_their_buffer() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let slot = heap.dynamic(1).expect("a free slot");
+        let Some(host) = host() else {
+            return;
+        };
+        // SAFETY: one plain committed buffer, held by the slot below.
+        unsafe {
+            let mut buffer: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 256,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .unwrap();
+            let buffer = buffer.unwrap();
+            let references = |b: &ID3D12Resource| {
+                let raw = windows::core::Interface::as_raw(b);
+                let unknown = &*(raw as *const *const windows::core::IUnknown_Vtbl);
+                ((**unknown).AddRef)(raw);
+                ((**unknown).Release)(raw)
+            };
+            // Both views name the same resource and byte offset, so the
+            // descriptor bytes must agree apart from allocation addresses.
+            heap.constant_at(slot, &buffer, 0, 256);
+            assert_eq!(references(&buffer), 2, "ours and the slot's");
+            let reference_slot = heap.dynamic(1).expect("another free slot");
+            heap.raw_view_at(reference_slot, Some(&buffer), 0, 256, false);
+            assert_eq!(references(&buffer), 3, "ours and both slots'");
+            let cbv_slot = heap.dynamic(1).expect("a third free slot");
+            let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                BufferLocation: buffer.GetGPUVirtualAddress(),
+                SizeInBytes: 256,
+            };
+            host.device.CreateConstantBufferView(Some(&cbv), heap.cpu(cbv_slot));
+            let expected = HostHeap::raw_srv(0, 64);
+            assert_eq!(expected.Format, DXGI_FORMAT_R32_TYPELESS);
+            assert_eq!(expected.ViewDimension, D3D12_SRV_DIMENSION_BUFFER);
+            assert_eq!(expected.Shader4ComponentMapping, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+            let expected = expected.Anonymous.Buffer;
+            assert_eq!(expected.FirstElement, 0);
+            assert_eq!(expected.NumElements, 64);
+            assert_eq!(expected.StructureByteStride, 0);
+            assert_eq!(expected.Flags, D3D12_BUFFER_SRV_FLAG_RAW);
+            let gpu = buffer.GetGPUVirtualAddress() as u32;
+            let words = |slot| {
+                let at = heap.cpu(slot).ptr as *const u32;
+                let words: Vec<_> = (0..(heap.step as usize / 4).min(10))
+                    .map(|i| at.add(i).read_unaligned())
+                    .collect();
+                let base = words[0];
+                words
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, word)| match i {
+                        // Dword 8 is the low half of the view's GPU address:
+                        // compare it from the resource's base, so allocations
+                        // holding the same bytes agree.
+                        8 => word.wrapping_sub(gpu),
+                        i if i % 2 == 0 => word.wrapping_sub(base),
+                        _ => word,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(words(slot), words(reference_slot), "a raw buffer SRV at matching offsets");
+            assert_ne!(words(slot), words(cbv_slot), "not a CBV");
+            assert!(host.device.GetDeviceRemovedReason().is_ok());
+        }
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.

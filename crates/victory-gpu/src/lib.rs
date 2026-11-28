@@ -32,6 +32,8 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+mod heap_pass;
 mod hold;
 #[cfg(windows)]
 mod host;
@@ -62,6 +64,8 @@ mod switch;
 mod tdr;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+mod texture_worker;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]

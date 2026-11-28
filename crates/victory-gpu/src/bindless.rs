@@ -9,11 +9,12 @@
 //! such shaders first brings all of them up to date (what changed since,
 //! `crate::watch`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use crate::descriptor::View;
+use crate::heap_pass::Marked;
 use crate::host::HostList;
 use crate::object::This;
 use crate::shadow::Shadow;
@@ -64,6 +65,7 @@ struct Inner {
     /// lists, and remerging the world's 130,000 ranges each time cost 0.15
     /// s per frame).
     ends: HashMap<(usize, bool), Ends>,
+    marked_buffers: Marked<(usize, bool)>,
 }
 
 /// A copy, and the counts of its ranges' starts and ends.
@@ -136,6 +138,12 @@ impl Viewed {
             inner.count(&old, false);
         }
         if let Some(seen) = seen {
+            match &seen {
+                Seen::Buffer(shadow, _, _, uav) => {
+                    inner.marked_buffers.note((Arc::as_ptr(shadow) as usize, *uav));
+                }
+                Seen::Texture(_) | Seen::Left(_) => {}
+            }
             inner.count(&seen, true);
             inner.slots.insert(index, seen);
         }
@@ -227,14 +235,21 @@ pub(crate) fn uploads(
         if copy.host_written.load(Relaxed) {
             continue;
         }
-        if staged.insert(Arc::as_ptr(staging)) {
+        let key = Arc::as_ptr(staging) as usize;
+        if crate::texture_worker::on() && crate::texture_worker::pending(key) {
+            continue;
+        }
+        if staged.insert(key) {
             work.push((staging.clone(), copy.clone()));
         }
     }
     let mut done = std::collections::HashSet::new();
     for viewed in heaps {
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        for &r in inner.textures.keys() {
+        let pending: Vec<usize> = {
+            let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.textures.keys().copied().collect()
+        };
+        for r in pending {
             if !done.insert(r) {
                 continue;
             }
@@ -257,31 +272,42 @@ pub(crate) fn uploads(
             if texture.host_written.load(Relaxed) {
                 continue;
             }
-            if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
-                && staged.insert(Arc::as_ptr(&staging))
-            {
-                work.push((staging, texture));
+            if let Some(staging) = crate::texture::staging(r as This, &texture.texture) {
+                if !staging.maybe_changed() {
+                    continue;
+                }
+                let key = Arc::as_ptr(&staging) as usize;
+                if crate::texture_worker::on() && crate::texture_worker::pending(key) {
+                    continue;
+                }
+                if staged.insert(key) {
+                    work.push((staging, texture));
+                }
             }
         }
     }
     let mut recorded = false;
-    // The textures copied into stay alive in `work` until recorded.
-    let mut readable = Vec::new();
-    for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
-        if let Some(upload) = upload {
-            readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
-            recorded = true;
-            #[cfg(feature = "diagnostics")]
-            UPLOADED.fetch_add(1, Relaxed);
+    let ready = if crate::texture_worker::on() {
+        crate::texture_worker::submit(work)
+    } else {
+        let mut readable = Vec::new();
+        for ((staging, copy), upload) in work.iter().zip(crate::texture::refresh_all(&work)) {
+            if let Some(upload) = upload {
+                readable.extend(crate::texture::record_upload(list, copy, staging, &upload));
+                recorded = true;
+                #[cfg(feature = "diagnostics")]
+                UPLOADED.fetch_add(1, Relaxed);
+            }
         }
-    }
-    if !readable.is_empty() {
-        // SAFETY: an open list; the barriers name live textures.
-        unsafe { list.list.ResourceBarrier(&readable) };
-    }
+        if !readable.is_empty() {
+            // SAFETY: an open list; the barriers name live textures.
+            unsafe { list.list.ResourceBarrier(&readable) };
+        }
+        Vec::new()
+    };
+    recorded |= !ready.is_empty();
     list.close();
-    // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads(guard))
+    recorded.then_some(Uploads { held: guard, ready })
 }
 
 /// The upload list, used under its lock only.
@@ -291,11 +317,22 @@ pub(crate) struct Holder(Option<HostList>);
 unsafe impl Send for Holder {}
 
 /// The upload list of a submission, ours until it has run.
-pub(crate) struct Uploads(std::sync::MutexGuard<'static, Holder>);
+pub(crate) struct Uploads {
+    held: std::sync::MutexGuard<'static, Holder>,
+    ready: Vec<crate::texture_worker::Ready>,
+}
 
 impl Uploads {
-    pub(crate) fn list(&self) -> &HostList {
-        self.0.0.as_ref().expect("made before it is handed out")
+    pub(crate) fn lists(&self) -> impl Iterator<Item = &HostList> {
+        self.ready.iter().map(|ready| &ready.list).chain(self.held.0.iter())
+    }
+}
+
+impl Drop for Uploads {
+    fn drop(&mut self) {
+        for ready in self.ready.drain(..) {
+            crate::texture_worker::recycle(ready);
+        }
     }
 }
 
@@ -314,8 +351,24 @@ impl Uploads {
 /// Copies the title has not written since they took it are passed by: a
 /// world submission's heaps reach ~9,000 copies, a few of them written.
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-    for (shadow, address, len, uav, bit) in inner.hulls.values() {
+    let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let all: Vec<((usize, bool), bool)> = inner
+        .hulls
+        .iter()
+        .map(|(key, (_, _, _, _, bit))| (*key, !crate::watch::clean_bit(*bit)))
+        .collect();
+    let dirty: HashSet<_> = all.iter().filter_map(|(key, dirty)| dirty.then_some(*key)).collect();
+    let keys = if crate::heap_pass::marked() {
+        inner
+            .marked_buffers
+            .plan(|key| dirty.contains(key), || all.iter().map(|(key, _)| *key).collect())
+    } else {
+        all.iter().map(|(key, _)| *key).collect()
+    };
+    for key in keys {
+        let Some((shadow, address, len, uav, bit)) = inner.hulls.get(&key) else {
+            continue;
+        };
         if !crate::watch::clean_bit(*bit) {
             let (address, len) = if *uav && shadow.marked() {
                 shadow.page_range(*address, *len)
@@ -424,7 +477,7 @@ pub(crate) fn log(frames: f64) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -492,7 +545,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// A title resource from a description in the console's layout (56
     /// bytes: dimension, alignment, width, height, depth and mips, format,
     /// samples, layout, flags).
-    fn resource(dimension: u32, width: u64, height: u32, format: u32, layout: u32) -> This {
+    pub(crate) fn resource(dimension: u32, width: u64, height: u32, format: u32, layout: u32) -> This {
         let desc: [u32; 14] = [
             dimension, 0, 0, 0, width as u32, (width >> 32) as u32, height, 1 | 1 << 16, format, 1, 0,
             layout, 0, 0,
@@ -637,6 +690,27 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 
     const PAGE_BYTES: usize = crate::watch::PAGE;
+
+    /// Ready worker lists are run before the submission's own upload list,
+    /// so draws see the textures they uploaded.
+    #[test]
+    fn ready_upload_lists_run_before_the_held_list() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        static HELD: Mutex<Holder> = Mutex::new(Holder(None));
+        let held = host.new_list().unwrap();
+        held.close();
+        *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Holder(Some(held));
+        let worker = host.new_list().unwrap();
+        worker.close();
+        let worker_raw = windows::core::Interface::as_raw(&worker.list);
+        let ready = crate::texture_worker::ready_for_test(worker, Vec::new());
+        let uploads = Uploads { held: HELD.lock().unwrap_or_else(|e| e.into_inner()), ready: vec![ready] };
+        let lists: Vec<_> = uploads.lists().collect();
+        assert_eq!(lists.len(), 2);
+        assert_eq!(windows::core::Interface::as_raw(&lists[0].list), worker_raw);
+    }
 
     /// Three rounds of: record a dispatch reading slots 0 and 2 and writing
     /// slot 1, let the title `write` (after recording, before submitting),

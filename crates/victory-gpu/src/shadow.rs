@@ -144,6 +144,12 @@ impl Shadow {
         self.gpu + (address - self.start)
     }
 
+    /// The byte offset of `address` in the host buffer, for a raw view.
+    pub(crate) fn raw_first(&self, address: u64) -> u64 {
+        // SAFETY: a live buffer held by the shadow.
+        self.gpu(address) - unsafe { self.buffer.GetGPUVirtualAddress() }
+    }
+
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)

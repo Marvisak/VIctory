@@ -200,6 +200,37 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+pub(crate) static CONSTANT_VIEWS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn direct_constants() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_CONSTANTS").is_some_and(|v| v == "1"))
+}
+
+fn direct_constant(list: &HostList, address: u64, size: u32) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u32)> {
+    let counted = |direct: bool| {
+        CONSTANT_VIEWS[usize::from(!direct)].fetch_add(1, Ordering::Relaxed);
+    };
+    if !direct_constants() || size == 0 || size > 1 << 16 {
+        counted(false);
+        return None;
+    }
+    let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
+        counted(false);
+        return None;
+    };
+    let gpu = shadow.gpu(address);
+    let rounded = u64::from(size.next_multiple_of(256));
+    if !gpu.is_multiple_of(256) || shadow.left(address) < rounded {
+        counted(false);
+        return None;
+    }
+    shadow.refresh(list, address, rounded);
+    counted(true);
+    let first = shadow.raw_first(address);
+    Some((shadow, first, rounded as u32))
+}
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory. What shaders write through a root UAV goes back
@@ -1345,6 +1376,14 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(view) => {
+                        if let Some(u) = used
+                            && u.kind == ResourceType::Srv
+                            && let View::Constant(address, size) = &view
+                            && let Some((shadow, first, bytes)) = direct_constant(list, *address, *size)
+                        {
+                            host.constant_at(index, &shadow.buffer, first, bytes);
+                            continue;
+                        }
                         host.make_at(index, &view);
                         if let Some(u) = used {
                             readable(list, u, &view, true);
